@@ -2,8 +2,6 @@
 
 NEOPAX aims to be a simple JAX framework to solve radial transport equations for stellarators and use it to optimise for different neoclassical quantities of interest.
 
-## Repository Organization
-
 ## Quick Start
 The main packages used by NEOPAX can be installed via pip:
 
