@@ -24,7 +24,7 @@ pip install optimistix
 pip install diffrax
 ```
 
-At the moment the code makes use of a Monkes-JAX monoenergetic database Dij(r,collisionality,Er). To obtain these you can use Monkes-JAX, see: https://github.com/eduardolneto/monkes  
+At the moment the code makes use of a Monkes-JAX monoenergetic database Dij(r,collisionality,Er). To obtain these you can use Monkes-JAX, see: https://github.com/monkes  
 
 ## Examples
 To see examples of flux calculation or solving for the electric field simply go to the folder NEOPAX/tests and into one of the example folders you can run the respective script by 
