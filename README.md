@@ -7,7 +7,6 @@ The main packages used by NEOPAX can be installed via pip:
 
 ```
 pip install matplotlib
-pip install simsopt
 ```
 For GPU enable jax use this (it requires cuda12 installation, with the corresponding libraries, see JAX documentation for more details on this):
 ```
