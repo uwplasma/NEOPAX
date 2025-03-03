@@ -1,50 +1,127 @@
 import h5py as h5
 import jax
 import jax.numpy as jnp
-from _field import a_b
-from scipy.constants import elementary_charge
-from _parameters import monkes_file
+from jax import config
+# to use higher precision
+config.update("jax_enable_x64", True)
+from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
+import equinox as eqx
 
 
-#Read monkes database
-file=h5.File(monkes_file ,'r')
-D11=file['D11'][()]
-D13=file['D13'][()]
-D33=file['D33'][()]
-nu_v=file['nu_v'][()]
-Er_save=file['Er'][()]
-drds=file['drds'][()]
-rho=jnp.array(file['rho'][()])
-Er=file['Er'][()]
-Es=file['Es'][()]
-Er_tilde=file['Er_tilde'][()]
-Er_to_Ertilde=file['Er_to_Ertilde'][()]
-file.close()
+#Monoenergetic database class
+class Monoenergetic(eqx.Module):
+    """Monoenergetic database.
 
-Er_ref=jnp.array(1.e-8)
+    """
 
-Er_list=jnp.zeros((len(rho),len(Er_tilde)))
-for j in range(len(rho)):
-    D11[j,:,:]=D11[j,:,:]*jnp.power(drds[j],2)
-    D13[j,:,:]=D13[j,:,:]*drds[j]
-    for k in range(len(Er_tilde)):
-        Er_list=Er_list.at[j,k].set(jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0,k])/(a_b*rho.at[j].get()))))
-        D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
-#Er_list=Er[0]#jnp.log10(np.maximum(1.e-8,jnp.abs(Er[0])))
+    # note: assumes (psi, theta, zeta) coordinates, not (rho, theta, zeta)
+    a_b: float  #int = eqx.field(static=True)
+    D11_lower_limit: float
+    Er_lower_limit: float
+    Er_lower_limit_log : float
+    low_limit_r : float
+    r1_lim : float
+    rmn2_lim: float 
+    r1 : float
+    r2: float
+    r3: float
+    rnm3: float
+    rnm2 : float
+    rnm1: float
+    rho: Float[Array,'...']
+    nu_log : Float[Array,'...'] 
+    Er_list: Float[Array,'...']
+    D11_log: Float[Array,'...']
+    D13 : Float[Array,'...'] 
+    D33 : Float[Array,'...']
 
-D11_log=jnp.log10(D11)
-nu_log=jnp.log10(nu_v)
-D13=jnp.array(D13)
-D33=jnp.array(D33)
-#nu_t = 10**jnp.linspace(np.log10(1.e-9),np.log10(1000.), 101)
-#Er_t = jnp.linspace(Er.min(), Er.max(), 101)
-#rho_t = jnp.linspace(0.,1., 101)
-#Er_pm = jnp.linspace(-50., 50., 101)
-#rho_pm = jnp.linspace(0., 1.0, 21)
+    def __init__(
+        self,
+        a_b: float,
+        rho: Float[Array,'...'],
+        nu_log : Float[Array,'...'], 
+        Er_list: Float[Array,'...'],
+        D11_log: Float[Array,'...'],
+        D13 : Float[Array,'...'],
+        D33 : Float[Array,'...'],
+    ):
 
-#Create interpolation object of monoenergetic database
-#Create interpolation object of monoenergetic database
-#monodata=interpax.Interpolator3D(rho*a_b,nu_log,Er_list,D11_log,extrap=True)
+        self.a_b=a_b
+        self.rho=rho
+        self.nu_log=nu_log
+        self.Er_list=Er_list
+        self.D11_log=D11_log
+        self.D13=D13
+        self.D33=D33
+        self.D11_lower_limit=jnp.array(-12.0)
+        self.Er_lower_limit=1.e-8
+        self.Er_lower_limit_log=jnp.log10(1.e-8)
+        self.low_limit_r=jnp.array(1.e-3*self.a_b)
+        self.r1_lim=self.a_b*self.rho[1]
+        self.rmn2_lim=self.a_b*self.rho[-2]
+        self.r1=self.rho[0]*self.a_b
+        self.r2=self.rho[1]*self.a_b
+        self.r3=self.rho[2]*self.a_b
+        self.rnm3=self.rho[-3]*self.a_b
+        self.rnm2=self.rho[-2]*self.a_b
+        self.rnm1=self.rho[-1]*self.a_b
+
+
+    @classmethod
+    def read_monkes(cls,
+        a_b,                    
+        monkes_file,
+    ):
+        """Construct Field from BOOZ_XFORM file.
+
+        Parameters
+        ----------
+        monkes_file : path-like
+            Path to vmec wout file.
+        """
+
+        file=h5.File(monkes_file ,'r')
+        D11=file['D11'][()]
+        D13=file['D13'][()]
+        D33=file['D33'][()]
+        nu_v=file['nu_v'][()]
+        Er_save=file['Er'][()]
+        drds=file['drds'][()]
+        rho=jnp.array(file['rho'][()])
+        Er=file['Er'][()]
+        Es=file['Es'][()]
+        Er_tilde=file['Er_tilde'][()]
+        Er_to_Ertilde=file['Er_to_Ertilde'][()]
+        file.close()
+
+        Er_ref=jnp.array(1.e-8)
+
+        Er_list=jnp.zeros((len(rho),len(Er_tilde)))
+        for j in range(len(rho)):
+            D11[j,:,:]=D11[j,:,:]*jnp.power(drds[j],2)
+            D13[j,:,:]=D13[j,:,:]*drds[j]
+            for k in range(len(Er_tilde)):
+                Er_list=Er_list.at[j,k].set(jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0,k])/(a_b*rho.at[j].get()))))
+                D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
+        #Er_list=jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0])))
+
+        D11_log=jnp.log10(D11)
+        nu_log=jnp.log10(nu_v)
+        D13=jnp.array(D13)
+        D33=jnp.array(D33)
+
+        data = {}
+        data["a_b"]=a_b
+        data["rho"] = rho
+        data["nu_log"] = nu_log
+        data["Er_list"] = Er_list
+        data["D11_log"] = D11_log
+        data["D13"] = D13
+        data["D33"] = D33
+
+        return cls(**data)
+
+
 
 
 

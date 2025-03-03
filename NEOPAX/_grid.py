@@ -3,43 +3,70 @@ import jax
 from jax import config
 # to use higher precision
 config.update("jax_enable_x64", True)
+from jax import jit
 import orthax
-from _parameters import n_radial, Nx, n_species, Sonine_expansion
-from _field import a_b
+import equinox as eqx
+from jaxtyping import Array, Float, Int  # https://github.com/google/jaxtyping
 
 
-#This should go to grids
-#defining xgrid quadrature points, and weights for needed entries of transport matrices
-xgrid=orthax.laguerre.laggauss(Nx)
-x=xgrid[0]
-xWeights=xgrid[1]
-#Define normalised v grid points
-v_norm=jnp.sqrt(x)
-#Define weights for velocity integrals of energy convolution
-L11_weight=jnp.power(x,2.) #The same mount of v factors as in MONKES paper n_v-1, as one of the factors is used to get the factor d(v^2)= dx
-L12_weight=jnp.power(x,3.)
-L22_weight=jnp.power(x,4.) 
-L13_weight=jnp.power(x,1.5)
-L23_weight=jnp.power(x,2.5)
-L33_weight=jnp.power(x,1.)
-####Extra weights for momentum correction Lij is a 5x5 matrix
-L24_weight=jnp.power(x,3.5)
-L25_weight=jnp.power(x,4.5)
-L43_weight=jnp.power(x,2.)
-L44_weight=jnp.power(x,3.)
-L45_weight=jnp.power(x,4.)
-L55_weight=jnp.power(x,5.)
-
-
-#Radial grids
-r0 = 0.
-r_final = a_b 
-rho_grid=jnp.linspace(0., 1., n_radial)
-rho_grid_half=jnp.linspace((rho_grid[0]+rho_grid[1])*0.5, (rho_grid[0]+rho_grid[1])*0.5+rho_grid[-1], n_radial)
-r_grid_half=rho_grid_half*a_b
-r_grid=rho_grid*a_b
-dr=r_grid[2]-r_grid[1]
-
-species_indeces=jnp.arange(n_species)
-full_grid_indeces=jnp.arange(n_radial)
-sonine_indeces=jnp.arange(len(Sonine_expansion))
+class Grid(eqx.Module):
+    #Defining radial and energy grids
+    n_r: int
+    n_x: int
+    n_species: int
+    n_order: int
+    Sonine_expansion : Float[Array, "n_order"]
+    species_indeces : Int[Array, "n_species"]
+    full_grid_indeces : Int[Array, "n_r"]    
+    sonine_indeces : Int[Array, "n_order"] 
+    x : Float[Array, "n_x"]      
+    xWeights : Float[Array, "n_x"] 
+    v_norm : Float[Array, "n_x"] 
+    L11_weight : Float[Array, "n_x"] 
+    L12_weight : Float[Array, "n_x"] 
+    L22_weight : Float[Array, "n_x"] 
+    L13_weight : Float[Array, "n_x"] 
+    L23_weight : Float[Array, "n_x"] 
+    L33_weight : Float[Array, "n_x"] 
+    L24_weight : Float[Array, "n_x"] 
+    L25_weight : Float[Array, "n_x"]                    
+    L43_weight : Float[Array, "n_x"] 
+    L44_weight : Float[Array, "n_x"] 
+    L45_weight : Float[Array, "n_x"]   
+    L55_weight : Float[Array, "n_x"]     
+     
+    def __init__(
+        self,
+        n_r: int,
+        n_x: int,
+        n_species: int,
+    ):
+        
+        self.n_r=n_r
+        self.n_x=n_x
+        self.n_species=n_species
+        self.n_order=3
+        self.Sonine_expansion=jnp.array([1.0,0.4,8.0/35.0]) #order 2 Sonine expansion, fixed for now
+        self.species_indeces=jnp.arange(self.n_species) 
+        self.full_grid_indeces=jnp.arange(self.n_r) 
+        self.sonine_indeces=jnp.arange(len(self.Sonine_expansion))
+        xgrid=orthax.laguerre.laggauss(self.n_x)
+        self.x=xgrid[0]
+        self.xWeights=xgrid[1]
+        self.v_norm=jnp.sqrt(self.x)
+        self.L11_weight=jnp.power(self.x,2.)
+        self.L12_weight=jnp.power(self.x,3.)
+        self.L22_weight=jnp.power(self.x,4.)
+        self.L13_weight=jnp.power(self.x,1.5)
+        self.L23_weight=jnp.power(self.x,2.5)
+        self.L33_weight=jnp.power(self.x,1.)        
+        self.L24_weight=jnp.power(self.x,3.5)        
+        self.L25_weight=jnp.power(self.x,4.5)   
+        self.L43_weight=jnp.power(self.x,2.)        
+        self.L44_weight=jnp.power(self.x,3.) 
+        self.L45_weight=jnp.power(self.x,4.) 
+        self.L55_weight=jnp.power(self.x,5.)
+            
+    @classmethod
+    def create_standard(cls,n_r,n_x,n_species):
+        return cls(n_r,n_x,n_species)

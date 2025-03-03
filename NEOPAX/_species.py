@@ -1,4 +1,3 @@
-import functools
 from functools import partial
 from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
 import equinox as eqx
@@ -9,30 +8,23 @@ from jax import config
 config.update("jax_enable_x64", True)
 from jax import jit
 import jax.numpy as jnp
-from scipy.constants import Boltzmann, elementary_charge, epsilon_0, hbar, proton_mass
-from dataclasses import dataclass
+from ._constants import Boltzmann, elementary_charge, epsilon_0, hbar, proton_mass
 import interpax
-from _grid import r_grid,dr, r_grid_half, species_indeces, rho_grid, rho_grid_half
-from _field import dVdr,a_b
-from _parameters import n_edge,T_edge
+#from _io import grid,field
 
 
-###This module uses some functions of JAX-MONKES by R. Colin, but class structure was revamped to fit the overall package better#####
+
+###This module uses some functions adapted from JAX-MONKES by R. Colin, but class structure was revamped to fit the overall package better#####
 
 JOULE_PER_EV = 11606 * Boltzmann
 EV_PER_JOULE = 1 / JOULE_PER_EV
-Vprime=dVdr(rho_grid)*2.*rho_grid/a_b#*(2.*jnp.pi)**2
-Vprime_half=dVdr(rho_grid_half)*2.*rho_grid_half/a_b#*(2.*jnp.pi)**2
-overVprime=1./Vprime
-overVprime=overVprime.at[0].set(0.0)
-
 
 @jit
 def get_v_thermal(mass,temperature):
     return jnp.sqrt(2*temperature * JOULE_PER_EV/mass)
 
 @jit
-def get_gradient_temperature(T):
+def get_gradient_temperature(T,r_grid,r_grid_half,dr,T_edge):
     T_next = jnp.roll(T, shift=-1)
     #T_prev = jnp.roll(T, shift=1)    
     #grad_y = (y_next -  y_prev) / (2.*y.delta_x)
@@ -44,7 +36,7 @@ def get_gradient_temperature(T):
     return dTdr_full
 
 @jit
-def get_gradient_density(n):
+def get_gradient_density(n,r_grid,r_grid_half,dr,n_edge):
     n_next = jnp.roll(n, shift=-1)
     #n_prev = jnp.roll(n, shift=1)    
     #grad_y = (y_next -  y_prev) / (2.*y.delta_x)
@@ -56,7 +48,7 @@ def get_gradient_density(n):
     return dndr_full
 
 @jit
-def get_gradient_Er(y):
+def get_gradient_Er(y,dr):
     y_next = jnp.roll(y, shift=-1)
     #y_prev = jnp.roll(y shift=1)    
     #grad_y = (y_next -  y_prev) / (2.*y.delta_x)
@@ -71,7 +63,7 @@ def get_gradient_Er(y):
 
 
 @jit
-def gradient_no(y):
+def gradient_no(y,dr):
     y_next = jnp.roll(y, shift=-1)
     diff = (y_next-y)/(dr)
     # Dirichlet boundary condition
@@ -84,7 +76,7 @@ def gradient_no(y):
 
 
 @jit
-def get_diffusion_Er(y):
+def get_diffusion_Er(y,r_grid,r_grid_half,Vprime_half,overVprime,dr):
     #Auxiliary Spatial discretizations for convective terms (this is missing the last term of turbulent fluxes)
     #Derivatives for electric field
     #aux=-Er.vals/(rho_grid*a_b)
@@ -100,8 +92,8 @@ def get_diffusion_Er(y):
     #Flux_Er_full=gradEr-Er_half/r_grid_half
     #Flux_Er_half=Vprime_half*interpax.Interpolator1D(r_grid_half,Flux_Er_full)(r_grid_half)
     y_half=interpax.Interpolator1D(r_grid,y,extrap=True)(r_grid_half)
-    FluxEr=Vprime_half*(get_gradient_Er(y)-y_half/r_grid_half)
-    diffusion=gradient_no(FluxEr)*overVprime
+    FluxEr=Vprime_half*(get_gradient_Er(y,dr)-y_half/r_grid_half)
+    diffusion=gradient_no(FluxEr,dr)*overVprime
     #diffusion=diffusion_Er(Er).vals/Vprime
     return diffusion
 
@@ -127,23 +119,22 @@ def get_Thermodynamical_Forces_A3(Er):
 
 @jit
 class Species(eqx.Module):
-    """Global Maxwellian distribution function over radius.
-    Parameters
-    ----------
-    species : Species
-        Atomic species of the distribution function.
-    temperature : callable
-        Temperature of the species as a function of radius, in units of eV.
-    density : callable
-        Density of the species as a function of radius, in units of particles/m^3.
-    """
     number_species: int
     radial_points: int
+    species_indeces: int
     mass_mp: Float[Array, "species"]  
     charge_qp: Float[Array, "species"]  
     temperature: Float[Array, "species x radial_points"]    # in units of eV
     density: Float[Array, "species x radial_points"]    # in units of particles/m^3
     Er: Float[Array, "radial_points"] 
+    r_grid: Float[Array, "radial_points"] 
+    r_grid_half: Float[Array, "radial_points"] 
+    dr: float
+    Vprime_half: Float[Array, "radial_points"] 
+    overVprime: Float[Array, "radial_points"] 
+    n_edge: float
+    T_edge: float
+
     #v_thermal: Float[Array, "species x radial_points"]    # in units of particles/m^3
     @property
     def v_thermal(self):
@@ -156,10 +147,10 @@ class Species(eqx.Module):
         return self.mass_mp*proton_mass
     @property
     def dTdr(self): 
-        return jax.vmap(get_gradient_temperature,in_axes=(0))(self.temperature)
+        return jax.vmap(get_gradient_temperature,in_axes=(0,None,None,None,None))(self.temperature,self.r_grid,self.r_grid_half,self.dr,self.T_edge)
     @property
     def dndr(self): 
-        return jax.vmap(get_gradient_density,in_axes=(0))(self.density)
+        return jax.vmap(get_gradient_density,in_axes=(0,None,None,None,None))(self.density,self.r_grid,self.r_grid_half,self.dr,self.n_edge)
     @property
     def dErdr(self): 
         return get_gradient_Er(self.Er) 
@@ -174,7 +165,7 @@ class Species(eqx.Module):
         return get_Thermodynamical_Forces_A3(self.Er)
     @property
     def diffusion_Er(self):
-        return get_diffusion_Er(self.Er)
+        return get_diffusion_Er(self.Er,self.r_grid,self.r_grid_half,self.Vprime_half,self.overVprime,self.dr)
 
 def collisionality(species_a: int,  species: Species,v: float, r_index: int) -> float:
     """Collisionality between species a and others.
@@ -197,7 +188,7 @@ def collisionality(species_a: int,  species: Species,v: float, r_index: int) -> 
     #I think we can do jnp.sum(jnp.vmap) here but let see with the normal one first TODO
     #for ma in range(species.number_species):
     #    nu += nuD_ab(species,species_a, ma, v, r_index)
-    nu=jnp.sum(jax.vmap(nuD_ab,in_axes=(None,None,0,None,None))(species,species_a,species_indeces,v,r_index),axis=0)
+    nu=jnp.sum(jax.vmap(nuD_ab,in_axes=(None,None,0,None,None))(species,species_a,species.species_indeces,v,r_index),axis=0)
     return nu
 
 

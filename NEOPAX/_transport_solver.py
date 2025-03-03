@@ -9,34 +9,53 @@ import jax.numpy as jnp
 from jax import jit
 import matplotlib.pyplot as plt
 import interpax
-from scipy.constants import Boltzmann, elementary_charge, epsilon_0, hbar, proton_mass
+from ._constants import Boltzmann, elementary_charge, epsilon_0, hbar, proton_mass
 import optimistix as optx
 from typing import Callable
 import diffrax
 import equinox as eqx  # https://github.com/patrick-kidger/equinox
 import jax.lax as lax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
 import jax.experimental.host_callback as hcb
-from _species import Species
-#from _field import a_b, dVdr, iota
-from _grid import rho_grid, rho_grid_half, r_grid, r_grid_half,species_indeces,full_grid_indeces,dr,a_b
-from _neoclassical import get_Neoclassical_Fluxes
-from _parameters import n_species,n_radial, on_Er, on_Pe, on_PD,on_PT, on_nD,on_nT,on_nHe, DEr, Er_Relax
-from _parameters import n_edge, T_edge
-from _parameters import t0, t_final, ts,rtol,atol, dt 
-from _species import Species 
-from _physics import get_plasma_permitivity
+from ._species import Species
+from ._neoclassical import get_Neoclassical_Fluxes
+from ._physics import get_plasma_permitivity
 
+#Solver parameters, to be fixed
+momentum_correction_flag=False
+# Temporal discretisation
+t0 = 0
+t_final =20.  
+dt = 0.0001
+#timesteps at which to save solution
+ts_list=jnp.array([0,1.e-5,1.e-4,1.e-3,2.e-3,3.e-3,4.e-3,5.e-3,6.e-3,7.e-3,8.e-3,9.e-3, 1.e-2,1.5e-2,2.e-2,2.5e-2,3.e-2,3.5e-2,1.e-1,1.05e-1,1.1e-1,1.15e-1,1.2e-1,1.25e-1,1.3e-1,1.35e-1,1.4e-1,1.45e-1,1.5e-1,1.55e-1,1.6e-1,1.65e-1,1.7e-1,1.75e-1,1.8e-1,1.85e-1,1.9e-1,1.95e-1,20.])
+# Tolerances for  diffrax solver
+rtol = 1e-5
+atol = 1e-5
+#Electric field equation parameters
+DEr=jnp.array(0.0) #electric field diffusion coefficient
+Er_relax=jnp.array(0.1)  #Relaxation time of the Electric field
+on_OmegaC=jnp.array(0.0)  #Keep zero!!, parameter for testing  
+#Turn on/off evolution of quantities (0.0=off)
+on_Er=jnp.array(1.0)
+on_ne=jnp.array(0.0)
+on_nD=jnp.array(0.0)
+on_nT=jnp.array(0.0)
+on_nHe=jnp.array(0.0)
+on_Pe=jnp.array(0.0)
+on_PD=jnp.array(0.0)
+on_PT=jnp.array(0.0)
+#Heat diffusivities
+chi=jnp.ones(3)*0.0065
 
 #Define the source terms, Er and pressures are in r nor rho!!!! This serves to construct vector field for diffrax
 @jit
-def sources(species: Species):
+def sources(species: Species,grid,field,database):
     #Evolve species profiles (TODO find a better way for doing the update) 
-    Er_half=interpax.Interpolator1D(r_grid,species.Er,extrap=True)(r_grid_half)     
+    Er_half=interpax.Interpolator1D(field.r_grid,species.Er,extrap=True)(field.r_grid_half)     
     #Get neoclassical fluxes 
-    Lij,Gamma,Q,Upar=get_Neoclassical_Fluxes(species,species_indeces,full_grid_indeces)
+    Lij,Gamma,Q,Upar=get_Neoclassical_Fluxes(species,grid,field,database)
     #     #Apply momentum correction 
     Gamma = Gamma.at[:,0].set(0.0)
     ##Q_e = Q_e.at[0].set(0.0)
@@ -44,19 +63,19 @@ def sources(species: Species):
     ##Q_T = Q_T.at[0].set(0.0)
     ##Gamma_e_half=interpax.Interpolator1D(r_grid,Gamma_e,extrap=True)(r_grid_half)
     ##Gamma_D_half=interpax.Interpolator1D(r_grid,Gamma_D,extrap=True)(r_grid_half)
-    ##Gamma_T_half=interpax.Interpolator1D(r_grid,Gamma_T,extrap=True)(r_grid_half)
+    ##Gamma_T_half=interpax.Interpolato1D(r_grid,Gamma_T,extrap=True)(r_grid_half)
     ##Q_e_half=interpax.Interpolator1D(r_grid,Gamma_e,extrap=True)(r_grid_half)
     ##Q_D_half=interpax.Interpolator1D(r_grid,Gamma_D,extrap=True)(r_grid_half)
     ##Q_T_half=interpax.Interpolator1D(r_grid,Gamma_T,extrap=True)(r_grid_half)
     #Permitivity is interpolated in rho
-    plasma_permitivity=jax.vmap(get_plasma_permitivity,in_axes=(None,0))(species,r_grid)
+    plasma_permitivity=jax.vmap(get_plasma_permitivity,in_axes=(None,None,0))(species,field,field.r_grid)
     ambi_term=(-Gamma[0]+Gamma[1]+Gamma[2])*elementary_charge*1.e-3/plasma_permitivity#(density*psi_fac)
     #ambi_term=ambi_term.at[-1].set(1.82104167e+05)
     #ambi_term=ambi_term.at[-1].set(2.65723598e+05)
     #ambi_term=ambi_term*elementary_charge*1.e-3/(4.21* 1.e+20*proton_mass)#*B00**2#(density*psi_fac)
     #jax.debug.print("AMBI_ER {Er_VALS_AMBI} ", Er_VALS_AMBI=Er.vals)
     #jax.debug.print("AMBI_ER PLS SEE {ambi_term} , {Er_VALS_AMBI}, {Gamma_D}, {Gamma_e}, {Gamma_T}  ", ambi_term=ambi_term, Er_VALS_AMBI=Er.vals, Gamma_D=Gamma_D, Gamma_e=Gamma_e, Gamma_T=Gamma_T)
-    SourceEr=on_Er*Er_Relax*(DEr*species.diffusion_Er-ambi_term)
+    SourceEr=on_Er*Er_relax*(DEr*species.diffusion_Er-ambi_term)
     SourceEr=SourceEr.at[0].set(0.)
     ####Derivatives for convective terms
     ###PeD=jax.vmap(Power_Exchange,in_axes=(0,None,None),out_axes=0)(r_grid,global_species[0],global_species[1])
@@ -104,16 +123,16 @@ def sources(species: Species):
     #jax.debug.print("Er {Er} ", Er=Er.vals)
     #jax.debug.print("PD {Source_PD} ", Source_PD=PD.vals/nD_initial.vals)
     #jax.debug.print("PT {Source_PT} ", Source_PT=PT.vals/nT_initial.vals)
-    #jax.debug.print("AMBI_ER PLS SEE  {SourcePe}, {SourcePD}, {SourcePT}  ", ambi_term=SourceEr,  SourcePe=SourcePe, SourcePD=SourcePD, SourcePT=SourcePT)
+    jax.debug.print("AMBI_ER PLS SEE  {ambi_term}  ", ambi_term=SourceEr)
     #Auxiliary Spatial discretizations for convective terms (this is missing the last term of turbulent fluxes)
     return SourceEr,SourcePe,SourcePD,SourcePT,SourcenD,SourcenD,SourcenT
 
 @jit
 def vector_field(t, y,args):
     Er,Pe,PD,PT,ne,nD,nT=y
-    n_r,n_s,mass,charge=args
+    Initial_Species,grid,field,database=args
     #print('Here')
-    jax.debug.print(" {t} ", t=t)
+    ##jax.debug.print(" {t} ", t=t)
     #jax.debug.print(" {dt} ", dt=dt)
     #print('Here')
     #Er.vals=Er.vals.at[-1].set(-48.)
@@ -168,15 +187,30 @@ def vector_field(t, y,args):
     #density=density.at[2,:].set(nT_new)
     density=jnp.vstack([ne_new,nD_new,nT_new])
     density=density*1.e+20
-    species_new=Species(n_r,n_s,mass,charge,temperature,density,Er)
+    species_new=Species(Initial_Species.number_species,
+                        Initial_Species.radial_points,
+                        Initial_Species.species_indeces,
+                        Initial_Species.mass_mp,
+                        Initial_Species.charge_qp,
+                        temperature,
+                        density,
+                        Er,
+                        field.r_grid,
+                        field.r_grid_half,
+                        field.dr,
+                        field.Vprime_half,
+                        field.overVprime,
+                        Initial_Species.n_edge,
+                        Initial_Species.T_edge)
+
     jax.debug.print("Pe {Pe} ", Pe=Pe_new/ne_new)
     jax.debug.print("Er {Er} ", Er=Er)
     #hcb.id_print((t,Pe.vals))
-    return sources(species_new)
+    return sources(species_new,grid,field,database)
 
 def solve_transport_equations(y0,args):
     term = diffrax.ODETerm(vector_field)
-    saveat = diffrax.SaveAt(ts=ts)
+    saveat = diffrax.SaveAt(ts=ts_list)
     stepsize_controller = diffrax.PIDController(pcoeff=0.3, icoeff=0.4, rtol=rtol, atol=atol, dtmax=None,dtmin=None)
     #solver = diffrax.Tsit5()
     solver=diffrax.Kvaerno5()

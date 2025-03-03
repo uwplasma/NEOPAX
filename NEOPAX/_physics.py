@@ -5,31 +5,24 @@ from jax import config
 # to use higher precision
 config.update("jax_enable_x64", True)
 import interpax
-from scipy.constants import proton_mass,elementary_charge
-from _grid import rho_grid,rho_grid_half, r_grid
-from _field import B00, B10, a_b, R00, iota, dVdr ,G,I
-from _species import coulomb_logarithm
+from ._constants import proton_mass,elementary_charge
+from ._species import coulomb_logarithm
 
 
-epsilon_t=rho_grid*a_b/R00(rho_grid)
-B0=B00(rho_grid_half)
-B_10=B10(rho_grid_half)/B0
-enlogation=jnp.square(epsilon_t/B_10)
-psi_fac=1.+1./(enlogation*jnp.square(iota(rho_grid)))
-psi_fac=psi_fac.at[0].set(1.)
-#Important geometrical quantities interpolated from equilibrium
- 
 @jit
-def get_plasma_permitivity(species,grid_x):    
+def get_plasma_permitivity(species,field,grid_x):   
+    psi_fac=1.+1./(field.enlogation*jnp.square(field.iota))
+    psi_fac=psi_fac.at[0].set(1.) 
     mass_density=species.mass[0]*species.density[0,:]+species.mass[1]*species.density[1,:]+species.mass[2]*species.density[2,:]
-    epsilon_r=mass_density*psi_fac/jnp.square(B0)
-    plasma_permitivity=interpax.Interpolator1D(r_grid,epsilon_r,extrap=True)
+    epsilon_r=mass_density*psi_fac/jnp.square(field.B0)
+    plasma_permitivity=interpax.Interpolator1D(field.r_grid,epsilon_r,extrap=True)
     #psi_fac=psi_fac.at[0].set(0)
     return plasma_permitivity(grid_x)
 
 
 #These should go to the physics_models.py 
 #Get FusionPower Fraction to Electrons, using same model as NTSS - update in the future
+@jit
 def FusionPowerFractionElectrons(species,r_index): 
     Te=species.temperature[0,r_index]*1.e-3
     y2 = 88./Te
@@ -37,6 +30,7 @@ def FusionPowerFractionElectrons(species,r_index):
     part = 2.*(jnp.log((1-y+y2)/(1+2*y+y2))/6 + 0.57735026*jnp.atan(0.57735026*(2*y-1))+0.30229987 ) / y2
     return 1.-part
 
+@jit
 #Get D-T reaction rate, using same model as NTSS - update in the future
 def get_DT_Reaction(species, r_index):
     nD=species.density[1,r_index]*1.e-20 
@@ -49,7 +43,7 @@ def get_DT_Reaction(species, r_index):
     AlphaPower=3.52e3*HeSource  #in keV*10^20/m^3/s
     return DTreactionRate,HeSource,AlphaPower
 
-
+@jit
 #Get Power exchange
 def Power_Exchange(species,species_a,species_b,r_index):
     nA=species.density[species_a,r_index]*1.e-20
@@ -65,7 +59,7 @@ def Power_Exchange(species,species_a,species_b,r_index):
     return Pab
 
 
-
+@jit
 def P_rad(species,r_index):
     Te=species.temperature[0,r_index]*1.e-3
     ne=species.density[0,r_index]*1.e-20
