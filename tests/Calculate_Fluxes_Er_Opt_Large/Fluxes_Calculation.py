@@ -19,14 +19,14 @@ import matplotlib.pyplot as plt
 from NEOPAX._constants import elementary_charge
 
 #Opening NTSS file for solution with and without momentum correction
-file_Initial=h5.File('../inputs/NTSS_Initial_Er_Opt.h5','r')
-file_Initial_Momentum=h5.File('../inputs/NTSS_Initial_Momentum_Corr_Er_Opt.h5','r')
+file_Initial=h5.File('../inputs/NTSS_Er_Opt_Large_Initial.h5','r')
+file_Initial_Momentum=h5.File('../inputs/NTSS_Er_Opt_Large_Initial_Moments.h5','r')
 Er_Initial=interpax.Interpolator1D(file_Initial['r'][()],file_Initial['Er'][()],extrap=True)
 
 
 vmec_file=os.path.join(current_path,'../inputs/wout_QI_nfp2_newNT_opt_hires.nc')
 boozer_file=os.path.join(current_path, '../inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc')
-neoclassical_file='../inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+neoclassical_file='../inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt_Large.h5'
 neoclassical_option= 1
 #Create grid
 n_species=3
