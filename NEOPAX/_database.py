@@ -123,6 +123,52 @@ class Monoenergetic(eqx.Module):
         return cls(**data)
 
 
+    @classmethod
+    def read_data(cls,
+        a_b,  
+        rho,                  
+        nu_v,
+        Er,
+        drds,
+        D11,
+        D13,
+        D33
+    ):
+        """Construct Field from BOOZ_XFORM file.
+
+        Parameters
+        ----------
+        monkes_file : path-like
+            Path to vmec wout file.
+        """
+
+        Er_ref=jnp.array(1.e-8)
+
+        Er_list=jnp.zeros((len(rho),len(Er.shape[2])))
+        for j in range(len(rho)):
+            D11[j,:,:]=D11[j,:,:]*jnp.power(drds[j],2)
+            D13[j,:,:]=D13[j,:,:]*drds[j]
+            for k in range(Er.shape[2]):
+                Er_list=Er_list.at[j,k].set(jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0,k])/(a_b*rho.at[j].get()))))
+                D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
+
+
+        D11_log=jnp.log10(D11)
+        nu_log=jnp.log10(nu_v)
+        D13=jnp.array(D13)
+        D33=jnp.array(D33)
+
+        data = {}
+        data["a_b"]=a_b
+        data["rho"] = rho
+        data["nu_log"] = nu_log
+        data["Er_list"] = Er_list
+        data["D11_log"] = D11_log
+        data["D13"] = D13
+        data["D33"] = D33
+
+        return cls(**data)
+
 #    @classmethod
 #    def run_monkes(cls,
 #        a_b,                    
