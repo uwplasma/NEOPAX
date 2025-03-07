@@ -94,6 +94,8 @@ def get_diffusion_Er(y,r_grid,r_grid_half,Vprime_half,overVprime,dr):
     y_half=interpax.Interpolator1D(r_grid,y,extrap=True)(r_grid_half)
     FluxEr=Vprime_half*(get_gradient_Er(y,dr)-y_half/r_grid_half)
     diffusion=gradient_no(FluxEr,dr)*overVprime
+    diffusion=diffusion.at[0].set(0.0)
+    diffusion=diffusion.at[-1].set(0.0)
     #diffusion=diffusion_Er(Er).vals/Vprime
     return diffusion
 

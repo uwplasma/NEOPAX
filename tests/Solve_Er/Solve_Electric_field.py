@@ -17,9 +17,9 @@ import NEOPAX
 
 
 #Reading NTSS data file for electric field solution
-file_Final=h5.File('../inputs/NTSS_TEST_Final.h5','r')
+file_Final=h5.File('../inputs/NTSS_Final.h5','r')
 Er_Final=interpax.Interpolator1D(file_Final['r'][()],file_Final['Er'][()],extrap=True)
-file_Initial=h5.File('../inputs/NTSS_Test_Initial_Er_Opt.h5','r')
+file_Initial=h5.File('../inputs/NTSS_Initial_Er_Opt.h5','r')
 Er_Initial=interpax.Interpolator1D(file_Initial['r'][()],file_Initial['Er'][()],extrap=True)
 file_Initial.close()
 file_Final.close()
@@ -31,7 +31,7 @@ neoclassical_option= 1
 
 #Create grid
 n_species=3
-Nx=64
+Nx=4
 n_radial=51
 grid=NEOPAX.Grid.create_standard(n_radial,Nx,n_species)
 
@@ -86,6 +86,12 @@ temperature_initial=temperature_initial.at[2,:].set(TT_initial)
 density_initial=density_initial.at[0,:].set(ne_initial)
 density_initial=density_initial.at[1,:].set(nD_initial)
 density_initial=density_initial.at[2,:].set(nT_initial)
+
+fr=0.0
+temperature_initial=temperature_initial.at[:,0].set((4.*temperature_initial.at[:,1].get()-temperature_initial.at[:,2].get()-fr*2*field.dr)/(3.0))   
+temperature_initial=temperature_initial.at[:,-1].set(T_edge)
+density_initial=density_initial.at[:,0].set((4.*density_initial.at[:,1].get()-density_initial.at[:,2].get()-fr*2*field.dr)/(3.0))   
+density_initial=density_initial.at[:,-1].set(n_edge)
 mass=jnp.array([1 / 1836.15267343,2,3])
 charge=jnp.array([-1,1,1])
 

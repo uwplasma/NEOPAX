@@ -123,7 +123,7 @@ def sources(species: Species,grid,field,database):
     #jax.debug.print("Er {Er} ", Er=Er.vals)
     #jax.debug.print("PD {Source_PD} ", Source_PD=PD.vals/nD_initial.vals)
     #jax.debug.print("PT {Source_PT} ", Source_PT=PT.vals/nT_initial.vals)
-    jax.debug.print("AMBI_ER PLS SEE  {ambi_term}  ", ambi_term=SourceEr)
+    #jax.debug.print("AMBI_ER PLS SEE  {ambi_term}  ", ambi_term=SourceEr)
     #Auxiliary Spatial discretizations for convective terms (this is missing the last term of turbulent fluxes)
     return SourceEr,SourcePe,SourcePD,SourcePT,SourcenD,SourcenD,SourcenT
 
@@ -161,14 +161,16 @@ def vector_field(t, y,args):
     ###ne_sol=Z*ND+Z*NT+Z*NHe
     #Boundary conditions Pressures
     Pe_new=Pe
-    ##Pe_new=Pe_new.at[0].set((4.*Pe_new.at[1].get()-Pe_new.at[2].get()-fr*2*dr)/(3.0))   
-    ##Pe_new=Pe_new.at[-1].set(n_edge*T_edge*1.e-20*1.e-3)
+    Pe_new=Pe_new.at[0].set((4.*Pe_new.at[1].get()-Pe_new.at[2].get()-fr*2*field.dr)/(3.0))   
+    Pe_new=Pe_new.at[-1].set(Initial_Species.n_edge*Initial_Species.T_edge*1.e-20*1.e-3)
     #Pe_boundary=Pe_boundary.at[-1].set((4.*Pe_boundary.at[-2].get()-Pe_boundary.at[-3].get())/(3.0+2*edlenPe*dr))   
     PD_new=PD
-    #P#D_new=PD_new.at[0].set((4.*PD_new.at[1].get()-PD_new.at[2].get()-fr*2*dr)/(3.0))   
-    #P#D_new=PD_new.at[-1].set(n_edge*T_edge*1.e-20*1.e-3)
+    PD_new=PD_new.at[0].set((4.*PD_new.at[1].get()-PD_new.at[2].get()-fr*2*field.dr)/(3.0))   
+    PD_new=PD_new.at[-1].set(Initial_Species.n_edge*Initial_Species.T_edge*1.e-20*1.e-3)
     #PD_boundary=PD_boundary.at[-1].set((4.*PD_boundary.at[-2].get()-PD_boundary.at[-3].get())/(3.0+2*edlenPD*dr))
     PT_new=PT
+    PT_new=PT_new.at[0].set((4.*PT_new.at[1].get()-PT_new.at[2].get()-fr*2*field.dr)/(3.0))   
+    PT_new=PT_new.at[-1].set(Initial_Species.n_edge*Initial_Species.T_edge*1.e-20*1.e-3)
     ##PT_new=PT_new.at[0].set((4.*PT_new.at[1].get()-PT_new.at[2].get()-fr*2*dr)/(3.0))   
     ##PT_new=PT_new.at[-1].set(n_edge*T_edge*1.e-20*1.e-3)
     #PT_boundary=PT_boundary.at[-1].set((4.*PT_boundary.at[-2].get()-PT_boundary.at[-3].get())/(3.0+2*edlenPT*dr))
@@ -203,7 +205,7 @@ def vector_field(t, y,args):
                         Initial_Species.n_edge,
                         Initial_Species.T_edge)
 
-    jax.debug.print("Pe {Pe} ", Pe=Pe_new/ne_new)
+    #jax.debug.print("Pe {Pe} ", Pe=Pe_new/ne_new)
     jax.debug.print("Er {Er} ", Er=Er)
     #hcb.id_print((t,Pe.vals))
     return sources(species_new,grid,field,database)
@@ -225,7 +227,8 @@ def solve_transport_equations(y0,args):
         args=args,
         saveat=saveat,
         stepsize_controller=stepsize_controller,
-        max_steps=None
+        max_steps=None,
+        progress_meter=diffrax.TqdmProgressMeter(),
     )
     return sol
 
