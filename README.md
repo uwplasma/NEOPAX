@@ -22,6 +22,8 @@ pip install equinox
 pip install lineax
 pip install optimistix
 pip install diffrax
+pip install orthax
+pip install interpax
 ```
 
 At the moment the code makes use of a Monkes-JAX monoenergetic database Dij(r,collisionality,Er). To obtain these you can use Monkes-JAX, see: https://github.com/monkes  
