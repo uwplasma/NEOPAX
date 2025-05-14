@@ -1,4 +1,11 @@
-# NEOPAX - Neoclassical Transport Package in JAX
+<p align="center">
+    <img src="https://raw.githubusercontent.com/uwplasma/NEOPAX/refs/heads/main/docs/NEOPAX_logo_1.png" align="center" width="30%">
+</p>
+<p align="center">
+    <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
+</p>
+
+
 
 NEOPAX aims to be a simple JAX framework to solve radial transport equations for stellarators allowing for the optimization of different neoclassical quantities of interest.
 
