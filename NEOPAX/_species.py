@@ -124,10 +124,10 @@ class Species(eqx.Module):
     number_species: int
     radial_points: int
     species_indeces: int
-    mass_mp: Float[Array, "species"]  
-    charge_qp: Float[Array, "species"]  
-    temperature: Float[Array, "species x radial_points"]    # in units of eV
-    density: Float[Array, "species x radial_points"]    # in units of particles/m^3
+    mass_mp: Float[Array, "number_species"]  
+    charge_qp: Float[Array, "number_species"]  
+    temperature: Float[Array, "number_species x radial_points"]    # in units of eV
+    density: Float[Array, "number_species x radial_points"]    # in units of particles/m^3
     Er: Float[Array, "radial_points"] 
     r_grid: Float[Array, "radial_points"] 
     r_grid_half: Float[Array, "radial_points"] 
