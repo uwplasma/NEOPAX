@@ -7,7 +7,6 @@ print('Using device:', jax.devices())
 from jax import config
 # to use higher precision
 config.update("jax_enable_x64", True)
-import toml
 import interpax
 import h5py as h5
 import NEOPAX
