@@ -136,7 +136,7 @@ def interpolator_nu_mid_Er_finite_npoints4(index,grid_nu,grid_Er,database):
         dg11_new=jnp.select(condlist=[dg11l*dg11u <= 0.0,dg11l*dg11u>0],
                         choicelist=[0.2*jnp.array([dg11l,dg11u]),jnp.array([dg11l,dg11u])],default=0)
         dxnu21= nu2-nu1
-        xnun  = (grid_nu-nu_log[idx1])/dxnu21
+        xnun  = (grid_nu-nu1[idx1])/dxnu21
         ha1   = 3.*(d11_2-d11_1)-(2.*dg11_new[0]+dg11_new[1])*dxnu21
         hb1   =-2.*(d11_2-d11_1)+(dg11_new[0]+dg11_new[1])*dxnu21
         xg11 = d11_1+xnun*(dg11_new[0]*dxnu21+xnun*(ha1+xnun*hb1))
