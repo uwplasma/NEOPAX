@@ -1,6 +1,6 @@
 .. NEOPAX documentation master file
 
-.. image:: NEOPAX_logo_1.png
+.. image:: https://github.com/uwplasma/NEOPAX/blob/main/docs/NEOPAX_logo_1.png
    :width: 200px
    :align: center
    :target: https://github.com/uwplasma/NEOPAX
