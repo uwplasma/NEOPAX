@@ -126,8 +126,8 @@ class Species(eqx.Module):
     species_indeces: int
     mass_mp: Float[Array, "number_species"]  
     charge_qp: Float[Array, "number_species"]  
-    temperature: ndarray # Float[Array, "number_species x radial_points"]    # in units of eV
-    density: ndarray#Float[Array, "species x radial_points"]    # in units of particles/m^3
+    temperature: Float[Array, "..."]#Float[Array, "number_species x radial_points"]    # in units of eV
+    density: Float[Array, "..."]#Float[Array, "species x radial_points"]    # in units of particles/m^3
     Er: Float[Array, "radial_points"] 
     r_grid: Float[Array, "radial_points"] 
     r_grid_half: Float[Array, "radial_points"] 

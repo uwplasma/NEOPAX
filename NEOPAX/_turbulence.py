@@ -21,13 +21,13 @@ class Turbulence(eqx.Module):
     # note: assumes (psi, theta, zeta) coordinates, not (rho, theta, zeta)
     nspecies: int
     nradial: int
-    Qa_turb : ndarray#Float[Array, "nspecies x nradial"]  #int = eqx.field(static=True)
+    Qa_turb :  Float[Array, "..."] #Float[Array, "nspecies x nradial"]  #int = eqx.field(static=True)
 
     def __init__(
         self,
         nspecies,
         nradial,
-        Qa_turb: Float[Array, "nspecies x nradial"],
+        Qa_turb,
     ):
 
         self.nspecies=nspecies
