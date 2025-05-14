@@ -1,0 +1,15 @@
+jax
+jaxlib
+diffrax
+optimistix
+equinox
+interpax
+orthax
+lineax
+functools
+typing
+h5py
+scipy
+netcdf4
+matplotlib
+inductiva
