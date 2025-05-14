@@ -1,0 +1,96 @@
+Metadata-Version: 2.4
+Name: NEOPAX
+Version: 0.1.dev23+gdf9d57a.d20250514
+Summary: NEOPAX: NEOclassical transport Package in jAX
+Author-email: "UWPlasma, UW-Madison group" <lascasneto@wisc.edu>
+License: MIT License
+        
+        Copyright (c) 2024 uwplasma
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/uwplasma/NEOPAX
+Keywords: Plasma,Physics,Simulation,JAX
+Classifier: Development Status :: Pre - Alpha
+Classifier: Operating System :: OS Independent
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.5
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: jax
+Requires-Dist: jaxlib
+Requires-Dist: matplotlib
+Requires-Dist: equinox
+Requires-Dist: optimistix
+Requires-Dist: lineax
+Requires-Dist: diffrax
+Requires-Dist: interpax
+Requires-Dist: orthax
+Requires-Dist: scipy
+Requires-Dist: h5py
+Requires-Dist: netcdf4
+Requires-Dist: inductiva
+Dynamic: license-file
+
+<p align="center">
+    <img src="https://github.com/uwplasma/NEOPAX/blob/main/docs/NEOPAX_logo_1.png" align="center" width="50%">
+</p>
+<p align="center">
+    <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
+</p>
+
+
+
+NEOPAX aims to be a simple JAX framework to solve radial transport equations for stellarators allowing for the optimization of different neoclassical quantities of interest.
+
+## Quick Start
+The main packages used by NEOPAX can be installed via pip:
+
+```
+pip install matplotlib
+```
+For GPU enable jax use this (it requires cuda12 installation, with the corresponding libraries, see JAX documentation for more details on this):
+```
+pip install -U "jax[cuda12]"
+```
+For CPU only usage use instead: 
+```
+pip install -U jax
+```
+The following packages are also needed:
+```
+pip install equinox
+pip install lineax
+pip install optimistix
+pip install diffrax
+pip install orthax
+pip install interpax
+```
+
+At the moment the code makes use of a Monkes-JAX monoenergetic database Dij(r,collisionality,Er). To obtain these you can use Monkes-JAX, see: https://github.com/monkes  
+
+## Examples
+To see examples of flux calculation or solving for the electric field simply go to the folder NEOPAX/tests and into one of the example folders you can run the respective script by 
+
+'''
+python script.py
+'''
+
+## Contributing

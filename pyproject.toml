@@ -10,14 +10,14 @@ write_to = "NEOPAX/version.py"
 
 [project]
 name = "NEOPAX"
-description = "ESSOS: e-Stellarator Simulation and Optimization Suite"
+description = "NEOPAX: NEOclassical transport Package in jAX"
 readme = "README.md"
 authors = [{ name = "UWPlasma, UW-Madison group", email = "lascasneto@wisc.edu" }]
 license = { file = "LICENSE" }
 dynamic = ["version"]
 
 classifiers = [
-    "Development Status :: 1 - Beta",
+    "Development Status :: Pre - Alpha",
     "Operating System :: OS Independent",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -27,13 +27,12 @@ keywords = ["Plasma",
      "Simulation",
      "JAX"]
  
-dependencies = [ "jax", "jaxlib", "matplotlib", "diffrax", "interpax, "optimistix","h5py", "netcdf4"]
+dependencies = [ "jax", "jaxlib", "matplotlib","equinox","optimistix","lineax", "diffrax","interpax","orthax", "scipy","h5py", "netcdf4","inductiva"]
  
 requires-python = ">=3.5"
 
 [project.urls]
 Homepage = "https://github.com/uwplasma/NEOPAX"
 
-[project.scripts]
-NEOPAX = "NEOPAX.__main__:main"
+
  

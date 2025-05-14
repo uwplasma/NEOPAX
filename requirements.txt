@@ -1,13 +1,11 @@
 jax
 jaxlib
-diffrax
 optimistix
 equinox
 interpax
 orthax
 lineax
-functools
-typing
+diffrax
 h5py
 scipy
 netcdf4
