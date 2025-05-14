@@ -13,9 +13,9 @@ import matplotlib.pyplot as plt
 import NEOPAX
 from NEOPAX._constants import elementary_charge
 
-vmec_file=os.path.join(current_path,'./inputs/wout_QI_nfp2_newNT_opt_hires.nc')
-boozer_file=os.path.join(current_path, './inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc')
-neoclassical_file='./inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+vmec_file=os.path.join(current_path,'../tests/inputs/wout_QI_nfp2_newNT_opt_hires.nc')
+boozer_file=os.path.join(current_path, '../tests/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc')
+neoclassical_file='../tests/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
 neoclassical_option= 1
 
 #Solver parameters 
