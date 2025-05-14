@@ -1,4 +1,4 @@
-# Code of Conduct - ESSOS
+# Code of Conduct - NEOPAX
 
 ## Our Pledge
 
@@ -55,7 +55,7 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
-reported to the community leaders responsible for enforcement at <rogerio.jorge@wisc.edu>.
+reported to the community leaders responsible for enforcement at <lascasneto@wisc.edu>.
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
