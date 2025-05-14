@@ -3,7 +3,7 @@ import os
 current_path = os.path.dirname(os.path.realpath(__name__))
 import jax
 import jax.numpy as jnp
-jax.config.update('jax_platform_name', 'gpu')
+jax.config.update('jax_platform_name', 'cpu')
 print(jax.devices()) # TFRT_CPU_0
 from jax import config
 # to use higher precision
