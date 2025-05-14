@@ -1,6 +1,4 @@
 #Initialization
-import os
-current_path = os.path.dirname(os.path.realpath(__name__))
 import jax
 import jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
@@ -13,9 +11,9 @@ import matplotlib.pyplot as plt
 import NEOPAX
 from NEOPAX._constants import elementary_charge
 
-vmec_file='../tests/inputs/wout_QI_nfp2_newNT_opt_hires.nc'
-boozer_file='../tests/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc'
-neoclassical_file='../tests/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+vmec_file='./tests/inputs/wout_QI_nfp2_newNT_opt_hires.nc'
+boozer_file='./tests/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc'
+neoclassical_file='./tests/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
 neoclassical_option= 1
 
 #Solver parameters 
