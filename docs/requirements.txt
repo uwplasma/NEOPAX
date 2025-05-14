@@ -6,8 +6,6 @@ equinox
 interpax
 orthax
 lineax
-functools
-typing
 h5py
 scipy
 netcdf4
