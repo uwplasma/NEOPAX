@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="https://raw.githubusercontent.com/uwplasma/NEOPAX/refs/heads/main/docs/NEOPAX_logo_1.png" align="center" width="30%">
+    <img src="https://raw.githubusercontent.com/uwplasma/NEOPAX/docs/NEOPAX_logo_1.png" align="center" width="30%">
 </p>
 <p align="center">
     <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
