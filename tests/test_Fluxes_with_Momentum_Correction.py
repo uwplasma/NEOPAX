@@ -28,14 +28,14 @@ plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
 
 #Opening NTSS file for solution with and without momentum correction
-file_Initial=h5.File('./inputs/NTSS_W7X_Initial.h5','r')
-file_Initial_Momentum=h5.File('./inputs/NTSS_W7X_Initial_Momentum.h5','r')
+file_Initial=h5.File('./tests/inputs/NTSS_W7X_Initial.h5','r')
+file_Initial_Momentum=h5.File('./tests/inputs/NTSS_W7X_Initial_Momentum.h5','r')
 Er_Initial=interpax.Interpolator1D(file_Initial['r'][()],file_Initial['Er'][()],extrap=True)
 
 
-vmec_file='./inputs/wout_W7-X_standard_configuration.nc'
-boozer_file= './inputs/boozmn_wout_W7-X_standard_configuration.nc'
-neoclassical_file='./inputs/Dij_NEOPAX_FULL_S_NEW_W7X.h5'
+vmec_file='./tests/inputs/wout_W7-X_standard_configuration.nc'
+boozer_file= './tests/inputs/boozmn_wout_W7-X_standard_configuration.nc'
+neoclassical_file='./tests/inputs/Dij_NEOPAX_FULL_S_NEW_W7X.h5'
 neoclassical_option= 1
 
 #Create grid
