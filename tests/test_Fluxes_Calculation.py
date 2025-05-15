@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from NEOPAX._constants import elementary_charge
 
 
-def test_fluxes_with_momentum_correction():
+def test_fluxes():
   #Opening NTSS file for solution with and without momentum correction
   file_Initial=h5.File('./tests/inputs/NTSS_W7X_Initial.h5','r')
   Er_Initial=interpax.Interpolator1D(file_Initial['r'][()],file_Initial['Er'][()],extrap=True)
@@ -113,8 +113,8 @@ def test_fluxes_with_momentum_correction():
   Final=jnp.abs(J_final-J_final_solution)
 
 
-  assert jnp.all(Final[1:19]) < 1.e-6 ,"Electric field solution matches correct value."
-  assert jnp.all(Final[20:]) < 1.e-6 , "Electric field solution matches correct value."
+  assert jnp.allclose(J_final[1:19],J_final_solution[1:19],atol=1.e-6) ,"Bootstrap solution matches correct value."
+  assert jnp.allclose(J_final[20:],J_final_solution[20:],atol=1.e-6) ,"Bootstrap solution matches correct value."
 
 if __name__ == "__main__":
     pytest.main()

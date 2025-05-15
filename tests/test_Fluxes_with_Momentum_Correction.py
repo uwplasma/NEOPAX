@@ -16,7 +16,7 @@ from NEOPAX._constants import elementary_charge
 
 
 
-def test_fluxes():
+def test_fluxes_with_momentum_correction():
   #Opening NTSS file for solution with and without momentum correction
   file_Initial=h5.File('./tests/inputs/NTSS_W7X_Initial.h5','r')
   Er_Initial=interpax.Interpolator1D(file_Initial['r'][()],file_Initial['Er'][()],extrap=True)
