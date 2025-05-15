@@ -115,8 +115,8 @@ def test_fluxes():
 
   Final=jnp.abs(J_final-J_final_solution)
 
-  assert jnp.all(Final[1:19]) < 1.e-6 ,"Electric field solution matches correct value."
-  assert jnp.all(Final[20::]) < 1.e-6 , "Electric field solution matches correct value."
+  assert jnp.allclose(J_final,J_final_solution,atol=1.e-6) ,"Bootstrap solution matches correct value."
+
 
 
 
