@@ -1,0 +1,3 @@
+[submodule "thirdparty/monkes"]
+	path = thirdparty/monkes
+	url = https://github.com/eduardolneto/monkes/tree/vmec_neopax
