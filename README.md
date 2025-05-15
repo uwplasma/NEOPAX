@@ -4,9 +4,39 @@
 <p align="center">
     <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
 </p>
+<p align="center">
+    <img src="https://img.shields.io/github/license/uwplasma/ESSOS?style=default&logo=opensourceinitiative&logoColor=white&color=0080ff" alt="license">
+    <img src="https://img.shields.io/github/last-commit/uwplasma/ESSOS?style=default&logo=git&logoColor=white&color=0080ff" alt="last-commit">
+    <img src="https://img.shields.io/github/languages/top/uwplasma/ESSOS?style=default&color=0080ff" alt="repo-top-language">
+    <a href="https://github.com/uwplasma/ESSOS/actions/workflows/build_test.yml">
+        <img src="https://github.com/uwplasma/ESSOS/actions/workflows/build_test.yml/badge.svg" alt="Build Status">
+    </a>
+    <a href="https://codecov.io/gh/uwplasma/ESSOS">
+        <img src="https://codecov.io/gh/uwplasma/ESSOS/branch/main/graph/badge.svg" alt="Coverage">
+    </a>
+    <a href="https://essos.readthedocs.io/en/latest/?badge=latest">
+        <img src="https://readthedocs.org/projects/essos/badge/?version=latest" alt="Documentation Status">
+    </a>
+</p>
+
+## Table of Contents
+- [Overview](#overview)
+- [Features](#features)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+    - [From PyPI](#from-pypi)
+    - [From Source](#from-source)
+- [Usage](#usage)
+- [Testing](#testing)
+- [Project Roadmap](#project-roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
 
 
-
+## Overview
 NEOPAX aims to be a simple JAX framework to solve radial transport equations for stellarators allowing for the optimization of different neoclassical quantities of interest.
 
 ## Quick Start
