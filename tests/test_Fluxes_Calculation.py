@@ -110,5 +110,5 @@ J_final_solution=jnp.array([      0.,         45168.07982563,   95688.8335667,  
 Final=jnp.abs(J_final-J_final_solution)
 
 
-assert not jnp.all(Final[1:19]) < 1.e-6 ,"Electric field solution matches correct value."
-assert not jnp.all(Final[20:]) < 1.e-6 , "Electric field solution matches correct value."
+assert jnp.all(Final[1:19]) < 1.e-6 ,"Electric field solution matches correct value."
+assert jnp.all(Final[20:]) < 1.e-6 , "Electric field solution matches correct value."
