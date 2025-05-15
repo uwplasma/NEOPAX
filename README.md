@@ -5,17 +5,17 @@
     <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
 </p>
 <p align="center">
-    <img src="https://img.shields.io/github/license/uwplasma/ESSOS?style=default&logo=opensourceinitiative&logoColor=white&color=0080ff" alt="license">
-    <img src="https://img.shields.io/github/last-commit/uwplasma/ESSOS?style=default&logo=git&logoColor=white&color=0080ff" alt="last-commit">
-    <img src="https://img.shields.io/github/languages/top/uwplasma/ESSOS?style=default&color=0080ff" alt="repo-top-language">
-    <a href="https://github.com/uwplasma/ESSOS/actions/workflows/build_test.yml">
-        <img src="https://github.com/uwplasma/ESSOS/actions/workflows/build_test.yml/badge.svg" alt="Build Status">
+    <img src="https://img.shields.io/github/license/uwplasma/NEOPAX?style=default&logo=opensourceinitiative&logoColor=white&color=0080ff" alt="license">
+    <img src="https://img.shields.io/github/last-commit/uwplasma/NEOPAX?style=default&logo=git&logoColor=white&color=0080ff" alt="last-commit">
+    <img src="https://img.shields.io/github/languages/top/uwplasma/NEOPAX?style=default&color=0080ff" alt="repo-top-language">
+    <a href="https://github.com/uwplasma/NEOPAX/actions/workflows/build_test.yml">
+        <img src="https://github.com/uwplasma/NEOPAX/actions/workflows/build_test.yml/badge.svg" alt="Build Status">
     </a>
-    <a href="https://codecov.io/gh/uwplasma/ESSOS">
-        <img src="https://codecov.io/gh/uwplasma/ESSOS/branch/main/graph/badge.svg" alt="Coverage">
+    <a href="https://codecov.io/gh/uwplasma/NEOPAX">
+        <img src="https://codecov.io/gh/uwplasma/NEOPAX/branch/main/graph/badge.svg" alt="Coverage">
     </a>
-    <a href="https://essos.readthedocs.io/en/latest/?badge=latest">
-        <img src="https://readthedocs.org/projects/essos/badge/?version=latest" alt="Documentation Status">
+    <a href="https://neopax.readthedocs.io/en/latest/?badge=latest">
+        <img src="https://readthedocs.org/projects/neopax/badge/?version=latest" alt="Documentation Status">
     </a>
 </p>
 
