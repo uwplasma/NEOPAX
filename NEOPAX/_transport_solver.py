@@ -17,7 +17,6 @@ import equinox as eqx  # https://github.com/patrick-kidger/equinox
 import jax.lax as lax
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
-import jax.experimental.host_callback as hcb
 from ._species import Species, gradient_no
 from ._neoclassical import get_Neoclassical_Fluxes,get_Neoclassical_Fluxes_With_Momentum_Correction
 from ._physics import get_plasma_permitivity, Power_Exchange, get_DT_Reaction, FusionPowerFractionElectrons, P_rad
@@ -203,7 +202,6 @@ def vector_field(t, y,args):
 
     #jax.debug.print("Pe {Pe} ", Pe=Pe_new/ne_new)
     #jax.debug.print("Er {Er} ", Er=Er)
-    #hcb.id_print((t,Pe.vals))
     return sources(species_new,grid,field,database,turbulent,solver_parameters)
 
 
@@ -387,7 +385,6 @@ def vector_field_momentum_correction(t, y,args):
 
     #jax.debug.print("Pe {Pe} ", Pe=Pe_new/ne_new)
     #jax.debug.print("Er {Er} ", Er=Er)
-    #hcb.id_print((t,Pe.vals))
     return sources_momentum_correction(species_new,grid,field,database,turbulent,solver_parameters)
 
 

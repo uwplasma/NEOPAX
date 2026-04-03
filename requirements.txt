@@ -1,7 +1,7 @@
-jax
+jax >= 0.4.36, < 0.10
 jaxlib
 optimistix
-equinox
+equinox >= 0.11.0, < 0.14
 interpax
 orthax
 lineax
