@@ -5,11 +5,13 @@ from jax import config
 config.update("jax_enable_x64", True)
 from jax import jit
 import orthax
-import equinox as eqx
+import dataclasses
 from jaxtyping import Array, Float, Int  # https://github.com/google/jaxtyping
 
 
-class Grid(eqx.Module):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class Grid:
     #Defining radial and energy grids
     n_r: int
     n_x: int
@@ -40,11 +42,23 @@ class Grid(eqx.Module):
         n_r: int,
         n_x: int,
         n_species: int,
+        **kwargs,
     ):
-        
+
         self.n_r=n_r
         self.n_x=n_x
         self.n_species=n_species
+
+        # JAX dataclass pytree reconstruction may call Grid(...) with all
+        # fields as keyword arguments. If the full payload is present, load it
+        # directly instead of regenerating derived arrays.
+        grid_fields = [f.name for f in dataclasses.fields(type(self))]
+        payload_fields = [name for name in grid_fields if name not in ("n_r", "n_x", "n_species")]
+        if all(name in kwargs for name in payload_fields):
+            for name in payload_fields:
+                setattr(self, name, kwargs[name])
+            return
+
         self.n_order=3
         self.Sonine_expansion=jnp.array([1.0,0.4,8.0/35.0]) #order 2 Sonine expansion, fixed for now
         self.species_indeces=jnp.arange(self.n_species) 

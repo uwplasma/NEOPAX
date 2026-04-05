@@ -1,0 +1,148 @@
+[paths]
+input_dir = "examples/inputs"
+output_dir = "examples/Solve_Er_General"
+
+[geometry]
+vmec_file = "wout_QI_nfp2_newNT_opt_hires.nc"
+boozer_file = "boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+
+[grid]
+n_x = 4
+n_radial = 51
+
+[species]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
+
+[equations]
+# Per-species equation control using three simple boolean toggles.
+# Works for ANY number of species (2, 3, 4, or more).
+#
+# toggle_density: array of booleans, one per species
+#   true = evolve that species density, false = freeze at initial profile
+# toggle_temperature: array of booleans, one per species
+#   true = evolve that species temperature, false = freeze at initial profile
+# toggle_Er: boolean
+#   true = evolve electric field, false = keep Er constant
+
+# Toggle density evolution for each species (e, D, T, He, ...)
+# Note: the electron entry is automatically forced to false — electron density
+# is a dependent variable derived from quasi-neutrality: n_e = sum_i Z_i * n_i
+# Example: [false, false, false] = all ion densities frozen
+toggle_density = [false, false, false]
+
+# Toggle temperature evolution for each species (e, D, T, ...)
+# Example: [true, false, true] = freeze deuterium (species[1]) only
+toggle_temperature = [false, false, false]
+
+# Toggle electric field evolution
+toggle_Er = true
+
+# Electric field evolution mode and parameters
+er_mode = "diffusion"  # Options: "diffusion" (evolve Er equation), "entropy" (fixed via ambipolar root selection)
+er_DEr = 2.0           # Er diffusivity parameter
+er_relax = 0.1         # Er relaxation parameter
+
+# Optional boundary conditions in the SAME [equations] block.
+# If these keys are omitted, solver uses legacy endpoint-copy ghosting.
+#
+# Naming convention:
+#   <equation>_<side>_<field>
+# where:
+#   equation = density | temperature | er
+#   side     = left | right
+#   field    = type | value | gradient | decay_length
+#
+# Types:
+#   dirichlet: prescribe value
+#   neumann:   prescribe gradient
+#   robin:     prescribe decay_length (dQ/dr = -Q/L)
+#
+# If needed values are omitted, they are inferred from initial profiles/fluxes.
+
+density_left_type = "dirichlet"
+# density_left_value = [0.0, 0.0, 0.0]   # scalar or per-species array
+density_right_type = "dirichlet"
+# density_right_gradient = [0.0, 0.0, 0.0]
+# density_right_decay_length = [0.05, 0.05, 0.05]
+
+temperature_left_type = "dirichlet"
+temperature_right_type = "dirichlet"
+
+er_left_type = "dirichlet"
+# er_left_value = 0.0
+er_right_type = "dirichlet"
+# er_right_value = 0.0
+
+[solver]
+integrator = "diffrax_kvaerno5"
+t0 = 0.0
+t_final = 20.0
+dt = 1.0e-4
+n_save = 10
+rtol = 1.0e-5
+atol = 1.0e-5
+
+
+[neoclassical]
+model = "monkes_database"
+file = "Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+momentum_correction_flag = false
+
+[turbulence]
+model = "analytical"
+chi_temperature = [0.5, 0.5, 0.5]
+chi_density = [0.0, 0.0, 0.0]
+
+[profiles]
+model = "standard_analytical"
+
+# Standard analytical profile model parameters.
+# Base profiles:
+#   n_base(r) = n0 * (1 - (r/a)^density_shape_power) + n_edge
+#   T_base(r) = T0 * (1 - (r/a)^temperature_shape_power) + T_edge
+# Species concentrations scale these base profiles.
+n0 = 4.21e20
+n_edge = 0.6e20
+T0 = 17.8e3
+T_edge = 0.7e3
+
+# Relative concentrations per species (order follows [species].names).
+# c_density may be given for all species or only ions (electron entry omitted).
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
+
+# Shape controls (examples: 2 for parabolic, 5 for flatter core/steeper edge).
+density_shape_power = 2.0
+temperature_shape_power = 5.0
+
+# Optional global scales
+n_scale = 1.0
+T_scale = 1.0
+
+# Er initialization options:
+# er_initialization_mode = "parabolic"      -> use analytical parabolic Er profile
+# er_initialization_mode = "ambipolar_auto" -> select electron root when multiple
+#                                               roots exist, otherwise ion root
+# er_initialization_mode = "ambipolar_ion"  -> always select ion root
+er_initialization_mode = "parabolic"
+# Optional when mode is ambipolar_auto/ambipolar_ion:
+# er_ambipolar_root_selection = "electron_or_ion"  # or "ion_root"
+# er_ambipolar_scan_min = -20.0
+# er_ambipolar_scan_max = 20.0
+# er_ambipolar_n_scan = 200
+# er_ambipolar_tol = 1.0e-6
+
+er0_scale = 100.0
+er0_peak_rho = 0.8
+
+# For prescribed profiles set model="prescribed" and provide:
+# temperature = [[...], [...], [...]]
+# density = [[...], [...], [...]]
+# Er = [...]
+# Optional:
+# T_edge = [...]
+# n_edge = [...]
+

@@ -1,0 +1,85 @@
+[paths]
+input_dir = "examples/inputs"
+output_dir = "examples/Solve_Er_General"
+
+[geometry]
+vmec_file = "wout_QI_nfp2_newNT_opt_hires.nc"
+boozer_file = "boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+
+[grid]
+n_x = 4
+n_radial = 51
+
+[species]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
+
+[equations]
+toggle_density = [false, false, false]
+toggle_temperature = [false, false, false]
+toggle_Er = true
+er_mode = "diffusion"
+er_DEr = 2.0
+er_relax = 0.1
+
+density_left_type = "dirichlet"
+density_right_type = "dirichlet"
+temperature_left_type = "dirichlet"
+temperature_right_type = "dirichlet"
+er_left_type = "dirichlet"
+er_right_type = "dirichlet"
+
+[solver]
+# Time solver backend/integrator (selected through _transport_solvers factory)
+# Options: diffrax_kvaerno5, diffrax_tsit5, diffrax_dopri5, predictor_corrector
+integrator = "diffrax_kvaerno5"
+t0 = 0.0
+t_final = 20.0
+dt = 1.0e-4
+n_save = 10
+rtol = 1.0e-5
+atol = 1.0e-5
+
+[sources]
+# Optional registry-based source model selection
+# density = ["fusion_power_fraction_electrons"]
+# temperature = ["bremsstrahlung_radiation"]
+
+[neoclassical]
+model = "monkes_database"
+file = "Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+momentum_correction_flag = false
+# Transport flux model name used by composed transport-model registry
+# Options: neoclassical, neoclassical_momentum, monkes_database
+transport_model = "neoclassical"
+
+[turbulence]
+model = "analytical"
+chi_temperature = [0.5, 0.5, 0.5]
+chi_density = [0.0, 0.0, 0.0]
+# Turbulent transport model used by composed transport-model registry
+# Options: from_turbulence_state, analytical, zero, none
+transport_model = "analytical"
+
+[profiles]
+model = "standard_analytical"
+
+n0 = 4.21e20
+n_edge = 0.6e20
+T0 = 17.8e3
+T_edge = 0.7e3
+
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
+
+density_shape_power = 2.0
+temperature_shape_power = 5.0
+
+n_scale = 1.0
+T_scale = 1.0
+
+er_initialization_mode = "parabolic"
+er0_scale = 100.0
+er0_peak_rho = 0.8

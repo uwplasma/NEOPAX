@@ -96,9 +96,23 @@ Global_species=NEOPAX.Species(n_species,n_radial,grid.species_indeces,mass,charg
 database=NEOPAX.Monoenergetic.read_monkes(field.a_b,neoclassical_file)
 
 
-#Calculating fluxes with momentum correction and without momentum correction
 
-Lij,Gamma,Q,Upar=NEOPAX.get_Neoclassical_Fluxes(Global_species,grid,field,database)
+# --- Calculate and plot neoclassical particle fluxes for the input Er profile (NEW NEOPAX implementation) ---
+Lij, Gamma, Q, Upar = NEOPAX.get_Neoclassical_Fluxes(Global_species, grid, field, database)
+
+# Plot the neoclassical particle fluxes for the input Er profile
+fig, ax = plt.subplots(dpi=120)
+ax.plot(field.rho_grid, Gamma[0], label='Electron flux')
+ax.plot(field.rho_grid, Gamma[1], label='Deuterium flux')
+ax.plot(field.rho_grid, Gamma[2], label='Tritium flux')
+ax.set_xlabel(r'$\rho$')
+ax.set_ylabel(r'$\Gamma_s$')
+ax.set_title('Neoclassical Particle Fluxes vs Input $E_r$')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(Output_Path, 'neo_fluxes_vs_Er.pdf'))
+plt.show()
 
 fig,ax=plt.subplots(dpi=120)
 plt.ylabel('$n_a$')

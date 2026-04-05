@@ -48,7 +48,7 @@ atol=1.e-5        #Tolerance for solver
 momentum_correction_flag=False   #Consider momementum correection (True) or not (False)
 DEr=2.0           #Electric field diffusion (m^2/s)
 Er_relax=0.1      #Relaxation time of electric field equation
-on_Er=1           #Electric field equation on (1), off (0)
+evolve_Er=True    #Electric field equation on (True), off (False)
 on_Pe=0           #Electron energy equation on (1), off (0)
 on_PD=0           #Deuterium energy equation on (1), off (0)
 on_PT=0           #Tritium energy equation on (1), off (0)
@@ -57,7 +57,9 @@ chi=jnp.ones(3)*0.0065   #Anomalous heat transport coefficients for e,D,T
 #Create parameters class
 parameters=NEOPAX.Solver_Parameters(t0=t0,t_final=t_final,dt=dt,ts_list=ts_list,rtol=rtol,
                         atol=atol,momentum_correction_flag=momentum_correction_flag,DEr=DEr,Er_relax=Er_relax,
-                        on_Er=on_Er,on_ne=None,on_nD=None,on_nT=None,on_nHe=None,on_Pe=on_Pe,on_PD=on_PD,on_PT=on_PT,
+                        evolve_Er=evolve_Er,
+                        evolve_density=jnp.asarray([False, False, False]),
+                        evolve_temperature=jnp.asarray([bool(on_Pe), bool(on_PD), bool(on_PT)]),
                         chi=chi,on_OmegaC=None)
         
 

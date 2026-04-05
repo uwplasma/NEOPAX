@@ -6,9 +6,25 @@ from jax import jit
 from netCDF4 import Dataset
 import interpax 
 from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
-import equinox as eqx
+import dataclasses
 
-class Field(eqx.Module):
+def extend_grid_with_ghosts(grid):
+    """Extend a 1D grid array with one ghost cell on each side (extrapolated)."""
+    dr = grid[1] - grid[0]
+    left_ghost = grid[0] - dr
+    right_ghost = grid[-1] + dr
+    return jnp.concatenate([jnp.array([left_ghost]), grid, jnp.array([right_ghost])])
+
+def extend_faces_with_ghosts(grid_half):
+    """Extend a 1D face grid array for N+1 faces to N+3 faces (ghost faces)."""
+    dr = grid_half[1] - grid_half[0]
+    left_ghost = grid_half[0] - dr
+    right_ghost = grid_half[-1] + dr
+    return jnp.concatenate([jnp.array([left_ghost]), grid_half, jnp.array([right_ghost])])
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class Field:
     """Magnetic field and config parameters.
 
     """
@@ -43,30 +59,52 @@ class Field(eqx.Module):
     def __init__(
         self,
         n_r: int,
-        rho_half : Float[Array,'...'],
-        rho_full : Float[Array,'...'],
-        volume_p : float ,
-        vp : Float[Array,'...'],
-        iotaf : Float[Array,'...'],
-        Psia : float,
-        bmnc_b : Float[Array,'...'],
-        rmnc_b : Float[Array,'...'],
-        gmnc_b : Float[Array,'...'],
-        xm_b : int,
-        xn_b : int,
-        bvco : Float[Array,'...'],
-        buco : Float[Array,'...'],
+        rho_half : Float[Array,'...']=None,
+        rho_full : Float[Array,'...']=None,
+        volume_p : float=None,
+        vp : Float[Array,'...']=None,
+        iotaf : Float[Array,'...']=None,
+        Psia : float=None,
+        bmnc_b : Float[Array,'...']=None,
+        rmnc_b : Float[Array,'...']=None,
+        gmnc_b : Float[Array,'...']=None,
+        xm_b : int=None,
+        xn_b : int=None,
+        bvco : Float[Array,'...']=None,
+        buco : Float[Array,'...']=None,
+        **kwargs,
     ):
+
+        self.n_r = n_r
+
+        # JAX dataclass pytree reconstruction may call Field(...) with all
+        # dataclass fields as keyword payload.
+        field_names = [f.name for f in dataclasses.fields(type(self))]
+        payload_fields = [name for name in field_names if name != "n_r"]
+        if all(name in kwargs for name in payload_fields):
+            for name in payload_fields:
+                setattr(self, name, kwargs[name])
+            return
 
 
         self.R0=rmnc_b[-1,0]
         self.a_b=np.sqrt(volume_p/(2*jnp.pi**2*self.R0))
         self.n_r=n_r
-        self.rho_grid=jnp.linspace(0., 1., self.n_r)
-        self.rho_grid_half=jnp.linspace((self.rho_grid.at[0].get()+self.rho_grid.at[1].get())*0.5, (self.rho_grid.at[0].get()+self.rho_grid.at[1].get())*0.5+self.rho_grid.at[-1].get(), self.n_r)
-        self.r_grid=self.rho_grid*self.a_b
-        self.r_grid_half=self.rho_grid_half*self.a_b
-        self.dr=self.r_grid[2]-self.r_grid[1]
+        self.rho_grid = jnp.linspace(0., 1., self.n_r)
+        # torax-style: n_r+1 faces, endpoints at 0 and 1, faces halfway between centers
+        self.rho_grid_half = jnp.concatenate([
+            jnp.array([0.]),
+            0.5 * (self.rho_grid[:-1] + self.rho_grid[1:]),
+            jnp.array([1.])
+        ])
+        self.r_grid = self.rho_grid * self.a_b
+        self.r_grid_half = self.rho_grid_half * self.a_b
+        self.dr = self.r_grid[1] - self.r_grid[0]
+
+        # --- Add ghost cells to r_grid and r_grid_half ---
+        self.r_grid_full_ghost = extend_grid_with_ghosts(self.r_grid)
+        self.r_grid_half_ghost = extend_faces_with_ghosts(self.r_grid_half)
+        # Now r_grid_full_ghost has n_r+2 points, r_grid_half_ghost has n_r+3 faces
 
         for l in range(len(xm_b)):
             if(xm_b[l]==0 and xn_b[l]==0):
@@ -110,7 +148,7 @@ class Field(eqx.Module):
         self.I_value=I(self.rho_grid)
         self.G_value=G(self.rho_grid)
         self.Psia_value=Psia
-        self.sqrtg00_value=sqrtg00(self.rho_grid_half)
+        self.sqrtg00_value=sqrtg00(self.rho_grid)
         #Bsqav=jnp.power(2.*jnp.pi,2)*(G(rho_grid)+iota(rho_grid)*I(rho_grid))/dVdr(rho_grid)
         self.Bsqav=(self.G_value+self.iota*self.I_value)/self.sqrtg00_value/jnp.power(self.B0,2)
         #Important geometrical quantities interpolated from equilibrium

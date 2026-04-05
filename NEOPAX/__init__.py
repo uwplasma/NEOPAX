@@ -6,7 +6,12 @@ from ._field import *
 from ._database import *
 from ._interpolators import *
 from ._species import *
-from ._physics import *
 from ._neoclassical import *
-from ._transport_solver import *
+from ._main_solver import *
+from ._transport_equations import *
+from ._transport_solvers import *
+from ._transport_flux_models import *
+from ._profiles import *
 from ._turbulence import *
+from ._runtime_models import *
+from ._boundary_conditions import *
