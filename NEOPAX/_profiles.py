@@ -155,6 +155,7 @@ class PrescribedProfileModel(ProfileModel):
 
 
 def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> ProfileSet:
+
     model = str(profile_cfg.get("model", profile_cfg.get("profiles_model", "standard_analytical"))).lower()
 
     if model in ("standard_analytical", "standard analytical", "analytical"):
@@ -170,7 +171,8 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
             if n_species == 3:
                 c_density = [1.0, deuterium_ratio, tritium_ratio]
 
-        return AnalyticalProfileModel(
+        # Build initial profiles using analytical model
+        analytical_model = AnalyticalProfileModel(
             n0=n0,
             n_edge=n_edge,
             T0=T0,
@@ -188,7 +190,24 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
             charge_qp=None
             if profile_cfg.get("charge_qp") is None
             else tuple(float(v) for v in profile_cfg.get("charge_qp")),
-        ).build(field, n_species)
+        )
+        profile_set = analytical_model.build(field, n_species)
+
+        # Optionally override Er with ambipolar root initialization
+        er_init_mode = str(profile_cfg.get("er_initialization_mode", "analytical")).lower()
+        if er_init_mode == "ambipolar_root":
+            # Import here to avoid circular import
+            from ._ambipolarity import find_ambipolar_Er_min_entropy_jit
+            # Dummy Gamma/entropy functions: user must provide get_Neoclassical_Fluxes, species, grid, field, database
+            # For now, raise NotImplementedError to indicate where user must connect physics
+            raise NotImplementedError("Ambipolar root initialization for Er requires access to get_Neoclassical_Fluxes, species, grid, field, database, and initial profiles. Implement this logic in your driver script or extend build_profiles to accept these arguments.")
+            # Example (pseudo-code):
+            # for i in range(n_radial):
+            #     def gamma(er): ...
+            #     def entropy(er): ...
+            #     profile_set.Er[i] = find_ambipolar_Er_min_entropy_jit(gamma, entropy, ...)[0]
+
+        return profile_set
 
     if model in ("prescribed", "given"):
         return PrescribedProfileModel(

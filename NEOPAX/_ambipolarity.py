@@ -87,25 +87,100 @@ def find_ambipolar_Er_min_entropy_jit(
     return best_root, x_final, entropy_masked, valid_mask
 
 
-def find_all_ambipolar_Er_roots_min_entropy_jit(
+
+def find_ambipolar_Er_multistart_clustered(
+    Gamma_func,
+    entropy_func=None,
+    Er_range=(-20.0, 20.0),
+    n_starts=32,
+    tol=1e-6,
+    maxiter=30,
+    cluster_tol=1e-3,
+    return_entropies=False,
+):
+    """
+    Multi-start root-finding for ambipolarity using least-squares and clustering.
+    Uses many initial guesses, runs a root finder (optimistix if available), and clusters roots.
+    Returns unique roots (within cluster_tol).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    er_min, er_max = float(Er_range[0]), float(Er_range[1])
+    starts = jnp.linspace(er_min, er_max, n_starts)
+
+    def newton_step(x0):
+        def body_fun(i, val):
+            x, iter_idx = val
+            gx = Gamma_func(x)
+            dgx = jax.grad(Gamma_func)(x)
+            x_new = x - gx / (dgx + 1e-12)
+            x_new = jnp.clip(x_new, er_min, er_max)
+            return (jnp.where(jnp.abs(gx) < tol, x, x_new), iter_idx + 1)
+        x_init = x0
+        i_init = 0
+        x_final, _ = lax.fori_loop(0, maxiter, body_fun, (x_init, i_init))
+        return x_final
+
+    # Vectorized Newton from all starts
+    roots_all = jax.vmap(newton_step)(starts)
+    # Only keep roots that are finite and within bounds
+    valid_mask = jnp.isfinite(roots_all) & (roots_all >= er_min) & (roots_all <= er_max)
+    roots_valid = jnp.where(valid_mask, roots_all, jnp.nan)
+
+    # Cluster roots: keep only unique roots within cluster_tol
+    def cluster_unique(roots, tol):
+        roots = jnp.sort(roots)
+        mask = jnp.isfinite(roots)
+        idxs = jnp.nonzero(mask, size=roots.shape[0], fill_value=0)[0]
+        roots_finite = roots[idxs]
+        n_finite = roots_finite.shape[0]
+        def no_roots():
+            return jnp.full_like(roots, jnp.nan)
+        def some_roots():
+            # Broadcasting-based uniqueness: for each root, compare to all previous
+            diffs = jnp.abs(roots_finite[:, None] - roots_finite[None, :])
+            # diffs[i, j] is |root_i - root_j|
+            # For each i, set diffs[i, j] = inf for j >= i (ignore self and future)
+            mask_upper = jnp.triu(jnp.ones_like(diffs), k=0)
+            diffs_masked = jnp.where(mask_upper, jnp.inf, diffs)
+            # A root is unique if all previous diffs > tol
+            is_unique = jnp.all(diffs_masked > tol, axis=1)
+            # Always keep the first root
+            is_unique = is_unique.at[0].set(True)
+            unique_roots = jnp.where(is_unique, roots_finite, jnp.nan)
+            pad_len = roots.shape[0] - unique_roots.shape[0]
+            unique_roots_padded = jnp.concatenate([unique_roots, jnp.full((pad_len,), jnp.nan)])
+            return unique_roots_padded
+        return lax.cond(n_finite == 0, no_roots, some_roots)
+
+    unique_roots = cluster_unique(roots_valid, cluster_tol)
+
+    if entropy_func is not None and return_entropies:
+        entropies = jax.vmap(lambda er: entropy_func(er))(unique_roots)
+        return unique_roots, entropies
+    return unique_roots
+
+# --- Two-stage adaptive root-finder for a single radius ---
+def find_ambipolar_Er_min_entropy_jit_multires(
     Gamma_func,
     entropy_func,
     Er_range=(-20.0, 20.0),
-    n_scan=24,
+    n_coarse=24,
+    n_refine=8,
+    max_roots=3,
     tol=1e-6,
     x_tol=1e-6,
     maxiter=12,
 ):
-    """Two-stage coarse/fine JIT-friendly ambipolar root search.
-    Uses a single-stage, moderate grid to bracket all roots, then refines only valid brackets.
-
-    Returns:
-      roots: Er roots found (1D array, up to n_scan-1)
-      entropies: entropy at each root (1D array)
-      best_root: root with minimum entropy
+    """
+    Two-stage (coarse/fine) JIT-friendly ambipolar root search for a single radius.
+    1. Coarse scan to bracket roots (n_coarse)
+    2. Refine each bracket with Newton-bisection (n_refine)
+    3. Pad to max_roots for static shape
     """
     er_min, er_max = float(Er_range[0]), float(Er_range[1])
-    er_grid = jnp.linspace(er_min, er_max, n_scan, dtype=jnp.float64)
+    er_grid = jnp.linspace(er_min, er_max, n_coarse, dtype=jnp.float64)
     gamma_grid = jax.vmap(Gamma_func)(er_grid)
     left = er_grid[:-1]
     right = er_grid[1:]
@@ -117,26 +192,19 @@ def find_all_ambipolar_Er_roots_min_entropy_jit(
     right_zero = jnp.abs(g_right) <= tol
     sign_change = (g_left * g_right) < 0.0
     valid = sign_change | left_zero | right_zero
+    # --- JAX-friendly static-shape bracket gathering ---
+    idxs = jnp.arange(left.shape[0])
+    valid_idxs = jnp.where(valid, idxs, left.shape[0])  # invalids get out-of-bounds index
+    sorted_valid_idxs = jnp.sort(valid_idxs)
+    def safe_gather(arr):
+        arr_ext = jnp.concatenate([arr, jnp.zeros((1,), arr.dtype)], axis=0)  # pad for out-of-bounds
+        return arr_ext[sorted_valid_idxs[:max_roots]]
 
-    # --- DEBUG PRINTS ---
-    jax.debug.print("[DEBUG] g_left: {}", g_left)
-    jax.debug.print("[DEBUG] g_right: {}", g_right)
-    jax.debug.print("[DEBUG] sign_change: {}", sign_change)
-    jax.debug.print("[DEBUG] left_zero: {}", left_zero)
-    jax.debug.print("[DEBUG] right_zero: {}", right_zero)
-    jax.debug.print("[DEBUG] valid: {}", valid)
-
-    max_roots = n_scan - 1
-
-    # Instead of masking, fill invalid brackets with NaN and process all
-    def fill_invalid(arr, fill_value=jnp.nan):
-        return jnp.where(valid, arr, fill_value)
-
-    xl = fill_invalid(left)
-    xr = fill_invalid(right)
-    gl = fill_invalid(g_left)
-    gr = fill_invalid(g_right)
-    n_brackets = jnp.sum(valid)
+    xl = safe_gather(left)
+    xr = safe_gather(right)
+    gl = safe_gather(g_left)
+    gr = safe_gather(g_right)
+    n_found = jnp.minimum(jnp.sum(valid), max_roots)
 
     def _empty():
         roots = jnp.full((max_roots,), jnp.nan, dtype=jnp.float64)
@@ -146,9 +214,8 @@ def find_all_ambipolar_Er_roots_min_entropy_jit(
         return roots, entropies, best_root, n_roots
 
     def _roots():
-        # Initial guess: midpoint
         x = 0.5 * (xl + xr)
-        active = valid
+        active = jnp.arange(max_roots) < n_found
         def body(_, carry):
             x, xl, xr, gl, gr, active = carry
             gx = jax.vmap(Gamma_func)(x)
@@ -167,31 +234,22 @@ def find_all_ambipolar_Er_roots_min_entropy_jit(
             active_next = active & ~converged
             return (x_trial, xl_n, xr_n, gl_n, gr_n, active_next)
         carry0 = (x, xl, xr, gl, gr, active)
-        x_final, _, _, _, _, active_final = lax.fori_loop(0, int(maxiter), body, carry0)
+        x_final, _, _, _, _, active_final = lax.fori_loop(0, n_refine, body, carry0)
         entropies = jax.vmap(entropy_func)(x_final)
-        # Mark roots and entropies as nan where not valid
-        roots_padded = jnp.where(valid, x_final, jnp.nan)
-        entropies_padded = jnp.where(valid, entropies, jnp.nan)
-        n_roots = jnp.sum(valid).astype(jnp.int32)
-        # Best root: minimum entropy among valid
-        entropy_masked = jnp.where(valid, entropies, jnp.inf)
+        roots_padded = jnp.where(jnp.arange(max_roots) < n_found, x_final, jnp.nan)
+        entropies_padded = jnp.where(jnp.arange(max_roots) < n_found, entropies, jnp.nan)
+        n_roots = n_found.astype(jnp.int32)
+        entropy_masked = jnp.where(jnp.arange(max_roots) < n_found, entropies_padded, jnp.inf)
         best_idx = jnp.argmin(entropy_masked)
-        best_root = lax.cond(n_roots > 0, lambda _: x_final[best_idx], lambda _: jnp.asarray(0.0, dtype=jnp.float64), None)
-        # --- DEBUG PRINTS ---
-        jax.debug.print("[DEBUG/_roots] valid: {}", valid)
-        jax.debug.print("[DEBUG/_roots] x_final: {}", x_final)
-        jax.debug.print("[DEBUG/_roots] entropies: {}", entropies)
-        jax.debug.print("[DEBUG/_roots] roots_padded: {}", roots_padded)
-        jax.debug.print("[DEBUG/_roots] entropies_padded: {}", entropies_padded)
-        jax.debug.print("[DEBUG/_roots] n_roots: {}", n_roots)
-        jax.debug.print("[DEBUG/_roots] best_root: {}", best_root)
+        best_root = lax.cond(n_found > 0, lambda _: roots_padded[best_idx], lambda _: jnp.asarray(0.0, dtype=jnp.float64), None)
         return roots_padded, entropies_padded, best_root, n_roots
 
-    roots, entropies, best_root, n_roots = lax.cond(n_brackets == 0, _empty, _roots)
+    roots, entropies, best_root, n_roots = lax.cond(jnp.sum(valid) == 0, _empty, _roots)
     return roots, entropies, best_root, n_roots
 
 
 # --- Vectorized profile root-finder ---
+
 def find_all_ambipolar_Er_roots_profile_jit(
     get_Neoclassical_Fluxes,
     species,
@@ -201,14 +259,16 @@ def find_all_ambipolar_Er_roots_profile_jit(
     state,
     er_min,
     er_max,
-    n_scan=24,
+    n_coarse=24,
+    n_refine=8,
+    max_roots=3,
     tol=1e-6,
     x_tol=1e-6,
     maxiter=12,
     blocksize=None,
 ):
     """
-    Vectorized (vmap) root-finder for all radii. Returns roots, entropies, best_root for each radius.
+    Vectorized (vmap) two-stage root-finder for all radii. Returns roots, entropies, best_root for each radius.
     All arguments must be arrays or objects valid for all radii.
     """
     n_radial = state.Er.shape[0]
@@ -232,22 +292,21 @@ def find_all_ambipolar_Er_roots_profile_jit(
             return gamma_func(er, i)
         def entropy(er):
             return entropy_func(er, i)
-        roots, entropies, best_root, n_roots = find_all_ambipolar_Er_roots_min_entropy_jit(
+        return find_ambipolar_Er_min_entropy_jit_multires(
             gamma,
             entropy,
             Er_range=(er_min, er_max),
-            n_scan=n_scan,
+            n_coarse=n_coarse,
+            n_refine=n_refine,
+            max_roots=max_roots,
             tol=tol,
             x_tol=x_tol,
             maxiter=maxiter,
         )
-        return roots, entropies, best_root, n_roots
 
     if blocksize is None:
-        # Pure vmap over all radii
         roots_all, entropies_all, best_roots, n_roots_all = jax.vmap(root_finder_for_radius)(jnp.arange(n_radial))
     else:
-        # Process in blocks
         n_blocks = (n_radial + blocksize - 1) // blocksize
         roots_list = []
         entropies_list = []
@@ -302,3 +361,115 @@ def pad_and_sort_roots_for_plotting(roots_all, entropies_all, n_roots_all, best_
         if best_roots is not None and n_roots_all[i] > 0:
             best_root_out[i] = float(best_roots[i])
     return (roots_3, entropies_3, best_root_out) if best_roots is not None else (roots_3, entropies_3)
+
+
+# --- Adaptive bracketing root-finder ---
+
+def find_ambipolar_Er_min_entropy_jit_adaptive(
+    Gamma_func,
+    entropy_func,
+    Er_range=(-20.0, 20.0),
+    n_init=16,
+    n_subdiv=2,
+    n_rounds=2,
+    max_brackets=24,
+    n_refine=8,
+    max_roots=3,
+    tol=1e-6,
+    x_tol=1e-6,
+    maxiter=12,
+):
+    """
+    JAX-compatible adaptive bracketing root-finder with static padding.
+    - n_init: initial number of coarse intervals
+    - n_subdiv: number of subdivisions per round (e.g., 2 for bisection)
+    - n_rounds: number of adaptive subdivision rounds
+    - max_brackets: maximum number of brackets to pad for JIT
+    - n_refine: Newton-bisection steps per bracket
+    - max_roots: maximum roots to pad for output
+    """
+    er_min, er_max = float(Er_range[0]), float(Er_range[1])
+    # Initial coarse grid
+    er_grid = jnp.linspace(er_min, er_max, n_init, dtype=jnp.float64)
+    lefts = er_grid[:-1]
+    rights = er_grid[1:]
+    brackets = jnp.stack([lefts, rights], axis=1)  # shape (n_init-1, 2)
+    n_brackets = brackets.shape[0]
+
+    def bracket_signs(brackets):
+        l, r = brackets[:, 0], brackets[:, 1]
+        g_l = jax.vmap(Gamma_func)(l)
+        g_r = jax.vmap(Gamma_func)(r)
+        left_zero = jnp.abs(g_l) <= tol
+        right_zero = jnp.abs(g_r) <= tol
+        sign_change = (g_l * g_r) < 0.0
+        valid = sign_change | left_zero | right_zero
+        return valid
+
+    # Adaptive subdivision rounds
+    for _ in range(n_rounds):
+        valid = bracket_signs(brackets)
+        # Only subdivide valid brackets
+        l, r = brackets[:, 0], brackets[:, 1]
+        # Subdivide each valid bracket into n_subdiv sub-intervals
+        def subdivide_bracket(lr):
+            l, r = lr[0], lr[1]
+            return jnp.linspace(l, r, n_subdiv + 1, dtype=jnp.float64)
+        # For each valid bracket, get sub-interval edges
+        sub_edges = jax.vmap(subdivide_bracket)(brackets)
+        # Flatten all sub-intervals
+        sub_lefts = sub_edges[:, :-1].reshape(-1)
+        sub_rights = sub_edges[:, 1:].reshape(-1)
+        # Only keep sub-intervals from valid brackets
+        sub_lefts = sub_lefts[jnp.repeat(valid, n_subdiv)]
+        sub_rights = sub_rights[jnp.repeat(valid, n_subdiv)]
+        # Stack for next round
+        brackets = jnp.stack([sub_lefts, sub_rights], axis=1)
+        # Pad to max_brackets for JIT
+        pad_amt = max_brackets - brackets.shape[0]
+        if pad_amt > 0:
+            pad_brackets = jnp.full((pad_amt, 2), jnp.nan)
+            brackets = jnp.concatenate([brackets, pad_brackets], axis=0)
+        brackets = brackets[:max_brackets]
+
+    # Final valid brackets
+    valid = bracket_signs(brackets)
+    l, r = brackets[:, 0], brackets[:, 1]
+    n_found = jnp.sum(valid)
+    # Pad to max_brackets for JIT
+    l = jnp.where(valid, l, jnp.nan)
+    r = jnp.where(valid, r, jnp.nan)
+
+    # Refine each bracket
+    x = 0.5 * (l + r)
+    active = jnp.isfinite(x)
+    def body(_, carry):
+        x, l, r, active = carry
+        gx = jax.vmap(Gamma_func)(x)
+        dgx = jax.vmap(jax.grad(Gamma_func))(x)
+        x_newton = x - gx / (dgx + 1e-12)
+        x_bisect = 0.5 * (l + r)
+        use_newton = active & jnp.isfinite(x_newton) & (x_newton > l) & (x_newton < r)
+        x_trial = jnp.where(use_newton, x_newton, x_bisect)
+        g_trial = jax.vmap(Gamma_func)(x_trial)
+        same_sign_left = (jax.vmap(Gamma_func)(l) * g_trial) > 0.0
+        l_n = jnp.where(active & same_sign_left, x_trial, l)
+        r_n = jnp.where(active & ~same_sign_left, x_trial, r)
+        converged = active & ((jnp.abs(g_trial) <= tol) | (jnp.abs(r_n - l_n) <= x_tol))
+        active_next = active & ~converged
+        return (x_trial, l_n, r_n, active_next)
+    carry0 = (x, l, r, active)
+    x_final, _, _, active_final = lax.fori_loop(0, n_refine, body, carry0)
+    entropies = jax.vmap(entropy_func)(x_final)
+    # Only keep finite roots
+    roots_padded = jnp.where(jnp.isfinite(x_final), x_final, jnp.nan)
+    entropies_padded = jnp.where(jnp.isfinite(x_final), entropies, jnp.nan)
+    # Pad to max_roots for output
+    idxs = jnp.argsort(roots_padded)
+    roots_sorted = roots_padded[idxs][:max_roots]
+    entropies_sorted = entropies_padded[idxs][:max_roots]
+    n_roots = jnp.sum(jnp.isfinite(roots_sorted)).astype(jnp.int32)
+    entropy_masked = jnp.where(jnp.isfinite(entropies_sorted), entropies_sorted, jnp.inf)
+    best_idx = jnp.argmin(entropy_masked)
+    best_root = lax.cond(n_roots > 0, lambda _: roots_sorted[best_idx], lambda _: jnp.asarray(0.0, dtype=jnp.float64), None)
+    return roots_sorted, entropies_sorted, best_root, n_roots

@@ -73,7 +73,38 @@ T_scale = 1.0
 er_initialization_mode = "parabolic"
 er0_scale = 100.0
 er0_peak_rho = 0.8
-er_ambipolar_scan_min = -50.0
-er_ambipolar_scan_max = 30.0
-er_ambipolar_n_scan = 250
-er_ambipolar_tol = 1e-6
+
+[root_finding]
+# Method selection: "two_stage" or "adaptive"
+er_ambipolar_method = "two_stage"  # "multistart_clustered" or "adaptive"
+
+# --- Two-stage method parameters ---
+er_ambipolar_n_coarse = 80      # Number of coarse scan points (root bracketing)
+er_ambipolar_max_roots = 3      # Maximum roots to pad for output (static shape)
+
+# --- Optional memory/speed optimization ---
+er_ambipolar_use_float32 = false  # Use float32 for root finding (saves memory, may be faster)
+
+# --- Adaptive bracketing method parameters ---
+er_ambipolar_adaptive_n_init = 3        # Initial number of coarse intervals (starting grid)
+er_ambipolar_adaptive_n_subdiv = 2       # Subdivisions per round (2 = bisection)
+er_ambipolar_adaptive_n_rounds = 3       # Number of adaptive subdivision rounds
+# For challenging cases, try n_init=24, n_rounds=3
+# max_brackets should be >= expected number of brackets after subdivision
+er_ambipolar_adaptive_max_brackets = 16  # Maximum brackets to pad for JIT (static shape)
+
+# --- Shared parameters ---
+er_ambipolar_n_refine = 8       # Number of Newton-bisection steps per bracket (refinement)
+er_ambipolar_scan_min = -50.0    # Minimum Er for scan
+er_ambipolar_scan_max = 40.0    # Maximum Er for scan
+er_ambipolar_tol = 1e-6         # Function tolerance for root
+er_ambipolar_x_tol = 1e-6        # Interval tolerance for root
+er_ambipolar_blocksize = 0       # Block size for chunked root finding (0 or unset = auto/all)
+
+
+# --- Multi-start (JIT/diffable) method parameters ---
+# These control the multi-start root-finding method ("multistart" or "multistart_clustered")
+er_ambipolar_n_starts = 30           # Number of initial guesses (multi-start points)
+er_ambipolar_maxiter = 12            # Maximum Newton steps per start
+er_ambipolar_cluster_tol = 1e-2      # Clustering epsilon (group roots closer than this)
+er_ambipolar_max_clusters = 3        # Maximum number of clusters (roots) to pad for output

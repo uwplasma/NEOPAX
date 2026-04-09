@@ -17,69 +17,60 @@ mass_mp = [0.000544617, 2.0, 3.0]
 charge_qp = [-1.0, 1.0, 1.0]
 
 [equations]
+# Er diffusion equation: only Er is evolved, density/temperature fixed.
 toggle_density = [false, false, false]
 toggle_temperature = [false, false, false]
 toggle_Er = true
+# Set mode to diffusion for Er
 er_mode = "diffusion"
-er_DEr = 2.0
-er_relax = 0.1
-
-density_left_type = "dirichlet"
-density_right_type = "dirichlet"
-temperature_left_type = "dirichlet"
-temperature_right_type = "dirichlet"
-er_left_type = "dirichlet"
-er_right_type = "dirichlet"
+# Option to initialize Er from ambipolar root
+er_initialization_mode = "ambipolar_root"
+# Diffusion coefficient for Er (can be a float or a list for profile)
+er_diffusion_coefficient = 1.0e-2
+# Source term for Er diffusion (optional, can be zero)
+er_source = 0.0
+# Boundary conditions for Er
+er_left_type = "dirichlet"   # Fix Er at the left (core), e.g., Er=0
+er_left_value = 0.0           # Explicitly set Er(left) = 0.0
+er_right_type = "neumann"    # Zero gradient at the right (edge), lets ambipolarity set Er
+er_right_gradient = 0.0       # Explicitly set dEr/dr(right) = 0.0
 
 [solver]
-# Time solver backend/integrator (selected through _transport_solvers factory)
-# Options: diffrax_kvaerno5, diffrax_tsit5, diffrax_dopri5, predictor_corrector
-integrator = "diffrax_kvaerno5"
+integrator = "radau"           # Use the RADAU time solver
 t0 = 0.0
-t_final = 20.0
-dt = 1.0e-4
+t_final = 1.0
+dt = 1.0e-2
 n_save = 10
-rtol = 1.0e-5
-atol = 1.0e-5
+rtol = 1.0e-7
+atol = 1.0e-7
 
 [sources]
-# Optional registry-based source model selection
-# density = ["fusion_power_fraction_electrons"]
-# temperature = ["bremsstrahlung_radiation"]
+# No sources for density/temperature in Er diffusion test
 
 [neoclassical]
 model = "monkes_database"
 file = "Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
 momentum_correction_flag = false
-# Transport flux model name used by composed transport-model registry
-# Options: neoclassical, neoclassical_momentum, monkes_database
 transport_model = "neoclassical"
 
 [turbulence]
 model = "analytical"
-chi_temperature = [0.5, 0.5, 0.5]
+chi_temperature = [0.0, 0.0, 0.0]
 chi_density = [0.0, 0.0, 0.0]
-# Turbulent transport model used by composed transport-model registry
-# Options: from_turbulence_state, analytical, zero, none
 transport_model = "analytical"
 
 [profiles]
 model = "standard_analytical"
-
 n0 = 4.21e20
 n_edge = 0.6e20
 T0 = 17.8e3
 T_edge = 0.7e3
-
 c_density = [1.0, 0.5, 0.5]
 c_temperature = [1.0, 1.0, 1.0]
-
-density_shape_power = 2.0
-temperature_shape_power = 5.0
-
+density_shape_power = 10.0
+temperature_shape_power = 2.0
 n_scale = 1.0
 T_scale = 1.0
-
 er_initialization_mode = "parabolic"
 er0_scale = 100.0
 er0_peak_rho = 0.8
