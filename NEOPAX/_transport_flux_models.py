@@ -1,31 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Callable
 
+from typing import Any, Callable
+import abc
 import dataclasses
 import jax
 import jax.numpy as jnp
-
-from ._neoclassical import (
-    get_Neoclassical_Fluxes,
-    get_Neoclassical_Fluxes_With_Momentum_Correction,
-)
-from ._species import (
-    get_Thermodynamical_Forces_A1,
-    get_Thermodynamical_Forces_A2,
-    get_Thermodynamical_Forces_A3,
-)
-from ._cell_variable import get_gradient_density, get_gradient_temperature
-from ._state import get_v_thermal
+from ._neoclassical import get_Neoclassical_Fluxes,get_Neoclassical_Fluxes_With_Momentum_Correction
 from ._turbulence import get_Turbulent_Fluxes_Analytical
 
 
-TRANSPORT_FLUX_MODEL_REGISTRY: dict[str, Callable[[], "TransportFluxModelBase"]] = {}
 
+# Registry for modular selection
+TRANSPORT_FLUX_MODEL_REGISTRY: dict[str, Callable[[], "TransportFluxModelBase"]] = {}
 
 def register_transport_flux_model(name: str, builder: Callable[[], "TransportFluxModelBase"]) -> None:
     TRANSPORT_FLUX_MODEL_REGISTRY[str(name).strip().lower()] = builder
-
 
 def get_transport_flux_model(name: str) -> "TransportFluxModelBase":
     key = str(name).strip().lower()
@@ -34,27 +24,19 @@ def get_transport_flux_model(name: str) -> "TransportFluxModelBase":
     return TRANSPORT_FLUX_MODEL_REGISTRY[key]()
 
 
-@jax.tree_util.register_dataclass
+
 @dataclasses.dataclass(frozen=True, eq=False)
-class TransportFluxModelBase:
-    """Base class for any transport flux model.
-
-    Implementations return a dict with optional keys such as:
-      Gamma, Q
-    """
-
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        raise NotImplementedError
+class TransportFluxModelBase(abc.ABC):
+        """
+        Abstract base class for transport flux models.
+        Output dict keys:
+            - Gamma: particle flux
+            - Q: heat flux
+            - Upar: parallel flow
+        """
+        @abc.abstractmethod
+        def __call__(self, state, geometry=None, params=None) -> dict:
+                pass
 
 
 def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -90,362 +72,116 @@ def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax
     return default_value, default_grad
 
 
-@jax.tree_util.register_dataclass
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class CombinedTransportFluxModel(TransportFluxModelBase):
-    models: tuple[TransportFluxModelBase, ...] = ()
+    neoclassical_model: TransportFluxModelBase
+    turbulent_model: TransportFluxModelBase
 
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        gamma_total = None
-        q_total = None
-        upar_total = None
-        out: dict[str, Any] = {}
-
-        for model in self.models:
-            fluxes = model(species, state, grid, field, database, turbulence, solver_parameters, bc)
-            gamma = fluxes.get("Gamma")
-            q = fluxes.get("Q")
-            upar = fluxes.get("Upar")
-
-            if gamma is not None:
-                gamma_total = gamma if gamma_total is None else gamma_total + gamma
-            if q is not None:
-                q_total = q if q_total is None else q_total + q
-            if upar is not None:
-                upar_total = upar if upar_total is None else upar_total + upar
-
-            out.update(fluxes)
-
-        if gamma_total is None:
-            gamma_total = jnp.zeros_like(state.density)
-        if q_total is None:
-            q_total = jnp.zeros_like(state.density)
-        if upar_total is None:
-            upar_total = jnp.zeros_like(state.density)
-
-        out["Gamma_total"] = gamma_total
-        out["Q_total"] = q_total
-        out["Upar_total"] = upar_total
+    def __call__(self, state, geometry=None, params=None) -> dict:
+        # Call both models and sum outputs
+        neo = self.neoclassical_model(state, geometry, params)
+        turb = self.turbulent_model(state, geometry, params)
+        out = {}
+        for key in ("Gamma", "Q", "Upar"):
+            out[key] = neo.get(key, 0) + turb.get(key, 0)
+        out["Gamma_neo"] = neo.get("Gamma", 0)
+        out["Q_neo"] = neo.get("Q", 0)
+        out["Upar_neo"] = neo.get("Upar", 0)
+        out["Gamma_turb"] = turb.get("Gamma", 0)
+        out["Q_turb"] = turb.get("Q", 0)
+        out["Upar_turb"] = turb.get("Upar", 0)
         return out
 
 
-@jax.tree_util.register_dataclass
+
 @dataclasses.dataclass(frozen=True, eq=False)
-class MonkesNeoclassicalTransportModel(TransportFluxModelBase):
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del turbulence, solver_parameters
-        density_bc = bc.get("density") if isinstance(bc, dict) else None
-        temperature_bc = bc.get("temperature") if isinstance(bc, dict) else None
-        n_right, n_right_grad = _extract_right_constraints(density_bc, state.density)
-        t_right, t_right_grad = _extract_right_constraints(temperature_bc, state.temperature)
+class MonkesDatabaseTransportModel(TransportFluxModelBase):
+    def __call__(self, state, geometry=None, params=None) -> dict:
+        # Assume params contains all needed info (species, grid, etc.)
+        # This is a minimal, jittable, differentiable wrapper
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
-            species,
-            grid,
-            field,
-            database,
+            params["species"],
+            params["grid"],
+            params["field"],
+            params["neoclassical_data"],
             state.Er,
             state.temperature,
             state.density,
-            density_right_constraint=n_right,
-            density_right_grad_constraint=n_right_grad,
-            temperature_right_constraint=t_right,
-            temperature_right_grad_constraint=t_right_grad,
         )
         return {
             "Gamma": gamma_neo,
             "Q": q_neo,
             "Upar": upar_neo,
-            "Gamma_neo": gamma_neo,
-            "Q_neo": q_neo,
-            "Upar_neo": upar_neo,
         }
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
-class MonkesMomentumTransportModel(TransportFluxModelBase):
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del turbulence, solver_parameters
-
-        # Build the same thermodynamic-force inputs as the standard neoclassical model,
-        # then evaluate the momentum-corrected transport kernel.
-        v_thermal = get_v_thermal(species.mass, state.temperature)
-        r_grid = field.r_grid
-        r_grid_half = field.r_grid_half
-        dr = field.dr
-
-        density_bc = bc.get("density") if isinstance(bc, dict) else None
-        temperature_bc = bc.get("temperature") if isinstance(bc, dict) else None
-        n_right, n_right_grad = _extract_right_constraints(density_bc, state.density)
-        t_right, t_right_grad = _extract_right_constraints(temperature_bc, state.temperature)
-
-        dndr = jax.vmap(
-            lambda n_a, n_rc, n_rg: get_gradient_density(
-                n_a,
-                r_grid,
-                r_grid_half,
-                dr,
-                right_face_constraint=n_rc,
-                right_face_grad_constraint=n_rg,
-            )
-        )(state.density, n_right, n_right_grad)
-
-        dTdr = jax.vmap(
-            lambda t_a, t_rc, t_rg: get_gradient_temperature(
-                t_a,
-                r_grid,
-                r_grid_half,
-                dr,
-                right_face_constraint=t_rc,
-                right_face_grad_constraint=t_rg,
-            )
-        )(state.temperature, t_right, t_right_grad)
-
-        a1 = jax.vmap(
-            lambda z_a, n_a, t_a, dn_a, dT_a: get_Thermodynamical_Forces_A1(
-                z_a,
-                n_a,
-                t_a,
-                dn_a,
-                dT_a,
-                state.Er,
-            )
-        )(species.charge, state.density, state.temperature, dndr, dTdr)
-        a2 = jax.vmap(get_Thermodynamical_Forces_A2)(state.temperature, dTdr)
-        a3 = get_Thermodynamical_Forces_A3(state.Er)
-
+class MonkesDatabaseWithMomentumTransportModel(TransportFluxModelBase):
+    def __call__(self, state, geometry=None, params=None) -> dict:
+        # Use new unified get_Neoclassical_Fluxes_With_Momentum_Correction interface
+        # Pass boundary constraints if present in params
+        density_right_constraint = params.get("density_right_constraint", None)
+        density_right_grad_constraint = params.get("density_right_grad_constraint", None)
+        temperature_right_constraint = params.get("temperature_right_constraint", None)
+        temperature_right_grad_constraint = params.get("temperature_right_grad_constraint", None)
         correction = get_Neoclassical_Fluxes_With_Momentum_Correction(
-            grid,
-            field,
-            database,
-            species.mass,
-            species.charge,
+            params["species"],
+            params["grid"],
+            params["field"],
+            params["neoclassical_data"],
             state.Er,
             state.temperature,
             state.density,
-            v_thermal,
-            a1,
-            a2,
-            a3,
-            dndr,
-            dTdr,
+            density_right_constraint=density_right_constraint,
+            density_right_grad_constraint=density_right_grad_constraint,
+            temperature_right_constraint=temperature_right_constraint,
+            temperature_right_grad_constraint=temperature_right_grad_constraint,
         )
-
-        def _species_radial(x: Any) -> Any:
-            arr = jnp.asarray(x)
-            target_shape = state.density.shape
-            if arr.ndim == 2 and arr.shape == (target_shape[1], target_shape[0]):
-                return jnp.swapaxes(arr, 0, 1)
-            return arr
-
-        if isinstance(correction, tuple) and len(correction) >= 2:
-            gamma_neo = _species_radial(correction[0])
-            q_neo = _species_radial(correction[1])
-            out = {
-                "Gamma": gamma_neo,
-                "Q": q_neo,
-                "Gamma_neo": gamma_neo,
-                "Q_neo": q_neo,
-            }
-            if len(correction) >= 3:
-                upar_neo = _species_radial(correction[2])
-                out["Upar"] = upar_neo
-                out["Upar_neo"] = upar_neo
-            return out
-        return MonkesNeoclassicalTransportModel()(
-            species,
-            state,
-            grid,
-            field,
-            database,
-            turbulence,
-            solver_parameters,
-            bc,
-        )
+        Gamma, Q, Upar, *_ = correction
+        return {"Gamma": Gamma, "Q": Q, "Upar": Upar}
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
-class ZeroTurbulentTransportModel(TransportFluxModelBase):
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del species, grid, field, database, turbulence, solver_parameters, bc
-        gamma_turb = jnp.zeros_like(state.density)
-        q_turb = jnp.zeros_like(state.density)
-        return {
-            "Gamma": gamma_turb,
-            "Q": q_turb,
-            "Gamma_turb": gamma_turb,
-            "Q_turb": q_turb,
-        }
+class ZeroTransportModel(TransportFluxModelBase):
+    def __call__(self, state, geometry=None, params=None) -> dict:
+        gamma = jnp.zeros_like(state.density)
+        q = jnp.zeros_like(state.density)
+        upar = jnp.zeros_like(state.density)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
 
 
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, eq=False)
-class TurbulenceStateTransportModel(TransportFluxModelBase):
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del grid, field, database, bc
-        if turbulence is None:
-            return ZeroTurbulentTransportModel()(
-                species,
-                state,
-                grid,
-                field,
-                database,
-                turbulence,
-                solver_parameters,
-            )
-
-        q_turb = getattr(turbulence, "Q_turb", None)
-        if q_turb is None:
-            q_turb = getattr(turbulence, "Qa_turb", None)
-        if q_turb is None:
-            q_turb = jnp.zeros_like(state.density)
-
-        gamma_turb = getattr(turbulence, "Gamma_turb", None)
-        if gamma_turb is None:
-            gamma_turb = jnp.zeros_like(state.density)
-
-        out = {
-            "Gamma": gamma_turb,
-            "Q": q_turb,
-            "Gamma_turb": gamma_turb,
-            "Q_turb": q_turb,
-        }
-
-        upar_turb = getattr(turbulence, "Upar_turb", None)
-        if upar_turb is not None:
-            out["Upar"] = upar_turb
-            out["Upar_turb"] = upar_turb
-        return out
 
 
-@jax.tree_util.register_dataclass
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
-    def __call__(
-        self,
-        species: Any,
-        state: Any,
-        grid: Any,
-        field: Any,
-        database: Any,
-        turbulence: Any,
-        solver_parameters: Any,
-        bc: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del database, turbulence
-        n_species = state.density.shape[0]
-
-        chi_t = jnp.asarray(getattr(solver_parameters, "chi_temperature", jnp.ones(n_species) * 0.5))
-        chi_n = jnp.asarray(getattr(solver_parameters, "chi_density", jnp.zeros(n_species)))
-
-        if chi_t.shape[0] < n_species:
-            chi_t = jnp.pad(chi_t, (0, n_species - chi_t.shape[0]), constant_values=0.5)
-        else:
-            chi_t = chi_t[:n_species]
-
-        if chi_n.shape[0] < n_species:
-            chi_n = jnp.pad(chi_n, (0, n_species - chi_n.shape[0]), constant_values=0.0)
-        else:
-            chi_n = chi_n[:n_species]
-
-        density_bc = bc.get("density") if isinstance(bc, dict) else None
-        temperature_bc = bc.get("temperature") if isinstance(bc, dict) else None
-        n_right, n_right_grad = _extract_right_constraints(density_bc, state.density)
-        t_right, t_right_grad = _extract_right_constraints(temperature_bc, state.temperature)
-
+    def __call__(self, state, geometry=None, params=None) -> dict:
+        # Assume params contains all needed info (chi_t, chi_n, etc.)
         gamma_turb, q_turb = get_Turbulent_Fluxes_Analytical(
-            species,
-            grid,
-            chi_t,
-            chi_n,
+            params["species"],
+            params["grid"],
+            params["chi_t"],
+            params["chi_n"],
             state.temperature,
             state.density,
-            field,
-            density_right_constraint=n_right,
-            density_right_grad_constraint=n_right_grad,
-            temperature_right_constraint=t_right,
-            temperature_right_grad_constraint=t_right_grad,
+            params["field"],
         )
-
-        return {
-            "Gamma": gamma_turb,
-            "Q": q_turb,
-            "Gamma_turb": gamma_turb,
-            "Q_turb": q_turb,
-        }
+        upar = jnp.zeros_like(state.density)
+        return {"Gamma": gamma_turb, "Q": q_turb, "Upar": upar}
 
 
-def build_transport_flux_model(solver_parameters: Any) -> CombinedTransportFluxModel:
-    """Build the active composed transport model from runtime parameters."""
-    neoclassical_name = str(
-        getattr(solver_parameters, "neoclassical_transport_model", "neoclassical")
-    ).strip().lower()
-    turbulent_name = str(
-        getattr(solver_parameters, "turbulent_transport_model", "from_turbulence_state")
-    ).strip().lower()
 
-    return CombinedTransportFluxModel(
-        models=(
-            get_transport_flux_model(neoclassical_name),
-            get_transport_flux_model(turbulent_name),
-        )
-    )
+def build_transport_flux_model(params: Any) -> CombinedTransportFluxModel:
+    """
+    Build the active composed transport model from runtime parameters.
+    Expects params["neoclassical_flux_model"] and params["turbulent_flux_model"] to specify model names.
+    """
+    neo_model = get_transport_flux_model(params["neoclassical_flux_model"])
+    turb_model = get_transport_flux_model(params["turbulent_flux_model"])
+    return CombinedTransportFluxModel(neo_model, turb_model)
 
-register_transport_flux_model("monkes_database", MonkesNeoclassicalTransportModel)
-register_transport_flux_model("neoclassical", MonkesNeoclassicalTransportModel)
-register_transport_flux_model("neoclassical_momentum", MonkesMomentumTransportModel)
-register_transport_flux_model("none", ZeroTurbulentTransportModel)
-register_transport_flux_model("zero", ZeroTurbulentTransportModel)
-register_transport_flux_model("from_turbulence_state", TurbulenceStateTransportModel)
-register_transport_flux_model("analytical", AnalyticalTurbulentTransportModel)
+register_transport_flux_model("monkes_database", MonkesDatabaseTransportModel)
+register_transport_flux_model("monkes_database_with_momentum", MonkesDatabaseWithMomentumTransportModel)
+register_transport_flux_model("turbulent_analytical", AnalyticalTurbulentTransportModel)
+register_transport_flux_model("none", ZeroTransportModel)

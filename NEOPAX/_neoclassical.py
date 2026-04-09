@@ -7,12 +7,25 @@ config.update("jax_enable_x64", True)
 from jax import jit
 import jax.numpy as jnp
 import lineax
+import interpax
 from ._constants import elementary_charge, epsilon_0
 from ._species import collisionality
 from ._interpolators import get_Dij
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 from ._state import get_v_thermal
+
+
+
+@jit
+def get_plasma_permitivity(state, species_mass, field, grid_x):
+    """Return epsilon(r) used in Er diffusion/ambipolar source term."""
+    psi_fac = 1.0 + 1.0 / (field.enlogation * jnp.square(field.iota))
+    psi_fac = psi_fac.at[0].set(1.0)
+    mass_density = jnp.sum(species_mass[:, None] * state.density, axis=0)
+    epsilon_r = mass_density * psi_fac / jnp.square(field.B0)
+    plasma_permitivity = interpax.Interpolator1D(field.r_grid, epsilon_r, extrap=True)
+    return plasma_permitivity(grid_x)
 
 
 def _as_species_constraint(arr, n_species):
@@ -490,13 +503,76 @@ def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
 
 
 @jit
-#Get_fluxes with momentum correction, fully explicit arguments
+#Get_fluxes with momentum correction, unified interface
 def get_Neoclassical_Fluxes_With_Momentum_Correction(
-    grid, field, database,
-    mass, charge, Er, temperature, density, v_thermal,
-    A1, A2, A3, dndr, dTdr
+    species,
+    grid,
+    field,
+    database,
+    Er,
+    temperature,
+    density,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
 ):
-    n_species = density.shape[0]
+    # Compute v_thermal for all species and radial points
+    v_thermal = get_v_thermal(species.mass, temperature)
+    r_grid = field.r_grid
+    r_grid_half = field.r_grid_half
+    dr = field.dr
+
+    n_species = int(temperature.shape[0])
+    n_right = _as_species_constraint(density_right_constraint, n_species)
+    if n_right is None:
+        n_right = density[:, -1]
+    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
+    if n_right_grad is None:
+        n_right_grad = jnp.zeros_like(n_right)
+    t_right = _as_species_constraint(temperature_right_constraint, n_species)
+    if t_right is None:
+        t_right = temperature[:, -1]
+    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
+    if t_right_grad is None:
+        t_right_grad = jnp.zeros_like(t_right)
+
+    # Compute gradients and thermodynamic forces for each species
+    def get_gradients_and_forces(density, temperature, n_rc, n_rg, t_rc, t_rg, Er, a):
+        dndr = get_gradient_density(
+            density,
+            r_grid,
+            r_grid_half,
+            dr,
+            right_face_constraint=n_rc,
+            right_face_grad_constraint=n_rg,
+        )
+        dTdr = get_gradient_temperature(
+            temperature,
+            r_grid,
+            r_grid_half,
+            dr,
+            right_face_constraint=t_rc,
+            right_face_grad_constraint=t_rg,
+        )
+        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
+        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
+        A3 = get_Thermodynamical_Forces_A3(Er)
+        return dndr, dTdr, A1, A2, A3
+
+    # Vectorize over species
+    grads_forces = jax.vmap(get_gradients_and_forces, in_axes=(0,0,0,0,0,0,None,0))(
+        density,
+        temperature,
+        n_right,
+        n_right_grad,
+        t_right,
+        t_right_grad,
+        Er,
+        jnp.arange(n_species),
+    )
+    dndr, dTdr, A1, A2, A3 = grads_forces
+
     species_indices = jnp.arange(n_species)
     radial_indices = grid.full_grid_indeces
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
@@ -507,7 +583,7 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         ),
         in_axes=(None, None, None, None, 0, None, None, None, None, None)
     )(
-        mass, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
+        species, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
     )
     # Adjust Lij and Eij as before
     Lij = Lij.at[:, 0, :, :].set(Lij.at[:, 1, :, :].get())
@@ -518,8 +594,9 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
     )(
         grid, field, radial_indices, Lij, Eij, nu_weighted_average,
-        v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr
+        v_thermal, density, temperature, A1, A2, A3, species.charge, dndr, dTdr
     )
+    # correction is (Gamma, Q, Upar, qpar, Upar2)
     return correction  #, Lij, Eij, nu_weighted_average
 
 

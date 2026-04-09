@@ -11,116 +11,151 @@ from ._species import coulomb_logarithm
 #These should go to the physics_models.py 
 #Get FusionPower Fraction to Electrons, using same model as NTSS - update in the future
 
-# Refactored: JAX-compatible, explicit arguments, SourceModelBase subclass
+
+import dataclasses
+import jax
 import jax.numpy as jnp
-from ._sources import SourceModelBase
-from ._state import TransportState
+from typing import Any, Callable
+from ._sources import fusion_power_fraction_electrons, dt_reaction, power_exchange, bremsstrahlung_radiation
 
-SPECIES_IDX = {
-    "e": 0,
-    "D": 1,
-    "T": 2,
-    "He": 3,
-}
+# Registry for modular selection
+SOURCE_MODEL_REGISTRY: dict[str, Callable[..., "SourceModelBase"]] = {}
+_DEFAULTS_REGISTERED = False
 
+def register_source_model(name: str, builder: Callable[..., "SourceModelBase"]) -> None:
+    SOURCE_MODEL_REGISTRY[str(name).strip().lower()] = builder
 
+def register_source(name: str, builder: Callable[..., "SourceModelBase"]) -> None:
+    register_source_model(name, builder)
 
-@jit
-def get_plasma_permitivity(state, species_mass, field, grid_x):
-    """Return epsilon(r) used in Er diffusion/ambipolar source term."""
-    psi_fac = 1.0 + 1.0 / (field.enlogation * jnp.square(field.iota))
-    psi_fac = psi_fac.at[0].set(1.0)
-    mass_density = jnp.sum(species_mass[:, None] * state.density, axis=0)
-    epsilon_r = mass_density * psi_fac / jnp.square(field.B0)
-    plasma_permitivity = interpax.Interpolator1D(field.r_grid, epsilon_r, extrap=True)
-    return plasma_permitivity(grid_x)
+def _ensure_default_source_models_registered() -> None:
+    global _DEFAULTS_REGISTERED
+    if _DEFAULTS_REGISTERED:
+        return
+    register_source_model("fusion_power_fraction_electrons", FusionPowerFractionElectronsSource)
+    register_source_model("dt_reaction", DTReactionSource)
+    register_source_model("power_exchange", PowerExchangeSource)
+    register_source_model("bremsstrahlung_radiation", BremsstrahlungRadiationSource)
+    register_source_model("analytic", AnalyticSource)
+    register_source_model("example_state", ExampleStateDrivenSource)
+    _DEFAULTS_REGISTERED = True
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class SourceModelBase:
+    """Base class for non-conservative source models."""
+    def __call__(self, state: Any):
+        raise NotImplementedError
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class AnalyticSource(SourceModelBase):
+    profile: Any
+    def __call__(self, state: Any):
+        if callable(self.profile):
+            return self.profile(state)
+        return jnp.asarray(self.profile)
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class ExampleStateDrivenSource(SourceModelBase):
+    scale: float = 1.0
+    def __call__(self, state: Any):
+        te = state["Te"]
+        ne = state["ne"]
+        return self.scale * ne * jnp.sqrt(te)
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class CombinedSourceModel(SourceModelBase):
+    sources: tuple[SourceModelBase, ...] = dataclasses.field(default_factory=tuple)
+    def __call__(self, state: Any):
+        out = self.sources[0](state)
+        for src in self.sources[1:]:
+            out = out + src(state)
+        return out
 
 class FusionPowerFractionElectronsSource(SourceModelBase):
-    def __call__(self, state: TransportState):
-        Te = state.temperature[SPECIES_IDX['e']]
-        y2 = 88. / Te
-        y = jnp.sqrt(y2)
-        part = 2. * (jnp.log((1 - y + y2) / (1 + 2 * y + y2)) / 6 +
-                    0.57735026 * jnp.atan(0.57735026 * (2 * y - 1)) +
-                    0.30229987) / y2
-        return 1. - part
-
-
-# Refactored: D-T Reaction Source
+    def __call__(self, state):
+        return fusion_power_fraction_electrons(state)
 
 class DTReactionSource(SourceModelBase):
-    def __call__(self, state: TransportState):
-        nD = state.density[SPECIES_IDX['D']]
-        nT = state.density[SPECIES_IDX['T']]
-        TT = state.temperature[SPECIES_IDX['T']]
-        t = jnp.power(TT, -1. / 3.)
-        wrk = (TT + 1.0134) / (1 + 6.386e-3 * jnp.square(TT + 1.0134)) + 1.877 * jnp.exp(-0.16176 * jnp.sqrt(TT) * TT)
-        DTreactionRate = 8.972e-19 * t * t * jnp.exp(-19.94 * t) * wrk
-        HeSource = 1e20 * DTreactionRate * nD * nT
-        AlphaPower = 3.52e3 * HeSource
-        return DTreactionRate, HeSource, AlphaPower
+    def __call__(self, state):
+        return dt_reaction(state)
 
-
-# Refactored: Power Exchange Source
-
-
-# Stateless/config-driven: all parameters from state/species
 class PowerExchangeSource(SourceModelBase):
     def __init__(self, idx_a=None, idx_b=None):
-        # Optionally allow config for which species to use, else default to D and T
-        self.idx_a = idx_a if idx_a is not None else SPECIES_IDX['D']
-        self.idx_b = idx_b if idx_b is not None else SPECIES_IDX['T']
-    def __call__(self, state: TransportState, species=None):
-        # If species object is provided, use it for mass/charge, else assume standard mapping
-        idx_a = self.idx_a
-        idx_b = self.idx_b
-        nA = state.density[idx_a]
-        nB = state.density[idx_b]
-        TA = state.temperature[idx_a]
-        TB = state.temperature[idx_b]
-        # Default values for D and T if species not provided
-        if species is not None:
-            mA = species.mass[idx_a]
-            mB = species.mass[idx_b]
-            qA = species.charge[idx_a]
-            qB = species.charge[idx_b]
-        else:
-            # Defaults: D and T
-            mA = 2.014 * proton_mass
-            mB = 3.016 * proton_mass
-            qA = elementary_charge
-            qB = elementary_charge
-        # Coulomb logarithm: can be a function of state, or use a default
-        lnL = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
-        Pab = 663. * jnp.sqrt(mA * mB) * jnp.square(qA * qB / (elementary_charge * elementary_charge)) \
-            * nA * nB * lnL * (TB - TA) / jnp.power(mA * TB + mB * TA, 1.5)
-        return Pab
+        self.idx_a = idx_a
+        self.idx_b = idx_b
+    def __call__(self, state, species=None):
+        return power_exchange(state, idx_a=self.idx_a, idx_b=self.idx_b, species=species)
 
-
-
-# Refactored: Bremsstrahlung Radiation Source
-
-
-# Stateless/config-driven: all parameters from state/species
 class BremsstrahlungRadiationSource(SourceModelBase):
     def __init__(self, ZD=None, ZT=None):
-        # Optionally allow config for ZD/ZT, else use standard values for D/T
-        self.ZD = ZD if ZD is not None else 1.0
-        self.ZT = ZT if ZT is not None else 1.0
-    def __call__(self, state: TransportState, species=None):
-        Te = state.temperature[SPECIES_IDX['e']]
-        ne = state.density[SPECIES_IDX['e']]
-        nD = state.density[SPECIES_IDX['D']]
-        nT = state.density[SPECIES_IDX['T']]
-        # If species object is provided, use its Z for D/T
-        ZD = self.ZD
-        ZT = self.ZT
-        if species is not None:
-            ZD = species.charge[SPECIES_IDX['D']] / elementary_charge
-            ZT = species.charge[SPECIES_IDX['T']] / elementary_charge
-        Zeff = (ZD ** 2 * nD + ZT ** 2 * nT) / ne
-        PBrems = 3.16e-1 * Zeff * ne * ne * jnp.sqrt(Te)
-        return PBrems, Zeff
+        self.ZD = ZD
+        self.ZT = ZT
+    def __call__(self, state, species=None):
+        return bremsstrahlung_radiation(state, ZD=self.ZD, ZT=self.ZT, species=species)
+
+def get_source_model(name: str, **kwargs) -> SourceModelBase:
+    _ensure_default_source_models_registered()
+    key = str(name).strip().lower()
+    if key not in SOURCE_MODEL_REGISTRY:
+        raise ValueError(f"Unknown source model '{name}'.")
+    return SOURCE_MODEL_REGISTRY[key](**kwargs)
+
+def get_source(name: str, *args, **kwargs) -> SourceModelBase:
+    if args:
+        raise TypeError("Positional args are not supported for source builders; use keyword args.")
+    return get_source_model(name, **kwargs)
+
+def _as_name_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    v = str(value).strip()
+    return [v] if len(v) > 0 else []
+
+def _builder_kwargs_for(source_name: str, params_cfg: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(params_cfg, dict):
+        return {}
+    return dict(params_cfg.get(source_name, {})) if isinstance(params_cfg.get(source_name, {}), dict) else {}
+
+def _compose_sources(names: list[str], params_cfg: dict[str, Any] | None = None) -> SourceModelBase | None:
+    if len(names) == 0:
+        return None
+    params_cfg = params_cfg or {}
+    models = tuple(
+        get_source_model(name, **_builder_kwargs_for(name, params_cfg))
+        for name in names
+    )
+    return CombinedSourceModel(models)
+
+def build_source_models_from_config(cfg: dict[str, Any]) -> dict[str, SourceModelBase] | None:
+    """Build density/temperature source callables from TOML-style config.
+
+    Supported schema:
+
+      [sources]
+      density = ["name1", "name2"]
+      temperature = ["name3"]
+
+      [sources.parameters]
+      name3 = {some_kw = 1.0}
+    """
+    src_cfg = cfg.get("sources", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(src_cfg, dict):
+        return None
+
+    params_cfg = src_cfg.get("parameters", {})
+    density_src = _compose_sources(_as_name_list(src_cfg.get("density")), params_cfg)
+    temp_src = _compose_sources(_as_name_list(src_cfg.get("temperature")), params_cfg)
+
+    out: dict[str, SourceModelBase] = {}
+    if density_src is not None:
+        out["density"] = density_src
+    if temp_src is not None:
+        out["temperature"] = temp_src
+    return out if len(out) > 0 else None
 
