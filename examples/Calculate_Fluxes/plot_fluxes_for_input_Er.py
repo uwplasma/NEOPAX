@@ -9,6 +9,10 @@ import matplotlib.pyplot as plt
 import h5py as h5
 import interpax
 import NEOPAX
+from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
+from NEOPAX._geometry_models import get_geometry_model
+from NEOPAX._transport_flux_models import get_transport_flux_model
+from NEOPAX._state import TransportState
 
 # --- Paths and files ---
 current_path = os.path.dirname(os.path.realpath(__file__))
@@ -25,9 +29,9 @@ n_species = 3
 n_radial = 51
 n_x = 4
 
-grid = NEOPAX.Grid.create_standard(n_radial, n_x, n_species)
-field = NEOPAX.Field.read_vmec_booz(n_radial, vmec_file, boozer_file)
-rho = field.rho_grid
+energy_grid = StandardLaguerreEnergyGrid(n_x=n_x)
+geometry = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
+rho = geometry.rho_grid
 
 def analytic_profile(val0, val_edge, power=2.0):
     return (val0 - val_edge) * (1 - (rho ) ** power) + val_edge
@@ -50,7 +54,7 @@ temperature = jnp.stack([Te, TD, TT])
 # --- Load Er profile from file (as in Fluxes_Calculation_comparison) ---
 with h5.File(Er_file, 'r') as f:
     Er_interp = interpax.Interpolator1D(f['r'][()], f['Er'][()], extrap=True)
-    Er = Er_interp(field.r_grid)
+    Er = Er_interp(geometry.r_grid)
 
 # --- Species object ---
 mass = jnp.array([1 / 1836.15267343, 2, 3])
@@ -62,23 +66,43 @@ species = NEOPAX.Species(
     charge_qp=charge,
 )
 
-database = NEOPAX.Monoenergetic.read_monkes(field.a_b, neoclassical_file)
+database = NEOPAX.Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
 
-# --- Calculate neoclassical fluxes for the input Er profile ---
+
+# --- Calculate neoclassical fluxes for the input Er profile (direct call) ---
 Gamma_neo = NEOPAX.get_Neoclassical_Fluxes(
-    species, grid, field, database, Er, temperature, density
+    species, energy_grid, geometry, database, Er, temperature, density
 )[1]  # [1] is Gamma
 
-# --- Plot ---
+# --- Calculate fluxes using the transport flux model ---
+state = TransportState(
+    density=density,
+    temperature=temperature,
+    Er=Er
+)
+params = {
+    "species": species,
+    "energy_grid": energy_grid,
+    "geometry": geometry,
+    "database": database,
+}
+transport_flux_model = get_transport_flux_model("monkes_database")
+fluxes_model = transport_flux_model(state, geometry=geometry, params=params)
+Gamma_model = fluxes_model["Gamma"]
+
+# --- Plot comparison ---
 plt.figure(dpi=120)
-plt.plot(rho, Gamma_neo[0], label='Electron flux')
-plt.plot(rho, Gamma_neo[1], label='Deuterium flux')
-plt.plot(rho, Gamma_neo[2], label='Tritium flux')
+plt.plot(rho, Gamma_neo[0], label='Electron flux (direct)')
+plt.plot(rho, Gamma_neo[1], label='Deuterium flux (direct)')
+plt.plot(rho, Gamma_neo[2], label='Tritium flux (direct)')
+plt.plot(rho, Gamma_model[0], '--', label='Electron flux (model)')
+plt.plot(rho, Gamma_model[1], '--', label='Deuterium flux (model)')
+plt.plot(rho, Gamma_model[2], '--', label='Tritium flux (model)')
 plt.xlabel(r'$\rho$')
 plt.ylabel(r'$\Gamma_s$')
-plt.title('Neoclassical Particle Fluxes vs Input $E_r$ (from file)')
+plt.title('Neoclassical Particle Fluxes vs Input $E_r$ (direct vs model)')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig(os.path.join(output_path, 'neo_fluxes_vs_input_Er.pdf'))
+plt.savefig(os.path.join(output_path, 'neo_fluxes_vs_input_Er_comparison.pdf'))
 plt.show()

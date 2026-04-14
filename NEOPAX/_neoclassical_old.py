@@ -7,25 +7,12 @@ config.update("jax_enable_x64", True)
 from jax import jit
 import jax.numpy as jnp
 import lineax
-import interpax
 from ._constants import elementary_charge, epsilon_0
 from ._species import collisionality
 from ._interpolators import get_Dij
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 from ._state import get_v_thermal
-
-
-
-@jit
-def get_plasma_permitivity(state, species_mass, geometry, grid_x):
-    """Return epsilon(r) used in Er diffusion/ambipolar source term."""
-    psi_fac = 1.0 + 1.0 / (geometry.enlogation * jnp.square(geometry.iota))
-    psi_fac = psi_fac.at[0].set(1.0)
-    mass_density = jnp.sum(species_mass[:, None] * state.density, axis=0)
-    epsilon_r = mass_density * psi_fac / jnp.square(geometry.B0)
-    plasma_permitivity = interpax.Interpolator1D(geometry.r_grid, epsilon_r, extrap=True)
-    return plasma_permitivity(grid_x)
 
 
 def _as_species_constraint(arr, n_species):
@@ -40,7 +27,7 @@ def _as_species_constraint(arr, n_species):
 
 
 @jit
-def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal):
+def get_Lij_matrix(species, grid, field, database, index_species, r_index, Er, temperature, density, v_thermal):
     #def scan_Dij(_,pair):
     #    nu_dummy,Er_dummy=pair
     #    return None,get_Dij(r_grid[r_index], nu_dummy, Er_dummy)
@@ -50,7 +37,7 @@ def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_in
     #Thermal velocities
     vth_a = v_thermal[index_species, r_index]
     #velocities for convolution
-    v_new_a = energy_grid.v_norm * vth_a
+    v_new_a = grid.v_norm * vth_a
     #Er's for convolution
     Er_vnew_a = Er[r_index] * 1.e+3 / v_new_a
     n = density[index_species, r_index]
@@ -66,26 +53,30 @@ def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_in
     L13_fac_a=-1./jnp.sqrt(jnp.pi)*(species.mass[index_species]/species.charge[index_species])*vth_a**2#*B00(r_grid[r_index])
     L33_fac_a=-1./jnp.sqrt(jnp.pi)*vth_a#*B00(r_grid[r_index])    
     #Interpolate D11's, D13's and D33's 
-    Dij=jax.vmap(get_Dij,in_axes=(None,0,0,None))(geometry.r_grid[r_index],nu_vnew_a,Er_vnew_a,database)
+    Dij=jax.vmap(get_Dij,in_axes=(None,0,0,None))(field.r_grid[r_index],nu_vnew_a,Er_vnew_a,database)
     #_, Dij = jax.lax.scan(scan_Dij, None, (nu_vnew_a, Er_vnew_a))
     D11_a=-10**Dij.at[:,0].get()###+4.*nu_vnew_a/3.
     D13_a=-Dij.at[:,1].get()
     D33_a=-jnp.true_divide(Dij.at[:,2].get(),nu_vnew_a)
-    Lij=Lij.at[0,0].set(L11_fac_a*jnp.sum(energy_grid.L11_weight*energy_grid.xWeights*(D11_a)))
-    Lij=Lij.at[0,1].set(L11_fac_a*jnp.sum(energy_grid.L12_weight*energy_grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,0].set(L11_fac_a*jnp.sum(grid.L11_weight*grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,1].set(L11_fac_a*jnp.sum(grid.L12_weight*grid.xWeights*(D11_a)))
     Lij=Lij.at[1,0].set(Lij.at[0,1].get())
-    Lij=Lij.at[1,1].set(L11_fac_a*jnp.sum(energy_grid.L22_weight*energy_grid.xWeights*(D11_a)))
-    Lij=Lij.at[0,2].set(L13_fac_a*jnp.sum(energy_grid.L13_weight*energy_grid.xWeights*(D13_a)))
-    Lij=Lij.at[1,2].set(L13_fac_a*jnp.sum(energy_grid.L23_weight*energy_grid.xWeights*(D13_a)))
+    Lij=Lij.at[1,1].set(L11_fac_a*jnp.sum(grid.L22_weight*grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,2].set(L13_fac_a*jnp.sum(grid.L13_weight*grid.xWeights*(D13_a)))
+    Lij=Lij.at[1,2].set(L13_fac_a*jnp.sum(grid.L23_weight*grid.xWeights*(D13_a)))
     Lij=Lij.at[2,0].set(-Lij.at[0,2].get())
     Lij=Lij.at[2,1].set(-Lij.at[1,2].get())
-    Lij=Lij.at[2,2].set(L33_fac_a*jnp.sum(energy_grid.L33_weight*energy_grid.xWeights*(D33_a)))
+    Lij=Lij.at[2,2].set(L33_fac_a*jnp.sum(grid.L33_weight*grid.xWeights*(D33_a)))
     return Lij
+
+
 @jit
+#Get_fluxes with no momentum correction
+# Now requires explicit temperature, density, and Er arrays (not embedded in Species)
 def get_Neoclassical_Fluxes(
     species,
-    energy_grid,
-    geometry,
+    grid,
+    field,
     database,
     Er,
     temperature,
@@ -97,9 +88,9 @@ def get_Neoclassical_Fluxes(
 ):
     # Compute v_thermal for all species and radial points
     v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
+    r_grid = field.r_grid
+    r_grid_half = field.r_grid_half
+    dr = field.dr
 
     n_species = int(temperature.shape[0])
     n_right = _as_species_constraint(density_right_constraint, n_species)
@@ -146,15 +137,16 @@ def get_Neoclassical_Fluxes(
     # Vectorize Lij calculation over species and radial points
     Lij = jax.vmap(
         lambda a: jax.vmap(
-            lambda r: get_Lij_matrix(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal),
-            in_axes=(0))(geometry.full_grid_indices),
+            lambda r: get_Lij_matrix(species, grid, field, database, a, r, Er, temperature, density, v_thermal),
+            in_axes=(0)
+        )(grid.full_grid_indeces),
         in_axes=(0)
-    )(species.species_indices)
+    )(grid.species_indeces)
     # Lij shape: (n_species, n_radial, 3, 3)
 
     # Vectorize flux calculation over species
     results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
+        grid.species_indeces,
         Lij,
         temperature,
         density,
@@ -171,7 +163,7 @@ def get_Neoclassical_Fluxes(
 
 #####FOR MOMEMTUM CORRECTION
 @jit
-def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal):
+def get_Lij_matrix_with_momentum_correction(species, grid, field, database, index_species, r_index, Er, temperature, density, v_thermal):
     #For no momentum correction, Lij is just a 3 x 3 matrix for each species at each radial position
     Lij=jnp.zeros((5,5))
     Eij=jnp.zeros((5,5))
@@ -179,7 +171,7 @@ def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, data
     #Thermal velocities
     vth_a = v_thermal[index_species, r_index]
     #velocities for convolution
-    v_new_a = energy_grid.v_norm * vth_a
+    v_new_a = grid.v_norm * vth_a
     #Er's for convolution
     Er_vnew_a = Er[r_index] * 1.e+3 / v_new_a
     n = density[index_species, r_index]
@@ -196,63 +188,63 @@ def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, data
     L13_fac_a=-1./jnp.sqrt(jnp.pi)*(species.mass[index_species]/species.charge[index_species])*vth_a**2#*B00(r_grid[r_index])
     L33_fac_a=-1./jnp.sqrt(jnp.pi)*vth_a#*B00(r_grid[r_index])    
     #Interpolate D11's, D13's and D33's 
-    Dij=jax.vmap(get_Dij,in_axes=(None,0,0,None))(geometry.r_grid[r_index],nu_vnew_a,Er_vnew_a,database)
+    Dij=jax.vmap(get_Dij,in_axes=(None,0,0,None))(field.r_grid[r_index],nu_vnew_a,Er_vnew_a,database)
     D11_a=-10**Dij.at[:,0].get()###+4.*nu_vnew_a/3.
     D13_a=-Dij.at[:,1].get()
     D33_a=-jnp.true_divide(Dij.at[:,2].get(),nu_vnew_a)
-    Lij=Lij.at[0,0].set(L11_fac_a*jnp.sum(energy_grid.L11_weight*energy_grid.xWeights*(D11_a)))
-    Lij=Lij.at[0,1].set(L11_fac_a*jnp.sum(energy_grid.L12_weight*energy_grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,0].set(L11_fac_a*jnp.sum(grid.L11_weight*grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,1].set(L11_fac_a*jnp.sum(grid.L12_weight*grid.xWeights*(D11_a)))
     Lij=Lij.at[1,0].set(Lij.at[0,1].get())
-    Lij=Lij.at[1,1].set(L11_fac_a*jnp.sum(energy_grid.L22_weight*energy_grid.xWeights*(D11_a)))
-    Lij=Lij.at[0,2].set(L13_fac_a*jnp.sum(energy_grid.L13_weight*energy_grid.xWeights*(D13_a)))
-    Lij=Lij.at[1,2].set(L13_fac_a*jnp.sum(energy_grid.L23_weight*energy_grid.xWeights*(D13_a)))
+    Lij=Lij.at[1,1].set(L11_fac_a*jnp.sum(grid.L22_weight*grid.xWeights*(D11_a)))
+    Lij=Lij.at[0,2].set(L13_fac_a*jnp.sum(grid.L13_weight*grid.xWeights*(D13_a)))
+    Lij=Lij.at[1,2].set(L13_fac_a*jnp.sum(grid.L23_weight*grid.xWeights*(D13_a)))
     Lij=Lij.at[2,0].set(-Lij.at[0,2].get())
     Lij=Lij.at[2,1].set(-Lij.at[1,2].get())
-    Lij=Lij.at[2,2].set(L33_fac_a*jnp.sum(energy_grid.L33_weight*energy_grid.xWeights*(D33_a)))
+    Lij=Lij.at[2,2].set(L33_fac_a*jnp.sum(grid.L33_weight*grid.xWeights*(D33_a)))
     #Entries of the Lij matrix related with momentum correction
     Lij=Lij.at[0,3].set(Lij.at[1,2].get())
-    Lij=Lij.at[1,3].set(L13_fac_a*jnp.sum(energy_grid.L24_weight*energy_grid.xWeights*(D13_a)))       
+    Lij=Lij.at[1,3].set(L13_fac_a*jnp.sum(grid.L24_weight*grid.xWeights*(D13_a)))       
     Lij=Lij.at[0,4].set(Lij.at[1,3].get()) 
-    Lij=Lij.at[1,4].set(L13_fac_a*jnp.sum(energy_grid.L25_weight*energy_grid.xWeights*(D13_a))) 
+    Lij=Lij.at[1,4].set(L13_fac_a*jnp.sum(grid.L25_weight*grid.xWeights*(D13_a))) 
     Lij=Lij.at[3,0].set(-Lij.at[0,3].get())
     Lij=Lij.at[4,0].set(-Lij.at[0,4].get())    
     Lij=Lij.at[3,1].set(-Lij.at[1,3].get())    
     Lij=Lij.at[4,1].set(-Lij.at[1,4].get())    
-    Lij=Lij.at[3,2].set(L33_fac_a*jnp.sum(energy_grid.L43_weight*energy_grid.xWeights*(D33_a)))
+    Lij=Lij.at[3,2].set(L33_fac_a*jnp.sum(grid.L43_weight*grid.xWeights*(D33_a)))
     Lij=Lij.at[2,3].set(Lij.at[3,2].get())    
-    Lij=Lij.at[3,3].set(L33_fac_a*jnp.sum(energy_grid.L44_weight*energy_grid.xWeights*(D33_a)))
+    Lij=Lij.at[3,3].set(L33_fac_a*jnp.sum(grid.L44_weight*grid.xWeights*(D33_a)))
     Lij=Lij.at[2,4].set(Lij.at[3,3].get())    
     Lij=Lij.at[4,2].set(Lij.at[3,3].get())        
-    Lij=Lij.at[3,4].set(L33_fac_a*jnp.sum(energy_grid.L45_weight*energy_grid.xWeights*(D33_a))) 
+    Lij=Lij.at[3,4].set(L33_fac_a*jnp.sum(grid.L45_weight*grid.xWeights*(D33_a))) 
     Lij=Lij.at[4,3].set(Lij.at[3,4].get())          
-    Lij=Lij.at[4,4].set(L33_fac_a*jnp.sum(energy_grid.L55_weight*energy_grid.xWeights*(D33_a))) 
+    Lij=Lij.at[4,4].set(L33_fac_a*jnp.sum(grid.L55_weight*grid.xWeights*(D33_a))) 
     #collisionality weighted velocity integrals matrix Eij 
-    Eij=Eij.at[0,2].set(L13_fac_a*jnp.sum(energy_grid.L13_weight*nu_a*energy_grid.xWeights*(D13_a)))
-    Eij=Eij.at[1,2].set(L13_fac_a*jnp.sum(energy_grid.L23_weight*nu_a*energy_grid.xWeights*(D13_a)))
+    Eij=Eij.at[0,2].set(L13_fac_a*jnp.sum(grid.L13_weight*nu_a*grid.xWeights*(D13_a)))
+    Eij=Eij.at[1,2].set(L13_fac_a*jnp.sum(grid.L23_weight*nu_a*grid.xWeights*(D13_a)))
     Eij=Eij.at[2,0].set(-Eij.at[0,2].get())
     Eij=Eij.at[2,1].set(-Eij.at[1,2].get())   
-    Eij=Eij.at[2,2].set(L33_fac_a*jnp.sum(energy_grid.L33_weight*nu_a*energy_grid.xWeights*(D33_a)))    
+    Eij=Eij.at[2,2].set(L33_fac_a*jnp.sum(grid.L33_weight*nu_a*grid.xWeights*(D33_a)))    
     ##
     Eij=Eij.at[0,3].set(Eij.at[1,2].get())
-    Eij=Eij.at[1,3].set(L13_fac_a*jnp.sum(energy_grid.L24_weight*nu_a*energy_grid.xWeights*(D13_a)))  
+    Eij=Eij.at[1,3].set(L13_fac_a*jnp.sum(grid.L24_weight*nu_a*grid.xWeights*(D13_a)))  
     Eij=Eij.at[0,4].set(Eij.at[1,3].get())  
-    Eij=Eij.at[1,4].set(L13_fac_a*jnp.sum(energy_grid.L25_weight*nu_a*energy_grid.xWeights*(D13_a))) 
+    Eij=Eij.at[1,4].set(L13_fac_a*jnp.sum(grid.L25_weight*nu_a*grid.xWeights*(D13_a))) 
     Eij=Eij.at[3,0].set(-Eij.at[0,3].get())
     Eij=Eij.at[4,0].set(-Eij.at[0,4].get())    
     Eij=Eij.at[3,1].set(-Eij.at[1,3].get())    
     Eij=Eij.at[4,1].set(-Eij.at[1,4].get())    
-    Eij=Eij.at[3,2].set(L33_fac_a*jnp.sum(energy_grid.L43_weight*nu_a*energy_grid.xWeights*(D33_a)))
+    Eij=Eij.at[3,2].set(L33_fac_a*jnp.sum(grid.L43_weight*nu_a*grid.xWeights*(D33_a)))
     Eij=Eij.at[2,3].set(Eij.at[3,2].get())    
-    Eij=Eij.at[3,3].set(L33_fac_a*jnp.sum(energy_grid.L44_weight*nu_a*energy_grid.xWeights*(D33_a)))
+    Eij=Eij.at[3,3].set(L33_fac_a*jnp.sum(grid.L44_weight*nu_a*grid.xWeights*(D33_a)))
     Eij=Eij.at[2,4].set(Eij.at[3,3].get())    
     Eij=Eij.at[4,2].set(Eij.at[3,3].get())        
-    Eij=Eij.at[3,4].set(L33_fac_a*jnp.sum(energy_grid.L45_weight*nu_a*energy_grid.xWeights*(D33_a))) 
+    Eij=Eij.at[3,4].set(L33_fac_a*jnp.sum(grid.L45_weight*nu_a*grid.xWeights*(D33_a))) 
     Eij=Eij.at[4,3].set(Eij.at[3,4].get())          
-    Eij=Eij.at[4,4].set(L33_fac_a*jnp.sum(energy_grid.L55_weight*nu_a*energy_grid.xWeights*(D33_a)))     
+    Eij=Eij.at[4,4].set(L33_fac_a*jnp.sum(grid.L55_weight*nu_a*grid.xWeights*(D33_a)))     
     #Velocity average of collisionalities
-    nu_weighted_average=nu_weighted_average.at[0].set(jnp.sum(nu_a*energy_grid.L13_weight*energy_grid.xWeights))
-    nu_weighted_average=nu_weighted_average.at[1].set(jnp.sum(nu_a*energy_grid.L23_weight*energy_grid.xWeights))
-    nu_weighted_average=nu_weighted_average.at[2].set(jnp.sum(nu_a*energy_grid.L24_weight*energy_grid.xWeights))    
+    nu_weighted_average=nu_weighted_average.at[0].set(jnp.sum(nu_a*grid.L13_weight*grid.xWeights))
+    nu_weighted_average=nu_weighted_average.at[1].set(jnp.sum(nu_a*grid.L23_weight*grid.xWeights))
+    nu_weighted_average=nu_weighted_average.at[2].set(jnp.sum(nu_a*grid.L24_weight*grid.xWeights))    
     return Lij,Eij,nu_weighted_average
 
 
@@ -498,78 +490,15 @@ def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
 
 
 @jit
-#Get_fluxes with momentum correction, unified interface
+#Get_fluxes with momentum correction, fully explicit arguments
 def get_Neoclassical_Fluxes_With_Momentum_Correction(
-    species,
-    grid,
-    field,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
+    grid, field, database,
+    mass, charge, Er, temperature, density, v_thermal,
+    A1, A2, A3, dndr, dTdr
 ):
-    # Compute v_thermal for all species and radial points
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = field.r_grid
-    r_grid_half = field.r_grid_half
-    dr = field.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    # Compute gradients and thermodynamic forces for each species
-    def get_gradients_and_forces(density, temperature, n_rc, n_rg, t_rc, t_rg, Er, a):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        return dndr, dTdr, A1, A2, A3
-
-    # Vectorize over species
-    grads_forces = jax.vmap(get_gradients_and_forces, in_axes=(0,0,0,0,0,0,None,0))(
-        density,
-        temperature,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-        Er,
-        jnp.arange(n_species),
-    )
-    dndr, dTdr, A1, A2, A3 = grads_forces
-
+    n_species = density.shape[0]
     species_indices = jnp.arange(n_species)
-    radial_indices = grid.full_grid_indices
+    radial_indices = grid.full_grid_indeces
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
     Lij, Eij, nu_weighted_average = jax.vmap(
         jax.vmap(
@@ -578,7 +507,7 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         ),
         in_axes=(None, None, None, None, 0, None, None, None, None, None)
     )(
-        species, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
+        mass, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
     )
     # Adjust Lij and Eij as before
     Lij = Lij.at[:, 0, :, :].set(Lij.at[:, 1, :, :].get())
@@ -589,9 +518,8 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
     )(
         grid, field, radial_indices, Lij, Eij, nu_weighted_average,
-        v_thermal, density, temperature, A1, A2, A3, species.charge, dndr, dTdr
+        v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr
     )
-    # correction is (Gamma, Q, Upar, qpar, Upar2)
     return correction  #, Lij, Eij, nu_weighted_average
 
 

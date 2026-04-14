@@ -1,0 +1,78 @@
+# Example TOML for NEOPAX: Electric Field Diffusion with Custom Boundary Conditions
+
+[general]
+mode = 'transport'
+
+[geometry]
+vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
+boozer_file = "./examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+n_radial = 51
+
+[neoclassical]
+flux_model = "monkes_database"
+entropy_model = "monkes_database"
+neoclassical_file = './examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+
+[energy_grid]
+n_x = 4
+
+[species]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = 4.21e20
+n_edge = 0.6e20
+T0 = 17.8e3
+T_edge = 0.7e3
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
+density_shape_power = 10.0
+temperature_shape_power = 2.0
+n_scale = 1.0
+T_scale = 1.0
+er_initialization_mode = "parabolic"
+er0_scale = 100.0
+er0_peak_rho = 0.8
+
+[boundary.density.left]
+type = "neumann"
+gradient = 0.0
+[boundary.density.right]
+type = "dirichlet"
+value = 0.6e20
+
+[boundary.temperature.left]
+type = "neumann"
+gradient = 0.0
+[boundary.temperature.right]
+type = "robin"
+value = 0.7e3
+decay_length = 0.5
+
+[boundary.Er.left]
+type = "dirichlet"
+value = 0.0
+[boundary.Er.right]
+type = "neumann"
+gradient = 0.0
+
+
+# --- Equation selection: Only evolve Er (diffusion) ---
+[equations]
+toggle_density = [false, false, false]
+toggle_temperature = [false, false, false]
+toggle_Er = true
+
+# --- Time solver parameters ---
+[transport_solver]
+integrator = "radau"
+t0 = 0.0
+t_final = 1.0
+dt = 1.0e-2
+n_save = 10
+rtol = 1.0e-7
+atol = 1.0e-7

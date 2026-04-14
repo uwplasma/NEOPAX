@@ -19,7 +19,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 
-from ._ambipolarity import find_ambipolar_Er_min_entropy_jit
+from ._ambipolarity import find_ambipolar_Er_min_entropy_jit, find_ambipolar_Er_min_entropy_jit_multires
 from ._neoclassical import get_Neoclassical_Fluxes
 from ._state import TransportState
 from ._transport_solvers import build_time_solver
@@ -82,23 +82,6 @@ def _find_electron_index(charge_qp: Any) -> int:
         return -1
     eidx = int(jnp.argmin(q))
     return eidx if float(q[eidx]) < 0.0 else -1
-
-
-def _apply_floor_rhs(rhs: jax.Array, profile: jax.Array, floor: Any) -> jax.Array:
-    """Prevent further decreases where profile is already below a configured floor."""
-    if floor is None:
-        return rhs
-
-    floor_arr = jnp.asarray(floor, dtype=profile.dtype)
-    while floor_arr.ndim < profile.ndim:
-        floor_arr = jnp.expand_dims(floor_arr, axis=-1)
-    if floor_arr.shape[0] > profile.shape[0]:
-        floor_arr = floor_arr[: profile.shape[0]]
-    elif floor_arr.shape[0] < profile.shape[0] and floor_arr.ndim > 0:
-        pad = profile.shape[0] - floor_arr.shape[0]
-        floor_arr = jnp.pad(floor_arr, (0, pad), mode="edge")
-
-    return jnp.where(profile < floor_arr, jnp.maximum(rhs, 0.0), rhs)
 
 
 def _as_transport_state(y: Any) -> TransportState:
@@ -324,12 +307,6 @@ class MainTransportModel:
             )
             density_rhs = density_rhs.at[eidx, :].set(qn_rhs)
 
-        # Prevent negative updates where profiles are already below configured floors.
-        density_floor = getattr(self.solver_parameters, "density_floor", None)
-        temperature_floor = getattr(self.solver_parameters, "temperature_floor", None)
-        density_rhs = _apply_floor_rhs(density_rhs, state.density, density_floor)
-        temperature_rhs = _apply_floor_rhs(temperature_rhs, state.temperature, temperature_floor)
-
         return TransportState(
             density=density_rhs,
             temperature=temperature_rhs,
@@ -341,84 +318,6 @@ class MainTransportModel:
     def vector_field(self, t: jax.Array, y: Any, args: tuple[Any, ...]) -> Any:
         rhs_state = self._rhs_transport_state(t, y, args)
         return rhs_state
-
-    def ap_preconditioner_diag(self, t: jax.Array, y: Any, args: tuple[Any, ...]) -> jax.Array:
-        """Return flat AP diagonal for optional theta-Newton stabilization."""
-        del t
-        initial_species, grid, field, database, turbulent, _ = args
-        state = _as_transport_state(y)
-
-        n_species = state.density.shape[0]
-        zeros_state = TransportState(
-            density=jnp.zeros_like(state.density),
-            temperature=jnp.zeros_like(state.temperature),
-            Er=jnp.zeros_like(state.Er),
-            species_names=state.species_names,
-            is_evolved=state.is_evolved,
-        )
-
-        evolve_er = bool(getattr(self.solver_parameters, "evolve_Er", True))
-        er_mode = getattr(self.solver_parameters, "er_mode", "diffusion")
-        if (not evolve_er) or (er_mode != "diffusion"):
-            flat_zero, _ = jax.flatten_util.ravel_pytree(zeros_state)
-            return flat_zero
-
-        evolve_density = _resize_toggle_array(
-            getattr(self.solver_parameters, "evolve_density", None), n_species, default=True
-        )
-        evolve_temperature = _resize_toggle_array(
-            getattr(self.solver_parameters, "evolve_temperature", None), n_species, default=True
-        )
-
-        if er_mode == "entropy":
-            er_for_physics = _compute_entropy_mode_Er(
-                initial_species,
-                state,
-                grid,
-                field,
-                database,
-                self.solver_parameters,
-                self.bc,
-            )
-            state_for_physics = dataclasses.replace(state, Er=er_for_physics)
-        else:
-            state_for_physics = state
-
-        flux_models = _compute_flux_models(
-            self.transport_flux_model,
-            initial_species,
-            state_for_physics,
-            grid,
-            field,
-            database,
-            turbulent,
-            self.solver_parameters,
-            self.bc,
-        )
-
-        er_eq = get_equation("Er")()
-        diag_er, _ = er_eq.ap_linear_split(
-            state_for_physics,
-            flux_models,
-            self.source_models,
-            field,
-            self.solver_parameters,
-            bc=self.bc,
-            charge_qp=initial_species.charge_qp,
-            species_mass=initial_species.mass,
-        )
-
-        density_diag = jnp.zeros_like(state.density) * evolve_density[:, None]
-        temperature_diag = jnp.zeros_like(state.temperature) * evolve_temperature[:, None]
-        diag_state = TransportState(
-            density=density_diag,
-            temperature=temperature_diag,
-            Er=jnp.abs(diag_er),
-            species_names=state.species_names,
-            is_evolved=state.is_evolved,
-        )
-        flat_diag, _ = jax.flatten_util.ravel_pytree(diag_state)
-        return flat_diag
 
 
 def main_transport_solver(
@@ -457,8 +356,4 @@ def solve_transport_equations(
         transport_flux_model=transport_flux_model,
     )
     backend = build_time_solver(solver_parameters, solver_override=solver)
-    solve_kwargs = {}
-    if bool(getattr(solver_parameters, "use_ap_er_preconditioner", False)) and backend.__class__.__name__ == "ThetaNewtonSolver":
-        solve_kwargs["ap_preconditioner"] = model.ap_preconditioner_diag
-
-    return backend.solve(state0, model.vector_field, args=args, **solve_kwargs)
+    return backend.solve(state0, model.vector_field, args=args)

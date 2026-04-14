@@ -98,13 +98,12 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
 @dataclasses.dataclass(frozen=True, eq=False)
 class MonkesDatabaseTransportModel(TransportFluxModelBase):
     def __call__(self, state, geometry=None, params=None) -> dict:
-        # Assume params contains all needed info (species, grid, etc.)
-        # This is a minimal, jittable, differentiable wrapper
+        # Assume params contains all needed info (species, energy_grid, etc.)
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
             params["species"],
-            params["grid"],
-            params["field"],
-            params["neoclassical_data"],
+            params["energy_grid"],
+            params["geometry"],
+            params["database"],
             state.Er,
             state.temperature,
             state.density,
@@ -127,9 +126,9 @@ class MonkesDatabaseWithMomentumTransportModel(TransportFluxModelBase):
         temperature_right_grad_constraint = params.get("temperature_right_grad_constraint", None)
         correction = get_Neoclassical_Fluxes_With_Momentum_Correction(
             params["species"],
-            params["grid"],
-            params["field"],
-            params["neoclassical_data"],
+            params["energy_grid"],
+            params["geometry"],
+            params["database"],
             state.Er,
             state.temperature,
             state.density,
@@ -175,8 +174,14 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
 def build_transport_flux_model(params: Any) -> CombinedTransportFluxModel:
     """
     Build the active composed transport model from runtime parameters.
-    Expects params["neoclassical_flux_model"] and params["turbulent_flux_model"] to specify model names.
+    Accepts either a string model name (for simple ambipolarity) or a dict with keys.
     """
+    if isinstance(params, str):
+        # Simple case: just a single model name (ambipolarity)
+        neo_model = get_transport_flux_model(params)
+        turb_model = get_transport_flux_model("none")
+        return CombinedTransportFluxModel(neo_model, turb_model)
+    # Original logic for dict input
     neo_model = get_transport_flux_model(params["neoclassical_flux_model"])
     turb_model = get_transport_flux_model(params["turbulent_flux_model"])
     return CombinedTransportFluxModel(neo_model, turb_model)

@@ -511,7 +511,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
             Gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
             if Gamma is None:
                 raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            return jnp.sum(q[:] * Gamma[:,i])
+            return jnp.sum(q[:, None] * Gamma)
         return gamma
 
     def entropy_func_factory(i):
@@ -521,7 +521,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
             Gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
             if Gamma is None:
                 raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            return jnp.sum(jnp.abs(Gamma[:,i]))
+            return jnp.sum(jnp.abs(Gamma))
         return entropy
 
     def root_finder_for_radius(i):
@@ -576,11 +576,11 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
     if er_ambipolar_blocksize is None or er_ambipolar_blocksize >= n_radial:
         # Pure vmap
         result = jax.vmap(root_finder_for_radius)(jnp.arange(n_radial))
-        return tuple(np.asarray(arr)[:n_radial] for arr in result)
     else:
         # Blocked vmap for memory efficiency, JAX-friendly using lax.fori_loop with static indices
         block_size = er_ambipolar_blocksize
         n_blocks = (n_radial + block_size - 1) // block_size
+        # Get output shapes by running one block
         idxs0 = jnp.arange(block_size)
         roots0, entropies0, best0, n_roots0 = jax.vmap(root_finder_for_radius)(idxs0)
         roots_shape = (n_radial,) + roots0.shape[1:]
@@ -589,43 +589,46 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         n_roots_shape = (n_radial,) + n_roots0.shape[1:]
 
         def init_arrays():
-            nan_roots = jnp.full(roots_shape, jnp.nan, dtype=roots0.dtype)
-            nan_entropies = jnp.full(entropies_shape, jnp.nan, dtype=entropies0.dtype)
-            nan_best = jnp.full(best_shape, jnp.nan, dtype=best0.dtype)
-            zero_n_roots = jnp.zeros(n_roots_shape, dtype=jnp.int32)
             return (
-                nan_roots,
-                nan_entropies,
-                nan_best,
-                zero_n_roots,
+                jnp.zeros(roots_shape, roots0.dtype),
+                jnp.zeros(entropies_shape, entropies0.dtype),
+                jnp.zeros(best_shape, best0.dtype),
+                jnp.zeros(n_roots_shape, dtype=jnp.int32),
             )
 
         def body_fun(b, carry):
             roots_all, entropies_all, best_roots, n_roots_all = carry
             start = b * block_size
-            n_valid = int(np.minimum(block_size, n_radial - start))
-            idxs = start + np.arange(block_size)
-            # Only compute for valid indices in this block
-            valid_idxs = idxs[:n_valid]
-            roots_b, entropies_b, best_b, n_roots_b = jax.vmap(root_finder_for_radius)(jnp.array(valid_idxs))
-            # Update only the valid part of the arrays
-            if roots_b.ndim == 1:
-                roots_all = roots_all.at[start:start+n_valid].set(roots_b)
-                entropies_all = entropies_all.at[start:start+n_valid].set(entropies_b)
-                best_roots = best_roots.at[start:start+n_valid].set(best_b)
-                n_roots_all = n_roots_all.at[start:start+n_valid].set(n_roots_b)
-            else:
-                roots_all = roots_all.at[start:start+n_valid, ...].set(roots_b)
-                entropies_all = entropies_all.at[start:start+n_valid, ...].set(entropies_b)
-                best_roots = best_roots.at[start:start+n_valid, ...].set(best_b)
-                n_roots_all = n_roots_all.at[start:start+n_valid, ...].set(n_roots_b)
+            n_valid = jnp.minimum(block_size, n_radial - start)
+            idxs = start + jnp.arange(block_size)
+            roots_b, entropies_b, best_b, n_roots_b = jax.vmap(root_finder_for_radius)(idxs)
+            # Mask out invalid entries (beyond n_radial) by zeroing or NaN
+            def mask_block(arr):
+                mask = jnp.arange(block_size) < n_valid
+                if arr.ndim == 1:
+                    return jnp.where(mask, arr, jnp.nan)
+                else:
+                    # For 2D or higher, mask first axis
+                    mask_shape = (block_size,) + (1,) * (arr.ndim - 1)
+                    return jnp.where(mask.reshape(mask_shape), arr, jnp.nan)
+            roots_b = mask_block(roots_b)
+            entropies_b = mask_block(entropies_b)
+            best_b = mask_block(best_b)
+            n_roots_b = mask_block(n_roots_b)
+            # Defensive: ensure n_roots_b is int32 for JAX dynamic_update_slice
+            n_roots_b = n_roots_b.astype(jnp.int32)
+            # Use dynamic_update_slice to update arrays
+            roots_all = lax.dynamic_update_slice(roots_all, roots_b, (start,) + (0,) * (roots_all.ndim - 1))
+            entropies_all = lax.dynamic_update_slice(entropies_all, entropies_b, (start,) + (0,) * (entropies_all.ndim - 1))
+            best_roots = lax.dynamic_update_slice(best_roots, best_b, (start,) + (0,) * (best_roots.ndim - 1))
+            n_roots_all = lax.dynamic_update_slice(n_roots_all, n_roots_b, (start,) + (0,) * (n_roots_all.ndim - 1))
             return (roots_all, entropies_all, best_roots, n_roots_all)
 
-        # Use Python for loop for block processing (outside JAX JIT)
-        roots_all, entropies_all, best_roots, n_roots_all = init_arrays()
-        for b in range(n_blocks):
-            roots_all, entropies_all, best_roots, n_roots_all = body_fun(b, (roots_all, entropies_all, best_roots, n_roots_all))
-        return tuple(np.asarray(arr)[:n_radial] for arr in (roots_all, entropies_all, best_roots, n_roots_all))
+        roots_all, entropies_all, best_roots, n_roots_all = lax.fori_loop(
+            0, n_blocks, body_fun, init_arrays()
+        )
+        result = (roots_all, entropies_all, best_roots, n_roots_all)
+    return result
 
 # --- Orchestration/config reading only ---
 def solve_ambipolarity_roots_from_config(state, config, params):
@@ -648,7 +651,6 @@ def solve_ambipolarity_roots_from_config(state, config, params):
     flux_model = build_transport_flux_model(flux_model_name)
     entropy_model = get_entropy_model(entropy_model_name)
 
-
     # Call the JIT/diff radial root-finder
     roots_all, entropies_all, best_roots, n_roots_all = solve_ambipolarity_roots_radial(
         state, config, params, model_name, flux_model, entropy_model, amb_cfg
@@ -659,18 +661,10 @@ def solve_ambipolarity_roots_from_config(state, config, params):
     er_ambipolar_write_hdf5 = amb_cfg.get("er_ambipolar_write_hdf5", False)
     er_ambipolar_output_dir = amb_cfg.get("er_ambipolar_output_dir", None)
 
-    # Ensure only the first n_radial valid entries are used (in case of blocksize padding)
-    n_radial = getattr(state, "Er", None)
-    if n_radial is not None and hasattr(n_radial, "shape"):
-        n_radial = n_radial.shape[0]
-    else:
-        n_radial = best_roots.shape[0] if hasattr(best_roots, "shape") else 1
-
-    roots_all = np.asarray(roots_all)[:n_radial]
-    entropies_all = np.asarray(entropies_all)[:n_radial]
-    best_roots = np.asarray(best_roots)[:n_radial]
-    n_roots_all = np.asarray(n_roots_all)[:n_radial]
-
+    n_radial = n_roots_all.shape[0] if hasattr(n_roots_all, "shape") else 1
+    n_roots_all = jnp.atleast_1d(n_roots_all)
+    if n_roots_all.shape[0] != n_radial:
+        n_roots_all = jnp.broadcast_to(n_roots_all, (n_radial,))
     return roots_all, entropies_all, best_roots, n_roots_all, er_ambipolar_plot, er_ambipolar_write_hdf5, er_ambipolar_output_dir
 
 
