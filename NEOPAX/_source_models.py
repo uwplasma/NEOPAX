@@ -70,32 +70,53 @@ class ExampleStateDrivenSource(SourceModelBase):
 class CombinedSourceModel(SourceModelBase):
     sources: tuple[SourceModelBase, ...] = dataclasses.field(default_factory=tuple)
     def __call__(self, state: Any):
-        out = self.sources[0](state)
-        for src in self.sources[1:]:
-            out = out + src(state)
-        return out
+        # Collect all outputs as dicts
+        outs = [src(state) for src in self.sources]
+        # Use jax.tree_util to sum all dicts elementwise
+        def tree_add(x, y):
+            if x is None:
+                return y
+            if y is None:
+                return x
+            return jax.tree_util.tree_map(lambda a, b: a + b, x, y)
+        from functools import reduce
+        return reduce(tree_add, outs, None) or {}
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class FusionPowerFractionElectronsSource(SourceModelBase):
-    def __call__(self, state):
-        return fusion_power_fraction_electrons(state)
+    def __call__(self, state, species):
+        return {"fusion_power_fraction_electrons": fusion_power_fraction_electrons(state, species)}
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class DTReactionSource(SourceModelBase):
-    def __call__(self, state):
-        return dt_reaction(state)
+    def __call__(self, state, species):
+        DTreactionRate, HeSource, AlphaPower = dt_reaction(state, species)
+        return {
+            "DTreactionRate": DTreactionRate,
+            "HeSource": HeSource,
+            "AlphaPower": AlphaPower,
+        }
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class PowerExchangeSource(SourceModelBase):
-    def __init__(self, idx_a=None, idx_b=None):
-        self.idx_a = idx_a
-        self.idx_b = idx_b
-    def __call__(self, state, species=None):
-        return power_exchange(state, idx_a=self.idx_a, idx_b=self.idx_b, species=species)
+    idx_a: str = None
+    idx_b: str = None
+    def __call__(self, state, species):
+        idx_a_val = species.species_idx[self.idx_a] if self.idx_a is not None else None
+        idx_b_val = species.species_idx[self.idx_b] if self.idx_b is not None else None
+        return {"power_exchange": power_exchange(state, idx_a=idx_a_val, idx_b=idx_b_val, species=species)}
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class BremsstrahlungRadiationSource(SourceModelBase):
-    def __init__(self, ZD=None, ZT=None):
-        self.ZD = ZD
-        self.ZT = ZT
-    def __call__(self, state, species=None):
-        return bremsstrahlung_radiation(state, ZD=self.ZD, ZT=self.ZT, species=species)
+    ZD: float = None
+    ZT: float = None
+    def __call__(self, state, species):
+        PBrems, Zeff = bremsstrahlung_radiation(state, species=species)
+        return {"PBrems": PBrems, "Zeff": Zeff}
 
 def get_source_model(name: str, **kwargs) -> SourceModelBase:
     _ensure_default_source_models_registered()

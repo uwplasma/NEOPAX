@@ -1,7 +1,7 @@
 # Example TOML for NEOPAX ambipolarity root-finding with refactored orchestrator
 # This config enables HDF5 output and plotting of roots/entropy branches
 [general]
-mode='fluxes'
+mode='ambipolarity'
 
 [geometry]
 vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"

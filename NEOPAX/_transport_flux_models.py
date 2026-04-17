@@ -6,7 +6,17 @@ import abc
 import dataclasses
 import jax
 import jax.numpy as jnp
-from ._neoclassical import get_Neoclassical_Fluxes,get_Neoclassical_Fluxes_With_Momentum_Correction
+from ._cell_variable import get_gradient_density, get_gradient_temperature
+from ._neoclassical import (
+    get_Lij_matrix_local,
+    get_Neoclassical_Fluxes,
+    get_Neoclassical_Fluxes_With_Momentum_Correction,
+)
+from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
+from ._state import get_v_thermal
+
+DENSITY_STATE_TO_PHYSICAL = 1.0e20
+TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
 from ._turbulence import get_Turbulent_Fluxes_Analytical
 
 
@@ -14,15 +24,14 @@ from ._turbulence import get_Turbulent_Fluxes_Analytical
 # Registry for modular selection
 TRANSPORT_FLUX_MODEL_REGISTRY: dict[str, Callable[[], "TransportFluxModelBase"]] = {}
 
-def register_transport_flux_model(name: str, builder: Callable[[], "TransportFluxModelBase"]) -> None:
+def register_transport_flux_model(name: str, builder: Callable[..., "TransportFluxModelBase"]) -> None:
     TRANSPORT_FLUX_MODEL_REGISTRY[str(name).strip().lower()] = builder
 
-def get_transport_flux_model(name: str) -> "TransportFluxModelBase":
+def get_transport_flux_model(name: str) -> Callable[..., "TransportFluxModelBase"]:
     key = str(name).strip().lower()
     if key not in TRANSPORT_FLUX_MODEL_REGISTRY:
         raise ValueError(f"Unknown transport flux model '{name}'.")
-    return TRANSPORT_FLUX_MODEL_REGISTRY[key]()
-
+    return TRANSPORT_FLUX_MODEL_REGISTRY[key]
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -37,6 +46,10 @@ class TransportFluxModelBase(abc.ABC):
         @abc.abstractmethod
         def __call__(self, state, geometry=None, params=None) -> dict:
                 pass
+
+        def build_local_particle_flux_evaluator(self, state):
+                del state
+                return None
 
 
 def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -77,33 +90,57 @@ def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax
 class CombinedTransportFluxModel(TransportFluxModelBase):
     neoclassical_model: TransportFluxModelBase
     turbulent_model: TransportFluxModelBase
+    classical_model: TransportFluxModelBase
 
-    def __call__(self, state, geometry=None, params=None) -> dict:
-        # Call both models and sum outputs
-        neo = self.neoclassical_model(state, geometry, params)
-        turb = self.turbulent_model(state, geometry, params)
-        out = {}
-        for key in ("Gamma", "Q", "Upar"):
-            out[key] = neo.get(key, 0) + turb.get(key, 0)
-        out["Gamma_neo"] = neo.get("Gamma", 0)
-        out["Q_neo"] = neo.get("Q", 0)
-        out["Upar_neo"] = neo.get("Upar", 0)
-        out["Gamma_turb"] = turb.get("Gamma", 0)
-        out["Q_turb"] = turb.get("Q", 0)
-        out["Upar_turb"] = turb.get("Upar", 0)
+    def __call__(self, state, *args, **kwargs) -> dict:
+        # Only pass 'state' to the model instances, as expected by their __call__
+        neo = self.neoclassical_model(state)
+        turb = self.turbulent_model(state)
+        classical = self.classical_model(state)
+        out = {
+            "Gamma": neo.get("Gamma", 0) + turb.get("Gamma", 0) + classical.get("Gamma", 0),
+            "Q":     neo.get("Q", 0)     + turb.get("Q", 0)     + classical.get("Q", 0),
+            "Upar":  neo.get("Upar", 0)  + turb.get("Upar", 0)  + classical.get("Upar", 0),
+            "Gamma_neo": neo.get("Gamma", 0),
+            "Q_neo":     neo.get("Q", 0),
+            "Upar_neo":  neo.get("Upar", 0),
+            "Gamma_turb": turb.get("Gamma", 0),
+            "Q_turb":     turb.get("Q", 0),
+            "Upar_turb":  turb.get("Upar", 0),
+            "Gamma_classical": classical.get("Gamma", 0),
+            "Q_classical":     classical.get("Q", 0),
+            "Upar_classical":  classical.get("Upar", 0),
+        }
         return out
+
+    def build_local_particle_flux_evaluator(self, state):
+        neo_eval = self.neoclassical_model.build_local_particle_flux_evaluator(state)
+        turb_eval = self.turbulent_model.build_local_particle_flux_evaluator(state)
+        classical_eval = self.classical_model.build_local_particle_flux_evaluator(state)
+        if neo_eval is None or turb_eval is None or classical_eval is None:
+            return None
+
+        def evaluator(radius_index, er_value):
+            return neo_eval(radius_index, er_value) + turb_eval(radius_index, er_value) + classical_eval(radius_index, er_value)
+
+        return evaluator
+
 
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class MonkesDatabaseTransportModel(TransportFluxModelBase):
-    def __call__(self, state, geometry=None, params=None) -> dict:
-        # Assume params contains all needed info (species, energy_grid, etc.)
+    species: Any
+    energy_grid: Any
+    geometry: Any
+    database: Any
+
+    def __call__(self, state) -> dict:
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
-            params["species"],
-            params["energy_grid"],
-            params["geometry"],
-            params["database"],
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            self.database,
             state.Er,
             state.temperature,
             state.density,
@@ -114,79 +151,149 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             "Upar": upar_neo,
         }
 
+    def build_local_particle_flux_evaluator(self, state):
+        species = self.species
+        energy_grid = self.energy_grid
+        geometry = self.geometry
+        database = self.database
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class MonkesDatabaseWithMomentumTransportModel(TransportFluxModelBase):
-    def __call__(self, state, geometry=None, params=None) -> dict:
-        # Use new unified get_Neoclassical_Fluxes_With_Momentum_Correction interface
-        # Pass boundary constraints if present in params
-        density_right_constraint = params.get("density_right_constraint", None)
-        density_right_grad_constraint = params.get("density_right_grad_constraint", None)
-        temperature_right_constraint = params.get("temperature_right_constraint", None)
-        temperature_right_grad_constraint = params.get("temperature_right_grad_constraint", None)
-        correction = get_Neoclassical_Fluxes_With_Momentum_Correction(
-            params["species"],
-            params["energy_grid"],
-            params["geometry"],
-            params["database"],
-            state.Er,
-            state.temperature,
-            state.density,
-            density_right_constraint=density_right_constraint,
-            density_right_grad_constraint=density_right_grad_constraint,
-            temperature_right_constraint=temperature_right_constraint,
-            temperature_right_grad_constraint=temperature_right_grad_constraint,
-        )
-        Gamma, Q, Upar, *_ = correction
-        return {"Gamma": Gamma, "Q": Q, "Upar": Upar}
+        def evaluator(radius_index, er_value):
+            er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
+            er_profile = state.Er.at[radius_index].set(er_scalar)
+            _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
+                species,
+                energy_grid,
+                geometry,
+                database,
+                er_profile,
+                state.temperature,
+                state.density,
+            )
+            return gamma_neo[:, radius_index]
+
+        return evaluator
+    
 
 
+# --- Torax-style, JAX-friendly ZeroTransportModel ---
 @dataclasses.dataclass(frozen=True, eq=False)
 class ZeroTransportModel(TransportFluxModelBase):
-    def __call__(self, state, geometry=None, params=None) -> dict:
-        gamma = jnp.zeros_like(state.density)
-        q = jnp.zeros_like(state.density)
-        upar = jnp.zeros_like(state.density)
+    shape: Any = None
+
+    def __call__(self, state) -> dict:
+        arr_shape = self.shape if self.shape is not None else state.density.shape
+        gamma = jnp.zeros(arr_shape)
+        q = jnp.zeros(arr_shape)
+        upar = jnp.zeros(arr_shape)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
+    def build_local_particle_flux_evaluator(self, state):
+        zeros = jnp.zeros(state.density.shape[0], dtype=state.density.dtype)
+
+        def evaluator(radius_index, er_value):
+            del radius_index, er_value
+            return zeros
+
+        return evaluator
 
 
 
 
+
+
+# --- Torax-style, JAX-friendly AnalyticalTurbulentTransportModel ---
 @dataclasses.dataclass(frozen=True, eq=False)
 class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
-    def __call__(self, state, geometry=None, params=None) -> dict:
-        # Assume params contains all needed info (chi_t, chi_n, etc.)
+    species: Any
+    grid: Any
+    chi_t: Any
+    chi_n: Any
+    field: Any
+
+    def __call__(self, state) -> dict:
         gamma_turb, q_turb = get_Turbulent_Fluxes_Analytical(
-            params["species"],
-            params["grid"],
-            params["chi_t"],
-            params["chi_n"],
+            self.species,
+            self.grid,
+            self.chi_t,
+            self.chi_n,
             state.temperature,
             state.density,
-            params["field"],
+            self.field,
         )
         upar = jnp.zeros_like(state.density)
         return {"Gamma": gamma_turb, "Q": q_turb, "Upar": upar}
 
+    def build_local_particle_flux_evaluator(self, state):
+        gamma_turb, _ = get_Turbulent_Fluxes_Analytical(
+            self.species,
+            self.grid,
+            self.chi_t,
+            self.chi_n,
+            state.temperature,
+            state.density,
+            self.field,
+        )
+
+        def evaluator(radius_index, er_value):
+            del er_value
+            return gamma_turb[:, radius_index]
+
+        return evaluator
 
 
-def build_transport_flux_model(params: Any) -> CombinedTransportFluxModel:
+# --- PATCH: Accept [neoclassical]/flux_model and [turbulence]/model as defaults ---
+
+# --- Refactored: Only the orchestrator builds models; this function is now a pure factory ---
+def build_transport_flux_model(neo_model: TransportFluxModelBase,
+                              turb_model: TransportFluxModelBase,
+                              classical_model: TransportFluxModelBase = None) -> CombinedTransportFluxModel:
     """
-    Build the active composed transport model from runtime parameters.
-    Accepts either a string model name (for simple ambipolarity) or a dict with keys.
+    Build the composed transport model from explicit model instances.
+    All models must be constructed up front by the orchestrator.
     """
-    if isinstance(params, str):
-        # Simple case: just a single model name (ambipolarity)
-        neo_model = get_transport_flux_model(params)
-        turb_model = get_transport_flux_model("none")
-        return CombinedTransportFluxModel(neo_model, turb_model)
-    # Original logic for dict input
-    neo_model = get_transport_flux_model(params["neoclassical_flux_model"])
-    turb_model = get_transport_flux_model(params["turbulent_flux_model"])
-    return CombinedTransportFluxModel(neo_model, turb_model)
+    if classical_model is None:
+        classical_model = ZeroTransportModel()
+    return CombinedTransportFluxModel(neo_model, turb_model, classical_model)
 
-register_transport_flux_model("monkes_database", MonkesDatabaseTransportModel)
-register_transport_flux_model("monkes_database_with_momentum", MonkesDatabaseWithMomentumTransportModel)
-register_transport_flux_model("turbulent_analytical", AnalyticalTurbulentTransportModel)
-register_transport_flux_model("none", ZeroTransportModel)
+register_transport_flux_model(
+    "monkes_database",
+    lambda species, energy_grid, geometry, database: MonkesDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    ),
+)
+
+
+register_transport_flux_model(
+    "monkes_database_with_momentum",
+    lambda species, energy_grid, geometry, database,
+           density_right_constraint=None, density_right_grad_constraint=None,
+           temperature_right_constraint=None, temperature_right_grad_constraint=None: MonkesDatabaseWithMomentumTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+        density_right_constraint=density_right_constraint,
+        density_right_grad_constraint=density_right_grad_constraint,
+        temperature_right_constraint=temperature_right_constraint,
+        temperature_right_grad_constraint=temperature_right_grad_constraint,
+    ),
+)
+
+register_transport_flux_model(
+    "turbulent_analytical",
+    lambda species, grid, chi_t, chi_n, field: AnalyticalTurbulentTransportModel(
+        species=species,
+        grid=grid,
+        chi_t=chi_t,
+        chi_n=chi_n,
+        field=field,
+    ),
+)
+
+register_transport_flux_model(
+    "none",
+    lambda *args, **kwargs: ZeroTransportModel(),
+)

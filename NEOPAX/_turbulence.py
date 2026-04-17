@@ -4,6 +4,9 @@ from jax import config, jit
 
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 
+DENSITY_STATE_TO_PHYSICAL = 1.0e20
+TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
+
 
 config.update("jax_enable_x64", True)
 
@@ -28,6 +31,16 @@ def get_Turbulent_Fluxes_Analytical(
       Gamma_a = -chi_density[a] * d n_a / dr
       Q_a     = -chi_temperature[a] * d T_a / dr
     """
+    temperature = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+    density = DENSITY_STATE_TO_PHYSICAL * density
+    if density_right_constraint is not None:
+        density_right_constraint = DENSITY_STATE_TO_PHYSICAL * density_right_constraint
+    if density_right_grad_constraint is not None:
+        density_right_grad_constraint = DENSITY_STATE_TO_PHYSICAL * density_right_grad_constraint
+    if temperature_right_constraint is not None:
+        temperature_right_constraint = TEMPERATURE_STATE_TO_PHYSICAL * temperature_right_constraint
+    if temperature_right_grad_constraint is not None:
+        temperature_right_grad_constraint = TEMPERATURE_STATE_TO_PHYSICAL * temperature_right_grad_constraint
 
     n_species = int(temperature.shape[0])
 

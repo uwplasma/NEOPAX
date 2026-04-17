@@ -3,7 +3,6 @@ import jax.numpy as jnp
 from NEOPAX.NEOPAX._sources import SourceModelBase, AnalyticSource, CombinedSourceModel, register_source, get_source
 import pytest
 from NEOPAX.NEOPAX._source_models import (
-    SPECIES_IDX,
     FusionPowerFractionElectronsSource,
     DTReactionSource,
     PowerExchangeSource,
@@ -12,6 +11,9 @@ from NEOPAX.NEOPAX._source_models import (
 from NEOPAX.NEOPAX._state import TransportState
 
 class DummySpecies:
+        @property
+        def species_idx(self):
+            return {'e': 0, 'D': 1, 'T': 2, 'He': 3}
     def __init__(self):
         self.mass = jnp.array([1.0, 2.014, 3.016, 4.0])
         self.charge = jnp.array([-1.0, 1.0, 1.0, 2.0])
@@ -59,27 +61,29 @@ def test_jax_jit_compatibility():
 
 def test_fusion_power_fraction_electrons():
     state = make_dummy_state()
+    species = DummySpecies()
     src = FusionPowerFractionElectronsSource()
-    result = src(state)
-    assert result.shape == state.temperature[SPECIES_IDX['e']].shape
+    result = src(state, species)
+    assert result['fusion_power_fraction_electrons'].shape == state.temperature[species.species_idx['e']].shape
 
 def test_dt_reaction():
     state = make_dummy_state()
+    species = DummySpecies()
     src = DTReactionSource()
-    rate, he, alpha = src(state)
-    assert rate.shape == state.temperature[SPECIES_IDX['T']].shape
+    result = src(state, species)
+    assert result['DTreactionRate'].shape == state.temperature[species.species_idx['T']].shape
 
 def test_power_exchange():
     state = make_dummy_state()
     species = DummySpecies()
-    src = PowerExchangeSource()
+    src = PowerExchangeSource(idx_a='D', idx_b='T')
     result = src(state, species)
-    assert result.shape == state.temperature[SPECIES_IDX['D']].shape
+    assert result['power_exchange'].shape == state.temperature[species.species_idx['D']].shape
 
 def test_bremsstrahlung_radiation():
     state = make_dummy_state()
     species = DummySpecies()
     src = BremsstrahlungRadiationSource()
-    pbrems, zeff = src(state, species)
-    assert pbrems.shape == state.temperature[SPECIES_IDX['e']].shape
-    assert zeff.shape == state.temperature[SPECIES_IDX['e']].shape
+    result = src(state, species)
+    assert result['PBrems'].shape == state.temperature[species.species_idx['e']].shape
+    assert result['Zeff'].shape == state.temperature[species.species_idx['e']].shape

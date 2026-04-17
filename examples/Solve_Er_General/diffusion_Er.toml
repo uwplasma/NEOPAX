@@ -13,6 +13,13 @@ flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = './examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
 
+[turbulence]
+flux_model="none"
+
+[classical]
+flux_model="none"
+
+
 [energy_grid]
 n_x = 4
 
@@ -67,12 +74,42 @@ toggle_density = [false, false, false]
 toggle_temperature = [false, false, false]
 toggle_Er = true
 
-# --- Time solver parameters ---
+
 [transport_solver]
-integrator = "radau"
+integrator = "diffrax_kvaerno5"
+
 t0 = 0.0
-t_final = 1.0
+t_final = 20.0
 dt = 1.0e-2
-n_save = 10
+
 rtol = 1.0e-7
 atol = 1.0e-7
+
+max_step = 1.0
+min_step = 1.0e-14
+
+debug_stage_markers = true
+debug_disable_jit = false
+Er_source_mode = "ambipolar_centered"
+Er_right_boundary_mode = "floating_ambipolar_edge"
+Er_edge_relax = 0.1
+
+save_n = 10
+
+Er_relax = 1.0
+DEr = 0.0
+
+[transport_output]
+transport_plot = true
+transport_write_hdf5 = true
+transport_compare_ambipolarity_residual = false
+transport_scan_ambipolarity_residual = false
+transport_overlay_reference_er = true
+# Same reference file style used in ambipolarity plotting.
+transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
+transport_residual_scan_min = -50.0
+transport_residual_scan_max = 50.0
+transport_residual_scan_n = 121
+transport_residual_scan_radii = [0, 25, -1]
+transport_output_dir = "./outputs/transport_diffusion_Er"
+transport_plot_n_times = -1

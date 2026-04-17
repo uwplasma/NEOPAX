@@ -311,8 +311,6 @@ class MainTransportModel:
             density=density_rhs,
             temperature=temperature_rhs,
             Er=er_rhs,
-            species_names=state.species_names,
-            is_evolved=state.is_evolved,
         )
 
     def vector_field(self, t: jax.Array, y: Any, args: tuple[Any, ...]) -> Any:
@@ -328,7 +326,10 @@ def main_transport_solver(
 ) -> Any:
     """Evaluate one RHS call of the composed transport system."""
     solver_parameters = args[-1]
-    transport_flux_model = build_transport_flux_model(solver_parameters)
+    transport_flux_model = build_transport_flux_model({
+        **solver_parameters,
+        "solver_parameters": solver_parameters
+    })
     model = MainTransportModel(
         solver_parameters,
         source_models=source_models,
@@ -348,7 +349,10 @@ def solve_transport_equations(
     """Integrate the selected transport equations in time via TransportSolver backend."""
     solver_parameters = args[-1]
 
-    transport_flux_model = build_transport_flux_model(solver_parameters)
+    transport_flux_model = build_transport_flux_model({
+        **solver_parameters,
+        "solver_parameters": solver_parameters
+    })
     model = MainTransportModel(
         solver_parameters,
         source_models=source_models,

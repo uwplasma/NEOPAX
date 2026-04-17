@@ -20,13 +20,16 @@ import interpax
 ###This module uses some functions adapted from JAX-MONKES by R. Colin, but class structure was revamped to fit the overall package better#####
 
 JOULE_PER_EV = 11606 * Boltzmann
+JOULE_PER_KEV = 1.0e3 * JOULE_PER_EV
 EV_PER_JOULE = 1 / JOULE_PER_EV
+STATE_DENSITY_TO_PHYSICAL = 1.0e20
+STATE_TEMPERATURE_TO_EV = 1.0e3
 
 
 #Get thermodynamical forces
 @jit
 def get_Thermodynamical_Forces_A1(q,n,T,dndr,dTdr,Er):
-    A1=dndr/n-1.5*dTdr/T-1.e+3*Er*q/(T*elementary_charge)    
+    A1=dndr/n-1.5*dTdr/T-Er*q/(T*elementary_charge)
     return A1
 
 #Get thermodynamical forces
@@ -42,7 +45,7 @@ def get_Thermodynamical_Forces_A3(Er):
     return A3
 
 
-@jax.tree_util.register_dataclass
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class Species:
     """
@@ -63,7 +66,42 @@ class Species:
     @property
     def mass(self):
         return self.mass_mp * proton_mass
-    
+
+    @property
+    def species_idx(self) -> dict:
+        """Return a mapping from species name to index."""
+        return {name: i for i, name in enumerate(self.names)}
+
+    @property
+    def ion_indices(self) -> tuple:
+        """Return a tuple of all species indices except the electron ('e')."""
+        if "e" not in self.names:
+            raise ValueError("'e' (electron) must be present in species names for ion_indices.")
+        eidx = self.names.index("e")
+        return tuple(i for i in range(self.number_species) if i != eidx)
+
+
+# Register Species as a pytree, treating 'names' and 'is_frozen' as static (auxiliary) data
+def _species_flatten(s):
+    # Only array fields are treated as pytree leaves
+    children = (s.number_species, s.species_indices, s.mass_mp, s.charge_qp)
+    aux_data = {'names': s.names, 'is_frozen': s.is_frozen}
+    return children, aux_data
+
+def _species_unflatten(aux_data, children):
+    number_species, species_indices, mass_mp, charge_qp = children
+    return Species(
+        number_species=number_species,
+        species_indices=species_indices,
+        mass_mp=mass_mp,
+        charge_qp=charge_qp,
+        names=aux_data.get('names', ()),
+        is_frozen=aux_data.get('is_frozen', None)
+    )
+
+jax.tree_util.register_pytree_node(Species, _species_flatten, _species_unflatten)
+
+
 
 def collisionality(species_a: int, species: Species, v: float, r_index: int, density, temperature, v_thermal) -> float:
     """Collisionality of species_a against all species."""
@@ -79,7 +117,7 @@ def collisionality(species_a: int, species: Species, v: float, r_index: int, den
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
            density, temperature, v_thermal) -> float:
     """Pairwise pitch-angle scattering frequency for species a against species b."""
-    nb = density[species_b, r_index]
+    nb = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
     vtb = v_thermal[species_b, r_index]
     prefactor = gamma_ab(species, species_a, species_b, v, r_index, temperature, density) * nb / v**3
     erf_part = jax.scipy.special.erf(v / vtb) - chandrasekhar(v / vtb)
@@ -98,7 +136,7 @@ def gamma_ab(species: Species, species_a: int, species_b: int, v: float, r_index
 def nupar_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
              density, temperature, v_thermal) -> float:
     """Parallel collisionality."""
-    nb = density[species_b, r_index]
+    nb = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
     vtb = v_thermal[species_b, r_index]
     return (
         2 * gamma_ab(species, species_a, species_b, v, r_index, temperature, density) * nb / v**3
@@ -109,7 +147,9 @@ def nupar_ab(species: Species, species_a: int, species_b: int, v: float, r_index
 def coulomb_logarithm(species: Species, species_a: int, species_b: int, r_index: int,
                       temperature, density) -> float:
     """Coulomb logarithm for collisions between species a and b."""
-    lnL = 32.2 + 1.15 * jnp.log10(temperature[0, r_index]**2 / density[0, r_index])
+    Te_eV = STATE_TEMPERATURE_TO_EV * temperature[0, r_index]
+    ne_m3 = STATE_DENSITY_TO_PHYSICAL * density[0, r_index]
+    lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
     return lnL
 
 
@@ -155,7 +195,9 @@ def debroglie_length(species: Species, species_a: int, species_b: int, r_index: 
 def debye_length(species: Species, r_index: int, density, temperature) -> float:
     """Scale length for charge screening."""
     den = jnp.sum(
-        density[:, r_index] / (temperature[:, r_index] * JOULE_PER_EV) * species.charge**2
+        (STATE_DENSITY_TO_PHYSICAL * density[:, r_index])
+        / (temperature[:, r_index] * JOULE_PER_KEV)
+        * species.charge**2
     )
     return jnp.sqrt(epsilon_0 / den)
 

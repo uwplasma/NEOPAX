@@ -63,12 +63,11 @@ def _as_state_residual(vector_field: Callable) -> Callable:
 
 def _select_solver_family_and_backend(solver_parameters: Any) -> tuple[str, str]:
     """Pick solver family/backend while preserving legacy integrator-only configs."""
-    family = str(getattr(solver_parameters, "transport_solver_family", "auto")).strip().lower()
+    family = str(solver_parameters.get("transport_solver_family", "auto")).strip().lower()
     backend = str(
-        getattr(
-            solver_parameters,
+        solver_parameters.get(
             "transport_solver_backend",
-            getattr(solver_parameters, "integrator", "diffrax_kvaerno5"),
+            solver_parameters.get("integrator", "diffrax_kvaerno5"),
         )
     ).strip().lower()
 
@@ -108,6 +107,89 @@ def _tree_sub(a: Any, b: Any) -> Any:
 
 def _tree_scale(a: Any, alpha: float | jax.Array) -> Any:
     return jax.tree_util.tree_map(lambda x: alpha * x, a)
+
+
+def _extract_species_from_args(args: tuple[Any, ...]) -> Any:
+    if len(args) == 0:
+        return None
+    first = args[0]
+    if isinstance(first, dict):
+        return first.get("species", None)
+    if hasattr(first, "charge_qp") and hasattr(first, "names"):
+        return first
+    if hasattr(first, "species"):
+        return getattr(first, "species")
+    return None
+
+
+def _save_state_series(state: Any) -> Any:
+    return jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), state)
+
+
+def _save_scalar_series(value: Any) -> jax.Array:
+    return jnp.expand_dims(jnp.asarray(value), axis=0)
+
+
+def _strip_state_metadata_for_solver(state: Any) -> Any:
+    """Hook for state cleanup before solver calls."""
+    return state
+
+
+def _pack_transport_state_arrays(state: Any) -> Any:
+    """Convert a TransportState-like object into an array-only pytree."""
+    if dataclasses.is_dataclass(state) and hasattr(state, "density") and hasattr(state, "temperature") and hasattr(state, "Er"):
+        return (state.density, state.temperature, state.Er)
+    return state
+
+
+def _unpack_transport_state_arrays(state_like: Any, template_state: Any) -> Any:
+    """Rebuild a TransportState-like object from an array-only pytree."""
+    if (
+        dataclasses.is_dataclass(template_state)
+        and hasattr(template_state, "density")
+        and hasattr(template_state, "temperature")
+        and hasattr(template_state, "Er")
+        and isinstance(state_like, tuple)
+        and len(state_like) == 3
+    ):
+        density, temperature, er = state_like
+        return dataclasses.replace(template_state, density=density, temperature=temperature, Er=er)
+    return state_like
+
+
+def _restore_state_metadata(state_like: Any, template_state: Any) -> Any:
+    """Hook for restoring state metadata after solver calls."""
+    return state_like
+
+
+def _apply_quasi_neutrality_output(state_like: Any, species: Any, reference_state: Any) -> Any:
+    """Apply quasi-neutrality to either a single state or a saved time-series of states."""
+    from ._transport_equations import enforce_quasi_neutrality
+
+    density = getattr(state_like, "density", None)
+    ref_density = getattr(reference_state, "density", None)
+    if density is None or ref_density is None:
+        return state_like
+
+    if density.ndim == ref_density.ndim + 1:
+        out = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(state_like)
+        return _restore_state_metadata(out, reference_state)
+    out = enforce_quasi_neutrality(state_like, species)
+    return _restore_state_metadata(out, reference_state)
+
+
+def _radau_stage_matvec(
+    v_flat: jax.Array,
+    stage_linears: tuple[Callable[[jax.Array], jax.Array], ...],
+    a_matrix: jax.Array,
+    h_value: jax.Array,
+    state_dim: int,
+) -> jax.Array:
+    """Matrix-free Jacobian-vector product for the 3-stage Radau Newton system."""
+    v_stages = v_flat.reshape((3, state_dim))
+    coupled = h_value * (a_matrix @ v_stages)
+    out = tuple(v_stages[i] - stage_linears[i](coupled[i]) for i in range(3))
+    return jnp.stack(out, axis=0).reshape((-1,))
 
 
 def _get_diffrax_integrator(name: str) -> Callable:
@@ -153,14 +235,18 @@ class DiffraxSolver(TransportSolver):
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         # Adapt NEOPAX vector fields to Diffrax's expected signature (t, y, args).
         import diffrax
+        import equinox as eqx
+        solver_state_template = _strip_state_metadata_for_solver(state)
+        solver_state = _pack_transport_state_arrays(solver_state_template)
 
-        if _expects_time_argument(vector_field):
-            def wrapped_vector_field(t, y, _solver_args):
-                return vector_field(t, y, *args, **kwargs)
-        else:
-            def wrapped_vector_field(t, y, _solver_args):
-                del t
-                return vector_field(y, *args, **kwargs)
+        # Diffrax expects vf(t, y, args). Capture NEOPAX runtime args in the
+        # closure instead of passing non-array objects through Diffrax/Eqinox
+        # loop state.
+        def wrapped_vector_field(t, y, _vf_args):
+            y_state = _unpack_transport_state_arrays(y, solver_state_template)
+            dy_state = vector_field(t, y_state, *args)
+            dy_state = _strip_state_metadata_for_solver(dy_state)
+            return _pack_transport_state_arrays(dy_state)
 
         term = diffrax.ODETerm(wrapped_vector_field)
         solver = self.integrator()
@@ -168,6 +254,7 @@ class DiffraxSolver(TransportSolver):
         call_kwargs.update(kwargs)
         save_n = getattr(self, 'save_n', None)
         if save_n is not None and save_n > 1:
+            call_kwargs.pop("saveat", None)
             ts = jnp.linspace(self.t0, self.t1, save_n)
             saveat = diffrax.SaveAt(ts=ts)
             sol = diffrax.diffeqsolve(
@@ -176,7 +263,7 @@ class DiffraxSolver(TransportSolver):
                 t0=self.t0,
                 t1=self.t1,
                 dt0=self.dt,
-                y0=state,
+                y0=solver_state,
                 args=None,
                 saveat=saveat,
                 **call_kwargs
@@ -188,10 +275,28 @@ class DiffraxSolver(TransportSolver):
                 t0=self.t0,
                 t1=self.t1,
                 dt0=self.dt,
-                y0=state,
+                y0=solver_state,
                 args=None,
                 **call_kwargs
             )
+        # Enforce quasi-neutrality on all saved states and final state
+        species = _extract_species_from_args(args)
+        if species is not None:
+            if hasattr(sol, 'ys'):
+                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template)
+                sol = eqx.tree_at(
+                    lambda s: s.ys,
+                    sol,
+                    _apply_quasi_neutrality_output(ys_state, species, state),
+                )
+        else:
+            if hasattr(sol, 'ys'):
+                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template)
+                sol = eqx.tree_at(
+                    lambda s: s.ys,
+                    sol,
+                    _restore_state_metadata(ys_state, state),
+                )
         return sol
 
 @jax.tree_util.register_dataclass
@@ -236,22 +341,26 @@ class NewtonSolver(TransportSolver):
 
 
 # Jaxopt-based steady-state solver (minimize norm of residual)
-import jaxopt
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class JaxoptSteadyStateSolver(TransportSolver):
     tol: float = 1e-8
     maxiter: int = 100
-    optimizer: Any = jaxopt.ProjectedGradient
+    optimizer: Any = None
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         # Minimize the L2 norm of the residual: ||vector_field(state)||^2
         residual_fn = _as_state_residual(vector_field)
+        optimizer_cls = self.optimizer
+        if optimizer_cls is None:
+            import jaxopt
+
+            optimizer_cls = jaxopt.ProjectedGradient
         def loss_fn(x):
             res = residual_fn(x, *args, **kwargs)
             flat, _ = jax.flatten_util.ravel_pytree(res)
             return jnp.sum(flat ** 2)
-        opt = self.optimizer(fun=loss_fn, maxiter=self.maxiter, tol=self.tol)
+        opt = optimizer_cls(fun=loss_fn, maxiter=self.maxiter, tol=self.tol)
         flat_state, unravel = jax.flatten_util.ravel_pytree(state)
         sol = opt.run(flat_state)
         final_state = unravel(sol.params)
@@ -384,8 +493,10 @@ class PredictorCorrectorSolver(TransportSolver):
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         # Implements Heun's method (predictor-corrector, explicit trapezoidal)
+        from ._transport_equations import enforce_quasi_neutrality
         n_steps = self.n_steps
         dt = (self.t1 - self.t0) / n_steps
+        species = _extract_species_from_args(args)
         def step_fn(val, _):
             t, y = val
             f0 = vector_field(t, y, *args, **kwargs)
@@ -393,14 +504,18 @@ class PredictorCorrectorSolver(TransportSolver):
             f1 = vector_field(t + dt, y_pred, *args, **kwargs)
             y_next = jax.tree_util.tree_map(lambda yi, fi0, fi1: yi + 0.5 * dt * (fi0 + fi1), y, f0, f1)
             return (t + dt, y_next), y_next
-        # Run the integration
         (tf, yf), ys = jax.lax.scan(step_fn, (self.t0, state), None, length=n_steps)
         save_n = getattr(self, 'save_n', None)
         if save_n is not None and save_n > 1:
+            if species is not None:
+                ys = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(ys)
+                yf = enforce_quasi_neutrality(yf, species)
             idxs = jnp.linspace(0, n_steps-1, save_n).round().astype(int)
             ys_saved = ys[idxs]
         else:
-            ys_saved = ys[-1:]
+            if species is not None:
+                yf = enforce_quasi_neutrality(yf, species)
+            ys_saved = _save_state_series(yf)
         result = {
             'ys': ys_saved,
             't0': self.t0,
@@ -433,6 +548,7 @@ class ThetaLinearSolver(TransportSolver):
         theta_implicit: float = 1.0,
         use_predictor_corrector: bool = True,
         n_corrector_steps: int = 1,
+        save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
         object.__setattr__(self, "t0", t0)
@@ -442,12 +558,15 @@ class ThetaLinearSolver(TransportSolver):
         object.__setattr__(self, "use_predictor_corrector", use_predictor_corrector)
         object.__setattr__(self, "n_corrector_steps", int(max(0, n_corrector_steps)))
         object.__setattr__(self, "n_steps", n_steps)
+        object.__setattr__(self, "save_n", save_n)
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         n_steps = self.n_steps
         dt = (self.t1 - self.t0) / n_steps
         theta = self.theta_implicit
 
+        from ._transport_equations import enforce_quasi_neutrality
+        species = _extract_species_from_args(args)
         def one_step(carry, _):
             t, y = carry
             f_old = vector_field(t, y, *args, **kwargs)
@@ -471,9 +590,20 @@ class ThetaLinearSolver(TransportSolver):
 
             return (t + dt, y_next), y_next
 
+        save_n = getattr(self, "save_n", None)
         (tf, yf), ys = jax.lax.scan(one_step, (self.t0, state), None, length=n_steps)
+        if save_n is not None and save_n > 1:
+            if species is not None:
+                ys = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(ys)
+                yf = enforce_quasi_neutrality(yf, species)
+            idxs = jnp.linspace(0, n_steps - 1, save_n).round().astype(int)
+            ys_saved = ys[idxs]
+        else:
+            if species is not None:
+                yf = enforce_quasi_neutrality(yf, species)
+            ys_saved = _save_state_series(yf)
         return {
-            "ys": ys,
+            "ys": ys_saved,
             "t0": self.t0,
             "t1": self.t1,
             "dt": dt,
@@ -631,9 +761,10 @@ class ThetaNewtonSolver(TransportSolver):
                             )
 
                         if self.linear_solver == "gmres":
+                            _, residual_lin = jax.linearize(residual_flat, flat_cur)
+
                             def matvec(v):
-                                _, jvp_val = jax.jvp(residual_flat, (flat_cur,), (v,))
-                                return jvp_val + ap_diag * v
+                                return residual_lin(v) + ap_diag * v
 
                             delta, _ = jax.scipy.sparse.linalg.gmres(
                                 matvec,
@@ -677,30 +808,44 @@ class ThetaNewtonSolver(TransportSolver):
                 out = (y_next, t_next, dt, jnp.asarray(True), jnp.asarray(False), jnp.asarray(0))
                 return (t_next, y_next), out
 
-            (t_f, y_f), outs = jax.lax.scan(
-                one_step,
-                (jnp.asarray(self.t0), y0),
-                None,
-                length=n_steps,
-            )
-            ys_all, ts_all, dts_all, accepted_mask, failed_mask, fail_codes = outs
             save_n = getattr(self, 'save_n', None)
             if save_n is not None and save_n > 1:
+                (t_f, y_f), outs = jax.lax.scan(
+                    one_step,
+                    (jnp.asarray(self.t0), y0),
+                    None,
+                    length=n_steps,
+                )
+                ys_all, ts_all, dts_all, accepted_mask, failed_mask, fail_codes = outs
                 idxs = jnp.linspace(0, n_steps-1, save_n).round().astype(int)
                 ys_saved = ys_all[idxs]
                 ts_saved = ts_all[idxs]
+                dts_saved = dts_all[idxs]
+                accepted_mask_saved = accepted_mask[idxs]
+                failed_mask_saved = failed_mask[idxs]
+                fail_codes_saved = fail_codes[idxs]
             else:
-                ys_saved = ys_all[-1:]
-                ts_saved = ts_all[-1:]
+                def body(i, carry):
+                    t, y = carry
+                    (t_next, y_next), _ = one_step((t, y), None)
+                    return t_next, y_next
+
+                t_f, y_f = jax.lax.fori_loop(0, n_steps, body, (jnp.asarray(self.t0), y0))
+                ys_saved = _save_state_series(y_f)
+                ts_saved = _save_scalar_series(t_f)
+                dts_saved = _save_scalar_series(dt)
+                accepted_mask_saved = _save_scalar_series(True)
+                failed_mask_saved = _save_scalar_series(False)
+                fail_codes_saved = _save_scalar_series(0)
             return {
                 "ys": ys_saved,
                 "t0": self.t0,
                 "t1": self.t1,
                 "dt": dt,
-                "dts": dts_all,
-                "accepted_mask": accepted_mask,
-                "failed_mask": failed_mask,
-                "fail_codes": fail_codes,
+                "dts": dts_saved,
+                "accepted_mask": accepted_mask_saved,
+                "failed_mask": failed_mask_saved,
+                "fail_codes": fail_codes_saved,
                 "n_steps": jnp.asarray(n_steps),
                 "done": jnp.asarray(True),
                 "failed": jnp.asarray(False),
@@ -772,9 +917,10 @@ class ThetaNewtonSolver(TransportSolver):
                     )
 
                 if self.linear_solver == "gmres":
+                    _, residual_lin = jax.linearize(residual_flat, flat_y)
+
                     def matvec(v):
-                        _, jvp_val = jax.jvp(residual_flat, (flat_y,), (v,))
-                        return jvp_val + ap_diag * v
+                        return residual_lin(v) + ap_diag * v
 
                     delta, _ = jax.scipy.sparse.linalg.gmres(
                         matvec,
@@ -980,15 +1126,36 @@ class ThetaNewtonSolver(TransportSolver):
             loop_carry = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
             t_f, y_f, _, done_f, failed_f, fail_code_f, n_acc_f, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = loop_carry
         else:
-            final_carry, outs = jax.lax.scan(step_fn, init_carry, None, length=max_total_steps)
-            t_f, y_f, _, done_f, failed_f, fail_code_f, n_acc_f = final_carry
-            ys_all, ts_all, dts_all, accepted_mask, failed_mask, fail_codes = outs
-            ys_saved = ys_all[-1:]
-            ts_saved = ts_all[-1:]
-            dts_saved = dts_all[-1:]
-            accepted_mask_saved = accepted_mask[-1:]
-            failed_mask_saved = failed_mask[-1:]
-            fail_codes_saved = fail_codes[-1:]
+            def cond_fun(loop_carry):
+                t, y, dt_current, done, failed, fail_code, n_acc, step_idx = loop_carry
+                active = jnp.logical_not(jnp.logical_or(done, failed))
+                return jnp.logical_and(step_idx < max_total_steps, active)
+
+            def body_fun(loop_carry):
+                t, y, dt_current, done, failed, fail_code, n_acc, step_idx = loop_carry
+                (t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new), _ = step_fn(
+                    (t, y, dt_current, done, failed, fail_code, n_acc),
+                    None,
+                )
+                return (t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new, step_idx + 1)
+
+            loop_carry = (
+                jnp.asarray(self.t0),
+                y0,
+                jnp.asarray(base_dt),
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(0),
+                jnp.asarray(0),
+                jnp.asarray(0),
+            )
+            t_f, y_f, dt_last, done_f, failed_f, fail_code_f, n_acc_f, _ = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+            ys_saved = _save_state_series(y_f)
+            ts_saved = _save_scalar_series(t_f)
+            dts_saved = _save_scalar_series(dt_last)
+            accepted_mask_saved = _save_scalar_series(jnp.logical_not(failed_f))
+            failed_mask_saved = _save_scalar_series(failed_f)
+            fail_codes_saved = _save_scalar_series(fail_code_f)
         return {
             "ys": ys_saved,
             "t0": self.t0,
@@ -1021,9 +1188,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
     """
     import diffrax
 
-    t0 = float(getattr(solver_parameters, "t0"))
-    t1 = float(getattr(solver_parameters, "t_final"))
-    dt = float(getattr(solver_parameters, "dt"))
+    t0 = float(solver_parameters["t0"])
+    t1 = float(solver_parameters["t_final"])
+    dt = float(solver_parameters["dt"])
 
     if solver_override is not None:
         if hasattr(solver_override, "solve"):
@@ -1031,23 +1198,31 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
         return DiffraxSolver(integrator=lambda: solver_override, t0=t0, t1=t1, dt=dt)
 
     family, backend = _select_solver_family_and_backend(solver_parameters)
-    theta_implicit = float(getattr(solver_parameters, "theta_implicit", 1.0))
-    use_predictor_corrector = bool(getattr(solver_parameters, "use_predictor_corrector", True))
-    n_corrector_steps = int(getattr(solver_parameters, "n_corrector_steps", 1))
+    theta_implicit = float(solver_parameters.get("theta_implicit", 1.0))
+    use_predictor_corrector = bool(solver_parameters.get("use_predictor_corrector", True))
+    n_corrector_steps = int(solver_parameters.get("n_corrector_steps", 1))
+    save_n = solver_parameters.get("save_n", solver_parameters.get("n_save"))
+    theta_linear_solver = str(solver_parameters.get("theta_linear_solver", "direct")).strip().lower()
+    theta_gmres_tol = float(solver_parameters.get("theta_gmres_tol", 1.0e-8))
+    theta_gmres_maxiter = int(solver_parameters.get("theta_gmres_maxiter", 200))
+    radau_linear_solver = str(solver_parameters.get("radau_linear_solver", "direct")).strip().lower()
+    radau_gmres_tol = float(solver_parameters.get("radau_gmres_tol", 1.0e-8))
+    radau_gmres_maxiter = int(solver_parameters.get("radau_gmres_maxiter", 200))
+    radau_error_estimator = str(solver_parameters.get("radau_error_estimator", "embedded2")).strip().lower()
+    radau_newton_strategy = str(solver_parameters.get("radau_newton_strategy", "simplified")).strip().lower()
+    radau_debug_print_er = bool(solver_parameters.get("debug_print_er", False))
 
     if family == "theta":
         tol = float(
-            getattr(
-                solver_parameters,
+            solver_parameters.get(
                 "nonlinear_solver_tol",
-                getattr(solver_parameters, "residual_tol", 1e-8),
+                solver_parameters.get("residual_tol", 1e-8),
             )
         )
         maxiter = int(
-            getattr(
-                solver_parameters,
+            solver_parameters.get(
                 "nonlinear_solver_maxiter",
-                getattr(solver_parameters, "n_max_iterations", 50),
+                solver_parameters.get("n_max_iterations", 50),
             )
         )
         if backend == "theta_linear":
@@ -1058,6 +1233,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
                 theta_implicit=theta_implicit,
                 use_predictor_corrector=use_predictor_corrector,
                 n_corrector_steps=n_corrector_steps,
+                save_n=save_n,
             )
         if backend == "theta_newton":
             return ThetaNewtonSolver(
@@ -1067,23 +1243,24 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
                 theta_implicit=theta_implicit,
                 tol=tol,
                 maxiter=maxiter,
-                ptc_enabled=bool(getattr(solver_parameters, "theta_ptc_enabled", True)),
-                ptc_dt_min_factor=float(getattr(solver_parameters, "theta_ptc_dt_min_factor", 1.0e-4)),
-                ptc_dt_max_factor=float(getattr(solver_parameters, "theta_ptc_dt_max_factor", 1.0e3)),
-                ptc_growth=float(getattr(solver_parameters, "theta_ptc_growth", 1.5)),
-                ptc_shrink=float(getattr(solver_parameters, "theta_ptc_shrink", 0.5)),
-                line_search_enabled=bool(getattr(solver_parameters, "theta_line_search_enabled", True)),
-                line_search_contraction=float(getattr(solver_parameters, "theta_line_search_contraction", 0.5)),
-                line_search_min_alpha=float(getattr(solver_parameters, "theta_line_search_min_alpha", 1.0e-4)),
-                line_search_c=float(getattr(solver_parameters, "theta_line_search_c", 1.0e-4)),
-                max_step_retries=int(getattr(solver_parameters, "theta_max_step_retries", 8)),
-                linear_solver=str(getattr(solver_parameters, "theta_linear_solver", "direct")),
-                gmres_tol=float(getattr(solver_parameters, "theta_gmres_tol", 1.0e-8)),
-                gmres_maxiter=int(getattr(solver_parameters, "theta_gmres_maxiter", 200)),
-                trust_region_enabled=bool(getattr(solver_parameters, "theta_trust_region_enabled", False)),
-                trust_radius=float(getattr(solver_parameters, "theta_trust_radius", 1.0)),
-                homotopy_steps=int(getattr(solver_parameters, "theta_homotopy_steps", 1)),
-                differentiable_mode=bool(getattr(solver_parameters, "theta_differentiable_mode", False)),
+                ptc_enabled=bool(solver_parameters.get("theta_ptc_enabled", True)),
+                ptc_dt_min_factor=float(solver_parameters.get("theta_ptc_dt_min_factor", 1.0e-4)),
+                ptc_dt_max_factor=float(solver_parameters.get("theta_ptc_dt_max_factor", 1.0e3)),
+                ptc_growth=float(solver_parameters.get("theta_ptc_growth", 1.5)),
+                ptc_shrink=float(solver_parameters.get("theta_ptc_shrink", 0.5)),
+                line_search_enabled=bool(solver_parameters.get("theta_line_search_enabled", True)),
+                line_search_contraction=float(solver_parameters.get("theta_line_search_contraction", 0.5)),
+                line_search_min_alpha=float(solver_parameters.get("theta_line_search_min_alpha", 1.0e-4)),
+                line_search_c=float(solver_parameters.get("theta_line_search_c", 1.0e-4)),
+                max_step_retries=int(solver_parameters.get("theta_max_step_retries", 8)),
+                linear_solver=theta_linear_solver,
+                gmres_tol=theta_gmres_tol,
+                gmres_maxiter=theta_gmres_maxiter,
+                trust_region_enabled=bool(solver_parameters.get("theta_trust_region_enabled", False)),
+                trust_radius=float(solver_parameters.get("theta_trust_radius", 1.0)),
+                homotopy_steps=int(solver_parameters.get("theta_homotopy_steps", 1)),
+                differentiable_mode=bool(solver_parameters.get("theta_differentiable_mode", False)),
+                save_n=save_n,
             )
         raise ValueError(
             f"Unknown theta transport backend '{backend}'. "
@@ -1092,17 +1269,15 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
 
     if family == "nonlinear":
         tol = float(
-            getattr(
-                solver_parameters,
+            solver_parameters.get(
                 "nonlinear_solver_tol",
-                getattr(solver_parameters, "residual_tol", 1e-8),
+                solver_parameters.get("residual_tol", 1e-8),
             )
         )
         maxiter = int(
-            getattr(
-                solver_parameters,
+            solver_parameters.get(
                 "nonlinear_solver_maxiter",
-                getattr(solver_parameters, "n_max_iterations", 50),
+                solver_parameters.get("n_max_iterations", 50),
             )
         )
         if backend == "newton":
@@ -1124,42 +1299,58 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             t0=t0,
             t1=t1,
             dt=dt,
-            rtol=float(getattr(solver_parameters, "rtol", 1.0e-6)),
-            atol=float(getattr(solver_parameters, "atol", 1.0e-8)),
-            max_step=float(getattr(solver_parameters, "max_step", max(t1 - t0, dt))),
-            min_step=float(getattr(solver_parameters, "min_step", 1.0e-14)),
+            rtol=float(solver_parameters.get("rtol", 1.0e-6)),
+            atol=float(solver_parameters.get("atol", 1.0e-8)),
+            max_step=float(solver_parameters.get("max_step", max(t1 - t0, dt))),
+            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
             tol=float(
-                getattr(
-                    solver_parameters,
+                solver_parameters.get(
+                    "tol",
+                    solver_parameters.get(
                     "nonlinear_solver_tol",
-                    getattr(solver_parameters, "residual_tol", 1.0e-8),
+                    solver_parameters.get("residual_tol", 1.0e-8),
+                    )
                 )
             ),
             maxiter=int(
-                getattr(
-                    solver_parameters,
+                solver_parameters.get(
+                    "maxiter",
+                    solver_parameters.get(
                     "nonlinear_solver_maxiter",
-                    getattr(solver_parameters, "n_max_iterations", 50),
+                    solver_parameters.get("n_max_iterations", 50),
+                    )
                 )
             ),
+            linear_solver=radau_linear_solver,
+            gmres_tol=radau_gmres_tol,
+            gmres_maxiter=radau_gmres_maxiter,
+            error_estimator=radau_error_estimator,
+            newton_strategy=radau_newton_strategy,
+            debug_print_er=radau_debug_print_er,
+            safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
+            min_step_factor=float(solver_parameters.get("min_step_factor", 0.1)),
+            max_step_factor=float(solver_parameters.get("max_step_factor", 5.0)),
+            save_n=save_n,
         )
 
     if backend in ("predictor_corrector", "heun"):
-        return PredictorCorrectorSolver(t0=t0, t1=t1, dt=dt)
+        return PredictorCorrectorSolver(t0=t0, t1=t1, dt=dt, save_n=save_n)
 
     integrator_ctor = _get_diffrax_integrator(backend)
-    saveat = diffrax.SaveAt(ts=getattr(solver_parameters, "ts_list"))
+    ts_list = solver_parameters.get("ts_list")
+    saveat = diffrax.SaveAt(ts=ts_list) if ts_list is not None else diffrax.SaveAt(t1=True)
     stepsize_controller = diffrax.PIDController(
         pcoeff=0.3,
         icoeff=0.4,
-        rtol=float(getattr(solver_parameters, "rtol")),
-        atol=float(getattr(solver_parameters, "atol")),
+        rtol=float(solver_parameters.get("rtol")),
+        atol=float(solver_parameters.get("atol")),
     )
     return DiffraxSolver(
         integrator=integrator_ctor,
         t0=t0,
         t1=t1,
         dt=dt,
+        save_n=save_n,
         saveat=saveat,
         stepsize_controller=stepsize_controller,
         max_steps=None,
@@ -1196,6 +1387,12 @@ class RADAUSolver(TransportSolver):
     min_step: float = 1.0e-14
     tol: float = 1.0e-8
     maxiter: int = 50
+    linear_solver: str = "direct"
+    gmres_tol: float = 1.0e-8
+    gmres_maxiter: int = 200
+    error_estimator: str = "embedded2"
+    newton_strategy: str = "simplified"
+    debug_print_er: bool = False
     safety_factor: float = 0.9
     min_step_factor: float = 0.1
     max_step_factor: float = 5.0
@@ -1212,6 +1409,12 @@ class RADAUSolver(TransportSolver):
         min_step: float = 1.0e-14,
         tol: float = 1.0e-8,
         maxiter: int = 50,
+        linear_solver: str = "direct",
+        gmres_tol: float = 1.0e-8,
+        gmres_maxiter: int = 200,
+        error_estimator: str = "embedded2",
+        newton_strategy: str = "simplified",
+        debug_print_er: bool = False,
         safety_factor: float = 0.9,
         min_step_factor: float = 0.1,
         max_step_factor: float = 5.0,
@@ -1229,6 +1432,12 @@ class RADAUSolver(TransportSolver):
         object.__setattr__(self, "min_step", float(min_step))
         object.__setattr__(self, "tol", float(tol))
         object.__setattr__(self, "maxiter", int(max(1, maxiter)))
+        object.__setattr__(self, "linear_solver", str(linear_solver).strip().lower())
+        object.__setattr__(self, "gmres_tol", float(gmres_tol))
+        object.__setattr__(self, "gmres_maxiter", int(max(1, gmres_maxiter)))
+        object.__setattr__(self, "error_estimator", str(error_estimator).strip().lower())
+        object.__setattr__(self, "newton_strategy", str(newton_strategy).strip().lower())
+        object.__setattr__(self, "debug_print_er", bool(debug_print_er))
         object.__setattr__(self, "safety_factor", float(safety_factor))
         object.__setattr__(self, "min_step_factor", float(min_step_factor))
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
@@ -1238,26 +1447,38 @@ class RADAUSolver(TransportSolver):
         object.__setattr__(self, "save_n", save_n)
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
-        """Integrate from t0 to t1 using a 3-stage Radau IIA method with adaptive step-doubling."""
-        sqrt6 = jnp.sqrt(jnp.asarray(6.0))
-        c = jnp.asarray([(4.0 - sqrt6) / 10.0, (4.0 + sqrt6) / 10.0, 1.0], dtype=jnp.float64)
+        """Integrate from t0 to t1 using a 3-stage Radau IIA method with adaptive timestep control."""
+        flat_state0, unravel = jax.flatten_util.ravel_pytree(state)
+        state_dtype = flat_state0.dtype
+        sqrt6 = jnp.sqrt(jnp.asarray(6.0, dtype=state_dtype))
+        c = jnp.asarray([(4.0 - sqrt6) / 10.0, (4.0 + sqrt6) / 10.0, 1.0], dtype=state_dtype)
         a = jnp.asarray(
             [
                 [(88.0 - 7.0 * sqrt6) / 360.0, (296.0 - 169.0 * sqrt6) / 1800.0, (-2.0 + 3.0 * sqrt6) / 225.0],
                 [(296.0 + 169.0 * sqrt6) / 1800.0, (88.0 + 7.0 * sqrt6) / 360.0, (-2.0 - 3.0 * sqrt6) / 225.0],
                 [(16.0 - sqrt6) / 36.0, (16.0 + sqrt6) / 36.0, 1.0 / 9.0],
             ],
-            dtype=jnp.float64,
+            dtype=state_dtype,
         )
         b = a[2]
+        # Low-memory embedded second-order estimator using the existing stage
+        # derivatives. This avoids step-doubling, which was tripling implicit
+        # stage solves and inflating compile-time memory.
+        b_embedded = jnp.asarray(
+            [
+                0.5 - 0.5 / sqrt6,
+                0.5 + 0.5 / sqrt6,
+                0.0,
+            ],
+            dtype=state_dtype,
+        )
         order = 5.0
-
-        flat_state0, unravel = jax.flatten_util.ravel_pytree(state)
+        error_order = 2.0 if self.error_estimator == "embedded2" else order
         state_dim = flat_state0.shape[0]
-        t_final = jnp.asarray(self.t1, dtype=jnp.float64)
-        dt_min = jnp.asarray(self.min_step, dtype=jnp.float64)
-        dt_max = jnp.asarray(self.max_step, dtype=jnp.float64)
-        base_dt = jnp.clip(jnp.asarray(self.dt, dtype=jnp.float64), dt_min, dt_max)
+        t_final = jnp.asarray(self.t1, dtype=state_dtype)
+        dt_min = jnp.asarray(self.min_step, dtype=state_dtype)
+        dt_max = jnp.asarray(self.max_step, dtype=state_dtype)
+        base_dt = jnp.clip(jnp.asarray(self.dt, dtype=state_dtype), dt_min, dt_max)
         max_total_steps = int(max(8, self.n_steps * 16))
 
         def _flatten_rhs(t_value, flat_y):
@@ -1269,7 +1490,7 @@ class RADAUSolver(TransportSolver):
             f0 = _flatten_rhs(t_value, flat_y)
             z0 = jnp.tile(f0, 3)
 
-            def residual(z_flat):
+            def residual_with_stages(z_flat):
                 stages = z_flat.reshape((3, state_dim))
                 stage_states = flat_y[None, :] + h_value * (a @ stages)
                 evals = jnp.stack(
@@ -1279,16 +1500,84 @@ class RADAUSolver(TransportSolver):
                     ],
                     axis=0,
                 )
-                return (stages - evals).reshape((-1,))
+                residual_flat = (stages - evals).reshape((-1,))
+                return residual_flat, stage_states
 
-            def body_fn(_, z_cur):
-                residual_cur = residual(z_cur)
-                jac = jax.jacfwd(residual)(z_cur)
-                delta = jax.scipy.linalg.solve(jac, -residual_cur)
+            def residual(z_flat):
+                residual_flat, _ = residual_with_stages(z_flat)
+                return residual_flat
+
+            if self.newton_strategy == "simplified":
+                _, stage_states_ref = residual_with_stages(z0)
+                if self.linear_solver == "gmres":
+                    stage_linears_ref = tuple(
+                        jax.linearize(
+                            lambda y_stage, t_stage=t_value + c[i] * h_value: _flatten_rhs(t_stage, y_stage),
+                            stage_states_ref[i],
+                        )[1]
+                        for i in range(3)
+                    )
+                    stage_solver = lambda rhs: jax.scipy.sparse.linalg.gmres(
+                        lambda v_flat: _radau_stage_matvec(v_flat, stage_linears_ref, a, h_value, state_dim),
+                        rhs,
+                        tol=self.gmres_tol,
+                        atol=self.gmres_tol,
+                        maxiter=self.gmres_maxiter,
+                    )[0]
+                else:
+                    jac_ref = jax.jacfwd(residual)(z0)
+                    stage_solver = lambda rhs: jax.scipy.linalg.solve(jac_ref, rhs)
+            else:
+                stage_solver = None
+
+            def body_fn(newton_state):
+                iter_idx, z_cur, delta_norm, residual_norm = newton_state
+                residual_cur, stage_states = residual_with_stages(z_cur)
+                if self.newton_strategy == "simplified":
+                    delta = stage_solver(-residual_cur)
+                else:
+                    if self.linear_solver == "gmres":
+                        stage_linears = tuple(
+                            jax.linearize(
+                                lambda y_stage, t_stage=t_value + c[i] * h_value: _flatten_rhs(t_stage, y_stage),
+                                stage_states[i],
+                            )[1]
+                            for i in range(3)
+                        )
+                        delta, _ = jax.scipy.sparse.linalg.gmres(
+                            lambda v_flat: _radau_stage_matvec(v_flat, stage_linears, a, h_value, state_dim),
+                            -residual_cur,
+                            tol=self.gmres_tol,
+                            atol=self.gmres_tol,
+                            maxiter=self.gmres_maxiter,
+                        )
+                    else:
+                        jac = jax.jacfwd(residual)(z_cur)
+                        delta = jax.scipy.linalg.solve(jac, -residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
-                return z_cur + delta
+                z_next = z_cur + delta
+                return (
+                    iter_idx + 1,
+                    z_next,
+                    jnp.linalg.norm(delta),
+                    jnp.linalg.norm(residual_cur),
+                )
 
-            z_final = jax.lax.fori_loop(0, self.maxiter, body_fn, z0)
+            def cond_fn(newton_state):
+                iter_idx, _, delta_norm, residual_norm = newton_state
+                active = jnp.logical_and(
+                    residual_norm > self.tol,
+                    delta_norm > self.tol,
+                )
+                return jnp.logical_and(iter_idx < self.maxiter, active)
+
+            init_newton = (
+                jnp.asarray(0),
+                z0,
+                jnp.asarray(jnp.inf, dtype=state_dtype),
+                jnp.asarray(jnp.inf, dtype=state_dtype),
+            )
+            _, z_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_newton)
             stages_final = z_final.reshape((3, state_dim))
             final_residual = residual(z_final)
             converged = jnp.logical_and(
@@ -1296,7 +1585,8 @@ class RADAUSolver(TransportSolver):
                 jnp.linalg.norm(final_residual) <= self.tol,
             )
             flat_next = flat_y + h_value * (b @ stages_final)
-            return flat_next, converged
+            flat_next_embedded = flat_y + h_value * (b_embedded @ stages_final)
+            return flat_next, flat_next_embedded, converged
 
         def _scaled_error(candidate, reference):
             scale = self.atol + self.rtol * jnp.maximum(jnp.abs(candidate), jnp.abs(reference))
@@ -1323,19 +1613,16 @@ class RADAUSolver(TransportSolver):
 
             def body_fn(retry_state):
                 retry_count, trial_dt, _, _, _, _, _ = retry_state
-                full_step, ok_full = _single_step(flat_y, t_value, trial_dt)
-                half_step, ok_half1 = _single_step(flat_y, t_value, 0.5 * trial_dt)
-                half_step_2, ok_half2 = _single_step(half_step, t_value + 0.5 * trial_dt, 0.5 * trial_dt)
-                converged = jnp.logical_and(ok_full, jnp.logical_and(ok_half1, ok_half2))
-                error_norm = _scaled_error(half_step_2, full_step)
+                high_step, low_step, converged = _single_step(flat_y, t_value, trial_dt)
+                error_norm = _scaled_error(high_step, low_step)
                 accepted = jnp.logical_and(converged, error_norm <= 1.0)
                 safe_error = jnp.maximum(error_norm, 1.0e-12)
-                growth = self.safety_factor * safe_error ** (-1.0 / (order + 1.0))
+                growth = self.safety_factor * safe_error ** (-1.0 / (error_order + 1.0))
                 growth = jnp.clip(growth, self.min_step_factor, self.max_step_factor)
                 next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
                 def accept_state(_):
-                    return retry_count + 1, trial_dt, half_step_2, accepted, converged, trial_dt, next_dt
+                    return retry_count + 1, trial_dt, high_step, accepted, converged, trial_dt, next_dt
 
                 def reject_state(_):
                     reduced_dt = jnp.clip(next_dt, dt_min, trial_dt * self.safety_factor)
@@ -1349,6 +1636,15 @@ class RADAUSolver(TransportSolver):
                 dt_used = accepted_dt
                 t_new = t_value + dt_used
                 done_new = t_new >= (t_final - 1.0e-15)
+                if self.debug_print_er:
+                    accepted_state = unravel(retry_y)
+                    if hasattr(accepted_state, "Er"):
+                        jax.debug.print(
+                            "RADAU accepted step: t={t}, dt={dt}, Er={er}",
+                            t=t_new,
+                            dt=dt_used,
+                            er=accepted_state.Er,
+                        )
                 return (
                     t_new,
                     retry_y,
@@ -1380,7 +1676,7 @@ class RADAUSolver(TransportSolver):
                 ), (
                     flat_y,
                     t_value,
-                    jnp.asarray(0.0, dtype=jnp.float64),
+                    jnp.asarray(0.0, dtype=state_dtype),
                     jnp.asarray(False),
                     jnp.asarray(True),
                     code,
@@ -1395,7 +1691,7 @@ class RADAUSolver(TransportSolver):
                 return carry, (
                     flat_y,
                     t_value,
-                    jnp.asarray(0.0, dtype=jnp.float64),
+                    jnp.asarray(0.0, dtype=state_dtype),
                     jnp.asarray(False),
                     failed,
                     fail_code,
@@ -1417,6 +1713,13 @@ class RADAUSolver(TransportSolver):
         )
 
         save_n = getattr(self, 'save_n', None)
+        # --- PATCH: Enforce quasi-neutrality after each step and on final state ---
+        from ._transport_equations import enforce_quasi_neutrality
+        species = _extract_species_from_args(args)
+
+        # Remove all calls to enforce_quasi_neutrality inside stepping logic
+        # Only apply to output states after all stepping is complete
+
         if save_n is not None and save_n > 1:
             save_times = jnp.linspace(self.t0, self.t1, save_n)
             y0, t0, dt0, acc0, fail0, code0 = step_fn(init_carry, None)[1]
@@ -1446,16 +1749,42 @@ class RADAUSolver(TransportSolver):
             t_f, y_f_flat, _, done_f, failed_f, fail_code_f, n_acc_f, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = loop_carry
             ys_saved = jax.vmap(unravel)(ys_saved)
         else:
-            final_carry, outs = jax.lax.scan(step_fn, init_carry, None, length=max_total_steps)
-            t_f, y_f_flat, _, done_f, failed_f, fail_code_f, n_acc_f = final_carry
-            ys_flat, ts_all, dts_all, accepted_mask, failed_mask, fail_codes = outs
-            ys_all = jax.vmap(unravel)(ys_flat)
-            ys_saved = ys_all[-1:]
-            ts_saved = ts_all[-1:]
-            dts_saved = dts_all[-1:]
-            accepted_mask_saved = accepted_mask[-1:]
-            failed_mask_saved = failed_mask[-1:]
-            fail_codes_saved = fail_codes[-1:]
+            def cond_fun(loop_carry):
+                t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, step_idx = loop_carry
+                active = jnp.logical_not(jnp.logical_or(done, failed))
+                return jnp.logical_and(step_idx < max_total_steps, active)
+
+            def body_fun(loop_carry):
+                t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, step_idx = loop_carry
+                (t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new), _ = step_fn(
+                    (t_value, flat_y, dt_value, done, failed, fail_code, n_accepted),
+                    None,
+                )
+                return (t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new, step_idx + 1)
+
+            loop_carry = (
+                jnp.asarray(self.t0, dtype=state_dtype),
+                flat_state0,
+                base_dt,
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(0),
+                jnp.asarray(0),
+                jnp.asarray(0),
+            )
+            t_f, y_f_flat, dt_last, done_f, failed_f, fail_code_f, n_acc_f, _ = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+            ys_saved = _save_state_series(unravel(y_f_flat))
+            ts_saved = _save_scalar_series(t_f)
+            dts_saved = _save_scalar_series(dt_last)
+            accepted_mask_saved = _save_scalar_series(jnp.logical_not(failed_f))
+            failed_mask_saved = _save_scalar_series(failed_f)
+            fail_codes_saved = _save_scalar_series(fail_code_f)
+        # Only enforce quasi-neutrality on output states
+        if species is not None:
+            ys_saved = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(ys_saved)
+        final_state = unravel(y_f_flat)
+        if species is not None:
+            final_state = enforce_quasi_neutrality(final_state, species)
         return {
             "ys": ys_saved,
             "ts": ts_saved,
@@ -1467,7 +1796,7 @@ class RADAUSolver(TransportSolver):
             "done": done_f,
             "failed": failed_f,
             "fail_code": fail_code_f,
-            "final_state": unravel(y_f_flat),
+            "final_state": final_state,
             "final_time": t_f,
             "t0": self.t0,
             "t1": self.t1,

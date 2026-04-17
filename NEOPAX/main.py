@@ -1,283 +1,479 @@
 """
-NEOPAX main orchestrator (torax-style): TOML-driven workflow dispatch for ambipolarity and transport.
+NEOPAX main orchestrator: TOML-driven workflow dispatch for ambipolarity,
+transport, and direct flux evaluation.
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import dataclasses
+import sys
+from pathlib import Path
+
+import jax.numpy as jnp
+
+from ._ambipolarity import (
+    pad_and_sort_roots_for_plotting,
+    plot_roots,
+    solve_ambipolarity_roots_from_config,
+    solve_ambipolarity_roots_radial,
+    write_ambipolarity_hdf5,
+)
+from ._database import Monoenergetic
+from ._entropy_models import get_entropy_model
+from ._profiles import build_profiles
+from ._source_models import build_source_models_from_config
 from ._species import Species
 from ._state import TransportState
-from ._database import Monoenergetic
-import jax
-import jax.numpy as jnp
+from ._transport_flux_models import (
+    ZeroTransportModel,
+    build_transport_flux_model,
+    get_transport_flux_model,
+)
 
 try:
     import tomli as toml
 except ImportError:
     import toml
 
-from ._ambipolarity import solve_ambipolarity_roots_from_config
-from ._source_models import build_source_models_from_config
-from ._transport_flux_models import build_transport_flux_model
-from ._entropy_models import get_entropy_model
-# Add other imports as needed (profiles, grid, field, database, etc.)
+
+@dataclasses.dataclass(frozen=True)
+class Models:
+    flux: object = None
+    source: object = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeContext:
+    species: Species
+    energy_grid: object
+    geometry: object | None
+    database: object | None
+    solver_parameters: dict
+    models: Models
 
 
 def load_config(path):
     with open(path, "rb") as f:
         return toml.load(f)
 
-def main(config_path):
-    config = load_config(config_path)
-    # --- Support [general] section for mode and other global options ---
-    general = config.get("general", {})
-    mode = general.get("mode", config.get("mode", "transport")).lower()
+
+def _normalize_solver_config(config: dict) -> dict:
+    solver_cfg = config.get("transport_solver", {})
+    if not solver_cfg:
+        solver_cfg = config.get("solver", config.get("transport", {}))
+    solver_cfg = dict(solver_cfg)
+    if "integrator" in solver_cfg and "transport_solver_backend" not in solver_cfg:
+        solver_cfg["transport_solver_backend"] = solver_cfg["integrator"]
+    solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
+    solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
+    solver_cfg.setdefault("Er_relax", 1.0)
+    solver_cfg.setdefault("DEr", 1.0)
+    return solver_cfg
 
 
-    # --- Robust config section reading ---
-    energy_grid_cfg = config.get("energy_grid", {})
-    geom_cfg = config.get("geometry", {})
+def _state_num_elements(state: TransportState | None) -> int:
+    if state is None:
+        return 0
+    total = 0
+    for arr in (state.density, state.temperature, state.Er):
+        if hasattr(arr, "size"):
+            total += int(arr.size)
+    return total
+
+
+def _apply_transport_solver_memory_heuristics(solver_cfg: dict, state: TransportState, n_equations: int) -> dict:
+    """
+    Prefer matrix-free linear solves automatically for larger coupled transport
+    solves where dense Jacobians are likely to blow up compile memory.
+
+    Keep small/single-equation problems on direct solves unless the user has
+    explicitly chosen otherwise.
+    """
+    tuned = dict(solver_cfg)
+    backend = str(tuned.get("transport_solver_backend", tuned.get("integrator", ""))).strip().lower()
+    state_size = _state_num_elements(state)
+    coupled_problem = n_equations > 1
+    large_problem = state_size >= 256
+    very_large_problem = state_size >= 512
+    prefer_low_memory = coupled_problem or large_problem
+
+    if backend == "theta_newton" and "theta_linear_solver" not in tuned and prefer_low_memory:
+        tuned["theta_linear_solver"] = "gmres"
+    if backend == "radau" and "radau_linear_solver" not in tuned and prefer_low_memory:
+        tuned["radau_linear_solver"] = "gmres"
+
+    # For larger coupled transport solves, prefer Diffrax's Kvaerno5 backend if
+    # the user did not explicitly request a backend. This avoids compiling the
+    # much larger custom implicit solver programs.
+    explicit_backend = ("transport_solver_backend" in solver_cfg) or ("integrator" in solver_cfg)
+    if (
+        not explicit_backend
+        and backend in ("theta_newton", "radau", "")
+        and (coupled_problem and very_large_problem)
+    ):
+        tuned["transport_solver_backend"] = "diffrax_kvaerno5"
+        tuned["integrator"] = "diffrax_kvaerno5"
+        tuned.setdefault("transport_solver_family", "ode")
+
+    return tuned
+
+
+def _build_species(config: dict) -> Species:
     species_cfg = config.get("species", {})
-    neoclassical_cfg = config.get("neoclassical", {})
-    profiles_cfg = config.get("profiles", {})
-
-
-
-    # --- Build species ---
-
-    # Ensure mass_mp and charge_qp are always jnp.arrays of float
-    mass_mp = species_cfg.get("mass_mp", [0.000544617, 2.0, 3.0])
-    charge_qp = species_cfg.get("charge_qp", [-1.0, 1.0, 1.0])
     n_species = int(species_cfg.get("n_species", 3))
-    # Convert to jnp.array(float) if needed
-    mass_mp = jnp.array(mass_mp, dtype=float)
-    charge_qp = jnp.array(charge_qp, dtype=float)
-    species_indices = jnp.arange(n_species)
-    species = Species(
+    mass_mp = jnp.asarray(species_cfg.get("mass_mp", [0.000544617, 2.0, 3.0]), dtype=float)
+    charge_qp = jnp.asarray(species_cfg.get("charge_qp", [-1.0, 1.0, 1.0]), dtype=float)
+    names = tuple(species_cfg.get("names", ["e", "D", "T"]))
+    return Species(
         number_species=n_species,
-        species_indices=species_indices,
+        species_indices=jnp.arange(n_species),
         mass_mp=mass_mp,
-        charge_qp=charge_qp
+        charge_qp=charge_qp,
+        names=names,
     )
 
 
-    # --- Build energy grid (modular) ---
-    n_radial = int(geom_cfg.get("n_radial", 51))
-    n_x = int(energy_grid_cfg.get("n_x", 4))
+def _build_energy_grid(config: dict):
     from ._energy_grid_models import get_energy_grid_model
-    energy_grid = get_energy_grid_model("standard_laguerre", n_x=n_x, n_order=3)
 
-    # --- Build grid (for species/radial indices, if needed) ---
-    # grid = None  # Legacy: NEOPAX.Grid.create_standard(n_radial, n_x, n_species)
-    # Only instantiate if legacy code still needs it; otherwise, remove.
+    energy_grid_cfg = config.get("energy_grid", {})
+    n_x = int(energy_grid_cfg.get("n_x", 4))
+    return get_energy_grid_model("standard_laguerre", n_x=n_x, n_order=3)
 
-    # --- Build geometry (modular) ---
+
+def _build_geometry(config: dict):
     from ._geometry_models import get_geometry_model
+
+    geom_cfg = config.get("geometry", {})
+    n_radial = int(geom_cfg.get("n_radial", 51))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
-    if vmec_file is not None and boozer_file is not None:
-        geometry = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
-    else:
-        geometry = None
+    if vmec_file is None or boozer_file is None:
+        return None
+    return get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
 
-    # --- Optionally: get flux/entropy model names from neoclassical section ---
-    flux_model_name = neoclassical_cfg.get("flux_model", "monkes_database")
-    entropy_model_name = neoclassical_cfg.get("entropy_model", "monkes_database")
 
-    # --- Build database if neoclassical_file is given ---
-    neoclassical_file = neoclassical_cfg.get("neoclassical_file")
+def _build_database(config: dict, geometry):
+    neoclassical_file = config.get("neoclassical", {}).get("neoclassical_file")
     if neoclassical_file and geometry is not None:
-        database = Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
-    else:
-        database = None
+        return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
+    return None
 
 
-    # --- Build state from profiles using _profiles.py logic ---
-    from ._profiles import build_profiles
+def _build_state(config: dict, geometry, n_species: int):
+    if geometry is None:
+        return None
+    profile_set = build_profiles(config.get("profiles", {}), geometry, n_species)
+    return TransportState(
+        temperature=profile_set.temperature / 1.0e3,
+        density=profile_set.density / 1.0e20,
+        Er=profile_set.Er,
+    )
 
-    if geometry is not None:
-        profile_set = build_profiles(profiles_cfg, geometry, n_species)
-        state = TransportState(
-            temperature=profile_set.temperature,
-            density=profile_set.density,
-            Er=profile_set.Er
+
+def _build_flux_model(config: dict, species, energy_grid, geometry, database):
+    neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "monkes_database"))
+    turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
+    classical_factory = (
+        get_transport_flux_model(config.get("classical", {}).get("flux_model", "none"))
+        if "classical" in config
+        else None
+    )
+
+    neoclassical_model = neoclassical_factory(species, energy_grid, geometry, database)
+    turbulence_model = (
+        turbulence_factory(species, energy_grid, geometry, database)
+        if turbulence_factory is not None
+        else ZeroTransportModel()
+    )
+    classical_model = (
+        classical_factory(species, energy_grid, geometry, database)
+        if classical_factory is not None
+        else ZeroTransportModel()
+    )
+    return build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
+
+
+def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState | None]:
+    species = _build_species(config)
+    energy_grid = _build_energy_grid(config)
+    geometry = _build_geometry(config)
+    database = _build_database(config, geometry)
+    state = _build_state(config, geometry, species.number_species)
+    solver_cfg = _normalize_solver_config(config)
+    models = Models(
+        flux=_build_flux_model(config, species, energy_grid, geometry, database),
+        source=build_source_models_from_config(config),
+    )
+    runtime = RuntimeContext(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+        solver_parameters=solver_cfg,
+        models=models,
+    )
+    return runtime, state
+
+
+def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
+    from ._boundary_conditions import build_boundary_condition_model
+    from ._transport_equations import ComposedEquationSystem, build_equation_system
+    from ._transport_solvers import build_time_solver
+
+    field = runtime.geometry
+    boundary_cfg = config.get("boundary", {})
+    bc = {}
+    dr = getattr(field, "dr", 1.0)
+    for key in ("density", "temperature", "Er", "gamma"):
+        if key in boundary_cfg:
+            bc[key] = build_boundary_condition_model(boundary_cfg[key], dr)
+
+    er_bc_mode = str(runtime.solver_parameters.get("Er_right_boundary_mode", "config")).strip().lower()
+    if er_bc_mode == "ambipolar_edge_root":
+        amb_cfg = dict(config.get("ambipolarity", {}))
+        model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
+        entropy_model_name = config.get("neoclassical", {}).get(
+            "entropy_model",
+            runtime.solver_parameters.get("neoclassical_flux_model", "monkes_database"),
         )
-    else:
-        state = None
+        entropy_model = get_entropy_model(entropy_model_name)
+        _, _, best_roots, _, = solve_ambipolarity_roots_radial(
+            state=state,
+            config=config,
+            params={
+                "species": runtime.species,
+                "energy_grid": runtime.energy_grid,
+                "geometry": runtime.geometry,
+                "database": runtime.database,
+                "solver_parameters": runtime.solver_parameters,
+            },
+            model_name=model_name,
+            flux_model=runtime.models.flux,
+            entropy_model=entropy_model,
+            amb_cfg=amb_cfg,
+        )
+        er_edge = float(jnp.asarray(best_roots)[-1])
+        if "Er" in bc:
+            bc["Er"] = dataclasses.replace(
+                bc["Er"],
+                right_type="dirichlet",
+                right_value=jnp.asarray(er_edge),
+                right_gradient=None,
+            )
+        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
+            print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={er_edge}")
 
-    # Build params dictionary for all models
-    params = {
-        "energy_grid": energy_grid,
-        "geometry": geometry,
-        "database": database,
-        "species": species,
+    equations_to_evolve = build_equation_system(
+        config=config,
+        species=runtime.species,
+        field=runtime.geometry,
+        flux_model=runtime.models.flux,
+        source_models=runtime.models.source,
+        solver_cfg=runtime.solver_parameters,
+        boundary_models=bc,
+    )
+    solver_cfg = _apply_transport_solver_memory_heuristics(
+        runtime.solver_parameters,
+        state,
+        len(equations_to_evolve),
+    )
+    shared_flux_model = runtime.models.flux if len(equations_to_evolve) > 1 else None
+    equation_system = ComposedEquationSystem(
+        tuple(equations_to_evolve),
+        species=runtime.species,
+        shared_flux_model=shared_flux_model,
+    )
+    solver = build_time_solver(solver_cfg)
+    debug_markers = bool(solver_cfg.get("debug_stage_markers", False))
+    debug_disable_jit = bool(solver_cfg.get("debug_disable_jit", False))
+    if debug_markers:
+        print(
+            "[NEOPAX] transport setup complete:",
+            f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
+            f"n_equations={len(equations_to_evolve)}",
+            f"state_size={_state_num_elements(state)}",
+        )
+        er_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None)
+        rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
+        er_rhs0 = getattr(rhs0, "Er", None)
+        if er_rhs0 is not None:
+            print(
+                "[NEOPAX] initial Er RHS summary:",
+                f"max_abs={float(jnp.max(jnp.abs(er_rhs0))):.6e}",
+                f"min={float(jnp.min(er_rhs0)):.6e}",
+                f"max={float(jnp.max(er_rhs0)):.6e}",
+            )
+            if er_equation is not None:
+                components = er_equation.debug_components(state)
+                for label, arr in components.items():
+                    arr = jnp.asarray(arr)
+                    finite_mask = jnp.isfinite(arr)
+                    finite_count = int(jnp.sum(finite_mask))
+                    total_count = arr.size
+                    if finite_count > 0:
+                        finite_vals = arr[finite_mask]
+                        print(
+                            f"[NEOPAX] Er component {label}:",
+                            f"finite={finite_count}/{total_count}",
+                            f"min={float(jnp.min(finite_vals)):.6e}",
+                            f"max={float(jnp.max(finite_vals)):.6e}",
+                        )
+                    else:
+                        print(
+                            f"[NEOPAX] Er component {label}:",
+                            f"finite=0/{total_count}",
+                            "all_nonfinite=true",
+                        )
+        print("[NEOPAX] entering solver.solve(...)")
+    if debug_disable_jit:
+        import jax
+
+        if debug_markers:
+            print("[NEOPAX] debug_disable_jit=true, forcing eager execution for diagnosis")
+        with jax.disable_jit(True):
+            result = solver.solve(state, equation_system.vector_field, runtime.species)
+    else:
+        result = solver.solve(state, equation_system.vector_field, runtime.species)
+    if debug_markers:
+        ys = getattr(result, "ys", None)
+        if ys is not None:
+            er_hist = getattr(ys, "Er", None)
+            if er_hist is not None and jnp.asarray(er_hist).ndim >= 2:
+                er_hist_arr = jnp.asarray(er_hist)
+                delta = er_hist_arr[-1] - er_hist_arr[0]
+                print(
+                    "[NEOPAX] saved Er evolution summary:",
+                    f"max_abs_delta={float(jnp.max(jnp.abs(delta))):.6e}",
+                    f"max_abs_initial={float(jnp.max(jnp.abs(er_hist_arr[0]))):.6e}",
+                    f"max_abs_final={float(jnp.max(jnp.abs(er_hist_arr[-1]))):.6e}",
+                )
+        print("[NEOPAX] solver.solve(...) returned")
+    transport_cfg = config.get("transport_output", {})
+    do_plot = transport_cfg.get("transport_plot", False)
+    do_hdf5 = transport_cfg.get("transport_write_hdf5", False)
+    do_residual_compare = transport_cfg.get("transport_compare_ambipolarity_residual", False)
+    do_residual_scan = transport_cfg.get("transport_scan_ambipolarity_residual", False)
+    output_dir = transport_cfg.get("transport_output_dir", None)
+    plot_n_times = int(transport_cfg.get("transport_plot_n_times", 1))
+    rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+    if do_plot or do_hdf5 or do_residual_compare:
+        if output_dir is None:
+            output_dir = Path("outputs")
+        elif not isinstance(output_dir, Path):
+            output_dir = Path(str(output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if do_plot:
+            plot_transport_solution(
+                rho,
+                result,
+                output_dir,
+                n_times=plot_n_times,
+                reference_er_file=transport_cfg.get("transport_reference_er_file"),
+                overlay_reference_er=bool(transport_cfg.get("transport_overlay_reference_er", False)),
+            )
+        if do_hdf5:
+            write_transport_hdf5(rho, result, output_dir)
+        if do_residual_compare:
+            write_transport_ambipolarity_residual_comparison(
+                state=state,
+                runtime=runtime,
+                transport_equations=equations_to_evolve,
+                config=config,
+                output_dir=output_dir,
+            )
+        if do_residual_scan:
+            write_transport_ambipolarity_residual_scan(
+                state=state,
+                runtime=runtime,
+                transport_equations=equations_to_evolve,
+                config=config,
+                output_dir=output_dir,
+            )
+    return result
+
+
+def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState):
+    result = solve_ambipolarity_roots_from_config(
+        state=state,
+        config=config,
+        params={
+            "species": runtime.species,
+            "energy_grid": runtime.energy_grid,
+            "geometry": runtime.geometry,
+            "database": runtime.database,
+            "solver_parameters": runtime.solver_parameters,
+        },
+        flux_model=runtime.models.flux,
+    )
+    if not (isinstance(result, tuple) and len(result) == 7):
+        raise RuntimeError(
+            "Ambipolarity solver must return a 7-tuple: "
+            "(roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir)"
+        )
+
+    roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir = result
+    rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+    roots_3, entropies_3, best_root = pad_and_sort_roots_for_plotting(
+        roots_all,
+        entropies_all,
+        n_roots_all,
+        best_roots=best_roots,
+        max_roots=3,
+    )
+
+    if output_dir is None:
+        output_dir = Path("outputs")
+    elif not isinstance(output_dir, Path):
+        output_dir = Path(str(output_dir))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if do_plot:
+        plot_roots(rho, roots_3, entropies_3, best_root, output_dir)
+    if do_hdf5:
+        write_ambipolarity_hdf5(rho, roots_3, entropies_3, best_root, output_dir)
+
+    return {
+        "rho": rho,
+        "roots_3": roots_3,
+        "entropies_3": entropies_3,
+        "best_root": best_root,
+        "output_dir": output_dir,
     }
 
-    # --- Build sources, fluxes, entropy models from config ---
-    source_models = build_source_models_from_config(config)
 
-    if mode == "ambipolarity":
-        from pathlib import Path
-        from ._ambipolarity import (
-            solve_ambipolarity_roots_from_config,
-            pad_and_sort_roots_for_plotting,
-            plot_roots,
-            write_ambipolarity_hdf5
-        )
-        # Solve ambipolarity roots (JIT/differentiable)
-        result = solve_ambipolarity_roots_from_config(state, config, params)
-        # New return signature: (roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir)
-        if not (isinstance(result, tuple) and len(result) == 7):
-            raise RuntimeError("Ambipolarity solver must return a 7-tuple: (roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir)")
-        roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir = result
-        # Use geometry.rho_grid for rho if needed
-        rho = geometry.rho_grid if geometry is not None and hasattr(geometry, "rho_grid") else None
-
-        # Debug print shapes and types before padding
-        print("[DEBUG] roots_all shape:", getattr(roots_all, 'shape', None), type(roots_all))
-        print("[DEBUG] entropies_all shape:", getattr(entropies_all, 'shape', None), type(entropies_all))
-        print("[DEBUG] best_roots shape:", getattr(best_roots, 'shape', None), type(best_roots))
-        print("[DEBUG] n_roots_all shape:", getattr(n_roots_all, 'shape', None), type(n_roots_all))
-        print("[DEBUG] rho shape:", getattr(rho, 'shape', None), type(rho))
-        # Prepare for plotting/writing (not JIT/differentiable, so outside main numerics)
-        roots_3, entropies_3, best_root = pad_and_sort_roots_for_plotting(
-            roots_all, entropies_all, n_roots_all, best_roots=best_roots, max_roots=3
-        )
-
-        print("Ambipolarity roots result:")
-        print(f"rho shape: {jnp.shape(rho)}")
-        print(f"roots_3 shape: {jnp.shape(roots_3)}")
-        print(f"entropies_3 shape: {jnp.shape(entropies_3)}")
-        print(f"best_root shape: {jnp.shape(best_root)}")
-
-        # Only plotting and HDF5 writing are non-JIT, non-differentiable
-        # output_dir may be None or a string; ensure Path
-        if output_dir is None:
-            output_dir = Path("outputs")
-        elif not isinstance(output_dir, Path):
-            output_dir = Path(str(output_dir))
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if do_plot:
-            out_png = plot_roots(rho, roots_3, entropies_3, best_root, output_dir)
-            print(f"Ambipolarity roots plot saved to: {out_png}")
-        if do_hdf5:
-            out_h5 = write_ambipolarity_hdf5(rho, roots_3, entropies_3, best_root, output_dir)
-            print(f"Ambipolarity roots HDF5 saved to: {out_h5}")
-        return {
-            "rho": rho,
-            "roots_3": roots_3,
-            "entropies_3": entropies_3,
-            "best_root": best_root,
-            "output_dir": output_dir,
-        }
-    elif mode == "fluxes":
-        from pathlib import Path
-        # --- Calculate fluxes for the current state and config ---
-        result = calculate_fluxes_from_config(state, config, params)
-        if not (isinstance(result, tuple) and len(result) == 4):
-            raise RuntimeError("Fluxes solver must return a 4-tuple: (fluxes, do_plot, do_hdf5, output_dir)")
-        fluxes, do_plot, do_hdf5, output_dir = result
-        rho = geometry.rho_grid if geometry is not None and hasattr(geometry, "rho_grid") else None
-        if output_dir is None:
-            output_dir = Path("outputs")
-        elif not isinstance(output_dir, Path):
-            output_dir = Path(str(output_dir))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if do_plot:
-            out_png = plot_fluxes(rho, fluxes, output_dir)
-            print(f"Fluxes plot saved to: {out_png}")
-        if do_hdf5:
-            out_h5 = write_fluxes_hdf5(rho, fluxes, output_dir)
-            print(f"Fluxes HDF5 saved to: {out_h5}")
-        return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}
-    elif mode == "transport":
-        # --- Transport solver: time evolution of profiles ---
-        from ._main_solver import solve_transport_equations
-        from ._boundary_conditions import build_boundary_condition_model
-        from ._transport_equations import get_equation
-        # Build field (geometry) for equations
-        field = geometry
-        state0 = state
-        # --- Equation selection from [equations] section ---
-        equations_cfg = config.get("equations", {})
-        eqn_flags = {
-            "density": equations_cfg.get("toggle_density", [True]*n_species),
-            "temperature": equations_cfg.get("toggle_temperature", [True]*n_species),
-            "Er": equations_cfg.get("toggle_Er", True),
-        }
-        # Build list of equations to evolve
-        equations_to_evolve = []
-        if any(eqn_flags["density"]):
-            equations_to_evolve.append(get_equation("density")())
-        if any(eqn_flags["temperature"]):
-            equations_to_evolve.append(get_equation("temperature")())
-        if eqn_flags["Er"]:
-            equations_to_evolve.append(get_equation("Er")())
-
-        # --- Solver parameters from [transport_solver] section ---
-        solver_cfg = config.get("transport_solver", {})
-        # Fallback to [solver] or [transport] if not present
-        if not solver_cfg:
-            solver_cfg = config.get("solver", config.get("transport", {}))
-
-        # --- Read [boundary] section and build BC models ---
-        boundary_cfg = config.get("boundary", {})
-        bc = {}
-        dr = getattr(field, "dr", 1.0)
-        for key in ("density", "temperature", "Er"):
-            if key in boundary_cfg:
-                bc[key] = build_boundary_condition_model(boundary_cfg[key], dr)
-
-        # --- Build params tuple for solver (species, grid, field, database, turbulent, solver_parameters) ---
-        args = (species, None, field, database, None, solver_cfg)
-
-        # --- Run the time solver ---
-        result = solve_transport_equations(
-            state0,
-            args,
-            equations=equations_to_evolve,
-            source_models=source_models,
-            bc=bc
-        )
-        print("Transport solver completed.")
-        return result
-    else:
-        raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes'.")
-    
-    
-def calculate_fluxes_from_config(state, config, params):
+def calculate_fluxes_from_config(state, config, params, flux_model=None):
     """
     Config-driven entrypoint for direct flux calculation (no root-finding).
-    Reads config, builds models, computes fluxes for the current state.
     Returns (fluxes, do_plot, do_hdf5, output_dir)
     """
-    general = config.get("general", {})
     fluxes_cfg = config.get("fluxes", {})
-    neoclassical_cfg = config.get("neoclassical", {})
-    # Select flux model
-    flux_model_name = neoclassical_cfg.get("flux_model", "monkes_database")
-    flux_model = build_transport_flux_model(flux_model_name)
-    # Compute fluxes
-    fluxes = flux_model(state, params.get("geometry"), params)
-    # Output options
+    if flux_model is None:
+        flux_model = _build_flux_model(
+            config,
+            params["species"],
+            params["energy_grid"],
+            params["geometry"],
+            params["database"],
+        )
+    fluxes = flux_model(state)
     do_plot = fluxes_cfg.get("fluxes_plot", False)
     do_hdf5 = fluxes_cfg.get("fluxes_write_hdf5", False)
     output_dir = fluxes_cfg.get("fluxes_output_dir", None)
     return fluxes, do_plot, do_hdf5, output_dir
 
+
 def plot_fluxes(rho, fluxes, output_dir):
-    """Stub: Plot fluxes vs rho. Implement as needed."""
     import matplotlib.pyplot as plt
+
     out_png = output_dir / "fluxes.png"
-    # Example: plot Gamma for each species if present
-    Gamma = fluxes.get("Gamma", None)
-    if Gamma is not None:
-        if Gamma.ndim == 2:
-            for i in range(Gamma.shape[0]):
-                plt.plot(rho, Gamma[i], label=f"Gamma[{i}]")
+    gamma = fluxes.get("Gamma", None)
+    if gamma is not None:
+        if gamma.ndim == 2:
+            for i in range(gamma.shape[0]):
+                plt.plot(rho, gamma[i], label=f"Gamma[{i}]")
         else:
-            plt.plot(rho, Gamma, label="Gamma")
+            plt.plot(rho, gamma, label="Gamma")
         plt.xlabel("rho")
         plt.ylabel("Gamma")
         plt.title("Particle Fluxes vs rho")
@@ -288,9 +484,10 @@ def plot_fluxes(rho, fluxes, output_dir):
         plt.close()
     return out_png
 
+
 def write_fluxes_hdf5(rho, fluxes, output_dir):
-    """Stub: Write fluxes to HDF5. Implement as needed."""
     import h5py
+
     out_h5 = output_dir / "fluxes.h5"
     with h5py.File(out_h5, "w") as f:
         if rho is not None:
@@ -298,6 +495,382 @@ def write_fluxes_hdf5(rho, fluxes, output_dir):
         for key, val in fluxes.items():
             f.create_dataset(key, data=jnp.asarray(val))
     return out_h5
+
+
+def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_file=None, overlay_reference_er=False):
+    import matplotlib.pyplot as plt
+
+    ys = getattr(solution, "ys", None)
+    if ys is None:
+        ys = solution.get("ys") if isinstance(solution, dict) else None
+    if ys is None:
+        return None
+
+    ts = getattr(solution, "ts", None)
+    if ts is None and isinstance(solution, dict):
+        ts = solution.get("ts")
+
+    def _select_time_slices(arr, kind):
+        if arr is None:
+            return []
+        arr = jnp.asarray(arr)
+        if rho is None or arr.ndim == 0:
+            return [(None, arr)]
+        radial_n = len(rho)
+        if arr.shape[-1] != radial_n:
+            return [(None, arr)]
+
+        if kind == "scalar":
+            if arr.ndim == 1:
+                return [(None, arr)]
+            if arr.ndim == 2:
+                n_saved = arr.shape[0]
+                if int(n_times) < 0:
+                    n_pick = n_saved
+                else:
+                    n_pick = max(1, min(int(n_times), n_saved))
+                idxs = jnp.linspace(0, n_saved - 1, n_pick).round().astype(int)
+                idxs = jnp.unique(idxs)
+                labels = None
+                if ts is not None:
+                    ts_arr = jnp.asarray(ts)
+                    labels = [float(ts_arr[int(i)]) for i in idxs]
+                return [
+                    (labels[k] if labels is not None else None, arr[int(i)])
+                    for k, i in enumerate(idxs)
+                ]
+            return [(None, arr)]
+
+        # species x rho
+        if arr.ndim == 2:
+            return [(None, arr)]
+        # time x species x rho
+        if arr.ndim >= 3:
+            n_saved = arr.shape[0]
+            if int(n_times) < 0:
+                n_pick = n_saved
+            else:
+                n_pick = max(1, min(int(n_times), n_saved))
+            idxs = jnp.linspace(0, n_saved - 1, n_pick).round().astype(int)
+            idxs = jnp.unique(idxs)
+            labels = None
+            if ts is not None:
+                ts_arr = jnp.asarray(ts)
+                labels = [float(ts_arr[int(i)]) for i in idxs]
+            return [
+                (labels[k] if labels is not None else None, arr[int(i)])
+                for k, i in enumerate(idxs)
+            ]
+        return [(None, arr)]
+
+    density_series = _select_time_slices(getattr(ys, "density", None), kind="species")
+    temperature_series = _select_time_slices(getattr(ys, "temperature", None), kind="species")
+    er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
+
+    if density_series:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for time_label, density in density_series:
+            for i in range(density.shape[0]):
+                label = f"density[{i}]"
+                if time_label is not None:
+                    label += f" t={time_label:.3g}"
+                ax.plot(rho, density[i], label=label)
+        ax.set_xlabel("rho")
+        ax.set_ylabel("Density")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_dir / "transport_density.png", dpi=170)
+        plt.close(fig)
+
+    if temperature_series:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for time_label, temperature in temperature_series:
+            for i in range(temperature.shape[0]):
+                label = f"temperature[{i}]"
+                if time_label is not None:
+                    label += f" t={time_label:.3g}"
+                ax.plot(rho, temperature[i], label=label)
+        ax.set_xlabel("rho")
+        ax.set_ylabel("Temperature")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_dir / "transport_temperature.png", dpi=170)
+        plt.close(fig)
+
+    if er_series:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for time_label, er in er_series:
+            label = "Er"
+            if time_label is not None:
+                label += f" t={time_label:.3g}"
+            ax.plot(rho, er, label=label)
+        if overlay_reference_er and rho is not None:
+            try:
+                import h5py
+                import interpax
+
+                if reference_er_file is None:
+                    candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
+                else:
+                    candidate = Path(reference_er_file)
+                    if not candidate.is_absolute():
+                        candidate = (Path.cwd() / candidate).resolve()
+                if candidate.is_file():
+                    with h5py.File(candidate, "r") as f:
+                        r_data = f["r"][()]
+                        er_data = f["Er"][()]
+                    if len(er_data) != len(rho):
+                        er_ref = interpax.interp1d(r_data, er_data, rho)
+                    else:
+                        er_ref = er_data
+                    ax.plot(rho, er_ref, color="black", linewidth=2.2, linestyle="--", label=f"reference Er")
+            except Exception as e:
+                print(f"Could not plot transport reference Er: {e}")
+        ax.set_xlabel("rho")
+        ax.set_ylabel("Er")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_dir / "transport_Er.png", dpi=170)
+        plt.close(fig)
+
+    return {
+        "density": output_dir / "transport_density.png" if density_series else None,
+        "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
+        "Er": output_dir / "transport_Er.png" if er_series else None,
+    }
+
+
+def write_transport_hdf5(rho, solution, output_dir):
+    import h5py
+
+    ys = getattr(solution, "ys", None)
+    if ys is None:
+        ys = solution.get("ys") if isinstance(solution, dict) else None
+    ts = getattr(solution, "ts", None)
+    if ts is None:
+        ts = solution.get("ts") if isinstance(solution, dict) else None
+    dts = getattr(solution, "dts", None)
+    if dts is None:
+        dts = solution.get("dts") if isinstance(solution, dict) else None
+
+    out_h5 = output_dir / "transport_solution.h5"
+    with h5py.File(out_h5, "w") as f:
+        if rho is not None:
+            f.create_dataset("rho", data=jnp.asarray(rho))
+        if ts is not None:
+            f.create_dataset("ts", data=jnp.asarray(ts))
+        if dts is not None:
+            f.create_dataset("dts", data=jnp.asarray(dts))
+        if ys is not None:
+            density = getattr(ys, "density", None)
+            temperature = getattr(ys, "temperature", None)
+            er = getattr(ys, "Er", None)
+            if density is not None:
+                f.create_dataset("density", data=jnp.asarray(density))
+            if temperature is not None:
+                f.create_dataset("temperature", data=jnp.asarray(temperature))
+            if er is not None:
+                f.create_dataset("Er", data=jnp.asarray(er))
+    return out_h5
+
+
+def write_transport_ambipolarity_residual_comparison(state, runtime, transport_equations, config, output_dir):
+    import h5py
+    import jax
+    import matplotlib.pyplot as plt
+
+    from ._constants import elementary_charge
+    from ._entropy_models import get_entropy_model
+    from ._transport_equations import ElectricFieldEquation, _plasma_permitivity_from_prefactor
+
+    er_equation = next((eq for eq in transport_equations if isinstance(eq, ElectricFieldEquation)), None)
+    if er_equation is None:
+        return None
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+
+    def _transport_charge_flux_for_state(test_state):
+        if er_equation.source_mode == "ambipolar_local" and local_particle_flux is not None:
+            return jax.vmap(
+                lambda i, er: jnp.sum(charge_qp * local_particle_flux(i, er))
+            )(jnp.arange(test_state.Er.shape[0]), test_state.Er)
+        fluxes = runtime.models.flux(test_state)
+        gamma = fluxes["Gamma"]
+        gamma_faces = er_equation.gamma_faces_builder(gamma)
+        ambipolar_flux_center = 0.5 * (gamma_faces[:, :-1] + gamma_faces[:, 1:])
+        return jnp.sum(er_equation.charge_qp[:, None] * ambipolar_flux_center, axis=0)
+
+    plasma_permitivity = _plasma_permitivity_from_prefactor(
+        state,
+        er_equation.species_mass,
+        er_equation.permitivity_prefactor,
+    )
+    transport_charge_flux = _transport_charge_flux_for_state(state)
+    transport_ambi_term = transport_charge_flux * elementary_charge * 1.0e-3 / plasma_permitivity
+
+    if local_particle_flux is not None:
+        local_charge_flux = jax.vmap(
+            lambda i, er: jnp.sum(charge_qp * local_particle_flux(i, er))
+        )(jnp.arange(state.Er.shape[0]), state.Er)
+    else:
+        local_charge_flux = transport_charge_flux
+
+    rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+    out_h5 = output_dir / "transport_ambipolarity_residual_compare.h5"
+    with h5py.File(out_h5, "w") as f:
+        if rho is not None:
+            f.create_dataset("rho", data=jnp.asarray(rho))
+        f.create_dataset("transport_charge_flux", data=jnp.asarray(transport_charge_flux))
+        f.create_dataset("transport_ambi_term", data=jnp.asarray(transport_ambi_term))
+        f.create_dataset("ambipolar_charge_flux_local", data=jnp.asarray(local_charge_flux))
+
+    if rho is not None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(rho, transport_charge_flux, label="transport charge flux")
+        ax.plot(rho, local_charge_flux, label="ambipolar local charge flux", linestyle="--")
+        ax.set_xlabel("rho")
+        ax.set_ylabel("charge-weighted flux")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(output_dir / "transport_ambipolarity_residual_compare.png", dpi=170)
+        plt.close(fig)
+
+    return out_h5
+
+
+def write_transport_ambipolarity_residual_scan(state, runtime, transport_equations, config, output_dir):
+    import dataclasses as py_dataclasses
+    import h5py
+    import jax
+    import matplotlib.pyplot as plt
+
+    from ._transport_equations import ElectricFieldEquation
+
+    er_equation = next((eq for eq in transport_equations if isinstance(eq, ElectricFieldEquation)), None)
+    if er_equation is None:
+        return None
+
+    transport_cfg = config.get("transport_output", {})
+    scan_min = float(transport_cfg.get("transport_residual_scan_min", -50.0))
+    scan_max = float(transport_cfg.get("transport_residual_scan_max", 50.0))
+    n_scan = int(transport_cfg.get("transport_residual_scan_n", 101))
+    scan_radii = transport_cfg.get("transport_residual_scan_radii", [0, -1])
+    er_scan = jnp.linspace(scan_min, scan_max, n_scan)
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+    rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+    n_radial = state.Er.shape[0]
+
+    resolved_radii = []
+    for idx in scan_radii:
+        i = int(idx)
+        if i < 0:
+            i = n_radial + i
+        if 0 <= i < n_radial:
+            resolved_radii.append(i)
+    resolved_radii = sorted(set(resolved_radii))
+    if not resolved_radii:
+        resolved_radii = [0, n_radial - 1]
+
+    out_h5 = output_dir / "transport_ambipolarity_residual_scan.h5"
+    fig, axes = plt.subplots(len(resolved_radii), 1, figsize=(9, 4 * len(resolved_radii)), sharex=True)
+    if len(resolved_radii) == 1:
+        axes = [axes]
+
+    with h5py.File(out_h5, "w") as f:
+        f.create_dataset("Er_scan", data=jnp.asarray(er_scan))
+        if rho is not None:
+            f.create_dataset("rho", data=jnp.asarray(rho))
+
+        for ax, i in zip(axes, resolved_radii):
+            def transport_charge_flux_at(er_value):
+                er_vec = state.Er.at[i].set(er_value)
+                test_state = py_dataclasses.replace(state, Er=er_vec)
+                if er_equation.source_mode == "ambipolar_local" and local_particle_flux is not None:
+                    return jnp.sum(charge_qp * local_particle_flux(i, er_value))
+                fluxes = runtime.models.flux(test_state)
+                gamma = fluxes["Gamma"]
+                gamma_faces = er_equation.gamma_faces_builder(gamma)
+                ambipolar_flux_center = 0.5 * (gamma_faces[:, :-1] + gamma_faces[:, 1:])
+                return jnp.sum(charge_qp * ambipolar_flux_center[:, i])
+
+            transport_scan = jax.vmap(transport_charge_flux_at)(er_scan)
+
+            if local_particle_flux is not None:
+                ambipolar_scan = jax.vmap(
+                    lambda er_value: jnp.sum(charge_qp * local_particle_flux(i, er_value))
+                )(er_scan)
+            else:
+                ambipolar_scan = transport_scan
+
+            group = f.create_group(f"radius_{i}")
+            group.create_dataset("transport_charge_flux", data=jnp.asarray(transport_scan))
+            group.create_dataset("ambipolar_charge_flux_local", data=jnp.asarray(ambipolar_scan))
+            if rho is not None:
+                group.attrs["rho_value"] = float(rho[i])
+            group.attrs["index"] = i
+
+            label_suffix = f"i={i}"
+            if rho is not None:
+                label_suffix += f", rho={float(rho[i]):.3g}"
+            ax.plot(er_scan, transport_scan, label=f"transport ({label_suffix})")
+            ax.plot(er_scan, ambipolar_scan, "--", label=f"ambipolar ({label_suffix})")
+            ax.axhline(0.0, color="k", linewidth=0.8, alpha=0.5)
+            ax.set_ylabel("charge-weighted flux")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Er")
+    fig.tight_layout()
+    fig.savefig(output_dir / "transport_ambipolarity_residual_scan.png", dpi=170)
+    plt.close(fig)
+    return out_h5
+
+
+def main(config_path):
+    config = load_config(config_path)
+    runtime, state = build_runtime_context(config)
+    general = config.get("general", {})
+    mode = general.get("mode", config.get("mode", "transport")).lower()
+
+    if mode == "transport":
+        return run_transport(config, runtime, state)
+
+    if mode == "ambipolarity":
+        return run_ambipolarity(config, runtime, state)
+
+    if mode == "fluxes":
+        fluxes, do_plot, do_hdf5, output_dir = calculate_fluxes_from_config(
+            state,
+            config,
+            {
+                "species": runtime.species,
+                "energy_grid": runtime.energy_grid,
+                "geometry": runtime.geometry,
+                "database": runtime.database,
+                "solver_parameters": runtime.solver_parameters,
+            },
+            flux_model=runtime.models.flux,
+        )
+        rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+        if output_dir is None:
+            output_dir = Path("outputs")
+        elif not isinstance(output_dir, Path):
+            output_dir = Path(str(output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if do_plot:
+            plot_fluxes(rho, fluxes, output_dir)
+        if do_hdf5:
+            write_fluxes_hdf5(rho, fluxes, output_dir)
+        return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}
+
+    raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes'.")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

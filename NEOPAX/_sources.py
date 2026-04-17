@@ -3,16 +3,10 @@ import jax.numpy as jnp
 from jax import jit
 from ._constants import proton_mass, elementary_charge
 
-SPECIES_IDX = {
-    "e": 0,
-    "D": 1,
-    "T": 2,
-    "He": 3,
-}
 
 @jit
-def fusion_power_fraction_electrons(state):
-    Te = state.temperature[SPECIES_IDX['e']]
+def fusion_power_fraction_electrons(state, species):
+    Te = state.temperature[species.species_idx['e']]
     y2 = 88. / Te
     y = jnp.sqrt(y2)
     part = 2. * (jnp.log((1 - y + y2) / (1 + 2 * y + y2)) / 6 +
@@ -21,10 +15,10 @@ def fusion_power_fraction_electrons(state):
     return 1. - part
 
 @jit
-def dt_reaction(state):
-    nD = state.density[SPECIES_IDX['D']]
-    nT = state.density[SPECIES_IDX['T']]
-    TT = state.temperature[SPECIES_IDX['T']]
+def dt_reaction(state, species):
+    nD = state.density[species.species_idx['D']]
+    nT = state.density[species.species_idx['T']]
+    TT = state.temperature[species.species_idx['T']]
     t = jnp.power(TT, -1. / 3.)
     wrk = (TT + 1.0134) / (1 + 6.386e-3 * jnp.square(TT + 1.0134)) + 1.877 * jnp.exp(-0.16176 * jnp.sqrt(TT) * TT)
     DTreactionRate = 8.972e-19 * t * t * jnp.exp(-19.94 * t) * wrk
@@ -33,7 +27,7 @@ def dt_reaction(state):
     return DTreactionRate, HeSource, AlphaPower
 
 @jit
-def power_exchange(state, species=None):
+def power_exchange(state, species):
     # JAX-jittable, differentiable: vectorized pairwise sum
     n_species = state.temperature.shape[0]
     idx_i, idx_j = jnp.triu_indices(n_species, k=1)
@@ -41,19 +35,10 @@ def power_exchange(state, species=None):
     nB = state.density[idx_j]
     TA = state.temperature[idx_i]
     TB = state.temperature[idx_j]
-    if species is not None:
-        mA = species.mass[idx_i]
-        mB = species.mass[idx_j]
-        qA = species.charge[idx_i]
-        qB = species.charge[idx_j]
-    else:
-        def get_mass(idx):
-            return jnp.where(idx == SPECIES_IDX.get('D', -1), 2.014 * proton_mass,
-                    jnp.where(idx == SPECIES_IDX.get('T', -1), 3.016 * proton_mass, proton_mass))
-        mA = get_mass(idx_i)
-        mB = get_mass(idx_j)
-        qA = elementary_charge * jnp.ones_like(idx_i, dtype=state.density.dtype)
-        qB = elementary_charge * jnp.ones_like(idx_j, dtype=state.density.dtype)
+    mA = species.mass[idx_i]
+    mB = species.mass[idx_j]
+    qA = species.charge[idx_i]
+    qB = species.charge[idx_j]
     lnL = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
     Pab = 663. * jnp.sqrt(mA * mB) * jnp.square(qA * qB / (elementary_charge * elementary_charge)) \
         * nA * nB * lnL * (TB - TA) / jnp.power(mA * TB + mB * TA, 1.5)
@@ -64,16 +49,13 @@ def power_exchange(state, species=None):
     return out
 
 @jit
-def bremsstrahlung_radiation(state, ZD=None, ZT=None, species=None):
-    ZD = ZD if ZD is not None else 1.0
-    ZT = ZT if ZT is not None else 1.0
-    Te = state.temperature[SPECIES_IDX['e']]
-    ne = state.density[SPECIES_IDX['e']]
-    nD = state.density[SPECIES_IDX['D']]
-    nT = state.density[SPECIES_IDX['T']]
-    if species is not None:
-        ZD = species.charge[SPECIES_IDX['D']] / elementary_charge
-        ZT = species.charge[SPECIES_IDX['T']] / elementary_charge
+def bremsstrahlung_radiation(state, species):
+    Te = state.temperature[species.species_idx['e']]
+    ne = state.density[species.species_idx['e']]
+    nD = state.density[species.species_idx['D']]
+    nT = state.density[species.species_idx['T']]
+    ZD = species.charge[species.species_idx['D']] / elementary_charge
+    ZT = species.charge[species.species_idx['T']] / elementary_charge
     Zeff = (ZD ** 2 * nD + ZT ** 2 * nT) / ne
     PBrems = 3.16e-1 * Zeff * ne * ne * jnp.sqrt(Te)
     return PBrems, Zeff

@@ -15,6 +15,9 @@ from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 from ._state import get_v_thermal
 
+DENSITY_STATE_TO_PHYSICAL = 1.0e20
+TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
+
 
 
 @jit
@@ -22,7 +25,7 @@ def get_plasma_permitivity(state, species_mass, geometry, grid_x):
     """Return epsilon(r) used in Er diffusion/ambipolar source term."""
     psi_fac = 1.0 + 1.0 / (geometry.enlogation * jnp.square(geometry.iota))
     psi_fac = psi_fac.at[0].set(1.0)
-    mass_density = jnp.sum(species_mass[:, None] * state.density, axis=0)
+    mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(species_mass[:, None] * state.density, axis=0)
     epsilon_r = mass_density * psi_fac / jnp.square(geometry.B0)
     plasma_permitivity = interpax.Interpolator1D(geometry.r_grid, epsilon_r, extrap=True)
     return plasma_permitivity(grid_x)
@@ -81,6 +84,36 @@ def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_in
     Lij=Lij.at[2,1].set(-Lij.at[1,2].get())
     Lij=Lij.at[2,2].set(L33_fac_a*jnp.sum(energy_grid.L33_weight*energy_grid.xWeights*(D33_a)))
     return Lij
+
+
+@jit
+def get_Lij_matrix_local(species, energy_grid, geometry, database, index_species, r_index, Er_value, temperature, density, v_thermal):
+    """Local-in-radius Lij matrix using only the trial Er at one radius."""
+    Lij = jnp.zeros((3, 3))
+    vth_a = v_thermal[index_species, r_index]
+    v_new_a = energy_grid.v_norm * vth_a
+    Er_vnew_a = Er_value * 1.0e3 / v_new_a
+    nu_vnew_a = collisionality(index_species, species, v_new_a, r_index, density, temperature, v_thermal) / v_new_a
+
+    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
+    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
+    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
+
+    Dij = jax.vmap(get_Dij, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
+    D11_a = -10**Dij.at[:, 0].get()
+    D13_a = -Dij.at[:, 1].get()
+    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
+
+    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
+    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
+    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
+    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
+    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
+    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
+    return Lij
 @jit
 def get_Neoclassical_Fluxes(
     species,
@@ -95,7 +128,9 @@ def get_Neoclassical_Fluxes(
     temperature_right_constraint=None,
     temperature_right_grad_constraint=None,
 ):
-    # Compute v_thermal for all species and radial points
+    # TransportState stores normalized units (density in 1e20 m^-3,
+    # temperature in keV). The low-level species/collision helpers convert
+    # those to physical units internally where needed, so do not rescale here.
     v_thermal = get_v_thermal(species.mass, temperature)
     r_grid = geometry.r_grid
     r_grid_half = geometry.r_grid_half
@@ -138,9 +173,11 @@ def get_Neoclassical_Fluxes(
         A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
         A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
         A3 = get_Thermodynamical_Forces_A3(Er)
-        Gamma = -density * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature * density * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
+        density_phys = DENSITY_STATE_TO_PHYSICAL * density
+        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
+        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
+        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
         return Gamma, Q, Upar
 
     # Vectorize Lij calculation over species and radial points
@@ -512,7 +549,9 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     temperature_right_constraint=None,
     temperature_right_grad_constraint=None,
 ):
-    # Compute v_thermal for all species and radial points
+    # TransportState stores normalized units (density in 1e20 m^-3,
+    # temperature in keV). The low-level species/collision helpers convert
+    # those to physical units internally where needed, so do not rescale here.
     v_thermal = get_v_thermal(species.mass, temperature)
     r_grid = field.r_grid
     r_grid_half = field.r_grid_half

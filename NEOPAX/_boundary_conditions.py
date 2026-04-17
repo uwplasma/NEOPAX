@@ -255,3 +255,37 @@ def right_constraints_from_bc_model(bc_model, default_value):
         return None, robin_grad
 
     raise ValueError(f"Unsupported right BC type: {right_type}")
+
+
+def left_constraints_from_bc_model(bc_model, default_value):
+    """Translate left BC model to ``CellVariable`` left-face constraints."""
+    default_arr = jnp.asarray(default_value)
+    zeros_like_default = jnp.zeros_like(default_arr)
+
+    if bc_model is None:
+        return None, zeros_like_default
+
+    left_type = str(getattr(bc_model, "left_type", "dirichlet")).strip().lower()
+    left_value = getattr(bc_model, "left_value", None)
+    left_gradient = getattr(bc_model, "left_gradient", None)
+    left_decay = getattr(bc_model, "left_decay_length", None)
+
+    if left_type == "dirichlet":
+        lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
+        return lv, None
+
+    if left_type == "neumann":
+        lg = zeros_like_default if left_gradient is None else _as_like_template(left_gradient, default_arr)
+        return None, lg
+
+    if left_type == "robin":
+        lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
+        decay = (
+            jnp.ones_like(default_arr)
+            if left_decay is None
+            else _as_like_template(left_decay, default_arr)
+        )
+        robin_grad = lv / (decay + 1e-12)
+        return None, robin_grad
+
+    raise ValueError(f"Unsupported left BC type: {left_type}")

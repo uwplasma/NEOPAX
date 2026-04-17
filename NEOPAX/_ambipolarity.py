@@ -240,7 +240,6 @@ def find_ambipolar_Er_min_entropy_jit_multires(
     roots, entropies, best_root, n_roots = lax.cond(jnp.sum(valid) == 0, _empty, _roots)
     return roots, entropies, best_root, n_roots
 
-
 # --- Adaptive bracketing root-finder ---
 
 def find_ambipolar_Er_min_entropy_jit_adaptive(
@@ -481,6 +480,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
     JIT/differentiable radial root-finder with blocksize option (default: pure vmap).
     """
     import dataclasses
+
     Er = getattr(state, "Er", None)
     if Er is None:
         raise ValueError("State must have an 'Er' attribute.")
@@ -502,26 +502,38 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
     root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(model_name)
     if root_finder is None:
         raise ValueError(f"Unknown ambipolarity model: {model_name}")
+    charge_qp = jnp.asarray(params["species"].charge_qp)
+    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+
+    def _evaluate_gamma_and_entropy(i, er):
+        if local_particle_flux is not None:
+            gamma = local_particle_flux(i, er)
+        else:
+            er_value = jnp.asarray(er, dtype=Er.dtype)
+            if n_radial > 1:
+                er_vec = Er.at[i].set(er_value)
+            else:
+                er_vec = jnp.asarray([er_value], dtype=Er.dtype)
+            fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
+            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
+            if gamma is None:
+                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
+            gamma = gamma[:, i]
+        return (
+            jnp.sum(charge_qp * gamma),
+            jnp.sum(jnp.abs(gamma)),
+        )
 
     def gamma_func_factory(i):
         def gamma(er):
-            er_vec = Er.at[i].set(er) if n_radial > 1 else jnp.array([er])
-            fluxes = flux_model(dataclasses.replace(state, Er=er_vec), params=params)
-            q = params["species"].charge_qp
-            Gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
-            if Gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            return jnp.sum(q[:] * Gamma[:,i])
+            gamma_val, _ = _evaluate_gamma_and_entropy(i, er)
+            return gamma_val
         return gamma
 
     def entropy_func_factory(i):
         def entropy(er):
-            er_vec = Er.at[i].set(er) if n_radial > 1 else jnp.array([er])
-            fluxes = flux_model(dataclasses.replace(state, Er=er_vec), params=params)
-            Gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
-            if Gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            return jnp.sum(jnp.abs(Gamma[:,i]))
+            _, entropy_val = _evaluate_gamma_and_entropy(i, er)
+            return entropy_val
         return entropy
 
     def root_finder_for_radius(i):
@@ -628,7 +640,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         return tuple(np.asarray(arr)[:n_radial] for arr in (roots_all, entropies_all, best_roots, n_roots_all))
 
 # --- Orchestration/config reading only ---
-def solve_ambipolarity_roots_from_config(state, config, params):
+def solve_ambipolarity_roots_from_config(state, config, params, flux_model=None, entropy_model=None):
     """
     Config-driven entrypoint for ambipolarity root finding. Reads config, builds models, and calls the JIT/diff radial solver.
     """
@@ -642,12 +654,30 @@ def solve_ambipolarity_roots_from_config(state, config, params):
 
     # Select root-finding model
     model_name = amb_cfg.get("er_ambipolar_method", "two_stage").lower()
-    # Select transport/entropy models
-    flux_model_name = neoclassical_cfg.get("flux_model", "monkes_database")
-    entropy_model_name = neoclassical_cfg.get("entropy_model", flux_model_name)
-    flux_model = build_transport_flux_model(flux_model_name)
-    entropy_model = get_entropy_model(entropy_model_name)
 
+    if flux_model is None:
+        from ._transport_flux_models import ZeroTransportModel, get_transport_flux_model
+
+        neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "monkes_database"))
+        turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
+        classical_factory = get_transport_flux_model(config.get("classical", {}).get("flux_model", "none")) if "classical" in config else None
+
+        species = params["species"]
+        energy_grid = params["energy_grid"]
+        geometry = params["geometry"]
+        database = params["database"]
+
+        neoclassical_model = neoclassical_factory(species, energy_grid, geometry, database)
+        turbulence_model = turbulence_factory(species, energy_grid, geometry, database) if turbulence_factory is not None else ZeroTransportModel()
+        classical_model = classical_factory(species, energy_grid, geometry, database) if classical_factory is not None else ZeroTransportModel()
+        flux_model = build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
+
+    if entropy_model is None:
+        entropy_model_name = neoclassical_cfg.get(
+            "entropy_model",
+            params["solver_parameters"].get("neoclassical_flux_model", "monkes_database"),
+        )
+        entropy_model = get_entropy_model(entropy_model_name)
 
     # Call the JIT/diff radial root-finder
     roots_all, entropies_all, best_roots, n_roots_all = solve_ambipolarity_roots_radial(
