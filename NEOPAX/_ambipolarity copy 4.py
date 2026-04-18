@@ -1203,8 +1203,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
 
     batched_root_finder = jax.vmap(root_finder_for_radius)
 
-    # Pure vmap or blocked vmap. Dispatch here so each mode keeps its own
-    # smaller compiled program.
+    # Blocked or pure vmap, JAX-friendly
     if er_ambipolar_blocksize is None or er_ambipolar_blocksize >= n_radial:
         # JIT the full radial batch once when we can fit it in memory.
         if debug_stage_markers and model_name == "two_stage":

@@ -451,3 +451,145 @@ If the next session confirms compile-time death before execution, the best use o
 2. keep it JAX-friendly, jittable, and differentiable
 3. use that backend as the main low-memory stiff solver for transport
 4. leave custom Radau available for validation / comparison rather than as the default workhorse
+
+## Current Transport/Er Status
+
+### Stable direction reached
+
+- The `Er` transport path is now behaving much better with:
+  - `integrator = "diffrax_kvaerno5"`
+  - `Er_source_mode = "ambipolar_local"`
+  - `DEr = 0.0` for pure ambipolar relaxation tests
+- The centered ambipolar source was producing an odd-even / checkerboard instability in the pure-source case.
+- The local ambipolar source removes that face-to-cell averaging step and gives a much more physical relaxation toward the expected branch.
+- `ambipolar_local` was therefore made the default source mode for the `Er` equation.
+
+### Important implementation notes
+
+- `TransportState` is currently treated as normalized:
+  - density in `1e20 m^-3`
+  - temperature in `keV`
+  - `Er` in `kV/m`
+- Flux-producing physics is converted back to physical units internally where needed.
+- A critical bug was fixed in the current repo where normalized state values were being converted to physical units twice in the neoclassical path; that double conversion was a major cause of the later centered-path blow-up.
+- Another critical fix was applied in the neoclassical flux assembly so final `Gamma`, `Q`, and `Upar` are returned in physical units instead of staying scaled by normalized state factors.
+- For `DEr = 0`, the `Er` equation now bypasses diffusion entirely instead of computing diffusion and multiplying by zero. This avoids `0 * NaN` contamination and makes the pure ambipolar test mathematically faithful.
+
+### Initialization improvement already added
+
+- Transport can now optionally initialize `Er` from the ambipolar min-entropy branch before time integration.
+- This is selected from TOML via:
+
+```toml
+[profiles]
+er_initialization_mode = "ambipolar_min_entropy"
+```
+
+- The initializer computes the ambipolar `best_roots` profile using the same root-finder / entropy-selection machinery as `mode = "ambipolarity"` and replaces the initial `state.Er` with that branch.
+
+## Next Ambipolarity Upgrade Path
+
+### Goal
+
+Make the ambipolarity root finder significantly faster and more memory efficient while keeping it:
+
+- differentiable
+- JAX-jittable
+- JAX-friendly
+- low-closure / low-memory
+- suitable for reuse as an `Er` initialization tool for transport
+
+### Recommended direction
+
+Upgrade the current `two_stage` method rather than replacing it immediately.
+
+Reason:
+
+- this is a scalar root problem in `Er` at each radius
+- the main cost is repeated expensive `Gamma(Er)` evaluations
+- a more structured scalar solver should beat a heavier generic nonlinear method
+- continuity in radius can be exploited strongly
+
+### Proposed upgraded method
+
+Implement a continuation-based ambipolar root finder, keeping the current method as a fallback/reference.
+
+Working name:
+
+- `two_stage_continuation`
+
+Core idea:
+
+1. Solve the first radius with the current robust search/bracketing logic.
+2. For each next radius, use the selected root from the previous radius as the first guess or bracket center.
+3. Only widen the search when the local continuation guess fails.
+4. Only evaluate entropy on the small set of candidate roots that survive the local stage.
+
+### Why this should help
+
+- far fewer global trial points per radius
+- much smaller repeated closure work
+- better branch tracking across radius
+- lower memory than broad multistart everywhere
+- faster initialization for transport when using `ambipolar_min_entropy`
+
+### Specific improvements to implement
+
+1. Radius continuation
+- use `best_root[i-1]` as the first guess for `i`
+- optionally use a narrow bracket around that value
+
+2. Adaptive bracketing
+- start with a small local search window
+- widen only when sign changes / convergence checks fail
+
+3. Cheaper entropy selection
+- do not evaluate entropy on a large cloud of guesses
+- evaluate entropy only on the final small candidate set
+
+4. Blocked radial execution
+- keep block processing as a first-class option for memory control
+- avoid vmapping all radii at once if compile/runtime memory grows too much
+
+5. Compact local evaluator
+- keep using a compact local particle-flux evaluator
+- avoid carrying unnecessary transport-equation machinery into the scalar root closure
+
+### Constraints to preserve
+
+The upgraded method must remain:
+
+- differentiable through the chosen numerical path where intended
+- `jax.jit` compatible
+- free of Python-side per-iteration logic inside the core jitted numerical kernel where practical
+- careful about traced closure size
+- as memory-light as possible for repeated radial scans
+
+### What not to do first
+
+- do not jump immediately to a heavier generic root solver
+- do not reintroduce large multistart scans at every radius if continuation can avoid them
+- do not make the local `Gamma(Er)` closure depend on the full transport machinery more than necessary
+
+### Recommended implementation order for the next session
+
+1. Keep current `two_stage` as reference/fallback.
+2. Add a continuation-based ambipolar solver variant.
+3. Expose it by TOML as a new ambipolarity method option.
+4. Benchmark:
+  - compile memory
+  - runtime
+  - branch consistency
+  - agreement with current `two_stage`
+5. If it is clearly better, make it the preferred method for:
+  - `mode = "ambipolarity"`
+  - `er_initialization_mode = "ambipolar_min_entropy"`
+
+### Success criterion for this upgrade
+
+The ambipolar upgrade is successful if:
+
+- it produces the same selected branch as current `two_stage` on the reference case
+- it uses less compile/runtime memory
+- it is faster enough to be practical as a transport initializer
+- it stays differentiable, jittable, and JAX-friendly

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import time
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -171,6 +172,70 @@ def _build_state(config: dict, geometry, n_species: int):
     )
 
 
+def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
+    if state is None:
+        return state
+
+    profiles_cfg = config.get("profiles", {})
+    init_mode = str(profiles_cfg.get("er_initialization_mode", "analytical")).strip().lower()
+    removed_modes = {
+        "ambipolar_min_entropy_fast",
+        "ambipolar_min_entropy_tracked",
+        "ambipolar_min_entropy_hybrid",
+        "ambipolar_min_entropy_multibranch",
+    }
+    if init_mode in removed_modes:
+        raise ValueError(
+            f"Unsupported er_initialization_mode '{init_mode}'. "
+            "Alternative ambipolar initializers were removed; use 'ambipolar_min_entropy'."
+        )
+    if init_mode not in {
+        "ambipolar_min_entropy",
+        "ambipolar_best_root",
+        "ambipolarity_best_root",
+    }:
+        return state
+
+    debug_stage_markers = bool(runtime.solver_parameters.get("debug_stage_markers", False))
+    if debug_stage_markers:
+        print(f"[NEOPAX] starting Er initialization: mode={init_mode}")
+    t_start = time.perf_counter()
+
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
+    entropy_model_name = config.get("neoclassical", {}).get(
+        "entropy_model",
+        runtime.solver_parameters.get("neoclassical_flux_model", "monkes_database"),
+    )
+    entropy_model = get_entropy_model(entropy_model_name)
+    params = {
+        "species": runtime.species,
+        "energy_grid": runtime.energy_grid,
+        "geometry": runtime.geometry,
+        "database": runtime.database,
+        "solver_parameters": runtime.solver_parameters,
+    }
+    _, _, best_roots, _ = solve_ambipolarity_roots_radial(
+        state=state,
+        config=config,
+        params=params,
+        model_name=model_name,
+        flux_model=runtime.models.flux,
+        entropy_model=entropy_model,
+        amb_cfg=amb_cfg,
+    )
+    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
+    er_init = jnp.where(jnp.isfinite(best_roots), best_roots, state.Er)
+    if debug_stage_markers:
+        dt = time.perf_counter() - t_start
+        n_finite = int(jnp.sum(jnp.isfinite(best_roots)))
+        print(
+            f"[NEOPAX] finished Er initialization: mode={init_mode} "
+            f"elapsed_s={dt:.3f} finite_roots={n_finite}/{best_roots.shape[0]}"
+        )
+    return dataclasses.replace(state, Er=er_init)
+
+
 def _build_flux_model(config: dict, species, energy_grid, geometry, database):
     neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "monkes_database"))
     turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
@@ -213,6 +278,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
         solver_parameters=solver_cfg,
         models=models,
     )
+    state = _maybe_initialize_er_from_ambipolarity(config, runtime, state)
     return runtime, state
 
 

@@ -13,6 +13,18 @@ flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = './examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
 
+[ambipolarity]
+er_ambipolar_method = "two_stage"
+er_ambipolar_scan_min = -50.0
+er_ambipolar_scan_max = 50.0
+er_ambipolar_n_coarse = 30
+er_ambipolar_n_refine = 8
+er_ambipolar_max_roots = 3
+er_ambipolar_tol = 1.0e-6
+er_ambipolar_x_tol = 1.0e-6
+er_ambipolar_maxiter = 12
+er_ambipolar_blocksize = 0
+
 [turbulence]
 flux_model="none"
 
@@ -41,7 +53,7 @@ density_shape_power = 10.0
 temperature_shape_power = 2.0
 n_scale = 1.0
 T_scale = 1.0
-er_initialization_mode = "parabolic"
+er_initialization_mode = "ambipolar_min_entropy"
 er0_scale = 100.0
 er0_peak_rho = 0.8
 
@@ -90,14 +102,14 @@ min_step = 1.0e-14
 
 debug_stage_markers = true
 debug_disable_jit = false
-Er_source_mode = "ambipolar_centered"
+Er_source_mode = "ambipolar_local"
 Er_right_boundary_mode = "floating_ambipolar_edge"
 Er_edge_relax = 0.1
 
 save_n = 10
 
 Er_relax = 1.0
-DEr = 0.0
+DEr = 2.0
 
 [transport_output]
 transport_plot = true
