@@ -1,0 +1,50 @@
+[general]
+mode = "fluxes"
+
+[geometry]
+vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
+boozer_file = "./examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+n_radial = 51
+
+[neoclassical]
+flux_model = "monkes_database"
+neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+
+[turbulence]
+flux_model = "turbulent_analytical"
+# Zero particle fluxes from the analytical turbulence model.
+chi_density = [0.0, 0.0, 0.0]
+# Finite heat fluxes for electrons, deuterium, and tritium.
+chi_temperature = [0.8, 0.4, 0.4]
+
+[classical]
+flux_model = "none"
+
+[energy_grid]
+n_x = 4
+
+[species]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = 4.21
+n_edge = 0.6
+T0 = 17.8
+T_edge = 0.7
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
+density_shape_power = 10.0
+temperature_shape_power = 2.0
+n_scale = 1.0
+T_scale = 1.0
+er0_scale = 100.0
+er0_peak_rho = 0.8
+
+[fluxes]
+fluxes_plot = true
+fluxes_write_hdf5 = false
+fluxes_output_dir = "./outputs/fluxes_analytical_heat"

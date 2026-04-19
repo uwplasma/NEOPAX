@@ -42,10 +42,10 @@ charge_qp = [-1.0, 1.0, 1.0]
 
 [profiles]
 model = "standard_analytical"
-n0 = 4.21e20
-n_edge = 0.6e20
-T0 = 17.8e3
-T_edge = 0.7e3
+n0 = 4.21
+n_edge = 0.6
+T0 = 17.8
+T_edge = 0.7
 c_density = [1.0, 0.5, 0.5]
 c_temperature = [1.0, 1.0, 1.0]
 density_shape_power = 10.0
@@ -61,14 +61,14 @@ type = "neumann"
 gradient = 0.0
 [boundary.density.right]
 type = "dirichlet"
-value = 0.6e20
+value = 0.6
 
 [boundary.temperature.left]
 type = "neumann"
 gradient = 0.0
 [boundary.temperature.right]
 type = "robin"
-value = 0.7e3
+value = 0.7
 decay_length = 0.5
 
 [boundary.Er.left]

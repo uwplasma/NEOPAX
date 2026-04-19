@@ -82,7 +82,7 @@ def get_Turbulent_Fluxes_Analytical(
         return gamma, q
 
     gamma_turb, q_turb = jax.vmap(per_species, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0))(
-        grid.species_indeces,
+        species.species_indices,
         temperature,
         density,
         n_right,

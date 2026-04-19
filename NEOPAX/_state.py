@@ -33,5 +33,10 @@ class TransportState:
     All fields are JAX arrays for differentiability and vmap support.
     """
     density: Float[Array, "n_species n_radial"]
-    temperature: Float[Array, "n_species n_radial"]
+    pressure: Float[Array, "n_species n_radial"]
     Er: Float[Array, "n_radial"]
+
+    @property
+    def temperature(self):
+        eps = jnp.asarray(1.0e-20, dtype=self.pressure.dtype)
+        return self.pressure / jnp.maximum(self.density, eps)

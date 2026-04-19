@@ -7,8 +7,65 @@ from ._fem import conservative_update, faces_from_cell_centered
 from ._cell_variable import make_profile_cell_variable
 from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
 from ._constants import elementary_charge
+from ._source_models import (
+    assemble_density_source_components,
+    assemble_pressure_source_components,
+    sum_source_components,
+)
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
+PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
+HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
+
+
+def _minmod_pair(a, b):
+    same_sign = (a * b) > 0.0
+    return jnp.where(same_sign, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
+
+
+def _minmod3(a, b, c):
+    return _minmod_pair(a, _minmod_pair(b, c))
+
+
+def _mc_limited_face_states(profile_ghost):
+    um = profile_ghost[:, :-2]
+    u0 = profile_ghost[:, 1:-1]
+    up = profile_ghost[:, 2:]
+    slope = _minmod3(
+        0.5 * (up - um),
+        2.0 * (u0 - um),
+        2.0 * (up - u0),
+    )
+    left_states = jnp.concatenate([profile_ghost[:, :1], u0 + 0.5 * slope], axis=1)
+    right_states = jnp.concatenate([u0 - 0.5 * slope, profile_ghost[:, -1:]], axis=1)
+    return left_states, right_states
+
+
+def _temperature_face_states(temperature_ghost, reconstruction_mode):
+    mode = str(reconstruction_mode).strip().lower()
+    if mode in {"tvd_mc", "mc", "muscl", "muscl_tvd"}:
+        return _mc_limited_face_states(temperature_ghost)
+    return temperature_ghost[:, :-1], temperature_ghost[:, 1:]
+
+
+def _cell_centered_flux_faces(flux, reconstruction_mode):
+    mode = str(reconstruction_mode).strip().lower()
+    if flux.ndim == 1:
+        flux = flux[None, :]
+        squeeze = True
+    else:
+        squeeze = False
+
+    flux_ghost = jnp.concatenate([flux[:, :1], flux, flux[:, -1:]], axis=1)
+    if mode in {"tvd_mc", "mc", "muscl", "muscl_tvd"}:
+        left_states, right_states = _mc_limited_face_states(flux_ghost)
+        faces = 0.5 * (left_states + right_states)
+    else:
+        faces = faces_from_cell_centered(flux) if flux.shape[0] == 1 else jax.vmap(faces_from_cell_centered)(flux)
+
+    if squeeze:
+        return faces[0]
+    return faces
 
 
 def enforce_quasi_neutrality(state, species):
@@ -32,6 +89,7 @@ def _plasma_permitivity_from_prefactor(state, species_mass, permitivity_prefacto
     """Plasma permittivity on the transport grid using a precomputed geometry prefactor."""
     mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(species_mass[:, None] * state.density, axis=0)
     return mass_density * permitivity_prefactor
+
 
 # --- Modular Equation Registry and Base ---
 __equation_registry: Dict[str, Type] = {}
@@ -73,22 +131,28 @@ class DensityEquation(EquationBase):
     flux_model: callable = dataclasses.field(repr=False)
     gamma_faces_builder: callable = dataclasses.field(repr=False)
     source_model: callable = dataclasses.field(repr=False, default=None)
+    species: object = dataclasses.field(repr=False, default=None)
     name: str = "density"
 
     def __call__(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
-        Gamma = fluxes["Gamma"]
+        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
         Gamma_faces = self.gamma_faces_builder(Gamma)
         density_rhs = jax.vmap(
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(Gamma_faces)
         if self.source_model is not None:
-            density_rhs += self.source_model(state)
+            source_components = assemble_density_source_components(
+                self.source_model(state),
+                state,
+                self.species,
+            )
+            density_rhs += sum_source_components(source_components, state.density)
         return density_rhs
 
 # --- Factory function to build DensityEquation up front ---
-def build_density_equation(field, flux_model, source_model, bc_density, reconstruction="linear"):
+def build_density_equation(field, flux_model, source_model, bc_density, species, reconstruction="linear"):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
@@ -138,11 +202,12 @@ def build_density_equation(field, flux_model, source_model, bc_density, reconstr
         flux_model=flux_model,
         source_model=source_model,
         gamma_faces_builder=gamma_faces_builder,
+        species=species,
     )
 
-# --- Example built-in equation: Temperature evolution ---
+# --- Example built-in equation: Pressure evolution ---
 
-# --- JAX-friendly, torax-style TemperatureEquation ---
+# --- JAX-friendly, torax-style PressureEquation ---
 @register_equation("temperature")
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -151,73 +216,262 @@ class TemperatureEquation(EquationBase):
     Vprime: jax.Array = dataclasses.field(repr=False)
     Vprime_half: jax.Array = dataclasses.field(repr=False)
     flux_model: callable = dataclasses.field(repr=False)
-    q_faces_builder: callable = dataclasses.field(repr=False)
+    flux_faces_builder: callable = dataclasses.field(repr=False)
+    temperature_ghost_builder: callable = dataclasses.field(repr=False)
+    charge_qp: jax.Array = dataclasses.field(repr=False)
+    temperature_bc_model: object = dataclasses.field(repr=False, default=None)
+    convection_reconstruction: str = "tvd_mc"
+    heat_flux_reconstruction: str = "tvd_mc"
+    include_neo_convection: bool = True
+    include_turbulent_convection: bool = True
+    include_classical_convection: bool = True
     source_model: callable = dataclasses.field(repr=False, default=None)
+    species: object = dataclasses.field(repr=False, default=None)
     name: str = "temperature"
+
+    def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
+        bc = self.temperature_bc_model
+        if bc is None:
+            return pressure_rhs
+
+        out = pressure_rhs
+
+        left_type = str(getattr(bc, "left_type", "")).strip().lower()
+        if left_type == "dirichlet":
+            left_value = getattr(bc, "left_value", None)
+            if left_value is None:
+                t_left = state.temperature[:, 0]
+            else:
+                t_left = jnp.asarray(left_value, dtype=pressure_rhs.dtype)
+                if t_left.ndim == 0:
+                    t_left = jnp.broadcast_to(t_left, (pressure_rhs.shape[0],))
+            out = out.at[:, 0].set(t_left * density_rhs[:, 0])
+
+        right_type = str(getattr(bc, "right_type", "")).strip().lower()
+        if right_type == "dirichlet":
+            right_value = getattr(bc, "right_value", None)
+            if right_value is None:
+                t_right = state.temperature[:, -1]
+            else:
+                t_right = jnp.asarray(right_value, dtype=pressure_rhs.dtype)
+                if t_right.ndim == 0:
+                    t_right = jnp.broadcast_to(t_right, (pressure_rhs.shape[0],))
+            out = out.at[:, -1].set(t_right * density_rhs[:, -1])
+
+        return out
+
+    def debug_components(self, state, fluxes=None):
+        if fluxes is None:
+            fluxes = self.flux_model(state)
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        Q_faces = self.flux_faces_builder(Q, self.heat_flux_reconstruction)
+        temperature_ghost = self.temperature_ghost_builder(state.temperature)
+        temperature_left, temperature_right = _temperature_face_states(
+            temperature_ghost,
+            self.convection_reconstruction,
+        )
+
+        def _convective_component(gamma_key):
+            gamma_comp = fluxes.get(gamma_key, None)
+            if gamma_comp is None:
+                gamma_comp = jnp.zeros_like(Q)
+            gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
+            temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
+            return temperature_upwind * gamma_faces
+
+        convective_neo_faces = (
+            _convective_component("Gamma_neo") if self.include_neo_convection else jnp.zeros_like(Q_faces)
+        )
+        convective_turb_faces = (
+            _convective_component("Gamma_turb") if self.include_turbulent_convection else jnp.zeros_like(Q_faces)
+        )
+        convective_classical_faces = (
+            _convective_component("Gamma_classical") if self.include_classical_convection else jnp.zeros_like(Q_faces)
+        )
+        total_energy_flux_faces = Q_faces + convective_neo_faces + convective_turb_faces + convective_classical_faces
+
+        q_divergence = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(Q_faces)
+        convective_neo_divergence = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(convective_neo_faces)
+        convective_turb_divergence = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(convective_turb_faces)
+        convective_classical_divergence = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(convective_classical_faces)
+        thermal_flux_rhs = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(total_energy_flux_faces)
+        source_components = assemble_pressure_source_components(
+            None if self.source_model is None else self.source_model(state),
+            state,
+            self.species,
+        )
+        source_rhs = sum_source_components(source_components, state.pressure)
+        work_rhs = (
+            self.charge_qp[:, None]
+            * PARTICLE_FLUX_PHYSICAL_TO_STATE
+            * fluxes["Gamma"]
+            * state.Er[None, :]
+        )
+        total_rhs = (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs)
+        return {
+            "Q_faces": Q_faces,
+            "convective_neo_faces": convective_neo_faces,
+            "convective_turb_faces": convective_turb_faces,
+            "convective_classical_faces": convective_classical_faces,
+            "q_divergence": q_divergence,
+            "convective_neo_divergence": convective_neo_divergence,
+            "convective_turb_divergence": convective_turb_divergence,
+            "convective_classical_divergence": convective_classical_divergence,
+            "thermal_flux_rhs": thermal_flux_rhs,
+            **{f"source_{key}": value for key, value in source_components.items()},
+            "source_rhs": source_rhs,
+            "work_rhs": work_rhs,
+            "pressure_rhs": total_rhs,
+        }
 
     def __call__(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
-        Q = fluxes["Q"]
-        Q_faces = self.q_faces_builder(Q)
-        temp_rhs = jax.vmap(
-            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
-        )(Q_faces)
-        if self.source_model is not None:
-            temp_rhs += self.source_model(state)
-        return temp_rhs
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        Q_faces = self.flux_faces_builder(Q, self.heat_flux_reconstruction)
+        temperature_ghost = self.temperature_ghost_builder(state.temperature)
+        temperature_left, temperature_right = _temperature_face_states(
+            temperature_ghost,
+            self.convection_reconstruction,
+        )
 
-# --- Factory function to build TemperatureEquation up front ---
-def build_temperature_equation(field, flux_model, source_model, bc_temperature, reconstruction="linear"):
+        def _convective_component(gamma_key):
+            gamma_comp = fluxes.get(gamma_key, None)
+            if gamma_comp is None:
+                gamma_comp = jnp.zeros_like(Q)
+            gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
+            temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
+            return temperature_upwind * gamma_faces
+
+        convective_flux_faces = jnp.zeros_like(Q_faces)
+        if self.include_neo_convection:
+            convective_flux_faces = convective_flux_faces + _convective_component("Gamma_neo")
+        if self.include_turbulent_convection:
+            convective_flux_faces = convective_flux_faces + _convective_component("Gamma_turb")
+        if self.include_classical_convection:
+            convective_flux_faces = convective_flux_faces + _convective_component("Gamma_classical")
+
+        total_energy_flux_faces = Q_faces + convective_flux_faces
+        thermal_flux_rhs = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(total_energy_flux_faces)
+        source_components = assemble_pressure_source_components(
+            None if self.source_model is None else self.source_model(state),
+            state,
+            self.species,
+        )
+        source_rhs = sum_source_components(source_components, state.pressure)
+        work_rhs = (
+            self.charge_qp[:, None]
+            * PARTICLE_FLUX_PHYSICAL_TO_STATE
+            * fluxes["Gamma"]
+            * state.Er[None, :]
+        )
+        return (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs)
+
+def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
+    if bc_model is not None and hasattr(bc_model, "right_type"):
+        def faces_builder(profile):
+            rv, rg = right_constraints_from_bc_model(bc_model, profile[:, -1])
+            if rv is not None:
+                return jax.vmap(
+                    lambda prof, right_val: make_profile_cell_variable(
+                        prof,
+                        field.r_grid_half,
+                        left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                        right_face_constraint=right_val,
+                    ).face_value(reconstruction=reconstruction)
+                )(profile, jnp.asarray(rv))
+            return jax.vmap(
+                lambda prof, right_grad: make_profile_cell_variable(
+                    prof,
+                    field.r_grid_half,
+                    left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    right_face_grad_constraint=right_grad,
+                ).face_value(reconstruction=reconstruction)
+            )(profile, jnp.asarray(rg))
+    elif bc_model is not None and hasattr(bc_model, "apply_ghost"):
+        def faces_builder(profile):
+            if hasattr(bc_model, "apply_ghost_all"):
+                ghost = bc_model.apply_ghost_all(profile)
+            else:
+                ghost = jax.vmap(lambda prof: bc_model.apply_ghost(prof))(profile)
+            return jax.vmap(faces_from_cell_centered)(ghost)
+    else:
+        def faces_builder(profile):
+            return jax.vmap(
+                lambda prof: make_profile_cell_variable(
+                    prof,
+                    field.r_grid_half,
+                    left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    right_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                ).face_value(reconstruction=reconstruction)
+            )(profile)
+    return faces_builder
+
+
+def _build_species_ghost_builder(bc_model):
+    if bc_model is not None and hasattr(bc_model, "apply_ghost_all"):
+        def ghost_builder(profile):
+            return bc_model.apply_ghost_all(profile)
+    elif bc_model is not None and hasattr(bc_model, "apply_ghost"):
+        def ghost_builder(profile):
+            return jax.vmap(lambda prof: bc_model.apply_ghost(prof))(profile)
+    else:
+        def ghost_builder(profile):
+            return jnp.concatenate([profile[:, :1], profile, profile[:, -1:]], axis=1)
+    return ghost_builder
+
+
+# --- Factory function to build PressureEquation up front ---
+def build_temperature_equation(
+    field,
+        flux_model,
+        source_model,
+        species,
+        bc_temperature,
+    bc_density=None,
+    bc_gamma=None,
+    charge_qp=None,
+    include_neo_convection=True,
+    include_turbulent_convection=True,
+    include_classical_convection=True,
+    convection_reconstruction="tvd_mc",
+    heat_flux_reconstruction="tvd_mc",
+    reconstruction="linear",
+):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
-    # Pre-build the q_faces_builder function for BC handling
-    if bc_temperature is not None and hasattr(bc_temperature, "right_type"):
-        def q_faces_builder(Q):
-            rv, rg = right_constraints_from_bc_model(bc_temperature, Q[:, -1])
-            if rv is not None:
-                return jax.vmap(
-                    lambda Qv, right_val: make_profile_cell_variable(
-                        Qv,
-                        field.r_grid_half,
-                        left_face_constraint=jnp.asarray(0.0, dtype=Qv.dtype),
-                        right_face_constraint=right_val,
-                    ).face_value(reconstruction=reconstruction)
-                )(Q, jnp.asarray(rv))
-            else:
-                return jax.vmap(
-                    lambda Qv, right_grad: make_profile_cell_variable(
-                        Qv,
-                        field.r_grid_half,
-                        left_face_constraint=jnp.asarray(0.0, dtype=Qv.dtype),
-                        right_face_grad_constraint=right_grad,
-                    ).face_value(reconstruction=reconstruction)
-                )(Q, jnp.asarray(rg))
-    elif bc_temperature is not None and hasattr(bc_temperature, "apply_ghost"):
-        def q_faces_builder(Q):
-            if hasattr(bc_temperature, "apply_ghost_all"):
-                Q_ghost = bc_temperature.apply_ghost_all(Q)
-            else:
-                Q_ghost = jax.vmap(lambda Qv: bc_temperature.apply_ghost(Qv))(Q)
-            return jax.vmap(faces_from_cell_centered)(Q_ghost)
-    else:
-        def q_faces_builder(Q):
-            return jax.vmap(
-                lambda Qv: make_profile_cell_variable(
-                    Qv,
-                    field.r_grid_half,
-                    left_face_constraint=jnp.asarray(0.0, dtype=Qv.dtype),
-                    right_face_grad_constraint=jnp.asarray(0.0, dtype=Qv.dtype),
-                ).face_value(reconstruction=reconstruction)
-            )(Q)
+    def flux_faces_builder(flux, face_reconstruction="centered"):
+        return _cell_centered_flux_faces(flux, face_reconstruction)
+    temperature_ghost_builder = _build_species_ghost_builder(bc_temperature)
     return TemperatureEquation(
         dr_cells=dr_cells,
         Vprime=Vprime,
         Vprime_half=Vprime_half,
         flux_model=flux_model,
         source_model=source_model,
-        q_faces_builder=q_faces_builder,
+        species=species,
+        flux_faces_builder=flux_faces_builder,
+        temperature_ghost_builder=temperature_ghost_builder,
+        temperature_bc_model=bc_temperature,
+        charge_qp=jnp.asarray(charge_qp),
+        include_neo_convection=bool(include_neo_convection),
+        include_turbulent_convection=bool(include_turbulent_convection),
+        include_classical_convection=bool(include_classical_convection),
+        convection_reconstruction=str(convection_reconstruction),
+        heat_flux_reconstruction=str(heat_flux_reconstruction),
     )
 
 # --- Example built-in equation: Electric field (Er) evolution ---
@@ -470,6 +724,11 @@ def build_equation_system(
     Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
     Er_boundary_mode = solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))
     Er_edge_relax = solver_cfg.get("Er_edge_relax", Er_relax)
+    include_neo_convection = solver_cfg.get("temperature_include_neo_convection", True)
+    include_turbulent_convection = solver_cfg.get("temperature_include_turbulent_convection", True)
+    include_classical_convection = solver_cfg.get("temperature_include_classical_convection", True)
+    convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "tvd_mc")
+    heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "tvd_mc")
 
     if any(eqn_flags["density"]):
         equations_to_evolve.append(build_density_equation(
@@ -477,13 +736,23 @@ def build_equation_system(
             flux_model,
             density_source_model,
             bc_density,
+            species,
         ))
     if any(eqn_flags["temperature"]):
         equations_to_evolve.append(build_temperature_equation(
             field,
             flux_model,
             temperature_source_model,
+            species,
             bc_temperature,
+            bc_density=bc_density,
+            bc_gamma=bc_gamma,
+            charge_qp=charge_qp,
+            include_neo_convection=include_neo_convection,
+            include_turbulent_convection=include_turbulent_convection,
+            include_classical_convection=include_classical_convection,
+            convection_reconstruction=convection_reconstruction,
+            heat_flux_reconstruction=heat_flux_reconstruction,
         ))
     if eqn_flags["Er"]:
         equations_to_evolve.append(build_electric_field_equation(
@@ -549,7 +818,7 @@ def build_equation_system_from_config(config, species):
     solver_cfg = config.get("transport_solver", {})
     if not solver_cfg:
         solver_cfg = config.get("solver", config.get("transport", {}))
-    source_models = build_source_models_from_config(config)
+    source_models = build_source_models_from_config(config, species)
 
     return build_equation_system(
         config=config,
@@ -588,9 +857,9 @@ class ComposedEquationSystem:
             if name is not None:
                 eq_outputs[name] = eq(state, fluxes=shared_fluxes)
 
-        # Defensive: always use shape of state.density, state.temperature, state.Er
+        # Defensive: always use shape of state.density, state.pressure, state.Er
         density_rhs = eq_outputs.get('density', jnp.zeros_like(state.density))
-        temperature_rhs = eq_outputs.get('temperature', jnp.zeros_like(state.temperature))
+        pressure_rhs = eq_outputs.get('temperature', jnp.zeros_like(state.pressure))
         Er_rhs = eq_outputs.get('Er', jnp.zeros_like(state.Er))
 
         # If density_rhs is missing, fill with zeros
@@ -604,9 +873,13 @@ class ComposedEquationSystem:
         except Exception:
             pass
 
+        temperature_equation = next((eq for eq in self.equations if getattr(eq, "name", None) == "temperature"), None)
+        if temperature_equation is not None and hasattr(temperature_equation, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_equation.enforce_dirichlet_boundary_rhs(state, density_rhs, pressure_rhs)
+
         return TransportState(
             density=density_rhs,
-            temperature=temperature_rhs,
+            pressure=pressure_rhs,
             Er=Er_rhs,
         )
 

@@ -224,7 +224,7 @@ class MainTransportModel:
         )
         evolve_er = bool(getattr(self.solver_parameters, "evolve_Er", True))
         density_rhs = jnp.zeros_like(state.density)
-        temperature_rhs = jnp.zeros_like(state.temperature)
+        pressure_rhs = jnp.zeros_like(state.pressure)
         er_rhs = jnp.zeros_like(state.Er)
 
         er_mode = getattr(self.solver_parameters, "er_mode", "diffusion")
@@ -266,7 +266,7 @@ class MainTransportModel:
 
         if jnp.any(evolve_temperature):
             temperature_eq = get_equation("temperature")()
-            temperature_rhs = temperature_eq(
+            pressure_rhs = temperature_eq(
                 state_for_physics,
                 flux_models,
                 self.source_models,
@@ -292,7 +292,7 @@ class MainTransportModel:
 
         # Apply per-species boolean toggles: zero out RHS for frozen species.
         density_rhs = density_rhs * evolve_density[:, None]
-        temperature_rhs = temperature_rhs * evolve_temperature[:, None]
+        pressure_rhs = pressure_rhs * evolve_temperature[:, None]
 
         # Quasi-neutrality: electron density is not independent — it is derived from
         # n_e = sum_ions Z_i * n_i  =>  dn_e/dt = sum_ions Z_i * dn_i/dt
@@ -309,7 +309,7 @@ class MainTransportModel:
 
         return TransportState(
             density=density_rhs,
-            temperature=temperature_rhs,
+            pressure=pressure_rhs,
             Er=er_rhs,
         )
 

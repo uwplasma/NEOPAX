@@ -57,8 +57,14 @@ class AnalyticalProfileModel(ProfileModel):
         density_shape = 1.0 - x ** self.density_shape_power
         temperature_shape = 1.0 - x ** self.temperature_shape_power
 
-        base_density = self.n_scale * ((self.n0-self.n_edge) * density_shape + self.n_edge)
-        base_temperature = self.T_scale * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
+        # User-facing TOML convention:
+        #   density inputs in units of 1e20 m^-3
+        #   temperature inputs in keV
+        # Internally ProfileSet stores physical density [m^-3] and temperature [eV].
+        density_scale_physical = 1.0e20
+        temperature_scale_physical = 1.0e3
+        base_density = density_scale_physical * self.n_scale * ((self.n0-self.n_edge) * density_shape + self.n_edge)
+        base_temperature = temperature_scale_physical * self.T_scale * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
 
         charge_qp = None
         electron_index = -1

@@ -107,10 +107,10 @@ class BoundaryConditionModel:
         right_grad = (arr[-1] - arr[-2]) / self.dr
         return left_grad, right_grad
 
-    def _infer_decay_length(self, boundary_value: jnp.ndarray, boundary_grad: jnp.ndarray) -> jnp.ndarray:
+    def _infer_log_gradient_coeff(self, boundary_value: jnp.ndarray, boundary_grad: jnp.ndarray) -> jnp.ndarray:
         eps = jnp.asarray(1e-12)
-        L = jnp.abs(boundary_value) / (jnp.abs(boundary_grad) + eps)
-        return jnp.where(jnp.isfinite(L) & (L > 0.0), L, jnp.asarray(1.0))
+        coeff = jnp.abs(boundary_grad) / (jnp.abs(boundary_value) + eps)
+        return jnp.where(jnp.isfinite(coeff), coeff, jnp.asarray(0.0))
 
     def _apply_ghost_row(self, arr: jnp.ndarray, row_index: int, reference_row: jnp.ndarray | None) -> jnp.ndarray:
         arr_ext = jnp.concatenate([arr[:1], arr, arr[-1:]])
@@ -137,8 +137,8 @@ class BoundaryConditionModel:
         elif left_type == "robin":
             lv = ref[0] if left_value is None else left_value
             lg = inferred_left_grad if left_grad is None else left_grad
-            ll = self._infer_decay_length(lv, lg) if left_decay is None else left_decay
-            robin_left_grad = -lv / (ll + 1e-12)
+            ll = self._infer_log_gradient_coeff(lv, lg) if left_decay is None else left_decay
+            robin_left_grad = lv * ll
             arr_ext = arr_ext.at[0].set(arr_ext[1] - robin_left_grad * self.dr)
         else:
             raise ValueError(f"Unsupported left BC type: {self.left_type}")
@@ -152,8 +152,8 @@ class BoundaryConditionModel:
         elif right_type == "robin":
             rv = ref[-1] if right_value is None else right_value
             rg = inferred_right_grad if right_grad is None else right_grad
-            rl = self._infer_decay_length(rv, rg) if right_decay is None else right_decay
-            robin_right_grad = -rv / (rl + 1e-12)
+            rl = self._infer_log_gradient_coeff(rv, rg) if right_decay is None else right_decay
+            robin_right_grad = -rv * rl
             arr_ext = arr_ext.at[-1].set(arr_ext[-2] + robin_right_grad * self.dr)
         else:
             raise ValueError(f"Unsupported right BC type: {self.right_type}")
@@ -247,11 +247,11 @@ def right_constraints_from_bc_model(bc_model, default_value):
     if right_type == "robin":
         rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
         decay = (
-            jnp.ones_like(default_arr)
+            jnp.zeros_like(default_arr)
             if right_decay is None
             else _as_like_template(right_decay, default_arr)
         )
-        robin_grad = -rv / (decay + 1e-12)
+        robin_grad = -rv * decay
         return None, robin_grad
 
     raise ValueError(f"Unsupported right BC type: {right_type}")
@@ -281,11 +281,11 @@ def left_constraints_from_bc_model(bc_model, default_value):
     if left_type == "robin":
         lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
         decay = (
-            jnp.ones_like(default_arr)
+            jnp.zeros_like(default_arr)
             if left_decay is None
             else _as_like_template(left_decay, default_arr)
         )
-        robin_grad = lv / (decay + 1e-12)
+        robin_grad = lv * decay
         return None, robin_grad
 
     raise ValueError(f"Unsupported left BC type: {left_type}")

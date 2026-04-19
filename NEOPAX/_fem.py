@@ -46,7 +46,13 @@ def conservative_update(flux, dx, Vprime=None, Vprime_half=None, source=None):
     """
     if Vprime is not None and Vprime_half is not None:
         net_flux = Vprime_half[1:] * flux[1:] - Vprime_half[:-1] * flux[:-1]
-        update = -net_flux / (Vprime * dx)
+        # At the magnetic axis Vprime[0] can be exactly zero even though the
+        # first control volume is finite, which would produce a single 0/0 or
+        # inf/nan entry. Fall back there to a face-based cell-volume estimate.
+        point_volume = Vprime * dx
+        face_volume = 0.5 * (Vprime_half[1:] + Vprime_half[:-1]) * dx
+        cell_volume = jnp.where(jnp.abs(point_volume) > 0.0, point_volume, face_volume)
+        update = -net_flux / cell_volume
     else:
         net_flux = flux[1:] - flux[:-1]
         update = -net_flux / dx

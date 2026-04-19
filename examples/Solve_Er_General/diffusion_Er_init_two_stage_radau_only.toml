@@ -1,7 +1,7 @@
-# Benchmark config: baseline full min-entropy initialization
+# Er-only benchmark: two-stage ambipolar initialization + adaptive Radau transport
 
 [general]
-mode = 'transport'
+mode = "transport"
 
 [geometry]
 vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
@@ -11,7 +11,7 @@ n_radial = 51
 [neoclassical]
 flux_model = "monkes_database"
 entropy_model = "monkes_database"
-neoclassical_file = './examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -26,10 +26,10 @@ er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
 
 [turbulence]
-flux_model="none"
+flux_model = "none"
 
 [classical]
-flux_model="none"
+flux_model = "none"
 
 [energy_grid]
 n_x = 4
@@ -69,7 +69,6 @@ gradient = 0.0
 [boundary.temperature.right]
 type = "dirichlet"
 value = 0.7
-decay_length = 0.5
 
 [boundary.Er.left]
 type = "dirichlet"
@@ -84,16 +83,23 @@ toggle_temperature = [false, false, false]
 toggle_Er = true
 
 [transport_solver]
-integrator = "diffrax_kvaerno5"
+integrator = "radau"
 t0 = 0.0
 t_final = 20.0
 dt = 1.0e-2
-rtol = 1.0e-7
-atol = 1.0e-7
+rtol = 1.0e-6
+atol = 1.0e-6
 max_step = 1.0
 min_step = 1.0e-14
 debug_stage_markers = true
 debug_disable_jit = false
+radau_linear_solver = "gmres"
+radau_gmres_tol = 1.0e-6
+radau_gmres_maxiter = 80
+radau_error_estimator = "embedded2"
+radau_newton_strategy = "simplified"
+nonlinear_solver_tol = 1.0e-7
+nonlinear_solver_maxiter = 20
 Er_source_mode = "ambipolar_local"
 Er_right_boundary_mode = "floating_ambipolar_edge"
 Er_edge_relax = 0.1
@@ -108,5 +114,5 @@ transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
 transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
-transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage"
+transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage_radau_only"
 transport_plot_n_times = -1

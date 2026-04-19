@@ -1,7 +1,11 @@
-# Benchmark config: baseline full min-entropy initialization
+# Focused transport debug case:
+# - density frozen
+# - pressure evolved for e, D, T
+# - Er evolved
+# - startup prints thermal and Er term breakdowns
 
 [general]
-mode = 'transport'
+mode = "transport"
 
 [geometry]
 vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
@@ -11,7 +15,7 @@ n_radial = 51
 [neoclassical]
 flux_model = "monkes_database"
 entropy_model = "monkes_database"
-neoclassical_file = './examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5'
+neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -26,10 +30,12 @@ er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
 
 [turbulence]
-flux_model="none"
+flux_model = "turbulent_analytical"
+chi_density = [0.0, 0.0, 0.0]
+chi_temperature = [0.8, 0.4, 0.4]
 
 [classical]
-flux_model="none"
+flux_model = "none"
 
 [energy_grid]
 n_x = 4
@@ -69,7 +75,7 @@ gradient = 0.0
 [boundary.temperature.right]
 type = "dirichlet"
 value = 0.7
-decay_length = 0.5
+decay_length = 0.05
 
 [boundary.Er.left]
 type = "dirichlet"
@@ -80,13 +86,16 @@ gradient = 0.0
 
 [equations]
 toggle_density = [false, false, false]
-toggle_temperature = [false, false, false]
+toggle_temperature = [true, true, true]
 toggle_Er = true
+
+[sources]
+temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
 
 [transport_solver]
 integrator = "diffrax_kvaerno5"
 t0 = 0.0
-t_final = 20.0
+t_final = 0.1
 dt = 1.0e-2
 rtol = 1.0e-7
 atol = 1.0e-7
@@ -100,6 +109,11 @@ Er_edge_relax = 0.1
 save_n = 10
 Er_relax = 1.0
 DEr = 2.0
+temperature_include_neo_convection = false
+temperature_include_turbulent_convection = false
+temperature_include_classical_convection = false
+temperature_convection_reconstruction = "tvd_mc"
+temperature_heat_flux_reconstruction = "tvd_mc"
 
 [transport_output]
 transport_plot = true
@@ -108,5 +122,6 @@ transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
 transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
-transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage"
+transport_output_dir = "./outputs/transport_pressure_Er_debug"
 transport_plot_n_times = -1
+

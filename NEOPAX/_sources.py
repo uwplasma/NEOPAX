@@ -35,13 +35,34 @@ def power_exchange(state, species):
     nB = state.density[idx_j]
     TA = state.temperature[idx_i]
     TB = state.temperature[idx_j]
-    mA = species.mass[idx_i]
-    mB = species.mass[idx_j]
-    qA = species.charge[idx_i]
-    qB = species.charge[idx_j]
+    # This transport source formula is written for the normalized transport
+    # state convention used in NEOPAX:
+    #   density in 1e20 m^-3, temperature in keV/eV-style transport units,
+    #   masses in proton-mass units, charges in proton-charge units.
+    # Using SI masses here blows up the denominator and produces unphysical
+    # ~1e15-1e16 source magnitudes.
+    mA = species.mass_mp[idx_i]
+    mB = species.mass_mp[idx_j]
+    qA = species.charge_qp[idx_i]
+    qB = species.charge_qp[idx_j]
     lnL = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
-    Pab = 663. * jnp.sqrt(mA * mB) * jnp.square(qA * qB / (elementary_charge * elementary_charge)) \
-        * nA * nB * lnL * (TB - TA) / jnp.power(mA * TB + mB * TA, 1.5)
+    mA = mA[:, None]
+    mB = mB[:, None]
+    qA = qA[:, None]
+    qB = qB[:, None]
+    pair_prefactor = (
+        663.0
+        * jnp.sqrt(mA * mB)
+        * jnp.square(qA * qB)
+    )
+    Pab = (
+        pair_prefactor
+        * nA
+        * nB
+        * lnL
+        * (TB - TA)
+        / jnp.power(mA * TB + mB * TA, 1.5)
+    )
     # For each pair (i, j): +Pab to i, -Pab to j
     out = jnp.zeros((n_species,) + Pab.shape[1:], dtype=Pab.dtype)
     out = out.at[idx_i].add(Pab)
