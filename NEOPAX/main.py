@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 
 from ._ambipolarity import (
@@ -31,9 +32,12 @@ from ._source_models import (
 from ._species import Species
 from ._state import TransportState
 from ._transport_flux_models import (
+    FluxesRFileTransportModel,
     ZeroTransportModel,
     build_transport_flux_model,
+    compute_total_power_mw,
     get_transport_flux_model,
+    read_flux_profile_file,
 )
 
 try:
@@ -76,6 +80,7 @@ def _normalize_solver_config(config: dict) -> dict:
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
     solver_cfg.setdefault("Er_relax", 1.0)
     solver_cfg.setdefault("DEr", 1.0)
+    solver_cfg.setdefault("density_floor", 1.0e-6)
     return solver_cfg
 
 
@@ -216,20 +221,67 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
     return dataclasses.replace(state, Er=er_init)
 
 
-def _build_flux_model(config: dict, species, energy_grid, geometry, database):
-    neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "monkes_database"))
+def _build_flux_model(config: dict, species, energy_grid, geometry, database, source_models=None):
+    def _model_name(section_cfg, default):
+        return str(section_cfg.get("flux_model", section_cfg.get("model", default))).strip().lower()
+
+    def _file_path(section_name, section_cfg):
+        candidates = [
+            section_cfg.get("fluxes_file"),
+            section_cfg.get("file"),
+            section_cfg.get(f"{section_name}_file"),
+        ]
+        if section_name == "neoclassical":
+            candidates.insert(0, section_cfg.get("neoclassical_file"))
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return None
+
+    def _build_file_model(section_name, section_cfg):
+        path = _file_path(section_name, section_cfg)
+        if path is None:
+            raise ValueError(
+                f"[{section_name}] fluxes_r_file requires a flux file. "
+                f"Provide one of: fluxes_file, file, or {section_name}_file."
+            )
+        r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+        return FluxesRFileTransportModel(
+            species=species,
+            geometry=geometry,
+            r_data=r_data,
+            gamma_data=gamma_data,
+            q_data=q_data,
+            upar_data=upar_data,
+        )
+
+    neoclassical_cfg = config.get("neoclassical", {})
     turbulence_cfg = config.get("turbulence", {})
-    turbulence_factory = get_transport_flux_model(turbulence_cfg.get("flux_model", "none"))
+    classical_cfg = config.get("classical", {})
+
+    neoclassical_name = _model_name(neoclassical_cfg, "monkes_database")
+    neoclassical_factory = get_transport_flux_model(neoclassical_name) if neoclassical_name != "fluxes_r_file" else None
+    turbulence_cfg = config.get("turbulence", {})
+    turbulence_name = _model_name(turbulence_cfg, "none")
+    turbulence_factory = get_transport_flux_model(turbulence_name) if turbulence_name != "fluxes_r_file" else None
     classical_factory = (
-        get_transport_flux_model(config.get("classical", {}).get("flux_model", "none"))
+        get_transport_flux_model(_model_name(classical_cfg, "none"))
         if "classical" in config
+        and _model_name(classical_cfg, "none") != "fluxes_r_file"
         else None
     )
 
-    neoclassical_model = neoclassical_factory(species, energy_grid, geometry, database)
-    turbulence_name = str(turbulence_cfg.get("flux_model", "none")).strip().lower()
+    neoclassical_model = (
+        _build_file_model("neoclassical", neoclassical_cfg)
+        if neoclassical_name == "fluxes_r_file"
+        else neoclassical_factory(species, energy_grid, geometry, database)
+    )
     if turbulence_factory is None:
-        turbulence_model = ZeroTransportModel()
+        turbulence_model = (
+            _build_file_model("turbulence", turbulence_cfg)
+            if turbulence_name == "fluxes_r_file"
+            else ZeroTransportModel()
+        )
     elif turbulence_name == "turbulent_analytical":
         chi_t = jnp.asarray(
             turbulence_cfg.get(
@@ -246,12 +298,49 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database):
             dtype=float,
         )
         turbulence_model = turbulence_factory(species, energy_grid, chi_t, chi_n, geometry)
+    elif turbulence_name in {"turbulent_power_analytical", "ntss_power_over_n"}:
+        chi_t = jnp.asarray(
+            turbulence_cfg.get(
+                "chi_temperature",
+                turbulence_cfg.get("chi_t", [0.0] * species.number_species),
+            ),
+            dtype=float,
+        )
+        chi_n = jnp.asarray(
+            turbulence_cfg.get(
+                "chi_density",
+                turbulence_cfg.get("chi_n", [0.0] * species.number_species),
+            ),
+            dtype=float,
+        )
+        if "coef_dano" in turbulence_cfg or "coef_d" in turbulence_cfg:
+            chi_n = jnp.full((species.number_species,), float(turbulence_cfg.get("coef_dano", turbulence_cfg.get("coef_d", 0.0))), dtype=float)
+        if any(key in turbulence_cfg for key in ("coef_xe", "coef_e", "coef_xi", "coef_i")):
+            electron_idx = int(species.species_idx.get("e", 0))
+            ion_value = float(turbulence_cfg.get("coef_xi", turbulence_cfg.get("coef_i", 0.0)))
+            electron_value = float(turbulence_cfg.get("coef_xe", turbulence_cfg.get("coef_e", ion_value)))
+            chi_t = jnp.full((species.number_species,), ion_value, dtype=float).at[electron_idx].set(electron_value)
+        total_power_mw = turbulence_cfg.get("total_power_mw", turbulence_cfg.get("power_mw"))
+        pressure_source_model = None if source_models is None else source_models.get("temperature")
+        turbulence_model = turbulence_factory(
+            species,
+            energy_grid,
+            geometry,
+            chi_t,
+            chi_n,
+            pressure_source_model,
+            total_power_mw,
+        )
     else:
         turbulence_model = turbulence_factory(species, energy_grid, geometry, database)
     classical_model = (
-        classical_factory(species, energy_grid, geometry, database)
-        if classical_factory is not None
-        else ZeroTransportModel()
+        _build_file_model("classical", classical_cfg)
+        if _model_name(classical_cfg, "none") == "fluxes_r_file"
+        else (
+            classical_factory(species, energy_grid, geometry, database)
+            if classical_factory is not None
+            else ZeroTransportModel()
+        )
     )
     return build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
 
@@ -263,9 +352,10 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     database = _build_database(config, geometry)
     state = _build_state(config, geometry, species.number_species)
     solver_cfg = _normalize_solver_config(config)
+    source_models = build_source_models_from_config(config, species)
     models = Models(
-        flux=_build_flux_model(config, species, energy_grid, geometry, database),
-        source=build_source_models_from_config(config, species),
+        flux=_build_flux_model(config, species, energy_grid, geometry, database, source_models=source_models),
+        source=source_models,
     )
     runtime = RuntimeContext(
         species=species,
@@ -290,7 +380,11 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     dr = getattr(field, "dr", 1.0)
     for key in ("density", "temperature", "Er", "gamma"):
         if key in boundary_cfg:
-            bc[key] = build_boundary_condition_model(boundary_cfg[key], dr)
+            bc[key] = build_boundary_condition_model(
+                boundary_cfg[key],
+                dr,
+                species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
+            )
 
     er_bc_mode = str(runtime.solver_parameters.get("Er_right_boundary_mode", "config")).strip().lower()
     if er_bc_mode == "ambipolar_edge_root":
@@ -346,6 +440,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         tuple(equations_to_evolve),
         species=runtime.species,
         shared_flux_model=shared_flux_model,
+        density_floor=solver_cfg.get("density_floor", 1.0e-6),
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -358,9 +453,63 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )
+        density_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None)
         temperature_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "temperature"), None)
         er_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None)
         rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
+        density_rhs0 = getattr(rhs0, "density", None)
+        if density_rhs0 is not None:
+            density_rhs0_arr = jnp.asarray(density_rhs0)
+            for i in range(density_rhs0_arr.shape[0]):
+                arr = density_rhs0_arr[i]
+                print(
+                    f"[NEOPAX] initial density RHS summary[{i}]:",
+                    f"max_abs={float(jnp.max(jnp.abs(arr))):.6e}",
+                    f"min={float(jnp.min(arr)):.6e}",
+                    f"max={float(jnp.max(arr)):.6e}",
+                )
+            if density_equation is not None:
+                components = density_equation.debug_components(state)
+                for label, arr in components.items():
+                    arr = jnp.asarray(arr)
+                    if arr.ndim == 2:
+                        for i in range(arr.shape[0]):
+                            comp = arr[i]
+                            finite_mask = jnp.isfinite(comp)
+                            finite_count = int(jnp.sum(finite_mask))
+                            total_count = comp.size
+                            if finite_count > 0:
+                                finite_vals = comp[finite_mask]
+                                print(
+                                    f"[NEOPAX] density component {label}[{i}]:",
+                                    f"finite={finite_count}/{total_count}",
+                                    f"min={float(jnp.min(finite_vals)):.6e}",
+                                    f"max={float(jnp.max(finite_vals)):.6e}",
+                                )
+                            else:
+                                print(
+                                    f"[NEOPAX] density component {label}[{i}]:",
+                                    f"finite=0/{total_count}",
+                                    "all_nonfinite=true",
+                                )
+                    else:
+                        finite_mask = jnp.isfinite(arr)
+                        finite_count = int(jnp.sum(finite_mask))
+                        total_count = arr.size
+                        if finite_count > 0:
+                            finite_vals = arr[finite_mask]
+                            print(
+                                f"[NEOPAX] density component {label}:",
+                                f"finite={finite_count}/{total_count}",
+                                f"min={float(jnp.min(finite_vals)):.6e}",
+                                f"max={float(jnp.max(finite_vals)):.6e}",
+                            )
+                        else:
+                            print(
+                                f"[NEOPAX] density component {label}:",
+                                f"finite=0/{total_count}",
+                                "all_nonfinite=true",
+                            )
         pressure_rhs0 = getattr(rhs0, "pressure", None)
         if pressure_rhs0 is not None:
             pressure_rhs0_arr = jnp.asarray(pressure_rhs0)
@@ -468,6 +617,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             result = solver.solve(solve_state, solve_vector_field, runtime.species)
     else:
         result = solver.solve(solve_state, solve_vector_field, runtime.species)
+
     solve_wall_mid = time.perf_counter() if debug_markers else None
     if debug_markers:
         _block_until_ready_result(result)
@@ -480,6 +630,15 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         )
     if debug_markers:
         ys = getattr(result, "ys", None)
+        diffrax_result = getattr(result, "result", None)
+        diffrax_stats = getattr(result, "stats", None)
+        if diffrax_result is not None:
+            print(f"[NEOPAX] diffrax result: {diffrax_result}")
+        if diffrax_stats is not None:
+            try:
+                print(f"[NEOPAX] diffrax stats: {diffrax_stats}")
+            except Exception:
+                pass
         if ys is not None:
             er_hist = getattr(ys, "Er", None)
             if er_hist is not None and jnp.asarray(er_hist).ndim >= 2:
@@ -527,9 +686,19 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 n_times=plot_n_times,
                 reference_er_file=transport_cfg.get("transport_reference_er_file"),
                 overlay_reference_er=bool(transport_cfg.get("transport_overlay_reference_er", False)),
+                source_models=runtime.models.source,
+                species=runtime.species,
+                flux_model=runtime.models.flux,
             )
         if do_hdf5:
-            write_transport_hdf5(rho, result, output_dir)
+            write_transport_hdf5(
+                rho,
+                result,
+                output_dir,
+                geometry=runtime.geometry,
+                species=runtime.species,
+                source_models=runtime.models.source,
+            )
         if do_residual_compare:
             write_transport_ambipolarity_residual_comparison(
                 state=state,
@@ -792,7 +961,17 @@ def write_sources_hdf5(rho, sources, output_dir):
     return out_h5
 
 
-def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_file=None, overlay_reference_er=False):
+def plot_transport_solution(
+    rho,
+    solution,
+    output_dir,
+    n_times=1,
+    reference_er_file=None,
+    overlay_reference_er=False,
+    source_models=None,
+    species=None,
+    flux_model=None,
+):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
@@ -860,8 +1039,15 @@ def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_f
         return [(None, arr)]
 
     density_series = _select_time_slices(getattr(ys, "density", None), kind="species")
+    pressure_series = _select_time_slices(getattr(ys, "pressure", None), kind="species")
     temperature_series = _select_time_slices(getattr(ys, "temperature", None), kind="species")
     er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
+    species_names = list(getattr(species, "names", ())) if species is not None else []
+
+    def _species_label(species_idx):
+        if species_idx < len(species_names):
+            return str(species_names[species_idx])
+        return f"species[{species_idx}]"
 
     def _plot_species_time_series(series, ylabel, out_name):
         if not series:
@@ -889,7 +1075,7 @@ def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_f
         for species_idx in range(species_count):
             linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
             species_handles.append(
-                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=f"species[{species_idx}]")
+                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
             )
 
         ax.set_xlabel("rho")
@@ -906,11 +1092,123 @@ def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_f
         plt.close(fig)
         return out_png
 
+    def _plot_individual_species_series(series, ylabel, out_stem):
+        if not series:
+            return {}
+        written = {}
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not color_cycle:
+            color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
+        species_count = int(jnp.asarray(series[0][1]).shape[0])
+        for species_idx in range(species_count):
+            fig, ax = plt.subplots(figsize=(9, 4))
+            for time_idx, (time_label, values) in enumerate(series):
+                color = color_cycle[time_idx % len(color_cycle)]
+                label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+                ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
+            ax.set_xlabel("rho")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
+            ax.grid(True, alpha=0.3)
+            ax.legend(title="Time")
+            fig.tight_layout()
+            out_png = output_dir / f"{out_stem}_{_species_label(species_idx)}.png"
+            fig.savefig(out_png, dpi=170)
+            plt.close(fig)
+            written[_species_label(species_idx)] = out_png
+        return written
+
+    def _plot_scalar_time_series(series, ylabel, out_name, title=None):
+        if not series:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for time_idx, (time_label, values) in enumerate(series):
+            label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+            ax.plot(rho, values, linewidth=1.8, label=label)
+        ax.set_xlabel("rho")
+        ax.set_ylabel(ylabel)
+        if title is not None:
+            ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend(title="Time")
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=170)
+        plt.close(fig)
+        return out_png
+
     if density_series:
         _plot_species_time_series(density_series, "Density", "transport_density.png")
+        _plot_individual_species_series(density_series, "Density", "transport_density")
 
     if temperature_series:
         _plot_species_time_series(temperature_series, "Temperature", "transport_temperature.png")
+        _plot_individual_species_series(temperature_series, "Temperature", "transport_temperature")
+
+    power_source_series = []
+    if source_models is not None and density_series and pressure_series and er_series and species is not None:
+        n_source_snapshots = min(len(density_series), len(pressure_series), len(er_series))
+        for idx in range(n_source_snapshots):
+            time_label = pressure_series[idx][0]
+            snapshot_state = TransportState(
+                density=jnp.asarray(density_series[idx][1]),
+                pressure=jnp.asarray(pressure_series[idx][1]),
+                Er=jnp.asarray(er_series[idx][1]),
+            )
+            sources, _, _, _ = calculate_sources_from_config(
+                snapshot_state,
+                {},
+                {"species": species},
+                source_models=source_models,
+            )
+            pressure_total = sources.get("pressure_total")
+            if pressure_total is None:
+                continue
+            power_source_series.append((time_label, jnp.sum(jnp.asarray(pressure_total), axis=0)))
+
+    flux_component_series: dict[str, list[tuple[float | None, jax.Array]]] = {
+        "Gamma_neo": [],
+        "Gamma_turb": [],
+        "Q_neo": [],
+        "Q_turb": [],
+    }
+    if flux_model is not None and density_series and pressure_series and er_series:
+        n_flux_snapshots = min(len(density_series), len(pressure_series), len(er_series))
+        for idx in range(n_flux_snapshots):
+            time_label = density_series[idx][0]
+            snapshot_state = TransportState(
+                density=jnp.asarray(density_series[idx][1]),
+                pressure=jnp.asarray(pressure_series[idx][1]),
+                Er=jnp.asarray(er_series[idx][1]),
+            )
+            fluxes = flux_model(snapshot_state)
+            for key in tuple(flux_component_series.keys()):
+                value = fluxes.get(key)
+                if value is not None:
+                    flux_component_series[key].append((time_label, jnp.asarray(value)))
+
+    power_sources_png = _plot_scalar_time_series(
+        power_source_series,
+        "Total Power Source",
+        "transport_power_sources_total.png",
+        title="Summed Power Sources vs rho",
+    )
+
+    flux_plot_paths = {}
+    flux_plot_specs = (
+        ("Gamma_neo", "Neo Particle Flux", "transport_flux_Gamma_neo"),
+        ("Gamma_turb", "Turbulent Particle Flux", "transport_flux_Gamma_turb"),
+        ("Q_neo", "Neo Heat Flux", "transport_flux_Q_neo"),
+        ("Q_turb", "Turbulent Heat Flux", "transport_flux_Q_turb"),
+    )
+    for key, ylabel, stem in flux_plot_specs:
+        series = flux_component_series.get(key, [])
+        if not series:
+            continue
+        flux_plot_paths[f"{key}_all"] = _plot_species_time_series(series, ylabel, f"{stem}.png")
+        per_species = _plot_individual_species_series(series, ylabel, stem)
+        for species_name, path in per_species.items():
+            flux_plot_paths[f"{key}_{species_name}"] = path
 
     if er_series:
         fig, ax = plt.subplots(figsize=(9, 4))
@@ -953,10 +1251,12 @@ def plot_transport_solution(rho, solution, output_dir, n_times=1, reference_er_f
         "density": output_dir / "transport_density.png" if density_series else None,
         "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
         "Er": output_dir / "transport_Er.png" if er_series else None,
+        "power_sources_total": power_sources_png,
+        **flux_plot_paths,
     }
 
 
-def write_transport_hdf5(rho, solution, output_dir):
+def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None, source_models=None):
     import h5py
 
     ys = getattr(solution, "ys", None)
@@ -979,14 +1279,39 @@ def write_transport_hdf5(rho, solution, output_dir):
             f.create_dataset("dts", data=jnp.asarray(dts))
         if ys is not None:
             density = getattr(ys, "density", None)
+            pressure = getattr(ys, "pressure", None)
             temperature = getattr(ys, "temperature", None)
             er = getattr(ys, "Er", None)
             if density is not None:
                 f.create_dataset("density", data=jnp.asarray(density))
+            if pressure is not None:
+                f.create_dataset("pressure", data=jnp.asarray(pressure))
             if temperature is not None:
                 f.create_dataset("temperature", data=jnp.asarray(temperature))
             if er is not None:
                 f.create_dataset("Er", data=jnp.asarray(er))
+            if (
+                density is not None
+                and pressure is not None
+                and er is not None
+                and geometry is not None
+                and species is not None
+                and source_models is not None
+                and source_models.get("temperature") is not None
+            ):
+                power_total = jax.vmap(
+                    lambda dens, pres, er_prof: compute_total_power_mw(
+                        TransportState(
+                            density=jnp.asarray(dens),
+                            pressure=jnp.asarray(pres),
+                            Er=jnp.asarray(er_prof),
+                        ),
+                        species,
+                        source_models.get("temperature"),
+                        geometry,
+                    )
+                )(jnp.asarray(density), jnp.asarray(pressure), jnp.asarray(er))
+                f.create_dataset("P_total_mw", data=jnp.asarray(power_total))
     return out_h5
 
 

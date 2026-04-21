@@ -197,11 +197,19 @@ def assemble_density_source_components(source_value: Any, state: Any, species: A
         return {"configured": _broadcast_profile(source_value, template)}
 
     out: dict[str, jax.Array] = {}
-    he_idx = species.species_idx.get("He") if hasattr(species, "species_idx") else None
+    species_idx = species.species_idx if hasattr(species, "species_idx") else {}
+    he_idx = species_idx.get("He")
+    d_idx = species_idx.get("D")
+    t_idx = species_idx.get("T")
     for key, value in source_value.items():
         if key == "HeSource":
             if he_idx is not None:
                 out["HeSource"] = _species_component(template, he_idx, value)
+                he_profile = jnp.asarray(value, dtype=template.dtype)
+                if d_idx is not None:
+                    out["fusion_sink_D"] = -_species_component(template, d_idx, he_profile)
+                if t_idx is not None:
+                    out["fusion_sink_T"] = -_species_component(template, t_idx, he_profile)
             continue
         if key in {"DTreactionRate", "AlphaPower", "PBrems", "Zeff", "fusion_power_fraction_electrons", "power_exchange"}:
             continue

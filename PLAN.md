@@ -1,5 +1,144 @@
 # NEOPAX Memory and Speed Rewrite Plan
 
+## Current next upgrade: face-evaluated closure fluxes for the pressure equation
+
+### Problem to solve
+
+The pressure equation currently uses closure-provided heat fluxes `Q` on cell centers and then interpolates those centered fluxes to faces before taking the conservative divergence. This is especially fragile near the sharp `Er` transition and is the leading suspected cause of the temperature oscillations seen in both `RADAU` and `Kvaerno5`.
+
+We explicitly do **not** want to replace the neoclassical/turbulent closures with an inferred diffusive surrogate. The fix must preserve the actual closure models and instead evaluate those models on face states from the beginning.
+
+### Upgrade plan
+
+1. Add a shared face-state builder in [NEOPAX/_transport_flux_models.py](/abs/path/d:/PostDocsProxima/Github_5/NEOPAX/NEOPAX/_transport_flux_models.py)
+   - reconstruct `density`, `pressure/temperature`, and `Er` on `r_grid_half`
+   - keep boundary handling consistent with the current cell-centered code
+   - keep everything JAX/JIT/trace friendly
+
+2. Add an optional model-side face-flux API
+   - extend transport models with a method like `evaluate_face_fluxes(...)`
+   - keep the current `__call__(state)` centered path unchanged
+   - make the new API return physically modeled `Gamma_face`, `Q_face`, `Upar_face`
+
+3. Implement the turbulent face-flux path first
+   - this is the simplest and lowest-risk model to move to faces
+   - use reconstructed face states and face gradients to get exact model-consistent `Gamma_face` and `Q_face`
+
+4. Implement the neoclassical face-flux path next
+   - evaluate the actual neoclassical closure on face states, not an inferred effective `chi`
+   - this likely requires allowing `Lij`/database evaluation at arbitrary radial coordinates on the face grid
+   - compute `A1`, `A2`, `A3` on faces and form `Gamma_face`, `Q_face` directly
+
+5. Keep legacy and new paths side by side during validation
+   - legacy: centered closure flux + face interpolation
+   - new: closure evaluated directly on faces
+   - expose the switch in config only after both model paths exist
+
+6. Only then switch the pressure equation to consume face fluxes directly
+   - `TemperatureEquation` should use closure-provided `Q_face` when available
+   - keep the legacy fallback for comparison and regression testing
+
+7. Validate in this order
+   - fixed-`Er`, pressure-only case
+   - compare temperature smoothness and `q_divergence`
+   - then rerun the coupled pressure + `Er` case
+
+### Implementation status
+
+- [x] shared face-state builder
+- [x] model-side face-flux API
+- [x] turbulent face fluxes
+- [x] neoclassical face fluxes
+- [x] pressure equation direct face-flux consumption
+- [ ] validation on pressure-only fixed-`Er` case
+
+## Current next upgrade: quasi-neutral density equation construction
+
+### Problem to solve
+
+The density equation currently has two inconsistencies:
+
+1. The electron density equation is effectively disabled by forcing electron `density_rhs = 0`, while ion densities may evolve.
+2. Quasi-neutrality is enforced mainly as an output cleanup, instead of being built into the density ODE seen by the solver at every RHS evaluation.
+
+That means the internal solver state can drift away from quasi-neutrality during time stepping, even though the final/saved outputs are projected back afterward. This is not the correct construction if electrons are meant to remain part of the state while still satisfying the quasi-neutrality constraint dynamically.
+
+The next refinement is to move from the current "dependent electron RHS inside the
+ODE system" construction to an NTSS-style algebraic update:
+
+- keep electron density in the transport state/output
+- evolve only the independent ion/impurity density rows
+- reconstruct electron density algebraically from quasi-neutrality for the
+  working state and for accepted/output states
+
+\[
+n_e = -\frac{1}{Z_e}\sum_{i \ne e} Z_i n_i
+\]
+
+This keeps the full public state shape unchanged, but removes the dependent
+electron density row from the coupled implicit solve. It should reduce solver
+coupling and be friendlier to JAX stiff integrators on the He-coupled cases.
+
+### Upgrade plan
+
+1. Enforce quasi-neutrality on the working state before every RHS evaluation
+   - in [NEOPAX/_transport_equations.py](/abs/path/d:/PostDocsProxima/Github_5/NEOPAX/NEOPAX/_transport_equations.py)
+   - build a quasi-neutral working state before evaluating shared fluxes and source terms
+   - this ensures all closures see a physically consistent electron density
+
+2. Remove the electron density row from the solved density subsystem
+   - compute independent ion/impurity density RHSs only
+   - keep the electron density RHS at zero inside the returned ODE state
+   - do not feed a dependent electron density equation into the implicit solver
+
+3. Reconstruct a quasi-neutral working state before every RHS evaluation
+   - the closures and equation assembly should always see a quasi-neutral `n_e`
+   - `n_e` must be rebuilt algebraically from the current ion/impurity state
+
+4. Preserve toggle semantics for partially evolved species
+   - fixed species must keep `rhs = 0`
+   - if only some ions/impurities evolve, the electron density used in the
+     working state must still be reconstructed from the currently evolved
+     charged species
+   - examples:
+     - only `He` evolves, `D/T` fixed
+     - only one fuel ion evolves
+     - all ions evolve
+
+5. Keep the density equation JAX/JIT/trace friendly
+   - no Python-side constraint loop in the hot path
+   - keep fixed shapes and array-only algebra
+   - no dynamic indexing or host-side solves
+
+6. Avoid redundant direct electron density transport work
+   - treat electrons as a dependent density species inside the density equation itself
+   - compute density flux divergence and density sources only for independent species
+   - do not compute or solve a direct electron density transport/source row
+   - keep full state shapes fixed to stay JAX/JIT friendly
+
+7. Keep output-side quasi-neutrality reconstruction
+   - accepted/saved/final states should rebuild `n_e` from the ion/impurity
+     state before plotting/output and before the next user-visible state
+   - this remains the mechanism that updates the stored electron profile between
+     timesteps, without solving an electron density ODE row
+
+8. Validate in this order
+   - He-only density evolution with fixed `D/T`
+   - confirm electron density updates according to quasi-neutrality after
+     accepted steps
+   - compare no-oscillation behavior with the new `Gamma_face` density flux path
+   - then test mixed-species density toggles and coupled transport
+
+### Implementation status
+
+- [x] density face-flux path (`Gamma_face`) added
+- [x] density toggle masking added
+- [x] enforce quasi-neutral working state during RHS evaluation
+- [x] skip redundant direct electron density transport/source work
+- [x] remove dependent electron density RHS from the solved ODE system
+- [x] keep electron density updated algebraically on accepted/output states
+- [ ] validate He-only density evolution
+
 ## Goal
 
 Reduce compilation memory, runtime memory, and total wall-clock time for both `mode = "transport"` and `mode = "ambipolarity"` while preserving these constraints:

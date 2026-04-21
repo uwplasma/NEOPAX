@@ -8,6 +8,27 @@ from ._constants import Boltzmann
 
 JOULE_PER_EV = 11606 * Boltzmann
 JOULE_PER_KEV = 1.0e3 * JOULE_PER_EV
+DEFAULT_TRANSPORT_DENSITY_FLOOR = 1.0e-6
+
+
+def _broadcast_species_floor(reference: Array, floor) -> Array:
+    floor_arr = jnp.asarray(floor, dtype=reference.dtype)
+    if floor_arr.ndim == 0:
+        return floor_arr
+    if floor_arr.ndim == 1 and reference.ndim >= 2:
+        return floor_arr[:, None]
+    return floor_arr
+
+
+def safe_density(density: Array, floor=DEFAULT_TRANSPORT_DENSITY_FLOOR) -> Array:
+    return jnp.maximum(density, _broadcast_species_floor(density, floor))
+
+
+def apply_transport_density_floor(state, density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR):
+    density = getattr(state, "density", None)
+    if density is None:
+        return state
+    return dataclasses.replace(state, density=safe_density(density, density_floor))
 
 
 @jax.jit
@@ -38,5 +59,4 @@ class TransportState:
 
     @property
     def temperature(self):
-        eps = jnp.asarray(1.0e-20, dtype=self.pressure.dtype)
-        return self.pressure / jnp.maximum(self.density, eps)
+        return self.pressure / safe_density(self.density)

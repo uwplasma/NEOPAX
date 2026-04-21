@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import lineax
 import interpax
 from ._constants import elementary_charge, epsilon_0
-from ._species import collisionality
+from ._species import collisionality, collisionality_local
 from ._interpolators import get_Dij
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
@@ -114,6 +114,36 @@ def get_Lij_matrix_local(species, energy_grid, geometry, database, index_species
     Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
     Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
     return Lij
+
+
+@jit
+def get_Lij_matrix_at_radius(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local):
+    """Lij matrix using local profiles at an arbitrary radial coordinate."""
+    Lij = jnp.zeros((3, 3))
+    vth_a = v_thermal_local[index_species]
+    v_new_a = energy_grid.v_norm * vth_a
+    Er_vnew_a = Er_value * 1.0e3 / v_new_a
+    nu_vnew_a = collisionality_local(index_species, species, v_new_a, density_local, temperature_local, v_thermal_local) / v_new_a
+
+    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
+    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
+    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
+
+    Dij = jax.vmap(get_Dij, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
+    D11_a = -10**Dij.at[:, 0].get()
+    D13_a = -Dij.at[:, 1].get()
+    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
+
+    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
+    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
+    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
+    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
+    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
+    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
+    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
+    return Lij
 @jit
 def get_Neoclassical_Fluxes(
     species,
@@ -203,6 +233,71 @@ def get_Neoclassical_Fluxes(
     )
     Gamma, Q, Upar = results
     return Lij, Gamma, Q, Upar
+
+
+@jit
+def get_Neoclassical_Fluxes_Faces(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er_faces,
+    temperature_faces,
+    density_faces,
+    dndr_faces,
+    dTdr_faces,
+):
+    """Evaluate neoclassical fluxes directly on face states and face gradients."""
+    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
+    radius_values = geometry.r_grid_half
+
+    Lij_faces = jax.vmap(
+        lambda a: jax.vmap(
+            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: get_Lij_matrix_at_radius(
+                species,
+                energy_grid,
+                geometry,
+                database,
+                a,
+                radius_value,
+                er_value,
+                temperature_local,
+                density_local,
+                vthermal_local,
+            ),
+            in_axes=(0, 0, 1, 1, 1),
+        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
+        in_axes=(0,),
+    )(species.species_indices)
+
+    A1 = jax.vmap(
+        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
+        ),
+        in_axes=(0, 0, 0, 0, 0),
+    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
+    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
+    A3 = get_Thermodynamical_Forces_A3(Er_faces)
+
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
+
+    Gamma = -density_phys * (
+        Lij_faces[:, :, 0, 0] * A1
+        + Lij_faces[:, :, 0, 1] * A2
+        + Lij_faces[:, :, 0, 2] * A3[None, :]
+    )
+    Q = -temperature_phys * density_phys * (
+        Lij_faces[:, :, 1, 0] * A1
+        + Lij_faces[:, :, 1, 1] * A2
+        + Lij_faces[:, :, 1, 2] * A3[None, :]
+    )
+    Upar = -density_phys * (
+        Lij_faces[:, :, 2, 0] * A1
+        + Lij_faces[:, :, 2, 1] * A2
+        + Lij_faces[:, :, 2, 2] * A3[None, :]
+    )
+    return Lij_faces, Gamma, Q, Upar
 
 
 

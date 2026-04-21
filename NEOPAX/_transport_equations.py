@@ -12,6 +12,8 @@ from ._source_models import (
     assemble_pressure_source_components,
     sum_source_components,
 )
+from ._transport_flux_models import build_face_transport_state
+from ._state import DEFAULT_TRANSPORT_DENSITY_FLOOR, apply_transport_density_floor
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
@@ -130,15 +132,64 @@ class DensityEquation(EquationBase):
     Vprime_half: jax.Array = dataclasses.field(repr=False)
     flux_model: callable = dataclasses.field(repr=False)
     gamma_faces_builder: callable = dataclasses.field(repr=False)
+    active_species_mask: jax.Array = dataclasses.field(repr=False)
+    independent_density_mask: jax.Array = dataclasses.field(repr=False)
+    face_flux_builder: callable = dataclasses.field(repr=False, default=None)
+    particle_flux_reconstruction: str = "closure_face_flux"
     source_model: callable = dataclasses.field(repr=False, default=None)
     species: object = dataclasses.field(repr=False, default=None)
     name: str = "density"
 
+    def _use_model_face_particle_fluxes(self):
+        mode = str(self.particle_flux_reconstruction).strip().lower()
+        return mode in {"closure_face_flux", "model_face_flux", "face_closure"}
+
+    def debug_components(self, state, fluxes=None):
+        if fluxes is None:
+            fluxes = self.flux_model(state)
+        use_face_gamma = self._use_model_face_particle_fluxes()
+        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and use_face_gamma) else None
+        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
+        Gamma_faces = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
+            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            else self.gamma_faces_builder(Gamma)
+        )
+        Gamma_faces = Gamma_faces * self.independent_density_mask[:, None]
+        gamma_divergence = jax.vmap(
+            lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
+        )(Gamma_faces)
+        source_components = assemble_density_source_components(
+            None if self.source_model is None else self.source_model(state),
+            state,
+            self.species,
+        )
+        source_rhs = (
+            sum_source_components(source_components, state.density) * self.independent_density_mask[:, None]
+            if source_components
+            else jnp.zeros_like(state.density)
+        )
+        density_rhs = (gamma_divergence + source_rhs) * self.independent_density_mask[:, None]
+        return {
+            "Gamma_faces": Gamma_faces,
+            "gamma_divergence": gamma_divergence,
+            **{f"source_{key}": value for key, value in source_components.items()},
+            "source_rhs": source_rhs,
+            "density_rhs": density_rhs,
+        }
+
     def __call__(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
+        use_face_gamma = self._use_model_face_particle_fluxes()
+        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and use_face_gamma) else None
         Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
-        Gamma_faces = self.gamma_faces_builder(Gamma)
+        Gamma_faces = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
+            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            else self.gamma_faces_builder(Gamma)
+        )
+        Gamma_faces = Gamma_faces * self.independent_density_mask[:, None]
         density_rhs = jax.vmap(
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(Gamma_faces)
@@ -148,11 +199,23 @@ class DensityEquation(EquationBase):
                 state,
                 self.species,
             )
-            density_rhs += sum_source_components(source_components, state.density)
-        return density_rhs
+            density_rhs += sum_source_components(source_components, state.density) * self.independent_density_mask[:, None]
+        return density_rhs * self.independent_density_mask[:, None]
 
 # --- Factory function to build DensityEquation up front ---
-def build_density_equation(field, flux_model, source_model, bc_density, species, reconstruction="linear"):
+def build_density_equation(
+    field,
+    flux_model,
+    source_model,
+    bc_density,
+    species,
+    bc_temperature=None,
+    bc_er=None,
+    reconstruction="linear",
+    active_species_mask=None,
+    particle_flux_reconstruction="closure_face_flux",
+    density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
@@ -195,6 +258,31 @@ def build_density_equation(field, flux_model, source_model, bc_density, species,
                     right_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
                 ).face_value(reconstruction=reconstruction)
             )(Gamma)
+    def face_flux_builder(state):
+        state = apply_transport_density_floor(state, density_floor)
+        face_state = build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+        )
+        return flux_model.evaluate_face_fluxes(
+            state,
+            face_state,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+        )
+    if active_species_mask is None:
+        active_species_mask = jnp.ones(species.number_species, dtype=bool)
+    active_species_mask = jnp.asarray(active_species_mask, dtype=bool)
+    independent_density_mask = active_species_mask
+    if hasattr(species, "names") and "e" in tuple(species.names):
+        eidx = tuple(species.names).index("e")
+        independent_density_mask = independent_density_mask.at[eidx].set(False)
     return DensityEquation(
         dr_cells=dr_cells,
         Vprime=Vprime,
@@ -202,6 +290,10 @@ def build_density_equation(field, flux_model, source_model, bc_density, species,
         flux_model=flux_model,
         source_model=source_model,
         gamma_faces_builder=gamma_faces_builder,
+        active_species_mask=active_species_mask,
+        independent_density_mask=independent_density_mask,
+        face_flux_builder=face_flux_builder,
+        particle_flux_reconstruction=str(particle_flux_reconstruction),
         species=species,
     )
 
@@ -219,6 +311,8 @@ class TemperatureEquation(EquationBase):
     flux_faces_builder: callable = dataclasses.field(repr=False)
     temperature_ghost_builder: callable = dataclasses.field(repr=False)
     charge_qp: jax.Array = dataclasses.field(repr=False)
+    active_species_mask: jax.Array = dataclasses.field(repr=False)
+    face_flux_builder: callable = dataclasses.field(repr=False, default=None)
     temperature_bc_model: object = dataclasses.field(repr=False, default=None)
     convection_reconstruction: str = "tvd_mc"
     heat_flux_reconstruction: str = "tvd_mc"
@@ -228,6 +322,16 @@ class TemperatureEquation(EquationBase):
     source_model: callable = dataclasses.field(repr=False, default=None)
     species: object = dataclasses.field(repr=False, default=None)
     name: str = "temperature"
+
+    def _mode_requests_face_fluxes(self, mode_value):
+        mode = str(mode_value).strip().lower()
+        return mode in {"closure_face_flux", "model_face_flux", "face_closure"}
+
+    def _use_model_face_heat_fluxes(self):
+        return self._mode_requests_face_fluxes(self.heat_flux_reconstruction)
+
+    def _use_model_face_particle_fluxes(self):
+        return self._mode_requests_face_fluxes(self.convection_reconstruction)
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
         bc = self.temperature_bc_model
@@ -263,19 +367,30 @@ class TemperatureEquation(EquationBase):
     def debug_components(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
+        use_face_q = self._use_model_face_heat_fluxes()
+        use_face_gamma = self._use_model_face_particle_fluxes()
+        need_face_fluxes = use_face_q or use_face_gamma
+        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
-        Q_faces = self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
+        Q_faces = (
+            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            if (face_fluxes is not None and use_face_q)
+            else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
+        )
         temperature_left, temperature_right = _temperature_face_states(
             temperature_ghost,
             self.convection_reconstruction,
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = fluxes.get(gamma_key, None)
+            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
             if gamma_comp is None:
-                gamma_comp = jnp.zeros_like(Q)
-            gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
+                gamma_faces = jnp.zeros_like(Q_faces)
+            elif face_fluxes is not None and use_face_gamma:
+                gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp
+            else:
+                gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
             temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
             return temperature_upwind * gamma_faces
 
@@ -331,25 +446,36 @@ class TemperatureEquation(EquationBase):
             **{f"source_{key}": value for key, value in source_components.items()},
             "source_rhs": source_rhs,
             "work_rhs": work_rhs,
-            "pressure_rhs": total_rhs,
+            "pressure_rhs": total_rhs * self.active_species_mask[:, None],
         }
 
     def __call__(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
+        use_face_q = self._use_model_face_heat_fluxes()
+        use_face_gamma = self._use_model_face_particle_fluxes()
+        need_face_fluxes = use_face_q or use_face_gamma
+        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
-        Q_faces = self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
+        Q_faces = (
+            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            if (face_fluxes is not None and use_face_q)
+            else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
+        )
         temperature_left, temperature_right = _temperature_face_states(
             temperature_ghost,
             self.convection_reconstruction,
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = fluxes.get(gamma_key, None)
+            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
             if gamma_comp is None:
-                gamma_comp = jnp.zeros_like(Q)
-            gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
+                gamma_faces = jnp.zeros_like(Q_faces)
+            elif face_fluxes is not None and use_face_gamma:
+                gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp
+            else:
+                gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
             temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
             return temperature_upwind * gamma_faces
 
@@ -377,7 +503,7 @@ class TemperatureEquation(EquationBase):
             * fluxes["Gamma"]
             * state.Er[None, :]
         )
-        return (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs)
+        return (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs) * self.active_species_mask[:, None]
 
 def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
     if bc_model is not None and hasattr(bc_model, "right_type"):
@@ -442,6 +568,8 @@ def build_temperature_equation(
         bc_temperature,
     bc_density=None,
     bc_gamma=None,
+    bc_er=None,
+    active_species_mask=None,
     charge_qp=None,
     include_neo_convection=True,
     include_turbulent_convection=True,
@@ -449,13 +577,34 @@ def build_temperature_equation(
     convection_reconstruction="tvd_mc",
     heat_flux_reconstruction="tvd_mc",
     reconstruction="linear",
+    density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
 ):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
     def flux_faces_builder(flux, face_reconstruction="centered"):
         return _cell_centered_flux_faces(flux, face_reconstruction)
+    def face_flux_builder(state):
+        state = apply_transport_density_floor(state, density_floor)
+        face_state = build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+        )
+        return flux_model.evaluate_face_fluxes(
+            state,
+            face_state,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+        )
     temperature_ghost_builder = _build_species_ghost_builder(bc_temperature)
+    if active_species_mask is None:
+        active_species_mask = jnp.ones(species.number_species, dtype=bool)
     return TemperatureEquation(
         dr_cells=dr_cells,
         Vprime=Vprime,
@@ -464,9 +613,11 @@ def build_temperature_equation(
         source_model=source_model,
         species=species,
         flux_faces_builder=flux_faces_builder,
+        face_flux_builder=face_flux_builder,
         temperature_ghost_builder=temperature_ghost_builder,
         temperature_bc_model=bc_temperature,
         charge_qp=jnp.asarray(charge_qp),
+        active_species_mask=jnp.asarray(active_species_mask, dtype=bool),
         include_neo_convection=bool(include_neo_convection),
         include_turbulent_convection=bool(include_turbulent_convection),
         include_classical_convection=bool(include_classical_convection),
@@ -724,11 +875,13 @@ def build_equation_system(
     Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
     Er_boundary_mode = solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))
     Er_edge_relax = solver_cfg.get("Er_edge_relax", Er_relax)
+    density_flux_reconstruction = solver_cfg.get("density_flux_reconstruction", "closure_face_flux")
     include_neo_convection = solver_cfg.get("temperature_include_neo_convection", True)
     include_turbulent_convection = solver_cfg.get("temperature_include_turbulent_convection", True)
     include_classical_convection = solver_cfg.get("temperature_include_classical_convection", True)
-    convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "tvd_mc")
-    heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "tvd_mc")
+    convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
+    heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
+    density_floor = solver_cfg.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
 
     if any(eqn_flags["density"]):
         equations_to_evolve.append(build_density_equation(
@@ -737,6 +890,11 @@ def build_equation_system(
             density_source_model,
             bc_density,
             species,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            active_species_mask=eqn_flags["density"],
+            particle_flux_reconstruction=density_flux_reconstruction,
+            density_floor=density_floor,
         ))
     if any(eqn_flags["temperature"]):
         equations_to_evolve.append(build_temperature_equation(
@@ -747,12 +905,15 @@ def build_equation_system(
             bc_temperature,
             bc_density=bc_density,
             bc_gamma=bc_gamma,
+            bc_er=bc_er,
+            active_species_mask=eqn_flags["temperature"],
             charge_qp=charge_qp,
             include_neo_convection=include_neo_convection,
             include_turbulent_convection=include_turbulent_convection,
             include_classical_convection=include_classical_convection,
             convection_reconstruction=convection_reconstruction,
             heat_flux_reconstruction=heat_flux_reconstruction,
+            density_floor=density_floor,
         ))
     if eqn_flags["Er"]:
         equations_to_evolve.append(build_electric_field_equation(
@@ -811,7 +972,11 @@ def build_equation_system_from_config(config, species):
     boundary_cfg = config.get("boundary", {})
     dr = getattr(field, "dr", 1.0)
     boundary_models = {
-        key: build_boundary_condition_model(boundary_cfg[key], dr)
+        key: build_boundary_condition_model(
+            boundary_cfg[key],
+            dr,
+            species_names=species.names if key in {"density", "temperature", "gamma"} else None,
+        )
         for key in ("density", "temperature", "Er", "gamma")
         if key in boundary_cfg
     }
@@ -837,25 +1002,39 @@ class ComposedEquationSystem:
     equations: tuple
     species: object | None = None
     shared_flux_model: object | None = None
+    density_floor: object = DEFAULT_TRANSPORT_DENSITY_FLOOR
 
     def __call__(self, t, state, runtime):
         """
         Call all equations with state, return a TransportState matching the state structure.
         Always output all three fields, setting missing ones to zero arrays of the correct shape.
-        For density, always output a zero array for electrons if quasi-neutrality is enforced.
+        When electrons are present, evaluate the RHS on a quasi-neutral working
+        state, but keep electron density out of the solved density subsystem.
+        This matches the NTSS-style pattern: evolve independent ion/impurity
+        density rows, reconstruct electron density algebraically for the working
+        state and accepted/output states.
         """
         import jax.numpy as jnp
         from ._state import TransportState
-        from ._species import get_species_idx
+        working_state = state
+        eidx = None
+        if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
+            try:
+                working_state = enforce_quasi_neutrality(state, self.species)
+                eidx = int(tuple(self.species.names).index("e"))
+            except Exception:
+                working_state = state
+        working_state = apply_transport_density_floor(working_state, self.density_floor)
+
         shared_fluxes = None
         if self.shared_flux_model is not None:
-            shared_fluxes = self.shared_flux_model(state)
+            shared_fluxes = self.shared_flux_model(working_state)
         # Map equation types to their outputs
         eq_outputs = {}
         for eq in self.equations:
             name = getattr(eq, 'name', None)
             if name is not None:
-                eq_outputs[name] = eq(state, fluxes=shared_fluxes)
+                eq_outputs[name] = eq(working_state, fluxes=shared_fluxes)
 
         # Defensive: always use shape of state.density, state.pressure, state.Er
         density_rhs = eq_outputs.get('density', jnp.zeros_like(state.density))
@@ -866,16 +1045,18 @@ class ComposedEquationSystem:
         if density_rhs.shape != state.density.shape:
             density_rhs = jnp.zeros_like(state.density)
 
-        # Always set electron density_rhs to zero (quasi-neutrality enforced elsewhere)
-        try:
-            eidx = get_species_idx("e", getattr(self.species, 'names', ()))
-            density_rhs = density_rhs.at[eidx, :].set(0.0)
-        except Exception:
-            pass
+        # Keep the full state dynamically consistent with quasi-neutrality by
+        # deriving the electron-density RHS from the charged-species RHSs.
+        if eidx is not None:
+            charge_qp = jnp.asarray(getattr(self.species, "charge_qp", ()), dtype=density_rhs.dtype)
+            charge_weights = charge_qp.at[int(eidx)].set(0.0)
+            ion_charge_rhs = jnp.sum(charge_weights[:, None] * density_rhs, axis=0)
+            electron_rhs = -ion_charge_rhs / charge_qp[int(eidx)]
+            density_rhs = density_rhs.at[int(eidx), :].set(electron_rhs)
 
         temperature_equation = next((eq for eq in self.equations if getattr(eq, "name", None) == "temperature"), None)
         if temperature_equation is not None and hasattr(temperature_equation, "enforce_dirichlet_boundary_rhs"):
-            pressure_rhs = temperature_equation.enforce_dirichlet_boundary_rhs(state, density_rhs, pressure_rhs)
+            pressure_rhs = temperature_equation.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
 
         return TransportState(
             density=density_rhs,

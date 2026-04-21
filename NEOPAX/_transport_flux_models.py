@@ -4,20 +4,78 @@ from __future__ import annotations
 from typing import Any, Callable
 import abc
 import dataclasses
+import h5py
 import jax
 import jax.numpy as jnp
-from ._cell_variable import get_gradient_density, get_gradient_temperature
+import interpax
+from ._cell_variable import (
+    get_gradient_density,
+    get_gradient_temperature,
+    make_profile_cell_variable,
+)
+from ._boundary_conditions import (
+    left_constraints_from_bc_model,
+    right_constraints_from_bc_model,
+)
 from ._neoclassical import (
     get_Lij_matrix_local,
     get_Neoclassical_Fluxes,
+    get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
 )
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
-from ._state import get_v_thermal
+from ._state import (
+    DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    TransportState,
+    apply_transport_density_floor,
+    get_v_thermal,
+    safe_density,
+)
+from ._source_models import assemble_pressure_source_components, sum_source_components
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
-from ._turbulence import get_Turbulent_Fluxes_Analytical
+PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
+from ._turbulence import get_Turbulent_Fluxes_Analytical, get_Turbulent_Fluxes_PowerOverN
+
+
+def compute_total_power_mw(state, species, pressure_source_model, geometry, fallback_mw=3.0):
+    fallback = jnp.asarray(fallback_mw, dtype=state.density.dtype)
+    if pressure_source_model is None or geometry is None:
+        return fallback
+    raw_sources = pressure_source_model(state)
+    if not isinstance(raw_sources, dict):
+        return fallback
+
+    net_power_density = None
+    alpha_power = raw_sources.get("AlphaPower")
+    if alpha_power is not None:
+        net_power_density = jnp.asarray(alpha_power, dtype=state.density.dtype)
+
+    pbrems = raw_sources.get("PBrems")
+    if pbrems is not None:
+        pbrems_arr = jnp.asarray(pbrems, dtype=state.density.dtype)
+        net_power_density = -pbrems_arr if net_power_density is None else net_power_density - pbrems_arr
+
+    for key in ("heating", "external_heating", "ecrh", "icrh", "nbi", "ohmic_heating"):
+        value = raw_sources.get(key)
+        if value is None:
+            continue
+        arr = jnp.asarray(value, dtype=state.density.dtype)
+        net_power_density = arr if net_power_density is None else net_power_density + arr
+
+    if net_power_density is None:
+        components = assemble_pressure_source_components(raw_sources, state, species)
+        if not components:
+            return fallback
+        power_density_state = jnp.sum(sum_source_components(components, state.pressure), axis=0)
+        power_density_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * power_density_state
+        total_power = jnp.trapezoid(power_density_mw_m3 * geometry.Vprime, x=geometry.r_grid)
+        return jnp.where(total_power < 0.0, fallback, total_power)
+
+    power_density_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * net_power_density
+    total_power = jnp.trapezoid(power_density_mw_m3 * geometry.Vprime, x=geometry.r_grid)
+    return jnp.where(total_power < 0.0, fallback, total_power)
 
 
 
@@ -51,6 +109,22 @@ class TransportFluxModelBase(abc.ABC):
                 del state
                 return None
 
+        def evaluate_face_fluxes(self, state, face_state, **kwargs):
+                del state, face_state, kwargs
+                return None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class FaceTransportState:
+    density: jax.Array
+    pressure: jax.Array
+    Er: jax.Array
+
+    @property
+    def temperature(self):
+        return self.pressure / safe_density(self.density)
+
 
 def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
     n_species = state_arr.shape[0]
@@ -83,6 +157,102 @@ def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax
         robin_grad = -right_value / (right_decay + 1e-12)
         return default_value, robin_grad
     return default_value, default_grad
+
+
+def _extract_face_constraints(
+    bc_model: Any,
+    state_arr: jax.Array,
+) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None, jax.Array | None]:
+    default_left = state_arr[:, 0]
+    default_right = state_arr[:, -1]
+    left_value, left_grad = left_constraints_from_bc_model(bc_model, default_left)
+    right_value, right_grad = right_constraints_from_bc_model(bc_model, default_right)
+    return left_value, left_grad, right_value, right_grad
+
+
+def _face_profile(profile, face_centers, bc_model=None, reconstruction="linear"):
+    if profile.ndim == 1:
+        profile_2d = profile[None, :]
+        squeeze = True
+    else:
+        profile_2d = profile
+        squeeze = False
+    left_value, left_grad, right_value, right_grad = _extract_face_constraints(bc_model, profile_2d)
+    faces = jax.vmap(
+        lambda prof, lv, lg, rv, rg: make_profile_cell_variable(
+            prof,
+            face_centers,
+            left_face_constraint=lv,
+            left_face_grad_constraint=lg,
+            right_face_constraint=rv,
+            right_face_grad_constraint=rg,
+        ).face_value(reconstruction=reconstruction)
+    )(profile_2d, left_value, left_grad, right_value, right_grad)
+    if squeeze:
+        return faces[0]
+    return faces
+
+
+def _face_profile_gradient(profile, face_centers, bc_model=None):
+    if profile.ndim == 1:
+        profile_2d = profile[None, :]
+        squeeze = True
+    else:
+        profile_2d = profile
+        squeeze = False
+    left_value, left_grad, right_value, right_grad = _extract_face_constraints(bc_model, profile_2d)
+
+    grads = jax.vmap(
+        lambda prof, lv, lg, rv, rg: make_profile_cell_variable(
+            prof,
+            face_centers,
+            left_face_constraint=lv,
+            left_face_grad_constraint=lg,
+            right_face_constraint=rv,
+            right_face_grad_constraint=rg,
+        ).face_grad()
+    )(profile_2d, left_value, left_grad, right_value, right_grad)
+    if squeeze:
+        return grads[0]
+    return grads
+
+
+def build_face_transport_state(
+    state: TransportState,
+    geometry: Any,
+    *,
+    bc_density: Any = None,
+    bc_temperature: Any = None,
+    bc_er: Any = None,
+    reconstruction: str = "linear",
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+) -> FaceTransportState:
+    state = apply_transport_density_floor(state, density_floor)
+    density_faces = _face_profile(
+        state.density,
+        geometry.r_grid_half,
+        bc_model=bc_density,
+        reconstruction=reconstruction,
+    )
+    density_faces = safe_density(density_faces, density_floor)
+    temperature_faces = _face_profile(
+        state.temperature,
+        geometry.r_grid_half,
+        bc_model=bc_temperature,
+        reconstruction=reconstruction,
+    )
+    pressure_faces = density_faces * temperature_faces
+    er_faces = _face_profile(
+        state.Er,
+        geometry.r_grid_half,
+        bc_model=bc_er,
+        reconstruction=reconstruction,
+    )
+    return FaceTransportState(
+        density=density_faces,
+        pressure=pressure_faces,
+        Er=er_faces,
+    )
 
 
 
@@ -124,6 +294,27 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             return neo_eval(radius_index, er_value) + turb_eval(radius_index, er_value) + classical_eval(radius_index, er_value)
 
         return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        neo = self.neoclassical_model.evaluate_face_fluxes(state, face_state, **kwargs)
+        turb = self.turbulent_model.evaluate_face_fluxes(state, face_state, **kwargs)
+        classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
+        if neo is None or turb is None or classical is None:
+            return None
+        return {
+            "Gamma": neo.get("Gamma", 0) + turb.get("Gamma", 0) + classical.get("Gamma", 0),
+            "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
+            "Upar": neo.get("Upar", 0) + turb.get("Upar", 0) + classical.get("Upar", 0),
+            "Gamma_neo": neo.get("Gamma", 0),
+            "Q_neo": neo.get("Q", 0),
+            "Upar_neo": neo.get("Upar", 0),
+            "Gamma_turb": turb.get("Gamma", 0),
+            "Q_turb": turb.get("Q", 0),
+            "Upar_turb": turb.get("Upar", 0),
+            "Gamma_classical": classical.get("Gamma", 0),
+            "Q_classical": classical.get("Q", 0),
+            "Upar_classical": classical.get("Upar", 0),
+        }
 
 
 
@@ -172,6 +363,36 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             return gamma_neo[:, radius_index]
 
         return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        dndr_faces = _face_profile_gradient(
+            state.density,
+            self.geometry.r_grid_half,
+            bc_model=bc_density,
+        )
+        dTdr_faces = _face_profile_gradient(
+            state.temperature,
+            self.geometry.r_grid_half,
+            bc_model=bc_temperature,
+        )
+        _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes_Faces(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            self.database,
+            face_state.Er,
+            face_state.temperature,
+            face_state.density,
+            dndr_faces,
+            dTdr_faces,
+        )
+        return {
+            "Gamma": gamma_neo,
+            "Q": q_neo,
+            "Upar": upar_neo,
+        }
     
 
 
@@ -195,6 +416,98 @@ class ZeroTransportModel(TransportFluxModelBase):
             return zeros
 
         return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        del state, kwargs
+        arr_shape = self.shape if self.shape is not None else face_state.density.shape
+        gamma = jnp.zeros(arr_shape)
+        q = jnp.zeros(arr_shape)
+        upar = jnp.zeros(arr_shape)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+
+def _normalize_flux_dataset(arr, n_species):
+    out = jnp.asarray(arr, dtype=float)
+    if out.ndim == 1:
+        out = out[None, :]
+    elif out.ndim != 2:
+        raise ValueError(f"Flux dataset must be 1D or 2D, got shape {out.shape}.")
+
+    if out.shape[0] == n_species:
+        return out
+    if out.shape[1] == n_species:
+        return jnp.swapaxes(out, 0, 1)
+    if out.shape[0] == 1:
+        return jnp.repeat(out, n_species, axis=0)
+    if out.shape[1] == 1:
+        return jnp.repeat(jnp.swapaxes(out, 0, 1), n_species, axis=0)
+    raise ValueError(f"Flux dataset shape {out.shape} is not compatible with n_species={n_species}.")
+
+
+def read_flux_profile_file(path, n_species):
+    with h5py.File(path, "r") as f:
+        keys = set(f.keys())
+
+        def _first(*names):
+            for name in names:
+                if name in keys:
+                    return f[name][...]
+            return None
+
+        r = _first("r", "rho", "r_grid", "radius")
+        if r is None:
+            raise ValueError(f"Flux file '{path}' must contain one of datasets: r, rho, r_grid, radius.")
+        gamma = _first("Gamma", "gamma")
+        q = _first("Q", "q")
+        upar = _first("Upar", "upar", "u_par")
+
+    if gamma is None and q is None and upar is None:
+        raise ValueError(f"Flux file '{path}' must contain at least one of Gamma, Q, or Upar.")
+
+    r_arr = jnp.ravel(jnp.asarray(r, dtype=float))
+    gamma_arr = None if gamma is None else _normalize_flux_dataset(gamma, n_species)
+    q_arr = None if q is None else _normalize_flux_dataset(q, n_species)
+    upar_arr = None if upar is None else _normalize_flux_dataset(upar, n_species)
+    return r_arr, gamma_arr, q_arr, upar_arr
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class FluxesRFileTransportModel(TransportFluxModelBase):
+    species: Any
+    geometry: Any
+    r_data: Any
+    gamma_data: Any = None
+    q_data: Any = None
+    upar_data: Any = None
+
+    def _interp_species_profile(self, data, target_r):
+        if data is None:
+            return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
+        return jax.vmap(lambda prof: interpax.interp1d(self.r_data, prof, target_r))(data)
+
+    def __call__(self, state) -> dict:
+        del state
+        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid)
+        q = self._interp_species_profile(self.q_data, self.geometry.r_grid)
+        upar = self._interp_species_profile(self.upar_data, self.geometry.r_grid)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+    def build_local_particle_flux_evaluator(self, state):
+        del state
+        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid)
+
+        def evaluator(radius_index, er_value):
+            del er_value
+            return gamma[:, radius_index]
+
+        return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        del state, face_state, kwargs
+        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid_half)
+        q = self._interp_species_profile(self.q_data, self.geometry.r_grid_half)
+        upar = self._interp_species_profile(self.upar_data, self.geometry.r_grid_half)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
 
 
 
@@ -239,6 +552,100 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
             return gamma_turb[:, radius_index]
 
         return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        dndr_faces = _face_profile_gradient(
+            DENSITY_STATE_TO_PHYSICAL * state.density,
+            self.field.r_grid_half,
+            bc_model=bc_density,
+        )
+        dTdr_faces = _face_profile_gradient(
+            TEMPERATURE_STATE_TO_PHYSICAL * state.temperature,
+            self.field.r_grid_half,
+            bc_model=bc_temperature,
+        )
+        gamma = -self.chi_n[:, None] * dndr_faces
+        q = -(DENSITY_STATE_TO_PHYSICAL * face_state.density) * self.chi_t[:, None] * dTdr_faces
+        upar = jnp.zeros_like(gamma)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
+    species: Any
+    field: Any
+    chi_t: Any
+    chi_n: Any
+    pressure_source_model: Any = None
+    total_power_mw: Any = None
+
+    def _effective_total_power_mw(self, state):
+        if self.total_power_mw is not None:
+            return jnp.asarray(self.total_power_mw, dtype=state.density.dtype)
+        return compute_total_power_mw(
+            state,
+            self.species,
+            self.pressure_source_model,
+            self.field,
+        )
+
+    def __call__(self, state) -> dict:
+        total_power_mw = self._effective_total_power_mw(state)
+        gamma_turb, q_turb = get_Turbulent_Fluxes_PowerOverN(
+            self.species,
+            self.chi_t,
+            self.chi_n,
+            total_power_mw,
+            state.temperature,
+            state.density,
+            self.field,
+        )
+        upar = jnp.zeros_like(state.density)
+        return {"Gamma": gamma_turb, "Q": q_turb, "Upar": upar}
+
+    def build_local_particle_flux_evaluator(self, state):
+        total_power_mw = self._effective_total_power_mw(state)
+        gamma_turb, _ = get_Turbulent_Fluxes_PowerOverN(
+            self.species,
+            self.chi_t,
+            self.chi_n,
+            total_power_mw,
+            state.temperature,
+            state.density,
+            self.field,
+        )
+
+        def evaluator(radius_index, er_value):
+            del er_value
+            return gamma_turb[:, radius_index]
+
+        return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        total_power_mw = self._effective_total_power_mw(state)
+        dndr_faces = _face_profile_gradient(
+            DENSITY_STATE_TO_PHYSICAL * state.density,
+            self.field.r_grid_half,
+            bc_model=bc_density,
+        )
+        dTdr_faces = _face_profile_gradient(
+            TEMPERATURE_STATE_TO_PHYSICAL * state.temperature,
+            self.field.r_grid_half,
+            bc_model=bc_temperature,
+        )
+        electron_idx = int(self.species.species_idx["e"])
+        ne_face = jnp.maximum(jnp.asarray(face_state.density[electron_idx], dtype=state.density.dtype), 1.0e-12)
+        p075 = jnp.where(total_power_mw < 0.0, jnp.asarray(3.0, dtype=state.density.dtype), jnp.power(total_power_mw, 0.75))
+        density_coeff = jnp.asarray(self.chi_n, dtype=state.density.dtype)[:, None] * p075 / ne_face[None, :]
+        heat_coeff = jnp.asarray(self.chi_t, dtype=state.density.dtype)[:, None] * p075 / ne_face[None, :]
+        gamma = -density_coeff * dndr_faces
+        q = -(DENSITY_STATE_TO_PHYSICAL * face_state.density) * heat_coeff * dTdr_faces
+        upar = jnp.zeros_like(gamma)
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
 
 
 # --- PATCH: Accept [neoclassical]/flux_model and [turbulence]/model as defaults ---
@@ -290,6 +697,30 @@ register_transport_flux_model(
         chi_t=chi_t,
         chi_n=chi_n,
         field=field,
+    ),
+)
+
+register_transport_flux_model(
+    "turbulent_power_analytical",
+    lambda species, grid, field, chi_t, chi_n, pressure_source_model=None, total_power_mw=None: PowerAnalyticalTurbulentTransportModel(
+        species=species,
+        field=field,
+        chi_t=chi_t,
+        chi_n=chi_n,
+        pressure_source_model=pressure_source_model,
+        total_power_mw=total_power_mw,
+    ),
+)
+
+register_transport_flux_model(
+    "ntss_power_over_n",
+    lambda species, grid, field, chi_t, chi_n, pressure_source_model=None, total_power_mw=None: PowerAnalyticalTurbulentTransportModel(
+        species=species,
+        field=field,
+        chi_t=chi_t,
+        chi_n=chi_n,
+        pressure_source_model=pressure_source_model,
+        total_power_mw=total_power_mw,
     ),
 )
 

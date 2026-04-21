@@ -114,6 +114,17 @@ def collisionality(species_a: int, species: Species, v: float, r_index: int, den
     return nu
 
 
+def collisionality_local(species_a: int, species: Species, v: float, density_local, temperature_local, v_thermal_local) -> float:
+    """Collisionality of species_a against all species using local profiles at one radius."""
+    nu = jnp.sum(
+        jax.vmap(nuD_ab_local, in_axes=(None, None, 0, None, None, None, None))(
+            species, species_a, species.species_indices, v, density_local, temperature_local, v_thermal_local
+        ),
+        axis=0,
+    )
+    return nu
+
+
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
            density, temperature, v_thermal) -> float:
     """Pairwise pitch-angle scattering frequency for species a against species b."""
@@ -124,10 +135,29 @@ def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: 
     return prefactor * erf_part
 
 
+def nuD_ab_local(species: Species, species_a: int, species_b: int, v: float,
+                 density_local, temperature_local, v_thermal_local) -> float:
+    """Pairwise pitch-angle scattering frequency using local profiles at one radius."""
+    nb = STATE_DENSITY_TO_PHYSICAL * density_local[species_b]
+    vtb = v_thermal_local[species_b]
+    prefactor = gamma_ab_local(species, species_a, species_b, temperature_local, density_local) * nb / v**3
+    erf_part = jax.scipy.special.erf(v / vtb) - chandrasekhar(v / vtb)
+    return prefactor * erf_part
+
+
 def gamma_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
              temperature, density) -> float:
     """Prefactor for pairwise collisionality."""
     lnlambda = coulomb_logarithm(species, species_a, species_b, r_index, temperature, density)
+    ea, eb = species.charge[species_a], species.charge[species_b]
+    ma = species.mass[species_a]
+    return ea**2 * eb**2 * lnlambda / (4 * jnp.pi * epsilon_0**2 * ma**2)
+
+
+def gamma_ab_local(species: Species, species_a: int, species_b: int,
+                   temperature_local, density_local) -> float:
+    """Prefactor for pairwise collisionality using local profiles at one radius."""
+    lnlambda = coulomb_logarithm_local(species, species_a, species_b, temperature_local, density_local)
     ea, eb = species.charge[species_a], species.charge[species_b]
     ma = species.mass[species_a]
     return ea**2 * eb**2 * lnlambda / (4 * jnp.pi * epsilon_0**2 * ma**2)
@@ -149,6 +179,16 @@ def coulomb_logarithm(species: Species, species_a: int, species_b: int, r_index:
     """Coulomb logarithm for collisions between species a and b."""
     Te_eV = STATE_TEMPERATURE_TO_EV * temperature[0, r_index]
     ne_m3 = STATE_DENSITY_TO_PHYSICAL * density[0, r_index]
+    lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
+    return lnL
+
+
+def coulomb_logarithm_local(species: Species, species_a: int, species_b: int,
+                            temperature_local, density_local) -> float:
+    """Coulomb logarithm using local profiles at one radius."""
+    del species, species_a, species_b
+    Te_eV = STATE_TEMPERATURE_TO_EV * temperature_local[0]
+    ne_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[0]
     lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
     return lnL
 

@@ -31,9 +31,9 @@ er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
 
 [turbulence]
-flux_model = "turbulent_analytical"
-chi_density = [0.0, 0.0, 0.0]
-chi_temperature = [0.8, 0.4, 0.4]
+flux_model = "turbulent_power_analytical"
+chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 0.0]
+chi_temperature = [0.0065, 0.0065, 0.0065, 0.0]
 
 [classical]
 flux_model = "none"
@@ -42,10 +42,10 @@ flux_model = "none"
 n_x = 4
 
 [species]
-n_species = 3
-names = ["e", "D", "T"]
-mass_mp = [0.000544617, 2.0, 3.0]
-charge_qp = [-1.0, 1.0, 1.0]
+n_species = 4
+names = ["e", "D", "T", "He"]
+mass_mp = [0.000544617, 2.0, 3.0, 4.0]
+charge_qp = [-1.0, 1.0, 1.0, 2.0]
 
 [profiles]
 model = "standard_analytical"
@@ -53,12 +53,12 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.5, 0.5]
-c_temperature = [1.0, 1.0, 1.0]
+c_density = [1.0, 0.4, 0.4, 0.1]
+c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
-n_scale = 1.0#0.65
-T_scale = 1.0#0.7
+n_scale = 0.65
+T_scale = 0.7
 er_initialization_mode = "ambipolar_min_entropy"
 er0_scale = 100.0
 er0_peak_rho = 0.8
@@ -70,9 +70,10 @@ default = 0.0
 [boundary.density.right]
 type = "dirichlet"
 [boundary.density.right.value]
-e = 0.6
-D = 0.3
-T = 0.3
+e = 0.39
+D = 0.156
+T = 0.156
+He = 0.039
 
 [boundary.temperature.left]
 type = "neumann"
@@ -81,7 +82,7 @@ default = 0.0
 [boundary.temperature.right]
 type = "robin"
 [boundary.temperature.right.value]
-default = 0.7
+default = 0.49
 [boundary.temperature.right.decay_length]
 default = 0.05
 
@@ -93,22 +94,26 @@ type = "neumann"
 gradient = 0.0
 
 [equations]
-toggle_density = [false, false, false]
-toggle_temperature = [true, true, true]
+toggle_density = [false, false, false, true]
+toggle_temperature = [false, false, false, false]
 toggle_Er = true
 
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+density = ["dt_reaction"]
 
 [transport_solver]
+density_floor = 1.0e-6
 integrator = "diffrax_kvaerno5"
 t0 = 0.0
-t_final = 0.1
-dt = 1.0e-2
+t_final = 0.01
+dt = 1.0e-4
 rtol = 1.0e-3
 atol = 1.0e-7
 max_step = 1.0
 min_step = 1.0e-14
+max_steps = 20000
+throw = false
 debug_stage_markers = true
 debug_disable_jit = false
 radau_linear_solver = "gmres"
@@ -125,7 +130,7 @@ Er_edge_relax = 0.1
 save_n = 10
 Er_relax = 0.1
 DEr = 2.0
-temperature_include_neo_convection = false
+temperature_include_neo_convection = true
 temperature_include_turbulent_convection = false
 temperature_include_classical_convection = false
 temperature_convection_reconstruction = "closure_face_flux"
