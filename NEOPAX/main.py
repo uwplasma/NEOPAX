@@ -63,8 +63,8 @@ class RuntimeContext:
 
 
 def load_config(path):
-    with open(path, "rb") as f:
-        return toml.load(f)
+    text = Path(path).read_text(encoding="utf-8")
+    return toml.loads(text)
 
 
 def _normalize_solver_config(config: dict) -> dict:
@@ -1169,6 +1169,9 @@ def plot_transport_solution(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
+    HEAT_FLUX_W_M2_TO_MW_M2 = 1.0e-6
+    PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
+
     ys = getattr(solution, "ys", None)
     if ys is None:
         ys = solution.get("ys") if isinstance(solution, dict) else None
@@ -1341,6 +1344,9 @@ def plot_transport_solution(
 
     power_source_series = []
     he_source_series = []
+    alpha_power_series = []
+    pbrems_series = []
+    total_heat_flux_series = []
     if source_models is not None and density_series and pressure_series and er_series and species is not None:
         n_source_snapshots = min(len(density_series), len(pressure_series), len(er_series))
         for idx in range(n_source_snapshots):
@@ -1361,7 +1367,9 @@ def plot_transport_solution(
                 pressure_total_arr = None
             else:
                 pressure_total_arr = jnp.asarray(pressure_total)
-                power_source_series.append((time_label, jnp.sum(pressure_total_arr, axis=0)))
+                power_source_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(pressure_total_arr, axis=0))
+                )
 
             density_components = sources.get("density_components", {})
             he_component = density_components.get("HeSource")
@@ -1375,9 +1383,24 @@ def plot_transport_solution(
                 elif he_arr.ndim == 1:
                     he_source_series.append((time_label, he_arr))
 
+            pressure_components = sources.get("pressure_components", {})
+            alpha_component = pressure_components.get("AlphaPower")
+            if alpha_component is not None:
+                alpha_arr = jnp.asarray(alpha_component)
+                alpha_power_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(alpha_arr, axis=0))
+                )
+            pbrems_component = pressure_components.get("PBrems")
+            if pbrems_component is not None:
+                pbrems_arr = jnp.asarray(pbrems_component)
+                pbrems_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(pbrems_arr, axis=0))
+                )
+
     flux_component_series: dict[str, list[tuple[float | None, jax.Array]]] = {
         "Gamma_neo": [],
         "Gamma_turb": [],
+        "Q_total": [],
         "Q_neo": [],
         "Q_turb": [],
     }
@@ -1391,14 +1414,26 @@ def plot_transport_solution(
                 Er=jnp.asarray(er_series[idx][1]),
             )
             fluxes = flux_model(snapshot_state)
+            q_total = fluxes.get("Q")
+            if q_total is not None:
+                q_total_arr = HEAT_FLUX_W_M2_TO_MW_M2 * jnp.asarray(q_total)
+                flux_component_series["Q_total"].append((time_label, q_total_arr))
+                total_heat_flux_series.append(
+                    (time_label, jnp.sum(q_total_arr, axis=0) if q_total_arr.ndim == 2 else q_total_arr)
+                )
             for key in tuple(flux_component_series.keys()):
+                if key == "Q_total":
+                    continue
                 value = fluxes.get(key)
                 if value is not None:
-                    flux_component_series[key].append((time_label, jnp.asarray(value)))
+                    value_arr = jnp.asarray(value)
+                    if key.startswith("Q_"):
+                        value_arr = HEAT_FLUX_W_M2_TO_MW_M2 * value_arr
+                    flux_component_series[key].append((time_label, value_arr))
 
     power_sources_png = _plot_scalar_time_series(
         power_source_series,
-        "Total Power Source",
+        "Total Power Source [MW/m^3]",
         "transport_power_sources_total.png",
         title="Summed Power Sources vs rho",
     )
@@ -1407,17 +1442,39 @@ def plot_transport_solution(
     if he_source_series:
         he_source_png = _plot_scalar_time_series(
             he_source_series,
-            "Helium Particle Source",
+            "Alpha Particle Source [1e20 m^-3 s^-1]",
             "transport_density_source_HeSource.png",
-            title="Helium Particle Source vs rho",
+            title="Alpha Particle Source vs rho",
         )
+
+    total_heat_flux_png = _plot_scalar_time_series(
+        total_heat_flux_series,
+        "Total Heat Flux [MW/m^2]",
+        "transport_flux_Q_total_sum.png",
+        title="Summed Total Heat Flux vs rho",
+    )
+
+    alpha_power_png = _plot_scalar_time_series(
+        alpha_power_series,
+        "Alpha Power [MW/m^3]",
+        "transport_pressure_source_AlphaPower.png",
+        title="Alpha Power vs rho",
+    )
+
+    pbrems_png = _plot_scalar_time_series(
+        pbrems_series,
+        "Bremsstrahlung Power [MW/m^3]",
+        "transport_pressure_source_PBrems.png",
+        title="Bremsstrahlung Power vs rho",
+    )
 
     flux_plot_paths = {}
     flux_plot_specs = (
         ("Gamma_neo", "Neo Particle Flux", "transport_flux_Gamma_neo"),
         ("Gamma_turb", "Turbulent Particle Flux", "transport_flux_Gamma_turb"),
-        ("Q_neo", "Neo Heat Flux", "transport_flux_Q_neo"),
-        ("Q_turb", "Turbulent Heat Flux", "transport_flux_Q_turb"),
+        ("Q_total", "Total Heat Flux [MW/m^2]", "transport_flux_Q_total"),
+        ("Q_neo", "Neo Heat Flux [MW/m^2]", "transport_flux_Q_neo"),
+        ("Q_turb", "Turbulent Heat Flux [MW/m^2]", "transport_flux_Q_turb"),
     )
     for key, ylabel, stem in flux_plot_specs:
         series = flux_component_series.get(key, [])
@@ -1471,6 +1528,9 @@ def plot_transport_solution(
         "Er": output_dir / "transport_Er.png" if er_series else None,
         "power_sources_total": power_sources_png,
         "helium_particle_source": he_source_png,
+        "total_heat_flux": total_heat_flux_png,
+        "alpha_power": alpha_power_png,
+        "bremsstrahlung_power": pbrems_png,
         **flux_plot_paths,
     }
 

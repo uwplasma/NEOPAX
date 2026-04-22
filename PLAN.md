@@ -245,6 +245,9 @@ Completed in this phase so far:
 - added a first contraction-aware Newton rejection improvement:
   - the Newton loop now tracks previous residual norm and a simple contraction estimate
   - clearly bad Newton progress can now trigger earlier rejection/shrinkage instead of only exhausting the maximum iteration budget
+- improved Jacobian reuse behavior in the simplified-Newton Radau path:
+  - Jacobian recomputation is now lazy when the cache is valid
+  - rejected-step retries now keep the freshly computed Jacobian/cache state instead of falling back to an older cache entry
 
 Observed result so far:
 - the lean Radau `temperature + Er` benchmark no longer gets killed immediately after entering `solver.solve(...)`
@@ -257,6 +260,32 @@ Observed result so far:
   - robustness improved materially
   - memory/stability likely improved enough for the lean benchmark to finish
   - runtime is still too slow, so more work is needed on Newton/factorization/step-control efficiency
+
+NTSS comparison findings relevant to this phase:
+- NTSS `CRadau/radau.cpp` does not use GMRES in its main Radau path
+  - it uses direct decomposition/solve routines on transformed block systems (`decomr_`, `decomc_`, `slvrad_`, `slvrar_`, `slvrai_`)
+- NTSS reject/retry handling keeps the newest Jacobian when possible
+  - on a rejected step, if the Jacobian is still considered valid (`caljac` true), NTSS retries from the matrix/decomposition path instead of forcing a full Jacobian rebuild
+  - this matches the intended direction of the recent NEOPAX change that preserves `jacobian_out`/cache state across rejected retries
+- NTSS still goes beyond the current NEOPAX implementation by combining Jacobian reuse with more mature decomposition reuse and step-history logic
+
+Important next improvement steps for this phase:
+- add explicit transformed-block factorization reuse across accepted/rejected retries when:
+  - the cached Jacobian is reused
+  - the transformed-block direct path is active
+  - the step-size change remains within a safe reuse window
+- separate the concepts of:
+  - Jacobian reuse
+  - transformed-block decomposition/factorization reuse
+  so NEOPAX can move closer to NTSS/Hairer behavior without overcoupling cache decisions
+- reduce compile-heavy branching inside the traced Radau loop where possible
+  - recent runtime improvements have come with heavier `jit_while` compile cost
+  - future Newton/retry logic should prefer static-shape, low-branch formulations
+- after factorization reuse is in place, re-benchmark the lean `temperature + Er` Radau case and compare:
+  - compile time
+  - total solve time
+  - total step count
+  - whether runtime improvements continue without another major compile regression
 
 Still open in this phase:
 - benchmark the new contraction-aware Newton changes

@@ -546,6 +546,12 @@ class TemperatureEquation(EquationBase):
 def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
     if bc_model is not None and hasattr(bc_model, "right_type"):
         def faces_builder(profile):
+            lv, lg = left_constraints_from_bc_model(
+                bc_model,
+                profile[:, 0],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
             rv, rg = right_constraints_from_bc_model(
                 bc_model,
                 profile[:, -1],
@@ -554,21 +560,23 @@ def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
             )
             if rv is not None:
                 return jax.vmap(
-                    lambda prof, right_val: make_profile_cell_variable(
+                    lambda prof, left_val, left_grad, right_val: make_profile_cell_variable(
                         prof,
                         field.r_grid_half,
-                        left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                        left_face_constraint=left_val,
+                        left_face_grad_constraint=left_grad,
                         right_face_constraint=right_val,
                     ).face_value(reconstruction=reconstruction)
-                )(profile, jnp.asarray(rv))
+                )(profile, lv, lg, jnp.asarray(rv))
             return jax.vmap(
-                lambda prof, right_grad: make_profile_cell_variable(
+                lambda prof, left_val, left_grad, right_grad: make_profile_cell_variable(
                     prof,
                     field.r_grid_half,
-                    left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    left_face_constraint=left_val,
+                    left_face_grad_constraint=left_grad,
                     right_face_grad_constraint=right_grad,
                 ).face_value(reconstruction=reconstruction)
-            )(profile, jnp.asarray(rg))
+            )(profile, lv, lg, jnp.asarray(rg))
     elif bc_model is not None and hasattr(bc_model, "apply_ghost"):
         def faces_builder(profile):
             if hasattr(bc_model, "apply_ghost_all"):
@@ -582,7 +590,7 @@ def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
                 lambda prof: make_profile_cell_variable(
                     prof,
                     field.r_grid_half,
-                    left_face_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    left_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
                     right_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
                 ).face_value(reconstruction=reconstruction)
             )(profile)
@@ -793,6 +801,12 @@ def build_electric_field_equation(
     # Pre-build the gamma_faces_builder function for BC handling (density/Er)
     if bc_gamma is not None and hasattr(bc_gamma, "right_type"):
         def gamma_faces_builder(Gamma):
+            lv, lg = left_constraints_from_bc_model(
+                bc_gamma,
+                Gamma[:, 0],
+                profile=Gamma,
+                face_centers=field.r_grid_half,
+            )
             rv, rg = right_constraints_from_bc_model(
                 bc_gamma,
                 Gamma[:, -1],
@@ -801,22 +815,24 @@ def build_electric_field_equation(
             )
             if rv is not None:
                 return jax.vmap(
-                    lambda G, right_val: make_profile_cell_variable(
+                    lambda G, left_val, left_grad, right_val: make_profile_cell_variable(
                         G,
                         field.r_grid_half,
-                        left_face_constraint=jnp.asarray(0.0, dtype=G.dtype),
+                        left_face_constraint=left_val,
+                        left_face_grad_constraint=left_grad,
                         right_face_constraint=right_val,
                     ).face_value(reconstruction=reconstruction)
-                )(Gamma, jnp.asarray(rv))
+                )(Gamma, lv, lg, jnp.asarray(rv))
             else:
                 return jax.vmap(
-                    lambda G, right_grad: make_profile_cell_variable(
+                    lambda G, left_val, left_grad, right_grad: make_profile_cell_variable(
                         G,
                         field.r_grid_half,
-                        left_face_constraint=jnp.asarray(0.0, dtype=G.dtype),
+                        left_face_constraint=left_val,
+                        left_face_grad_constraint=left_grad,
                         right_face_grad_constraint=right_grad,
                     ).face_value(reconstruction=reconstruction)
-                )(Gamma, jnp.asarray(rg))
+                )(Gamma, lv, lg, jnp.asarray(rg))
     elif bc_gamma is not None and hasattr(bc_gamma, "apply_ghost"):
         def gamma_faces_builder(Gamma):
             if hasattr(bc_gamma, "apply_ghost_all"):
@@ -830,7 +846,7 @@ def build_electric_field_equation(
                 lambda G: make_profile_cell_variable(
                     G,
                     field.r_grid_half,
-                    left_face_constraint=jnp.asarray(0.0, dtype=G.dtype),
+                    left_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
                     right_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
                 ).face_value(reconstruction=reconstruction)
             )(Gamma)

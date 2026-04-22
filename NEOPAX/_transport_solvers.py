@@ -1139,6 +1139,11 @@ class RADAUSolver(TransportSolver):
         radau_inv_transform = jnp.asarray(_RADAU3_INV_TRANSFORM, dtype=dtype)
         radau_real_eig = jnp.asarray(_RADAU3_REAL_EIG, dtype=dtype)
         radau_complex_block = jnp.asarray(_RADAU3_COMPLEX_BLOCK, dtype=dtype)
+        real_lu0 = jnp.eye(state_dim, dtype=dtype)
+        real_piv0 = jnp.arange(state_dim, dtype=jnp.int32)
+        complex_dim = 2 * state_dim
+        complex_lu0 = jnp.eye(complex_dim, dtype=dtype)
+        complex_piv0 = jnp.arange(complex_dim, dtype=jnp.int32)
 
         def _error_norm(err_vec, flat_ref, flat_candidate):
             scale = self.atol + self.rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
@@ -1157,12 +1162,26 @@ class RADAUSolver(TransportSolver):
         def _inverse_transform_stage_stack(stage_stack):
             return radau_transform @ stage_stack
 
-        def _make_transformed_radau_stage_solver(jacobian_ref, h_value, linear_solver_mode):
+        def _make_transformed_radau_stage_solver(
+            jacobian_ref,
+            h_value,
+            linear_solver_mode,
+            real_lu_cache,
+            real_piv_cache,
+            complex_lu_cache,
+            complex_piv_cache,
+            factor_cache_valid,
+            factor_cache_dt,
+        ):
             identity_n = jnp.eye(state_dim, dtype=dtype)
             block00 = radau_complex_block[0, 0]
             block01 = radau_complex_block[0, 1]
             block10 = radau_complex_block[1, 0]
             block11 = radau_complex_block[1, 1]
+            use_direct_blocks = linear_solver_mode != "gmres"
+            factor_dt_scale = jnp.maximum(jnp.abs(factor_cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
+            factor_dt_close = jnp.abs(h_value - factor_cache_dt) <= self.jacobian_reuse_rtol * factor_dt_scale
+            reuse_factorization = jnp.logical_and(factor_cache_valid, jnp.logical_and(use_direct_blocks, factor_dt_close))
 
             real_matrix = identity_n - h_value * radau_real_eig * jacobian_ref
 
@@ -1178,6 +1197,29 @@ class RADAUSolver(TransportSolver):
                     ]
                 )
 
+            def _reuse_factorization(_):
+                return real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+            def _recompute_factorization(_):
+                real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+                complex_lu, complex_piv = jax.scipy.linalg.lu_factor(complex_dense)
+                return real_lu, real_piv, complex_lu, complex_piv
+
+            if use_direct_blocks:
+                real_lu, real_piv, complex_lu, complex_piv = jax.lax.cond(
+                    reuse_factorization,
+                    _reuse_factorization,
+                    _recompute_factorization,
+                    operand=None,
+                )
+            else:
+                real_lu, real_piv, complex_lu, complex_piv = (
+                    real_lu_cache,
+                    real_piv_cache,
+                    complex_lu_cache,
+                    complex_piv_cache,
+                )
+
             def complex_matvec(v):
                 v1, v2 = jnp.split(v, 2)
                 jv1 = jacobian_ref @ v1
@@ -1191,31 +1233,61 @@ class RADAUSolver(TransportSolver):
                 rhs_transformed = _transform_stage_stack(rhs_stages)
                 rhs_real = rhs_transformed[0]
                 rhs_complex = rhs_transformed[1:].reshape((-1,))
-                delta_real = _solve_linear_system(
-                    matvec=real_matvec,
-                    rhs=rhs_real,
-                    linear_solver="direct" if linear_solver_mode == "direct" else linear_solver_mode,
-                    dense_matrix_builder=lambda: real_matrix if linear_solver_mode != "gmres" else None,
-                    gmres_tol=self.gmres_tol,
-                    gmres_maxiter=self.gmres_maxiter,
-                )
-                delta_complex = _solve_linear_system(
-                    matvec=complex_matvec,
-                    rhs=rhs_complex,
-                    linear_solver=linear_solver_mode,
-                    dense_matrix_builder=(lambda: complex_dense) if linear_solver_mode != "gmres" else None,
-                    gmres_tol=self.gmres_tol,
-                    gmres_maxiter=self.gmres_maxiter,
-                )
+                if use_direct_blocks:
+                    delta_real = jax.scipy.linalg.lu_solve((real_lu, real_piv), rhs_real)
+                    delta_complex = jax.scipy.linalg.lu_solve((complex_lu, complex_piv), rhs_complex)
+                else:
+                    delta_real = _solve_linear_system(
+                        matvec=real_matvec,
+                        rhs=rhs_real,
+                        linear_solver=linear_solver_mode,
+                        dense_matrix_builder=None,
+                        gmres_tol=self.gmres_tol,
+                        gmres_maxiter=self.gmres_maxiter,
+                    )
+                    delta_complex = _solve_linear_system(
+                        matvec=complex_matvec,
+                        rhs=rhs_complex,
+                        linear_solver=linear_solver_mode,
+                        dense_matrix_builder=None,
+                        gmres_tol=self.gmres_tol,
+                        gmres_maxiter=self.gmres_maxiter,
+                    )
                 delta_transformed = jnp.concatenate(
                     [delta_real[None, :], delta_complex.reshape((2, state_dim))],
                     axis=0,
                 )
                 return _inverse_transform_stage_stack(delta_transformed).reshape((-1,))
 
-            return stage_solver
+            factor_cache_valid_out = jnp.asarray(use_direct_blocks)
+            factor_cache_dt_out = jnp.where(use_direct_blocks, h_value, factor_cache_dt)
+            return (
+                stage_solver,
+                real_lu,
+                real_piv,
+                complex_lu,
+                complex_piv,
+                factor_cache_valid_out,
+                factor_cache_dt_out,
+            )
 
-        def _single_step(flat_y, t_value, h_value, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age):
+        def _single_step(
+            flat_y,
+            t_value,
+            h_value,
+            prev_stages,
+            prev_dt,
+            jacobian_cache,
+            cache_valid,
+            cache_dt,
+            cache_age,
+            real_lu_cache,
+            real_piv_cache,
+            complex_lu_cache,
+            complex_piv_cache,
+            factor_cache_valid,
+            factor_cache_dt,
+        ):
             f0 = flat_rhs(t_value, flat_y)
             fallback_guess = jnp.tile(f0, 3)
             use_predictor = jnp.logical_and(
@@ -1258,9 +1330,30 @@ class RADAUSolver(TransportSolver):
                     _recompute_jac,
                     operand=None,
                 )
-                stage_solver = _make_transformed_radau_stage_solver(jacobian_ref, h_value, linear_solver_mode)
+                (
+                    stage_solver,
+                    real_lu_out,
+                    real_piv_out,
+                    complex_lu_out,
+                    complex_piv_out,
+                    factor_cache_valid_out,
+                    factor_cache_dt_out,
+                ) = _make_transformed_radau_stage_solver(
+                    jacobian_ref,
+                    h_value,
+                    linear_solver_mode,
+                    real_lu_cache,
+                    real_piv_cache,
+                    complex_lu_cache,
+                    complex_piv_cache,
+                    factor_cache_valid,
+                    factor_cache_dt,
+                )
             else:
                 stage_solver = None
+                real_lu_out, real_piv_out = real_lu_cache, real_piv_cache
+                complex_lu_out, complex_piv_out = complex_lu_cache, complex_piv_cache
+                factor_cache_valid_out, factor_cache_dt_out = factor_cache_valid, factor_cache_dt
 
             def body_fn(newton_state):
                 iter_idx, z_cur, delta_norm, residual_norm, prev_residual_norm, theta_est, diverged = newton_state
@@ -1352,13 +1445,40 @@ class RADAUSolver(TransportSolver):
                 cache_valid_out = cache_valid
                 cache_dt_out = cache_dt
                 cache_age_out = cache_age
-            return flat_next, err_norm, converged, z_final, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out, newton_shrink
+            return (
+                flat_next,
+                err_norm,
+                converged,
+                z_final,
+                jacobian_out,
+                cache_valid_out,
+                cache_dt_out,
+                cache_age_out,
+                real_lu_out,
+                real_piv_out,
+                complex_lu_out,
+                complex_piv_out,
+                factor_cache_valid_out,
+                factor_cache_dt_out,
+                newton_shrink,
+            )
 
         def _attempt_step(carry):
-            t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age = carry
+            (
+                t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
+                jacobian_cache, cache_valid, cache_dt, cache_age,
+                real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+            ) = carry
             trial_dt = jnp.minimum(dt_value, t_final - t_value)
-            trial_y, err_norm, converged, stage_history, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out, newton_shrink = _single_step(
-                flat_y, t_value, trial_dt, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age
+            (
+                trial_y, err_norm, converged, stage_history,
+                jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
+                real_lu_out, real_piv_out, complex_lu_out, complex_piv_out, factor_cache_valid_out, factor_cache_dt_out,
+                newton_shrink,
+            ) = _single_step(
+                flat_y, t_value, trial_dt, prev_stages, prev_dt,
+                jacobian_cache, cache_valid, cache_dt, cache_age,
+                real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
             )
             accepted = jnp.logical_and(converged, err_norm <= 1.0)
             safe_error = jnp.maximum(err_norm, 1.0e-12)
@@ -1385,6 +1505,12 @@ class RADAUSolver(TransportSolver):
                     cache_valid_out,
                     cache_dt_out,
                     cache_age_out,
+                    real_lu_out,
+                    real_piv_out,
+                    complex_lu_out,
+                    complex_piv_out,
+                    factor_cache_valid_out,
+                    factor_cache_dt_out,
                 ), (
                     accepted_y,
                     t_new,
@@ -1417,10 +1543,16 @@ class RADAUSolver(TransportSolver):
                     prev_error,
                     prev_stages,
                     prev_dt,
-                    jacobian_cache,
-                    cache_valid,
-                    cache_dt,
-                    cache_age,
+                    jacobian_out,
+                    cache_valid_out,
+                    cache_dt_out,
+                    cache_age_out,
+                    real_lu_out,
+                    real_piv_out,
+                    complex_lu_out,
+                    complex_piv_out,
+                    factor_cache_valid_out,
+                    factor_cache_dt_out,
                 ), (
                     flat_y,
                     t_value,
@@ -1433,7 +1565,11 @@ class RADAUSolver(TransportSolver):
             return jax.lax.cond(accepted, _accept, _reject, operand=None)
 
         def step_fn(carry, _):
-            t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age = carry
+            (
+                t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
+                jacobian_cache, cache_valid, cache_dt, cache_age,
+                real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+            ) = carry
 
             def _skip(_):
                 return carry, (
@@ -1484,6 +1620,12 @@ class RADAUSolver(TransportSolver):
                     cache_valid,
                     cache_dt,
                     cache_age,
+                    real_lu_cache,
+                    real_piv_cache,
+                    complex_lu_cache,
+                    complex_piv_cache,
+                    factor_cache_valid,
+                    factor_cache_dt,
                     step_idx,
                     save_idx,
                     ys,
@@ -1497,11 +1639,13 @@ class RADAUSolver(TransportSolver):
                     t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new,
                     prev_error_new, prev_stages_new, prev_dt_new,
                     jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
+                    real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
                 ), step_info = step_fn(
                     (
                         t_value, flat_y, dt_value, done, failed, fail_code, n_accepted,
                         prev_error, prev_stages, prev_dt,
                         jacobian_cache, cache_valid, cache_dt, cache_age,
+                        real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
                     ),
                     None,
                 )
@@ -1525,6 +1669,12 @@ class RADAUSolver(TransportSolver):
                     cache_valid_new,
                     cache_dt_new,
                     cache_age_new,
+                    real_lu_new,
+                    real_piv_new,
+                    complex_lu_new,
+                    complex_piv_new,
+                    factor_cache_valid_new,
+                    factor_cache_dt_new,
                     step_idx + 1,
                     save_idx,
                     ys,
@@ -1550,6 +1700,12 @@ class RADAUSolver(TransportSolver):
                 jnp.asarray(False),
                 jnp.asarray(0.0, dtype=dtype),
                 jnp.asarray(0, dtype=jnp.int32),
+                real_lu0,
+                real_piv0,
+                complex_lu0,
+                complex_piv0,
+                jnp.asarray(False),
+                jnp.asarray(0.0, dtype=dtype),
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(1, dtype=jnp.int32),
                 ys_saved,
@@ -1574,6 +1730,12 @@ class RADAUSolver(TransportSolver):
                 _cache_valid_f,
                 _cache_dt_f,
                 _cache_age_f,
+                _real_lu_f,
+                _real_piv_f,
+                _complex_lu_f,
+                _complex_piv_f,
+                _factor_cache_valid_f,
+                _factor_cache_dt_f,
                 _,
                 _save_idx_f,
                 ys_saved,
@@ -1591,21 +1753,28 @@ class RADAUSolver(TransportSolver):
             )
 
         def cond_fun(loop_carry):
-            t_value, _, _, done, failed, _, _, _, _, _, _, _, _, _, step_idx = loop_carry
+            t_value, _, _, done, failed, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, step_idx = loop_carry
             active = jnp.logical_not(jnp.logical_or(done, failed))
             return jnp.logical_and(step_idx < max_total_steps, active)
 
         def body_fun(loop_carry):
-            t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age, step_idx = loop_carry
+            (
+                t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
+                jacobian_cache, cache_valid, cache_dt, cache_age,
+                real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                step_idx,
+            ) = loop_carry
             (
                 t_new, y_new, dt_next, done_new, failed_new, fail_code_new, n_acc_new,
                 prev_error_new, prev_stages_new, prev_dt_new,
                 jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
+                real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
             ), _ = step_fn(
                 (
                     t_value, flat_y, dt_value, done, failed, fail_code, n_accepted,
                     prev_error, prev_stages, prev_dt,
                     jacobian_cache, cache_valid, cache_dt, cache_age,
+                    real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
                 ),
                 None,
             )
@@ -1624,6 +1793,12 @@ class RADAUSolver(TransportSolver):
                 cache_valid_new,
                 cache_dt_new,
                 cache_age_new,
+                real_lu_new,
+                real_piv_new,
+                complex_lu_new,
+                complex_piv_new,
+                factor_cache_valid_new,
+                factor_cache_dt_new,
                 step_idx + 1,
             )
 
@@ -1642,12 +1817,20 @@ class RADAUSolver(TransportSolver):
             jnp.asarray(False),
             jnp.asarray(0.0, dtype=dtype),
             jnp.asarray(0, dtype=jnp.int32),
+            real_lu0,
+            real_piv0,
+            complex_lu0,
+            complex_piv0,
+            jnp.asarray(False),
+            jnp.asarray(0.0, dtype=dtype),
             jnp.asarray(0, dtype=jnp.int32),
         )
         (
             t_f, y_f_flat, dt_last, done_f, failed_f, fail_code_f, n_acc_f,
             _prev_err_f, _prev_stages_f, _prev_dt_f,
-            _jacobian_f, _cache_valid_f, _cache_dt_f, _cache_age_f, _
+            _jacobian_f, _cache_valid_f, _cache_dt_f, _cache_age_f,
+            _real_lu_f, _real_piv_f, _complex_lu_f, _complex_piv_f, _factor_cache_valid_f, _factor_cache_dt_f,
+            _
         ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
         ys_saved_flat = jnp.expand_dims(y_f_flat, axis=0)
         ts_saved = jnp.expand_dims(t_f, axis=0)
