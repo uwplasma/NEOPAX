@@ -1,8 +1,9 @@
-# Focused transport debug case:
+# Lean transport efficiency test for Diffrax Kvaerno5:
 # - density frozen
-# - pressure evolved for e, D, T
+# - temperature evolved for all species
 # - Er evolved
-# - startup prints thermal and Er term breakdowns
+# - no transport sources
+# - no convection or work term
 
 [general]
 mode = "transport"
@@ -16,7 +17,6 @@ n_radial = 51
 flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
-
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -53,7 +53,7 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.5, 0.5, 0.1]
+c_density = [1.0, 0.4, 0.4, 0.1]
 c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
@@ -94,51 +94,44 @@ type = "neumann"
 gradient = 0.0
 
 [equations]
-toggle_density = [false, false, false, true]
-toggle_temperature = [true, true, true, false]
-toggle_Er = false
+toggle_density = [false, false, false, false]
+toggle_temperature = [true, true, true, true]
+toggle_Er = true
 
 [sources]
-temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
-density= ["dt_reaction"]
+temperature = []
+density = []
 
 [transport_solver]
 density_floor = 1.0e-6
-temperature_include_work_term = true
+transport_solver_backend = "diffrax_kvaerno5"
 integrator = "diffrax_kvaerno5"
 t0 = 0.0
-t_final = 0.001
+t_final = 0.01
 dt = 1.0e-8
-rtol = 1.0e-3
-atol = 1.0e-7
+rtol = 1.0e-6
+atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
 throw = false
 debug_stage_markers = true
 debug_disable_jit = false
-radau_linear_solver = "gmres"
-radau_gmres_tol = 1.0e-6
-radau_gmres_maxiter = 80
-radau_error_estimator = "embedded2"
-radau_newton_strategy = "simplified"
-nonlinear_solver_tol = 1.0e-7
-nonlinear_solver_maxiter = 20
-Er_source_mode = "ambipolar_local"
-work_source_mode = "local"
-Er_right_boundary_mode = "floating_ambipolar_edge"
-Er_edge_relax = 0.1
 save_n = 10
-Er_relax = 0.1
-DEr = 2.0
+
+temperature_include_work_term = true
 temperature_include_neo_convection = true
 temperature_include_turbulent_convection = false
 temperature_include_classical_convection = false
 temperature_convection_reconstruction = "closure_face_flux"
 temperature_heat_flux_reconstruction = "closure_face_flux"
-density_flux_reconstruction = "closure_face_flux"
-density_particle_face_closure_mode = "reconstructed"
 
+Er_source_mode = "ambipolar_local"
+work_source_mode = "local"
+Er_right_boundary_mode = "floating_ambipolar_edge"
+Er_edge_relax = 0.1
+Er_relax = 0.1
+DEr = 2.0
 
 [transport_output]
 transport_plot = true
@@ -147,5 +140,5 @@ transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
 transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
-transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage_radau_only_density"
+transport_output_dir = "./outputs/transport_temp_Er_kvaerno5_lean"
 transport_plot_n_times = -1

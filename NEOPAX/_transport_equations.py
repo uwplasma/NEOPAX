@@ -1044,24 +1044,16 @@ def build_equation_system_from_config(config, species):
 @dataclasses.dataclass(frozen=True, eq=False)
 class ComposedEquationSystem:
     equations: tuple
+    density_equation: object | None = None
+    temperature_equation: object | None = None
+    er_equation: object | None = None
     species: object | None = None
     shared_flux_model: object | None = None
     density_floor: object = DEFAULT_TRANSPORT_DENSITY_FLOOR
     temperature_active_mask: object | None = None
     fixed_temperature_profile: object | None = None
 
-    def __call__(self, t, state, runtime):
-        """
-        Call all equations with state, return a TransportState matching the state structure.
-        Always output all three fields, setting missing ones to zero arrays of the correct shape.
-        When electrons are present, evaluate the RHS on a quasi-neutral working
-        state, but keep electron density out of the solved density subsystem.
-        This matches the NTSS-style pattern: evolve independent ion/impurity
-        density rows, reconstruct electron density algebraically for the working
-        state and accepted/output states.
-        """
-        import jax.numpy as jnp
-        from ._state import TransportState
+    def _prepare_working_state(self, state):
         working_state = state
         eidx = None
         if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
@@ -1076,21 +1068,51 @@ class ComposedEquationSystem:
             self.temperature_active_mask,
             self.fixed_temperature_profile,
         )
+        return working_state, eidx
+
+    def __call__(self, t, state, runtime):
+        """
+        Call all equations with state, return a TransportState matching the state structure.
+        Always output all three fields, setting missing ones to zero arrays of the correct shape.
+        When electrons are present, evaluate the RHS on a quasi-neutral working
+        state, but keep electron density out of the solved density subsystem.
+        This matches the NTSS-style pattern: evolve independent ion/impurity
+        density rows, reconstruct electron density algebraically for the working
+        state and accepted/output states.
+        """
+        import jax.numpy as jnp
+        from ._state import TransportState
+        working_state, eidx = self._prepare_working_state(state)
 
         shared_fluxes = None
         if self.shared_flux_model is not None:
             shared_fluxes = self.shared_flux_model(working_state)
-        # Map equation types to their outputs
-        eq_outputs = {}
-        for eq in self.equations:
-            name = getattr(eq, 'name', None)
-            if name is not None:
-                eq_outputs[name] = eq(working_state, fluxes=shared_fluxes)
 
-        # Defensive: always use shape of state.density, state.pressure, state.Er
-        density_rhs = eq_outputs.get('density', jnp.zeros_like(state.density))
-        pressure_rhs = eq_outputs.get('temperature', jnp.zeros_like(state.pressure))
-        Er_rhs = eq_outputs.get('Er', jnp.zeros_like(state.Er))
+        density_eq = self.density_equation
+        temperature_eq = self.temperature_equation
+        er_eq = self.er_equation
+        if density_eq is None:
+            density_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "density"), None)
+        if temperature_eq is None:
+            temperature_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "temperature"), None)
+        if er_eq is None:
+            er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
+
+        density_rhs = (
+            density_eq(working_state, fluxes=shared_fluxes)
+            if density_eq is not None
+            else jnp.zeros_like(state.density)
+        )
+        pressure_rhs = (
+            temperature_eq(working_state, fluxes=shared_fluxes)
+            if temperature_eq is not None
+            else jnp.zeros_like(state.pressure)
+        )
+        Er_rhs = (
+            er_eq(working_state, fluxes=shared_fluxes)
+            if er_eq is not None
+            else jnp.zeros_like(state.Er)
+        )
 
         density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
 
@@ -1100,9 +1122,8 @@ class ComposedEquationSystem:
         if eidx is not None:
             density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
 
-        temperature_equation = next((eq for eq in self.equations if getattr(eq, "name", None) == "temperature"), None)
-        if temperature_equation is not None and hasattr(temperature_equation, "enforce_dirichlet_boundary_rhs"):
-            pressure_rhs = temperature_equation.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+        if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
 
         return TransportState(
             density=density_rhs,

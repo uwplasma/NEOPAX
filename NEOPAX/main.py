@@ -445,6 +445,9 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     )
     equation_system = ComposedEquationSystem(
         tuple(equations_to_evolve),
+        density_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None),
+        temperature_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "temperature"), None),
+        er_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None),
         species=runtime.species,
         shared_flux_model=shared_flux_model,
         density_floor=solver_cfg.get("density_floor", 1.0e-6),

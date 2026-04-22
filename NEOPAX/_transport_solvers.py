@@ -11,6 +11,7 @@ import dataclasses
 import inspect
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 TIME_SOLVER_REGISTRY: dict[str, Callable[..., "TransportSolver"]] = {}
@@ -22,6 +23,39 @@ ODE_SOLVER_BACKENDS = {
     "radau",
     "rosenbrock",
 }
+
+
+def _build_radau3_transform_constants() -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """Return real stage transform data for the 3-stage Radau IIA tableau."""
+    sqrt6 = np.sqrt(6.0)
+    a = np.asarray(
+        [
+            [(88.0 - 7.0 * sqrt6) / 360.0, (296.0 - 169.0 * sqrt6) / 1800.0, (-2.0 + 3.0 * sqrt6) / 225.0],
+            [(296.0 + 169.0 * sqrt6) / 1800.0, (88.0 + 7.0 * sqrt6) / 360.0, (-2.0 - 3.0 * sqrt6) / 225.0],
+            [(16.0 - sqrt6) / 36.0, (16.0 + sqrt6) / 36.0, 1.0 / 9.0],
+        ],
+        dtype=np.float64,
+    )
+    eigvals, eigvecs = np.linalg.eig(a)
+    real_idx = int(np.argmin(np.abs(eigvals.imag)))
+    complex_candidates = [idx for idx in range(3) if idx != real_idx]
+    complex_idx = max(complex_candidates, key=lambda idx: eigvals[idx].imag)
+    real_vec = eigvecs[:, real_idx].real
+    complex_vec = eigvecs[:, complex_idx]
+    transform = np.column_stack([real_vec, complex_vec.real, complex_vec.imag]).astype(np.float64)
+    inv_transform = np.linalg.inv(transform)
+    real_eig = float(eigvals[real_idx].real)
+    complex_block = np.asarray(
+        [
+            [float(eigvals[complex_idx].real), float(eigvals[complex_idx].imag)],
+            [-float(eigvals[complex_idx].imag), float(eigvals[complex_idx].real)],
+        ],
+        dtype=np.float64,
+    )
+    return transform, inv_transform, real_eig, complex_block
+
+
+_RADAU3_TRANSFORM, _RADAU3_INV_TRANSFORM, _RADAU3_REAL_EIG, _RADAU3_COMPLEX_BLOCK = _build_radau3_transform_constants()
 
 
 def register_time_solver(name: str, builder: Callable[..., "TransportSolver"]) -> None:
@@ -99,6 +133,16 @@ def _electron_density_index(species: Any) -> int | None:
     return names.index("e") if "e" in names else None
 
 
+def _extract_fixed_temperature_projection(vector_field: Callable) -> tuple[Any, Any]:
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None, None
+    return (
+        getattr(owner, "temperature_active_mask", None),
+        getattr(owner, "fixed_temperature_profile", None),
+    )
+
+
 def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
     """Convert a TransportState-like object into an array-only pytree."""
     if dataclasses.is_dataclass(state) and hasattr(state, "density") and hasattr(state, "pressure") and hasattr(state, "Er"):
@@ -110,7 +154,13 @@ def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
     return state
 
 
-def _unpack_transport_state_arrays(state_like: Any, template_state: Any, species: Any = None) -> Any:
+def _unpack_transport_state_arrays(
+    state_like: Any,
+    template_state: Any,
+    species: Any = None,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+) -> Any:
     """Rebuild a TransportState-like object from an array-only pytree."""
     if (
         dataclasses.is_dataclass(template_state)
@@ -128,8 +178,20 @@ def _unpack_transport_state_arrays(state_like: Any, template_state: Any, species
             full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
             full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
             rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er)
-            return _apply_quasi_neutrality_output(rebuilt, species, template_state)
-        return dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
+            return _apply_quasi_neutrality_output(
+                rebuilt,
+                species,
+                template_state,
+                temperature_active_mask=temperature_active_mask,
+                fixed_temperature_profile=fixed_temperature_profile,
+            )
+        rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
+        return _project_fixed_temperature_output(
+            rebuilt,
+            template_state,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
     return state_like
 
 
@@ -138,7 +200,43 @@ def _restore_state_metadata(state_like: Any, template_state: Any) -> Any:
     return state_like
 
 
-def _apply_quasi_neutrality_output(state_like: Any, species: Any, reference_state: Any) -> Any:
+def _project_fixed_temperature_output(
+    state_like: Any,
+    reference_state: Any,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+) -> Any:
+    from ._transport_equations import project_fixed_temperature_species
+
+    density = getattr(state_like, "density", None)
+    ref_density = getattr(reference_state, "density", None)
+    if density is None or ref_density is None:
+        return state_like
+
+    if density.ndim == ref_density.ndim + 1:
+        out = jax.vmap(
+            lambda s: project_fixed_temperature_species(
+                s,
+                temperature_active_mask=temperature_active_mask,
+                fixed_temperature_profile=fixed_temperature_profile,
+            )
+        )(state_like)
+        return _restore_state_metadata(out, reference_state)
+    out = project_fixed_temperature_species(
+        state_like,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+    )
+    return _restore_state_metadata(out, reference_state)
+
+
+def _apply_quasi_neutrality_output(
+    state_like: Any,
+    species: Any,
+    reference_state: Any,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+) -> Any:
     """Apply quasi-neutrality to either a single state or a saved time-series of states."""
     from ._transport_equations import enforce_quasi_neutrality
 
@@ -149,45 +247,142 @@ def _apply_quasi_neutrality_output(state_like: Any, species: Any, reference_stat
 
     if density.ndim == ref_density.ndim + 1:
         out = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(state_like)
-        return _restore_state_metadata(out, reference_state)
+        return _project_fixed_temperature_output(
+            out,
+            reference_state,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
     out = enforce_quasi_neutrality(state_like, species)
-    return _restore_state_metadata(out, reference_state)
+    return _project_fixed_temperature_output(
+        out,
+        reference_state,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+    )
 
 
-def _project_state_to_quasi_neutrality(state_like: Any, species: Any) -> Any:
-    from ._transport_equations import enforce_quasi_neutrality
+def _project_state_to_quasi_neutrality(
+    state_like: Any,
+    species: Any,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+) -> Any:
+    from ._transport_equations import enforce_quasi_neutrality, project_fixed_temperature_species
 
     if species is None:
-        return state_like
+        return project_fixed_temperature_species(
+            state_like,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
     density = getattr(state_like, "density", None)
     if density is None:
+        return project_fixed_temperature_species(
+            state_like,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+    projected = enforce_quasi_neutrality(state_like, species)
+    return project_fixed_temperature_species(
+        projected,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+    )
+
+
+def _project_packed_transport_state_arrays(
+    state_like: Any,
+    template_state: Any,
+    species: Any,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+) -> Any:
+    """Project packed solver arrays without rebuilding a full TransportState."""
+    if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
-    return enforce_quasi_neutrality(state_like, species)
+
+    density, pressure, er = state_like
+    if temperature_active_mask is None or fixed_temperature_profile is None:
+        return state_like
+
+    eidx = _electron_density_index(species)
+    if eidx is not None and density.shape[-2] == template_state.density.shape[0] - 1:
+        full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
+        full_density = jnp.zeros(full_shape, dtype=pressure.dtype)
+        full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
+        full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
+        charge_qp = jnp.asarray(species.charge_qp, dtype=pressure.dtype)
+        ion_indices = jnp.asarray(getattr(species, "ion_indices", ()), dtype=int)
+        if ion_indices.size > 0:
+            Z_i = jnp.take(charge_qp, ion_indices, axis=0)
+            n_i = jnp.take(full_density, ion_indices, axis=-2)
+            n_e = -jnp.sum(Z_i[..., None] * n_i, axis=-2) / charge_qp[int(eidx)]
+            full_density = full_density.at[..., int(eidx), :].set(n_e)
+    else:
+        full_density = density
+
+    active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
+    fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure.dtype)
+    active_mask = active_mask.reshape((1,) * (pressure.ndim - 2) + (active_mask.shape[0], 1))
+    fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure.shape)
+    fixed_pressure = full_density * fixed_temperature
+    projected_pressure = jnp.where(active_mask, pressure, fixed_pressure)
+    return (density, projected_pressure, er)
 
 
-def _project_flat_state_if_needed(flat_y: jax.Array, unravel: Callable, species: Any) -> jax.Array:
-    if species is None:
+def _project_flat_state_if_needed(
+    flat_y: jax.Array,
+    project_flat: Callable[[jax.Array], jax.Array] | None,
+) -> jax.Array:
+    if project_flat is None:
         return flat_y
-    projected_state = _project_state_to_quasi_neutrality(unravel(flat_y), species)
-    flat_projected, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(projected_state, species))
-    return flat_projected
+    return project_flat(flat_y)
 
 
-def _make_solver_state_transform(template_state: Any, species: Any):
+def _make_solver_state_transform(
+    template_state: Any,
+    species: Any,
+    temperature_active_mask: Any = None,
+    fixed_temperature_profile: Any = None,
+):
     packed_state = _pack_transport_state_arrays(template_state, species)
     flat_state0, unravel_packed = jax.flatten_util.ravel_pytree(packed_state)
 
     def unpack_flat(flat_y):
-        return _unpack_transport_state_arrays(unravel_packed(flat_y), template_state, species)
+        return _unpack_transport_state_arrays(
+            unravel_packed(flat_y),
+            template_state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
 
     def unpack_packed(packed_state_like):
-        return _unpack_transport_state_arrays(packed_state_like, template_state, species)
+        return _unpack_transport_state_arrays(
+            packed_state_like,
+            template_state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
 
     def pack_state(state_like):
         flat_out, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state_like, species))
         return flat_out
 
-    return flat_state0, unpack_flat, unpack_packed, pack_state
+    def project_flat(flat_y):
+        projected_packed = _project_packed_transport_state_arrays(
+            unravel_packed(flat_y),
+            template_state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+        flat_projected, _ = jax.flatten_util.ravel_pytree(projected_packed)
+        return flat_projected
+
+    return flat_state0, unpack_flat, unpack_packed, pack_state, project_flat
 
 
 def _get_diffrax_integrator(name: str) -> Callable:
@@ -231,23 +426,29 @@ class DiffraxSolver(TransportSolver):
         object.__setattr__(self, 'save_n', save_n)
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
-        # Adapt NEOPAX vector fields to Diffrax's expected signature (t, y, args).
+        # Keep Diffrax on a flat array state to shrink the traced solve graph.
+        # The physics still goes through the same NEOPAX vector field via the
+        # shared pack/unpack/projection helpers used by the custom solvers.
         import diffrax
         import equinox as eqx
         species = _extract_species_from_args(args)
-        state = _project_state_to_quasi_neutrality(state, species)
-        solver_state_template = _strip_state_metadata_for_solver(state)
-        solver_state = _pack_transport_state_arrays(solver_state_template, species)
+        temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        state = _project_state_to_quasi_neutrality(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
 
-        # Diffrax expects vf(t, y, args). Capture NEOPAX runtime args in the
-        # closure instead of passing non-array objects through Diffrax/Eqinox
-        # loop state.
-        def wrapped_vector_field(t, y, _vf_args):
-            y_state = _unpack_transport_state_arrays(y, solver_state_template, species)
-            y_state = _project_state_to_quasi_neutrality(y_state, species)
-            dy_state = vector_field(t, y_state, *args)
-            dy_state = _strip_state_metadata_for_solver(dy_state)
-            return _pack_transport_state_arrays(dy_state, species)
+        def wrapped_vector_field(t, flat_y, _vf_args):
+            return flat_rhs(t, flat_y)
 
         term = diffrax.ODETerm(wrapped_vector_field)
         solver = self.integrator()
@@ -265,7 +466,7 @@ class DiffraxSolver(TransportSolver):
                 t0=self.t0,
                 t1=self.t1,
                 dt0=self.dt,
-                y0=solver_state,
+                y0=flat_state0,
                 args=None,
                 saveat=saveat,
                 **call_kwargs
@@ -277,26 +478,44 @@ class DiffraxSolver(TransportSolver):
                 t0=self.t0,
                 t1=self.t1,
                 dt0=self.dt,
-                y0=solver_state,
+                y0=flat_state0,
                 args=None,
                 **call_kwargs
             )
-        # Enforce quasi-neutrality on all saved states and final state
+
+        def _unpack_saved_values(flat_values):
+            if isinstance(flat_values, jax.Array) and flat_values.ndim == flat_state0.ndim + 1:
+                return jax.vmap(unpack_flat)(flat_values)
+            return unpack_flat(flat_values)
+
+        # Rebuild saved/final states and reapply the output-side algebraic
+        # projections so solver outputs keep the same public semantics.
         if species is not None:
             if hasattr(sol, 'ys'):
-                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template, species)
+                ys_state = _unpack_saved_values(sol.ys)
                 sol = eqx.tree_at(
                     lambda s: s.ys,
                     sol,
-                    _apply_quasi_neutrality_output(ys_state, species, state),
+                    _apply_quasi_neutrality_output(
+                        ys_state,
+                        species,
+                        state,
+                        temperature_active_mask=temperature_active_mask,
+                        fixed_temperature_profile=fixed_temperature_profile,
+                    ),
                 )
         else:
             if hasattr(sol, 'ys'):
-                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template, species)
+                ys_state = _unpack_saved_values(sol.ys)
                 sol = eqx.tree_at(
                     lambda s: s.ys,
                     sol,
-                    _restore_state_metadata(ys_state, state),
+                    _project_fixed_temperature_output(
+                        ys_state,
+                        state,
+                        temperature_active_mask=temperature_active_mask,
+                        fixed_temperature_profile=fixed_temperature_profile,
+                    ),
                 )
         return sol
 
@@ -319,16 +538,31 @@ def _finalize_custom_solver_output(
     fail_code_f,
     n_steps_f,
     unpack_flat,
+    reference_state,
     species,
+    temperature_active_mask=None,
+    fixed_temperature_profile=None,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
     ys_saved = jax.vmap(unpack_flat)(ys_saved_flat)
     if species is not None:
         ys_saved = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(ys_saved)
+    ys_saved = _project_fixed_temperature_output(
+        ys_saved,
+        reference_state,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+    )
     final_state = unpack_flat(y_final_flat)
     if species is not None:
         final_state = enforce_quasi_neutrality(final_state, species)
+    final_state = _project_fixed_temperature_output(
+        final_state,
+        reference_state,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+    )
     return {
         "ys": ys_saved,
         "ts": ts_saved,
@@ -384,11 +618,14 @@ def _fill_saved_slots(
     )
 
 
-def _flat_rhs_factory(unravel, vector_field, args, kwargs):
+def _flat_rhs_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
 
     def _flat_rhs(t_value, flat_y):
-        projected_flat_y = _project_flat_state_if_needed(flat_y, unravel, species)
+        projected_flat_y = _project_flat_state_if_needed(
+            flat_y,
+            project_flat,
+        )
         rhs_tree = vector_field(t_value, unravel(projected_flat_y), *args, **kwargs)
         rhs_flat, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(rhs_tree, species))
         return rhs_flat
@@ -421,9 +658,11 @@ def _solve_linear_system(
 
 def _prefer_dense_direct(linear_solver: str, system_size: int, threshold: int = 2048) -> bool:
     mode = str(linear_solver).strip().lower()
-    if mode in ("direct", "dense", "auto"):
+    if mode in ("direct", "dense"):
         return True
-    return system_size <= threshold
+    if mode == "auto":
+        return system_size <= threshold
+    return False
 
 
 @jax.tree_util.register_dataclass
@@ -442,7 +681,7 @@ class RosenbrockSolver(TransportSolver):
     safety_factor: float = 0.9
     min_step_factor: float = 0.2
     max_step_factor: float = 5.0
-    gamma: float = 1.0
+    gamma: float = 1.7071067811865475
     n_steps: int = 0
 
     def __init__(
@@ -460,7 +699,7 @@ class RosenbrockSolver(TransportSolver):
         safety_factor: float = 0.9,
         min_step_factor: float = 0.2,
         max_step_factor: float = 5.0,
-        gamma: float = 1.0,
+        gamma: float = 1.7071067811865475,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -483,8 +722,19 @@ class RosenbrockSolver(TransportSolver):
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         species = _extract_species_from_args(args)
-        state = _project_state_to_quasi_neutrality(state, species)
-        flat_state0, unpack_flat, _unpack_packed, _pack_state = _make_solver_state_transform(state, species)
+        temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        state = _project_state_to_quasi_neutrality(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
         dtype = flat_state0.dtype
         t0 = jnp.asarray(self.t0, dtype=dtype)
         t_final = jnp.asarray(self.t1, dtype=dtype)
@@ -493,8 +743,16 @@ class RosenbrockSolver(TransportSolver):
         base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(16, self.n_steps * 32))
         gamma = jnp.asarray(self.gamma, dtype=dtype)
-        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs)
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         state_dim = flat_state0.shape[0]
+
+        # L-stable ROS2 (Kaps-Rentrop / Hairer-Wanner-style) coefficients.
+        a21 = 1.0 / gamma
+        c21 = -2.0 / gamma
+        m1 = 3.0 / (2.0 * gamma)
+        m2 = 1.0 / (2.0 * gamma)
+        e1 = 1.0 / (2.0 * gamma)
+        e2 = 1.0 / (2.0 * gamma)
 
         def _error_norm(err_vec, flat_ref, flat_candidate):
             scale = self.atol + self.rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
@@ -504,6 +762,8 @@ class RosenbrockSolver(TransportSolver):
         def _single_step(flat_y, t_value, h_value):
             f_n = flat_rhs(t_value, flat_y)
             use_dense_direct = _prefer_dense_direct(self.linear_solver, state_dim)
+            linear_solver_mode = "direct" if use_dense_direct else self.linear_solver
+
             if use_dense_direct:
                 jacobian = jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
                 system_matrix = jnp.eye(state_dim, dtype=dtype) - gamma * h_value * jacobian
@@ -512,7 +772,7 @@ class RosenbrockSolver(TransportSolver):
                     return system_matrix @ v
 
                 dense_builder = lambda: system_matrix
-                linear_solver_mode = "direct"
+                lin = lambda v: jacobian @ v
             else:
                 _, lin = jax.linearize(lambda y: flat_rhs(t_value, y), flat_y)
 
@@ -520,19 +780,20 @@ class RosenbrockSolver(TransportSolver):
                     return v - gamma * h_value * lin(v)
 
                 dense_builder = None
-                linear_solver_mode = self.linear_solver
 
+            rhs1 = h_value * f_n
             k1 = _solve_linear_system(
                 matvec=matvec,
-                rhs=f_n,
+                rhs=rhs1,
                 linear_solver=linear_solver_mode,
                 dense_matrix_builder=dense_builder,
                 gmres_tol=self.gmres_tol,
                 gmres_maxiter=self.gmres_maxiter,
             )
-            y_stage = flat_y + h_value * k1
+
+            y_stage = flat_y + a21 * k1
             f_stage = flat_rhs(t_value + h_value, y_stage)
-            rhs2 = f_stage - 2.0 * k1
+            rhs2 = h_value * f_stage + c21 * k1
             k2 = _solve_linear_system(
                 matvec=matvec,
                 rhs=rhs2,
@@ -541,10 +802,14 @@ class RosenbrockSolver(TransportSolver):
                 gmres_tol=self.gmres_tol,
                 gmres_maxiter=self.gmres_maxiter,
             )
-            flat_next = flat_y + 1.5 * h_value * k1 + 0.5 * h_value * k2
-            err_vec = 0.5 * h_value * (k1 - k2)
+
+            flat_next = flat_y + m1 * k1 + m2 * k2
+            err_vec = e1 * k1 + e2 * k2
             err_norm = _error_norm(err_vec, flat_y, flat_next)
-            success = jnp.all(jnp.isfinite(flat_next))
+            success = jnp.logical_and(
+                jnp.all(jnp.isfinite(flat_next)),
+                jnp.all(jnp.isfinite(err_vec)),
+            )
             return flat_next, err_norm, success
 
         def _attempt_step(carry):
@@ -559,7 +824,7 @@ class RosenbrockSolver(TransportSolver):
 
             def _accept(_):
                 t_new = t_value + trial_dt
-                accepted_y = _project_flat_state_if_needed(trial_y, unpack_flat, species)
+                accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
                 return (
                     t_new,
                     accepted_y,
@@ -717,7 +982,9 @@ class RosenbrockSolver(TransportSolver):
             ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
             return _finalize_custom_solver_output(
                 ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
+                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
+                temperature_active_mask=temperature_active_mask,
+                fixed_temperature_profile=fixed_temperature_profile,
             )
 
         def cond_fun(loop_carry):
@@ -752,7 +1019,9 @@ class RosenbrockSolver(TransportSolver):
         fail_codes_saved = jnp.expand_dims(fail_code_f, axis=0)
         return _finalize_custom_solver_output(
             ys_saved_flat, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
+            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
         )
 
 
@@ -828,8 +1097,19 @@ class RADAUSolver(TransportSolver):
 
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         species = _extract_species_from_args(args)
-        state = _project_state_to_quasi_neutrality(state, species)
-        flat_state0, unpack_flat, _unpack_packed, _pack_state = _make_solver_state_transform(state, species)
+        temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        state = _project_state_to_quasi_neutrality(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+        )
         dtype = flat_state0.dtype
         sqrt6 = jnp.sqrt(jnp.asarray(6.0, dtype=dtype))
         c = jnp.asarray([(4.0 - sqrt6) / 10.0, (4.0 + sqrt6) / 10.0, 1.0], dtype=dtype)
@@ -851,10 +1131,14 @@ class RADAUSolver(TransportSolver):
         base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(32, self.n_steps * 128))
         state_dim = flat_state0.shape[0]
-        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs)
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         error_order = 2.0 if self.error_estimator == "embedded2" else 5.0
         controller_alpha = 0.7 / (error_order + 1.0)
         controller_beta = 0.4 / (error_order + 1.0)
+        radau_transform = jnp.asarray(_RADAU3_TRANSFORM, dtype=dtype)
+        radau_inv_transform = jnp.asarray(_RADAU3_INV_TRANSFORM, dtype=dtype)
+        radau_real_eig = jnp.asarray(_RADAU3_REAL_EIG, dtype=dtype)
+        radau_complex_block = jnp.asarray(_RADAU3_COMPLEX_BLOCK, dtype=dtype)
 
         def _error_norm(err_vec, flat_ref, flat_candidate):
             scale = self.atol + self.rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
@@ -866,6 +1150,70 @@ class RADAUSolver(TransportSolver):
             coupled = h_value * (a @ v_stages)
             out = tuple(v_stages[i] - stage_linears[i](coupled[i]) for i in range(3))
             return jnp.stack(out, axis=0).reshape((-1,))
+
+        def _transform_stage_stack(stage_stack):
+            return radau_inv_transform @ stage_stack
+
+        def _inverse_transform_stage_stack(stage_stack):
+            return radau_transform @ stage_stack
+
+        def _make_transformed_radau_stage_solver(jacobian_ref, h_value, linear_solver_mode):
+            identity_n = jnp.eye(state_dim, dtype=dtype)
+            block00 = radau_complex_block[0, 0]
+            block01 = radau_complex_block[0, 1]
+            block10 = radau_complex_block[1, 0]
+            block11 = radau_complex_block[1, 1]
+
+            real_matrix = identity_n - h_value * radau_real_eig * jacobian_ref
+
+            def real_matvec(v):
+                return v - h_value * radau_real_eig * (jacobian_ref @ v)
+
+            complex_dense = None
+            if linear_solver_mode != "gmres":
+                complex_dense = jnp.block(
+                    [
+                        [identity_n - h_value * block00 * jacobian_ref, -h_value * block01 * jacobian_ref],
+                        [-h_value * block10 * jacobian_ref, identity_n - h_value * block11 * jacobian_ref],
+                    ]
+                )
+
+            def complex_matvec(v):
+                v1, v2 = jnp.split(v, 2)
+                jv1 = jacobian_ref @ v1
+                jv2 = jacobian_ref @ v2
+                out1 = v1 - h_value * (block00 * jv1 + block01 * jv2)
+                out2 = v2 - h_value * (block10 * jv1 + block11 * jv2)
+                return jnp.concatenate([out1, out2], axis=0)
+
+            def stage_solver(rhs):
+                rhs_stages = rhs.reshape((3, state_dim))
+                rhs_transformed = _transform_stage_stack(rhs_stages)
+                rhs_real = rhs_transformed[0]
+                rhs_complex = rhs_transformed[1:].reshape((-1,))
+                delta_real = _solve_linear_system(
+                    matvec=real_matvec,
+                    rhs=rhs_real,
+                    linear_solver="direct" if linear_solver_mode == "direct" else linear_solver_mode,
+                    dense_matrix_builder=lambda: real_matrix if linear_solver_mode != "gmres" else None,
+                    gmres_tol=self.gmres_tol,
+                    gmres_maxiter=self.gmres_maxiter,
+                )
+                delta_complex = _solve_linear_system(
+                    matvec=complex_matvec,
+                    rhs=rhs_complex,
+                    linear_solver=linear_solver_mode,
+                    dense_matrix_builder=(lambda: complex_dense) if linear_solver_mode != "gmres" else None,
+                    gmres_tol=self.gmres_tol,
+                    gmres_maxiter=self.gmres_maxiter,
+                )
+                delta_transformed = jnp.concatenate(
+                    [delta_real[None, :], delta_complex.reshape((2, state_dim))],
+                    axis=0,
+                )
+                return _inverse_transform_stage_stack(delta_transformed).reshape((-1,))
+
+            return stage_solver
 
         def _single_step(flat_y, t_value, h_value, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age):
             f0 = flat_rhs(t_value, flat_y)
@@ -897,54 +1245,25 @@ class RADAUSolver(TransportSolver):
             )
 
             if self.newton_strategy == "simplified":
-                use_dense_direct = _prefer_dense_direct(self.linear_solver, 3 * state_dim)
-                if use_dense_direct:
-                    fresh_jacobian = jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
-                    jacobian_ref = jnp.where(use_cached_jacobian, jacobian_cache, fresh_jacobian)
-                    stage_matrix = jnp.eye(3 * state_dim, dtype=dtype) - h_value * jnp.kron(a, jacobian_ref)
+                linear_solver_mode = "direct" if _prefer_dense_direct(self.linear_solver, 2 * state_dim) else self.linear_solver
+                def _reuse_jac(_):
+                    return jacobian_cache
 
-                    def stage_solver(rhs):
-                        return _solve_linear_system(
-                            matvec=lambda v: stage_matrix @ v,
-                            rhs=rhs,
-                            linear_solver="direct",
-                            dense_matrix_builder=lambda: stage_matrix,
-                            gmres_tol=self.gmres_tol,
-                            gmres_maxiter=self.gmres_maxiter,
-                        )
-                else:
-                    _, stage_states_ref = residual_with_stages(z0)
-                    stage_linears_ref = tuple(
-                        jax.linearize(
-                            lambda y_stage, t_stage=t_value + c[i] * h_value: flat_rhs(t_stage, y_stage),
-                            stage_states_ref[i],
-                        )[1]
-                        for i in range(3)
-                    )
+                def _recompute_jac(_):
+                    return jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
 
-                    dense_builder = None
-                    if self.linear_solver != "gmres":
-                        basis = jnp.eye(3 * state_dim, dtype=dtype)
-                        dense_builder = lambda: jax.vmap(
-                            lambda col: _radau_stage_matvec(col, stage_linears_ref, h_value),
-                            in_axes=1,
-                            out_axes=1,
-                        )(basis)
-
-                    def stage_solver(rhs):
-                        return _solve_linear_system(
-                            matvec=lambda v: _radau_stage_matvec(v, stage_linears_ref, h_value),
-                            rhs=rhs,
-                            linear_solver=self.linear_solver,
-                            dense_matrix_builder=dense_builder,
-                            gmres_tol=self.gmres_tol,
-                            gmres_maxiter=self.gmres_maxiter,
-                        )
+                jacobian_ref = jax.lax.cond(
+                    use_cached_jacobian,
+                    _reuse_jac,
+                    _recompute_jac,
+                    operand=None,
+                )
+                stage_solver = _make_transformed_radau_stage_solver(jacobian_ref, h_value, linear_solver_mode)
             else:
                 stage_solver = None
 
             def body_fn(newton_state):
-                iter_idx, z_cur, delta_norm, residual_norm = newton_state
+                iter_idx, z_cur, delta_norm, residual_norm, prev_residual_norm, theta_est, diverged = newton_state
                 residual_cur, stage_states = residual_with_stages(z_cur)
                 if self.newton_strategy == "simplified":
                     delta = stage_solver(-residual_cur)
@@ -974,27 +1293,56 @@ class RADAUSolver(TransportSolver):
                     )
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
                 z_next = z_cur + delta
-                return iter_idx + 1, z_next, jnp.linalg.norm(delta), jnp.linalg.norm(residual_cur)
+                current_residual_norm = jnp.linalg.norm(residual_cur)
+                safe_prev_residual = jnp.maximum(prev_residual_norm, jnp.asarray(1.0e-30, dtype=dtype))
+                theta_raw = current_residual_norm / safe_prev_residual
+                theta_candidate = jnp.where(iter_idx > 0, theta_raw, jnp.asarray(0.0, dtype=dtype))
+                theta_next = jnp.where(iter_idx > 0, jnp.maximum(theta_est, theta_candidate), theta_est)
+                slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > jnp.asarray(0.95, dtype=dtype))
+                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * jnp.asarray(2.0, dtype=dtype))
+                nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)))
+                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_contraction, jnp.logical_or(residual_blowup, nonfinite_state)))
+                return (
+                    iter_idx + 1,
+                    z_next,
+                    jnp.linalg.norm(delta),
+                    current_residual_norm,
+                    current_residual_norm,
+                    theta_next,
+                    diverged_next,
+                )
 
             def cond_fn(newton_state):
-                iter_idx, _, delta_norm, residual_norm = newton_state
+                iter_idx, _, delta_norm, residual_norm, _, _, diverged = newton_state
                 active = jnp.logical_or(residual_norm > self.tol, delta_norm > self.tol)
-                return jnp.logical_and(iter_idx < self.maxiter, active)
+                return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
             init_newton = (
                 jnp.asarray(0, dtype=jnp.int32),
                 z0,
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(False),
             )
-            _, z_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_newton)
+            _, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
             stages_final = z_final.reshape((3, state_dim))
             final_residual = residual(z_final)
-            converged = jnp.logical_and(jnp.all(jnp.isfinite(z_final)), jnp.linalg.norm(final_residual) <= self.tol)
+            converged = jnp.logical_and(
+                jnp.logical_and(jnp.all(jnp.isfinite(z_final)), jnp.linalg.norm(final_residual) <= self.tol),
+                jnp.logical_not(diverged_final),
+            )
             flat_next = flat_y + h_value * (b @ stages_final)
             err_vec = h_value * (b_error @ stages_final)
             err_norm = _error_norm(err_vec, flat_y, flat_next)
-            if self.newton_strategy == "simplified" and _prefer_dense_direct(self.linear_solver, 3 * state_dim):
+            theta_safe = jnp.clip(theta_final, jnp.asarray(0.1, dtype=dtype), jnp.asarray(1.5, dtype=dtype))
+            newton_shrink = jnp.where(
+                converged,
+                jnp.asarray(1.0, dtype=dtype),
+                jnp.clip(jnp.asarray(0.8, dtype=dtype) / theta_safe, jnp.asarray(0.1, dtype=dtype), jnp.asarray(0.5, dtype=dtype)),
+            )
+            if self.newton_strategy == "simplified":
                 jacobian_out = jacobian_ref
                 cache_valid_out = jnp.asarray(True)
                 cache_dt_out = h_value
@@ -1004,12 +1352,12 @@ class RADAUSolver(TransportSolver):
                 cache_valid_out = cache_valid
                 cache_dt_out = cache_dt
                 cache_age_out = cache_age
-            return flat_next, err_norm, converged, z_final, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out
+            return flat_next, err_norm, converged, z_final, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out, newton_shrink
 
         def _attempt_step(carry):
             t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age = carry
             trial_dt = jnp.minimum(dt_value, t_final - t_value)
-            trial_y, err_norm, converged, stage_history, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out = _single_step(
+            trial_y, err_norm, converged, stage_history, jacobian_out, cache_valid_out, cache_dt_out, cache_age_out, newton_shrink = _single_step(
                 flat_y, t_value, trial_dt, prev_stages, prev_dt, jacobian_cache, cache_valid, cache_dt, cache_age
             )
             accepted = jnp.logical_and(converged, err_norm <= 1.0)
@@ -1021,7 +1369,7 @@ class RADAUSolver(TransportSolver):
 
             def _accept(_):
                 t_new = t_value + trial_dt
-                accepted_y = _project_flat_state_if_needed(trial_y, unpack_flat, species)
+                accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
                 return (
                     t_new,
                     accepted_y,
@@ -1052,7 +1400,11 @@ class RADAUSolver(TransportSolver):
                     jnp.asarray(2, dtype=jnp.int32),
                     jnp.asarray(1, dtype=jnp.int32),
                 )
-                reduced_dt = jnp.maximum(jnp.minimum(next_dt, trial_dt * self.min_step_factor), dt_min)
+                rejection_target = jnp.where(converged, next_dt, trial_dt * newton_shrink)
+                reduced_dt = jnp.maximum(
+                    jnp.minimum(rejection_target, trial_dt * jnp.asarray(0.5, dtype=dtype)),
+                    dt_min,
+                )
                 fail_now = jnp.logical_and(reduced_dt <= dt_min * (1.0 + 1.0e-12), jnp.logical_not(accepted))
                 return (
                     t_value,
@@ -1233,7 +1585,9 @@ class RADAUSolver(TransportSolver):
             ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
             return _finalize_custom_solver_output(
                 ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
+                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
+                temperature_active_mask=temperature_active_mask,
+                fixed_temperature_profile=fixed_temperature_profile,
             )
 
         def cond_fun(loop_carry):
@@ -1303,7 +1657,9 @@ class RADAUSolver(TransportSolver):
         fail_codes_saved = jnp.expand_dims(fail_code_f, axis=0)
         return _finalize_custom_solver_output(
             ys_saved_flat, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
+            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
         )
 
 
@@ -1365,7 +1721,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
             min_step_factor=float(solver_parameters.get("min_step_factor", 0.2)),
             max_step_factor=float(solver_parameters.get("max_step_factor", 5.0)),
-            gamma=float(solver_parameters.get("rosenbrock_gamma", 1.0)),
+            gamma=float(solver_parameters.get("rosenbrock_gamma", 1.7071067811865475)),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)

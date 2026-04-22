@@ -156,7 +156,7 @@ class BoundaryConditionModel:
             lg = inferred_left_grad if left_grad is None else left_grad
             arr_ext = arr_ext.at[0].set(arr_ext[1] - lg * self.dr)
         elif left_type == "robin":
-            lv = ref[0] if left_value is None else left_value
+            lv = ref[0]
             lg = inferred_left_grad if left_grad is None else left_grad
             ll = self._infer_decay_length(lv, lg) if left_decay is None else left_decay
             robin_left_grad = lv / (ll + 1e-12)
@@ -171,7 +171,7 @@ class BoundaryConditionModel:
             rg = inferred_right_grad if right_grad is None else right_grad
             arr_ext = arr_ext.at[-1].set(arr_ext[-2] + rg * self.dr)
         elif right_type == "robin":
-            rv = ref[-1] if right_value is None else right_value
+            rv = ref[-1]
             rg = inferred_right_grad if right_grad is None else right_grad
             rl = self._infer_decay_length(rv, rg) if right_decay is None else right_decay
             robin_right_grad = -rv / (rl + 1e-12)
@@ -272,7 +272,7 @@ def right_constraints_from_bc_model(bc_model, default_value):
         return None, rg
 
     if right_type == "robin":
-        rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
+        rv = default_arr
         decay = (
             jnp.zeros_like(default_arr)
             if right_decay is None
@@ -306,7 +306,7 @@ def left_constraints_from_bc_model(bc_model, default_value):
         return None, lg
 
     if left_type == "robin":
-        lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
+        lv = default_arr
         decay = (
             jnp.zeros_like(default_arr)
             if left_decay is None

@@ -154,7 +154,7 @@ def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax
     if right_type == "neumann":
         return default_value, right_grad
     if right_type == "robin":
-        robin_grad = -right_value / (right_decay + 1e-12)
+        robin_grad = -default_value / (right_decay + 1e-12)
         return default_value, robin_grad
     return default_value, default_grad
 
