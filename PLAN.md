@@ -1,5 +1,60 @@
 # NEOPAX Memory and Speed Rewrite Plan
 
+## Current next upgrade: reduced internal density solve with algebraic `n_e` reconstruction
+
+### Problem to solve
+
+The transport solvers currently flatten and solve a full density state that still
+contains the electron density row. Even when quasi-neutrality is enforced on the
+working state, this means the implicit Jacobian still treats `n_e` as an
+independent unknown, which is not consistent with the intended NTSS-style
+construction.
+
+The next upgrade is to remove `n_e` from the **internal solver unknown vector**
+while keeping the **public/output** transport state unchanged:
+
+- internal solver state evolves only independent density species
+- full physical state is reconstructed with quasi-neutral `n_e`
+- all fluxes/sources/outputs still see the full state
+
+This should make the density subsystem cleaner, reduce stiffness introduced by a
+dependent electron row, and remain JAX/JIT/trace friendly because the reduced
+state still has fixed shape.
+
+### Upgrade plan
+
+1. Add a reduced transport-state pack/unpack transform in [NEOPAX/_transport_solvers.py](/abs/path/d:/PostDocsProxima/Github_5/NEOPAX/NEOPAX/_transport_solvers.py)
+   - remove the electron density row from the flattened internal solver state
+   - keep `pressure` and `Er` unchanged
+   - reconstruct the full state on unpack
+
+2. Reconstruct `n_e` algebraically on every unpack
+   - after rebuilding the full density array, enforce quasi-neutrality
+   - this ensures every residual/Jacobian evaluation sees a full physical state
+
+3. Keep the public state/output shape unchanged
+   - saved trajectories, plots, and HDF5 outputs should still contain full
+     `density = [n_e, ...]`
+   - only the internal unknown vector is reduced
+
+4. Keep solver internals JAX-friendly
+   - fixed reduced shapes
+   - no Python data-dependent branching in the hot path
+   - pure array pack/unpack algebra
+
+5. Validate in this order
+   - Diffrax `Kvaerno5` with He density evolution
+   - custom `radau`
+   - custom `rosenbrock`
+   - compare He-coupled cases against the previous full-state solve
+
+### Implementation status
+
+- [x] added reduced pack/unpack transform for internal transport state
+- [x] reconstruct full quasi-neutral state on solver unpack
+- [x] wire reduced state into Diffrax/Radau/Rosenbrock transport backends
+- [ ] validate He density evolution and coupled He cases
+
 ## Current next upgrade: face-evaluated closure fluxes for the pressure equation
 
 ### Problem to solve

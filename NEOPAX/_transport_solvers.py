@@ -92,14 +92,25 @@ def _strip_state_metadata_for_solver(state: Any) -> Any:
     return state
 
 
-def _pack_transport_state_arrays(state: Any) -> Any:
+def _electron_density_index(species: Any) -> int | None:
+    if species is None or not hasattr(species, "names"):
+        return None
+    names = tuple(getattr(species, "names", ()))
+    return names.index("e") if "e" in names else None
+
+
+def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
     """Convert a TransportState-like object into an array-only pytree."""
     if dataclasses.is_dataclass(state) and hasattr(state, "density") and hasattr(state, "pressure") and hasattr(state, "Er"):
-        return (state.density, state.pressure, state.Er)
+        density = state.density
+        eidx = _electron_density_index(species)
+        if eidx is not None:
+            density = jnp.concatenate([density[:eidx], density[eidx + 1 :]], axis=0)
+        return (density, state.pressure, state.Er)
     return state
 
 
-def _unpack_transport_state_arrays(state_like: Any, template_state: Any) -> Any:
+def _unpack_transport_state_arrays(state_like: Any, template_state: Any, species: Any = None) -> Any:
     """Rebuild a TransportState-like object from an array-only pytree."""
     if (
         dataclasses.is_dataclass(template_state)
@@ -110,6 +121,14 @@ def _unpack_transport_state_arrays(state_like: Any, template_state: Any) -> Any:
         and len(state_like) == 3
     ):
         density, pressure, er = state_like
+        eidx = _electron_density_index(species)
+        if eidx is not None and density.shape[-2] == template_state.density.shape[0] - 1:
+            full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
+            full_density = jnp.zeros(full_shape, dtype=density.dtype)
+            full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
+            full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
+            rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er)
+            return _apply_quasi_neutrality_output(rebuilt, species, template_state)
         return dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
     return state_like
 
@@ -150,8 +169,25 @@ def _project_flat_state_if_needed(flat_y: jax.Array, unravel: Callable, species:
     if species is None:
         return flat_y
     projected_state = _project_state_to_quasi_neutrality(unravel(flat_y), species)
-    flat_projected, _ = jax.flatten_util.ravel_pytree(projected_state)
+    flat_projected, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(projected_state, species))
     return flat_projected
+
+
+def _make_solver_state_transform(template_state: Any, species: Any):
+    packed_state = _pack_transport_state_arrays(template_state, species)
+    flat_state0, unravel_packed = jax.flatten_util.ravel_pytree(packed_state)
+
+    def unpack_flat(flat_y):
+        return _unpack_transport_state_arrays(unravel_packed(flat_y), template_state, species)
+
+    def unpack_packed(packed_state_like):
+        return _unpack_transport_state_arrays(packed_state_like, template_state, species)
+
+    def pack_state(state_like):
+        flat_out, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state_like, species))
+        return flat_out
+
+    return flat_state0, unpack_flat, unpack_packed, pack_state
 
 
 def _get_diffrax_integrator(name: str) -> Callable:
@@ -201,17 +237,17 @@ class DiffraxSolver(TransportSolver):
         species = _extract_species_from_args(args)
         state = _project_state_to_quasi_neutrality(state, species)
         solver_state_template = _strip_state_metadata_for_solver(state)
-        solver_state = _pack_transport_state_arrays(solver_state_template)
+        solver_state = _pack_transport_state_arrays(solver_state_template, species)
 
         # Diffrax expects vf(t, y, args). Capture NEOPAX runtime args in the
         # closure instead of passing non-array objects through Diffrax/Eqinox
         # loop state.
         def wrapped_vector_field(t, y, _vf_args):
-            y_state = _unpack_transport_state_arrays(y, solver_state_template)
+            y_state = _unpack_transport_state_arrays(y, solver_state_template, species)
             y_state = _project_state_to_quasi_neutrality(y_state, species)
             dy_state = vector_field(t, y_state, *args)
             dy_state = _strip_state_metadata_for_solver(dy_state)
-            return _pack_transport_state_arrays(dy_state)
+            return _pack_transport_state_arrays(dy_state, species)
 
         term = diffrax.ODETerm(wrapped_vector_field)
         solver = self.integrator()
@@ -248,7 +284,7 @@ class DiffraxSolver(TransportSolver):
         # Enforce quasi-neutrality on all saved states and final state
         if species is not None:
             if hasattr(sol, 'ys'):
-                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template)
+                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template, species)
                 sol = eqx.tree_at(
                     lambda s: s.ys,
                     sol,
@@ -256,7 +292,7 @@ class DiffraxSolver(TransportSolver):
                 )
         else:
             if hasattr(sol, 'ys'):
-                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template)
+                ys_state = _unpack_transport_state_arrays(sol.ys, solver_state_template, species)
                 sol = eqx.tree_at(
                     lambda s: s.ys,
                     sol,
@@ -282,15 +318,15 @@ def _finalize_custom_solver_output(
     failed_f,
     fail_code_f,
     n_steps_f,
-    unravel,
+    unpack_flat,
     species,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
-    ys_saved = jax.vmap(unravel)(ys_saved_flat)
+    ys_saved = jax.vmap(unpack_flat)(ys_saved_flat)
     if species is not None:
         ys_saved = jax.vmap(lambda s: enforce_quasi_neutrality(s, species))(ys_saved)
-    final_state = unravel(y_final_flat)
+    final_state = unpack_flat(y_final_flat)
     if species is not None:
         final_state = enforce_quasi_neutrality(final_state, species)
     return {
@@ -354,7 +390,7 @@ def _flat_rhs_factory(unravel, vector_field, args, kwargs):
     def _flat_rhs(t_value, flat_y):
         projected_flat_y = _project_flat_state_if_needed(flat_y, unravel, species)
         rhs_tree = vector_field(t_value, unravel(projected_flat_y), *args, **kwargs)
-        rhs_flat, _ = jax.flatten_util.ravel_pytree(rhs_tree)
+        rhs_flat, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(rhs_tree, species))
         return rhs_flat
 
     return _flat_rhs
@@ -448,7 +484,7 @@ class RosenbrockSolver(TransportSolver):
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         species = _extract_species_from_args(args)
         state = _project_state_to_quasi_neutrality(state, species)
-        flat_state0, unravel = jax.flatten_util.ravel_pytree(state)
+        flat_state0, unpack_flat, _unpack_packed, _pack_state = _make_solver_state_transform(state, species)
         dtype = flat_state0.dtype
         t0 = jnp.asarray(self.t0, dtype=dtype)
         t_final = jnp.asarray(self.t1, dtype=dtype)
@@ -457,7 +493,7 @@ class RosenbrockSolver(TransportSolver):
         base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(16, self.n_steps * 32))
         gamma = jnp.asarray(self.gamma, dtype=dtype)
-        flat_rhs = _flat_rhs_factory(unravel, vector_field, args, kwargs)
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs)
         state_dim = flat_state0.shape[0]
 
         def _error_norm(err_vec, flat_ref, flat_candidate):
@@ -523,7 +559,7 @@ class RosenbrockSolver(TransportSolver):
 
             def _accept(_):
                 t_new = t_value + trial_dt
-                accepted_y = _project_flat_state_if_needed(trial_y, unravel, species)
+                accepted_y = _project_flat_state_if_needed(trial_y, unpack_flat, species)
                 return (
                     t_new,
                     accepted_y,
@@ -681,7 +717,7 @@ class RosenbrockSolver(TransportSolver):
             ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
             return _finalize_custom_solver_output(
                 ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unravel, species,
+                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
             )
 
         def cond_fun(loop_carry):
@@ -716,7 +752,7 @@ class RosenbrockSolver(TransportSolver):
         fail_codes_saved = jnp.expand_dims(fail_code_f, axis=0)
         return _finalize_custom_solver_output(
             ys_saved_flat, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unravel, species,
+            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
         )
 
 
@@ -793,7 +829,7 @@ class RADAUSolver(TransportSolver):
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         species = _extract_species_from_args(args)
         state = _project_state_to_quasi_neutrality(state, species)
-        flat_state0, unravel = jax.flatten_util.ravel_pytree(state)
+        flat_state0, unpack_flat, _unpack_packed, _pack_state = _make_solver_state_transform(state, species)
         dtype = flat_state0.dtype
         sqrt6 = jnp.sqrt(jnp.asarray(6.0, dtype=dtype))
         c = jnp.asarray([(4.0 - sqrt6) / 10.0, (4.0 + sqrt6) / 10.0, 1.0], dtype=dtype)
@@ -815,7 +851,7 @@ class RADAUSolver(TransportSolver):
         base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(32, self.n_steps * 128))
         state_dim = flat_state0.shape[0]
-        flat_rhs = _flat_rhs_factory(unravel, vector_field, args, kwargs)
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs)
         error_order = 2.0 if self.error_estimator == "embedded2" else 5.0
         controller_alpha = 0.7 / (error_order + 1.0)
         controller_beta = 0.4 / (error_order + 1.0)
@@ -985,7 +1021,7 @@ class RADAUSolver(TransportSolver):
 
             def _accept(_):
                 t_new = t_value + trial_dt
-                accepted_y = _project_flat_state_if_needed(trial_y, unravel, species)
+                accepted_y = _project_flat_state_if_needed(trial_y, unpack_flat, species)
                 return (
                     t_new,
                     accepted_y,
@@ -1197,7 +1233,7 @@ class RADAUSolver(TransportSolver):
             ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
             return _finalize_custom_solver_output(
                 ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unravel, species,
+                y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
             )
 
         def cond_fun(loop_carry):
@@ -1267,7 +1303,7 @@ class RADAUSolver(TransportSolver):
         fail_codes_saved = jnp.expand_dims(fail_code_f, axis=0)
         return _finalize_custom_solver_output(
             ys_saved_flat, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unravel, species,
+            y_f_flat, t_f, done_f, failed_f, fail_code_f, n_acc_f, unpack_flat, species,
         )
 
 

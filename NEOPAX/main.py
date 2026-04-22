@@ -436,11 +436,20 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         len(equations_to_evolve),
     )
     shared_flux_model = runtime.models.flux if len(equations_to_evolve) > 1 else None
+    temperature_active_mask = jnp.asarray(
+        config.get("equations", {}).get(
+            "toggle_temperature",
+            [True] * getattr(runtime.species, "number_species", state.temperature.shape[0]),
+        ),
+        dtype=bool,
+    )
     equation_system = ComposedEquationSystem(
         tuple(equations_to_evolve),
         species=runtime.species,
         shared_flux_model=shared_flux_model,
         density_floor=solver_cfg.get("density_floor", 1.0e-6),
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=state.temperature,
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -456,6 +465,43 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         density_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None)
         temperature_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "temperature"), None)
         er_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None)
+        if density_equation is not None:
+            if hasattr(density_equation, "active_species_mask"):
+                print(
+                    "[NEOPAX] density active_species_mask:",
+                    jnp.asarray(density_equation.active_species_mask).tolist(),
+                )
+            if hasattr(density_equation, "independent_density_mask"):
+                print(
+                    "[NEOPAX] density independent_density_mask:",
+                    jnp.asarray(density_equation.independent_density_mask).tolist(),
+                )
+            if hasattr(density_equation, "particle_flux_reconstruction"):
+                print(
+                    "[NEOPAX] density particle_flux_reconstruction:",
+                    getattr(density_equation, "particle_flux_reconstruction"),
+                )
+            if hasattr(density_equation, "particle_face_closure_mode"):
+                print(
+                    "[NEOPAX] density particle_face_closure_mode:",
+                    getattr(density_equation, "particle_face_closure_mode"),
+                )
+        if temperature_equation is not None and hasattr(temperature_equation, "active_species_mask"):
+            print(
+                "[NEOPAX] temperature active_species_mask:",
+                jnp.asarray(temperature_equation.active_species_mask).tolist(),
+            )
+        if temperature_equation is not None:
+            if hasattr(temperature_equation, "convection_reconstruction"):
+                print(
+                    "[NEOPAX] temperature convection_reconstruction:",
+                    getattr(temperature_equation, "convection_reconstruction"),
+                )
+            if hasattr(temperature_equation, "heat_flux_reconstruction"):
+                print(
+                    "[NEOPAX] temperature heat_flux_reconstruction:",
+                    getattr(temperature_equation, "heat_flux_reconstruction"),
+                )
         rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
         density_rhs0 = getattr(rhs0, "density", None)
         if density_rhs0 is not None:
@@ -510,6 +556,108 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                                 f"finite=0/{total_count}",
                                 "all_nonfinite=true",
                             )
+                if hasattr(runtime.species, "species_idx"):
+                    debug_species = [name for name in ("D", "T", "He") if name in runtime.species.species_idx]
+                    center_mask = (runtime.geometry.r_grid >= 0.45) & (runtime.geometry.r_grid <= 0.65)
+                    face_mask = (runtime.geometry.r_grid_half >= 0.45) & (runtime.geometry.r_grid_half <= 0.65)
+
+                    def _fmt_window(x, y):
+                        x_arr = jnp.asarray(x)
+                        y_arr = jnp.asarray(y)
+                        pairs = [f"({float(xv):.3f}, {float(yv):.6e})" for xv, yv in zip(x_arr.tolist(), y_arr.tolist())]
+                        return "[" + ", ".join(pairs) + "]"
+
+                    for debug_name in debug_species:
+                        sidx = int(runtime.species.species_idx[debug_name])
+                        gamma_faces_raw = components.get("Gamma_faces_raw", None)
+                        if gamma_faces_raw is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug Gamma_faces_raw window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(gamma_faces_raw)[sidx, face_mask],
+                                ),
+                            )
+
+                        gamma_div_raw = components.get("gamma_divergence_raw", None)
+                        if gamma_div_raw is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug gamma_divergence_raw window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid[center_mask],
+                                    jnp.asarray(gamma_div_raw)[sidx, center_mask],
+                                ),
+                            )
+
+                        density_rhs_dbg = components.get("density_rhs", None)
+                        if density_rhs_dbg is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug density_rhs window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid[center_mask],
+                                    jnp.asarray(density_rhs_dbg)[sidx, center_mask],
+                                ),
+                            )
+                    try:
+                        from ._transport_flux_models import _face_profile_gradient, build_face_transport_state
+
+                        face_state0 = build_face_transport_state(
+                            state,
+                            runtime.geometry,
+                            bc_density=bc.get("density"),
+                            bc_temperature=bc.get("temperature"),
+                            bc_er=bc.get("Er"),
+                            density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                        )
+                        dndr_faces0 = _face_profile_gradient(
+                            state.density,
+                            runtime.geometry.r_grid_half,
+                            bc_model=bc.get("density"),
+                        )
+                        dTdr_faces0 = _face_profile_gradient(
+                            state.temperature,
+                            runtime.geometry.r_grid_half,
+                            bc_model=bc.get("temperature"),
+                        )
+                        print(
+                            "[NEOPAX] debug Er_faces window:",
+                            _fmt_window(
+                                runtime.geometry.r_grid_half[face_mask],
+                                jnp.asarray(face_state0.Er)[face_mask],
+                            ),
+                        )
+                        for debug_name in debug_species:
+                            sidx = int(runtime.species.species_idx[debug_name])
+                            print(
+                                f"[NEOPAX] {debug_name} debug density_faces window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(face_state0.density)[sidx, face_mask],
+                                ),
+                            )
+                            print(
+                                f"[NEOPAX] {debug_name} debug temperature_faces window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(face_state0.temperature)[sidx, face_mask],
+                                ),
+                            )
+                            print(
+                                f"[NEOPAX] {debug_name} debug dndr_faces window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(dndr_faces0)[sidx, face_mask],
+                                ),
+                            )
+                            print(
+                                f"[NEOPAX] {debug_name} debug dTdr_faces window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(dTdr_faces0)[sidx, face_mask],
+                                ),
+                            )
+                    except Exception as exc:
+                        print(f"[NEOPAX] density face-state debug unavailable: {exc}")
         pressure_rhs0 = getattr(rhs0, "pressure", None)
         if pressure_rhs0 is not None:
             pressure_rhs0_arr = jnp.asarray(pressure_rhs0)
@@ -562,6 +710,49 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                                 f"[NEOPAX] pressure component {label}:",
                                 f"finite=0/{total_count}",
                                 "all_nonfinite=true",
+                            )
+                if hasattr(runtime.species, "species_idx"):
+                    debug_species = [name for name in ("D", "T", "He") if name in runtime.species.species_idx]
+                    center_mask = (runtime.geometry.r_grid >= 0.45) & (runtime.geometry.r_grid <= 0.65)
+                    face_mask = (runtime.geometry.r_grid_half >= 0.45) & (runtime.geometry.r_grid_half <= 0.65)
+
+                    def _fmt_window(x, y):
+                        x_arr = jnp.asarray(x)
+                        y_arr = jnp.asarray(y)
+                        pairs = [f"({float(xv):.3f}, {float(yv):.6e})" for xv, yv in zip(x_arr.tolist(), y_arr.tolist())]
+                        return "[" + ", ".join(pairs) + "]"
+
+                    for debug_name in debug_species:
+                        sidx = int(runtime.species.species_idx[debug_name])
+
+                        q_faces = components.get("Q_faces", None)
+                        if q_faces is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug Q_faces window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid_half[face_mask],
+                                    jnp.asarray(q_faces)[sidx, face_mask],
+                                ),
+                            )
+
+                        q_div = components.get("q_divergence", None)
+                        if q_div is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug q_divergence window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid[center_mask],
+                                    jnp.asarray(q_div)[sidx, center_mask],
+                                ),
+                            )
+
+                        thermal_rhs = components.get("thermal_flux_rhs", None)
+                        if thermal_rhs is not None:
+                            print(
+                                f"[NEOPAX] {debug_name} debug thermal_flux_rhs window:",
+                                _fmt_window(
+                                    runtime.geometry.r_grid[center_mask],
+                                    jnp.asarray(thermal_rhs)[sidx, center_mask],
+                                ),
                             )
         er_rhs0 = getattr(rhs0, "Er", None)
         if er_rhs0 is not None:
@@ -1146,6 +1337,7 @@ def plot_transport_solution(
         _plot_individual_species_series(temperature_series, "Temperature", "transport_temperature")
 
     power_source_series = []
+    he_source_series = []
     if source_models is not None and density_series and pressure_series and er_series and species is not None:
         n_source_snapshots = min(len(density_series), len(pressure_series), len(er_series))
         for idx in range(n_source_snapshots):
@@ -1163,8 +1355,22 @@ def plot_transport_solution(
             )
             pressure_total = sources.get("pressure_total")
             if pressure_total is None:
-                continue
-            power_source_series.append((time_label, jnp.sum(jnp.asarray(pressure_total), axis=0)))
+                pressure_total_arr = None
+            else:
+                pressure_total_arr = jnp.asarray(pressure_total)
+                power_source_series.append((time_label, jnp.sum(pressure_total_arr, axis=0)))
+
+            density_components = sources.get("density_components", {})
+            he_component = density_components.get("HeSource")
+            if he_component is not None:
+                he_arr = jnp.asarray(he_component)
+                he_idx = None
+                if species is not None and hasattr(species, "species_idx"):
+                    he_idx = species.species_idx.get("He")
+                if he_idx is not None and he_arr.ndim == 2:
+                    he_source_series.append((time_label, he_arr[int(he_idx)]))
+                elif he_arr.ndim == 1:
+                    he_source_series.append((time_label, he_arr))
 
     flux_component_series: dict[str, list[tuple[float | None, jax.Array]]] = {
         "Gamma_neo": [],
@@ -1193,6 +1399,15 @@ def plot_transport_solution(
         "transport_power_sources_total.png",
         title="Summed Power Sources vs rho",
     )
+
+    he_source_png = None
+    if he_source_series:
+        he_source_png = _plot_scalar_time_series(
+            he_source_series,
+            "Helium Particle Source",
+            "transport_density_source_HeSource.png",
+            title="Helium Particle Source vs rho",
+        )
 
     flux_plot_paths = {}
     flux_plot_specs = (
@@ -1252,6 +1467,7 @@ def plot_transport_solution(
         "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
         "Er": output_dir / "transport_Er.png" if er_series else None,
         "power_sources_total": power_sources_png,
+        "helium_particle_source": he_source_png,
         **flux_plot_paths,
     }
 

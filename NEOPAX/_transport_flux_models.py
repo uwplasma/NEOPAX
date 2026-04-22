@@ -255,6 +255,79 @@ def build_face_transport_state(
     )
 
 
+def _ntss_like_face_profile(profile, face_centers, bc_model=None, density_floor=None):
+    if profile.ndim == 1:
+        profile_2d = profile[None, :]
+        squeeze = True
+    else:
+        profile_2d = profile
+        squeeze = False
+    left_value, _left_grad, right_value, _right_grad = _extract_face_constraints(bc_model, profile_2d)
+    if left_value is None:
+        left_value = profile_2d[:, 0]
+    if right_value is None:
+        right_value = profile_2d[:, -1]
+    cell_centers = 0.5 * (face_centers[1:] + face_centers[:-1])
+    inner = 0.5 * (profile_2d[:, :-1] + profile_2d[:, 1:])
+    faces = jnp.concatenate([left_value[..., None], inner, right_value[..., None]], axis=-1)
+    if density_floor is not None:
+        faces = safe_density(faces, density_floor)
+    if squeeze:
+        return faces[0]
+    return faces
+
+
+def _ntss_like_face_gradient(profile, face_centers, bc_model=None):
+    if profile.ndim == 1:
+        profile_2d = profile[None, :]
+        squeeze = True
+    else:
+        profile_2d = profile
+        squeeze = False
+
+    reference = _face_profile_gradient(profile_2d, face_centers, bc_model=bc_model)
+    cell_centers = 0.5 * (face_centers[1:] + face_centers[:-1])
+    inner = (profile_2d[:, 1:] - profile_2d[:, :-1]) / (cell_centers[1:] - cell_centers[:-1])
+    grads = reference.at[:, 1:-1].set(inner)
+    if squeeze:
+        return grads[0]
+    return grads
+
+
+def build_ntss_like_face_transport_state(
+    state: TransportState,
+    geometry: Any,
+    *,
+    bc_density: Any = None,
+    bc_temperature: Any = None,
+    bc_er: Any = None,
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+) -> FaceTransportState:
+    state = apply_transport_density_floor(state, density_floor)
+    density_faces = _ntss_like_face_profile(
+        state.density,
+        geometry.r_grid_half,
+        bc_model=bc_density,
+        density_floor=density_floor,
+    )
+    temperature_faces = _ntss_like_face_profile(
+        state.temperature,
+        geometry.r_grid_half,
+        bc_model=bc_temperature,
+    )
+    pressure_faces = density_faces * temperature_faces
+    er_faces = _ntss_like_face_profile(
+        state.Er,
+        geometry.r_grid_half,
+        bc_model=bc_er,
+    )
+    return FaceTransportState(
+        density=density_faces,
+        pressure=pressure_faces,
+        Er=er_faces,
+    )
+
+
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class CombinedTransportFluxModel(TransportFluxModelBase):
@@ -367,16 +440,29 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
-        dndr_faces = _face_profile_gradient(
-            state.density,
-            self.geometry.r_grid_half,
-            bc_model=bc_density,
-        )
-        dTdr_faces = _face_profile_gradient(
-            state.temperature,
-            self.geometry.r_grid_half,
-            bc_model=bc_temperature,
-        )
+        particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
+        if particle_face_closure_mode in {"ntss_like", "ntss", "half_point"}:
+            dndr_faces = _ntss_like_face_gradient(
+                state.density,
+                self.geometry.r_grid_half,
+                bc_model=bc_density,
+            )
+            dTdr_faces = _ntss_like_face_gradient(
+                state.temperature,
+                self.geometry.r_grid_half,
+                bc_model=bc_temperature,
+            )
+        else:
+            dndr_faces = _face_profile_gradient(
+                state.density,
+                self.geometry.r_grid_half,
+                bc_model=bc_density,
+            )
+            dTdr_faces = _face_profile_gradient(
+                state.temperature,
+                self.geometry.r_grid_half,
+                bc_model=bc_temperature,
+            )
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes_Faces(
             self.species,
             self.energy_grid,

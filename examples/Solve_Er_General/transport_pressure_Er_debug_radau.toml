@@ -99,12 +99,13 @@ toggle_Er = true
 
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+density= ["dt_reaction"]
 
 [transport_solver]
 integrator = "diffrax_kvaerno5"
 t0 = 0.0
 t_final = 0.1
-dt = 1.0e-2
+dt = 1.0e-6
 rtol = 1.0e-3
 atol = 1.0e-7
 max_step = 1.0

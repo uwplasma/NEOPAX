@@ -32,8 +32,8 @@ er_ambipolar_blocksize = 1
 
 [turbulence]
 flux_model = "turbulent_power_analytical"
-chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 0.0]
-chi_temperature = [0.0065, 0.0065, 0.0065, 0.0]
+chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 6.5e-05]
+chi_temperature = [0.0065, 0.0065, 0.0065, 0.0065]
 
 [classical]
 flux_model = "none"
@@ -53,7 +53,7 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.4, 0.4, 0.1]
+c_density = [1.0, 0.5, 0.5, 0.1]
 c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
@@ -93,21 +93,21 @@ value = 0.0
 type = "neumann"
 gradient = 0.0
 
-[equations]
 toggle_density = [false, false, false, true]
-toggle_temperature = [false, false, false, false]
-toggle_Er = true
+toggle_temperature = [true, true, true, false]
+toggle_Er = false
 
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
-density = ["dt_reaction"]
+density= ["dt_reaction"]
 
 [transport_solver]
 density_floor = 1.0e-6
+temperature_include_work_term = true
 integrator = "diffrax_kvaerno5"
 t0 = 0.0
-t_final = 0.01
-dt = 1.0e-4
+t_final = 0.001
+dt = 1.0e-8
 rtol = 1.0e-3
 atol = 1.0e-7
 max_step = 1.0
@@ -130,11 +130,13 @@ Er_edge_relax = 0.1
 save_n = 10
 Er_relax = 0.1
 DEr = 2.0
-temperature_include_neo_convection = true
+temperature_include_neo_convection = false
 temperature_include_turbulent_convection = false
 temperature_include_classical_convection = false
 temperature_convection_reconstruction = "closure_face_flux"
 temperature_heat_flux_reconstruction = "closure_face_flux"
+density_flux_reconstruction = "closure_face_flux"
+density_particle_face_closure_mode = "reconstructed"
 
 
 [transport_output]
@@ -144,5 +146,5 @@ transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
 transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
-transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage_radau_only_temperature"
+transport_output_dir = "./outputs/transport_diffusion_Er_init_two_stage_radau_only_density"
 transport_plot_n_times = -1
