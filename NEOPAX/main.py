@@ -883,6 +883,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 source_models=runtime.models.source,
                 species=runtime.species,
                 flux_model=runtime.models.flux,
+                geometry=runtime.geometry,
             )
         if do_hdf5:
             write_transport_hdf5(
@@ -1165,12 +1166,17 @@ def plot_transport_solution(
     source_models=None,
     species=None,
     flux_model=None,
+    geometry=None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    HEAT_FLUX_W_M2_TO_MW_M2 = 1.0e-6
+    HEAT_FLUX_W_TO_MW = 1.0e-6
     PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
+
+    heat_power_scale = None
+    if geometry is not None and hasattr(geometry, "Vprime"):
+        heat_power_scale = HEAT_FLUX_W_TO_MW * jnp.asarray(geometry.Vprime)
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -1372,7 +1378,17 @@ def plot_transport_solution(
                 )
 
             density_components = sources.get("density_components", {})
+            density_raw = sources.get("density_raw")
+            pressure_raw = sources.get("pressure_raw")
             he_component = density_components.get("HeSource")
+            if he_component is None:
+                raw_he = None
+                if isinstance(density_raw, dict):
+                    raw_he = density_raw.get("HeSource")
+                if raw_he is None and isinstance(pressure_raw, dict):
+                    raw_he = pressure_raw.get("HeSource")
+                if raw_he is not None:
+                    he_component = raw_he
             if he_component is not None:
                 he_arr = jnp.asarray(he_component)
                 he_idx = None
@@ -1384,17 +1400,17 @@ def plot_transport_solution(
                     he_source_series.append((time_label, he_arr))
 
             pressure_components = sources.get("pressure_components", {})
-            alpha_component = pressure_components.get("AlphaPower")
+            alpha_component = pressure_components.get("alpha_power")
             if alpha_component is not None:
                 alpha_arr = jnp.asarray(alpha_component)
                 alpha_power_series.append(
                     (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(alpha_arr, axis=0))
                 )
-            pbrems_component = pressure_components.get("PBrems")
+            pbrems_component = pressure_components.get("bremsstrahlung")
             if pbrems_component is not None:
                 pbrems_arr = jnp.asarray(pbrems_component)
                 pbrems_series.append(
-                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(pbrems_arr, axis=0))
+                    (time_label, -PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(pbrems_arr, axis=0))
                 )
 
     flux_component_series: dict[str, list[tuple[float | None, jax.Array]]] = {
@@ -1416,7 +1432,11 @@ def plot_transport_solution(
             fluxes = flux_model(snapshot_state)
             q_total = fluxes.get("Q")
             if q_total is not None:
-                q_total_arr = HEAT_FLUX_W_M2_TO_MW_M2 * jnp.asarray(q_total)
+                q_total_arr = jnp.asarray(q_total)
+                if heat_power_scale is not None and q_total_arr.shape[-1] == heat_power_scale.shape[0]:
+                    q_total_arr = q_total_arr * heat_power_scale
+                else:
+                    q_total_arr = HEAT_FLUX_W_TO_MW * q_total_arr
                 flux_component_series["Q_total"].append((time_label, q_total_arr))
                 total_heat_flux_series.append(
                     (time_label, jnp.sum(q_total_arr, axis=0) if q_total_arr.ndim == 2 else q_total_arr)
@@ -1428,7 +1448,10 @@ def plot_transport_solution(
                 if value is not None:
                     value_arr = jnp.asarray(value)
                     if key.startswith("Q_"):
-                        value_arr = HEAT_FLUX_W_M2_TO_MW_M2 * value_arr
+                        if heat_power_scale is not None and value_arr.shape[-1] == heat_power_scale.shape[0]:
+                            value_arr = value_arr * heat_power_scale
+                        else:
+                            value_arr = HEAT_FLUX_W_TO_MW * value_arr
                     flux_component_series[key].append((time_label, value_arr))
 
     power_sources_png = _plot_scalar_time_series(
@@ -1449,7 +1472,7 @@ def plot_transport_solution(
 
     total_heat_flux_png = _plot_scalar_time_series(
         total_heat_flux_series,
-        "Total Heat Flux [MW/m^2]",
+        "Total Heat Flux [MW]",
         "transport_flux_Q_total_sum.png",
         title="Summed Total Heat Flux vs rho",
     )
@@ -1472,9 +1495,9 @@ def plot_transport_solution(
     flux_plot_specs = (
         ("Gamma_neo", "Neo Particle Flux", "transport_flux_Gamma_neo"),
         ("Gamma_turb", "Turbulent Particle Flux", "transport_flux_Gamma_turb"),
-        ("Q_total", "Total Heat Flux [MW/m^2]", "transport_flux_Q_total"),
-        ("Q_neo", "Neo Heat Flux [MW/m^2]", "transport_flux_Q_neo"),
-        ("Q_turb", "Turbulent Heat Flux [MW/m^2]", "transport_flux_Q_turb"),
+        ("Q_total", "Total Heat Flux [MW]", "transport_flux_Q_total"),
+        ("Q_neo", "Neo Heat Flux [MW]", "transport_flux_Q_neo"),
+        ("Q_turb", "Turbulent Heat Flux [MW]", "transport_flux_Q_turb"),
     )
     for key, ylabel, stem in flux_plot_specs:
         series = flux_component_series.get(key, [])
