@@ -162,11 +162,22 @@ def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax
 def _extract_face_constraints(
     bc_model: Any,
     state_arr: jax.Array,
+    face_centers: jax.Array,
 ) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None, jax.Array | None]:
     default_left = state_arr[:, 0]
     default_right = state_arr[:, -1]
-    left_value, left_grad = left_constraints_from_bc_model(bc_model, default_left)
-    right_value, right_grad = right_constraints_from_bc_model(bc_model, default_right)
+    left_value, left_grad = left_constraints_from_bc_model(
+        bc_model,
+        default_left,
+        profile=state_arr,
+        face_centers=face_centers,
+    )
+    right_value, right_grad = right_constraints_from_bc_model(
+        bc_model,
+        default_right,
+        profile=state_arr,
+        face_centers=face_centers,
+    )
     return left_value, left_grad, right_value, right_grad
 
 
@@ -177,7 +188,11 @@ def _face_profile(profile, face_centers, bc_model=None, reconstruction="linear")
     else:
         profile_2d = profile
         squeeze = False
-    left_value, left_grad, right_value, right_grad = _extract_face_constraints(bc_model, profile_2d)
+    left_value, left_grad, right_value, right_grad = _extract_face_constraints(
+        bc_model,
+        profile_2d,
+        face_centers,
+    )
     faces = jax.vmap(
         lambda prof, lv, lg, rv, rg: make_profile_cell_variable(
             prof,
@@ -200,7 +215,11 @@ def _face_profile_gradient(profile, face_centers, bc_model=None):
     else:
         profile_2d = profile
         squeeze = False
-    left_value, left_grad, right_value, right_grad = _extract_face_constraints(bc_model, profile_2d)
+    left_value, left_grad, right_value, right_grad = _extract_face_constraints(
+        bc_model,
+        profile_2d,
+        face_centers,
+    )
 
     grads = jax.vmap(
         lambda prof, lv, lg, rv, rg: make_profile_cell_variable(
@@ -262,7 +281,11 @@ def _ntss_like_face_profile(profile, face_centers, bc_model=None, density_floor=
     else:
         profile_2d = profile
         squeeze = False
-    left_value, _left_grad, right_value, _right_grad = _extract_face_constraints(bc_model, profile_2d)
+    left_value, _left_grad, right_value, _right_grad = _extract_face_constraints(
+        bc_model,
+        profile_2d,
+        face_centers,
+    )
     if left_value is None:
         left_value = profile_2d[:, 0]
     if right_value is None:

@@ -546,7 +546,12 @@ class TemperatureEquation(EquationBase):
 def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
     if bc_model is not None and hasattr(bc_model, "right_type"):
         def faces_builder(profile):
-            rv, rg = right_constraints_from_bc_model(bc_model, profile[:, -1])
+            rv, rg = right_constraints_from_bc_model(
+                bc_model,
+                profile[:, -1],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
             if rv is not None:
                 return jax.vmap(
                     lambda prof, right_val: make_profile_cell_variable(
@@ -788,7 +793,12 @@ def build_electric_field_equation(
     # Pre-build the gamma_faces_builder function for BC handling (density/Er)
     if bc_gamma is not None and hasattr(bc_gamma, "right_type"):
         def gamma_faces_builder(Gamma):
-            rv, rg = right_constraints_from_bc_model(bc_gamma, Gamma[:, -1])
+            rv, rg = right_constraints_from_bc_model(
+                bc_gamma,
+                Gamma[:, -1],
+                profile=Gamma,
+                face_centers=field.r_grid_half,
+            )
             if rv is not None:
                 return jax.vmap(
                     lambda G, right_val: make_profile_cell_variable(
@@ -827,8 +837,18 @@ def build_electric_field_equation(
     # Pre-build the diffusive Er face-flux builder for BC handling.
     if bc_er is not None and hasattr(bc_er, "right_type"):
         def er_diffusive_flux_builder(er_profile):
-            lv_er, lg_er = left_constraints_from_bc_model(bc_er, er_profile[0])
-            rv_er, rg_er = right_constraints_from_bc_model(bc_er, er_profile[-1])
+            lv_er, lg_er = left_constraints_from_bc_model(
+                bc_er,
+                er_profile[0],
+                profile=er_profile,
+                face_centers=field.r_grid_half,
+            )
+            rv_er, rg_er = right_constraints_from_bc_model(
+                bc_er,
+                er_profile[-1],
+                profile=er_profile,
+                face_centers=field.r_grid_half,
+            )
             if rv_er is not None:
                 er_cell_var = make_profile_cell_variable(
                     er_profile,

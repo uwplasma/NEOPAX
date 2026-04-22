@@ -243,7 +243,20 @@ def _as_like_template(value, template):
     return jnp.pad(arr, (0, pad_len), mode="edge")
 
 
-def right_constraints_from_bc_model(bc_model, default_value):
+def _boundary_cell_spacing(face_centers, *, side: str):
+    face_centers = jnp.asarray(face_centers)
+    n_faces = face_centers.shape[0]
+    if n_faces >= 4:
+        cell_centers = 0.5 * (face_centers[1:] + face_centers[:-1])
+        if side == "right":
+            return cell_centers[-1] - cell_centers[-2]
+        return cell_centers[1] - cell_centers[0]
+    if side == "right":
+        return face_centers[-1] - face_centers[-2]
+    return face_centers[1] - face_centers[0]
+
+
+def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_centers=None):
     """Translate right BC model to ``CellVariable`` right-face constraints.
 
     Returns
@@ -262,6 +275,34 @@ def right_constraints_from_bc_model(bc_model, default_value):
     right_value = getattr(bc_model, "right_value", None)
     right_gradient = getattr(bc_model, "right_gradient", None)
     right_decay = getattr(bc_model, "right_decay_length", None)
+
+    if profile is not None and face_centers is not None:
+        prof = jnp.asarray(profile)
+        dx = _boundary_cell_spacing(face_centers, side="right")
+        if prof.ndim == 1:
+            prof = prof[None, :]
+        u_im1 = prof[:, -1]
+        u_im2 = prof[:, -2] if prof.shape[-1] >= 2 else prof[:, -1]
+
+        if right_type == "dirichlet":
+            rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
+            rg = (3.0 * rv - 4.0 * u_im1 + u_im2) / (2.0 * dx)
+            return rv, rg
+
+        if right_type == "neumann":
+            rg = zeros_like_default if right_gradient is None else _as_like_template(right_gradient, default_arr)
+            rv = (4.0 * u_im1 - u_im2 + 2.0 * dx * rg) / 3.0
+            return rv, rg
+
+        if right_type == "robin":
+            decay = (
+                jnp.ones_like(default_arr)
+                if right_decay is None
+                else _as_like_template(right_decay, default_arr)
+            )
+            rv = (4.0 * u_im1 - u_im2) / (3.0 + 2.0 * dx / (decay + 1e-12))
+            rg = -rv / (decay + 1e-12)
+            return rv, rg
 
     if right_type == "dirichlet":
         rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
@@ -284,7 +325,7 @@ def right_constraints_from_bc_model(bc_model, default_value):
     raise ValueError(f"Unsupported right BC type: {right_type}")
 
 
-def left_constraints_from_bc_model(bc_model, default_value):
+def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_centers=None):
     """Translate left BC model to ``CellVariable`` left-face constraints."""
     default_arr = jnp.asarray(default_value)
     zeros_like_default = jnp.zeros_like(default_arr)
@@ -296,6 +337,34 @@ def left_constraints_from_bc_model(bc_model, default_value):
     left_value = getattr(bc_model, "left_value", None)
     left_gradient = getattr(bc_model, "left_gradient", None)
     left_decay = getattr(bc_model, "left_decay_length", None)
+
+    if profile is not None and face_centers is not None:
+        prof = jnp.asarray(profile)
+        dx = _boundary_cell_spacing(face_centers, side="left")
+        if prof.ndim == 1:
+            prof = prof[None, :]
+        u_ip1 = prof[:, 0]
+        u_ip2 = prof[:, 1] if prof.shape[-1] >= 2 else prof[:, 0]
+
+        if left_type == "dirichlet":
+            lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
+            lg = (-3.0 * lv + 4.0 * u_ip1 - u_ip2) / (2.0 * dx)
+            return lv, lg
+
+        if left_type == "neumann":
+            lg = zeros_like_default if left_gradient is None else _as_like_template(left_gradient, default_arr)
+            lv = (4.0 * u_ip1 - u_ip2 - 2.0 * dx * lg) / 3.0
+            return lv, lg
+
+        if left_type == "robin":
+            decay = (
+                jnp.ones_like(default_arr)
+                if left_decay is None
+                else _as_like_template(left_decay, default_arr)
+            )
+            lv = (4.0 * u_ip1 - u_ip2) / (3.0 - 2.0 * dx / (decay + 1e-12))
+            lg = lv / (decay + 1e-12)
+            return lv, lg
 
     if left_type == "dirichlet":
         lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
