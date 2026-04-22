@@ -1,9 +1,8 @@
-# Lean transport efficiency test for custom Radau:
+# Focused transport debug case:
 # - density frozen
-# - temperature evolved for all species
+# - pressure evolved for e, D, T
 # - Er evolved
-# - no transport sources
-# - same physics setup as the Kvaerno benchmark
+# - startup prints thermal and Er term breakdowns
 
 [general]
 mode = "transport"
@@ -17,6 +16,7 @@ n_radial = 51
 flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -32,8 +32,8 @@ er_ambipolar_blocksize = 1
 
 [turbulence]
 flux_model = "turbulent_power_analytical"
-chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 6.5e-05]
-chi_temperature = [0.0065, 0.0065, 0.0065, 0.0065]
+chi_density = [6.5e-05, 6.5e-05, 6.5e-05]
+chi_temperature = [0.0065, 0.0065, 0.0065]
 
 [classical]
 flux_model = "none"
@@ -42,10 +42,10 @@ flux_model = "none"
 n_x = 4
 
 [species]
-n_species = 4
-names = ["e", "D", "T", "He"]
-mass_mp = [0.000544617, 2.0, 3.0, 4.0]
-charge_qp = [-1.0, 1.0, 1.0, 2.0]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
 
 [profiles]
 model = "standard_analytical"
@@ -53,8 +53,8 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.4, 0.4, 0.1]
-c_temperature = [1.0, 1.0, 1.0, 1.0]
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
 n_scale = 0.65
@@ -71,9 +71,8 @@ default = 0.0
 type = "dirichlet"
 [boundary.density.right.value]
 e = 0.39
-D = 0.156
-T = 0.156
-He = 0.039
+D = 0.195
+T = 0.195
 
 [boundary.temperature.left]
 type = "neumann"
@@ -82,7 +81,7 @@ default = 0.0
 [boundary.temperature.right]
 type = "robin"
 [boundary.temperature.right.value]
-default = 0.49
+default = 1.0
 [boundary.temperature.right.decay_length]
 default = 0.05
 
@@ -94,13 +93,14 @@ type = "neumann"
 gradient = 0.0
 
 [equations]
-toggle_density = [false, false, false, false]
-toggle_temperature = [true, true, true, true]
+toggle_density = [false, false, false]
+toggle_temperature = [true, true, true]
 toggle_Er = true
 
 [sources]
-temperature = []
-density = []
+temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+
+
 
 [transport_solver]
 density_floor = 1.0e-6

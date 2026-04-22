@@ -78,6 +78,40 @@ def compute_total_power_mw(state, species, pressure_source_model, geometry, fall
     return jnp.where(total_power < 0.0, fallback, total_power)
 
 
+def compute_total_power_breakdown_mw(state, pressure_source_model, geometry):
+    if pressure_source_model is None or geometry is None:
+        return {}
+    raw_sources = pressure_source_model(state)
+    if not isinstance(raw_sources, dict):
+        return {}
+
+    breakdown: dict[str, jax.Array] = {}
+    dtype = state.density.dtype
+
+    def _integrate_state_power(name, value, sign=1.0):
+        if value is None:
+            return
+        arr = jnp.asarray(value, dtype=dtype)
+        power_density_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * (jnp.asarray(sign, dtype=dtype) * arr)
+        breakdown[name] = jnp.trapezoid(power_density_mw_m3 * geometry.Vprime, x=geometry.r_grid)
+
+    _integrate_state_power("alpha_power_mw", raw_sources.get("AlphaPower"), sign=1.0)
+    _integrate_state_power("bremsstrahlung_mw", raw_sources.get("PBrems"), sign=-1.0)
+
+    for key in ("heating", "external_heating", "ecrh", "icrh", "nbi", "ohmic_heating"):
+        value = raw_sources.get(key)
+        if value is None:
+            continue
+        _integrate_state_power(f"{key}_mw", value, sign=1.0)
+
+    if breakdown:
+        total = jnp.asarray(0.0, dtype=dtype)
+        for value in breakdown.values():
+            total = total + jnp.asarray(value, dtype=dtype)
+        breakdown["net_total_mw"] = total
+    return breakdown
+
+
 
 # Registry for modular selection
 TRANSPORT_FLUX_MODEL_REGISTRY: dict[str, Callable[[], "TransportFluxModelBase"]] = {}

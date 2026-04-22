@@ -35,6 +35,7 @@ from ._transport_flux_models import (
     FluxesRFileTransportModel,
     ZeroTransportModel,
     build_transport_flux_model,
+    compute_total_power_breakdown_mw,
     compute_total_power_mw,
     get_transport_flux_model,
     read_flux_profile_file,
@@ -471,6 +472,19 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )
+        if hasattr(runtime.geometry, "Vprime") and hasattr(runtime.geometry, "r_grid"):
+            total_volume = float(
+                jnp.asarray(
+                    jnp.trapezoid(
+                        jnp.asarray(runtime.geometry.Vprime),
+                        x=jnp.asarray(runtime.geometry.r_grid),
+                    )
+                )
+            )
+            print(
+                "[NEOPAX] geometry integrated Vprime:",
+                f"total_volume_m3={total_volume:.6e}",
+            )
         try:
             turbulence_debug_model = getattr(runtime.models.flux, "turbulent_model", runtime.models.flux)
             if hasattr(turbulence_debug_model, "_effective_total_power_mw"):
@@ -479,6 +493,18 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     "[NEOPAX] turbulence power_over_n scalar power:",
                     f"total_power_mw={total_power_used:.6e}",
                 )
+                pressure_source_model = getattr(turbulence_debug_model, "pressure_source_model", None)
+                breakdown = compute_total_power_breakdown_mw(
+                    state,
+                    pressure_source_model,
+                    runtime.geometry,
+                )
+                if breakdown:
+                    breakdown_text = " ".join(
+                        f"{key}={float(jnp.asarray(value)):.6e}"
+                        for key, value in breakdown.items()
+                    )
+                    print("[NEOPAX] turbulence power_over_n breakdown:", breakdown_text)
         except Exception as exc:
             print(f"[NEOPAX] turbulence power debug unavailable: {exc}")
         density_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None)
@@ -1369,6 +1395,22 @@ def plot_transport_solution(
         plt.close(fig)
         return out_png
 
+    def _plot_geometry_profile(x, values, xlabel, ylabel, out_name, title=None):
+        if x is None or values is None:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(jnp.asarray(x), jnp.asarray(values), linewidth=2.0)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if title is not None:
+            ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=170)
+        plt.close(fig)
+        return out_png
+
     if density_series:
         _plot_species_time_series(density_series, "Density", "transport_density.png")
         _plot_individual_species_series(density_series, "Density", "transport_density")
@@ -1546,6 +1588,24 @@ def plot_transport_solution(
         title="Bremsstrahlung Power vs rho",
     )
 
+    vprime_png = _plot_geometry_profile(
+        getattr(geometry, "r_grid", None) if geometry is not None else None,
+        getattr(geometry, "Vprime", None) if geometry is not None else None,
+        "rho",
+        "V'(rho) [m^3]",
+        "transport_geometry_Vprime.png",
+        title="Volume Derivative Used in Center-Grid Integrals",
+    )
+
+    vprime_half_png = _plot_geometry_profile(
+        getattr(geometry, "r_grid_half", None) if geometry is not None else None,
+        getattr(geometry, "Vprime_half", None) if geometry is not None else None,
+        "rho_face",
+        "V'(rho_face) [m^3]",
+        "transport_geometry_Vprime_half.png",
+        title="Volume Derivative Used on Faces",
+    )
+
     chi_t_png = _plot_species_time_series(
         chi_t_series,
         "Heat Diffusivity chi_t [m^2/s]",
@@ -1616,6 +1676,8 @@ def plot_transport_solution(
         "density": output_dir / "transport_density.png" if density_series else None,
         "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
         "Er": output_dir / "transport_Er.png" if er_series else None,
+        "Vprime": vprime_png,
+        "Vprime_half": vprime_half_png,
         "power_sources_total": power_sources_png,
         "helium_particle_source": he_source_png,
         "total_heat_flux": total_heat_flux_png,

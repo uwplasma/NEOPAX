@@ -2237,6 +2237,23 @@ class RADAUSolver(TransportSolver):
             )
             growth = jnp.maximum(growth, easy_growth_floor)
             growth = jnp.minimum(growth, jnp.minimum(post_reject_growth_cap, theta_growth_cap))
+            keep_dt_window = jnp.logical_and(
+                jnp.logical_not(rejected_last),
+                jnp.logical_and(
+                    reject_streak == 0,
+                    jnp.logical_and(
+                        theta_final < jnp.asarray(0.35, dtype=dtype),
+                        jnp.logical_and(
+                            safe_error < jnp.asarray(0.6, dtype=dtype),
+                            jnp.logical_and(
+                                growth >= jnp.asarray(0.9, dtype=dtype),
+                                growth <= jnp.asarray(1.25, dtype=dtype),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            growth = jnp.where(keep_dt_window, jnp.asarray(1.0, dtype=dtype), growth)
             next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
             def _accept(_):
