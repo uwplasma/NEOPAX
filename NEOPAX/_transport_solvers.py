@@ -897,7 +897,7 @@ class RosenbrockSolver(TransportSolver):
             accepted_mask_saved = accepted_mask_saved.at[0].set(True)
 
             def cond_fun(loop_carry):
-                t_value, _, _, done, failed, _, _, step_idx, *_ = loop_carry
+                t_value, _, _, done, failed, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, step_idx, *_ = loop_carry
                 active = jnp.logical_not(jnp.logical_or(done, failed))
                 return jnp.logical_and(step_idx < max_total_steps, active)
 
@@ -1144,6 +1144,9 @@ class RADAUSolver(TransportSolver):
         complex_dim = 2 * state_dim
         complex_lu0 = jnp.eye(complex_dim, dtype=dtype)
         complex_piv0 = jnp.arange(complex_dim, dtype=jnp.int32)
+        use_simplified_newton = self.newton_strategy == "simplified"
+        preferred_linear_solver_mode = "direct" if _prefer_dense_direct(self.linear_solver, 2 * state_dim) else self.linear_solver
+        use_ntss_direct_path = use_simplified_newton and preferred_linear_solver_mode != "gmres"
 
         def _error_norm(err_vec, flat_ref, flat_candidate):
             scale = self.atol + self.rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
@@ -1178,7 +1181,7 @@ class RADAUSolver(TransportSolver):
             block01 = radau_complex_block[0, 1]
             block10 = radau_complex_block[1, 0]
             block11 = radau_complex_block[1, 1]
-            use_direct_blocks = linear_solver_mode != "gmres"
+            use_direct_blocks = True if use_ntss_direct_path else (linear_solver_mode != "gmres")
             factor_dt_scale = jnp.maximum(jnp.abs(factor_cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
             factor_dt_close = jnp.abs(h_value - factor_cache_dt) <= self.jacobian_reuse_rtol * factor_dt_scale
             reuse_factorization = jnp.logical_and(factor_cache_valid, jnp.logical_and(use_direct_blocks, factor_dt_close))
@@ -1189,7 +1192,7 @@ class RADAUSolver(TransportSolver):
                 return v - h_value * radau_real_eig * (jacobian_ref @ v)
 
             complex_dense = None
-            if linear_solver_mode != "gmres":
+            if use_direct_blocks:
                 complex_dense = jnp.block(
                     [
                         [identity_n - h_value * block00 * jacobian_ref, -h_value * block01 * jacobian_ref],
@@ -1316,8 +1319,8 @@ class RADAUSolver(TransportSolver):
                 jnp.logical_and(cache_age <= self.max_jacobian_age, dt_close),
             )
 
-            if self.newton_strategy == "simplified":
-                linear_solver_mode = "direct" if _prefer_dense_direct(self.linear_solver, 2 * state_dim) else self.linear_solver
+            if use_simplified_newton:
+                linear_solver_mode = preferred_linear_solver_mode
                 def _reuse_jac(_):
                     return jacobian_cache
 
@@ -1358,7 +1361,7 @@ class RADAUSolver(TransportSolver):
             def body_fn(newton_state):
                 iter_idx, z_cur, delta_norm, residual_norm, prev_residual_norm, theta_est, diverged = newton_state
                 residual_cur, stage_states = residual_with_stages(z_cur)
-                if self.newton_strategy == "simplified":
+                if use_simplified_newton:
                     delta = stage_solver(-residual_cur)
                 else:
                     stage_linears = tuple(
@@ -1435,7 +1438,7 @@ class RADAUSolver(TransportSolver):
                 jnp.asarray(1.0, dtype=dtype),
                 jnp.clip(jnp.asarray(0.8, dtype=dtype) / theta_safe, jnp.asarray(0.1, dtype=dtype), jnp.asarray(0.5, dtype=dtype)),
             )
-            if self.newton_strategy == "simplified":
+            if use_simplified_newton:
                 jacobian_out = jacobian_ref
                 cache_valid_out = jnp.asarray(True)
                 cache_dt_out = h_value
@@ -1450,6 +1453,7 @@ class RADAUSolver(TransportSolver):
                 err_norm,
                 converged,
                 z_final,
+                theta_final,
                 jacobian_out,
                 cache_valid_out,
                 cache_dt_out,
@@ -1468,10 +1472,11 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                rejected_last, reject_streak,
             ) = carry
             trial_dt = jnp.minimum(dt_value, t_final - t_value)
             (
-                trial_y, err_norm, converged, stage_history,
+                trial_y, err_norm, converged, stage_history, theta_final,
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out, factor_cache_valid_out, factor_cache_dt_out,
                 newton_shrink,
@@ -1485,6 +1490,22 @@ class RADAUSolver(TransportSolver):
             safe_prev_error = jnp.maximum(prev_error, 1.0e-12)
             growth = self.safety_factor * safe_error ** (-controller_alpha) * safe_prev_error ** controller_beta
             growth = jnp.clip(growth, self.min_step_factor, self.max_step_factor)
+            max_growth = jnp.asarray(self.max_step_factor, dtype=dtype)
+            post_reject_growth_cap = jnp.where(
+                reject_streak > 0,
+                jnp.asarray(1.2, dtype=dtype),
+                max_growth,
+            )
+            theta_growth_cap = jnp.where(
+                theta_final > jnp.asarray(0.9, dtype=dtype),
+                jnp.asarray(1.1, dtype=dtype),
+                jnp.where(
+                    theta_final > jnp.asarray(0.5, dtype=dtype),
+                    jnp.asarray(2.0, dtype=dtype),
+                    max_growth,
+                ),
+            )
+            growth = jnp.minimum(growth, jnp.minimum(post_reject_growth_cap, theta_growth_cap))
             next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
             def _accept(_):
@@ -1511,6 +1532,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_out,
                     factor_cache_valid_out,
                     factor_cache_dt_out,
+                    jnp.asarray(False),
+                    jnp.asarray(0, dtype=jnp.int32),
                 ), (
                     accepted_y,
                     t_new,
@@ -1526,9 +1549,15 @@ class RADAUSolver(TransportSolver):
                     jnp.asarray(2, dtype=jnp.int32),
                     jnp.asarray(1, dtype=jnp.int32),
                 )
+                reject_streak_next = jnp.minimum(reject_streak + 1, jnp.asarray(8, dtype=jnp.int32))
                 rejection_target = jnp.where(converged, next_dt, trial_dt * newton_shrink)
+                rejection_cap = jnp.where(
+                    reject_streak > 0,
+                    jnp.asarray(0.25, dtype=dtype),
+                    jnp.asarray(0.5, dtype=dtype),
+                )
                 reduced_dt = jnp.maximum(
-                    jnp.minimum(rejection_target, trial_dt * jnp.asarray(0.5, dtype=dtype)),
+                    jnp.minimum(rejection_target, trial_dt * rejection_cap),
                     dt_min,
                 )
                 fail_now = jnp.logical_and(reduced_dt <= dt_min * (1.0 + 1.0e-12), jnp.logical_not(accepted))
@@ -1553,6 +1582,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_out,
                     factor_cache_valid_out,
                     factor_cache_dt_out,
+                    jnp.asarray(True),
+                    reject_streak_next,
                 ), (
                     flat_y,
                     t_value,
@@ -1569,6 +1600,7 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                rejected_last, reject_streak,
             ) = carry
 
             def _skip(_):
@@ -1626,6 +1658,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_cache,
                     factor_cache_valid,
                     factor_cache_dt,
+                    rejected_last,
+                    reject_streak,
                     step_idx,
                     save_idx,
                     ys,
@@ -1640,12 +1674,14 @@ class RADAUSolver(TransportSolver):
                     prev_error_new, prev_stages_new, prev_dt_new,
                     jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
                     real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
+                    rejected_last_new, reject_streak_new,
                 ), step_info = step_fn(
                     (
                         t_value, flat_y, dt_value, done, failed, fail_code, n_accepted,
                         prev_error, prev_stages, prev_dt,
                         jacobian_cache, cache_valid, cache_dt, cache_age,
                         real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                        rejected_last, reject_streak,
                     ),
                     None,
                 )
@@ -1675,6 +1711,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_new,
                     factor_cache_valid_new,
                     factor_cache_dt_new,
+                    rejected_last_new,
+                    reject_streak_new,
                     step_idx + 1,
                     save_idx,
                     ys,
@@ -1706,6 +1744,8 @@ class RADAUSolver(TransportSolver):
                 complex_piv0,
                 jnp.asarray(False),
                 jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(False),
+                jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(1, dtype=jnp.int32),
                 ys_saved,
@@ -1736,6 +1776,8 @@ class RADAUSolver(TransportSolver):
                 _complex_piv_f,
                 _factor_cache_valid_f,
                 _factor_cache_dt_f,
+                _rejected_last_f,
+                _reject_streak_f,
                 _,
                 _save_idx_f,
                 ys_saved,
@@ -1753,7 +1795,7 @@ class RADAUSolver(TransportSolver):
             )
 
         def cond_fun(loop_carry):
-            t_value, _, _, done, failed, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, step_idx = loop_carry
+            t_value, _, _, done, failed, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, step_idx = loop_carry
             active = jnp.logical_not(jnp.logical_or(done, failed))
             return jnp.logical_and(step_idx < max_total_steps, active)
 
@@ -1762,6 +1804,7 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, done, failed, fail_code, n_accepted, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                rejected_last, reject_streak,
                 step_idx,
             ) = loop_carry
             (
@@ -1769,12 +1812,14 @@ class RADAUSolver(TransportSolver):
                 prev_error_new, prev_stages_new, prev_dt_new,
                 jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
                 real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
+                rejected_last_new, reject_streak_new,
             ), _ = step_fn(
                 (
                     t_value, flat_y, dt_value, done, failed, fail_code, n_accepted,
                     prev_error, prev_stages, prev_dt,
                     jacobian_cache, cache_valid, cache_dt, cache_age,
                     real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                    rejected_last, reject_streak,
                 ),
                 None,
             )
@@ -1799,6 +1844,8 @@ class RADAUSolver(TransportSolver):
                 complex_piv_new,
                 factor_cache_valid_new,
                 factor_cache_dt_new,
+                rejected_last_new,
+                reject_streak_new,
                 step_idx + 1,
             )
 
@@ -1823,6 +1870,8 @@ class RADAUSolver(TransportSolver):
             complex_piv0,
             jnp.asarray(False),
             jnp.asarray(0.0, dtype=dtype),
+            jnp.asarray(False),
+            jnp.asarray(0, dtype=jnp.int32),
             jnp.asarray(0, dtype=jnp.int32),
         )
         (
@@ -1830,6 +1879,7 @@ class RADAUSolver(TransportSolver):
             _prev_err_f, _prev_stages_f, _prev_dt_f,
             _jacobian_f, _cache_valid_f, _cache_dt_f, _cache_age_f,
             _real_lu_f, _real_piv_f, _complex_lu_f, _complex_piv_f, _factor_cache_valid_f, _factor_cache_dt_f,
+            _rejected_last_f, _reject_streak_f,
             _
         ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
         ys_saved_flat = jnp.expand_dims(y_f_flat, axis=0)

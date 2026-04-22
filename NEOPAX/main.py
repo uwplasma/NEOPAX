@@ -1171,12 +1171,25 @@ def plot_transport_solution(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
+    EV_TO_J = 1.602176634e-19
     HEAT_FLUX_W_TO_MW = 1.0e-6
     PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
 
-    heat_power_scale = None
-    if geometry is not None and hasattr(geometry, "Vprime"):
-        heat_power_scale = HEAT_FLUX_W_TO_MW * jnp.asarray(geometry.Vprime)
+    heat_power_scale_center = None
+    heat_power_scale_face = None
+    if geometry is not None:
+        if hasattr(geometry, "Vprime"):
+            heat_power_scale_center = EV_TO_J * HEAT_FLUX_W_TO_MW * jnp.asarray(geometry.Vprime)
+        if hasattr(geometry, "Vprime_half"):
+            heat_power_scale_face = EV_TO_J * HEAT_FLUX_W_TO_MW * jnp.asarray(geometry.Vprime_half)
+
+    def _convert_heat_flux_density_to_mw(arr):
+        arr = jnp.asarray(arr)
+        if heat_power_scale_center is not None and arr.shape[-1] == heat_power_scale_center.shape[0]:
+            return arr * heat_power_scale_center
+        if heat_power_scale_face is not None and arr.shape[-1] == heat_power_scale_face.shape[0]:
+            return arr * heat_power_scale_face
+        return EV_TO_J * HEAT_FLUX_W_TO_MW * arr
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -1432,11 +1445,7 @@ def plot_transport_solution(
             fluxes = flux_model(snapshot_state)
             q_total = fluxes.get("Q")
             if q_total is not None:
-                q_total_arr = jnp.asarray(q_total)
-                if heat_power_scale is not None and q_total_arr.shape[-1] == heat_power_scale.shape[0]:
-                    q_total_arr = q_total_arr * heat_power_scale
-                else:
-                    q_total_arr = HEAT_FLUX_W_TO_MW * q_total_arr
+                q_total_arr = _convert_heat_flux_density_to_mw(q_total)
                 flux_component_series["Q_total"].append((time_label, q_total_arr))
                 total_heat_flux_series.append(
                     (time_label, jnp.sum(q_total_arr, axis=0) if q_total_arr.ndim == 2 else q_total_arr)
@@ -1448,10 +1457,7 @@ def plot_transport_solution(
                 if value is not None:
                     value_arr = jnp.asarray(value)
                     if key.startswith("Q_"):
-                        if heat_power_scale is not None and value_arr.shape[-1] == heat_power_scale.shape[0]:
-                            value_arr = value_arr * heat_power_scale
-                        else:
-                            value_arr = HEAT_FLUX_W_TO_MW * value_arr
+                        value_arr = _convert_heat_flux_density_to_mw(value_arr)
                     flux_component_series[key].append((time_label, value_arr))
 
     power_sources_png = _plot_scalar_time_series(

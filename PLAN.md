@@ -260,6 +260,15 @@ Observed result so far:
   - robustness improved materially
   - memory/stability likely improved enough for the lean benchmark to finish
   - runtime is still too slow, so more work is needed on Newton/factorization/step-control efficiency
+- after adding lazy Jacobian reuse, preserved reject-retry cache state, and explicit transformed-block LU-factor reuse, the same lean benchmark improved further to:
+  - total `solver.solve(...)` time about `574 s`
+  - compile warning phase about `3m59s`
+  - `n_steps = 1039`
+  - `failed_any = False`
+- updated interpretation:
+  - transformed-block factorization reuse produced a real runtime win
+  - step count only improved modestly, so NEOPAX Radau still appears weaker than NTSS mainly in step-control / acceptance policy rather than in the core transformed linear algebra
+  - compile time is now a clearer bottleneck, so future Radau work should prefer NTSS-like controller improvements and hot-path simplification over adding more generic branching
 
 NTSS comparison findings relevant to this phase:
 - NTSS `CRadau/radau.cpp` does not use GMRES in its main Radau path
@@ -281,6 +290,16 @@ Important next improvement steps for this phase:
 - reduce compile-heavy branching inside the traced Radau loop where possible
   - recent runtime improvements have come with heavier `jit_while` compile cost
   - future Newton/retry logic should prefer static-shape, low-branch formulations
+- tighten the Radau step controller in a more NTSS-like direction:
+  - remember recent rejected steps
+  - cap post-rejection step regrowth
+  - apply stronger shrinkage after repeated rejected retries
+  - use Newton contraction quality to limit aggressive accepted-step growth after difficult solves
+- consider simplifying the active Radau backend around the NTSS-like path:
+  - `simplified` Newton
+  - transformed blocks
+  - direct factorization
+  while keeping any legacy alternatives outside the primary benchmarked execution path if compile time continues to dominate
 - after factorization reuse is in place, re-benchmark the lean `temperature + Er` Radau case and compare:
   - compile time
   - total solve time
@@ -288,8 +307,7 @@ Important next improvement steps for this phase:
   - whether runtime improvements continue without another major compile regression
 
 Still open in this phase:
-- benchmark the new contraction-aware Newton changes
-- see whether `n_steps` and total wall time improve relative to the `~764 s / 1140 steps` direct transformed-block baseline
+- see whether more NTSS-like step-control logic can reduce `n_steps` materially relative to the new `~574 s / 1039 steps` baseline
 - revisit transformed-block direct-vs-GMRES policy after more timing data
 - investigate whether factorization reuse can be made more explicit and more NTSS-like
 
@@ -311,7 +329,7 @@ Still open in this phase:
 6. If custom Radau becomes the focus, start with the Hairer-style transformed-stage solve, then improve Jacobian reuse and Newton step control.
 7. Next Radau-specific checkpoint:
    - rerun `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml`
-   - compare against the current transformed-direct baseline (`~764 s`, compile `~3m29s`, `1140` steps)
+   - compare against the current transformed-direct baseline (`~574 s`, compile `~3m59s`, `1039` steps)
 
 ### Phase 8: Replace Custom Rosenbrock With Standard RODAS5P
 - Status: not started
