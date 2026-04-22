@@ -322,6 +322,12 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             chi_t = jnp.full((species.number_species,), ion_value, dtype=float).at[electron_idx].set(electron_value)
         total_power_mw = turbulence_cfg.get("total_power_mw", turbulence_cfg.get("power_mw"))
         pressure_source_model = None if source_models is None else source_models.get("temperature")
+        if total_power_mw is None and pressure_source_model is None:
+            raise ValueError(
+                f"[turbulence] flux_model='{turbulence_name}' requires a power source. "
+                "Provide 'total_power_mw' (or 'power_mw') in [turbulence], or configure "
+                "temperature sources so NEOPAX can build the scalar power automatically."
+            )
         turbulence_model = turbulence_factory(
             species,
             energy_grid,
@@ -465,6 +471,16 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )
+        try:
+            turbulence_debug_model = getattr(runtime.models.flux, "turbulent_model", runtime.models.flux)
+            if hasattr(turbulence_debug_model, "_effective_total_power_mw"):
+                total_power_used = float(jnp.asarray(turbulence_debug_model._effective_total_power_mw(state)))
+                print(
+                    "[NEOPAX] turbulence power_over_n scalar power:",
+                    f"total_power_mw={total_power_used:.6e}",
+                )
+        except Exception as exc:
+            print(f"[NEOPAX] turbulence power debug unavailable: {exc}")
         density_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None)
         temperature_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "temperature"), None)
         er_equation = next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None)
