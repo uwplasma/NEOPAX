@@ -1366,6 +1366,8 @@ def plot_transport_solution(
     alpha_power_series = []
     pbrems_series = []
     total_heat_flux_series = []
+    chi_t_series = []
+    chi_n_series = []
     if source_models is not None and density_series and pressure_series and er_series and species is not None:
         n_source_snapshots = min(len(density_series), len(pressure_series), len(er_series))
         for idx in range(n_source_snapshots):
@@ -1433,6 +1435,7 @@ def plot_transport_solution(
         "Q_neo": [],
         "Q_turb": [],
     }
+    turbulence_plot_model = getattr(flux_model, "turbulent_model", flux_model)
     if flux_model is not None and density_series and pressure_series and er_series:
         n_flux_snapshots = min(len(density_series), len(pressure_series), len(er_series))
         for idx in range(n_flux_snapshots):
@@ -1459,6 +1462,36 @@ def plot_transport_solution(
                     if key.startswith("Q_"):
                         value_arr = _convert_heat_flux_density_to_mw(value_arr)
                     flux_component_series[key].append((time_label, value_arr))
+
+            if turbulence_plot_model is not None and hasattr(turbulence_plot_model, "chi_t"):
+                chi_t_base = jnp.asarray(getattr(turbulence_plot_model, "chi_t"))
+                chi_n_base = jnp.asarray(getattr(turbulence_plot_model, "chi_n", jnp.zeros_like(chi_t_base)))
+                if hasattr(turbulence_plot_model, "_effective_total_power_mw") and species is not None and hasattr(species, "species_idx"):
+                    electron_idx = species.species_idx.get("e")
+                    if electron_idx is not None:
+                        total_power_mw = jnp.asarray(
+                            turbulence_plot_model._effective_total_power_mw(snapshot_state),
+                            dtype=snapshot_state.density.dtype,
+                        )
+                        p075 = jnp.where(
+                            total_power_mw < 0.0,
+                            jnp.asarray(3.0, dtype=snapshot_state.density.dtype),
+                            jnp.power(total_power_mw, 0.75),
+                        )
+                        ne_center = jnp.maximum(
+                            jnp.asarray(snapshot_state.density[int(electron_idx)], dtype=snapshot_state.density.dtype),
+                            1.0e-12,
+                        )
+                        chi_t_arr = chi_t_base[:, None] * p075 / ne_center[None, :]
+                        chi_n_arr = chi_n_base[:, None] * p075 / ne_center[None, :]
+                    else:
+                        chi_t_arr = jnp.repeat(chi_t_base[:, None], len(rho), axis=1)
+                        chi_n_arr = jnp.repeat(chi_n_base[:, None], len(rho), axis=1)
+                else:
+                    chi_t_arr = jnp.repeat(chi_t_base[:, None], len(rho), axis=1)
+                    chi_n_arr = jnp.repeat(chi_n_base[:, None], len(rho), axis=1)
+                chi_t_series.append((time_label, chi_t_arr))
+                chi_n_series.append((time_label, chi_n_arr))
 
     power_sources_png = _plot_scalar_time_series(
         power_source_series,
@@ -1496,6 +1529,18 @@ def plot_transport_solution(
         "transport_pressure_source_PBrems.png",
         title="Bremsstrahlung Power vs rho",
     )
+
+    chi_t_png = _plot_species_time_series(
+        chi_t_series,
+        "Heat Diffusivity chi_t [m^2/s]",
+        "transport_chi_t.png",
+    ) if chi_t_series else None
+
+    chi_n_png = _plot_species_time_series(
+        chi_n_series,
+        "Particle Diffusivity chi_n [m^2/s]",
+        "transport_chi_n.png",
+    ) if chi_n_series else None
 
     flux_plot_paths = {}
     flux_plot_specs = (
