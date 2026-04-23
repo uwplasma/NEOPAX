@@ -899,6 +899,27 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"n_steps={int(n_steps) if n_steps is not None else 'na'}",
                     f"failed_any={bool(jnp.any(jnp.asarray(failed_mask))) if failed_mask is not None else False}",
                 )
+            diagnostics = result.get("diagnostics", None)
+            if diagnostics is not None:
+                try:
+                    accepted_total = int(jnp.asarray(diagnostics.get("accepted_steps", 0)))
+                    rejected_total = int(jnp.asarray(diagnostics.get("rejected_steps", 0)))
+                    newton_sum = int(jnp.asarray(diagnostics.get("newton_iters_sum", 0)))
+                    avg_newton = (newton_sum / accepted_total) if accepted_total > 0 else 0.0
+                    print(
+                        "[NEOPAX] radau diagnostics:",
+                        f"accepted_total={accepted_total}",
+                        f"rejected_total={rejected_total}",
+                        f"jac_reuse={int(jnp.asarray(diagnostics.get('jacobian_reuse_steps', 0)))}",
+                        f"lu_reuse={int(jnp.asarray(diagnostics.get('lu_reuse_steps', 0)))}",
+                        f"avg_newton_iters={avg_newton:.2f}",
+                        f"max_newton_iters={int(jnp.asarray(diagnostics.get('newton_iters_max', 0)))}",
+                        f"theta_hard={int(jnp.asarray(diagnostics.get('theta_hard_steps', 0)))}",
+                        f"avg_dt_accepted={float(jnp.asarray(diagnostics.get('avg_dt_accepted', 0.0))):.6e}",
+                        f"avg_theta_accepted={float(jnp.asarray(diagnostics.get('avg_theta_accepted', 0.0))):.6e}",
+                    )
+                except Exception:
+                    pass
         print("[NEOPAX] solver.solve(...) returned")
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)

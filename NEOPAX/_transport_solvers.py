@@ -542,6 +542,7 @@ def _finalize_custom_solver_output(
     species,
     temperature_active_mask=None,
     fixed_temperature_profile=None,
+    diagnostics=None,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
@@ -576,6 +577,7 @@ def _finalize_custom_solver_output(
         "fail_code": fail_code_f,
         "final_state": final_state,
         "final_time": t_final,
+        "diagnostics": diagnostics,
     }
 
 
@@ -1093,6 +1095,15 @@ class RADAUSolver(TransportSolver):
         STATUS_REJECTED_LAST = 3
         STATUS_REJECT_STREAK = 4
         STATUS_EASY_ACCEPT_STREAK = 5
+        DIAG_ACCEPTED = 0
+        DIAG_REJECTED = 1
+        DIAG_JAC_REUSED = 2
+        DIAG_LU_REUSED = 3
+        DIAG_NEWTON_ITERS_SUM = 4
+        DIAG_NEWTON_ITERS_MAX = 5
+        DIAG_THETA_HARD = 6
+        DIAGF_DT_ACCEPT_SUM = 0
+        DIAGF_THETA_ACCEPT_SUM = 1
 
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
@@ -1219,6 +1230,7 @@ class RADAUSolver(TransportSolver):
                 complex_piv,
                 factor_cache_valid_out,
                 factor_cache_dt_out,
+                reuse_factorization,
             )
 
         def _single_step(
@@ -1286,6 +1298,7 @@ class RADAUSolver(TransportSolver):
                 complex_piv_out,
                 factor_cache_valid_out,
                 factor_cache_dt_out,
+                lu_reused,
             ) = _make_transformed_radau_stage_solver(
                 jacobian_ref,
                 h_value,
@@ -1336,7 +1349,7 @@ class RADAUSolver(TransportSolver):
                 jnp.asarray(0.0, dtype=dtype),
                 jnp.asarray(False),
             )
-            _, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
+            iter_final, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
             stages_final = z_final.reshape((3, state_dim))
             final_residual = residual(z_final)
             converged = jnp.logical_and(
@@ -1373,6 +1386,9 @@ class RADAUSolver(TransportSolver):
                 factor_cache_valid_out,
                 factor_cache_dt_out,
                 newton_shrink,
+                use_cached_jacobian,
+                lu_reused,
+                iter_final,
             )
 
         def _attempt_step(carry):
@@ -1380,6 +1396,7 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, status, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                diag_int, diag_float,
             ) = carry
             failed = status[STATUS_FAILED] != 0
             fail_code = status[STATUS_FAIL_CODE]
@@ -1393,6 +1410,9 @@ class RADAUSolver(TransportSolver):
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out, factor_cache_valid_out, factor_cache_dt_out,
                 newton_shrink,
+                jac_reused,
+                lu_reused,
+                newton_iters,
             ) = _single_step(
                 flat_y, t_value, trial_dt, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
@@ -1419,6 +1439,7 @@ class RADAUSolver(TransportSolver):
                 ),
             )
             growth = jnp.minimum(growth, jnp.minimum(post_reject_growth_cap, theta_growth_cap))
+            next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
             def _accept(_):
                 t_new = t_value + trial_dt
@@ -1465,6 +1486,14 @@ class RADAUSolver(TransportSolver):
                     trial_dt,
                     jnp.clip(trial_dt * growth_accept, dt_min, dt_max),
                 )
+                diag_int_next = diag_int.at[DIAG_ACCEPTED].add(1)
+                diag_int_next = diag_int_next.at[DIAG_JAC_REUSED].add(jac_reused.astype(jnp.int32))
+                diag_int_next = diag_int_next.at[DIAG_LU_REUSED].add(lu_reused.astype(jnp.int32))
+                diag_int_next = diag_int_next.at[DIAG_NEWTON_ITERS_SUM].add(newton_iters)
+                diag_int_next = diag_int_next.at[DIAG_NEWTON_ITERS_MAX].set(jnp.maximum(diag_int[DIAG_NEWTON_ITERS_MAX], newton_iters))
+                diag_int_next = diag_int_next.at[DIAG_THETA_HARD].add((theta_final > jnp.asarray(0.5, dtype=dtype)).astype(jnp.int32))
+                diag_float_next = diag_float.at[DIAGF_DT_ACCEPT_SUM].add(trial_dt)
+                diag_float_next = diag_float_next.at[DIAGF_THETA_ACCEPT_SUM].add(theta_final)
                 status_next = jnp.asarray(
                     [0, fail_code, n_accepted + 1, 0, 0, easy_accept_streak_next],
                     dtype=jnp.int32,
@@ -1487,6 +1516,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_out,
                     factor_cache_valid_out,
                     factor_cache_dt_out,
+                    diag_int_next,
+                    diag_float_next,
                 ), (
                     accepted_y,
                     t_new,
@@ -1515,6 +1546,7 @@ class RADAUSolver(TransportSolver):
                 )
                 fail_now = jnp.logical_and(reduced_dt <= dt_min * (1.0 + 1.0e-12), jnp.logical_not(accepted))
                 fail_code_next = jnp.where(fail_now, code, jnp.asarray(0, dtype=jnp.int32))
+                diag_int_next = diag_int.at[DIAG_REJECTED].add(1)
                 status_next = jnp.asarray(
                     [fail_now.astype(jnp.int32), fail_code_next, n_accepted, 1, reject_streak_next, 0],
                     dtype=jnp.int32,
@@ -1537,6 +1569,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_out,
                     factor_cache_valid_out,
                     factor_cache_dt_out,
+                    diag_int_next,
+                    diag_float,
                 ), (
                     flat_y,
                     t_value,
@@ -1553,6 +1587,7 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, status, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                diag_int, diag_float,
             ) = carry
             failed = status[STATUS_FAILED] != 0
             fail_code = status[STATUS_FAIL_CODE]
@@ -1588,7 +1623,7 @@ class RADAUSolver(TransportSolver):
             def cond_fun(loop_carry):
                 t_value = loop_carry[0]
                 status = loop_carry[3]
-                step_idx = loop_carry[17]
+                step_idx = loop_carry[19]
                 failed = status[STATUS_FAILED] != 0
                 active = jnp.logical_and(t_value < (t_final - 1.0e-15), jnp.logical_not(failed))
                 return jnp.logical_and(step_idx < max_total_steps, active)
@@ -1612,6 +1647,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_cache,
                     factor_cache_valid,
                     factor_cache_dt,
+                    diag_int,
+                    diag_float,
                     step_idx,
                     save_idx,
                     ys,
@@ -1626,12 +1663,14 @@ class RADAUSolver(TransportSolver):
                     prev_error_new, prev_stages_new, prev_dt_new,
                     jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
                     real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
+                    diag_int_new, diag_float_new,
                 ), step_info = step_fn(
                     (
                         t_value, flat_y, dt_value, status,
                         prev_error, prev_stages, prev_dt,
                         jacobian_cache, cache_valid, cache_dt, cache_age,
                         real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                        diag_int, diag_float,
                     ),
                     None,
                 )
@@ -1658,6 +1697,8 @@ class RADAUSolver(TransportSolver):
                     complex_piv_new,
                     factor_cache_valid_new,
                     factor_cache_dt_new,
+                    diag_int_new,
+                    diag_float_new,
                     step_idx + 1,
                     save_idx,
                     ys,
@@ -1686,6 +1727,8 @@ class RADAUSolver(TransportSolver):
                 complex_piv0,
                 jnp.asarray(False),
                 jnp.asarray(0.0, dtype=dtype),
+                jnp.zeros((7,), dtype=jnp.int32),
+                jnp.zeros((2,), dtype=dtype),
                 jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(1, dtype=jnp.int32),
                 ys_saved,
@@ -1707,6 +1750,8 @@ class RADAUSolver(TransportSolver):
                 _cache_valid_f,
                 _cache_dt_f,
                 _cache_age_f,
+                diag_int_f,
+                diag_float_f,
                 _real_lu_f,
                 _real_piv_f,
                 _complex_lu_f,
@@ -1725,17 +1770,38 @@ class RADAUSolver(TransportSolver):
             failed_f = status_f[STATUS_FAILED] != 0
             fail_code_f = status_f[STATUS_FAIL_CODE]
             n_acc_f = status_f[STATUS_N_ACCEPTED]
+            accepted_total = diag_int_f[DIAG_ACCEPTED]
+            diagnostics = {
+                "accepted_steps": accepted_total,
+                "rejected_steps": diag_int_f[DIAG_REJECTED],
+                "jacobian_reuse_steps": diag_int_f[DIAG_JAC_REUSED],
+                "lu_reuse_steps": diag_int_f[DIAG_LU_REUSED],
+                "newton_iters_sum": diag_int_f[DIAG_NEWTON_ITERS_SUM],
+                "newton_iters_max": diag_int_f[DIAG_NEWTON_ITERS_MAX],
+                "theta_hard_steps": diag_int_f[DIAG_THETA_HARD],
+                "avg_dt_accepted": jnp.where(
+                    accepted_total > 0,
+                    diag_float_f[DIAGF_DT_ACCEPT_SUM] / accepted_total.astype(dtype),
+                    jnp.asarray(0.0, dtype=dtype),
+                ),
+                "avg_theta_accepted": jnp.where(
+                    accepted_total > 0,
+                    diag_float_f[DIAGF_THETA_ACCEPT_SUM] / accepted_total.astype(dtype),
+                    jnp.asarray(0.0, dtype=dtype),
+                ),
+            }
             return _finalize_custom_solver_output(
                 ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
                 y_f_flat, t_f, t_f >= (t_final - 1.0e-15), failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
                 temperature_active_mask=temperature_active_mask,
                 fixed_temperature_profile=fixed_temperature_profile,
+                diagnostics=diagnostics,
             )
 
         def cond_fun(loop_carry):
             t_value = loop_carry[0]
             status = loop_carry[3]
-            step_idx = loop_carry[17]
+            step_idx = loop_carry[19]
             failed = status[STATUS_FAILED] != 0
             active = jnp.logical_and(t_value < (t_final - 1.0e-15), jnp.logical_not(failed))
             return jnp.logical_and(step_idx < max_total_steps, active)
@@ -1745,6 +1811,7 @@ class RADAUSolver(TransportSolver):
                 t_value, flat_y, dt_value, status, prev_error, prev_stages, prev_dt,
                 jacobian_cache, cache_valid, cache_dt, cache_age,
                 real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                diag_int, diag_float,
                 step_idx,
             ) = loop_carry
             (
@@ -1752,12 +1819,14 @@ class RADAUSolver(TransportSolver):
                 prev_error_new, prev_stages_new, prev_dt_new,
                 jacobian_new, cache_valid_new, cache_dt_new, cache_age_new,
                 real_lu_new, real_piv_new, complex_lu_new, complex_piv_new, factor_cache_valid_new, factor_cache_dt_new,
+                diag_int_new, diag_float_new,
             ), _ = step_fn(
                 (
                     t_value, flat_y, dt_value, status,
                     prev_error, prev_stages, prev_dt,
                     jacobian_cache, cache_valid, cache_dt, cache_age,
                     real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache, factor_cache_valid, factor_cache_dt,
+                    diag_int, diag_float,
                 ),
                 None,
             )
@@ -1779,6 +1848,8 @@ class RADAUSolver(TransportSolver):
                 complex_piv_new,
                 factor_cache_valid_new,
                 factor_cache_dt_new,
+                diag_int_new,
+                diag_float_new,
                 step_idx + 1,
             )
 
@@ -1800,6 +1871,8 @@ class RADAUSolver(TransportSolver):
             complex_piv0,
             jnp.asarray(False),
             jnp.asarray(0.0, dtype=dtype),
+            jnp.zeros((7,), dtype=jnp.int32),
+            jnp.zeros((2,), dtype=dtype),
             jnp.asarray(0, dtype=jnp.int32),
         )
         (
@@ -1807,11 +1880,32 @@ class RADAUSolver(TransportSolver):
             _prev_err_f, _prev_stages_f, _prev_dt_f,
             _jacobian_f, _cache_valid_f, _cache_dt_f, _cache_age_f,
             _real_lu_f, _real_piv_f, _complex_lu_f, _complex_piv_f, _factor_cache_valid_f, _factor_cache_dt_f,
+            diag_int_f, diag_float_f,
             _
         ) = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
         failed_f = status_f[STATUS_FAILED] != 0
         fail_code_f = status_f[STATUS_FAIL_CODE]
         n_acc_f = status_f[STATUS_N_ACCEPTED]
+        accepted_total = diag_int_f[DIAG_ACCEPTED]
+        diagnostics = {
+            "accepted_steps": accepted_total,
+            "rejected_steps": diag_int_f[DIAG_REJECTED],
+            "jacobian_reuse_steps": diag_int_f[DIAG_JAC_REUSED],
+            "lu_reuse_steps": diag_int_f[DIAG_LU_REUSED],
+            "newton_iters_sum": diag_int_f[DIAG_NEWTON_ITERS_SUM],
+            "newton_iters_max": diag_int_f[DIAG_NEWTON_ITERS_MAX],
+            "theta_hard_steps": diag_int_f[DIAG_THETA_HARD],
+            "avg_dt_accepted": jnp.where(
+                accepted_total > 0,
+                diag_float_f[DIAGF_DT_ACCEPT_SUM] / accepted_total.astype(dtype),
+                jnp.asarray(0.0, dtype=dtype),
+            ),
+            "avg_theta_accepted": jnp.where(
+                accepted_total > 0,
+                diag_float_f[DIAGF_THETA_ACCEPT_SUM] / accepted_total.astype(dtype),
+                jnp.asarray(0.0, dtype=dtype),
+            ),
+        }
         ys_saved_flat = jnp.expand_dims(y_f_flat, axis=0)
         ts_saved = jnp.expand_dims(t_f, axis=0)
         dts_saved = jnp.expand_dims(dt_last, axis=0)
@@ -1823,6 +1917,7 @@ class RADAUSolver(TransportSolver):
             y_f_flat, t_f, t_f >= (t_final - 1.0e-15), failed_f, fail_code_f, n_acc_f, unpack_flat, state, species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            diagnostics=diagnostics,
         )
 
 def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> TransportSolver:

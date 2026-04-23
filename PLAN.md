@@ -269,6 +269,33 @@ Observed result so far:
   - transformed-block factorization reuse produced a real runtime win
   - step count only improved modestly, so NEOPAX Radau still appears weaker than NTSS mainly in step-control / acceptance policy rather than in the core transformed linear algebra
   - compile time is now a clearer bottleneck, so future Radau work should prefer NTSS-like controller improvements and hot-path simplification over adding more generic branching
+- subsequent modernization on the fuller physical `temperature + Er` case established a cleaner current baseline:
+  - `diffrax_kvaerno5` on the same physical case completes in about `328.7 s`
+  - current best custom Radau benchmark on that case is about:
+    - compile `~4m16s`
+    - total `solver.solve(...)` time `~596.3 s`
+    - `n_steps = 871`
+    - `failed_any = False`
+- compile-focused findings from recent experiments:
+  - removing the carried `done` flag and trimming active-loop bookkeeping produced real wins
+  - unifying the save/non-save loop bodies did not help and was reverted
+  - tiny carry-packing / readability cleanups are now close to neutral in timing impact
+  - stripping the active Radau implementation down to the NTSS-style path only:
+    - simplified Newton
+    - transformed blocks
+    - direct LU solves
+    was still worth doing to reduce solver generality before more controller work
+- controller-focused findings from recent experiments:
+  - a stronger accepted-step `h` holding rule improved the current physical benchmark without reducing step count materially
+  - this suggests the next likely wins are in making accepted steps cheaper via better Jacobian/LU reuse rather than expecting large step-count drops from each small controller tweak
+  - a later history-loosened Jacobian/LU reuse experiment was reverted after proving too aggressive:
+    - compile improved to about `4m06s`
+    - total solve time worsened to about `614.5 s`
+    - `n_steps` jumped from about `871` to about `1234`
+  - interpretation:
+    - the experiment likely reduced average cost per step
+    - but it harmed controller behavior enough to make overall efficiency worse
+    - the active baseline therefore remains the earlier `~4m16s / ~596.3 s / 871 steps` state
 
 NTSS comparison findings relevant to this phase:
 - NTSS `CRadau/radau.cpp` does not use GMRES in its main Radau path
@@ -277,6 +304,10 @@ NTSS comparison findings relevant to this phase:
   - on a rejected step, if the Jacobian is still considered valid (`caljac` true), NTSS retries from the matrix/decomposition path instead of forcing a full Jacobian rebuild
   - this matches the intended direction of the recent NEOPAX change that preserves `jacobian_out`/cache state across rejected retries
 - NTSS still goes beyond the current NEOPAX implementation by combining Jacobian reuse with more mature decomposition reuse and step-history logic
+- NTSS-style behavior appears highly tolerance/controller sensitive in practice:
+  - a similar NTSS Radau run reportedly needs about `54793` steps at one setting
+  - but only about `260` steps with `rtol = 1.e-3`
+  - so future NEOPAX comparisons should continue to track controller/tolerance regime, not just method name
 
 Important next improvement steps for this phase:
 - add explicit transformed-block factorization reuse across accepted/rejected retries when:
@@ -295,6 +326,20 @@ Important next improvement steps for this phase:
   - cap post-rejection step regrowth
   - apply stronger shrinkage after repeated rejected retries
   - use Newton contraction quality to limit aggressive accepted-step growth after difficult solves
+- refine Jacobian and LU refresh policy on the stripped standard path:
+  - allow longer reuse after easy accepted-step streaks with stable `h`
+  - force earlier refresh after recent rejection or poor `theta`
+  - keep this narrow so the current compile gains are not given back
+- before another solver-policy change, add lightweight Radau diagnostics on the current physical benchmark:
+  - accepted vs rejected counts
+  - average / max Newton iterations
+  - Jacobian reuse count
+  - LU reuse count
+  - compact `dt` and `theta_final` summaries
+  - use those diagnostics to decide whether the next targeted change should focus on:
+    - post-reject regrowth/shrink
+    - keep-same-`h`
+    - or Newton iteration behavior
 - consider simplifying the active Radau backend around the NTSS-like path:
   - `simplified` Newton
   - transformed blocks
@@ -310,6 +355,16 @@ Still open in this phase:
 - see whether more NTSS-like step-control logic can reduce `n_steps` materially relative to the new `~574 s / 1039 steps` baseline
 - revisit transformed-block direct-vs-GMRES policy after more timing data
 - investigate whether factorization reuse can be made more explicit and more NTSS-like
+- decide later whether any remaining compile gap to `kvaerno5` is worth a more opinionated dedicated Radau kernel beyond the current stripped standard path
+- next-session handoff:
+  - keep using `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml` for Radau comparisons
+  - compare against the current custom-Radau reference:
+    - compile `~4m16s`
+    - total solve `~596.3 s`
+    - `n_steps = 871`
+  - keep `diffrax_kvaerno5` on the same physical case as the external comparison point:
+    - total solve `~328.7 s`
+    - `296` total steps (`239` accepted / `57` rejected)
 
 ### Next Recommended Steps
 1. Investigate shared flux-model / RHS cost, especially the neoclassical face/state evaluation path.
