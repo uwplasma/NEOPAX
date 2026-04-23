@@ -1200,10 +1200,24 @@ class RADAUSolver(_RadauSolverConfig):
         controller_alpha = 0.7 / (error_order + 1.0)
         controller_beta = 0.4 / (error_order + 1.0)
         lean_controller = self.controller_mode == "lean"
+        zero_scalar = jnp.asarray(0.0, dtype=dtype)
+        tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
+        theta_diverge_threshold = jnp.asarray(0.95, dtype=dtype)
+        residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
+        theta_clip_min = jnp.asarray(0.1, dtype=dtype)
+        theta_clip_max = jnp.asarray(1.5, dtype=dtype)
+        newton_shrink_num = jnp.asarray(0.8, dtype=dtype)
+        newton_shrink_min = jnp.asarray(0.1, dtype=dtype)
+        newton_shrink_max = jnp.asarray(0.5, dtype=dtype)
         radau_transform = jnp.asarray(_RADAU3_TRANSFORM, dtype=dtype)
         radau_inv_transform = jnp.asarray(_RADAU3_INV_TRANSFORM, dtype=dtype)
         radau_real_eig = jnp.asarray(_RADAU3_REAL_EIG, dtype=dtype)
         radau_complex_block = jnp.asarray(_RADAU3_COMPLEX_BLOCK, dtype=dtype)
+        identity_n = jnp.eye(state_dim, dtype=dtype)
+        block00 = radau_complex_block[0, 0]
+        block01 = radau_complex_block[0, 1]
+        block10 = radau_complex_block[1, 0]
+        block11 = radau_complex_block[1, 1]
         real_lu0 = jnp.eye(state_dim, dtype=dtype)
         real_piv0 = jnp.arange(state_dim, dtype=jnp.int32)
         complex_dim = 2 * state_dim
@@ -1220,67 +1234,6 @@ class RADAUSolver(_RadauSolverConfig):
 
         def _inverse_transform_stage_stack(stage_stack):
             return radau_transform @ stage_stack
-
-        def _make_transformed_radau_stage_solver(
-            jacobian_ref,
-            h_value,
-            reuse_factorization,
-            real_lu_cache,
-            real_piv_cache,
-            complex_lu_cache,
-            complex_piv_cache,
-        ):
-            identity_n = jnp.eye(state_dim, dtype=dtype)
-            block00 = radau_complex_block[0, 0]
-            block01 = radau_complex_block[0, 1]
-            block10 = radau_complex_block[1, 0]
-            block11 = radau_complex_block[1, 1]
-
-            real_matrix = identity_n - h_value * radau_real_eig * jacobian_ref
-            complex_dense = jnp.block(
-                [
-                    [identity_n - h_value * block00 * jacobian_ref, -h_value * block01 * jacobian_ref],
-                    [-h_value * block10 * jacobian_ref, identity_n - h_value * block11 * jacobian_ref],
-                ]
-            )
-
-            def _reuse_factorization(_):
-                return real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
-
-            def _recompute_factorization(_):
-                real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
-                complex_lu, complex_piv = jax.scipy.linalg.lu_factor(complex_dense)
-                return real_lu, real_piv, complex_lu, complex_piv
-
-            real_lu, real_piv, complex_lu, complex_piv = jax.lax.cond(
-                reuse_factorization,
-                _reuse_factorization,
-                _recompute_factorization,
-                operand=None,
-            )
-
-            def stage_solver(rhs):
-                rhs_stages = rhs.reshape((3, state_dim))
-                rhs_transformed = _transform_stage_stack(rhs_stages)
-                rhs_real = rhs_transformed[0]
-                rhs_complex = rhs_transformed[1:].reshape((-1,))
-                delta_real = jax.scipy.linalg.lu_solve((real_lu, real_piv), rhs_real)
-                delta_complex = jax.scipy.linalg.lu_solve((complex_lu, complex_piv), rhs_complex)
-                delta_transformed = jnp.concatenate(
-                    [delta_real[None, :], delta_complex.reshape((2, state_dim))],
-                    axis=0,
-                )
-                return _inverse_transform_stage_stack(delta_transformed).reshape((-1,))
-
-            factor_cache_valid_out = jnp.asarray(True)
-            factor_cache_dt_out = h_value
-            return (
-                stage_solver,
-                real_lu,
-                real_piv,
-                complex_lu,
-                complex_piv,
-            )
 
         def _single_step(
             flat_y,
@@ -1305,68 +1258,72 @@ class RADAUSolver(_RadauSolverConfig):
             )
             z0 = jnp.where(use_predictor, prev_stages * (h_value / prev_dt), fallback_guess)
 
-            def residual_with_stages(z_flat):
+            def residual(z_flat):
                 stages = z_flat.reshape((3, state_dim))
                 stage_states = flat_y[None, :] + h_value * (a @ stages)
                 stage_times = t_value + c * h_value
                 evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
-                return (stages - evals).reshape((-1,)), stage_states
-
-            def residual(z_flat):
-                residual_flat, _ = residual_with_stages(z_flat)
-                return residual_flat
+                return (stages - evals).reshape((-1,))
 
             jacobian_dt_scale = jnp.maximum(jnp.abs(cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
             dt_close = jnp.abs(h_value - cache_dt) <= self.jacobian_reuse_rtol * jacobian_dt_scale
             if lean_controller:
-                use_cached_jacobian = jnp.logical_and(cache_valid, dt_close)
+                reuse_linearization = jnp.logical_and(cache_valid, dt_close)
             else:
-                use_cached_jacobian = jnp.logical_and(
+                reuse_linearization = jnp.logical_and(
                     cache_valid,
                     jnp.logical_and(cache_age <= self.max_jacobian_age, dt_close),
                 )
 
-            def _reuse_jac(_):
-                return jacobian_cache
+            def _reuse_linearization(_):
+                return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
 
-            def _recompute_jac(_):
-                return jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
+            def _recompute_linearization(_):
+                jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
+                real_matrix = identity_n - h_value * radau_real_eig * jacobian_ref
+                complex_dense = jnp.block(
+                    [
+                        [identity_n - h_value * block00 * jacobian_ref, -h_value * block01 * jacobian_ref],
+                        [-h_value * block10 * jacobian_ref, identity_n - h_value * block11 * jacobian_ref],
+                    ]
+                )
+                real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+                complex_lu, complex_piv = jax.scipy.linalg.lu_factor(complex_dense)
+                return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
 
-            jacobian_ref = jax.lax.cond(
-                use_cached_jacobian,
-                _reuse_jac,
-                _recompute_jac,
+            jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+                reuse_linearization,
+                _reuse_linearization,
+                _recompute_linearization,
                 operand=None,
             )
-            (
-                stage_solver,
-                real_lu_out,
-                real_piv_out,
-                complex_lu_out,
-                complex_piv_out,
-            ) = _make_transformed_radau_stage_solver(
-                jacobian_ref,
-                h_value,
-                use_cached_jacobian,
-                real_lu_cache,
-                real_piv_cache,
-                complex_lu_cache,
-                complex_piv_cache,
-            )
+
+            def stage_solver(rhs):
+                rhs_stages = rhs.reshape((3, state_dim))
+                rhs_transformed = _transform_stage_stack(rhs_stages)
+                rhs_real = rhs_transformed[0]
+                rhs_complex = rhs_transformed[1:].reshape((-1,))
+                delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
+                delta_complex = jax.scipy.linalg.lu_solve((complex_lu_out, complex_piv_out), rhs_complex)
+                delta_transformed = jnp.concatenate(
+                    [delta_real[None, :], delta_complex.reshape((2, state_dim))],
+                    axis=0,
+                )
+                return _inverse_transform_stage_stack(delta_transformed).reshape((-1,))
 
             def body_fn(newton_state):
                 iter_idx, z_cur, delta_norm, residual_norm, prev_residual_norm, theta_est, diverged = newton_state
-                residual_cur, stage_states = residual_with_stages(z_cur)
+                residual_cur = residual(z_cur)
                 delta = stage_solver(-residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
                 z_next = z_cur + delta
                 current_residual_norm = jnp.linalg.norm(residual_cur)
-                safe_prev_residual = jnp.maximum(prev_residual_norm, jnp.asarray(1.0e-30, dtype=dtype))
+                safe_prev_residual = jnp.maximum(prev_residual_norm, tiny_scalar)
                 theta_raw = current_residual_norm / safe_prev_residual
-                theta_candidate = jnp.where(iter_idx > 0, theta_raw, jnp.asarray(0.0, dtype=dtype))
+                theta_candidate = jnp.where(iter_idx > 0, theta_raw, zero_scalar)
                 theta_next = jnp.where(iter_idx > 0, jnp.maximum(theta_est, theta_candidate), theta_est)
-                slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > jnp.asarray(0.95, dtype=dtype))
-                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * jnp.asarray(2.0, dtype=dtype))
+                slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > theta_diverge_threshold)
+                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * residual_blowup_factor)
                 nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)))
                 diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_contraction, jnp.logical_or(residual_blowup, nonfinite_state)))
                 return (
@@ -1390,7 +1347,7 @@ class RADAUSolver(_RadauSolverConfig):
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
-                jnp.asarray(0.0, dtype=dtype),
+                zero_scalar,
                 jnp.asarray(False),
             )
             _, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
@@ -1403,16 +1360,16 @@ class RADAUSolver(_RadauSolverConfig):
             flat_next = flat_y + h_value * (b @ stages_final)
             err_vec = h_value * (b_error @ stages_final)
             err_norm = _error_norm(err_vec, flat_y, flat_next)
-            theta_safe = jnp.clip(theta_final, jnp.asarray(0.1, dtype=dtype), jnp.asarray(1.5, dtype=dtype))
+            theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
             newton_shrink = jnp.where(
                 converged,
                 jnp.asarray(1.0, dtype=dtype),
-                jnp.clip(jnp.asarray(0.8, dtype=dtype) / theta_safe, jnp.asarray(0.1, dtype=dtype), jnp.asarray(0.5, dtype=dtype)),
+                jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max),
             )
             jacobian_out = jacobian_ref
             cache_valid_out = jnp.asarray(True)
             cache_dt_out = h_value
-            cache_age_out = jnp.where(use_cached_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
+            cache_age_out = jnp.where(reuse_linearization, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
             return (
                 flat_next,
                 err_norm,
