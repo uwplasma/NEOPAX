@@ -235,6 +235,50 @@ Current assessment for this phase:
 - adaptive-order Radau is interesting, but not the first thing to port into NEOPAX
 - given the current state sizes (for example `state_size ~ 459` in the benchmarked `temperature + Er` case), Radau may remain a secondary high-accuracy path rather than the main default solver target
 
+Current checkpoint for this phase:
+- keep two explicit Radau controller modes:
+  - `radau_controller_mode = "standard"`
+    - the more NTSS-like / history-aware controller path
+  - `radau_controller_mode = "lean"`
+    - the compile-experiment / lower-step controller path
+- default the solver back to `standard` unless `lean` is requested explicitly
+- recent lean benchmark on
+  - `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml`
+  produced:
+  - compile about `4m34s`
+  - total first-run `host_return_elapsed_s ~ 600.8 s`
+  - `n_steps = 713`
+  - `failed_any = False`
+- interpretation:
+  - compile time did not materially improve
+  - but the execution regime became much less conservative in step count
+  - so lean remains worth preserving as an alternate controller mode, not as the only Radau path
+
+Current compile-focused conclusion:
+- the main remaining compile burden is not in:
+  - save buffering
+  - outer loop-carry shape
+  - small cache-state cleanups
+- the main burden is more likely in the traced inner Radau step itself:
+  - Jacobian construction path
+  - transformed-stage solve staging
+  - Newton loop
+  - residual/stage evaluation structure
+
+Latest compile-focused implementation step:
+- simplified the 3-stage residual evaluation inside the custom Radau step from an explicit 3-call stack build to a batched `jax.vmap(...)` stage evaluation
+- goal:
+  - make the inner traced step more uniform and less manually unrolled
+  - preserve the same Radau numerics while moving the implementation shape a bit closer to a library-style batched stage evaluation
+
+Immediate next Radau compile steps:
+1. benchmark the current `standard` controller mode again after the batched stage-evaluation refactor
+2. benchmark the same case with explicit `radau_controller_mode = "lean"` to keep the two-path comparison honest
+3. if compile is still flat, stop micro-tuning wrappers and focus only on:
+   - Jacobian construction structure
+   - transformed linear-solve staging
+   - Newton/residual kernel regularity
+
 Completed in this phase so far:
 - added a transformed-stage simplified-Newton solve for the custom 3-stage Radau path in `_transport_solvers.py`
   - the simplified-Newton path no longer treats the Radau stage system as one monolithic `3n` solve

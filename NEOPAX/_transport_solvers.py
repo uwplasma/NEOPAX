@@ -1046,7 +1046,7 @@ class _RadauSolverConfig(TransportSolver):
     max_step_factor: float = 5.0
     jacobian_reuse_rtol: float = 0.1
     max_jacobian_age: int = 8
-    controller_mode: str = "lean"
+    controller_mode: str = "standard"
     n_steps: int = 0
 
     def __init__(
@@ -1066,7 +1066,7 @@ class _RadauSolverConfig(TransportSolver):
         max_step_factor: float = 5.0,
         jacobian_reuse_rtol: float = 0.1,
         max_jacobian_age: int = 8,
-        controller_mode: str = "lean",
+        controller_mode: str = "standard",
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -1085,7 +1085,12 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
         object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
-        object.__setattr__(self, "controller_mode", str(controller_mode).strip().lower())
+        controller_mode_norm = str(controller_mode).strip().lower()
+        if controller_mode_norm in ("", "default", "standard", "classic", "ntss"):
+            controller_mode_norm = "standard"
+        elif controller_mode_norm != "lean":
+            controller_mode_norm = "standard"
+        object.__setattr__(self, "controller_mode", controller_mode_norm)
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "save_n", save_n)
 
@@ -1303,10 +1308,8 @@ class RADAUSolver(_RadauSolverConfig):
             def residual_with_stages(z_flat):
                 stages = z_flat.reshape((3, state_dim))
                 stage_states = flat_y[None, :] + h_value * (a @ stages)
-                evals = jnp.stack(
-                    [flat_rhs(t_value + c[i] * h_value, stage_states[i]) for i in range(3)],
-                    axis=0,
-                )
+                stage_times = t_value + c * h_value
+                evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
                 return (stages - evals).reshape((-1,)), stage_states
 
             def residual(z_flat):
