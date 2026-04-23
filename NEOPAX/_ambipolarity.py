@@ -1001,7 +1001,16 @@ def pad_and_sort_roots_for_plotting(roots_all, entropies_all, n_roots_all, best_
 
 
 
-def plot_roots(rho, roots_3, entropies_3, best_root, output_dir: Path) -> Path:
+def plot_roots(
+    rho,
+    roots_3,
+    entropies_3,
+    best_root,
+    output_dir: Path,
+    overlay_reference_er: bool = True,
+    reference_er_file: str | Path | None = None,
+    reference_er_label: str | None = None,
+) -> Path:
     # --- DEBUG: Print root/entropy arrays before plotting ---
     import numpy as np
     print("[DEBUG] roots_3 shape:", np.shape(roots_3))
@@ -1026,23 +1035,30 @@ def plot_roots(rho, roots_3, entropies_3, best_root, output_dir: Path) -> Path:
         ax1.plot(rho, roots_3[k], color=colors[k], linewidth=1.8, label=labels[k])
     ax1.plot(rho, best_root, color="black", linewidth=2.2, linestyle="--", label="min-entropy root")
 
-    # --- Optionally: Plot Er profile from NTSS_Initial_Er_Opt.h5 if available ---
-    input_path = os.path.join(output_dir, '../inputs/')
-    er_file = os.path.join(input_path, 'NTSS_Initial_Er_Opt.h5')
-    try:
-        import h5py
-        import interpax
-        if os.path.isfile(er_file):
-            with h5py.File(er_file, 'r') as f:
-                r_data = f['r'][()]
-                er_data = f['Er'][()]
-                if len(er_data) != len(rho):
-                    er_interp = interpax.interp1d(r_data, er_data, rho)
-                else:
-                    er_interp = er_data
-                ax1.plot(rho, er_interp, color='tab:red', linewidth=2.0, linestyle=':', label='Er from NTSS_Initial_Er_Opt.h5')
-    except Exception as e:
-        print(f"Could not plot Er from NTSS_Initial_Er_Opt.h5: {e}")
+    if overlay_reference_er:
+        er_file = Path(reference_er_file) if reference_er_file is not None else Path("./examples/inputs/NTSS_Initial_Er_Opt.h5")
+        er_label = reference_er_label or "reference Er"
+        try:
+            import h5py
+
+            if er_file.is_file():
+                with h5py.File(er_file, "r") as f:
+                    r_data = np.asarray(f["r"][()])
+                    er_data = np.asarray(f["Er"][()])
+                    if r_data.ndim != 1 or er_data.ndim != 1 or r_data.size == 0 or er_data.size == 0:
+                        raise ValueError("reference Er file must contain 1D non-empty 'r' and 'Er' datasets")
+                    rho_ref = r_data / max(float(r_data[-1]), 1.0e-12)
+                    er_interp = np.interp(np.asarray(rho), rho_ref, er_data)
+                    ax1.plot(
+                        rho,
+                        er_interp,
+                        color="tab:red",
+                        linewidth=2.0,
+                        linestyle=":",
+                        label=er_label,
+                    )
+        except Exception as e:
+            print(f"Could not plot ambipolarity reference Er from {er_file}: {e}")
 
     ax1.set_ylabel(r"$E_r$")
     ax1.set_title("Ambipolar $E_r$ roots (up to three per radius)")

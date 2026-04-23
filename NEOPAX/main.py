@@ -976,6 +976,7 @@ def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportStat
         )
 
     roots_all, entropies_all, best_roots, n_roots_all, do_plot, do_hdf5, output_dir = result
+    amb_cfg = config.get("ambipolarity", {})
     rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
     roots_3, entropies_3, best_root = pad_and_sort_roots_for_plotting(
         roots_all,
@@ -992,7 +993,16 @@ def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportStat
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if do_plot:
-        plot_roots(rho, roots_3, entropies_3, best_root, output_dir)
+        plot_roots(
+            rho,
+            roots_3,
+            entropies_3,
+            best_root,
+            output_dir,
+            overlay_reference_er=bool(amb_cfg.get("er_ambipolar_overlay_reference_er", True)),
+            reference_er_file=amb_cfg.get("er_ambipolar_reference_er_file", "./examples/inputs/NTSS_Initial_Er_Opt.h5"),
+            reference_er_label=amb_cfg.get("er_ambipolar_reference_er_label", "reference Er"),
+        )
     if do_hdf5:
         write_ambipolarity_hdf5(rho, roots_3, entropies_3, best_root, output_dir)
 
