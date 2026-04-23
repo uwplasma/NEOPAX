@@ -1354,6 +1354,11 @@ def plot_transport_solution(
                         "T": _interp_dataset("Tt"),
                     },
                     "scalar": {},
+                    "flux_species": {
+                        "Q_total": {},
+                        "Q_neo": {},
+                        "Q_turb": {},
+                    },
                 }
                 vr = _interp_dataset("Vr")
                 flux_qe = _interp_dataset("FluxQe")
@@ -1369,10 +1374,19 @@ def plot_transport_solution(
                 if vr is not None:
                     if flux_qe is not None and flux_qi is not None:
                         profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
+                        profiles["flux_species"]["Q_total"]["e"] = flux_qe * vr
+                        profiles["flux_species"]["Q_total"]["D"] = flux_qi * vr
+                        profiles["flux_species"]["Q_total"]["T"] = flux_qi * vr
                     if flux_qe_neo is not None and flux_qi_neo is not None:
                         profiles["scalar"]["Q_neo_sum"] = (flux_qe_neo + flux_qi_neo) * vr
+                        profiles["flux_species"]["Q_neo"]["e"] = flux_qe_neo * vr
+                        profiles["flux_species"]["Q_neo"]["D"] = flux_qi_neo * vr
+                        profiles["flux_species"]["Q_neo"]["T"] = flux_qi_neo * vr
                     if flux_qe_ano is not None and flux_qi_ano is not None:
                         profiles["scalar"]["Q_turb_sum"] = (flux_qe_ano + flux_qi_ano) * vr
+                        profiles["flux_species"]["Q_turb"]["e"] = flux_qe_ano * vr
+                        profiles["flux_species"]["Q_turb"]["D"] = flux_qi_ano * vr
+                        profiles["flux_species"]["Q_turb"]["T"] = flux_qi_ano * vr
                 if alpha_power is not None:
                     profiles["scalar"]["alpha_power"] = alpha_power
                 power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
@@ -1472,11 +1486,25 @@ def plot_transport_solution(
                 label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
                 ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
             reference_kind = "density" if "density" in out_stem.lower() else "temperature" if "temperature" in out_stem.lower() else None
+            species_name = _species_label(species_idx)
+            ref_values = None
+            ref_label = "NTSS reference"
             if reference_kind is not None and ntss_reference:
-                species_name = _species_label(species_idx)
                 ref_values = ntss_reference.get(reference_kind, {}).get(species_name)
-                if ref_values is not None:
-                    ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label="NTSS reference")
+            elif "transport_flux_q_total" in out_stem.lower():
+                ref_values = ntss_reference.get("flux_species", {}).get("Q_total", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is not None:
+                    ref_label = "NTSS ion reference"
+            elif "transport_flux_q_neo" in out_stem.lower():
+                ref_values = ntss_reference.get("flux_species", {}).get("Q_neo", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is not None:
+                    ref_label = "NTSS ion reference"
+            elif "transport_flux_q_turb" in out_stem.lower():
+                ref_values = ntss_reference.get("flux_species", {}).get("Q_turb", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is not None:
+                    ref_label = "NTSS ion reference"
+            if ref_values is not None:
+                ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label=ref_label)
             ax.set_xlabel("rho")
             ax.set_ylabel(ylabel)
             ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
@@ -1540,6 +1568,7 @@ def plot_transport_solution(
     he_source_series = []
     alpha_power_series = []
     pbrems_series = []
+    power_exchange_series = []
     total_heat_flux_series = []
     neo_heat_flux_series = []
     turb_heat_flux_series = []
@@ -1592,6 +1621,12 @@ def plot_transport_solution(
                     he_source_series.append((time_label, he_arr))
 
             pressure_components = sources.get("pressure_components", {})
+            power_exchange_component = pressure_components.get("power_exchange")
+            if power_exchange_component is not None:
+                power_exchange_arr = jnp.asarray(power_exchange_component)
+                power_exchange_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(power_exchange_arr, axis=0))
+                )
             alpha_component = pressure_components.get("alpha_power")
             if alpha_component is not None:
                 alpha_arr = jnp.asarray(alpha_component)
@@ -1731,11 +1766,18 @@ def plot_transport_solution(
         title="Bremsstrahlung Power vs rho",
     )
 
+    power_exchange_png = _plot_scalar_time_series(
+        power_exchange_series,
+        "Power Exchange [MW/m^3]",
+        "transport_pressure_source_power_exchange.png",
+        title="Power Exchange vs rho",
+    )
+
     vprime_png = _plot_geometry_profile(
         getattr(geometry, "r_grid", None) if geometry is not None else None,
         getattr(geometry, "Vprime", None) if geometry is not None else None,
-        "rho",
-        "V'(rho) [m^3]",
+        "r [m]",
+        "V'(r) [m^3]",
         "transport_geometry_Vprime.png",
         title="Volume Derivative Used in Center-Grid Integrals",
     )
@@ -1743,8 +1785,8 @@ def plot_transport_solution(
     vprime_half_png = _plot_geometry_profile(
         getattr(geometry, "r_grid_half", None) if geometry is not None else None,
         getattr(geometry, "Vprime_half", None) if geometry is not None else None,
-        "rho_face",
-        "V'(rho_face) [m^3]",
+        "r_face [m]",
+        "V'(r_face) [m^3]",
         "transport_geometry_Vprime_half.png",
         title="Volume Derivative Used on Faces",
     )
@@ -1803,7 +1845,9 @@ def plot_transport_solution(
                             r_data = f["r"][()]
                             er_data = f["Er"][()]
                         if len(er_data) != len(rho):
-                            er_ref = interpax.interp1d(r_data, er_data, rho)
+                            r_data = jnp.asarray(r_data)
+                            rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
+                            er_ref = interpax.interp1d(rho_ref, er_data, rho)
                         else:
                             er_ref = er_data
                 if er_ref is not None:
@@ -1831,6 +1875,7 @@ def plot_transport_solution(
         "turbulent_heat_flux": total_turb_heat_flux_png,
         "alpha_power": alpha_power_png,
         "bremsstrahlung_power": pbrems_png,
+        "power_exchange": power_exchange_png,
         **flux_plot_paths,
     }
 

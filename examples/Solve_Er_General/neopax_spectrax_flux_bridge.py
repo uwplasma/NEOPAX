@@ -180,6 +180,13 @@ def _safe_log_gradient(values: np.ndarray, rho: np.ndarray, *, floor: float) -> 
     return -np.gradient(logr, np.asarray(rho, dtype=float), edge_order=2)
 
 
+def _safe_log_gradient_torflux(values: np.ndarray, rho: np.ndarray, *, floor: float) -> np.ndarray:
+    arr = np.maximum(np.asarray(values, dtype=float), float(floor))
+    logr = np.log(arr)
+    torflux = np.asarray(rho, dtype=float) ** 2
+    return -np.gradient(logr, torflux, edge_order=2)
+
+
 def _select_reference_ion_index(species: list[SpeciesMeta], preferred_name: str | None = None) -> int:
     if preferred_name is not None:
         key = _canonical_species_key(preferred_name)
@@ -249,14 +256,38 @@ def _build_manifest(
     if density.shape[0] != len(species) or temperature.shape[0] != len(species):
         raise ValueError("NEOPAX HDF5 species dimension does not match the species list from the TOML")
 
-    density_grad = np.vstack([
-        _safe_log_gradient(density[i], rho, floor=float(args.density_floor))
-        for i in range(density.shape[0])
-    ])
-    temperature_grad = np.vstack([
-        _safe_log_gradient(temperature[i], rho, floor=float(args.temperature_floor))
-        for i in range(temperature.shape[0])
-    ])
+    gradient_coordinate = str(args.gradient_coordinate).strip().lower()
+    gradient_scale = float(args.gradient_scale)
+    if gradient_coordinate not in {"rho", "torflux", "rho_with_scale"}:
+        raise ValueError("--gradient-coordinate must be one of: rho, torflux, rho_with_scale")
+
+    if gradient_coordinate == "rho":
+        density_grad = np.vstack([
+            _safe_log_gradient(density[i], rho, floor=float(args.density_floor))
+            for i in range(density.shape[0])
+        ])
+        temperature_grad = np.vstack([
+            _safe_log_gradient(temperature[i], rho, floor=float(args.temperature_floor))
+            for i in range(temperature.shape[0])
+        ])
+    elif gradient_coordinate == "torflux":
+        density_grad = np.vstack([
+            _safe_log_gradient_torflux(density[i], rho, floor=float(args.density_floor))
+            for i in range(density.shape[0])
+        ])
+        temperature_grad = np.vstack([
+            _safe_log_gradient_torflux(temperature[i], rho, floor=float(args.temperature_floor))
+            for i in range(temperature.shape[0])
+        ])
+    else:
+        density_grad = gradient_scale * np.vstack([
+            _safe_log_gradient(density[i], rho, floor=float(args.density_floor))
+            for i in range(density.shape[0])
+        ])
+        temperature_grad = gradient_scale * np.vstack([
+            _safe_log_gradient(temperature[i], rho, floor=float(args.temperature_floor))
+            for i in range(temperature.shape[0])
+        ])
 
     ref_idx = _select_reference_ion_index(species, preferred_name=reference_ion)
     ref_density = np.maximum(density[ref_idx], float(args.density_floor))
@@ -425,6 +456,10 @@ def _build_manifest(
             "Nl": int(args.nl),
             "Nm": int(args.nm),
         },
+        "gradient_mapping": {
+            "coordinate": gradient_coordinate,
+            "scale": gradient_scale,
+        },
         "init": {
             "init_field": str(args.init_field),
             "init_amp": float(args.init_amp),
@@ -473,6 +508,8 @@ def _write_runs_csv(path: Path, manifest: dict[str, Any]) -> None:
 def _build_normalization_audit_rows(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     electron_model = str(manifest["electron_model"])
+    gradient_coordinate = str(manifest.get("gradient_mapping", {}).get("coordinate", "rho"))
+    gradient_scale = float(manifest.get("gradient_mapping", {}).get("scale", 1.0))
     for run in manifest["runs"]:
         rho = float(run["rho"])
         torflux = float(run["torflux"])
@@ -500,6 +537,8 @@ def _build_normalization_audit_rows(manifest: dict[str, Any]) -> list[dict[str, 
                     "temperature_physical": float(sp["temperature_physical"]),
                     "density_normalized_to_ref_ion": float(sp["density"]),
                     "temperature_normalized_to_ref_ion": float(sp["temperature"]),
+                    "gradient_coordinate": gradient_coordinate,
+                    "gradient_scale": gradient_scale,
                     "fprim_used": dens_grad_rho,
                     "tprim_used": grad_rho,
                     "fprim_if_interpreted_per_torflux": dens_grad_torflux,
@@ -524,7 +563,12 @@ def _write_normalization_audit(output_dir: Path, manifest: dict[str, Any]) -> No
     payload = {
         "assumptions": {
             "reference_species_normalization": "All runtime densities and temperatures are normalized to the chosen reference ion at the same radius.",
-            "gradient_coordinate_used": "tprim/fprim are currently computed as -d ln(X) / d rho.",
+            "gradient_coordinate_used": (
+                "tprim/fprim are computed according to manifest.gradient_mapping.coordinate: "
+                "'rho' -> -d ln(X)/d rho, "
+                "'torflux' -> -d ln(X)/d torflux, "
+                "'rho_with_scale' -> gradient_scale * (-d ln(X)/d rho)."
+            ),
             "torflux_mapping": "torflux is currently assumed to be rho^2.",
             "alternate_torflux_gradient_columns": "The audit CSV also includes the derived values tprim_if_interpreted_per_torflux and fprim_if_interpreted_per_torflux.",
         },
@@ -943,6 +987,8 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--boozer-file-override", default=None, help="Reserved for later internal coupling metadata")
     prep.add_argument("--density-floor", type=float, default=1.0e-8)
     prep.add_argument("--temperature-floor", type=float, default=1.0e-8)
+    prep.add_argument("--gradient-coordinate", choices=("rho", "torflux", "rho_with_scale"), default="rho")
+    prep.add_argument("--gradient-scale", type=float, default=1.0)
     prep.add_argument("--tprim-scale", type=float, default=1.0)
     prep.add_argument("--fprim-scale", type=float, default=1.0)
     prep.add_argument("--tau-e-override", type=float, default=1.0)

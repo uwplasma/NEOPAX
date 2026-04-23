@@ -1046,6 +1046,7 @@ class _RadauSolverConfig(TransportSolver):
     max_step_factor: float = 5.0
     jacobian_reuse_rtol: float = 0.1
     max_jacobian_age: int = 8
+    controller_mode: str = "lean"
     n_steps: int = 0
 
     def __init__(
@@ -1065,6 +1066,7 @@ class _RadauSolverConfig(TransportSolver):
         max_step_factor: float = 5.0,
         jacobian_reuse_rtol: float = 0.1,
         max_jacobian_age: int = 8,
+        controller_mode: str = "lean",
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -1083,6 +1085,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
         object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
+        object.__setattr__(self, "controller_mode", str(controller_mode).strip().lower())
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "save_n", save_n)
 
@@ -1104,8 +1107,6 @@ class _RadauStepState:
     real_piv: Any
     complex_lu: Any
     complex_piv: Any
-    factor_cache_valid: Any
-    factor_cache_dt: Any
 
 
 @jax.tree_util.register_dataclass
@@ -1193,6 +1194,7 @@ class RADAUSolver(_RadauSolverConfig):
         error_order = 2.0 if self.error_estimator == "embedded2" else 5.0
         controller_alpha = 0.7 / (error_order + 1.0)
         controller_beta = 0.4 / (error_order + 1.0)
+        lean_controller = self.controller_mode == "lean"
         radau_transform = jnp.asarray(_RADAU3_TRANSFORM, dtype=dtype)
         radau_inv_transform = jnp.asarray(_RADAU3_INV_TRANSFORM, dtype=dtype)
         radau_real_eig = jnp.asarray(_RADAU3_REAL_EIG, dtype=dtype)
@@ -1217,21 +1219,17 @@ class RADAUSolver(_RadauSolverConfig):
         def _make_transformed_radau_stage_solver(
             jacobian_ref,
             h_value,
+            reuse_factorization,
             real_lu_cache,
             real_piv_cache,
             complex_lu_cache,
             complex_piv_cache,
-            factor_cache_valid,
-            factor_cache_dt,
         ):
             identity_n = jnp.eye(state_dim, dtype=dtype)
             block00 = radau_complex_block[0, 0]
             block01 = radau_complex_block[0, 1]
             block10 = radau_complex_block[1, 0]
             block11 = radau_complex_block[1, 1]
-            factor_dt_scale = jnp.maximum(jnp.abs(factor_cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
-            factor_dt_close = jnp.abs(h_value - factor_cache_dt) <= self.jacobian_reuse_rtol * factor_dt_scale
-            reuse_factorization = jnp.logical_and(factor_cache_valid, factor_dt_close)
 
             real_matrix = identity_n - h_value * radau_real_eig * jacobian_ref
             complex_dense = jnp.block(
@@ -1277,8 +1275,6 @@ class RADAUSolver(_RadauSolverConfig):
                 real_piv,
                 complex_lu,
                 complex_piv,
-                factor_cache_valid_out,
-                factor_cache_dt_out,
             )
 
         def _single_step(
@@ -1295,8 +1291,6 @@ class RADAUSolver(_RadauSolverConfig):
             real_piv_cache,
             complex_lu_cache,
             complex_piv_cache,
-            factor_cache_valid,
-            factor_cache_dt,
         ):
             f0 = flat_rhs(t_value, flat_y)
             fallback_guess = jnp.tile(f0, 3)
@@ -1321,10 +1315,13 @@ class RADAUSolver(_RadauSolverConfig):
 
             jacobian_dt_scale = jnp.maximum(jnp.abs(cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
             dt_close = jnp.abs(h_value - cache_dt) <= self.jacobian_reuse_rtol * jacobian_dt_scale
-            use_cached_jacobian = jnp.logical_and(
-                cache_valid,
-                jnp.logical_and(cache_age <= self.max_jacobian_age, dt_close),
-            )
+            if lean_controller:
+                use_cached_jacobian = jnp.logical_and(cache_valid, dt_close)
+            else:
+                use_cached_jacobian = jnp.logical_and(
+                    cache_valid,
+                    jnp.logical_and(cache_age <= self.max_jacobian_age, dt_close),
+                )
 
             def _reuse_jac(_):
                 return jacobian_cache
@@ -1344,17 +1341,14 @@ class RADAUSolver(_RadauSolverConfig):
                 real_piv_out,
                 complex_lu_out,
                 complex_piv_out,
-                factor_cache_valid_out,
-                factor_cache_dt_out,
             ) = _make_transformed_radau_stage_solver(
                 jacobian_ref,
                 h_value,
+                use_cached_jacobian,
                 real_lu_cache,
                 real_piv_cache,
                 complex_lu_cache,
                 complex_piv_cache,
-                factor_cache_valid,
-                factor_cache_dt,
             )
 
             def body_fn(newton_state):
@@ -1430,8 +1424,6 @@ class RADAUSolver(_RadauSolverConfig):
                 real_piv_out,
                 complex_lu_out,
                 complex_piv_out,
-                factor_cache_valid_out,
-                factor_cache_dt_out,
                 newton_shrink,
             )
 
@@ -1447,86 +1439,94 @@ class RADAUSolver(_RadauSolverConfig):
             (
                 trial_y, err_norm, converged, stage_history, theta_final,
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
-                real_lu_out, real_piv_out, complex_lu_out, complex_piv_out, factor_cache_valid_out, factor_cache_dt_out,
+                real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink,
             ) = _single_step(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
-                step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv, step_state.factor_cache_valid, step_state.factor_cache_dt,
+                step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv,
             )
             accepted = jnp.logical_and(converged, err_norm <= 1.0)
             safe_error = jnp.maximum(err_norm, 1.0e-12)
             safe_prev_error = jnp.maximum(step_state.prev_error, 1.0e-12)
-            growth = self.safety_factor * safe_error ** (-controller_alpha) * safe_prev_error ** controller_beta
-            growth = jnp.clip(growth, self.min_step_factor, self.max_step_factor)
-            max_growth = jnp.asarray(self.max_step_factor, dtype=dtype)
-            post_reject_growth_cap = jnp.where(
-                reject_streak > 0,
-                jnp.asarray(1.3, dtype=dtype),
-                max_growth,
-            )
-            theta_growth_cap = jnp.where(
-                theta_final > jnp.asarray(0.9, dtype=dtype),
-                jnp.asarray(1.25, dtype=dtype),
-                jnp.where(
-                    theta_final > jnp.asarray(0.5, dtype=dtype),
-                    jnp.asarray(2.5, dtype=dtype),
+            if lean_controller:
+                growth = self.safety_factor * safe_error ** (-controller_alpha)
+                growth = jnp.clip(growth, self.min_step_factor, self.max_step_factor)
+            else:
+                growth = self.safety_factor * safe_error ** (-controller_alpha) * safe_prev_error ** controller_beta
+                growth = jnp.clip(growth, self.min_step_factor, self.max_step_factor)
+                max_growth = jnp.asarray(self.max_step_factor, dtype=dtype)
+                post_reject_growth_cap = jnp.where(
+                    reject_streak > 0,
+                    jnp.asarray(1.3, dtype=dtype),
                     max_growth,
-                ),
-            )
-            growth = jnp.minimum(growth, jnp.minimum(post_reject_growth_cap, theta_growth_cap))
+                )
+                theta_growth_cap = jnp.where(
+                    theta_final > jnp.asarray(0.9, dtype=dtype),
+                    jnp.asarray(1.25, dtype=dtype),
+                    jnp.where(
+                        theta_final > jnp.asarray(0.5, dtype=dtype),
+                        jnp.asarray(2.5, dtype=dtype),
+                        max_growth,
+                    ),
+                )
+                growth = jnp.minimum(growth, jnp.minimum(post_reject_growth_cap, theta_growth_cap))
             next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
             def _accept(_):
                 t_new = step_state.t + trial_dt
                 accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
-                easy_accept = jnp.logical_and(
-                    jnp.logical_not(rejected_last),
-                    jnp.logical_and(
-                        safe_error < jnp.asarray(0.2, dtype=dtype),
-                        theta_final < jnp.asarray(0.35, dtype=dtype),
-                    ),
-                )
-                easy_accept_streak_next = jnp.where(
-                    easy_accept,
-                    jnp.minimum(easy_accept_streak + 1, jnp.asarray(6, dtype=jnp.int32)),
-                    jnp.asarray(0, dtype=jnp.int32),
-                )
-                stable_keep_h = jnp.logical_and(
-                    jnp.logical_not(rejected_last),
-                    jnp.logical_and(
-                        easy_accept_streak_next >= jnp.asarray(2, dtype=jnp.int32),
+                if lean_controller:
+                    next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
+                    status_next = jnp.asarray([0, fail_code, n_accepted + 1, 0, 0, 0], dtype=jnp.int32)
+                else:
+                    easy_accept = jnp.logical_and(
+                        jnp.logical_not(rejected_last),
                         jnp.logical_and(
-                            theta_final < jnp.asarray(0.3, dtype=dtype),
+                            safe_error < jnp.asarray(0.2, dtype=dtype),
+                            theta_final < jnp.asarray(0.35, dtype=dtype),
+                        ),
+                    )
+                    easy_accept_streak_next = jnp.where(
+                        easy_accept,
+                        jnp.minimum(easy_accept_streak + 1, jnp.asarray(6, dtype=jnp.int32)),
+                        jnp.asarray(0, dtype=jnp.int32),
+                    )
+                    stable_keep_h = jnp.logical_and(
+                        jnp.logical_not(rejected_last),
+                        jnp.logical_and(
+                            easy_accept_streak_next >= jnp.asarray(2, dtype=jnp.int32),
                             jnp.logical_and(
-                                growth > jnp.asarray(0.9, dtype=dtype),
-                                growth < jnp.asarray(1.35, dtype=dtype),
+                                theta_final < jnp.asarray(0.3, dtype=dtype),
+                                jnp.logical_and(
+                                    growth > jnp.asarray(0.9, dtype=dtype),
+                                    growth < jnp.asarray(1.35, dtype=dtype),
+                                ),
                             ),
                         ),
-                    ),
-                )
-                streak_growth_floor = jnp.where(
-                    jnp.logical_and(
-                        easy_accept_streak_next >= jnp.asarray(3, dtype=jnp.int32),
+                    )
+                    streak_growth_floor = jnp.where(
                         jnp.logical_and(
-                            safe_error < jnp.asarray(0.05, dtype=dtype),
-                            theta_final < jnp.asarray(0.2, dtype=dtype),
+                            easy_accept_streak_next >= jnp.asarray(3, dtype=jnp.int32),
+                            jnp.logical_and(
+                                safe_error < jnp.asarray(0.05, dtype=dtype),
+                                theta_final < jnp.asarray(0.2, dtype=dtype),
+                            ),
                         ),
-                    ),
-                    jnp.asarray(1.15, dtype=dtype),
-                    jnp.asarray(1.0, dtype=dtype),
-                )
-                growth_accept = jnp.maximum(growth, streak_growth_floor)
-                next_dt = jnp.where(
-                    stable_keep_h,
-                    trial_dt,
-                    jnp.clip(trial_dt * growth_accept, dt_min, dt_max),
-                )
-                status_next = jnp.asarray([0, fail_code, n_accepted + 1, 0, 0, easy_accept_streak_next], dtype=jnp.int32)
+                        jnp.asarray(1.15, dtype=dtype),
+                        jnp.asarray(1.0, dtype=dtype),
+                    )
+                    growth_accept = jnp.maximum(growth, streak_growth_floor)
+                    next_dt_accept = jnp.where(
+                        stable_keep_h,
+                        trial_dt,
+                        jnp.clip(trial_dt * growth_accept, dt_min, dt_max),
+                    )
+                    status_next = jnp.asarray([0, fail_code, n_accepted + 1, 0, 0, easy_accept_streak_next], dtype=jnp.int32)
                 return _RadauStepState(
                     t=t_new,
                     y=accepted_y,
-                    dt=next_dt,
+                    dt=next_dt_accept,
                     status=status_next,
                     prev_error=safe_error,
                     prev_stages=stage_history,
@@ -1539,8 +1539,6 @@ class RADAUSolver(_RadauSolverConfig):
                     real_piv=real_piv_out,
                     complex_lu=complex_lu_out,
                     complex_piv=complex_piv_out,
-                    factor_cache_valid=factor_cache_valid_out,
-                    factor_cache_dt=factor_cache_dt_out,
                 ), _RadauStepInfo(
                     y=accepted_y,
                     t=t_new,
@@ -1556,20 +1554,29 @@ class RADAUSolver(_RadauSolverConfig):
                     jnp.asarray(2, dtype=jnp.int32),
                     jnp.asarray(1, dtype=jnp.int32),
                 )
-                reject_streak_next = jnp.minimum(reject_streak + 1, jnp.asarray(8, dtype=jnp.int32))
-                rejection_target = jnp.where(converged, next_dt, trial_dt * newton_shrink)
-                rejection_cap = jnp.where(
-                    reject_streak > 0,
-                    jnp.asarray(0.25, dtype=dtype),
-                    jnp.asarray(0.5, dtype=dtype),
-                )
-                reduced_dt = jnp.maximum(
-                    jnp.minimum(rejection_target, trial_dt * rejection_cap),
-                    dt_min,
-                )
+                if lean_controller:
+                    reduced_dt = jnp.maximum(
+                        jnp.minimum(jnp.where(converged, next_dt, trial_dt * newton_shrink), trial_dt * jnp.asarray(0.5, dtype=dtype)),
+                        dt_min,
+                    )
+                    status_next = jnp.asarray([0, 0, n_accepted, 1, 0, 0], dtype=jnp.int32)
+                else:
+                    reject_streak_next = jnp.minimum(reject_streak + 1, jnp.asarray(8, dtype=jnp.int32))
+                    rejection_target = jnp.where(converged, next_dt, trial_dt * newton_shrink)
+                    rejection_cap = jnp.where(
+                        reject_streak > 0,
+                        jnp.asarray(0.25, dtype=dtype),
+                        jnp.asarray(0.5, dtype=dtype),
+                    )
+                    reduced_dt = jnp.maximum(
+                        jnp.minimum(rejection_target, trial_dt * rejection_cap),
+                        dt_min,
+                    )
+                    status_next = jnp.asarray([0, 0, n_accepted, 1, reject_streak_next, 0], dtype=jnp.int32)
                 fail_now = jnp.logical_and(reduced_dt <= dt_min * (1.0 + 1.0e-12), jnp.logical_not(accepted))
                 fail_code_next = jnp.where(fail_now, code, jnp.asarray(0, dtype=jnp.int32))
-                status_next = jnp.asarray([fail_now.astype(jnp.int32), fail_code_next, n_accepted, 1, reject_streak_next, 0], dtype=jnp.int32)
+                status_next = status_next.at[STATUS_FAILED].set(fail_now.astype(jnp.int32))
+                status_next = status_next.at[STATUS_FAIL_CODE].set(fail_code_next)
                 return _RadauStepState(
                     t=step_state.t,
                     y=step_state.y,
@@ -1586,8 +1593,6 @@ class RADAUSolver(_RadauSolverConfig):
                     real_piv=real_piv_out,
                     complex_lu=complex_lu_out,
                     complex_piv=complex_piv_out,
-                    factor_cache_valid=factor_cache_valid_out,
-                    factor_cache_dt=factor_cache_dt_out,
                 ), _RadauStepInfo(
                     y=step_state.y,
                     t=step_state.t,
@@ -1631,16 +1636,18 @@ class RADAUSolver(_RadauSolverConfig):
             ts_saved = ts_saved.at[0].set(t0)
             accepted_mask_saved = accepted_mask_saved.at[0].set(True)
 
-            def cond_fun(loop_state: _RadauSavedLoopState):
-                failed = loop_state.step.status[STATUS_FAILED] != 0
-                t_value = loop_state.step.t
+            def cond_fun(loop_carry):
+                step_state, step_idx, *_ = loop_carry
+                failed = step_state.status[STATUS_FAILED] != 0
+                t_value = step_state.t
                 active = jnp.logical_and(t_value < (t_final - 1.0e-15), jnp.logical_not(failed))
-                return jnp.logical_and(loop_state.step_idx < max_total_steps, active)
+                return jnp.logical_and(step_idx < max_total_steps, active)
 
-            def body_fun(loop_state: _RadauSavedLoopState):
-                step_state, step_info = step_fn(loop_state.step, None)
+            def body_fun(loop_carry):
+                step_state, step_idx, save_idx, ys, ts, dts, accs, fails, codes = loop_carry
+                step_state, step_info = step_fn(step_state, None)
                 save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
-                    loop_state.save.save_idx,
+                    save_idx,
                     save_times,
                     step_info.t,
                     step_info.y,
@@ -1648,29 +1655,26 @@ class RADAUSolver(_RadauSolverConfig):
                     step_info.accepted,
                     step_info.failed,
                     step_info.fail_code,
-                    loop_state.save.ys,
-                    loop_state.save.ts,
-                    loop_state.save.dts,
-                    loop_state.save.accs,
-                    loop_state.save.fails,
-                    loop_state.save.codes,
+                    ys,
+                    ts,
+                    dts,
+                    accs,
+                    fails,
+                    codes,
                 )
-                return _RadauSavedLoopState(
-                    step=step_state,
-                    step_idx=loop_state.step_idx + 1,
-                    save=_RadauSaveState(
-                        save_idx=save_idx,
-                        ys=ys,
-                        ts=ts,
-                        dts=dts,
-                        accs=accs,
-                        fails=fails,
-                        codes=codes,
-                    ),
+                return (
+                    step_state,
+                    step_idx + 1,
+                    save_idx,
+                    ys,
+                    ts,
+                    dts,
+                    accs,
+                    fails,
+                    codes,
                 )
 
-            loop_state = _RadauSavedLoopState(
-                step=_RadauStepState(
+            step_state0 = _RadauStepState(
                     t=t0,
                     y=flat_state0,
                     dt=base_dt,
@@ -1686,34 +1690,32 @@ class RADAUSolver(_RadauSolverConfig):
                     real_piv=real_piv0,
                     complex_lu=complex_lu0,
                     complex_piv=complex_piv0,
-                    factor_cache_valid=jnp.asarray(False),
-                    factor_cache_dt=jnp.asarray(0.0, dtype=dtype),
-                ),
-                step_idx=jnp.asarray(0, dtype=jnp.int32),
-                save=_RadauSaveState(
-                    save_idx=jnp.asarray(1, dtype=jnp.int32),
-                    ys=ys_saved,
-                    ts=ts_saved,
-                    dts=dts_saved,
-                    accs=accepted_mask_saved,
-                    fails=failed_mask_saved,
-                    codes=fail_codes_saved,
-                ),
+                )
+            loop_carry = (
+                step_state0,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
+                ys_saved,
+                ts_saved,
+                dts_saved,
+                accepted_mask_saved,
+                failed_mask_saved,
+                fail_codes_saved,
             )
-            loop_state = jax.lax.while_loop(cond_fun, body_fun, loop_state)
-            failed_f = loop_state.step.status[STATUS_FAILED] != 0
-            fail_code_f = loop_state.step.status[STATUS_FAIL_CODE]
-            n_acc_f = loop_state.step.status[STATUS_N_ACCEPTED]
+            step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+            failed_f = step_state_f.status[STATUS_FAILED] != 0
+            fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
+            n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
             return _finalize_custom_solver_output(
-                loop_state.save.ys,
-                loop_state.save.ts,
-                loop_state.save.dts,
-                loop_state.save.accs,
-                loop_state.save.fails,
-                loop_state.save.codes,
-                loop_state.step.y,
-                loop_state.step.t,
-                loop_state.step.t >= (t_final - 1.0e-15),
+                ys_saved,
+                ts_saved,
+                dts_saved,
+                accepted_mask_saved,
+                failed_mask_saved,
+                fail_codes_saved,
+                step_state_f.y,
+                step_state_f.t,
+                step_state_f.t >= (t_final - 1.0e-15),
                 failed_f,
                 fail_code_f,
                 n_acc_f,
@@ -1724,21 +1726,19 @@ class RADAUSolver(_RadauSolverConfig):
                 fixed_temperature_profile=fixed_temperature_profile,
             )
 
-        def cond_fun(loop_state: _RadauLoopState):
-            failed = loop_state.step.status[STATUS_FAILED] != 0
-            t_value = loop_state.step.t
+        def cond_fun(loop_carry):
+            step_state, step_idx = loop_carry
+            failed = step_state.status[STATUS_FAILED] != 0
+            t_value = step_state.t
             active = jnp.logical_and(t_value < (t_final - 1.0e-15), jnp.logical_not(failed))
-            return jnp.logical_and(loop_state.step_idx < max_total_steps, active)
+            return jnp.logical_and(step_idx < max_total_steps, active)
 
-        def body_fun(loop_state: _RadauLoopState):
-            step_state, _ = step_fn(loop_state.step, None)
-            return _RadauLoopState(
-                step=step_state,
-                step_idx=loop_state.step_idx + 1,
-            )
+        def body_fun(loop_carry):
+            step_state, step_idx = loop_carry
+            step_state, _ = step_fn(step_state, None)
+            return (step_state, step_idx + 1)
 
-        loop_state = _RadauLoopState(
-            step=_RadauStepState(
+        step_state0 = _RadauStepState(
                 t=t0,
                 y=flat_state0,
                 dt=base_dt,
@@ -1754,26 +1754,26 @@ class RADAUSolver(_RadauSolverConfig):
                 real_piv=real_piv0,
                 complex_lu=complex_lu0,
                 complex_piv=complex_piv0,
-                factor_cache_valid=jnp.asarray(False),
-                factor_cache_dt=jnp.asarray(0.0, dtype=dtype),
-            ),
-            step_idx=jnp.asarray(0, dtype=jnp.int32),
+            )
+        loop_carry = (
+            step_state0,
+            jnp.asarray(0, dtype=jnp.int32),
         )
-        loop_state = jax.lax.while_loop(cond_fun, body_fun, loop_state)
-        failed_f = loop_state.step.status[STATUS_FAILED] != 0
-        fail_code_f = loop_state.step.status[STATUS_FAIL_CODE]
-        n_acc_f = loop_state.step.status[STATUS_N_ACCEPTED]
-        ys_saved_flat = jnp.expand_dims(loop_state.step.y, axis=0)
-        ts_saved = jnp.expand_dims(loop_state.step.t, axis=0)
-        dts_saved = jnp.expand_dims(loop_state.step.dt, axis=0)
+        step_state_f, _ = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+        failed_f = step_state_f.status[STATUS_FAILED] != 0
+        fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
+        n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
+        ys_saved_flat = jnp.expand_dims(step_state_f.y, axis=0)
+        ts_saved = jnp.expand_dims(step_state_f.t, axis=0)
+        dts_saved = jnp.expand_dims(step_state_f.dt, axis=0)
         accepted_mask_saved = jnp.expand_dims(jnp.logical_not(failed_f), axis=0)
         failed_mask_saved = jnp.expand_dims(failed_f, axis=0)
         fail_codes_saved = jnp.expand_dims(fail_code_f, axis=0)
         return _finalize_custom_solver_output(
             ys_saved_flat, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
-            loop_state.step.y,
-            loop_state.step.t,
-            loop_state.step.t >= (t_final - 1.0e-15),
+            step_state_f.y,
+            step_state_f.t,
+            step_state_f.t >= (t_final - 1.0e-15),
             failed_f,
             fail_code_f,
             n_acc_f,
@@ -1819,6 +1819,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
             min_step_factor=float(solver_parameters.get("min_step_factor", 0.1)),
             max_step_factor=float(solver_parameters.get("max_step_factor", 5.0)),
+            controller_mode=str(solver_parameters.get("radau_controller_mode", "lean")),
             save_n=save_n,
         )
     if backend == "rosenbrock":

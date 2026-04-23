@@ -90,6 +90,8 @@ def cmd_all(args: argparse.Namespace) -> int:
         boozer_file_override=args.boozer_file_override,
         density_floor=args.density_floor,
         temperature_floor=args.temperature_floor,
+        gradient_coordinate=args.gradient_coordinate,
+        gradient_scale=args.gradient_scale,
         tprim_scale=args.tprim_scale,
         fprim_scale=args.fprim_scale,
         tau_e_override=args.tau_e_override,
@@ -179,6 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--boozer-file-override", default=None)
     p.add_argument("--density-floor", type=float, default=1.0e-8)
     p.add_argument("--temperature-floor", type=float, default=1.0e-8)
+    p.add_argument("--gradient-coordinate", choices=("rho", "torflux", "rho_with_scale"), default="rho")
+    p.add_argument("--gradient-scale", type=float, default=1.0)
     p.add_argument("--tprim-scale", type=float, default=1.0)
     p.add_argument("--fprim-scale", type=float, default=1.0)
     p.add_argument("--tau-e-override", type=float, default=1.0)
