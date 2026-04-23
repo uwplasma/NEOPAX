@@ -128,9 +128,12 @@ class VmecBoozer(GeometryModelBase):
             if(xm_b[l]==1 and xn_b[l]==0):
                 B10 = interpax.Interpolator1D(rho_half[1:], bmnc_b[:,l], extrap=True)
 
+        # VMEC stores `vp = dV/ds` with the standard 4*pi^2 normalization
+        # removed, so recover the physical volume derivative here.
+        volume_scale = (2.0 * jnp.pi) ** 2
         dVdr = interpax.Interpolator1D(rho_half[1:], vp[1:], extrap=True)
-        self.Vprime = dVdr(self.rho_grid)*2.*self.rho_grid/self.a_b
-        self.Vprime_half = dVdr(self.rho_grid_half)*2.*self.rho_grid_half/self.a_b
+        self.Vprime = dVdr(self.rho_grid) * 2.0 * self.rho_grid / self.a_b * volume_scale
+        self.Vprime_half = dVdr(self.rho_grid_half) * 2.0 * self.rho_grid_half / self.a_b * volume_scale
         self.overVprime = 1./self.Vprime
         self.overVprime = self.overVprime.at[0].set(0.0)
 
