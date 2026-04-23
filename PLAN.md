@@ -258,6 +258,67 @@ Observed result so far:
   - `failed_any = False`
 - interpretation:
   - robustness improved materially
+  - step count only improved modestly, so NEOPAX Radau still appears weaker than NTSS mainly in step-control / acceptance policy rather than in the core transformed linear algebra
+  - compile time is now a clearer bottleneck, so future Radau work should prefer NTSS-like controller improvements and hot-path simplification over adding more generic branching
+
+Current benchmark picture for the physical `temperature + Er` case:
+- `diffrax_kvaerno5` on the same physical case completes in about `328.7 s`
+  - Diffrax stats on that case:
+    - `num_steps = 296`
+    - `num_accepted_steps = 239`
+    - `num_rejected_steps = 57`
+- current best custom Radau benchmark on that case is about:
+  - compile `~4m10s`
+  - total `solver.solve(...)` `~567.2 s`
+  - `n_steps = 1229`
+  - `failed_any = False`
+
+Additional completed work in this phase:
+- stripped the active Radau implementation down to the NTSS-style path only:
+  - simplified Newton
+  - transformed stage blocks
+  - direct LU solves
+  - no active GMRES / full-Newton alternative path in the traced Radau step
+- removed one stale duplicate standard-Radau implementation and cleaned misleading Rosenbrock leftovers in `_transport_solvers.py`
+- restored the Radau path to a clean benchmarkable state after a failed intrusive diagnostics experiment
+
+Negative experiments / conclusions to remember:
+- a more aggressive history-loosened Jacobian/LU reuse policy reduced average step cost but pushed step count from about `871` to about `1234`, and total solve time got worse; this was reverted
+- intrusive Radau diagnostics threaded through the hot loop badly inflated compile/runtime and were removed
+- small carry-packing / loop-cleanup changes gave only marginal gains; they are not enough by themselves to close the compile gap to Diffrax
+- the older lower-step Radau regime (`~871` steps) was not the best overall runtime regime; newer controller tuning produced a better total runtime while remaining on a higher-step branch
+
+Current NTSS / standard-method interpretation:
+- keep using standard Radau IIA / Hairer-Wanner method structure as the numerical base
+- borrow NTSS-inspired controller heuristics where they clearly help this transport problem
+- do not chase exact NTSS line-by-line mimicry when it depends on codebase-specific surrounding assumptions
+
+Next method-focused work still missing before the larger refactor:
+- one more narrow pass on Radau step-control / acceptance policy, staying conservative:
+  - focus on more standard / NTSS-like acceptance and `h` evolution
+  - avoid broad reuse-loosening experiments
+  - keep the active path mathematically the same Radau IIA method
+- short immediate benchmark step before the structural refactor:
+  - rerun the same physical Radau case with `save_n = 1`
+  - use that as the cleanest config-side test of how much compile time is coming from save-buffer bookkeeping in the custom Radau loop
+
+New structural milestone for compile-time reduction:
+- add a dedicated Diffrax-like structural refactor track for custom Radau after the next narrow method pass:
+  - extract a compact `radau_step(...)` kernel
+  - separate solver state from save/output bookkeeping more cleanly
+  - shrink the visible loop carry toward a single solver-state pytree/dataclass
+  - simplify save handling so it resembles the cleaner `SaveAt`-style separation used by `DiffraxSolver.solve(...)`
+  - keep the same solver numerics:
+    - same Radau IIA tableau
+    - same transformed simplified Newton path
+    - same error estimator / controller semantics unless explicitly retuned
+
+Reason for ordering:
+- controller quality still appears to be the main remaining runtime weakness versus NTSS / state-of-the-art behavior
+- but compile time is now large enough that a Diffrax-like structural cleanup should follow soon after the next narrow controller pass, not be postponed indefinitely
+- current evidence suggests:
+  - controller tuning can still improve total solve time even when step count stays high
+  - compile time remains too large, so the `save_n = 1` benchmark is the last simple config-side check before moving into the structural refactor
   - memory/stability likely improved enough for the lean benchmark to finish
   - runtime is still too slow, so more work is needed on Newton/factorization/step-control efficiency
 - after adding lazy Jacobian reuse, preserved reject-retry cache state, and explicit transformed-block LU-factor reuse, the same lean benchmark improved further to:
@@ -271,10 +332,10 @@ Observed result so far:
   - compile time is now a clearer bottleneck, so future Radau work should prefer NTSS-like controller improvements and hot-path simplification over adding more generic branching
 - subsequent modernization on the fuller physical `temperature + Er` case established a cleaner current baseline:
   - `diffrax_kvaerno5` on the same physical case completes in about `328.7 s`
-  - current best custom Radau benchmark on that case is about:
-    - compile `~4m16s`
-    - total `solver.solve(...)` time `~596.3 s`
-    - `n_steps = 871`
+- current best custom Radau benchmark on that case is about:
+    - compile `~4m10s`
+    - total `solver.solve(...)` time `~567.2 s`
+    - `n_steps = 1229`
     - `failed_any = False`
 - compile-focused findings from recent experiments:
   - removing the carried `done` flag and trimming active-loop bookkeeping produced real wins
@@ -288,6 +349,14 @@ Observed result so far:
 - controller-focused findings from recent experiments:
   - a stronger accepted-step `h` holding rule improved the current physical benchmark without reducing step count materially
   - this suggests the next likely wins are in making accepted steps cheaper via better Jacobian/LU reuse rather than expecting large step-count drops from each small controller tweak
+  - a later relaxation of accepted-step growth caps improved the fuller physical benchmark further:
+    - compile improved to about `4m10s`
+    - total solve time improved to about `567.2 s`
+    - `n_steps` stayed high at about `1229`
+  - interpretation:
+    - the current controller is now in a faster high-step regime
+    - total runtime improved, but the method still does not look state-of-the-art in step economy
+    - compile time is still much larger than `diffrax_kvaerno5`
   - a later history-loosened Jacobian/LU reuse experiment was reverted after proving too aggressive:
     - compile improved to about `4m06s`
     - total solve time worsened to about `614.5 s`
@@ -330,21 +399,18 @@ Important next improvement steps for this phase:
   - allow longer reuse after easy accepted-step streaks with stable `h`
   - force earlier refresh after recent rejection or poor `theta`
   - keep this narrow so the current compile gains are not given back
-- before another solver-policy change, add lightweight Radau diagnostics on the current physical benchmark:
-  - accepted vs rejected counts
-  - average / max Newton iterations
-  - Jacobian reuse count
-  - LU reuse count
-  - compact `dt` and `theta_final` summaries
-  - use those diagnostics to decide whether the next targeted change should focus on:
-    - post-reject regrowth/shrink
-    - keep-same-`h`
-    - or Newton iteration behavior
 - consider simplifying the active Radau backend around the NTSS-like path:
   - `simplified` Newton
   - transformed blocks
   - direct factorization
   while keeping any legacy alternatives outside the primary benchmarked execution path if compile time continues to dominate
+- immediate next benchmark step:
+  - run `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml` with `save_n = 1`
+  - compare against the current `save_n = 10` reference:
+    - compile `~4m10s`
+    - total solve `~567.2 s`
+    - `n_steps = 1229`
+  - if compile remains too large after that, begin the planned Diffrax-like structural refactor for custom Radau
 - after factorization reuse is in place, re-benchmark the lean `temperature + Er` Radau case and compare:
   - compile time
   - total solve time
@@ -359,11 +425,14 @@ Still open in this phase:
 - next-session handoff:
   - keep using `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml` for Radau comparisons
   - compare against the current custom-Radau reference:
-    - compile `~4m16s`
-    - total solve `~596.3 s`
-    - `n_steps = 871`
+    - compile `~4m10s`
+    - total solve `~567.2 s`
+    - `n_steps = 1229`
   - keep `diffrax_kvaerno5` on the same physical case as the external comparison point:
     - total solve `~328.7 s`
+  - immediate next action:
+    - benchmark the same Radau case with `save_n = 1`
+    - then decide whether to start the Diffrax-like structural Radau refactor
     - `296` total steps (`239` accepted / `57` rejected)
 
 ### Next Recommended Steps

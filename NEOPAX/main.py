@@ -899,27 +899,6 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"n_steps={int(n_steps) if n_steps is not None else 'na'}",
                     f"failed_any={bool(jnp.any(jnp.asarray(failed_mask))) if failed_mask is not None else False}",
                 )
-            diagnostics = result.get("diagnostics", None)
-            if diagnostics is not None:
-                try:
-                    accepted_total = int(jnp.asarray(diagnostics.get("accepted_steps", 0)))
-                    rejected_total = int(jnp.asarray(diagnostics.get("rejected_steps", 0)))
-                    newton_sum = int(jnp.asarray(diagnostics.get("newton_iters_sum", 0)))
-                    avg_newton = (newton_sum / accepted_total) if accepted_total > 0 else 0.0
-                    print(
-                        "[NEOPAX] radau diagnostics:",
-                        f"accepted_total={accepted_total}",
-                        f"rejected_total={rejected_total}",
-                        f"jac_reuse={int(jnp.asarray(diagnostics.get('jacobian_reuse_steps', 0)))}",
-                        f"lu_reuse={int(jnp.asarray(diagnostics.get('lu_reuse_steps', 0)))}",
-                        f"avg_newton_iters={avg_newton:.2f}",
-                        f"max_newton_iters={int(jnp.asarray(diagnostics.get('newton_iters_max', 0)))}",
-                        f"theta_hard={int(jnp.asarray(diagnostics.get('theta_hard_steps', 0)))}",
-                        f"avg_dt_accepted={float(jnp.asarray(diagnostics.get('avg_dt_accepted', 0.0))):.6e}",
-                        f"avg_theta_accepted={float(jnp.asarray(diagnostics.get('avg_theta_accepted', 0.0))):.6e}",
-                    )
-                except Exception:
-                    pass
         print("[NEOPAX] solver.solve(...) returned")
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)
@@ -943,6 +922,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 n_times=plot_n_times,
                 reference_er_file=transport_cfg.get("transport_reference_er_file"),
                 overlay_reference_er=bool(transport_cfg.get("transport_overlay_reference_er", False)),
+                reference_profile_file=transport_cfg.get("transport_reference_profile_file", "./examples/inputs/NTSS_Test_init.h5"),
                 source_models=runtime.models.source,
                 species=runtime.species,
                 flux_model=runtime.models.flux,
@@ -1226,6 +1206,7 @@ def plot_transport_solution(
     n_times=1,
     reference_er_file=None,
     overlay_reference_er=False,
+    reference_profile_file=None,
     source_models=None,
     species=None,
     flux_model=None,
@@ -1323,6 +1304,90 @@ def plot_transport_solution(
     er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
     species_names = list(getattr(species, "names", ())) if species is not None else []
 
+    def _resolve_reference_path(path_value):
+        if path_value is None:
+            return None
+        candidate = Path(path_value)
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        return candidate if candidate.is_file() else None
+
+    def _load_ntss_reference_profiles(path_value):
+        candidate = _resolve_reference_path(path_value)
+        if candidate is None or rho is None:
+            return {}
+        try:
+            import h5py
+            import numpy as np
+
+            with h5py.File(candidate, "r") as f:
+                if "r" not in f:
+                    return {}
+                r_src = np.asarray(f["r"][()], dtype=float)
+                if r_src.ndim != 1 or r_src.size == 0:
+                    return {}
+                rho_src = r_src / max(float(r_src[-1]), 1.0e-14)
+                rho_dst = np.asarray(rho, dtype=float)
+
+                def _interp_dataset(name):
+                    if name not in f:
+                        return None
+                    values = np.asarray(f[name][()], dtype=float)
+                    if values.ndim != 1:
+                        return None
+                    if values.shape[0] == rho_dst.shape[0] and np.allclose(rho_src, rho_dst):
+                        return jnp.asarray(values)
+                    return jnp.asarray(np.interp(rho_dst, rho_src, values))
+
+                density_d = _interp_dataset("nD")
+                profiles = {
+                    "Er": _interp_dataset("Er"),
+                    "density": {
+                        "e": _interp_dataset("ne"),
+                        "D": density_d,
+                        "T": _interp_dataset("nT") if "nT" in f else density_d,
+                        "He": _interp_dataset("nHe"),
+                    },
+                    "temperature": {
+                        "e": _interp_dataset("Te"),
+                        "D": _interp_dataset("TD"),
+                        "T": _interp_dataset("Tt"),
+                    },
+                    "scalar": {},
+                }
+                vr = _interp_dataset("Vr")
+                flux_qe = _interp_dataset("FluxQe")
+                flux_qi = _interp_dataset("FluxQI")
+                flux_qe_neo = _interp_dataset("FluxQeNeo")
+                flux_qi_neo = _interp_dataset("FluxQiNeo")
+                flux_qe_ano = _interp_dataset("FluxQeAno")
+                flux_qi_ano = _interp_dataset("FluxQiAno")
+                alpha_power = _interp_dataset("AlphaPower")
+                ecrh_power = _interp_dataset("ECRHPower")
+                nbi_power_e = _interp_dataset("NBIPower_e")
+                nbi_power_i = _interp_dataset("NBIPower_I")
+                if vr is not None:
+                    if flux_qe is not None and flux_qi is not None:
+                        profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
+                    if flux_qe_neo is not None and flux_qi_neo is not None:
+                        profiles["scalar"]["Q_neo_sum"] = (flux_qe_neo + flux_qi_neo) * vr
+                    if flux_qe_ano is not None and flux_qi_ano is not None:
+                        profiles["scalar"]["Q_turb_sum"] = (flux_qe_ano + flux_qi_ano) * vr
+                if alpha_power is not None:
+                    profiles["scalar"]["alpha_power"] = alpha_power
+                power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
+                if power_terms:
+                    total_power_source = power_terms[0]
+                    for term in power_terms[1:]:
+                        total_power_source = total_power_source + term
+                    profiles["scalar"]["power_sources_total"] = total_power_source
+                return profiles
+        except Exception as exc:
+            print(f"Could not load NTSS benchmark profiles: {exc}")
+            return {}
+
+    ntss_reference = _load_ntss_reference_profiles(reference_profile_file)
+
     def _species_label(species_idx):
         if species_idx < len(species_names):
             return str(species_names[species_idx])
@@ -1343,6 +1408,20 @@ def plot_transport_solution(
             for species_idx in range(values.shape[0]):
                 linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
                 ax.plot(rho, values[species_idx], color=color, linestyle=linestyle, linewidth=1.8)
+        reference_kind = None
+        out_name_lower = out_name.lower()
+        if "density" in out_name_lower:
+            reference_kind = "density"
+        elif "temperature" in out_name_lower:
+            reference_kind = "temperature"
+        if reference_kind is not None and ntss_reference:
+            reference_profiles = ntss_reference.get(reference_kind, {})
+            for species_idx in range(species_count):
+                species_name = _species_label(species_idx)
+                ref_values = reference_profiles.get(species_name)
+                if ref_values is not None:
+                    linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                    ax.plot(rho, ref_values, color="black", linestyle=linestyle, linewidth=2.2, alpha=0.9)
 
         time_handles = []
         for time_idx, (time_label, _) in enumerate(series):
@@ -1355,6 +1434,13 @@ def plot_transport_solution(
             linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
             species_handles.append(
                 Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
+            )
+        if reference_kind is not None and any(
+            ntss_reference.get(reference_kind, {}).get(_species_label(species_idx)) is not None
+            for species_idx in range(species_count)
+        ):
+            species_handles.append(
+                Line2D([0], [0], color="black", linestyle="-", linewidth=2.2, label="NTSS reference")
             )
 
         ax.set_xlabel("rho")
@@ -1385,6 +1471,12 @@ def plot_transport_solution(
                 color = color_cycle[time_idx % len(color_cycle)]
                 label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
                 ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
+            reference_kind = "density" if "density" in out_stem.lower() else "temperature" if "temperature" in out_stem.lower() else None
+            if reference_kind is not None and ntss_reference:
+                species_name = _species_label(species_idx)
+                ref_values = ntss_reference.get(reference_kind, {}).get(species_name)
+                if ref_values is not None:
+                    ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label="NTSS reference")
             ax.set_xlabel("rho")
             ax.set_ylabel(ylabel)
             ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
@@ -1397,13 +1489,17 @@ def plot_transport_solution(
             written[_species_label(species_idx)] = out_png
         return written
 
-    def _plot_scalar_time_series(series, ylabel, out_name, title=None):
+    def _plot_scalar_time_series(series, ylabel, out_name, title=None, reference_key=None, reference_label="NTSS reference"):
         if not series:
             return None
         fig, ax = plt.subplots(figsize=(9, 4))
         for time_idx, (time_label, values) in enumerate(series):
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
             ax.plot(rho, values, linewidth=1.8, label=label)
+        if reference_key is not None:
+            ref_values = ntss_reference.get("scalar", {}).get(reference_key)
+            if ref_values is not None:
+                ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label=reference_label)
         ax.set_xlabel("rho")
         ax.set_ylabel(ylabel)
         if title is not None:
@@ -1445,6 +1541,8 @@ def plot_transport_solution(
     alpha_power_series = []
     pbrems_series = []
     total_heat_flux_series = []
+    neo_heat_flux_series = []
+    turb_heat_flux_series = []
     chi_t_series = []
     chi_n_series = []
     if source_models is not None and density_series and pressure_series and er_series and species is not None:
@@ -1540,6 +1638,11 @@ def plot_transport_solution(
                     value_arr = jnp.asarray(value)
                     if key.startswith("Q_"):
                         value_arr = _convert_heat_flux_density_to_mw(value_arr)
+                        scalar_sum = jnp.sum(value_arr, axis=0) if value_arr.ndim == 2 else value_arr
+                        if key == "Q_neo":
+                            neo_heat_flux_series.append((time_label, scalar_sum))
+                        elif key == "Q_turb":
+                            turb_heat_flux_series.append((time_label, scalar_sum))
                     flux_component_series[key].append((time_label, value_arr))
 
             if turbulence_plot_model is not None and hasattr(turbulence_plot_model, "chi_t"):
@@ -1577,6 +1680,7 @@ def plot_transport_solution(
         "Total Power Source [MW/m^3]",
         "transport_power_sources_total.png",
         title="Summed Power Sources vs rho",
+        reference_key="power_sources_total",
     )
 
     he_source_png = None
@@ -1593,6 +1697,23 @@ def plot_transport_solution(
         "Total Heat Flux [MW]",
         "transport_flux_Q_total_sum.png",
         title="Summed Total Heat Flux vs rho",
+        reference_key="Q_total_sum",
+    )
+
+    total_neo_heat_flux_png = _plot_scalar_time_series(
+        neo_heat_flux_series,
+        "Neo Heat Flux [MW]",
+        "transport_flux_Q_neo_sum.png",
+        title="Summed Neo Heat Flux vs rho",
+        reference_key="Q_neo_sum",
+    )
+
+    total_turb_heat_flux_png = _plot_scalar_time_series(
+        turb_heat_flux_series,
+        "Turbulent Heat Flux [MW]",
+        "transport_flux_Q_turb_sum.png",
+        title="Summed Turbulent Heat Flux vs rho",
+        reference_key="Q_turb_sum",
     )
 
     alpha_power_png = _plot_scalar_time_series(
@@ -1600,6 +1721,7 @@ def plot_transport_solution(
         "Alpha Power [MW/m^3]",
         "transport_pressure_source_AlphaPower.png",
         title="Alpha Power vs rho",
+        reference_key="alpha_power",
     )
 
     pbrems_png = _plot_scalar_time_series(
@@ -1665,23 +1787,26 @@ def plot_transport_solution(
             ax.plot(rho, er, label=label)
         if overlay_reference_er and rho is not None:
             try:
-                import h5py
-                import interpax
+                er_ref = ntss_reference.get("Er")
+                if er_ref is None:
+                    import h5py
+                    import interpax
 
-                if reference_er_file is None:
-                    candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
-                else:
-                    candidate = Path(reference_er_file)
-                    if not candidate.is_absolute():
-                        candidate = (Path.cwd() / candidate).resolve()
-                if candidate.is_file():
-                    with h5py.File(candidate, "r") as f:
-                        r_data = f["r"][()]
-                        er_data = f["Er"][()]
-                    if len(er_data) != len(rho):
-                        er_ref = interpax.interp1d(r_data, er_data, rho)
+                    if reference_er_file is None:
+                        candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
                     else:
-                        er_ref = er_data
+                        candidate = Path(reference_er_file)
+                        if not candidate.is_absolute():
+                            candidate = (Path.cwd() / candidate).resolve()
+                    if candidate.is_file():
+                        with h5py.File(candidate, "r") as f:
+                            r_data = f["r"][()]
+                            er_data = f["Er"][()]
+                        if len(er_data) != len(rho):
+                            er_ref = interpax.interp1d(r_data, er_data, rho)
+                        else:
+                            er_ref = er_data
+                if er_ref is not None:
                     ax.plot(rho, er_ref, color="black", linewidth=2.2, linestyle="--", label=f"reference Er")
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
@@ -1702,6 +1827,8 @@ def plot_transport_solution(
         "power_sources_total": power_sources_png,
         "helium_particle_source": he_source_png,
         "total_heat_flux": total_heat_flux_png,
+        "neo_heat_flux": total_neo_heat_flux_png,
+        "turbulent_heat_flux": total_turb_heat_flux_png,
         "alpha_power": alpha_power_png,
         "bremsstrahlung_power": pbrems_png,
         **flux_plot_paths,

@@ -1,0 +1,3 @@
+run_index,rho_index,rho,torflux,electron_model,species_name,charge,mass_mp,density_physical,temperature_physical,density_normalized_to_ref_ion,temperature_normalized_to_ref_ion,fprim_used,tprim_used,fprim_if_interpreted_per_torflux,tprim_if_interpreted_per_torflux,tau_e_used,Er_input
+0,25,0.5,0.25,adiabatic,D,1.0,2.0,2.1032373046875,13.525,1.0,1.0,0.01708568178758796,1.265235040355691,0.01708568178758796,1.265235040355691,1.0,31.136515093447496
+0,25,0.5,0.25,adiabatic,T,1.0,3.0,2.1032373046875,13.525,1.0,1.0,0.01708568178758796,1.265235040355691,0.01708568178758796,1.265235040355691,1.0,31.136515093447496
