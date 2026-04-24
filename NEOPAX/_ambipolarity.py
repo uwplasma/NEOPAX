@@ -1218,6 +1218,15 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         return root_finder(**args)
 
     batched_root_finder = jax.vmap(root_finder_for_radius)
+    database = params.get("database", None) if isinstance(params, dict) else None
+    interp_mode = 0
+    if database is not None and hasattr(database, "interp_mode"):
+        try:
+            interp_mode = int(np.asarray(database.interp_mode))
+        except Exception:
+            interp_mode = 0
+    force_eager_root_finder = bool(amb_cfg.get("er_ambipolar_disable_jit", False))
+    use_eager_root_finder = force_eager_root_finder or (interp_mode == 1)
 
     # Pure vmap or blocked vmap. Dispatch here so each mode keeps its own
     # smaller compiled program.
@@ -1225,21 +1234,29 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         # JIT the full radial batch once when we can fit it in memory.
         if debug_stage_markers and model_name == "two_stage":
             print(f"[NEOPAX] ambipolar two_stage radial solve: mode=full_vmap n_radial={n_radial}")
-        full_eval = jax.jit(batched_root_finder)
+        full_eval = batched_root_finder if use_eager_root_finder else jax.jit(batched_root_finder)
         t_eval = __import__("time").perf_counter() if debug_stage_markers and model_name == "two_stage" else None
         result = full_eval(jnp.arange(n_radial, dtype=jnp.int32))
         if debug_stage_markers and model_name == "two_stage":
             dt_eval = __import__("time").perf_counter() - t_eval
-            print(f"[NEOPAX] ambipolar two_stage full_vmap elapsed_s={dt_eval:.3f}")
+            jit_label = "eager" if use_eager_root_finder else "jit"
+            print(
+                f"[NEOPAX] ambipolar two_stage full_vmap elapsed_s={dt_eval:.3f} "
+                f"eval_mode={jit_label} interp_mode={interp_mode} "
+                f"disable_jit={force_eager_root_finder}"
+            )
         return tuple(np.asarray(arr)[:n_radial] for arr in result)
     else:
         # Blocked vmap for memory efficiency.
         block_size = er_ambipolar_blocksize
         n_blocks = (n_radial + block_size - 1) // block_size
         if debug_stage_markers and model_name == "two_stage":
+            jit_label = "eager" if use_eager_root_finder else "jit"
             print(
                 f"[NEOPAX] ambipolar two_stage radial solve: mode=blocked "
-                f"n_radial={n_radial} block_size={block_size} n_blocks={n_blocks}"
+                f"n_radial={n_radial} block_size={block_size} n_blocks={n_blocks} "
+                f"eval_mode={jit_label} interp_mode={interp_mode} "
+                f"disable_jit={force_eager_root_finder}"
             )
         if model_name in ("two_stage", "adaptive"):
             max_roots = int(amb_cfg.get("er_ambipolar_max_roots", 3))
@@ -1272,9 +1289,9 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
                 n_roots_b = jnp.where(valid, n_roots_b, 0)
                 return roots_b, entropies_b, best_b, n_roots_b
 
-            block_eval = jax.jit(evaluate_block)
+            block_eval = evaluate_block if use_eager_root_finder else jax.jit(evaluate_block)
         else:
-            block_eval = jax.jit(batched_root_finder)
+            block_eval = batched_root_finder if use_eager_root_finder else jax.jit(batched_root_finder)
 
         def init_arrays():
             nan_roots = jnp.full(roots_shape, jnp.nan, dtype=roots_dtype)
