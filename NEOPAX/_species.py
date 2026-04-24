@@ -145,7 +145,7 @@ def collisionality_ntss_like(
     )(species, species_a, species.species_indices, v, v_thermal[:, r_index])
     vn = v / jnp.maximum(v_thermal[species_a, r_index], 1.0e-30)
     vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
-    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab, axis=0) / vn3
+    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab[:, None], axis=0) / vn3
 
 
 def collisionality_ntss_like_local(
@@ -167,7 +167,7 @@ def collisionality_ntss_like_local(
     )(species, species_a, species.species_indices, v, v_thermal_local)
     vn = v / jnp.maximum(v_thermal_local[species_a], 1.0e-30)
     vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
-    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab, axis=0) / vn3
+    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab[:, None], axis=0) / vn3
 
 
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
