@@ -218,6 +218,23 @@ def _maybe_print_ntss_radial_grid_debug(config: dict, geometry, database) -> Non
     )
 
 
+def _maybe_print_neoclassical_mode_debug(config: dict) -> None:
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    neoclassical_cfg = config.get("neoclassical", {})
+    interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
+    collisionality_model = str(neoclassical_cfg.get("collisionality_model", "default")).strip().lower()
+    flux_model = str(neoclassical_cfg.get("flux_model", "monkes_database")).strip().lower()
+    entropy_model = str(neoclassical_cfg.get("entropy_model", flux_model)).strip().lower()
+    print(
+        "[NEOPAX] neoclassical modes: "
+        f"flux_model={flux_model} entropy_model={entropy_model} "
+        f"interpolation_mode={interp_mode} collisionality_model={collisionality_model}"
+    )
+
+
 def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
@@ -434,6 +451,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     energy_grid = _build_energy_grid(config)
     geometry = _build_geometry(config)
     database = _build_database(config, geometry)
+    _maybe_print_neoclassical_mode_debug(config)
     _maybe_print_ntss_radial_grid_debug(config, geometry, database)
     state = _build_state(config, geometry, species.number_species)
     solver_cfg = _normalize_solver_config(config)
