@@ -574,8 +574,9 @@ def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
     efield = jnp.where(xri <= 1.0e-30, 0.0, jnp.abs(grid_Er / xri))
     xer = jnp.log10(jnp.maximum(db.xref_l, efield))
 
-    exact_idx = jnp.argmin(jnp.abs(xri - arr))
-    is_exact = jnp.abs(xri - arr[exact_idx]) <= db.del_r
+    exact_mask = jnp.abs(xri - arr) <= db.del_r
+    exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
+    is_exact = jnp.any(exact_mask)
 
     nil = jnp.where(
         xri < arr[1],
