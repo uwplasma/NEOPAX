@@ -44,71 +44,84 @@ def _interp_linear(x, xs, ys, n):
     return y0 * (1.0 - w) + y1 * w
 
 
+def _interp_linear_segment(x, xs, ys, start, count):
+    size = xs.shape[0]
+    idxs = jnp.arange(size)
+    stop = start + count
+    valid = (idxs >= start) & (idxs < stop)
+    pair_valid = valid[:-1] & valid[1:]
+    cand = jnp.where(pair_valid & (x >= xs[:-1]), idxs[:-1], -1)
+    idx = jnp.maximum(jnp.max(cand), start)
+    idx = jnp.minimum(idx, jnp.maximum(stop - 2, start))
+    x0 = xs[idx]
+    x1 = xs[idx + 1]
+    y0 = ys[idx]
+    y1 = ys[idx + 1]
+    w = jnp.where(x1 > x0, (x - x0) / (x1 - x0), 0.0)
+    return y0 * (1.0 - w) + y1 * w
+
+
 def _eval_radius_node(ir, xnu, xer, efield, db):
     icu0 = db.nval0[ir]
     icue = db.icnur[ir]
+    xs0 = db.axnu0[ir]
+    g110 = db.ag110[ir]
+    g130 = db.ag130[ir]
+    g330 = db.ag330[ir]
+    avgs_full = db.axnuar[ir]
+    aref_full = db.aref[ir]
+    ag11_full = db.ag11[ir]
+    ag13_full = db.ag13[ir]
+    ag33_full = db.ag33[ir]
 
     def zero_field():
-        xs = db.axnu0[ir, :icu0]
-        g11s = db.ag110[ir, :icu0]
-        g13s = db.ag130[ir, :icu0]
-        g33s = db.ag330[ir, :icu0]
-        high = jnp.asarray([g11s[-1] - xs[-1] + xnu, db.x13_l, g33s[-1]])
-        low = jnp.asarray([g11s[0] + xs[0] - xnu, g13s[0], g33s[0]])
+        last0 = icu0 - 1
+        high = jnp.asarray([g110[last0] - xs0[last0] + xnu, db.x13_l, g330[last0]])
+        low = jnp.asarray([g110[0] + xs0[0] - xnu, g130[0], g330[0]])
         mid = jnp.asarray([
-            _interp_linear(xnu, xs, g11s, icu0),
-            _interp_linear(xnu, xs, g13s, icu0),
-            _interp_linear(xnu, xs, g33s, icu0),
+            _interp_linear_segment(xnu, xs0, g110, 0, icu0),
+            _interp_linear_segment(xnu, xs0, g130, 0, icu0),
+            _interp_linear_segment(xnu, xs0, g330, 0, icu0),
         ])
         return jnp.where(
-            xnu > xs[-1],
+            xnu > xs0[last0],
             high,
-            jnp.where(xnu < xs[0], low, mid),
+            jnp.where(xnu < xs0[0], low, mid),
         )
 
     def group_eval(ic):
         start = db.inulr[ir, ic]
-        stop = db.inugr[ir, ic] + 1
-        n = stop - start
-        aref = db.aref[ir, start:stop]
-        g11 = db.ag11[ir, start:stop]
-        g13 = db.ag13[ir, start:stop]
-        g33 = db.ag33[ir, start:stop]
-        first = aref[0]
-        last = aref[n - 1]
+        n = db.inugr[ir, ic] - start + 1
+        first = aref_full[start]
+        last = aref_full[start + n - 1]
         x11 = jnp.where(
             xer <= first,
-            g11[0],
-            jnp.where(xer > last, db.x11_l, _interp_linear(xer, aref, g11, n)),
+            ag11_full[start],
+            jnp.where(xer > last, db.x11_l, _interp_linear_segment(xer, aref_full, ag11_full, start, n)),
         )
         x13 = jnp.where(
             xer <= first,
-            g13[0],
-            jnp.where(xer > last, db.x13_l, _interp_linear(xer, aref, g13, n)),
+            ag13_full[start],
+            jnp.where(xer > last, db.x13_l, _interp_linear_segment(xer, aref_full, ag13_full, start, n)),
         )
         x33 = jnp.where(
             xer <= first,
-            g33[0],
-            jnp.where(xer > last, g33[n - 1], _interp_linear(xer, aref, g33, n)),
+            ag33_full[start],
+            jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(xer, aref_full, ag33_full, start, n)),
         )
         return jnp.asarray([x11, x13, x33])
 
     def positive_field():
-        avgs = db.axnuar[ir, :icue]
-
         def low_branch():
             ic = 0
             start = db.inulr[ir, ic]
-            stop = db.inugr[ir, ic] + 1
-            n = stop - start
-            aref = db.aref[ir, start:stop]
-            g11 = db.ag11[ir, start:stop]
-            g13 = db.ag13[ir, start:stop]
-            g33 = db.ag33[ir, start:stop]
-            xer_h = (avgs[0] - xnu) / 3.0 + xer
-            x11 = jnp.where(xer_h > aref[n - 1], db.x11_l, _interp_linear(xer_h, aref, g11, n))
-            x13 = jnp.where(xer > aref[n - 1], db.x13_l, _interp_linear(jnp.maximum(xer, aref[0]), aref, g13, n))
-            x33 = jnp.where(xer > aref[n - 1], g33[n - 1], _interp_linear(jnp.maximum(xer, aref[0]), aref, g33, n))
+            n = db.inugr[ir, ic] - start + 1
+            first = aref_full[start]
+            last = aref_full[start + n - 1]
+            xer_h = (avgs_full[0] - xnu) / 3.0 + xer
+            x11 = jnp.where(xer_h > last, db.x11_l, _interp_linear_segment(xer_h, aref_full, ag11_full, start, n))
+            x13 = jnp.where(xer > last, db.x13_l, _interp_linear_segment(jnp.maximum(xer, first), aref_full, ag13_full, start, n))
+            x33 = jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(jnp.maximum(xer, first), aref_full, ag33_full, start, n))
             return jnp.asarray([x11, x13, x33])
 
         def high_branch():
@@ -116,31 +129,32 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
 
         def middle_branch():
             ic_l = jnp.where(
-                xnu <= avgs[1],
+                xnu <= avgs_full[1],
                 0,
                 jnp.where(
-                    xnu >= avgs[icue - 2],
+                    xnu >= avgs_full[icue - 2],
                     icue - 3,
-                    jnp.searchsorted(avgs[2:icue - 1], xnu, side="right") + 1,
+                    jnp.sum(((jnp.arange(avgs_full.shape[0]) < icue) & (xnu >= avgs_full)).astype(jnp.int32)) - 2,
                 ),
             )
-            noic = jnp.where((xnu <= avgs[1]) | (xnu >= avgs[icue - 2]), 3, 4)
-            atc = jax.vmap(group_eval)(jnp.arange(ic_l, ic_l + noic))
+            noic = jnp.where((xnu <= avgs_full[1]) | (xnu >= avgs_full[icue - 2]), 3, 4)
+            ic_idx = jnp.minimum(ic_l + jnp.arange(4, dtype=jnp.int32), icue - 1)
+            atc = jax.vmap(group_eval)(ic_idx)
 
             def lag3():
-                x0 = avgs[ic_l]
-                x1 = avgs[ic_l + 1]
-                x2 = avgs[ic_l + 2]
+                x0 = avgs_full[ic_l]
+                x1 = avgs_full[ic_l + 1]
+                x2 = avgs_full[ic_l + 2]
                 y11 = _lagrange3(xnu, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0])
                 y13 = _lagrange3(xnu, x0, x1, x2, atc[0, 1], atc[1, 1], atc[2, 1])
                 y33 = _lagrange3(xnu, x0, x1, x2, atc[0, 2], atc[1, 2], atc[2, 2])
                 return jnp.asarray([y11, y13, y33])
 
             def but4():
-                x0 = avgs[ic_l]
-                x1 = avgs[ic_l + 1]
-                x2 = avgs[ic_l + 2]
-                x3 = avgs[ic_l + 3]
+                x0 = avgs_full[ic_l]
+                x1 = avgs_full[ic_l + 1]
+                x2 = avgs_full[ic_l + 2]
+                x3 = avgs_full[ic_l + 3]
                 y11 = _butland4(xnu, x0, x1, x2, x3, atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0], db.gmix_nu)
                 y13 = _butland4(xnu, x0, x1, x2, x3, atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1], db.gmix_nu)
                 y33 = _butland4(xnu, x0, x1, x2, x3, atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2], db.gmix_nu)
@@ -149,9 +163,9 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
             return jax.lax.cond(noic == 3, lag3, but4)
 
         return jax.lax.cond(
-            xnu < avgs[0],
+            xnu < avgs_full[0],
             low_branch,
-            lambda: jax.lax.cond(xnu > avgs[icue - 1], high_branch, middle_branch),
+            lambda: jax.lax.cond(xnu > avgs_full[icue - 1], high_branch, middle_branch),
         )
 
     return jax.lax.cond(efield <= db.xref_l, zero_field, positive_field)
