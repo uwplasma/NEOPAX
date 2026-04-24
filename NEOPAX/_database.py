@@ -37,6 +37,7 @@ class Monoenergetic:
     D11_log: Float[Array,'...']
     D13 : Float[Array,'...'] 
     D33 : Float[Array,'...']
+    interp_mode: int
 
     def __init__(
         self,
@@ -57,6 +58,7 @@ class Monoenergetic:
         self.D11_log=D11_log
         self.D13=D13
         self.D33=D33
+        self.interp_mode = jnp.asarray(kwargs.pop("interp_mode", 0), dtype=jnp.int32)
 
         # JAX dataclass pytree reconstruction may provide all derived fields
         # as keyword payload. If present, use it directly.
@@ -97,6 +99,7 @@ class Monoenergetic:
     def read_monkes(cls,
         a_b,                    
         monkes_file,
+        interpolation_mode="generic",
     ):
         """Construct Field from BOOZ_XFORM file.
 
@@ -144,6 +147,7 @@ class Monoenergetic:
         data["D11_log"] = D11_log
         data["D13"] = D13
         data["D33"] = D33
+        data["interp_mode"] = 1 if str(interpolation_mode).strip().lower() in {"ntss", "ntss_like"} else 0
 
         return cls(**data)
 
@@ -157,7 +161,8 @@ class Monoenergetic:
         drds,
         D11,
         D13,
-        D33
+        D33,
+        interpolation_mode="generic",
     ):
         """Construct Field from BOOZ_XFORM file.
 
@@ -191,6 +196,7 @@ class Monoenergetic:
         data["D11_log"] = D11_log
         data["D13"] = D13
         data["D33"] = D33
+        data["interp_mode"] = 1 if str(interpolation_mode).strip().lower() in {"ntss", "ntss_like"} else 0
 
         return cls(**data)
 
