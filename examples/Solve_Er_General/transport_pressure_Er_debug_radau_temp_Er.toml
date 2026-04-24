@@ -18,6 +18,9 @@ entropy_model = "monkes_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
 
 
+
+
+
 [ambipolarity]
 er_ambipolar_method = "two_stage"
 er_ambipolar_scan_min = -50.0

@@ -58,7 +58,14 @@ class Monoenergetic:
         self.D11_log=D11_log
         self.D13=D13
         self.D33=D33
-        self.interp_mode = jnp.asarray(kwargs.pop("interp_mode", 0), dtype=jnp.int32)
+        interp_mode_value = kwargs.pop("interp_mode", 0)
+        try:
+            self.interp_mode = jnp.asarray(interp_mode_value, dtype=jnp.int32)
+        except TypeError:
+            # JAX pytree/dataclass reconstruction can temporarily feed a
+            # non-array object sentinel through __init__. Fall back to the
+            # default generic interpolation mode in that case.
+            self.interp_mode = jnp.asarray(0, dtype=jnp.int32)
 
         # JAX dataclass pytree reconstruction may provide all derived fields
         # as keyword payload. If present, use it directly.
