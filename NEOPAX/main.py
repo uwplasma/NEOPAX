@@ -143,8 +143,7 @@ def _build_geometry(config: dict):
 def _build_database(config: dict, geometry):
     neoclassical_file = config.get("neoclassical", {}).get("neoclassical_file")
     if neoclassical_file and geometry is not None:
-        interpolation_mode = config.get("neoclassical", {}).get("interpolation_mode", "generic")
-        return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file, interpolation_mode=interpolation_mode)
+        return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
     return None
 
 
