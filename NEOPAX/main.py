@@ -156,6 +156,68 @@ def _build_database(config: dict, geometry):
     return None
 
 
+def _maybe_print_ntss_radial_grid_debug(config: dict, geometry, database) -> None:
+    if geometry is None or database is None:
+        return
+    interp_mode = str(
+        config.get("neoclassical", {}).get("interpolation_mode", "generic")
+    ).strip().lower()
+    if interp_mode != "ntss_preprocessed":
+        return
+
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    geom_rho = getattr(geometry, "rho_grid", None)
+    geom_r = getattr(geometry, "r_grid", None)
+    db_rho = getattr(database, "rho", None)
+    db_r = getattr(database, "r_grid", None)
+    if geom_rho is None or geom_r is None or db_rho is None or db_r is None:
+        return
+
+    geom_rho_np = jnp.asarray(geom_rho)
+    geom_r_np = jnp.asarray(geom_r)
+    db_rho_np = jnp.asarray(db_rho)
+    db_r_np = jnp.asarray(db_r)
+
+    rho_len = min(int(geom_rho_np.size), int(db_rho_np.size))
+    r_len = min(int(geom_r_np.size), int(db_r_np.size))
+    max_abs_rho_diff = (
+        float(jnp.max(jnp.abs(geom_rho_np[:rho_len] - db_rho_np[:rho_len])))
+        if rho_len > 0
+        else float("nan")
+    )
+    max_abs_r_diff = (
+        float(jnp.max(jnp.abs(geom_r_np[:r_len] - db_r_np[:r_len])))
+        if r_len > 0
+        else float("nan")
+    )
+
+    def _sample(arr):
+        arr = jnp.asarray(arr)
+        if arr.size <= 6:
+            return [float(x) for x in arr]
+        head = [float(x) for x in arr[:3]]
+        tail = [float(x) for x in arr[-3:]]
+        return head + tail
+
+    print(
+        "[NEOPAX] ntss radial grid check: "
+        f"n_geom={int(geom_rho_np.size)} n_db={int(db_rho_np.size)} "
+        f"max_abs_rho_diff={max_abs_rho_diff:.3e} "
+        f"max_abs_r_diff={max_abs_r_diff:.3e}"
+    )
+    print(
+        "[NEOPAX] ntss radial grid samples: "
+        f"geom_rho={_sample(geom_rho_np)} db_rho={_sample(db_rho_np)}"
+    )
+    print(
+        "[NEOPAX] ntss radius samples [m]: "
+        f"geom_r={_sample(geom_r_np)} db_r={_sample(db_r_np)}"
+    )
+
+
 def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
@@ -366,6 +428,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     energy_grid = _build_energy_grid(config)
     geometry = _build_geometry(config)
     database = _build_database(config, geometry)
+    _maybe_print_ntss_radial_grid_debug(config, geometry, database)
     state = _build_state(config, geometry, species.number_species)
     solver_cfg = _normalize_solver_config(config)
     source_models = build_source_models_from_config(config, species)
