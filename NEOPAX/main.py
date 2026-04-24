@@ -21,6 +21,7 @@ from ._ambipolarity import (
     write_ambipolarity_hdf5,
 )
 from ._database import Monoenergetic
+from ._database_preprocessed import PreprocessedMonoenergetic3D
 from ._entropy_models import get_entropy_model
 from ._profiles import build_profiles
 from ._source_models import (
@@ -143,6 +144,11 @@ def _build_geometry(config: dict):
 def _build_database(config: dict, geometry):
     neoclassical_file = config.get("neoclassical", {}).get("neoclassical_file")
     if neoclassical_file and geometry is not None:
+        interp_mode = str(
+            config.get("neoclassical", {}).get("interpolation_mode", "generic")
+        ).strip().lower()
+        if interp_mode == "preprocessed_3d":
+            return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
     return None
 
