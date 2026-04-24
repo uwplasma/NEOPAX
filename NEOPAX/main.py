@@ -346,7 +346,13 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
     neoclassical_model = (
         _build_file_model("neoclassical", neoclassical_cfg)
         if neoclassical_name == "fluxes_r_file"
-        else neoclassical_factory(species, energy_grid, geometry, database)
+        else neoclassical_factory(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            collisionality_model=neoclassical_cfg.get("collisionality_model", "default"),
+        )
     )
     if turbulence_factory is None:
         turbulence_model = (

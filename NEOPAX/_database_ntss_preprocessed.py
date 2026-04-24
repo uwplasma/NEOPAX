@@ -251,7 +251,14 @@ class NTSSPreprocessedMonoenergetic:
     @classmethod
     def read_monkes(cls, geometry, monkes_file):
         file = h5.File(monkes_file, "r")
-        n_r = file["rho"].shape[0]
+        rho_db = np.asarray(file["rho"][()], dtype=float)
+        n_r = rho_db.shape[0]
+        geom_rho = np.asarray(geometry.rho_grid, dtype=float)
+
+        def _interp_from_geometry(values):
+            values = np.asarray(values, dtype=float)
+            return np.interp(rho_db, geom_rho, values)
+
         optional = {}
         for h5_key, data_key, default in (
             ("lc_fit", "lc_fit_in", np.zeros(n_r, dtype=bool)),
@@ -264,9 +271,9 @@ class NTSSPreprocessedMonoenergetic:
         ):
             optional[data_key] = file[h5_key][()] if h5_key in file else default
         if optional["akn_in"] is None:
-            optional["akn_in"] = np.asarray(geometry.curvature)
+            optional["akn_in"] = _interp_from_geometry(geometry.curvature)
         if optional["air_in"] is None:
-            optional["air_in"] = np.asarray(geometry.iota)
+            optional["air_in"] = _interp_from_geometry(geometry.iota)
         optional["xrm_in"] = None
         for h5_key in ("xrm", "Rmajor", "major_radius"):
             if h5_key in file:
@@ -275,12 +282,15 @@ class NTSSPreprocessedMonoenergetic:
         if optional["xrm_in"] is None:
             r = np.asarray(geometry.r_grid)
             eps = np.asarray(geometry.epsilon_t)
-            local_R = np.where(np.abs(eps) > 1.0e-12, r / eps, float(geometry.R0))
-            local_R[0] = float(geometry.R0)
-            optional["xrm_in"] = local_R
+            R0 = float(geometry.R0)
+            safe_eps = np.where(np.abs(eps) > 1.0e-12, eps, 1.0)
+            local_R = r / safe_eps
+            local_R = np.where(np.abs(eps) > 1.0e-12, local_R, R0)
+            local_R[0] = R0
+            optional["xrm_in"] = _interp_from_geometry(local_R)
         data = _prepare_ntss_arrays(
             a_b=geometry.a_b,
-            rho=file["rho"][()],
+            rho=rho_db,
             nu_v=file["nu_v"][()],
             Er=file["Er"][()],
             drds=file["drds"][()],

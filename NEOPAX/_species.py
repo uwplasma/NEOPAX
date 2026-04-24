@@ -125,6 +125,51 @@ def collisionality_local(species_a: int, species: Species, v: float, density_loc
     return nu
 
 
+def collisionality_ntss_like(
+    species_a: int,
+    species: Species,
+    v: float,
+    r_index: int,
+    density,
+    temperature,
+    v_thermal,
+) -> float:
+    """NTSSfusion-like effective collision frequency cnue(v)."""
+    tau_ab = jax.vmap(
+        tau_ab_ntss_like,
+        in_axes=(None, None, 0, None, None, None, None),
+    )(species, species_a, species.species_indices, r_index, density, temperature, v_thermal)
+    kernel = jax.vmap(
+        ntss_collision_kernel,
+        in_axes=(None, None, 0, None, None),
+    )(species, species_a, species.species_indices, v, v_thermal[:, r_index])
+    vn = v / jnp.maximum(v_thermal[species_a, r_index], 1.0e-30)
+    vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
+    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab, axis=0) / vn3
+
+
+def collisionality_ntss_like_local(
+    species_a: int,
+    species: Species,
+    v: float,
+    density_local,
+    temperature_local,
+    v_thermal_local,
+) -> float:
+    """Local NTSSfusion-like effective collision frequency cnue(v)."""
+    tau_ab = jax.vmap(
+        tau_ab_ntss_like_local,
+        in_axes=(None, None, 0, None, None, None),
+    )(species, species_a, species.species_indices, density_local, temperature_local, v_thermal_local)
+    kernel = jax.vmap(
+        ntss_collision_kernel,
+        in_axes=(None, None, 0, None, None),
+    )(species, species_a, species.species_indices, v, v_thermal_local)
+    vn = v / jnp.maximum(v_thermal_local[species_a], 1.0e-30)
+    vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
+    return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab, axis=0) / vn3
+
+
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
            density, temperature, v_thermal) -> float:
     """Pairwise pitch-angle scattering frequency for species a against species b."""
@@ -191,6 +236,69 @@ def coulomb_logarithm_local(species: Species, species_a: int, species_b: int,
     ne_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[0]
     lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
     return lnL
+
+
+def tau_ab_ntss_like(
+    species: Species,
+    species_a: int,
+    species_b: int,
+    r_index: int,
+    density,
+    temperature,
+    v_thermal,
+) -> float:
+    """NTSSfusion-like test-particle collision time tau(a,b)."""
+    del v_thermal
+    lnL = coulomb_logarithm(species, species_a, species_b, r_index, temperature, density)
+    charge_prod = jnp.maximum(jnp.abs(species.charge_qp[species_a] * species.charge_qp[species_b]), 1.0e-30)
+    mass_a = species.mass[species_a]
+    temperature_a_eV = STATE_TEMPERATURE_TO_EV * temperature[species_a, r_index]
+    density_b_m3 = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
+    return (
+        3.0
+        * jnp.power(epsilon_0 / (charge_prod * elementary_charge), 2)
+        / elementary_charge
+        * jnp.sqrt(mass_a / elementary_charge * jnp.power(2.0 * jnp.pi * temperature_a_eV, 3))
+        / (elementary_charge * jnp.maximum(density_b_m3, 1.0e-30) * lnL)
+    )
+
+
+def tau_ab_ntss_like_local(
+    species: Species,
+    species_a: int,
+    species_b: int,
+    density_local,
+    temperature_local,
+    v_thermal_local,
+) -> float:
+    """Local NTSSfusion-like test-particle collision time tau(a,b)."""
+    del v_thermal_local
+    lnL = coulomb_logarithm_local(species, species_a, species_b, temperature_local, density_local)
+    charge_prod = jnp.maximum(jnp.abs(species.charge_qp[species_a] * species.charge_qp[species_b]), 1.0e-30)
+    mass_a = species.mass[species_a]
+    temperature_a_eV = STATE_TEMPERATURE_TO_EV * temperature_local[species_a]
+    density_b_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[species_b]
+    return (
+        3.0
+        * jnp.power(epsilon_0 / (charge_prod * elementary_charge), 2)
+        / elementary_charge
+        * jnp.sqrt(mass_a / elementary_charge * jnp.power(2.0 * jnp.pi * temperature_a_eV, 3))
+        / (elementary_charge * jnp.maximum(density_b_m3, 1.0e-30) * lnL)
+    )
+
+
+def ntss_collision_kernel(
+    species: Species,
+    species_a: int,
+    species_b: int,
+    v: float,
+    v_thermal_b,
+) -> float:
+    """Velocity kernel used by NTSSfusion for effective collisionality."""
+    del species, species_a, species_b
+    x = jnp.maximum((v / jnp.maximum(v_thermal_b, 1.0e-30)) ** 2, 1.0e-30)
+    sqx = jnp.sqrt(x)
+    return jax.scipy.special.erf(sqx) * (1.0 - 0.5 / x) + jnp.exp(-x) / (sqx * jnp.sqrt(jnp.pi))
 
 
 def impact_parameter(species: Species, species_a: int, species_b: int, r_index: int,

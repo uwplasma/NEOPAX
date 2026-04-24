@@ -455,6 +455,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
     energy_grid: Any
     geometry: Any
     database: Any
+    collisionality_model: str = "default"
 
     def __call__(self, state) -> dict:
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
@@ -465,6 +466,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             state.Er,
             state.temperature,
             state.density,
+            collisionality_model=self.collisionality_model,
         )
         return {
             "Gamma": gamma_neo,
@@ -489,6 +491,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
                 er_profile,
                 state.temperature,
                 state.density,
+                collisionality_model=self.collisionality_model,
             )
             return gamma_neo[:, radius_index]
 
@@ -530,6 +533,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             face_state.density,
             dndr_faces,
             dTdr_faces,
+            collisionality_model=self.collisionality_model,
         )
         return {
             "Gamma": gamma_neo,
@@ -807,11 +811,12 @@ def build_transport_flux_model(neo_model: TransportFluxModelBase,
 
 register_transport_flux_model(
     "monkes_database",
-    lambda species, energy_grid, geometry, database: MonkesDatabaseTransportModel(
+    lambda species, energy_grid, geometry, database, collisionality_model="default": MonkesDatabaseTransportModel(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,
         database=database,
+        collisionality_model=collisionality_model,
     ),
 )
 
