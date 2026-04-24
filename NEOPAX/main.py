@@ -31,8 +31,8 @@ from ._source_models import (
     build_source_models_from_config,
     sum_source_components,
 )
-from ._species import Species
-from ._state import TransportState
+from ._species import Species, collisionality, collisionality_ntss_like
+from ._state import TransportState, get_v_thermal
 from ._transport_flux_models import (
     FluxesRFileTransportModel,
     ZeroTransportModel,
@@ -233,6 +233,50 @@ def _maybe_print_neoclassical_mode_debug(config: dict) -> None:
         f"flux_model={flux_model} entropy_model={entropy_model} "
         f"interpolation_mode={interp_mode} collisionality_model={collisionality_model}"
     )
+
+
+def _maybe_print_collisionality_debug(config: dict, species, energy_grid, geometry, state) -> None:
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    neoclassical_cfg = config.get("neoclassical", {})
+    interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
+    if interp_mode != "ntss_preprocessed":
+        return
+
+    if geometry is None or state is None:
+        return
+
+    rho_targets = jnp.asarray([0.12247, 0.5, 0.875], dtype=geometry.rho_grid.dtype)
+    rho_grid = jnp.asarray(geometry.rho_grid)
+    idxs = [int(jnp.argmin(jnp.abs(rho_grid - rho_t))) for rho_t in rho_targets]
+    idxs = sorted(set(idxs))
+
+    species_index = 0
+    species_name = species.names[species_index] if species.names and species_index < len(species.names) else str(species_index)
+    v_thermal = get_v_thermal(species.mass, state.temperature)
+
+    lines = []
+    for r_index in idxs:
+        vth = v_thermal[species_index, r_index]
+        v_grid = energy_grid.v_norm * vth
+        nu_default = collisionality(species_index, species, v_grid, r_index, state.density, state.temperature, v_thermal) / v_grid
+        nu_ntss = jnp.full_like(
+            v_grid,
+            collisionality_ntss_like(species_index, species, v_grid, r_index, state.density, state.temperature, v_thermal)
+            / jnp.maximum(vth, 1.0e-30),
+        )
+        default_log = [float(x) for x in jnp.log10(jnp.maximum(nu_default, 1.0e-300))]
+        ntss_log = [float(x) for x in jnp.log10(jnp.maximum(nu_ntss, 1.0e-300))]
+        lines.append(
+            f"rho={float(rho_grid[r_index]):.5f} r_index={r_index} "
+            f"default_log10_cmul={default_log} ntss_like_log10_cmul={ntss_log}"
+        )
+
+    print(f"[NEOPAX] collisionality debug: species={species_name} n_x={int(energy_grid.v_norm.size)}")
+    for line in lines:
+        print(f"[NEOPAX] collisionality debug: {line}")
 
 
 def _build_state(config: dict, geometry, n_species: int):
@@ -454,6 +498,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     _maybe_print_neoclassical_mode_debug(config)
     _maybe_print_ntss_radial_grid_debug(config, geometry, database)
     state = _build_state(config, geometry, species.number_species)
+    _maybe_print_collisionality_debug(config, species, energy_grid, geometry, state)
     solver_cfg = _normalize_solver_config(config)
     source_models = build_source_models_from_config(config, species)
     models = Models(
