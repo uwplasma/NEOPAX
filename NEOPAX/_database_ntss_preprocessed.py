@@ -20,7 +20,25 @@ X13_L = 0.0
 DEL_R = 1.0e-3
 
 
-def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
+def _prepare_ntss_arrays(
+    a_b,
+    rho,
+    nu_v,
+    Er,
+    drds,
+    D11,
+    D13,
+    D33,
+    *,
+    lc_fit_in=None,
+    ag11_0_in=None,
+    ag11_sq_in=None,
+    aefld_u_in=None,
+    aex_er_in=None,
+    akn_in=None,
+    air_in=None,
+    xrm_in=None,
+):
     rho = np.asarray(rho, dtype=float)
     nu_v = np.asarray(nu_v, dtype=float)
     Er = np.asarray(Er, dtype=float)
@@ -54,14 +72,35 @@ def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
     inulr = np.zeros((n_r, max_groups), dtype=np.int32)
     inugr = np.zeros((n_r, max_groups), dtype=np.int32)
     icnur = np.zeros(n_r, dtype=np.int32)
-    lc_fit = np.zeros(n_r, dtype=bool)
-    ag11_0 = np.zeros(n_r, dtype=float)
-    ag11_sq = np.ones(n_r, dtype=float)
-    aefld_u = np.zeros(n_r, dtype=float)
-    aex_er = np.ones(n_r, dtype=float)
-    akn = np.ones(n_r, dtype=float)
-    air = np.ones(n_r, dtype=float)
-    xrm = float(np.max(r_grid) * 2.0) if n_r > 0 else 1.0
+    lc_fit = np.asarray(
+        np.zeros(n_r, dtype=bool) if lc_fit_in is None else lc_fit_in,
+        dtype=bool,
+    )
+    ag11_0 = np.asarray(
+        np.zeros(n_r, dtype=float) if ag11_0_in is None else ag11_0_in,
+        dtype=float,
+    )
+    ag11_sq = np.asarray(
+        np.ones(n_r, dtype=float) if ag11_sq_in is None else ag11_sq_in,
+        dtype=float,
+    )
+    aefld_u = np.asarray(
+        np.zeros(n_r, dtype=float) if aefld_u_in is None else aefld_u_in,
+        dtype=float,
+    )
+    aex_er = np.asarray(
+        np.ones(n_r, dtype=float) if aex_er_in is None else aex_er_in,
+        dtype=float,
+    )
+    akn = np.asarray(
+        np.ones(n_r, dtype=float) if akn_in is None else akn_in,
+        dtype=float,
+    )
+    air = np.asarray(
+        np.ones(n_r, dtype=float) if air_in is None else air_in,
+        dtype=float,
+    )
+    xrm = float(xrm_in) if xrm_in is not None else float(np.max(r_grid) * 2.0) if n_r > 0 else 1.0
 
     for ir in range(n_r):
         D11[ir, :, :] *= drds[ir] ** 2
@@ -82,7 +121,7 @@ def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
                     D13[ir, inu, ier],
                     abs(D33[ir, inu, ier]),
                 )
-                if xref_raw < XREF_L:
+                if abs(Er[0, ier]) < XREF_L:
                     zero_rows.append((xnu, row[2], row[3], row[4]))
                 finite_rows.append(row)
 
@@ -97,59 +136,39 @@ def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
 
         finite_rows.sort(key=lambda row: row[0])
         nve = len(finite_rows)
-        nvale[ir] = nve
-        for i, (xnu, xer, g11, g13, g33) in enumerate(finite_rows):
-            axnu[ir, i] = xnu
-            aref[ir, i] = xer
-            ag11[ir, i] = g11
-            ag13[ir, i] = g13
-            ag33[ir, i] = g33
 
-        groups = []
-        ml = 0
-        while ml < max(0, nve - 1):
-            mg = ml
-            xnuav = axnu[ir, mg]
-            while mg + 1 < nve and abs(axnu[ir, mg + 1] - axnu[ir, ml]) < DXNU:
-                mg += 1
-                xnuav += axnu[ir, mg]
-            noe = mg - ml + 1
-            next_ml = mg + 1
-            if noe > 2:
-                idx = np.arange(ml, mg + 1)
-                order = np.argsort(aref[ir, idx], kind="mergesort")
-                idx_sorted = idx[order]
-                aref_block = aref[ir, idx_sorted].copy()
-                ag11_block = ag11[ir, idx_sorted].copy()
-                ag13_block = ag13[ir, idx_sorted].copy()
-                ag33_block = ag33[ir, idx_sorted].copy()
-                if aref_block.shape[0] >= 2:
-                    aref_block[0] = max(aref_block[0], aref_block[1] - DREF)
-                groups.append(
-                    (
-                        float(xnuav / noe),
-                        aref_block,
-                        ag11_block,
-                        ag13_block,
-                        ag33_block,
-                    )
-                )
-            ml = next_ml
-
-        icnu = len(groups)
-        icnur[ir] = icnu
+        icnu = 0
         pos = 0
-        for ic, (xnu_avg, aref_block, ag11_block, ag13_block, ag33_block) in enumerate(groups):
-            start = pos
-            end = pos + aref_block.shape[0]
-            axnuar[ir, ic] = xnu_avg
-            inulr[ir, ic] = start
-            inugr[ir, ic] = end - 1
-            aref[ir, start:end] = aref_block
-            ag11[ir, start:end] = ag11_block
-            ag13[ir, start:end] = ag13_block
-            ag33[ir, start:end] = ag33_block
-            pos = end
+        ml = 0
+        while ml < nve:
+            mg = ml
+            xnuav = finite_rows[mg][0]
+            while mg + 1 < nve and abs(finite_rows[mg + 1][0] - finite_rows[ml][0]) < DXNU:
+                mg += 1
+                xnuav += finite_rows[mg][0]
+            noe = mg - ml + 1
+            if noe > 2:
+                block = finite_rows[ml : mg + 1]
+                block.sort(key=lambda row: row[1])
+                start = pos
+                end = pos + noe
+                inulr[ir, icnu] = start
+                inugr[ir, icnu] = end - 1
+                axnuar[ir, icnu] = float(xnuav / noe)
+                for local_idx, (xnu, xer, g11, g13, g33) in enumerate(block):
+                    idx = start + local_idx
+                    axnu[ir, idx] = xnu
+                    aref[ir, idx] = xer
+                    ag11[ir, idx] = g11
+                    ag13[ir, idx] = g13
+                    ag33[ir, idx] = g33
+                if noe >= 2:
+                    aref[ir, start] = max(aref[ir, start], aref[ir, start + 1] - DREF)
+                pos = end
+                icnu += 1
+            ml = mg + 1
+
+        icnur[ir] = icnu
         nvale[ir] = pos
 
     return {
@@ -227,6 +246,22 @@ class NTSSPreprocessedMonoenergetic:
     @classmethod
     def read_monkes(cls, a_b, monkes_file):
         file = h5.File(monkes_file, "r")
+        optional = {}
+        for h5_key, data_key, default in (
+            ("lc_fit", "lc_fit_in", np.zeros(file["rho"].shape[0], dtype=bool)),
+            ("ag11_0", "ag11_0_in", np.zeros(file["rho"].shape[0], dtype=float)),
+            ("ag11_sq", "ag11_sq_in", np.ones(file["rho"].shape[0], dtype=float)),
+            ("aefld_u", "aefld_u_in", np.zeros(file["rho"].shape[0], dtype=float)),
+            ("aex_er", "aex_er_in", np.ones(file["rho"].shape[0], dtype=float)),
+            ("akn", "akn_in", np.ones(file["rho"].shape[0], dtype=float)),
+            ("air", "air_in", np.ones(file["rho"].shape[0], dtype=float)),
+        ):
+            optional[data_key] = file[h5_key][()] if h5_key in file else default
+        optional["xrm_in"] = None
+        for h5_key in ("xrm", "Rmajor", "major_radius"):
+            if h5_key in file:
+                optional["xrm_in"] = file[h5_key][()]
+                break
         data = _prepare_ntss_arrays(
             a_b=a_b,
             rho=file["rho"][()],
@@ -236,24 +271,7 @@ class NTSSPreprocessedMonoenergetic:
             D11=file["D11"][()],
             D13=file["D13"][()],
             D33=file["D33"][()],
+            **optional,
         )
-        n_r = data["r_grid"].shape[0]
-        for h5_key, data_key, default in (
-            ("lc_fit", "lc_fit", np.zeros(n_r, dtype=bool)),
-            ("ag11_0", "ag11_0_fit", np.zeros(n_r, dtype=float)),
-            ("ag11_sq", "ag11_sq_fit", np.ones(n_r, dtype=float)),
-            ("aefld_u", "aefld_u_fit", np.zeros(n_r, dtype=float)),
-            ("aex_er", "aex_er_fit", np.ones(n_r, dtype=float)),
-            ("akn", "akn_fit", np.ones(n_r, dtype=float)),
-            ("air", "air_fit", np.ones(n_r, dtype=float)),
-        ):
-            if h5_key in file:
-                data[data_key] = jnp.asarray(file[h5_key][()])
-            else:
-                data[data_key] = jnp.asarray(default)
-        for h5_key in ("xrm", "Rmajor", "major_radius"):
-            if h5_key in file:
-                data["xrm_fit"] = jnp.asarray(file[h5_key][()])
-                break
         file.close()
         return cls(**data)

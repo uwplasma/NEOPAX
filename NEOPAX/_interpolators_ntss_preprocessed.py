@@ -8,6 +8,150 @@ config.update("jax_enable_x64", True)
 SEGMENT_WIDTH = 16
 
 
+def _dkfttc(cmul, eps, xkn, xio, xrm, b0):
+    a1 = 0.9733
+    a2 = 0.3899
+    a3 = 0.06778
+    a4 = -1.75
+    a5 = -1.75
+    b2 = 1.0340
+    b3 = -0.6689
+    b4 = 0.6666667
+    b6 = 0.3333333
+    c1 = -0.9665
+    c2 = 1.75
+    d0 = 4.0 / 3.0
+    d1 = 3.4229
+    d2 = -2.5766
+    d3 = -0.6039
+    d4 = 2.0 / 3.0
+    d5 = -1.1776
+    d6 = 0.6756
+    d7 = 1.8436
+
+    aio = jnp.maximum(jnp.abs(xio), 1.0e-30)
+    amul = jnp.maximum(jnp.abs(cmul), 1.0e-30)
+    akn = jnp.maximum(jnp.abs(xkn), 1.0e-30)
+    eps = jnp.maximum(eps, 1.0e-30)
+    rmul = xrm * amul
+    xkn2 = akn**2
+    g1 = jnp.sqrt(akn / eps) / aio
+    g2 = eps * xkn2
+    g3 = eps * xkn2 * aio
+    g4 = eps * aio
+
+    db0 = a1 * g1
+    gb = 1.0 / (eps**b4 * akn * aio**b6)
+    db = db0 * (1.0 + b3 * (akn * eps) ** 2) / (1.0 + b2 * gb * jnp.sqrt(rmul))
+    dpl = a2 * g2 / rmul
+    dps = a3 * g3 / rmul**2
+    dbp = (db**a4 + dpl**a4) ** (1.0 / a4)
+    d31 = (dbp**a5 + dps**a5) ** (1.0 / a5)
+
+    d11n_ps = d0 * (akn / aio) ** 2 * (1.0 + d1 * eps**3.6 * (1.0 + d2 * aio**1.6) + d3 * eps**2 * (1.0 - xkn2))
+    g33n = 1.0 + d5 * (eps * akn) ** d7 + d6 * eps**3 * aio**2.5
+    d33n_ps = d4 * g33n
+    d11n_ps = jnp.where(cmul > 0.0, d11n_ps + d0, d11n_ps)
+
+    gc4 = (1.0 + c1 * (eps * akn) ** c2) * g4
+    d11 = (d11n_ps + d31 / gc4) * amul
+    d33 = (d33n_ps - d31 * gc4) / amul
+
+    d11 = -d11 / (b0**2)
+    d31 = d31 * xio / (aio * b0)
+    d33 = -d33
+    d33 = jnp.where(xkn > 0.0, d33 / g33n, d33)
+    return d11, d31, d33
+
+
+def _dkftte(cmul, efield, eps, xkn, xio, xrm, b0):
+    pi = 3.1415927
+    pa1 = 3.733333
+    pa2 = 1.408160
+    pa3 = 0.469388
+    pa4 = 0.333333
+    pa5 = 2.333333
+    pa6 = 1.523808
+    pa7 = 1.600000
+    pa8 = 0.380952
+    pa9 = 0.177777
+    pb1 = 1.333333
+
+    d11, d31, d33 = _dkfttc(cmul, eps, xkn, xio, xrm, b0)
+    fac = eps * xio
+    fac_abs = jnp.maximum(jnp.abs(fac), 1.0e-30)
+    a = jnp.abs(efield / fac_abs)
+
+    def corrected():
+        amul = jnp.maximum(jnp.abs(cmul), 1.0e-30)
+        d11_cl = -pb1 * amul / (b0**2)
+        d11_wo = jnp.where(cmul > 0.0, d11 - d11_cl, d11)
+        b = jnp.abs(cmul * xrm / jnp.maximum(xio, 1.0e-30))
+        a2 = a**2
+        b2 = b**2
+
+        val11_a = pa1 * (1.0 - pa3 / b2) / b2
+        val31_a = -(pa7 - (pa8 - pa9 / b2) / b2) / b2
+
+        val11_b = pa1 * (1.0 - (b2 - pa2) / a2) / a2
+        val31_b = -(pa7 - (pa8 - b2) / a2) / a2
+
+        xln = jnp.log(((1.0 + a) ** 2 + b2) / ((1.0 - a) ** 2 + b2))
+
+        def atg_general():
+            return (jnp.arctan((1.0 - a) / b) + jnp.arctan((1.0 + a) / b)) / b
+
+        def atg_large_a():
+            return jnp.arctan(2.0 * b / (a2 + b2 - 1.0)) / b
+
+        atg = jax.lax.cond(
+            b > 1.0e-6,
+            lambda: jax.lax.cond(a > 2.0, atg_large_a, atg_general),
+            lambda: jnp.where(a < 1.0, pi / jnp.maximum(b, 1.0e-30), 0.0),
+        )
+
+        val11_c = 2.0 * (pa5 + 3.0 * a2 - b2 - a * (1.0 + a2 - b2) * xln) + (
+            1.0 + a2 * (2.0 + a2) - b2 * (2.0 - b2 + 6.0 * a2)
+        ) * atg
+        val31_c = 2.0 * (pa4 + 3.0 * a2 - b2 - a * (a2 - b2) * xln) - (
+            1.0 - a2**2 + 6.0 * a2 * b2 - b2**2
+        ) * atg
+
+        region_ab = (a2 + b2 >= 16.0) & (b >= 1.0)
+        region_a = a >= 4.0
+        val11 = jnp.where(region_ab, val11_a, jnp.where(region_a, val11_b, val11_c))
+        val31 = jnp.where(region_ab, val31_a, jnp.where(region_a, val31_b, val31_c))
+
+        atg0 = jnp.arctan(1.0 / b) / b
+        val110 = jnp.where(
+            b > 4.0,
+            pa1 * (1.0 - pa3 / b2) / b2,
+            jnp.where(
+                b < 1.0e-3,
+                2.0 * pa5 + pi / jnp.maximum(b, 1.0e-30),
+                2.0 * (pa5 - b2 + (1.0 - b2 * (2.0 - b2)) * atg0),
+            ),
+        )
+        val310 = jnp.where(
+            b > 4.0,
+            -(pa7 - (pa8 - pa9 / b2) / b2) / b2,
+            jnp.where(
+                b < 1.0e-3,
+                2.0 * pa4 - pi / jnp.maximum(b, 1.0e-30),
+                2.0 * (pa4 - b2 - (1.0 - b2**2) * atg0),
+            ),
+        )
+
+        d11_corr = d11_wo * val11 / val110
+        d31_corr = d31 * val31 / val310
+        eres1 = pa4 * fac_abs / jnp.maximum(b, 1.0e-30)
+        d11_corr = d11_corr / (1.0 + (efield / jnp.maximum(eres1, 1.0e-30)) ** 2)
+        d11_corr = jnp.where(cmul > 0.0, d11_corr + d11_cl, d11_corr)
+        return d11_corr, d31_corr, d33
+
+    return jax.lax.cond(a <= 1.0e-6, lambda: (d11, d31, d33), corrected)
+
+
 def _lagrange3(x, x0, x1, x2, y0, y1, y2):
     h0 = (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2))
     h1 = (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2))
@@ -357,7 +501,10 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
             return jnp.asarray([x11, x13, x33])
 
         def high_branch():
-            return group_eval(icue - 1)
+            cmul = 10.0 ** xnu
+            eps = db.r_grid[ir] / jnp.maximum(db.xrm_fit, 1.0e-30)
+            d11, d13, d33 = _dkftte(-cmul, efield, eps, db.akn_fit[ir], db.air_fit[ir], db.xrm_fit, 1.0)
+            return jnp.asarray([jnp.log10(jnp.maximum(1.0e-30, jnp.abs(d11))), d13, jnp.abs(d33) * cmul])
 
         def middle_branch():
             ic_l = jnp.where(
@@ -419,12 +566,12 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
 
 @jax.jit
 def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
-    xri = grid_x
-    xnu = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-    efield = jnp.where(xri <= 1.0e-30, 0.0, jnp.abs(grid_Er / xri))
-    xer = jnp.log10(jnp.maximum(db.xref_l, efield))
     arr = db.r_grid
     nr = arr.shape[0]
+    xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
+    xnu = jnp.log10(jnp.maximum(1.0e-12, jnp.abs(grid_nu)))
+    efield = jnp.where(xri <= 1.0e-30, 0.0, jnp.abs(grid_Er / xri))
+    xer = jnp.log10(jnp.maximum(db.xref_l, efield))
 
     exact_idx = jnp.argmin(jnp.abs(xri - arr))
     is_exact = jnp.abs(xri - arr[exact_idx]) <= db.del_r
