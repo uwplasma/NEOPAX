@@ -100,7 +100,12 @@ def _prepare_ntss_arrays(
         np.ones(n_r, dtype=float) if air_in is None else air_in,
         dtype=float,
     )
-    xrm = float(xrm_in) if xrm_in is not None else float(np.max(r_grid) * 2.0) if n_r > 0 else 1.0
+    xrm = np.asarray(
+        np.full(n_r, float(np.max(r_grid) * 2.0) if n_r > 0 else 1.0, dtype=float)
+        if xrm_in is None
+        else xrm_in,
+        dtype=float,
+    )
 
     for ir in range(n_r):
         D11[ir, :, :] *= drds[ir] ** 2
@@ -241,29 +246,40 @@ class NTSSPreprocessedMonoenergetic:
     aex_er_fit: Float[Array, "..."]
     akn_fit: Float[Array, "..."]
     air_fit: Float[Array, "..."]
-    xrm_fit: float
+    xrm_fit: Float[Array, "..."]
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
+    def read_monkes(cls, geometry, monkes_file):
         file = h5.File(monkes_file, "r")
+        n_r = file["rho"].shape[0]
         optional = {}
         for h5_key, data_key, default in (
-            ("lc_fit", "lc_fit_in", np.zeros(file["rho"].shape[0], dtype=bool)),
-            ("ag11_0", "ag11_0_in", np.zeros(file["rho"].shape[0], dtype=float)),
-            ("ag11_sq", "ag11_sq_in", np.ones(file["rho"].shape[0], dtype=float)),
-            ("aefld_u", "aefld_u_in", np.zeros(file["rho"].shape[0], dtype=float)),
-            ("aex_er", "aex_er_in", np.ones(file["rho"].shape[0], dtype=float)),
-            ("akn", "akn_in", np.ones(file["rho"].shape[0], dtype=float)),
-            ("air", "air_in", np.ones(file["rho"].shape[0], dtype=float)),
+            ("lc_fit", "lc_fit_in", np.zeros(n_r, dtype=bool)),
+            ("ag11_0", "ag11_0_in", np.zeros(n_r, dtype=float)),
+            ("ag11_sq", "ag11_sq_in", np.ones(n_r, dtype=float)),
+            ("aefld_u", "aefld_u_in", np.zeros(n_r, dtype=float)),
+            ("aex_er", "aex_er_in", np.ones(n_r, dtype=float)),
+            ("akn", "akn_in", None),
+            ("air", "air_in", None),
         ):
             optional[data_key] = file[h5_key][()] if h5_key in file else default
+        if optional["akn_in"] is None:
+            optional["akn_in"] = np.asarray(geometry.curvature)
+        if optional["air_in"] is None:
+            optional["air_in"] = np.asarray(geometry.iota)
         optional["xrm_in"] = None
         for h5_key in ("xrm", "Rmajor", "major_radius"):
             if h5_key in file:
                 optional["xrm_in"] = file[h5_key][()]
                 break
+        if optional["xrm_in"] is None:
+            r = np.asarray(geometry.r_grid)
+            eps = np.asarray(geometry.epsilon_t)
+            local_R = np.where(np.abs(eps) > 1.0e-12, r / eps, float(geometry.R0))
+            local_R[0] = float(geometry.R0)
+            optional["xrm_in"] = local_R
         data = _prepare_ntss_arrays(
-            a_b=a_b,
+            a_b=geometry.a_b,
             rho=file["rho"][()],
             nu_v=file["nu_v"][()],
             Er=file["Er"][()],

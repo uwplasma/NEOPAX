@@ -502,8 +502,9 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
 
         def high_branch():
             cmul = 10.0 ** xnu
-            eps = db.r_grid[ir] / jnp.maximum(db.xrm_fit, 1.0e-30)
-            d11, d13, d33 = _dkftte(-cmul, efield, eps, db.akn_fit[ir], db.air_fit[ir], db.xrm_fit, 1.0)
+            xrm = db.xrm_fit[ir]
+            eps = db.r_grid[ir] / jnp.maximum(xrm, 1.0e-30)
+            d11, d13, d33 = _dkftte(-cmul, efield, eps, db.akn_fit[ir], db.air_fit[ir], xrm, 1.0)
             return jnp.asarray([jnp.log10(jnp.maximum(1.0e-30, jnp.abs(d11))), d13, jnp.abs(d33) * cmul])
 
         def middle_branch():

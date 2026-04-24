@@ -149,7 +149,7 @@ def _build_database(config: dict, geometry):
             config.get("neoclassical", {}).get("interpolation_mode", "generic")
         ).strip().lower()
         if interp_mode == "ntss_preprocessed":
-            return NTSSPreprocessedMonoenergetic.read_monkes(geometry.a_b, neoclassical_file)
+            return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
