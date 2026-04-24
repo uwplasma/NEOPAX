@@ -182,7 +182,8 @@ def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
     nil = jnp.where(is_exact, exact_idx, nil)
     noi = jnp.where(is_exact, 1, noi)
 
-    atc = jax.vmap(lambda k: _eval_radius_node(nil + k, xnu, xer, efield, db))(jnp.arange(noi))
+    stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
+    atc = jax.vmap(lambda ir: _eval_radius_node(ir, xnu, xer, efield, db))(stencil_idx)
 
     def exact():
         return atc[0]

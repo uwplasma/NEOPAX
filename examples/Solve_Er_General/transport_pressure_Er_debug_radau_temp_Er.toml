@@ -16,7 +16,7 @@ n_radial = 51
 flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
-
+interpolation_mode = "ntss_like"
 
 
 
