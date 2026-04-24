@@ -24,6 +24,10 @@ from ._database import Monoenergetic
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
 from ._database_preprocessed import PreprocessedMonoenergetic3D
 from ._entropy_models import get_entropy_model
+from ._neoclassical import (
+    COLLISIONALITY_MODEL_DEFAULT,
+    _get_Lij_matrix_ntss_preprocessed,
+)
 from ._profiles import build_profiles
 from ._source_models import (
     assemble_density_source_components,
@@ -279,6 +283,63 @@ def _maybe_print_collisionality_debug(config: dict, species, energy_grid, geomet
         print(f"[NEOPAX] collisionality debug: {line}")
 
 
+def _maybe_print_ntss_transport_debug(config: dict, species, energy_grid, geometry, database, state, flux_model) -> None:
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    neoclassical_cfg = config.get("neoclassical", {})
+    interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
+    if interp_mode != "ntss_preprocessed":
+        return
+
+    if geometry is None or database is None or state is None:
+        return
+
+    rho_grid = jnp.asarray(geometry.rho_grid)
+    r_index = int(jnp.argmin(jnp.abs(rho_grid - 0.5)))
+    v_thermal = get_v_thermal(species.mass, state.temperature)
+
+    sample_species = []
+    if species.number_species > 0:
+        sample_species.append(0)
+    if species.number_species > 1:
+        sample_species.append(1)
+
+    print(f"[NEOPAX] ntss transport debug: rho={float(rho_grid[r_index]):.5f} r_index={r_index}")
+    for a in sample_species:
+        name = species.names[a] if species.names and a < len(species.names) else str(a)
+        Lij = _get_Lij_matrix_ntss_preprocessed(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            a,
+            r_index,
+            state.Er,
+            state.temperature,
+            state.density,
+            v_thermal,
+            COLLISIONALITY_MODEL_DEFAULT,
+        )
+        print(f"[NEOPAX] ntss transport debug: species={name} Lij={jnp.asarray(Lij).tolist()}")
+
+    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+    if local_particle_flux is None:
+        return
+
+    charge_qp = jnp.asarray(species.charge_qp, dtype=state.Er.dtype)
+    er_scan = jnp.asarray([-40.0, -30.0, -20.0, -10.0, 0.0, 10.0, 20.0], dtype=state.Er.dtype)
+    ambi_scan = []
+    for er_value in er_scan:
+        gamma = local_particle_flux(r_index, er_value)
+        ambi_scan.append(float(jnp.sum(charge_qp * gamma)))
+    print(
+        "[NEOPAX] ntss transport debug: "
+        f"ambipolar_charge_flux_scan={ambi_scan} er_scan={jnp.asarray(er_scan).tolist()}"
+    )
+
+
 def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
@@ -505,6 +566,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
         flux=_build_flux_model(config, species, energy_grid, geometry, database, source_models=source_models),
         source=source_models,
     )
+    _maybe_print_ntss_transport_debug(config, species, energy_grid, geometry, database, state, models.flux)
     runtime = RuntimeContext(
         species=species,
         energy_grid=energy_grid,
