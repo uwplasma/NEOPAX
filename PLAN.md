@@ -195,7 +195,24 @@ Expected validation in this phase:
 - Keep this as a Radau-specific branch of the solver plan, distinct from the main Kvaerno efficiency work.
 - Use the classic Hairer/NTSS Radau implementation and the newer Julia `AdaptiveRadau` / `OrdinaryDiffEqFIRK` implementation as design references.
 
+Updated assessment:
+- the recent custom 3-stage lean Radau work found a good stable baseline, but did not yet reduce step count below roughly `713` on the benchmark transport case
+- the strongest remaining gap to NTSS/Hairer is now believed to be in:
+  - predictor quality
+  - adaptive step-size controller quality
+  - Jacobian / LU reuse heuristics
+  - and, longer-term, adaptive-order / adaptive-stage Radau capability
+- compile-focused micro-refactors have mostly hit diminishing returns; the next high-value Radau work should be more algorithmic and more Hairer-like
+
 Priority items for this phase:
+- Implement a more Hairer/NTSS-like adaptive step-size controller:
+  - add a predictive / Gustafsson-style controller option for the custom Radau path
+  - compare it against the current lean controller on the transport benchmark
+  - target fewer rejected / unnecessarily small accepted steps rather than compile-only gains
+- Implement a stronger Hairer-style collocation predictor:
+  - use extrapolated collocation / prior accepted-step stage information more faithfully
+  - keep zero-start / fallback behavior available for difficult Newton regimes
+  - target fewer Newton iterations and larger accepted steps
 - Implement a Hairer-style transformed-stage linear solve for Radau:
   - avoid treating the 3-stage Radau Newton system as one monolithic `3n` solve
   - transform the stage system into block structure (one real `n x n` block plus one real `2n x 2n` block for the 3-stage case)
@@ -212,6 +229,60 @@ Priority items for this phase:
 - Improve Radau Jacobian / factorization reuse policy:
   - go beyond the current simple `dt_close + age` cache
   - make reuse/update decisions more consistent with Hairer-style Radau practice
+
+New explicit sub-track: Adaptive Radau
+- Goal:
+  - investigate an adaptive-order / adaptive-stage Radau path closer to the broader Hairer code family, instead of staying permanently fixed at the current 3-stage method
+- Scope:
+  - start from the Hairer/NTSS stage-count controls already visible in the code/comments
+  - evaluate whether NEOPAX should support:
+    - fixed 3-stage Radau as the default practical path
+    - optional adaptive-stage Radau for higher-accuracy / fewer-step regimes
+- Initial questions for this sub-track:
+  - how much of the NTSS step-count advantage is coming from better controller/predictor tuning versus higher stage/order selection
+  - whether adaptive-stage Radau can be implemented in a JAX-friendly way without exploding compile cost
+  - whether a small menu of static-shape Radau variants (for example fixed 3-stage and fixed higher-stage options) is a better first step than fully dynamic stage switching
+- Recommendation:
+  - treat adaptive Radau as an explicit planned phase item, but only after the predictor/controller improvements above are benchmarked
+  - do not let adaptive-stage work block the nearer-term controller/predictor work
+
+Current updated recommendation after fixed-stage benchmarking:
+- fixed higher-stage Radau is now working well in NEOPAX:
+  - `3` stages: about `713` steps, about `301 s`
+  - `5` stages: about `209-215` steps, about `250-266 s`
+  - `7` stages: about `163-166` steps, about `250-256 s`
+- additional exploratory higher-stage runs are also now in a strong regime:
+  - `9` stages: about `143-149` steps, about `232-250 s`
+  - `11` stages: about `147-151` steps, about `237-241 s`
+- current interpretation:
+  - `3 -> 5 -> 7` gave a strong monotonic improvement
+  - `9` and `11` are both high-performing, but `11` does not clearly beat `9`
+  - `9` stages currently look like the best balance / likely sweet spot on this benchmark
+- `9`-stage Radau should therefore be treated as the current custom Radau reference configuration for this benchmark regime
+- the most JAX-friendly adaptive-order direction is now:
+  - a discrete fixed-family adaptive Radau over `3 / 5 / 7 / 9` stages
+  - not a single fully dynamic shape-changing solver kernel
+
+Proposed adaptive-order design:
+- keep separate fixed-stage solver kernels for:
+  - `3` stages
+  - `5` stages
+  - `7` stages
+- switch order only at the outer accepted-step level
+- choose the next order based on:
+  - recent error ratio
+  - rejected-step history
+  - Newton difficulty / contraction quality
+  - step-size smoothness
+- practical first policy:
+  - start from `5`
+  - drop to `3` if Newton/rejections become difficult
+  - raise to `7` in smooth low-error regions
+
+Expected implementation / resource profile:
+- runtime state memory should increase only modestly if only the active-order cache is kept live
+- compile/cache memory will increase because JAX will likely compile separate kernels for `3`, `5`, and `7`
+- to control memory growth, avoid carrying all stage-specific reuse caches simultaneously unless benchmarking later proves that beneficial
 
 Lower-priority items for later:
 - investigate whether any banded/block structure in the transport Jacobian can be exploited in the Radau linear solve
@@ -232,8 +303,15 @@ Additional NTSS-inspired implementation ideas to evaluate for JAX/JIT-friendly a
 Current assessment for this phase:
 - the transformed-stage solve is the highest-value missing Radau algorithmic feature
 - the NTSS/Hairer-style direct transformed-block factorization should be considered part of that same main feature, not an optional extra
-- adaptive-order Radau is interesting, but not the first thing to port into NEOPAX
+- adaptive-order / adaptive-stage Radau is now a planned later sub-track, but still should not be the first Radau feature ported into NEOPAX
 - given the current state sizes (for example `state_size ~ 459` in the benchmarked `temperature + Er` case), Radau may remain a secondary high-accuracy path rather than the main default solver target
+
+Near-term execution order for this phase:
+1. benchmark and preserve the current best fixed-3-stage custom Radau baseline
+2. implement a more Hairer-like predictive/Gustafsson controller
+3. improve the extrapolated collocation predictor
+4. revisit Jacobian / factorization reuse policy with NTSS-style thresholds
+5. only then evaluate adaptive-stage / adaptive-order Radau designs
 
 Current checkpoint for this phase:
 - keep two explicit Radau controller modes:
@@ -328,6 +406,22 @@ Additional completed work in this phase:
 
 Negative experiments / conclusions to remember:
 - a more aggressive history-loosened Jacobian/LU reuse policy reduced average step cost but pushed step count from about `871` to about `1234`, and total solve time got worse; this was reverted
+- a combined Hairer-inspired tuning batch on the fixed 3-stage custom Radau path was clearly negative and has been reverted:
+  - ingredients tested together:
+    - stronger stage-history/drift predictor
+    - predictive / PI-style controller term
+    - NTSS-like reuse step-ratio window and "keep same dt" heuristic
+  - observed result on the transport benchmark:
+    - compile improved into roughly the `~2m05s` to `~2m10s` range
+    - but `n_steps` exploded from the good baseline of about `713` to about `3167`
+    - total solve time degraded to about `362-382 s`
+  - conclusion:
+    - this batch made the custom Radau controller much too conservative / step-inefficient
+    - future Radau tuning should test only one lever at a time:
+      - predictor only
+      - controller only
+      - reuse policy only
+    - do not reapply this combined tuning batch as a package
 - intrusive Radau diagnostics threaded through the hot loop badly inflated compile/runtime and were removed
 - small carry-packing / loop-cleanup changes gave only marginal gains; they are not enough by themselves to close the compile gap to Diffrax
 - the older lower-step Radau regime (`~871` steps) was not the best overall runtime regime; newer controller tuning produced a better total runtime while remaining on a higher-step branch
@@ -537,3 +631,141 @@ Validation targets:
 - confirm the new backend is materially more standard and robust than the current custom Rosenbrock implementation
 - compare compile time, wall time, step count, and survival on the lean benchmark case
 - only after lean-case validation, test fuller coupled cases
+
+### Phase 9: Ambipolarity / Interpolation Compile Cleanup
+- Status: noted for later
+- Goal:
+  - reduce compile-time noise and overhead in the ambipolar initialization / radial root-finding path, separate from the current Radau solver work
+
+Why this phase was added:
+- during `ambipolar two_stage radial solve`, XLA reported slow constant folding inside:
+  - `interpax/_fd_derivs.py`
+  - through the path:
+    - `evaluate_block`
+    - `get_Neoclassical_Fluxes`
+    - `get_Lij_matrix`
+    - `get_Dij`
+    - `interpolation_small_r`
+    - `interpolator_nu_Er_general`
+- this appears before `solver.solve(...)`, so it is not a Radau regression
+- it is likely compile overhead in the neoclassical interpolation / derivative setup used by ambipolar root finding
+
+Primary tasks for this later phase:
+- inspect where `interpax` derivative/interpolator objects are being created or specialized during ambipolar root finding
+- determine whether any interpolation setup can be:
+  - cached
+  - hoisted
+  - or made more static-shape / less recompilation-prone
+- benchmark ambipolar initialization time separately from transport solve time after any changes
+
+Scope note:
+- do not mix this work into the current Radau optimization track
+- treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
+
+### Phase 10: Shared Transport-Response Decomposition For Theta / Radau
+- Status: planned
+- Goal:
+  - add a solver-facing transport decomposition layer, closer in spirit to Trinity3D and partly to TORAX, so both `theta` and `radau` can optionally run on a frozen local transport-response model instead of only on the current black-box assembled RHS
+
+Why this phase was added:
+- current NEOPAX modularity stops at:
+  - `models/equations -> final semidiscrete RHS`
+- this is excellent for generic ODE solvers, but it hides:
+  - base flux vectors
+  - source vectors
+  - local transport response / Jacobian-like structure
+- both the future TORAX-like theta direction and a more transport-aware Radau path would benefit from an intermediate layer that exposes:
+  - local flux decomposition
+  - local source decomposition
+  - local linear response information
+- Trinity3D suggests a more reachable first target than a full TORAX `Block1DCoeffs` abstraction:
+  - compute base fluxes/sources
+  - compute perturbative local response / Jacobian-like operator
+  - assemble a transport linearization used by the solver
+
+Primary design idea:
+- add a new optional solver mode where, for one step attempt or one outer nonlinear iterate:
+  - base transport flux/source terms are computed at a reference state
+  - a local transport response is built around that state
+  - that local response is frozen for the internal solve
+- use the same decomposition for:
+  - a Trinity/TORAX-like theta solve
+  - a lagged-response Radau solve
+
+Intended mathematical form:
+- locally approximate transport fluxes/sources as:
+  - `Q ~= Q0 + J_Q * delta y`
+  - `Gamma ~= Gamma0 + J_Gamma * delta y`
+- assemble from this a discrete transport response object containing items equivalent in spirit to:
+  - base flux/source vectors
+  - geometry/grid divergence factors
+  - local implicit response matrix / operator
+- keep this frozen over:
+  - one theta nonlinear iterate
+  - or one Radau step attempt, if running in the lagged-response mode
+
+Primary tasks in this phase:
+- define a NEOPAX transport-response interface sitting between:
+  - current equation/physics evaluation
+  - solver implementation
+- first target a Trinity3D-like decomposition rather than a full TORAX-style coefficient object:
+  - base particle/heat flux vectors
+  - source vectors
+  - local response/Jacobian-like operator
+- make this decomposition available from the active transport state without breaking the current black-box RHS path
+- keep the current assembled-RHS path as a reference/validation mode
+
+Theta-specific tasks:
+- add a transport-response-backed theta mode in addition to the current generic-RHS theta implementation
+- let the solver:
+  - build one frozen local transport response per nonlinear iterate
+  - solve the resulting theta linearized system
+- use this as the path intended to move closer to Trinity3D/TORAX behavior
+
+Radau-specific tasks:
+- add an optional lagged-response Radau mode
+- in this mode:
+  - one local transport response is built per step attempt
+  - that response is frozen across all internal Radau stages and Newton iterations of that attempt
+- note carefully:
+  - the current custom Radau already freezes the black-box RHS Jacobian over a step attempt
+  - the new mode would go further by freezing the underlying transport-response model itself, not only `df/dy`
+
+Expected benefits:
+- create one shared decomposition usable by multiple solvers
+- reduce expensive within-step transport-model reevaluations for:
+  - theta
+  - and especially Radau in future expensive-flux settings
+- make NEOPAX much better prepared for:
+  - perturbative/GK-style flux models
+  - Trinity3D-like response construction
+  - fuller TORAX-like coefficient abstractions later if desired
+
+Expected tradeoffs / risks:
+- this is an approximation layer:
+  - the true nonlinear flux response may vary across Radau stages within a step
+- therefore a frozen-response Radau mode may sacrifice some of the full nonlinear collocation fidelity of the current black-box RHS Radau path
+- likely outcome:
+  - still better transient fidelity than theta
+  - cheaper than fully refreshed stage-by-stage nonlinear flux updates
+  - but not identical to the current fully nonlinear residual evaluation path
+
+Validation plan for this phase:
+- compare, for both theta and Radau:
+  - current black-box RHS mode
+  - new frozen transport-response mode
+- track:
+  - compile time
+  - total solve time
+  - step count / accepted steps
+  - physics agreement in transient and final state
+- pay special attention to cases with:
+  - hysteresis / multiple branches
+  - strongly state-dependent sources
+  - threshold-like transport behavior
+
+Implementation ordering recommendation:
+1. define the shared transport-response decomposition API
+2. implement the decomposition in a Trinity3D-like direct response form first
+3. wire it into theta before Radau
+4. only then add the lagged-response Radau mode and benchmark whether it preserves enough of Radau's transient advantages to justify its complexity

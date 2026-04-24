@@ -17,7 +17,6 @@ flux_model = "monkes_database"
 entropy_model = "monkes_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
 
-
 [ambipolarity]
 er_ambipolar_method = "two_stage"
 er_ambipolar_scan_min = -50.0
@@ -100,23 +99,20 @@ toggle_Er = true
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
 
-
-
 [transport_solver]
 density_floor = 1.0e-6
-transport_solver_backend = "radau"
-integrator = "radau"
-radau_num_stages = 11
-radau_error_estimator = "embedded2"
+transport_solver_backend = "theta_newton"
+integrator = "theta_newton"
+theta_implicit = 1.0
+use_predictor_corrector = true
+n_corrector_steps = 2
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
+theta_delta_reduction_factor = 0.5
+theta_tau_min = 0.01
 t0 = 0.0
 t_final = 0.01
-dt = 1.0e-8
-rtol = 1.0e-6
-atol = 1.0e-8
-max_step = 1.0
-min_step = 1.0e-14
+dt = 1.0e-4
 max_steps = 20000
 throw = false
 debug_stage_markers = true
@@ -144,5 +140,5 @@ transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
 transport_reference_er_file = "./examples/inputs/NTSS_Initial_Er_Opt.h5"
-transport_output_dir = "./outputs/transport_temp_Er_radau_lean"
+transport_output_dir = "./outputs/transport_temp_Er_theta_newton"
 transport_plot_n_times = -1
