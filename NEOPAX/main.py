@@ -340,6 +340,59 @@ def _maybe_print_ntss_transport_debug(config: dict, species, energy_grid, geomet
     )
 
 
+def _maybe_print_ntss_er_coordinate_debug(config: dict, species, energy_grid, geometry, database, state) -> None:
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    neoclassical_cfg = config.get("neoclassical", {})
+    interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
+    if interp_mode != "ntss_preprocessed":
+        return
+
+    if geometry is None or database is None or state is None:
+        return
+
+    rho_targets = jnp.asarray([0.12247, 0.5, 0.875], dtype=geometry.rho_grid.dtype)
+    rho_grid = jnp.asarray(geometry.rho_grid)
+    db_r_grid = jnp.asarray(database.r_grid)
+    first_db_radius = float(db_r_grid[0]) if int(db_r_grid.size) > 0 else float("nan")
+    floor_radius = 1.0e-2 * first_db_radius if first_db_radius == first_db_radius else float("nan")
+    xref_l = float(getattr(database, "xref_l", float("nan")))
+
+    species_index = 0
+    species_name = species.names[species_index] if species.names and species_index < len(species.names) else str(species_index)
+    v_thermal = get_v_thermal(species.mass, state.temperature)
+    er_profile = jnp.asarray(state.Er)
+
+    print(
+        "[NEOPAX] ntss Er-coordinate debug: "
+        f"species={species_name} xref_l={xref_l:.3e} "
+        f"first_db_radius={first_db_radius:.6e} floor_radius={floor_radius:.6e}"
+    )
+
+    idxs = [int(jnp.argmin(jnp.abs(rho_grid - rho_t))) for rho_t in rho_targets]
+    idxs = sorted(set(idxs))
+    for r_index in idxs:
+        rho_value = float(rho_grid[r_index])
+        r_geom = float(geometry.r_grid[r_index])
+        r_used = max(floor_radius, r_geom)
+        er_kvm = float(er_profile[r_index])
+        vth = float(v_thermal[species_index, r_index])
+        vnorm = jnp.asarray(energy_grid.v_norm)
+        er_over_v = er_kvm * 1.0e3 / jnp.maximum(vnorm * vth, 1.0e-30)
+        efield_over_r = jnp.abs(er_over_v) / max(r_used, 1.0e-30)
+        xer = jnp.log10(jnp.maximum(xref_l, efield_over_r))
+        print(
+            "[NEOPAX] ntss Er-coordinate debug: "
+            f"rho={rho_value:.5f} r_index={r_index} "
+            f"r_geom={r_geom:.6e} r_used={r_used:.6e} Er_profile_kVm={er_kvm:.6e} "
+            f"Er_over_v={jnp.asarray(er_over_v).tolist()} "
+            f"abs_Er_over_v_over_r={jnp.asarray(efield_over_r).tolist()} "
+            f"log10_xer={jnp.asarray(xer).tolist()}"
+        )
+
+
 def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
@@ -560,6 +613,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     _maybe_print_ntss_radial_grid_debug(config, geometry, database)
     state = _build_state(config, geometry, species.number_species)
     _maybe_print_collisionality_debug(config, species, energy_grid, geometry, state)
+    _maybe_print_ntss_er_coordinate_debug(config, species, energy_grid, geometry, database, state)
     solver_cfg = _normalize_solver_config(config)
     source_models = build_source_models_from_config(config, species)
     models = Models(
