@@ -83,8 +83,11 @@ def _nu_over_vnew(
     use_ntss_like = collisionality_kind == COLLISIONALITY_MODEL_NTSS_LIKE
     return jax.lax.cond(
         use_ntss_like,
-        lambda _: collisionality_ntss_like(index_species, species, v_new_a, r_index, density, temperature, v_thermal)
-        / jnp.maximum(v_thermal[index_species, r_index], 1.0e-30),
+        lambda _: jnp.full_like(
+            v_new_a,
+            collisionality_ntss_like(index_species, species, v_new_a, r_index, density, temperature, v_thermal)
+            / jnp.maximum(v_thermal[index_species, r_index], 1.0e-30),
+        ),
         lambda _: collisionality(index_species, species, v_new_a, r_index, density, temperature, v_thermal) / v_new_a,
         operand=None,
     )
@@ -103,8 +106,11 @@ def _nu_over_vnew_local(
     use_ntss_like = collisionality_kind == COLLISIONALITY_MODEL_NTSS_LIKE
     return jax.lax.cond(
         use_ntss_like,
-        lambda _: collisionality_ntss_like_local(index_species, species, v_new_a, density_local, temperature_local, v_thermal_local)
-        / jnp.maximum(v_thermal_local[index_species], 1.0e-30),
+        lambda _: jnp.full_like(
+            v_new_a,
+            collisionality_ntss_like_local(index_species, species, v_new_a, density_local, temperature_local, v_thermal_local)
+            / jnp.maximum(v_thermal_local[index_species], 1.0e-30),
+        ),
         lambda _: collisionality_local(index_species, species, v_new_a, density_local, temperature_local, v_thermal_local) / v_new_a,
         operand=None,
     )
