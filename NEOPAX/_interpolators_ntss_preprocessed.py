@@ -247,17 +247,30 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
     ag11_full = db.ag11[ir]
     ag13_full = db.ag13[ir]
     ag33_full = db.ag33[ir]
+    lc_fit = db.lc_fit[ir]
+    ag11_0_fit = db.ag11_0_fit[ir]
+    ag11_sq_fit = db.ag11_sq_fit[ir]
+    aefld_u_fit = db.aefld_u_fit[ir]
+    aex_er_fit = db.aex_er_fit[ir]
 
     def zero_field():
         last0 = icu0 - 1
         high = jnp.asarray([g110[last0] - xs0[last0] + xnu, db.x13_l, g330[last0]])
-        low = jnp.asarray([g110[0] + xs0[0] - xnu, g130[0], g330[0]])
+        low_g11 = jnp.where(
+            lc_fit & (ag11_0_fit < 0.0),
+            g110[0] - xs0[0] + xnu,
+            g110[0] + xs0[0] - xnu,
+        )
+        low = jnp.asarray([low_g11, g130[0], g330[0]])
         fc_l = -1.0
-        mid = jnp.asarray([
-            _inpold_segment(xnu, xs0, g110, 0, icu0, 0, fc_l, 0, 1.0, db.gmix_nu),
-            _inpold_segment(xnu, xs0, g130, 0, icu0, 1, 0.0, 1, 0.0, db.gmix_nu),
-            _inpold_segment(xnu, xs0, g330, 0, icu0, 0, 0.0, 0, 0.0, db.gmix_nu),
-        ])
+        fc_l = jnp.where(lc_fit & (ag11_0_fit < 0.0), 1.0, fc_l)
+        mid = jnp.asarray(
+            [
+                _inpold_segment(xnu, xs0, g110, 0, icu0, 0, fc_l, 0, 1.0, db.gmix_nu),
+                _inpold_segment(xnu, xs0, g130, 0, icu0, 1, 0.0, 1, 0.0, db.gmix_nu),
+                _inpold_segment(xnu, xs0, g330, 0, icu0, 0, 0.0, 0, 0.0, db.gmix_nu),
+            ]
+        )
         return jnp.where(
             xnu > xs0[last0],
             high,
@@ -294,7 +307,51 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
             first = aref_full[start]
             last = aref_full[start + n - 1]
             xer_h = (avgs_full[0] - xnu) / 3.0 + xer
-            x11 = jnp.where(xer_h > last, db.x11_l, _inpold_segment(xer_h, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
+
+            def old_sqrt_nu():
+                return jnp.where(
+                    xer_h > last,
+                    db.x11_l,
+                    _inpold_segment(xer_h, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er),
+                )
+
+            def fit_branch():
+                def tokamak_like():
+                    return jnp.where(
+                        xer_h > last,
+                        db.x11_l,
+                        _inpold_segment(xer_h, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)
+                        + xnu
+                        - avgs_full[0],
+                    )
+
+                def stellarator_like():
+                    efield_ge = efield >= aefld_u_fit
+
+                    def large_efield():
+                        return jnp.where(
+                            xer > last,
+                            db.x11_l,
+                            _inpold_segment(xer, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)
+                            + xnu
+                            - avgs_full[0],
+                        )
+
+                    def mixed_fit():
+                        xer_u = jnp.log10(jnp.maximum(db.xref_l, aefld_u_fit / jnp.maximum(db.r_grid[ir], 1.0e-30)))
+                        g11_u = _inpold_segment(xer_u, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)
+                        d11ad = 10.0 ** (g11_u + xnu - avgs_full[0])
+                        xmul = 10.0 ** xnu
+                        arg0 = (xmul / jnp.maximum(jnp.abs(ag11_0_fit), 1.0e-30)) ** aex_er_fit
+                        argsq = (efield * jnp.sqrt(efield / jnp.maximum(xmul, 1.0e-30)) / jnp.maximum(jnp.abs(ag11_sq_fit), 1.0e-30)) ** aex_er_fit
+                        d11ft = (arg0 + argsq) ** (-1.0 / jnp.maximum(aex_er_fit, 1.0e-30))
+                        return jnp.log10(jnp.maximum(1.0e-30, d11ad + d11ft))
+
+                    return jax.lax.cond(efield_ge, large_efield, mixed_fit)
+
+                return jax.lax.cond(ag11_0_fit < 0.0, tokamak_like, stellarator_like)
+
+            x11 = jax.lax.cond(lc_fit, fit_branch, old_sqrt_nu)
             x13 = jnp.where(xer > last, db.x13_l, _inpold_segment(xer, aref_full, ag13_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
             x33 = jnp.where(xer > last, ag33_full[start + n - 1], _inpold_segment(xer, aref_full, ag33_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
             return jnp.asarray([x11, x13, x33])

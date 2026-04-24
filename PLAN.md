@@ -769,3 +769,121 @@ Implementation ordering recommendation:
 2. implement the decomposition in a Trinity3D-like direct response form first
 3. wire it into theta before Radau
 4. only then add the lagged-response Radau mode and benchmark whether it preserves enough of Radau's transient advantages to justify its complexity
+
+### Phase 11: Neoclassical Interpolation Parity Against NTSS
+- Status: in progress
+- Goal:
+  - isolate and reduce the ambipolar root mismatch between NEOPAX and NTSS by comparing and evolving the monoenergetic interpolation model without destabilizing the current generic runtime path
+
+Why this phase was added:
+- the original `generic` monoenergetic interpolation path was fast enough, but it produced clear ambipolar root mismatches against NTSS
+- an experimental direct `ntss_like` runtime branch became too expensive to compile under JAX and was therefore not a viable production path
+- a separate preprocessed interpolation approach proved that:
+  - interpolation structure was a major source of the mismatch
+  - a JIT-friendly alternative can be much faster than the current generic path
+  - the remaining discrepancy is now in specific NTSS branch behavior rather than generic smoothing alone
+
+Current interpolation modes and findings:
+- `generic`
+  - current baseline NEOPAX path
+  - kept intact as the control/reference implementation
+- `preprocessed_3d`
+  - separate, JIT-friendly 3D interpolation over:
+    - `r`
+    - `log10(nu)`
+    - `log10(|Er| / r)`
+  - much faster than the generic path
+  - for `n_scale = 1`, profile/root agreement versus NTSS became nearly complete
+  - for scaled profile tests such as `n_scale = 0.6`, `T_scale = 0.75`, the branch-transition mismatch improved but remained
+- `ntss_preprocessed`
+  - separate, faster NTSS-oriented path
+  - uses:
+    - grouped collisionality bands
+    - `Er = 0` handling
+    - 3-point / 4-point interpolation in `xnu`
+    - `INPOLD`-style interpolation in `Er`
+    - NTSS-style radial interpolation structure
+  - compile/runtime became practical enough to iterate on
+  - still does not fully match NTSS in the transition region or in the last radii
+
+Key implementation updates completed in this phase:
+- restored the original generic path after earlier NTSS-like experiments started polluting compile time
+- added `preprocessed_3d` as a separate opt-in mode without modifying the generic baseline
+- added `ntss_preprocessed` as a separate opt-in mode without modifying the generic baseline
+- fixed multiple JAX-static-shape issues in the NTSS-oriented path:
+  - removed dynamic `jnp.arange(noi)` usage
+  - removed tracer-driven dynamic slicing
+  - rewrote the runtime kernel into fixed-shape arithmetic and masked access
+- updated ambipolarity-only runs to avoid solving the full radial root problem twice
+  - previously ambipolarity mode solved once during Er initialization and again during explicit ambipolarity execution
+  - ambipolarity mode now skips the initialization solve
+- added the NTSS no-data guards in the positive-field grouped-collisionality interpolation
+- added fit-aware logic in the loader/runtime when optional fit arrays are present in the HDF5
+
+Important conclusions so far:
+- the remaining mismatch is not due to a plotting bug
+  - when the last radii are missing in the plot, the solver is returning non-finite roots there
+- the remaining mismatch is not primarily a simple `r` versus `rho` bug
+  - the fast preprocessed paths use physical minor radius and the `|Er| / r` normalization in the same basic form as NTSS
+- the strongest remaining discrepancies are now in specific NTSS branch formulas rather than in broad interpolation architecture
+
+Confirmed remaining mismatches versus NTSS:
+- the positive-field high-PS / high-collisionality branch is still simplified
+  - current `high_branch()` is not yet the NTSS `dkftte` fallback
+- the low-`nu`, finite-`Er` fit logic is only active when the optional fit arrays are present in the source HDF5
+- if those fit arrays are absent in the MONKES/HDF5 file, the newly added fit-aware branches fall back to defaults and therefore do not change results materially
+- last-radii root loss is still present
+  - this is currently understood as a solver/interpolation edge mismatch, not a plotting truncation issue
+
+Radius-normalization audit summary:
+- for the active fast paths, the core normalization is consistent with NTSS:
+  - `r = a_b * rho`
+  - `xer = log10(max(xref_l, |Er| / r))`
+- two caveats remain:
+  - NTSS supports a radial scaling factor `fac_sc_r`, which NEOPAX does not currently expose
+  - axis treatment is not yet identical:
+    - NTSS enforces a finite effective radius near `r = 0`
+    - NEOPAX still treats the axis more directly
+
+Validation results recorded so far:
+- `preprocessed_3d`
+  - major speed win over the baseline generic path
+  - strong agreement with NTSS at unscaled profiles
+  - partial but incomplete improvement in the transition region under scaled profiles
+- `ntss_preprocessed`
+  - practical JIT behavior achieved
+  - still mismatches in:
+    - root-existence interval around the mid-radius branch transition
+    - missing final tail roots at the last radii
+
+Primary remaining tasks in this phase:
+- inspect the actual HDF5 keys of the production MONKES file and confirm whether the optional fit arrays are present:
+  - `lc_fit`
+  - `ag11_0`
+  - `ag11_sq`
+  - `aefld_u`
+  - `aex_er`
+  - `akn`
+  - `air`
+  - `xrm`
+- if those fit arrays are absent:
+  - document clearly that full NTSS parity cannot be reached from the current file alone using only table interpolation
+- port the NTSS high-PS fallback (`dkftte` / `dkfttc`) or build a faithful equivalent for the positive-field `high_branch`
+- audit collisionality parity between NEOPAX and NTSS before further interpolation-only changes:
+  - verify how `cmul = nu / v` is constructed in both codes
+  - compare the effective `xnu = log10(cmul)` at selected radii and profile scalings
+  - check whether the current NEOPAX Coulomb-log / multi-species collisionality model is shifting the interpolation band relative to NTSS
+  - pay special attention to scaled cases where `n / T^(3/2)` changes strongly
+- compare pointwise `D11 / D13 / D33` values at selected `(r, nu, Er)` points near the branch-transition region
+- add tail diagnostics for the last radii:
+  - explicit debug of `best_root[-5:]`
+  - `n_roots_all[-5:]`
+  - and grouped branch-selection behavior near the edge
+
+Implementation ordering recommendation:
+1. keep `generic` unchanged as the baseline control path
+2. use `preprocessed_3d` as the fast generic comparison path
+3. continue refining `ntss_preprocessed` rather than reintroducing a branch-heavy runtime `ntss_like` path
+4. check the production HDF5 for optional fit arrays before further fit-branch work
+5. audit `nu / v` parity between NEOPAX and NTSS in the scaled-profile mismatch case
+6. if needed, port `dkftte` / `dkfttc` next, as that is now the largest known missing NTSS branch

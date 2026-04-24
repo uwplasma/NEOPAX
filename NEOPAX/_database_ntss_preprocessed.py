@@ -54,6 +54,14 @@ def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
     inulr = np.zeros((n_r, max_groups), dtype=np.int32)
     inugr = np.zeros((n_r, max_groups), dtype=np.int32)
     icnur = np.zeros(n_r, dtype=np.int32)
+    lc_fit = np.zeros(n_r, dtype=bool)
+    ag11_0 = np.zeros(n_r, dtype=float)
+    ag11_sq = np.ones(n_r, dtype=float)
+    aefld_u = np.zeros(n_r, dtype=float)
+    aex_er = np.ones(n_r, dtype=float)
+    akn = np.ones(n_r, dtype=float)
+    air = np.ones(n_r, dtype=float)
+    xrm = float(np.max(r_grid) * 2.0) if n_r > 0 else 1.0
 
     for ir in range(n_r):
         D11[ir, :, :] *= drds[ir] ** 2
@@ -169,6 +177,14 @@ def _prepare_ntss_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
         "gmix_er": jnp.asarray(GMIX_ER),
         "gmix_nu": jnp.asarray(GMIX_NU),
         "del_r": jnp.asarray(DEL_R),
+        "lc_fit": jnp.asarray(lc_fit),
+        "ag11_0_fit": jnp.asarray(ag11_0),
+        "ag11_sq_fit": jnp.asarray(ag11_sq),
+        "aefld_u_fit": jnp.asarray(aefld_u),
+        "aex_er_fit": jnp.asarray(aex_er),
+        "akn_fit": jnp.asarray(akn),
+        "air_fit": jnp.asarray(air),
+        "xrm_fit": jnp.asarray(xrm),
     }
 
 
@@ -199,6 +215,14 @@ class NTSSPreprocessedMonoenergetic:
     gmix_er: float
     gmix_nu: float
     del_r: float
+    lc_fit: Float[Array, "..."]
+    ag11_0_fit: Float[Array, "..."]
+    ag11_sq_fit: Float[Array, "..."]
+    aefld_u_fit: Float[Array, "..."]
+    aex_er_fit: Float[Array, "..."]
+    akn_fit: Float[Array, "..."]
+    air_fit: Float[Array, "..."]
+    xrm_fit: float
 
     @classmethod
     def read_monkes(cls, a_b, monkes_file):
@@ -213,5 +237,23 @@ class NTSSPreprocessedMonoenergetic:
             D13=file["D13"][()],
             D33=file["D33"][()],
         )
+        n_r = data["r_grid"].shape[0]
+        for h5_key, data_key, default in (
+            ("lc_fit", "lc_fit", np.zeros(n_r, dtype=bool)),
+            ("ag11_0", "ag11_0_fit", np.zeros(n_r, dtype=float)),
+            ("ag11_sq", "ag11_sq_fit", np.ones(n_r, dtype=float)),
+            ("aefld_u", "aefld_u_fit", np.zeros(n_r, dtype=float)),
+            ("aex_er", "aex_er_fit", np.ones(n_r, dtype=float)),
+            ("akn", "akn_fit", np.ones(n_r, dtype=float)),
+            ("air", "air_fit", np.ones(n_r, dtype=float)),
+        ):
+            if h5_key in file:
+                data[data_key] = jnp.asarray(file[h5_key][()])
+            else:
+                data[data_key] = jnp.asarray(default)
+        for h5_key in ("xrm", "Rmajor", "major_radius"):
+            if h5_key in file:
+                data["xrm_fit"] = jnp.asarray(file[h5_key][()])
+                break
         file.close()
         return cls(**data)
