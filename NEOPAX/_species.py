@@ -254,7 +254,7 @@ def tau_ab_ntss_like(
     density_b_m3 = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
     return (
         3.0
-        * jnp.power(epsilon_0 / (charge_prod * elementary_charge), 2)
+        * jnp.power(epsilon_0 / charge_prod, 2)
         / elementary_charge
         * jnp.sqrt(mass_a / elementary_charge * jnp.power(2.0 * jnp.pi * temperature_a_eV, 3))
         / (elementary_charge * jnp.maximum(density_b_m3, 1.0e-30) * lnL)
@@ -278,7 +278,7 @@ def tau_ab_ntss_like_local(
     density_b_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[species_b]
     return (
         3.0
-        * jnp.power(epsilon_0 / (charge_prod * elementary_charge), 2)
+        * jnp.power(epsilon_0 / charge_prod, 2)
         / elementary_charge
         * jnp.sqrt(mass_a / elementary_charge * jnp.power(2.0 * jnp.pi * temperature_a_eV, 3))
         / (elementary_charge * jnp.maximum(density_b_m3, 1.0e-30) * lnL)
