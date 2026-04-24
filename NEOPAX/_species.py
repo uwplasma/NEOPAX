@@ -141,7 +141,7 @@ def collisionality_ntss_like(
     )(species, species_a, species.species_indices, r_index, density, temperature, v_thermal)
     kernel = jax.vmap(
         ntss_collision_kernel,
-        in_axes=(None, None, 0, None, None),
+        in_axes=(None, None, 0, None, 0),
     )(species, species_a, species.species_indices, v, v_thermal[:, r_index])
     vn = v / jnp.maximum(v_thermal[species_a, r_index], 1.0e-30)
     vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
@@ -163,7 +163,7 @@ def collisionality_ntss_like_local(
     )(species, species_a, species.species_indices, density_local, temperature_local, v_thermal_local)
     kernel = jax.vmap(
         ntss_collision_kernel,
-        in_axes=(None, None, 0, None, None),
+        in_axes=(None, None, 0, None, 0),
     )(species, species_a, species.species_indices, v, v_thermal_local)
     vn = v / jnp.maximum(v_thermal_local[species_a], 1.0e-30)
     vn3 = jnp.maximum(jnp.abs(vn) ** 3, 1.0e-30)
