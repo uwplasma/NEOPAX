@@ -381,7 +381,11 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
         solver_parameters=solver_cfg,
         models=models,
     )
-    state = _maybe_initialize_er_from_ambipolarity(config, runtime, state)
+    mode = str(config.get("general", {}).get("mode", config.get("mode", "transport"))).strip().lower()
+    # Ambipolarity-only runs solve the root problem explicitly later, so avoid
+    # paying for the same radial solve here during state initialization.
+    if mode != "ambipolarity":
+        state = _maybe_initialize_er_from_ambipolarity(config, runtime, state)
     return runtime, state
 
 

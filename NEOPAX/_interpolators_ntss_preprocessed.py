@@ -315,6 +315,13 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
             noic = jnp.where((xnu <= avgs_full[1]) | (xnu >= avgs_full[icue - 2]), 3, 4)
             ic_idx = jnp.minimum(ic_l + jnp.arange(4, dtype=jnp.int32), icue - 1)
             atc = jax.vmap(group_eval)(ic_idx)
+            no_data = jnp.asarray(
+                [
+                    db.x11_l,
+                    db.x13_l,
+                    ag33_full[db.inugr[ir, ic_l]],
+                ]
+            )
 
             def lag3():
                 x0 = avgs_full[ic_l]
@@ -323,7 +330,13 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
                 y11 = _lagrange3(xnu, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0])
                 y13 = _lagrange3(xnu, x0, x1, x2, atc[0, 1], atc[1, 1], atc[2, 1])
                 y33 = _lagrange3(xnu, x0, x1, x2, atc[0, 2], atc[1, 2], atc[2, 2])
-                return jnp.asarray([y11, y13, y33])
+                interp = jnp.asarray([y11, y13, y33])
+                no_data_guard = (
+                    (atc[2, 0] <= db.x11_l)
+                    | ((atc[1, 0] <= db.x11_l) & (xnu <= avgs_full[ic_l + 1]))
+                    | ((atc[0, 0] <= db.x11_l) & (xnu <= avgs_full[ic_l]))
+                )
+                return jnp.where(no_data_guard, no_data, interp)
 
             def but4():
                 x0 = avgs_full[ic_l]
@@ -333,7 +346,8 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
                 y11 = _butland4(xnu, x0, x1, x2, x3, atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0], db.gmix_nu)
                 y13 = _butland4(xnu, x0, x1, x2, x3, atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1], db.gmix_nu)
                 y33 = _butland4(xnu, x0, x1, x2, x3, atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2], db.gmix_nu)
-                return jnp.asarray([y11, y13, y33])
+                interp = jnp.asarray([y11, y13, y33])
+                return jnp.where(atc[2, 0] <= db.x11_l, no_data, interp)
 
             return jax.lax.cond(noic == 3, lag3, but4)
 
