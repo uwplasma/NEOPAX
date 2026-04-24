@@ -5,6 +5,8 @@ from jax import config
 # to use higher precision
 config.update("jax_enable_x64", True)
 
+SEGMENT_WIDTH = 16
+
 
 def _lagrange3(x, x0, x1, x2, y0, y1, y2):
     h0 = (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2))
@@ -61,6 +63,178 @@ def _interp_linear_segment(x, xs, ys, start, count):
     return y0 * (1.0 - w) + y1 * w
 
 
+def _segment_arrays(xs_full, ys_full, start):
+    max_start = jnp.maximum(xs_full.shape[0] - SEGMENT_WIDTH, 0)
+    start = jnp.clip(start, 0, max_start)
+    xs = jax.lax.dynamic_slice_in_dim(xs_full, start, SEGMENT_WIDTH, axis=0)
+    ys = jax.lax.dynamic_slice_in_dim(ys_full, start, SEGMENT_WIDTH, axis=0)
+    return xs, ys
+
+
+def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
+    kcl = jnp.clip(icl, 0, 4)
+    kcu = jnp.clip(icu, 0, 4)
+    amix = jnp.clip(fmix, 0.0, 1.0)
+
+    def case_n1():
+        return ys[0]
+
+    def case_n2():
+        dy = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        return ys[0] + dy * (x - xs[0])
+
+    def case_n3():
+        left_ge3 = kcl >= 3
+        right_ge3 = kcu >= 3
+        a0 = jnp.where(left_ge3, ys[0], ys[0] - ys[1])
+        a1 = jnp.where(left_ge3, 1.0, xs[0] - xs[1])
+        a2 = jnp.where(left_ge3, xs[0] - xs[1], 0.5 * (xs[0] - xs[1]) ** 2)
+        b0 = jnp.where(right_ge3, ys[2], ys[2] - ys[1])
+        b1 = jnp.where(right_ge3, 1.0, xs[2] - xs[1])
+        b2 = jnp.where(right_ge3, xs[2] - xs[1], 0.5 * (xs[2] - xs[1]) ** 2)
+        det = a1 * b2 - a2 * b1
+        g1 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * b2 - a2 * b0) / det)
+        g2 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * b0 - a0 * b1) / det)
+
+        def left():
+            dy = g1 + g2 * (xs[0] - xs[1])
+            return ys[0] + dy * (x - xs[0])
+
+        def middle():
+            gx = x - xs[1]
+            return ys[1] + gx * (g1 + 0.5 * g2 * gx)
+
+        def right():
+            dy = g1 + g2 * (xs[2] - xs[1])
+            return ys[2] + dy * (x - xs[2])
+
+        return jax.lax.cond(x <= xs[0], left, lambda: jax.lax.cond(x <= xs[2], middle, right))
+
+    def case_ngt3():
+        n_eff = jnp.minimum(n, SEGMENT_WIDTH)
+        valid_mask = jnp.arange(SEGMENT_WIDTH) < n_eff
+        xs_mask = jnp.where(valid_mask, xs, jnp.inf)
+        pos = jnp.searchsorted(xs_mask, x, side="left")
+
+        def left_boundary():
+            i1, i2, i3 = 0, 1, 2
+            a0 = ys[i3] - ys[i2]
+            a1 = xs[i3] - xs[i2]
+            a2 = 0.5 * a1**2
+            a3 = (2.0 / 3.0) * a1 * a2
+            use_low_bc = kcl <= 2
+            b0 = jnp.where(use_low_bc, ys[i1] - ys[i2], ys[i1])
+            b1 = jnp.where(use_low_bc, xs[i1] - xs[i2], 1.0)
+            b2 = jnp.where(use_low_bc, 0.5 * b1**2, xs[i1] - xs[i2])
+            b3 = jnp.where(use_low_bc, (2.0 / 3.0) * b1 * b2, b2**2)
+
+            def bc_vals():
+                c0 = jnp.where(kcl == 0, fcl, jnp.where(kcl <= 2, fcl, fcl))
+                c1 = jnp.where(kcl == 0, 1.0, 0.0)
+                c2 = jnp.where(kcl == 0, b1, jnp.where(kcl == 1, 1.0, jnp.where(kcl == 2, 0.0, 1.0)))
+                c3 = jnp.where(kcl == 0, b1**2, jnp.where(kcl == 1, 2.0 * b1, jnp.where(kcl == 2, 2.0, jnp.where(kcl == 3, 2.0 * b2, 2.0))))
+                return c0, c1, c2, c3
+
+            c0, c1, c2, c3 = bc_vals()
+            det = a1 * (b2 * c3 - b3 * c2) - a2 * (b1 * c3 - b3 * c1) + a3 * (b1 * c2 - b2 * c1)
+            g1 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * (b2 * c3 - b3 * c2) - a2 * (b0 * c3 - b3 * c0) + a3 * (b0 * c2 - b2 * c0)) / det)
+            g2 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b0 * c3 - b3 * c0) - a0 * (b1 * c3 - b3 * c1) + a3 * (b1 * c0 - b0 * c1)) / det)
+            g3 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b2 * c0 - b0 * c2) - a2 * (b1 * c0 - b0 * c1) + a0 * (b1 * c2 - b2 * c1)) / det)
+
+            def x_le_i1():
+                gx = xs[i1] - xs[i2]
+                dy = g1 + (g2 + g3 * gx) * gx
+                y1 = ys[i2] + (g1 + (0.5 * g2 + (1.0 / 3.0) * g3 * gx) * gx) * gx
+                return y1 + dy * (x - xs[i1])
+
+            def x_le_i2():
+                gx = x - xs[i2]
+                return ys[i2] + (g1 + (0.5 * g2 + (1.0 / 3.0) * g3 * gx) * gx) * gx
+
+            return jax.lax.cond(x <= xs[i1], x_le_i1, x_le_i2)
+
+        def right_or_interior():
+            i3 = jnp.minimum(jnp.maximum(pos, 2), n_eff - 1)
+            i2 = i3 - 1
+            i1 = i2 - 1
+            xl = xs[i2]
+            yl = ys[i2]
+            a0 = ys[i3] - yl
+            a1 = xs[i3] - xl
+            a2 = 0.5 * a1**2
+            b0 = ys[i1] - yl
+            b1 = xs[i1] - xl
+            b2 = 0.5 * b1**2
+            det = a1 * b2 - a2 * b1
+            dyl_raw = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * b2 - b0 * a2) / det)
+            dyl = jnp.where((yl - ys[i1]) * (yl - ys[i3]) >= 0.0, amix * dyl_raw, dyl_raw)
+
+            def interior():
+                i4 = i3 + 1
+                xu = xs[i3]
+                yu = ys[i3]
+                a0u = ys[i4] - yu
+                a1u = xs[i4] - xu
+                a2u = 0.5 * a1u**2
+                b0u = ys[i2] - yu
+                b1u = xs[i2] - xu
+                b2u = 0.5 * b1u**2
+                detu = a1u * b2u - a2u * b1u
+                dyu_raw = jnp.where(jnp.abs(detu) <= 1.0e-30, 0.0, (a0u * b2u - b0u * a2u) / detu)
+                dyu = jnp.where((yu - ys[i2]) * (yu - ys[i4]) >= 0.0, amix * dyu_raw, dyu_raw)
+                return xl, yl, dyl, xu, yu, dyu
+
+            def right_boundary():
+                i2r = jnp.minimum(n_eff - 2, i3)
+                i1r = i2r + 1
+                i3r = i2r - 1
+                a0r = ys[i3r] - ys[i2r]
+                a1r = xs[i3r] - xs[i2r]
+                a2r = 0.5 * a1r**2
+                a3r = (2.0 / 3.0) * a1r * a2r
+                use_up_bc = kcu <= 2
+                b0r = jnp.where(use_up_bc, ys[i1r] - ys[i2r], ys[i1r])
+                b1r = jnp.where(use_up_bc, xs[i1r] - xs[i2r], 1.0)
+                b2r = jnp.where(use_up_bc, 0.5 * b1r**2, xs[i1r] - xs[i2r])
+                b3r = jnp.where(use_up_bc, (2.0 / 3.0) * b1r * b2r, b2r**2)
+                c0 = fcu
+                c1 = jnp.where(kcu == 0, 1.0, 0.0)
+                c2 = jnp.where(kcu == 0, b1r, jnp.where(kcu == 1, 1.0, jnp.where(kcu == 2, 0.0, 1.0)))
+                c3 = jnp.where(kcu == 0, b1r**2, jnp.where(kcu == 1, 2.0 * b1r, jnp.where(kcu == 2, 2.0, jnp.where(kcu == 3, 2.0 * b2r, 2.0))))
+                detr = a1r * (b2r * c3 - b3r * c2) - a2r * (b1r * c3 - b3r * c1) + a3r * (b1r * c2 - b2r * c1)
+                g1r = jnp.where(jnp.abs(detr) <= 1.0e-30, 0.0, (a0r * (b2r * c3 - b3r * c2) - a2r * (b0r * c3 - b3r * c0) + a3r * (b0r * c2 - b2r * c0)) / detr)
+                xu = xs[i2r]
+                yu = ys[i2r]
+                return xl, yl, dyl, xu, yu, g1r
+
+            xl, yl, dyl2, xu, yu, dyu = jax.lax.cond(i3 < n_eff - 1, interior, right_boundary)
+            dx = xu - xl
+            dx2 = dx**2
+            dx3 = dx2 * dx
+            a0c = yu - yl - dx * dyl2
+            a2c = 0.5 * dx2
+            a3c = (1.0 / 3.0) * dx3
+            b0c = dyu - dyl2
+            b2c = dx
+            b3c = dx2
+            detc = a2c * b3c - a3c * b2c
+            g1c = dyl2
+            g2c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a0c * b3c - a3c * b0c) / detc)
+            g3c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a2c * b0c - a0c * b2c) / detc)
+            gx = x - xl
+            return yl + gx * (g1c + gx * (0.5 * g2c + (1.0 / 3.0) * g3c * gx))
+
+        return jax.lax.cond(x < xs[2], left_boundary, right_or_interior)
+
+    return jax.lax.cond(n <= 1, case_n1, lambda: jax.lax.cond(n == 2, case_n2, lambda: jax.lax.cond(n == 3, case_n3, case_ngt3)))
+
+
+def _inpold_segment(x, xs_full, ys_full, start, count, icl, fcl, icu, fcu, fmix):
+    xs, ys = _segment_arrays(xs_full, ys_full, start)
+    local_count = jnp.minimum(count, SEGMENT_WIDTH)
+    return _inpold_fixed(x, xs, ys, local_count, icl, fcl, icu, fcu, fmix)
+
+
 def _eval_radius_node(ir, xnu, xer, efield, db):
     icu0 = db.nval0[ir]
     icue = db.icnur[ir]
@@ -78,10 +252,11 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
         last0 = icu0 - 1
         high = jnp.asarray([g110[last0] - xs0[last0] + xnu, db.x13_l, g330[last0]])
         low = jnp.asarray([g110[0] + xs0[0] - xnu, g130[0], g330[0]])
+        fc_l = -1.0
         mid = jnp.asarray([
-            _interp_linear_segment(xnu, xs0, g110, 0, icu0),
-            _interp_linear_segment(xnu, xs0, g130, 0, icu0),
-            _interp_linear_segment(xnu, xs0, g330, 0, icu0),
+            _inpold_segment(xnu, xs0, g110, 0, icu0, 0, fc_l, 0, 1.0, db.gmix_nu),
+            _inpold_segment(xnu, xs0, g130, 0, icu0, 1, 0.0, 1, 0.0, db.gmix_nu),
+            _inpold_segment(xnu, xs0, g330, 0, icu0, 0, 0.0, 0, 0.0, db.gmix_nu),
         ])
         return jnp.where(
             xnu > xs0[last0],
@@ -97,17 +272,17 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
         x11 = jnp.where(
             xer <= first,
             ag11_full[start],
-            jnp.where(xer > last, db.x11_l, _interp_linear_segment(xer, aref_full, ag11_full, start, n)),
+            jnp.where(xer > last, db.x11_l, _inpold_segment(xer, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)),
         )
         x13 = jnp.where(
             xer <= first,
             ag13_full[start],
-            jnp.where(xer > last, db.x13_l, _interp_linear_segment(xer, aref_full, ag13_full, start, n)),
+            jnp.where(xer > last, db.x13_l, _inpold_segment(xer, aref_full, ag13_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)),
         )
         x33 = jnp.where(
             xer <= first,
             ag33_full[start],
-            jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(xer, aref_full, ag33_full, start, n)),
+            jnp.where(xer > last, ag33_full[start + n - 1], _inpold_segment(xer, aref_full, ag33_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er)),
         )
         return jnp.asarray([x11, x13, x33])
 
@@ -119,9 +294,9 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
             first = aref_full[start]
             last = aref_full[start + n - 1]
             xer_h = (avgs_full[0] - xnu) / 3.0 + xer
-            x11 = jnp.where(xer_h > last, db.x11_l, _interp_linear_segment(xer_h, aref_full, ag11_full, start, n))
-            x13 = jnp.where(xer > last, db.x13_l, _interp_linear_segment(jnp.maximum(xer, first), aref_full, ag13_full, start, n))
-            x33 = jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(jnp.maximum(xer, first), aref_full, ag33_full, start, n))
+            x11 = jnp.where(xer_h > last, db.x11_l, _inpold_segment(xer_h, aref_full, ag11_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
+            x13 = jnp.where(xer > last, db.x13_l, _inpold_segment(xer, aref_full, ag13_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
+            x33 = jnp.where(xer > last, ag33_full[start + n - 1], _inpold_segment(xer, aref_full, ag33_full, start, n, 0, 0.0, 1, 0.0, db.gmix_er))
             return jnp.asarray([x11, x13, x33])
 
         def high_branch():
@@ -236,10 +411,16 @@ def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
         x1 = arr[nil + 1]
         x2 = arr[nil + 2]
         x3 = arr[nil + 3]
+        def lagrange4(y0, y1, y2, y3):
+            h0 = (xri - x1) * (xri - x2) * (xri - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3))
+            h1 = (xri - x0) * (xri - x2) * (xri - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3))
+            h2 = (xri - x0) * (xri - x1) * (xri - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3))
+            h3 = (xri - x0) * (xri - x1) * (xri - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2))
+            return h0 * y0 + h1 * y1 + h2 * y2 + h3 * y3
         return jnp.asarray([
-            _butland4(xri, x0, x1, x2, x3, atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0], 1.0),
-            _butland4(xri, x0, x1, x2, x3, atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1], 1.0),
-            _butland4(xri, x0, x1, x2, x3, atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2], 1.0),
+            lagrange4(atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0]),
+            lagrange4(atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1]),
+            lagrange4(atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2]),
         ])
 
     return jax.lax.cond(
