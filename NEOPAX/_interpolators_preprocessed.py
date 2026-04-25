@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import config
-from ._interpolators_ntss_preprocessed import _inpold_segment
+from ._interpolators_ntss_preprocessed import _inpold_fixed
 
 # to use higher precision
 config.update("jax_enable_x64", True)
@@ -71,21 +71,21 @@ def _surface_bilinear(table, er_grid, ir, inu, ty, grid_er_internal):
     )
 
 
-def _surface_ntss1d(table, er_grid, ir, inu, ty, grid_er_internal):
-    xs = er_grid[ir]
-    n = xs.shape[0]
+def _surface_ntss1d(table, table_padded, er_grid_padded, er_count, gmix_er, ir, inu, ty, grid_er_internal):
+    xs = er_grid_padded[ir]
+    n = er_count
     first = xs[0]
     last = xs[n - 1]
 
     def interp_row(row):
-        ys = table[ir, row]
+        ys_padded = table_padded[ir, row]
         return jnp.where(
             grid_er_internal <= first,
-            ys[0],
+            ys_padded[0],
             jnp.where(
                 grid_er_internal > last,
-                ys[n - 1],
-                _inpold_segment(grid_er_internal, xs, ys, 0, n, 0, 0.0, 1, 0.0, 0.1),
+                ys_padded[n - 1],
+                _inpold_fixed(grid_er_internal, xs, ys_padded, n, 0, 0.0, 1, 0.0, gmix_er),
             ),
         )
 
@@ -308,9 +308,39 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
     stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
 
     def eval_surface(ir):
-        d11 = _surface_ntss1d(database.D11_log, database.Er_grid, ir, inu, ty, grid_er_internal)
-        d13 = _surface_ntss1d(database.D13, database.Er_grid, ir, inu, ty, grid_er_internal)
-        d33 = _surface_ntss1d(database.D33, database.Er_grid, ir, inu, ty, grid_er_internal)
+        d11 = _surface_ntss1d(
+            database.D11_log,
+            database.D11_log_ntss1d,
+            database.Er_grid_ntss1d,
+            database.er_count_ntss1d,
+            database.gmix_er_ntss1d,
+            ir,
+            inu,
+            ty,
+            grid_er_internal,
+        )
+        d13 = _surface_ntss1d(
+            database.D13,
+            database.D13_ntss1d,
+            database.Er_grid_ntss1d,
+            database.er_count_ntss1d,
+            database.gmix_er_ntss1d,
+            ir,
+            inu,
+            ty,
+            grid_er_internal,
+        )
+        d33 = _surface_ntss1d(
+            database.D33,
+            database.D33_ntss1d,
+            database.Er_grid_ntss1d,
+            database.er_count_ntss1d,
+            database.gmix_er_ntss1d,
+            ir,
+            inu,
+            ty,
+            grid_er_internal,
+        )
         return jnp.asarray([d11, d13, d33])
 
     atc = jax.vmap(eval_surface)(stencil_idx)

@@ -880,6 +880,54 @@ Primary remaining tasks in this phase:
   - `n_roots_all[-5:]`
   - and grouped branch-selection behavior near the edge
 
+### Phase 11B: Optimize The NTSS 1D Kernel
+- Status: planned
+- Goal:
+  - reduce compile/runtime cost of the NTSS-like `Er`-axis interpolation while preserving the root behavior that appears to come specifically from the NTSS 1D interpolation kernel
+
+Why this phase was added:
+- recent hybrid interpolation tests showed that:
+  - `preprocessed_3d_ntss_radial_ntss1d` cuts compile time significantly relative to full `preprocessed_ntss`
+  - and still preserves roughly the same ambipolar root transition
+- this strongly suggests the NTSS-like 1D interpolation in the `Er` direction is one of the main ingredients controlling the NTSS-like root location
+- by contrast, simplifying that 1D kernel too aggressively moved the root transition back toward the plain `preprocessed_3d` result
+
+Current interpretation:
+- likely compile/runtime cost drivers are now:
+  - the general `INPOLD`-style 1D interpolation kernel
+  - boundary/extrapolation handling inside that kernel
+  - repeated per-surface `Er`-axis work for every energy/radius query
+- likely high-value target:
+  - preserve the NTSS-like 1D behavior for `D11`
+  - while making the kernel more JAX-friendly and more specialized to the actual preprocessed database layout
+
+Primary tasks in this phase:
+- profile and isolate the hot cost of the current `_inpold_fixed` / `_inpold_segment` path under the hybrid mode
+- design a more JAX-friendly NTSS-like 1D kernel specialized to the actual preprocessed case:
+  - fixed small `Er` grid size
+  - fewer dynamic branches
+  - static-shape friendly internal logic
+- test precomputing reusable `Er`-axis interpolation metadata in the database object
+- evaluate whether most of the benefit is carried by `D11` alone:
+  - test a variant with NTSS-like 1D interpolation for `D11`
+  - and simpler interpolation retained for `D13` / `D33`
+- compare against the current three key modes:
+  - `preprocessed_3d_ntss_radial`
+  - `preprocessed_3d_ntss_radial_ntss1d`
+  - `preprocessed_ntss`
+
+Validation targets for this phase:
+- first-call compile time
+- total wall time for the ambipolar benchmark setup
+- root-transition position
+- agreement with the current `preprocessed_ntss` reference behavior
+
+Implementation ordering recommendation:
+1. keep `preprocessed_ntss` unchanged as the accuracy reference
+2. use `preprocessed_3d_ntss_radial_ntss1d` as the optimization playground
+3. optimize the NTSS-like 1D kernel before touching the NTSS radial stencil again
+4. only if needed later, revisit whether a partial `D11`-only NTSS 1D path gives most of the physics benefit at lower cost
+
 Implementation ordering recommendation:
 1. keep `generic` unchanged as the baseline control path
 2. use `preprocessed_3d` as the fast generic comparison path
