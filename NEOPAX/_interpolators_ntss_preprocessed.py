@@ -212,10 +212,11 @@ def _interp_linear_segment(x, xs, ys, start, count):
 
 
 def _segment_arrays(xs_full, ys_full, start):
-    max_start = jnp.maximum(xs_full.shape[0] - SEGMENT_WIDTH, 0)
+    width = min(SEGMENT_WIDTH, xs_full.shape[0])
+    max_start = jnp.maximum(xs_full.shape[0] - width, 0)
     start = jnp.clip(start, 0, max_start)
-    xs = jax.lax.dynamic_slice_in_dim(xs_full, start, SEGMENT_WIDTH, axis=0)
-    ys = jax.lax.dynamic_slice_in_dim(ys_full, start, SEGMENT_WIDTH, axis=0)
+    xs = jax.lax.dynamic_slice_in_dim(xs_full, start, width, axis=0)
+    ys = jax.lax.dynamic_slice_in_dim(ys_full, start, width, axis=0)
     return xs, ys
 
 
