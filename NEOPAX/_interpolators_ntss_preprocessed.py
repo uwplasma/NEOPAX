@@ -217,6 +217,9 @@ def _segment_arrays(xs_full, ys_full, start):
     start = jnp.clip(start, 0, max_start)
     xs = jax.lax.dynamic_slice_in_dim(xs_full, start, width, axis=0)
     ys = jax.lax.dynamic_slice_in_dim(ys_full, start, width, axis=0)
+    pad = SEGMENT_WIDTH - width
+    xs = jnp.pad(xs, (0, pad), constant_values=jnp.inf)
+    ys = jnp.pad(ys, (0, pad), constant_values=0.0)
     return xs, ys
 
 
