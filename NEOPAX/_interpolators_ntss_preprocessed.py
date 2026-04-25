@@ -179,9 +179,13 @@ def _butland4(x, x0, x1, x2, x3, y0, y1, y2, y3, gmix):
 
 
 def _interp_linear(x, xs, ys, n):
-    xs = xs[:n]
-    ys = ys[:n]
-    idx = jnp.clip(jnp.searchsorted(xs, x, side="right") - 1, 0, n - 2)
+    n_eff = jnp.minimum(n, xs.shape[0])
+    idxs = jnp.arange(xs.shape[0])
+    valid = idxs < n_eff
+    pair_valid = valid[:-1] & valid[1:]
+    cand = jnp.where(pair_valid & (x >= xs[:-1]), idxs[:-1], -1)
+    idx = jnp.maximum(jnp.max(cand), 0)
+    idx = jnp.minimum(idx, jnp.maximum(n_eff - 2, 0))
     x0 = xs[idx]
     x1 = xs[idx + 1]
     y0 = ys[idx]
