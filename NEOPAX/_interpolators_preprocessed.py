@@ -20,6 +20,19 @@ def _fraction(grid, idx, value):
     return jnp.clip((value - x0) / denom, 0.0, 1.0)
 
 
+def _clamped_interval_index_fixed(grid, value):
+    left = grid[:-1]
+    idx = jnp.sum(value >= left).astype(jnp.int32) - 1
+    return jnp.clip(idx, 0, grid.shape[0] - 2)
+
+
+def _fraction_fixed(grid, idx, value):
+    x0 = grid[idx]
+    x1 = grid[idx + 1]
+    denom = jnp.maximum(x1 - x0, 1.0e-30)
+    return jnp.clip((value - x0) / denom, 0.0, 1.0)
+
+
 def _bilinear(value00, value01, value10, value11, tx, ty):
     v0 = value00 * (1.0 - tx) + value10 * tx
     v1 = value01 * (1.0 - tx) + value11 * tx
@@ -417,6 +430,127 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
 
     inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
     ty = _fraction(database.nu_log, inu, grid_nu_internal)
+
+    exact_mask = jnp.abs(xri - arr) <= database.del_r
+    exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
+    is_exact = jnp.any(exact_mask)
+
+    nil = jnp.where(
+        xri < arr[1],
+        0,
+        jnp.where(
+            xri >= arr[nr - 2],
+            nr - 3,
+            jnp.searchsorted(arr[2:nr - 1], xri, side="left"),
+        ),
+    )
+    noi = jnp.where((xri < arr[1]) | (xri >= arr[nr - 2]), 3, 4)
+    nil = jnp.where(is_exact, exact_idx, nil)
+    noi = jnp.where(is_exact, 1, noi)
+
+    stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
+
+    def eval_surface(ir):
+        d11 = _surface_ntss1d(database.D11_log, ir, inu, ty, grid_er_internal, database)
+        d13 = _surface_ntss1d(database.D13, ir, inu, ty, grid_er_internal, database)
+        d33 = _surface_ntss1d(database.D33, ir, inu, ty, grid_er_internal, database)
+        return jnp.asarray([d11, d13, d33])
+
+    atc = jax.vmap(eval_surface)(stencil_idx)
+
+    def exact():
+        return atc[0]
+
+    def small_r():
+        xr2 = xri * xri
+        xr3 = xr2 * xri
+        r1 = arr[0]
+        r2 = arr[1]
+        r3 = arr[2]
+        r12 = r1 * r1
+        r22 = r2 * r2
+        r32 = r3 * r3
+        r13 = r1 * r12
+        r23 = r2 * r22
+        r33 = r3 * r32
+
+        def comp(v0, v1, v2):
+            ha = ((v2 - v1) / (r33 - r23) - (v2 - v0) / (r33 - r13)) / (
+                (r32 - r22) / (r33 - r23) - (r32 - r12) / (r33 - r13)
+            )
+            hb = ((v2 - v1) / (r32 - r22) - (v2 - v0) / (r32 - r12)) / (
+                (r33 - r23) / (r32 - r22) - (r33 - r13) / (r32 - r12)
+            )
+            hg = v0 - r12 * ha - r13 * hb
+            return hg + xr2 * ha + xr3 * hb
+
+        return jnp.asarray(
+            [
+                comp(atc[0, 0], atc[1, 0], atc[2, 0]),
+                comp(atc[0, 1], atc[1, 1], atc[2, 1]),
+                comp(atc[0, 2], atc[1, 2], atc[2, 2]),
+            ]
+        )
+
+    def edge3():
+        x0 = arr[nil]
+        x1 = arr[nil + 1]
+        x2 = arr[nil + 2]
+        return jnp.asarray(
+            [
+                _lagrange3(xri, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0]),
+                _lagrange3(xri, x0, x1, x2, atc[0, 1], atc[1, 1], atc[2, 1]),
+                _lagrange3(xri, x0, x1, x2, atc[0, 2], atc[1, 2], atc[2, 2]),
+            ]
+        )
+
+    def interior4():
+        x0 = arr[nil]
+        x1 = arr[nil + 1]
+        x2 = arr[nil + 2]
+        x3 = arr[nil + 3]
+
+        def lagrange4(y0, y1, y2, y3):
+            h0 = (xri - x1) * (xri - x2) * (xri - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3))
+            h1 = (xri - x0) * (xri - x2) * (xri - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3))
+            h2 = (xri - x0) * (xri - x1) * (xri - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3))
+            h3 = (xri - x0) * (xri - x1) * (xri - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2))
+            return h0 * y0 + h1 * y1 + h2 * y2 + h3 * y3
+
+        return jnp.asarray(
+            [
+                lagrange4(atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0]),
+                lagrange4(atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1]),
+                lagrange4(atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2]),
+            ]
+        )
+
+    return jax.lax.cond(
+        noi == 1,
+        exact,
+        lambda: jax.lax.cond(
+            xri < arr[1],
+            small_r,
+            lambda: jax.lax.cond((xri >= arr[nr - 2]) | (noi == 3), edge3, interior4),
+        ),
+    )
+
+
+@jax.jit
+def get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu(grid_x, grid_nu, grid_Er, database):
+    arr = database.r_grid
+    nr = arr.shape[0]
+    xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_ratio = jnp.where(
+        xri <= database.low_limit_r,
+        database.Er_lower_limit,
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+    )
+    grid_er_internal = jnp.log10(er_ratio)
+
+    inu = _clamped_interval_index_fixed(database.nu_log, grid_nu_internal)
+    ty = _fraction_fixed(database.nu_log, inu, grid_nu_internal)
 
     exact_mask = jnp.abs(xri - arr) <= database.del_r
     exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
