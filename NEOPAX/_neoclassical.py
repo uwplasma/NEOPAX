@@ -1130,13 +1130,11 @@ def _get_Neoclassical_Fluxes_preprocessed_ertilde(
     temperature_right_grad_constraint=None,
     collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
 ):
-    density = _density_state_like(density)
-    temperature = _temperature_state_like(temperature)
     n_right = _as_species_constraint(density_right_constraint, species.number_species)
     n_right_grad = _as_species_constraint(density_right_grad_constraint, species.number_species)
     t_right = _as_species_constraint(temperature_right_constraint, species.number_species)
     t_right_grad = _as_species_constraint(temperature_right_grad_constraint, species.number_species)
-    v_thermal = get_v_thermal(species.mass, temperature)
+    v_thermal = jax.vmap(get_v_thermal, in_axes=(0, 0), out_axes=(0))(species.mass, temperature)
 
     @jit
     def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
