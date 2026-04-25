@@ -137,6 +137,33 @@ def _prepare_ntss_arrays(
             ag110[ir, i] = g11
             ag130[ir, i] = g13
             ag330[ir, i] = g33
+        if nv0 >= 2:
+            min_idx = 0
+            max_idx = nv0 - 1
+            xnul = axnu0[ir, 0]
+            xnug = axnu0[ir, nv0 - 1]
+            for idx in range(nv0):
+                xnu = axnu0[ir, idx]
+                if xnu < xnul:
+                    xnul = xnu
+                    min_idx = idx
+                if xnu > xnug:
+                    xnug = xnu
+                    max_idx = idx
+
+            if min_idx > 0:
+                axnu0[ir, 0], axnu0[ir, min_idx] = axnu0[ir, min_idx], axnu0[ir, 0]
+                ag110[ir, 0], ag110[ir, min_idx] = ag110[ir, min_idx], ag110[ir, 0]
+                ag130[ir, 0], ag130[ir, min_idx] = ag130[ir, min_idx], ag130[ir, 0]
+                ag330[ir, 0], ag330[ir, min_idx] = ag330[ir, min_idx], ag330[ir, 0]
+                if max_idx == 0:
+                    max_idx = min_idx
+
+            if max_idx < nv0 - 1:
+                axnu0[ir, nv0 - 1], axnu0[ir, max_idx] = axnu0[ir, max_idx], axnu0[ir, nv0 - 1]
+                ag110[ir, nv0 - 1], ag110[ir, max_idx] = ag110[ir, max_idx], ag110[ir, nv0 - 1]
+                ag130[ir, nv0 - 1], ag130[ir, max_idx] = ag130[ir, max_idx], ag130[ir, nv0 - 1]
+                ag330[ir, nv0 - 1], ag330[ir, max_idx] = ag330[ir, max_idx], ag330[ir, nv0 - 1]
 
         nve = len(finite_rows)
 
