@@ -25,6 +25,10 @@ EV_PER_JOULE = 1 / JOULE_PER_EV
 STATE_DENSITY_TO_PHYSICAL = 1.0e20
 STATE_TEMPERATURE_TO_EV = 1.0e3
 
+COULOMB_LOG_MODEL_DEFAULT = 0
+COULOMB_LOG_MODEL_NTSS_LEGACY = 1
+COULOMB_LOG_MODEL_FIRST_PRINCIPLES = 2
+
 
 #Get thermodynamical forces
 @jit
@@ -103,22 +107,39 @@ jax.tree_util.register_pytree_node(Species, _species_flatten, _species_unflatten
 
 
 
-def collisionality(species_a: int, species: Species, v: float, r_index: int, density, temperature, v_thermal) -> float:
+def collisionality(
+    species_a: int,
+    species: Species,
+    v: float,
+    r_index: int,
+    density,
+    temperature,
+    v_thermal,
+    coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT,
+) -> float:
     """Collisionality of species_a against all species."""
     nu = jnp.sum(
-        jax.vmap(nuD_ab, in_axes=(None, None, 0, None, None, None, None, None))(
-            species, species_a, species.species_indices, v, r_index, density, temperature, v_thermal
+        jax.vmap(nuD_ab, in_axes=(None, None, 0, None, None, None, None, None, None))(
+            species, species_a, species.species_indices, v, r_index, density, temperature, v_thermal, coulomb_log_model
         ),
         axis=0,
     )
     return nu
 
 
-def collisionality_local(species_a: int, species: Species, v: float, density_local, temperature_local, v_thermal_local) -> float:
+def collisionality_local(
+    species_a: int,
+    species: Species,
+    v: float,
+    density_local,
+    temperature_local,
+    v_thermal_local,
+    coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT,
+) -> float:
     """Collisionality of species_a against all species using local profiles at one radius."""
     nu = jnp.sum(
-        jax.vmap(nuD_ab_local, in_axes=(None, None, 0, None, None, None, None))(
-            species, species_a, species.species_indices, v, density_local, temperature_local, v_thermal_local
+        jax.vmap(nuD_ab_local, in_axes=(None, None, 0, None, None, None, None, None))(
+            species, species_a, species.species_indices, v, density_local, temperature_local, v_thermal_local, coulomb_log_model
         ),
         axis=0,
     )
@@ -169,38 +190,39 @@ def collisionality_ntss_like_local(
 
 
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
-           density, temperature, v_thermal) -> float:
+           density, temperature, v_thermal, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Pairwise pitch-angle scattering frequency for species a against species b."""
     nb = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
     vtb = v_thermal[species_b, r_index]
-    prefactor = gamma_ab(species, species_a, species_b, v, r_index, temperature, density) * nb / v**3
+    prefactor = gamma_ab(species, species_a, species_b, v, r_index, temperature, density, v_thermal, coulomb_log_model) * nb / v**3
     erf_part = jax.scipy.special.erf(v / vtb) - chandrasekhar(v / vtb)
     return prefactor * erf_part
 
 
 def nuD_ab_local(species: Species, species_a: int, species_b: int, v: float,
-                 density_local, temperature_local, v_thermal_local) -> float:
+                 density_local, temperature_local, v_thermal_local, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Pairwise pitch-angle scattering frequency using local profiles at one radius."""
     nb = STATE_DENSITY_TO_PHYSICAL * density_local[species_b]
     vtb = v_thermal_local[species_b]
-    prefactor = gamma_ab_local(species, species_a, species_b, temperature_local, density_local) * nb / v**3
+    prefactor = gamma_ab_local(species, species_a, species_b, temperature_local, density_local, v_thermal_local, coulomb_log_model) * nb / v**3
     erf_part = jax.scipy.special.erf(v / vtb) - chandrasekhar(v / vtb)
     return prefactor * erf_part
 
 
 def gamma_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
-             temperature, density) -> float:
+             temperature, density, v_thermal, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Prefactor for pairwise collisionality."""
-    lnlambda = coulomb_logarithm(species, species_a, species_b, r_index, temperature, density)
+    del v
+    lnlambda = coulomb_logarithm(species, species_a, species_b, r_index, temperature, density, v_thermal, coulomb_log_model)
     ea, eb = species.charge[species_a], species.charge[species_b]
     ma = species.mass[species_a]
     return ea**2 * eb**2 * lnlambda / (4 * jnp.pi * epsilon_0**2 * ma**2)
 
 
 def gamma_ab_local(species: Species, species_a: int, species_b: int,
-                   temperature_local, density_local) -> float:
+                   temperature_local, density_local, v_thermal_local, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Prefactor for pairwise collisionality using local profiles at one radius."""
-    lnlambda = coulomb_logarithm_local(species, species_a, species_b, temperature_local, density_local)
+    lnlambda = coulomb_logarithm_local(species, species_a, species_b, temperature_local, density_local, v_thermal_local, coulomb_log_model)
     ea, eb = species.charge[species_a], species.charge[species_b]
     ma = species.mass[species_a]
     return ea**2 * eb**2 * lnlambda / (4 * jnp.pi * epsilon_0**2 * ma**2)
@@ -212,14 +234,18 @@ def nupar_ab(species: Species, species_a: int, species_b: int, v: float, r_index
     nb = STATE_DENSITY_TO_PHYSICAL * density[species_b, r_index]
     vtb = v_thermal[species_b, r_index]
     return (
-        2 * gamma_ab(species, species_a, species_b, v, r_index, temperature, density) * nb / v**3
+        2 * gamma_ab(species, species_a, species_b, v, r_index, temperature, density, v_thermal) * nb / v**3
         * chandrasekhar(v / vtb)
     )
 
 
 def coulomb_logarithm(species: Species, species_a: int, species_b: int, r_index: int,
-                      temperature, density) -> float:
+                      temperature, density, v_thermal, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Coulomb logarithm for collisions between species a and b."""
+    if coulomb_log_model == COULOMB_LOG_MODEL_NTSS_LEGACY:
+        return coulomb_logarithm_ntss_legacy(temperature, density, r_index)
+    if coulomb_log_model == COULOMB_LOG_MODEL_FIRST_PRINCIPLES:
+        return coulomb_logarithm_first_principles(species, species_a, species_b, r_index, density, temperature, v_thermal)
     Te_eV = STATE_TEMPERATURE_TO_EV * temperature[0, r_index]
     ne_m3 = STATE_DENSITY_TO_PHYSICAL * density[0, r_index]
     lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
@@ -227,13 +253,49 @@ def coulomb_logarithm(species: Species, species_a: int, species_b: int, r_index:
 
 
 def coulomb_logarithm_local(species: Species, species_a: int, species_b: int,
-                            temperature_local, density_local) -> float:
+                            temperature_local, density_local, v_thermal_local, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Coulomb logarithm using local profiles at one radius."""
-    del species, species_a, species_b
+    if coulomb_log_model == COULOMB_LOG_MODEL_NTSS_LEGACY:
+        return coulomb_logarithm_ntss_legacy_local(temperature_local, density_local)
+    if coulomb_log_model == COULOMB_LOG_MODEL_FIRST_PRINCIPLES:
+        return coulomb_logarithm_first_principles_local(species, species_a, species_b, density_local, temperature_local, v_thermal_local)
+    del species, species_a, species_b, v_thermal_local
     Te_eV = STATE_TEMPERATURE_TO_EV * temperature_local[0]
     ne_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[0]
     lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
     return lnL
+
+
+def coulomb_logarithm_ntss_legacy(temperature, density, r_index: int) -> float:
+    """Legacy NTSS/TC_DKES piecewise Coulomb logarithm."""
+    Te_eV = jnp.maximum(STATE_TEMPERATURE_TO_EV * temperature[0, r_index], 1.0e-30)
+    ne_cm3 = jnp.maximum(STATE_DENSITY_TO_PHYSICAL * density[0, r_index] / 1.0e6, 1.0e-30)
+    low_t = 23.4 - 1.15 * jnp.log10(ne_cm3) + 3.45 * jnp.log10(Te_eV)
+    high_t = 25.3 - 1.15 * jnp.log10(ne_cm3) + 2.30 * jnp.log10(Te_eV)
+    return jnp.where(Te_eV <= 50.0, low_t, high_t)
+
+
+def coulomb_logarithm_ntss_legacy_local(temperature_local, density_local) -> float:
+    """Local legacy NTSS/TC_DKES piecewise Coulomb logarithm."""
+    Te_eV = jnp.maximum(STATE_TEMPERATURE_TO_EV * temperature_local[0], 1.0e-30)
+    ne_cm3 = jnp.maximum(STATE_DENSITY_TO_PHYSICAL * density_local[0] / 1.0e6, 1.0e-30)
+    low_t = 23.4 - 1.15 * jnp.log10(ne_cm3) + 3.45 * jnp.log10(Te_eV)
+    high_t = 25.3 - 1.15 * jnp.log10(ne_cm3) + 2.30 * jnp.log10(Te_eV)
+    return jnp.where(Te_eV <= 50.0, low_t, high_t)
+
+
+def coulomb_logarithm_first_principles(species: Species, species_a: int, species_b: int, r_index: int,
+                                       density, temperature, v_thermal) -> float:
+    """Coulomb logarithm from impact parameters."""
+    bmin, bmax = impact_parameter(species, species_a, species_b, r_index, density, temperature, v_thermal)
+    return jnp.log(jnp.maximum(bmax, bmin * (1.0 + 1.0e-30)) / jnp.maximum(bmin, 1.0e-30))
+
+
+def coulomb_logarithm_first_principles_local(species: Species, species_a: int, species_b: int,
+                                             density_local, temperature_local, v_thermal_local) -> float:
+    """Local Coulomb logarithm from impact parameters."""
+    bmin, bmax = impact_parameter_local(species, species_a, species_b, density_local, temperature_local, v_thermal_local)
+    return jnp.log(jnp.maximum(bmax, bmin * (1.0 + 1.0e-30)) / jnp.maximum(bmin, 1.0e-30))
 
 
 def tau_ab_ntss_like(
@@ -247,7 +309,16 @@ def tau_ab_ntss_like(
 ) -> float:
     """NTSSfusion-like test-particle collision time tau(a,b)."""
     del v_thermal
-    lnL = coulomb_logarithm(species, species_a, species_b, r_index, temperature, density)
+    lnL = coulomb_logarithm(
+        species,
+        species_a,
+        species_b,
+        r_index,
+        temperature,
+        density,
+        v_thermal,
+        COULOMB_LOG_MODEL_DEFAULT,
+    )
     charge_prod = jnp.maximum(jnp.abs(species.charge_qp[species_a] * species.charge_qp[species_b]), 1.0e-30)
     mass_a = species.mass[species_a]
     temperature_a_eV = STATE_TEMPERATURE_TO_EV * temperature[species_a, r_index]
@@ -271,7 +342,15 @@ def tau_ab_ntss_like_local(
 ) -> float:
     """Local NTSSfusion-like test-particle collision time tau(a,b)."""
     del v_thermal_local
-    lnL = coulomb_logarithm_local(species, species_a, species_b, temperature_local, density_local)
+    lnL = coulomb_logarithm_local(
+        species,
+        species_a,
+        species_b,
+        temperature_local,
+        density_local,
+        v_thermal_local,
+        COULOMB_LOG_MODEL_DEFAULT,
+    )
     charge_prod = jnp.maximum(jnp.abs(species.charge_qp[species_a] * species.charge_qp[species_b]), 1.0e-30)
     mass_a = species.mass[species_a]
     temperature_a_eV = STATE_TEMPERATURE_TO_EV * temperature_local[species_a]
@@ -347,6 +426,17 @@ def impact_parameter(species: Species, species_a: int, species_b: int, r_index: 
     return bmin, bmax
 
 
+def impact_parameter_local(species: Species, species_a: int, species_b: int,
+                           density_local, temperature_local, v_thermal_local) -> float:
+    """Local impact parameters for classical Coulomb collision."""
+    bmin = jnp.maximum(
+        impact_parameter_perp_local(species, species_a, species_b, v_thermal_local),
+        debroglie_length_local(species, species_a, species_b, v_thermal_local),
+    )
+    bmax = debye_length_local(species, density_local, temperature_local)
+    return bmin, bmax
+
+
 def impact_parameter_perp(species: Species, species_a: int, species_b: int, r_index: int,
                           v_thermal) -> float:
     """Distance of the closest approach for a 90° Coulomb collision."""
@@ -357,9 +447,22 @@ def impact_parameter_perp(species: Species, species_a: int, species_b: int, r_in
     )
     v_th = jnp.sqrt(v_thermal[species_a, r_index] * v_thermal[species_b, r_index])
     return (
-        species.charge[species_a]
-        * species.charge[species_a]
+        jnp.abs(species.charge[species_a] * species.charge[species_b])
         / (4 * jnp.pi * epsilon_0 * m_reduced * v_th**2)
+    )
+
+
+def impact_parameter_perp_local(species: Species, species_a: int, species_b: int,
+                                v_thermal_local) -> float:
+    """Local distance of the closest approach for a 90 degree Coulomb collision."""
+    m_reduced = (
+        species.mass[species_a]
+        * species.mass[species_b]
+        / (species.mass[species_a] + species.mass[species_b])
+    )
+    v_th = jnp.sqrt(v_thermal_local[species_a] * v_thermal_local[species_b])
+    return jnp.abs(species.charge[species_a] * species.charge[species_b]) / (
+        4 * jnp.pi * epsilon_0 * m_reduced * v_th**2
     )
 
 
@@ -375,11 +478,33 @@ def debroglie_length(species: Species, species_a: int, species_b: int, r_index: 
     return hbar / (2 * m_reduced * v_th)
 
 
+def debroglie_length_local(species: Species, species_a: int, species_b: int,
+                           v_thermal_local) -> float:
+    """Local thermal DeBroglie wavelength."""
+    m_reduced = (
+        species.mass[species_a]
+        * species.mass[species_b]
+        / (species.mass[species_a] + species.mass[species_b])
+    )
+    v_th = jnp.sqrt(v_thermal_local[species_a] * v_thermal_local[species_b])
+    return hbar / (2 * m_reduced * v_th)
+
+
 def debye_length(species: Species, r_index: int, density, temperature) -> float:
     """Scale length for charge screening."""
     den = jnp.sum(
         (STATE_DENSITY_TO_PHYSICAL * density[:, r_index])
         / (temperature[:, r_index] * JOULE_PER_KEV)
+        * species.charge**2
+    )
+    return jnp.sqrt(epsilon_0 / den)
+
+
+def debye_length_local(species: Species, density_local, temperature_local) -> float:
+    """Local scale length for charge screening."""
+    den = jnp.sum(
+        (STATE_DENSITY_TO_PHYSICAL * density_local)
+        / (temperature_local * JOULE_PER_KEV)
         * species.charge**2
     )
     return jnp.sqrt(epsilon_0 / den)

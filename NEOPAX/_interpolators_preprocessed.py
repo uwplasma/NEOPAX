@@ -128,64 +128,6 @@ def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
 
 
 @jax.jit
-def get_Dij_preprocessed_3d_er_floor(grid_x, grid_nu, grid_Er, database):
-    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-    radius_denom = jnp.maximum(grid_x, 1.0e-30)
-    er_ratio = jnp.where(
-        grid_x <= database.low_limit_r,
-        database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er)) / radius_denom,
-    )
-    grid_er_internal = jnp.log10(jnp.maximum(database.Er_lower_limit, er_ratio))
-
-    ir = _clamped_interval_index(database.r_grid, grid_x)
-    inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
-
-    tx = _fraction(database.r_grid, ir, grid_x)
-    ty = _fraction(database.nu_log, inu, grid_nu_internal)
-
-    er_grid0 = database.Er_grid[ir]
-    er_grid1 = database.Er_grid[ir + 1]
-    ier0 = _clamped_interval_index(er_grid0, grid_er_internal)
-    ier1 = _clamped_interval_index(er_grid1, grid_er_internal)
-    tz0 = _fraction(er_grid0, ier0, grid_er_internal)
-    tz1 = _fraction(er_grid1, ier1, grid_er_internal)
-
-    d11_r0 = _bilinear(
-        database.D11_log[ir, inu, ier0],
-        database.D11_log[ir, inu, ier0 + 1],
-        database.D11_log[ir, inu + 1, ier0],
-        database.D11_log[ir, inu + 1, ier0 + 1],
-        ty,
-        tz0,
-    )
-    d11_r1 = _bilinear(
-        database.D11_log[ir + 1, inu, ier1],
-        database.D11_log[ir + 1, inu, ier1 + 1],
-        database.D11_log[ir + 1, inu + 1, ier1],
-        database.D11_log[ir + 1, inu + 1, ier1 + 1],
-        ty,
-        tz1,
-    )
-    d11 = d11_r0 * (1.0 - tx) + d11_r1 * tx
-
-    d13 = _trilinear(
-        _corner_cube(database.D13, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-    d33 = _trilinear(
-        _corner_cube(database.D33, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-
-    return jnp.asarray([d11, d13, d33])
-
-
-@jax.jit
 def get_Dij_preprocessed_3d_ntss_radius(grid_x, grid_nu, grid_Er, database):
     arr = database.r_grid
     nr = arr.shape[0]
