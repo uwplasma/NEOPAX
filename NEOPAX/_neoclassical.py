@@ -78,7 +78,7 @@ def _uses_ntss_preprocessed(database):
 
 
 def _preprocessed_b0_scale_center(database, geometry, r_index):
-    use_b0 = bool(getattr(database, "divide_by_b0", False))
+    use_b0 = jnp.asarray(getattr(database, "divide_by_b0", False), dtype=bool)
     return jax.lax.cond(
         use_b0,
         lambda _: jnp.maximum(geometry.B0[r_index], 1.0e-30),
@@ -88,7 +88,7 @@ def _preprocessed_b0_scale_center(database, geometry, r_index):
 
 
 def _preprocessed_b0_scale_radius(database, geometry, radius_value):
-    use_b0 = bool(getattr(database, "divide_by_b0", False))
+    use_b0 = jnp.asarray(getattr(database, "divide_by_b0", False), dtype=bool)
 
     def with_b0(_):
         b0_interp = interpax.Interpolator1D(geometry.r_grid, geometry.B0, extrap=True)
