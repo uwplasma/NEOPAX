@@ -211,3 +211,9 @@ class PreprocessedMonoenergetic3DNTSSRadiusNTSS1D(PreprocessedMonoenergetic3DNTS
             divide_by_radius=True,
         ))
         return cls(**data)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class PreprocessedMonoenergetic3DNTSSRadiusNTSS1DGeneric(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D):
+    pass
