@@ -308,7 +308,6 @@ def tau_ab_ntss_like(
     v_thermal,
 ) -> float:
     """NTSSfusion-like test-particle collision time tau(a,b)."""
-    del v_thermal
     lnL = coulomb_logarithm(
         species,
         species_a,
@@ -341,7 +340,6 @@ def tau_ab_ntss_like_local(
     v_thermal_local,
 ) -> float:
     """Local NTSSfusion-like test-particle collision time tau(a,b)."""
-    del v_thermal_local
     lnL = coulomb_logarithm_local(
         species,
         species_a,
