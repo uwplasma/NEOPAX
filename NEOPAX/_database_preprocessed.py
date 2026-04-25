@@ -142,3 +142,49 @@ class PreprocessedMonoenergetic3DNTSSRadius:
             D33=D33,
         )
         return cls(**data)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class PreprocessedMonoenergetic3DNTSSRadiusLocalState:
+    a_b: float
+    rho: Float[Array, "..."]
+    r_grid: Float[Array, "..."]
+    nu_log: Float[Array, "..."]
+    Er_grid: Float[Array, "..."]
+    D11_log: Float[Array, "..."]
+    D13: Float[Array, "..."]
+    D33: Float[Array, "..."]
+    Er_lower_limit: float
+    low_limit_r: float
+    del_r: float
+
+    @classmethod
+    def read_monkes(cls, a_b, monkes_file):
+        file = h5.File(monkes_file, "r")
+        data = _prepare_monkes_arrays(
+            a_b=a_b,
+            rho=file["rho"][()],
+            nu_v=file["nu_v"][()],
+            Er=file["Er"][()],
+            drds=file["drds"][()],
+            D11=file["D11"][()],
+            D13=file["D13"][()],
+            D33=file["D33"][()],
+        )
+        file.close()
+        return cls(**data)
+
+    @classmethod
+    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
+        data = _prepare_monkes_arrays(
+            a_b=a_b,
+            rho=rho,
+            nu_v=nu_v,
+            Er=Er,
+            drds=drds,
+            D11=D11,
+            D13=D13,
+            D33=D33,
+        )
+        return cls(**data)

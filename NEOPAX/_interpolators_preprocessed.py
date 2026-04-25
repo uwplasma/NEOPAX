@@ -71,6 +71,23 @@ def _surface_bilinear(table, er_grid, ir, inu, ty, grid_er_internal):
 
 
 @jax.jit
+def get_Dij_preprocessed_surface(ir, grid_nu, grid_Er, grid_r, database):
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_ratio = jnp.where(
+        grid_r <= database.low_limit_r,
+        database.Er_lower_limit,
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_r)),
+    )
+    grid_er_internal = jnp.log10(er_ratio)
+    inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
+    ty = _fraction(database.nu_log, inu, grid_nu_internal)
+    d11 = _surface_bilinear(database.D11_log, database.Er_grid, ir, inu, ty, grid_er_internal)
+    d13 = _surface_bilinear(database.D13, database.Er_grid, ir, inu, ty, grid_er_internal)
+    d33 = _surface_bilinear(database.D33, database.Er_grid, ir, inu, ty, grid_er_internal)
+    return jnp.asarray([d11, d13, d33])
+
+
+@jax.jit
 def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
     er_ratio = jnp.where(

@@ -22,7 +22,11 @@ from ._ambipolarity import (
 )
 from ._database import Monoenergetic
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
-from ._database_preprocessed import PreprocessedMonoenergetic3D, PreprocessedMonoenergetic3DNTSSRadius
+from ._database_preprocessed import (
+    PreprocessedMonoenergetic3D,
+    PreprocessedMonoenergetic3DNTSSRadius,
+    PreprocessedMonoenergetic3DNTSSRadiusLocalState,
+)
 from ._entropy_models import get_entropy_model
 from ._neoclassical import (
     COLLISIONALITY_MODEL_DEFAULT,
@@ -158,6 +162,8 @@ def _build_database(config: dict, geometry):
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
         if interp_mode in {"preprocessed_3d_ntss_radius", "preprocessed_3d_radial_stencil"}:
             return PreprocessedMonoenergetic3DNTSSRadius.read_monkes(geometry.a_b, neoclassical_file)
+        if interp_mode in {"preprocessed_3d_ntss_radius_local_state", "preprocessed_3d_radial_stencil_local_state"}:
+            return PreprocessedMonoenergetic3DNTSSRadiusLocalState.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
     return None
 
