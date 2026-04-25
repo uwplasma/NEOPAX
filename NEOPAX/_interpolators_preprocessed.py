@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from jax import config
-from ._interpolators_ntss_preprocessed import _inpold_fixed
 
 # to use higher precision
 config.update("jax_enable_x64", True)
@@ -71,21 +70,127 @@ def _surface_bilinear(table, er_grid, ir, inu, ty, grid_er_internal):
     )
 
 
-def _surface_ntss1d(table, table_padded, er_grid_padded, er_count, gmix_er, ir, inu, ty, grid_er_internal):
-    xs = er_grid_padded[ir]
-    n = er_count
+def _inpold_fixed12_er(x, xs, ys, gmix):
+    pos = jnp.searchsorted(xs, x, side="left")
+
+    def left_boundary():
+        i1, i2, i3 = 0, 1, 2
+        a0 = ys[i3] - ys[i2]
+        a1 = xs[i3] - xs[i2]
+        a2 = 0.5 * a1**2
+        a3 = (2.0 / 3.0) * a1 * a2
+        b0 = ys[i1] - ys[i2]
+        b1 = xs[i1] - xs[i2]
+        b2 = 0.5 * b1**2
+        b3 = (2.0 / 3.0) * b1 * b2
+        c0 = 0.0
+        c1 = 1.0
+        c2 = b1
+        c3 = b1**2
+        det = a1 * (b2 * c3 - b3 * c2) - a2 * (b1 * c3 - b3 * c1) + a3 * (b1 * c2 - b2 * c1)
+        g1 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * (b2 * c3 - b3 * c2) - a2 * (b0 * c3 - b3 * c0) + a3 * (b0 * c2 - b2 * c0)) / det)
+        g2 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b0 * c3 - b3 * c0) - a0 * (b1 * c3 - b3 * c1) + a3 * (b1 * c0 - b0 * c1)) / det)
+        g3 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b2 * c0 - b0 * c2) - a2 * (b1 * c0 - b0 * c1) + a0 * (b1 * c2 - b2 * c1)) / det)
+
+        def x_le_i1():
+            gx = xs[i1] - xs[i2]
+            dy = g1 + (g2 + g3 * gx) * gx
+            y1 = ys[i2] + (g1 + (0.5 * g2 + (1.0 / 3.0) * g3 * gx) * gx) * gx
+            return y1 + dy * (x - xs[i1])
+
+        def x_le_i2():
+            gx = x - xs[i2]
+            return ys[i2] + (g1 + (0.5 * g2 + (1.0 / 3.0) * g3 * gx) * gx) * gx
+
+        return jax.lax.cond(x <= xs[i1], x_le_i1, x_le_i2)
+
+    def right_or_interior():
+        i3 = jnp.minimum(jnp.maximum(pos, 2), 11)
+        i2 = i3 - 1
+        i1 = i2 - 1
+        xl = xs[i2]
+        yl = ys[i2]
+        a0 = ys[i3] - yl
+        a1 = xs[i3] - xl
+        a2 = 0.5 * a1**2
+        b0 = ys[i1] - yl
+        b1 = xs[i1] - xl
+        b2 = 0.5 * b1**2
+        det = a1 * b2 - a2 * b1
+        dyl_raw = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * b2 - b0 * a2) / det)
+        dyl = jnp.where((yl - ys[i1]) * (yl - ys[i3]) >= 0.0, gmix * dyl_raw, dyl_raw)
+
+        def interior():
+            i4 = i3 + 1
+            xu = xs[i3]
+            yu = ys[i3]
+            a0u = ys[i4] - yu
+            a1u = xs[i4] - xu
+            a2u = 0.5 * a1u**2
+            b0u = ys[i2] - yu
+            b1u = xs[i2] - xu
+            b2u = 0.5 * b1u**2
+            detu = a1u * b2u - a2u * b1u
+            dyu_raw = jnp.where(jnp.abs(detu) <= 1.0e-30, 0.0, (a0u * b2u - b0u * a2u) / detu)
+            dyu = jnp.where((yu - ys[i2]) * (yu - ys[i4]) >= 0.0, gmix * dyu_raw, dyu_raw)
+            return xl, yl, dyl, xu, yu, dyu
+
+        def right_boundary():
+            i2r = i3
+            i1r = i2r + 1
+            i3r = i2r - 1
+            a0r = ys[i3r] - ys[i2r]
+            a1r = xs[i3r] - xs[i2r]
+            a2r = 0.5 * a1r**2
+            a3r = (2.0 / 3.0) * a1r * a2r
+            b0r = ys[i1r] - ys[i2r]
+            b1r = xs[i1r] - xs[i2r]
+            b2r = 0.5 * b1r**2
+            b3r = (2.0 / 3.0) * b1r * b2r
+            c0 = 0.0
+            c1 = 0.0
+            c2 = 1.0
+            c3 = 2.0 * b1r
+            detr = a1r * (b2r * c3 - b3r * c2) - a2r * (b1r * c3 - b3r * c1) + a3r * (b1r * c2 - b2r * c1)
+            g1r = jnp.where(jnp.abs(detr) <= 1.0e-30, 0.0, (a0r * (b2r * c3 - b3r * c2) - a2r * (b0r * c3 - b3r * c0) + a3r * (b0r * c2 - b2r * c0)) / detr)
+            xu = xs[i2r]
+            yu = ys[i2r]
+            return xl, yl, dyl, xu, yu, g1r
+
+        xl, yl, dyl2, xu, yu, dyu = jax.lax.cond(i3 < 11, interior, right_boundary)
+        dx = xu - xl
+        dx2 = dx**2
+        dx3 = dx2 * dx
+        a0c = yu - yl - dx * dyl2
+        a2c = 0.5 * dx2
+        a3c = (1.0 / 3.0) * dx3
+        b0c = dyu - dyl2
+        b2c = dx
+        b3c = dx2
+        detc = a2c * b3c - a3c * b2c
+        g1c = dyl2
+        g2c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a0c * b3c - a3c * b0c) / detc)
+        g3c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a2c * b0c - a0c * b2c) / detc)
+        gx = x - xl
+        return yl + gx * (g1c + gx * (0.5 * g2c + (1.0 / 3.0) * g3c * gx))
+
+    return jax.lax.cond(x < xs[2], left_boundary, right_or_interior)
+
+
+def _surface_ntss1d(table, ir, inu, ty, grid_er_internal, database):
+    xs = database.Er_grid[ir]
     first = xs[0]
-    last = xs[n - 1]
+    last = xs[11]
 
     def interp_row(row):
-        ys_padded = table_padded[ir, row]
+        ys = table[ir, row]
         return jnp.where(
             grid_er_internal <= first,
-            ys_padded[0],
+            ys[0],
             jnp.where(
                 grid_er_internal > last,
-                ys_padded[n - 1],
-                _inpold_fixed(grid_er_internal, xs, ys_padded, n, 0, 0.0, 1, 0.0, gmix_er),
+                ys[11],
+                _inpold_fixed12_er(grid_er_internal, xs, ys, database.gmix_er_ntss1d),
             ),
         )
 
@@ -308,39 +413,9 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
     stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
 
     def eval_surface(ir):
-        d11 = _surface_ntss1d(
-            database.D11_log,
-            database.D11_log_ntss1d,
-            database.Er_grid_ntss1d,
-            database.er_count_ntss1d,
-            database.gmix_er_ntss1d,
-            ir,
-            inu,
-            ty,
-            grid_er_internal,
-        )
-        d13 = _surface_ntss1d(
-            database.D13,
-            database.D13_ntss1d,
-            database.Er_grid_ntss1d,
-            database.er_count_ntss1d,
-            database.gmix_er_ntss1d,
-            ir,
-            inu,
-            ty,
-            grid_er_internal,
-        )
-        d33 = _surface_ntss1d(
-            database.D33,
-            database.D33_ntss1d,
-            database.Er_grid_ntss1d,
-            database.er_count_ntss1d,
-            database.gmix_er_ntss1d,
-            ir,
-            inu,
-            ty,
-            grid_er_internal,
-        )
+        d11 = _surface_ntss1d(database.D11_log, ir, inu, ty, grid_er_internal, database)
+        d13 = _surface_ntss1d(database.D13, ir, inu, ty, grid_er_internal, database)
+        d33 = _surface_ntss1d(database.D33, ir, inu, ty, grid_er_internal, database)
         return jnp.asarray([d11, d13, d33])
 
     atc = jax.vmap(eval_surface)(stencil_idx)
