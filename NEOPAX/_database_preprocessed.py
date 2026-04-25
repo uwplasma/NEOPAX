@@ -73,11 +73,10 @@ def _prepare_monkes_arrays_ertilde(a_b, rho, nu_v, Er_tilde, Er_to_Ertilde, drds
     D33_scaled = jnp.array(D33)
     Er_grid = jnp.zeros((n_r, n_er))
 
-    scale_grid = jax.lax.cond(
-        Er_to_Ertilde.ndim == 2,
-        lambda: jnp.asarray(Er_to_Ertilde[:, 0]),
-        lambda: jnp.asarray(Er_to_Ertilde),
-    )
+    if Er_to_Ertilde.ndim == 2:
+        scale_grid = jnp.asarray(Er_to_Ertilde[:, 0])
+    else:
+        scale_grid = jnp.asarray(Er_to_Ertilde)
 
     for j in range(n_r):
         D11_scaled = D11_scaled.at[j, :, :].set(D11_scaled[j, :, :] * jnp.square(drds[j]))
