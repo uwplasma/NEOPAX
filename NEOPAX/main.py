@@ -24,6 +24,7 @@ from ._database import Monoenergetic
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
 from ._database_preprocessed import (
     PreprocessedMonoenergetic3D,
+    PreprocessedMonoenergetic3DErRaw,
     PreprocessedMonoenergetic3DMonotonic,
     PreprocessedMonoenergetic3DNTSSRadius,
 )
@@ -160,6 +161,8 @@ def _build_database(config: dict, geometry):
             return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
+        if interp_mode in {"preprocessed_3d_er", "preprocessed_3d_raw_er", "preprocessed_3d_no_r"}:
+            return PreprocessedMonoenergetic3DErRaw.read_monkes(geometry.a_b, neoclassical_file)
         if interp_mode in {"preprocessed_3d_monotonic", "preprocessed_3d_cubic_monotone"}:
             return PreprocessedMonoenergetic3DMonotonic.read_monkes(geometry.a_b, neoclassical_file)
         if interp_mode in {"preprocessed_3d_ntss_radius", "preprocessed_3d_radial_stencil"}:
