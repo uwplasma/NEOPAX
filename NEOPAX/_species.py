@@ -242,28 +242,39 @@ def nupar_ab(species: Species, species_a: int, species_b: int, v: float, r_index
 def coulomb_logarithm(species: Species, species_a: int, species_b: int, r_index: int,
                       temperature, density, v_thermal, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Coulomb logarithm for collisions between species a and b."""
-    if coulomb_log_model == COULOMB_LOG_MODEL_NTSS_LEGACY:
-        return coulomb_logarithm_ntss_legacy(temperature, density, r_index)
-    if coulomb_log_model == COULOMB_LOG_MODEL_FIRST_PRINCIPLES:
-        return coulomb_logarithm_first_principles(species, species_a, species_b, r_index, density, temperature, v_thermal)
-    Te_eV = STATE_TEMPERATURE_TO_EV * temperature[0, r_index]
-    ne_m3 = STATE_DENSITY_TO_PHYSICAL * density[0, r_index]
-    lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
-    return lnL
+    return jax.lax.switch(
+        coulomb_log_model,
+        (
+            lambda: _coulomb_logarithm_default(temperature, density, r_index),
+            lambda: coulomb_logarithm_ntss_legacy(temperature, density, r_index),
+            lambda: coulomb_logarithm_first_principles(species, species_a, species_b, r_index, density, temperature, v_thermal),
+        ),
+    )
 
 
 def coulomb_logarithm_local(species: Species, species_a: int, species_b: int,
                             temperature_local, density_local, v_thermal_local, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Coulomb logarithm using local profiles at one radius."""
-    if coulomb_log_model == COULOMB_LOG_MODEL_NTSS_LEGACY:
-        return coulomb_logarithm_ntss_legacy_local(temperature_local, density_local)
-    if coulomb_log_model == COULOMB_LOG_MODEL_FIRST_PRINCIPLES:
-        return coulomb_logarithm_first_principles_local(species, species_a, species_b, density_local, temperature_local, v_thermal_local)
-    del species, species_a, species_b, v_thermal_local
+    return jax.lax.switch(
+        coulomb_log_model,
+        (
+            lambda: _coulomb_logarithm_default_local(temperature_local, density_local),
+            lambda: coulomb_logarithm_ntss_legacy_local(temperature_local, density_local),
+            lambda: coulomb_logarithm_first_principles_local(species, species_a, species_b, density_local, temperature_local, v_thermal_local),
+        ),
+    )
+
+
+def _coulomb_logarithm_default(temperature, density, r_index: int) -> float:
+    Te_eV = STATE_TEMPERATURE_TO_EV * temperature[0, r_index]
+    ne_m3 = STATE_DENSITY_TO_PHYSICAL * density[0, r_index]
+    return 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
+
+
+def _coulomb_logarithm_default_local(temperature_local, density_local) -> float:
     Te_eV = STATE_TEMPERATURE_TO_EV * temperature_local[0]
     ne_m3 = STATE_DENSITY_TO_PHYSICAL * density_local[0]
-    lnL = 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
-    return lnL
+    return 32.2 + 1.15 * jnp.log10(Te_eV**2 / ne_m3)
 
 
 def coulomb_logarithm_ntss_legacy(temperature, density, r_index: int) -> float:
