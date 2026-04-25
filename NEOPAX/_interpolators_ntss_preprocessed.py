@@ -559,6 +559,37 @@ def _eval_radius_node(ir, xnu, xer, efield, db):
     return jax.lax.cond(efield <= db.xref_l, zero_field, positive_field)
 
 
+def _eval_radius_node_fast(ir, xnu, xer, efield, db):
+    icu0 = db.nval0[ir]
+    icue = db.icnur[ir]
+    xs0 = db.axnu0[ir]
+    g110 = db.ag110[ir]
+    g130 = db.ag130[ir]
+    g330 = db.ag330[ir]
+    avgs_full = db.axnuar[ir]
+    aref_full = db.aref[ir]
+    ag11_full = db.ag11[ir]
+    ag13_full = db.ag13[ir]
+    ag33_full = db.ag33[ir]
+    lc_fit = db.lc_fit[ir]
+    ag11_0_fit = db.ag11_0_fit[ir]
+    ag11_sq_fit = db.ag11_sq_fit[ir]
+    aefld_u_fit = db.aefld_u_fit[ir]
+    aex_er_fit = db.aex_er_fit[ir]
+
+    def zero_field():
+        return _eval_zero_field_node(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11_0_fit)
+
+    def positive_field():
+        return jax.lax.cond(
+            xnu < avgs_full[0],
+            lambda: _eval_low_branch(ir, xnu, xer, efield, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, lc_fit, ag11_0_fit, ag11_sq_fit, aefld_u_fit, aex_er_fit),
+            lambda: _eval_middle_branch(ir, xnu, xer, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, icue),
+        )
+
+    return jax.lax.cond(efield <= db.xref_l, zero_field, positive_field)
+
+
 @jax.jit
 def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
     arr = db.r_grid
@@ -587,6 +618,95 @@ def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
 
     stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
     atc = jax.vmap(lambda ir: _eval_radius_node(ir, xnu, xer, efield, db))(stencil_idx)
+
+    def exact():
+        return atc[0]
+
+    def small_r():
+        xr2 = xri * xri
+        xr3 = xr2 * xri
+        r1 = arr[0]
+        r2 = arr[1]
+        r3 = arr[2]
+        r12 = r1 * r1
+        r22 = r2 * r2
+        r32 = r3 * r3
+        r13 = r1 * r12
+        r23 = r2 * r22
+        r33 = r3 * r32
+        def comp(v0, v1, v2):
+            ha = ((v2 - v1) / (r33 - r23) - (v2 - v0) / (r33 - r13)) / ((r32 - r22) / (r33 - r23) - (r32 - r12) / (r33 - r13))
+            hb = ((v2 - v1) / (r32 - r22) - (v2 - v0) / (r32 - r12)) / ((r33 - r23) / (r32 - r22) - (r33 - r13) / (r32 - r12))
+            hg = v0 - r12 * ha - r13 * hb
+            return hg + xr2 * ha + xr3 * hb
+        return jnp.asarray([comp(atc[0, 0], atc[1, 0], atc[2, 0]), comp(atc[0, 1], atc[1, 1], atc[2, 1]), comp(atc[0, 2], atc[1, 2], atc[2, 2])])
+
+    def edge3():
+        x0 = arr[nil]
+        x1 = arr[nil + 1]
+        x2 = arr[nil + 2]
+        return jnp.asarray([
+            _lagrange3(xri, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0]),
+            _lagrange3(xri, x0, x1, x2, atc[0, 1], atc[1, 1], atc[2, 1]),
+            _lagrange3(xri, x0, x1, x2, atc[0, 2], atc[1, 2], atc[2, 2]),
+        ])
+
+    def interior4():
+        x0 = arr[nil]
+        x1 = arr[nil + 1]
+        x2 = arr[nil + 2]
+        x3 = arr[nil + 3]
+        def lagrange4(y0, y1, y2, y3):
+            h0 = (xri - x1) * (xri - x2) * (xri - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3))
+            h1 = (xri - x0) * (xri - x2) * (xri - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3))
+            h2 = (xri - x0) * (xri - x1) * (xri - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3))
+            h3 = (xri - x0) * (xri - x1) * (xri - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2))
+            return h0 * y0 + h1 * y1 + h2 * y2 + h3 * y3
+        return jnp.asarray([
+            lagrange4(atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0]),
+            lagrange4(atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1]),
+            lagrange4(atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2]),
+        ])
+
+    return jax.lax.cond(
+        noi == 1,
+        exact,
+        lambda: jax.lax.cond(
+            xri < arr[1],
+            small_r,
+            lambda: jax.lax.cond((xri >= arr[nr - 2]) | (noi == 3), edge3, interior4),
+        ),
+    )
+
+
+@jax.jit
+def get_Dij_ntss_preprocessed_fast(grid_x, grid_nu, grid_Er, db):
+    arr = db.r_grid
+    nr = arr.shape[0]
+    xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
+    xnu = jnp.log10(jnp.maximum(1.0e-12, jnp.abs(grid_nu)))
+    efield = jnp.where(xri <= 1.0e-30, 0.0, jnp.abs(grid_Er / xri))
+    xer = jnp.log10(jnp.maximum(db.xref_l, efield))
+
+    exact_mask = jnp.abs(xri - arr) <= db.del_r
+    exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
+    is_exact = jnp.any(exact_mask)
+
+    nil = jnp.where(
+        xri < arr[1],
+        0,
+        jnp.where(
+            xri >= arr[nr - 2],
+            nr - 3,
+            jnp.searchsorted(arr[2:nr - 1], xri, side="left") + 0,
+        ),
+    )
+    noi = jnp.where((xri < arr[1]) | (xri >= arr[nr - 2]), 3, 4)
+    nil = jnp.where(is_exact, exact_idx, nil)
+    noi = jnp.where(is_exact, 1, noi)
+
+    stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
+    atc = jax.vmap(lambda ir: _eval_radius_node_fast(ir, xnu, xer, efield, db))(stencil_idx)
 
     def exact():
         return atc[0]

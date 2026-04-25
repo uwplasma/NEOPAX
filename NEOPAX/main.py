@@ -21,7 +21,10 @@ from ._ambipolarity import (
     write_ambipolarity_hdf5,
 )
 from ._database import Monoenergetic
-from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
+from ._database_ntss_preprocessed import (
+    NTSSPreprocessedFastMonoenergetic,
+    NTSSPreprocessedMonoenergetic,
+)
 from ._database_preprocessed import (
     PreprocessedMonoenergetic3D,
     PreprocessedMonoenergetic3DNTSSRadius,
@@ -151,6 +154,8 @@ def _build_database(config: dict, geometry):
         interp_mode = str(
             config.get("neoclassical", {}).get("interpolation_mode", "generic")
         ).strip().lower()
+        if interp_mode == "preprocessed_ntss_fast":
+            return NTSSPreprocessedFastMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_ntss":
             return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
