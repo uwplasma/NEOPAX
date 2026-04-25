@@ -402,6 +402,29 @@ def _eval_group(ir, ic, xer, db, aref_full, ag11_full, ag13_full, ag33_full):
     return jnp.asarray([x11, x13, x33])
 
 
+def _eval_group_linear(ir, ic, xer, db, aref_full, ag11_full, ag13_full, ag33_full):
+    start = db.inulr[ir, ic]
+    n = db.inugr[ir, ic] - start + 1
+    first = aref_full[start]
+    last = aref_full[start + n - 1]
+    x11 = jnp.where(
+        xer <= first,
+        ag11_full[start],
+        jnp.where(xer > last, db.x11_l, _interp_linear_segment(xer, aref_full, ag11_full, start, n)),
+    )
+    x13 = jnp.where(
+        xer <= first,
+        ag13_full[start],
+        jnp.where(xer > last, db.x13_l, _interp_linear_segment(xer, aref_full, ag13_full, start, n)),
+    )
+    x33 = jnp.where(
+        xer <= first,
+        ag33_full[start],
+        jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(xer, aref_full, ag33_full, start, n)),
+    )
+    return jnp.asarray([x11, x13, x33])
+
+
 def _eval_zero_field_node(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11_0_fit):
     last0 = icu0 - 1
     high = jnp.asarray([g110[last0] - xs0[last0] + xnu, db.x13_l, g330[last0]])
@@ -417,6 +440,25 @@ def _eval_zero_field_node(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11
             _inpold_segment(xnu, xs0, g110, 0, icu0, 0, fc_l, 0, 1.0, db.gmix_nu),
             _inpold_segment(xnu, xs0, g130, 0, icu0, 1, 0.0, 1, 0.0, db.gmix_nu),
             _inpold_segment(xnu, xs0, g330, 0, icu0, 0, 0.0, 0, 0.0, db.gmix_nu),
+        ]
+    )
+    return jnp.where(xnu > xs0[last0], high, jnp.where(xnu < xs0[0], low, mid))
+
+
+def _eval_zero_field_node_linear(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11_0_fit):
+    last0 = icu0 - 1
+    high = jnp.asarray([g110[last0] - xs0[last0] + xnu, db.x13_l, g330[last0]])
+    low_g11 = jnp.where(
+        lc_fit & (ag11_0_fit < 0.0),
+        g110[0] - xs0[0] + xnu,
+        g110[0] + xs0[0] - xnu,
+    )
+    low = jnp.asarray([low_g11, g130[0], g330[0]])
+    mid = jnp.asarray(
+        [
+            _interp_linear(xnu, xs0, g110, icu0),
+            _interp_linear(xnu, xs0, g130, icu0),
+            _interp_linear(xnu, xs0, g330, icu0),
         ]
     )
     return jnp.where(xnu > xs0[last0], high, jnp.where(xnu < xs0[0], low, mid))
@@ -471,6 +513,55 @@ def _eval_low_branch(ir, xnu, xer, efield, db, avgs_full, aref_full, ag11_full, 
     return jnp.asarray([x11, x13, x33])
 
 
+def _eval_low_branch_linear(ir, xnu, xer, efield, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, lc_fit, ag11_0_fit, ag11_sq_fit, aefld_u_fit, aex_er_fit):
+    start = db.inulr[ir, 0]
+    n = db.inugr[ir, 0] - start + 1
+    last = aref_full[start + n - 1]
+    xer_h = (avgs_full[0] - xnu) / 3.0 + xer
+
+    def old_sqrt_nu():
+        return jnp.where(
+            xer_h > last,
+            db.x11_l,
+            _interp_linear_segment(xer_h, aref_full, ag11_full, start, n),
+        )
+
+    def fit_branch():
+        def tokamak_like():
+            return jnp.where(
+                xer_h > last,
+                db.x11_l,
+                _interp_linear_segment(xer_h, aref_full, ag11_full, start, n) + xnu - avgs_full[0],
+            )
+
+        def stellarator_like():
+            def large_efield():
+                return jnp.where(
+                    xer > last,
+                    db.x11_l,
+                    _interp_linear_segment(xer, aref_full, ag11_full, start, n) + xnu - avgs_full[0],
+                )
+
+            def mixed_fit():
+                xer_u = jnp.log10(jnp.maximum(db.xref_l, aefld_u_fit / jnp.maximum(db.r_grid[ir], 1.0e-30)))
+                g11_u = _interp_linear_segment(xer_u, aref_full, ag11_full, start, n)
+                d11ad = 10.0 ** (g11_u + xnu - avgs_full[0])
+                xmul = 10.0 ** xnu
+                arg0 = (xmul / jnp.maximum(jnp.abs(ag11_0_fit), 1.0e-30)) ** aex_er_fit
+                argsq = (efield * jnp.sqrt(efield / jnp.maximum(xmul, 1.0e-30)) / jnp.maximum(jnp.abs(ag11_sq_fit), 1.0e-30)) ** aex_er_fit
+                d11ft = (arg0 + argsq) ** (-1.0 / jnp.maximum(aex_er_fit, 1.0e-30))
+                return jnp.log10(jnp.maximum(1.0e-30, d11ad + d11ft))
+
+            return jax.lax.cond(efield >= aefld_u_fit, large_efield, mixed_fit)
+
+        return jax.lax.cond(ag11_0_fit < 0.0, tokamak_like, stellarator_like)
+
+    x11 = jax.lax.cond(lc_fit, fit_branch, old_sqrt_nu)
+    x13 = jnp.where(xer > last, db.x13_l, _interp_linear_segment(xer, aref_full, ag13_full, start, n))
+    x33 = jnp.where(xer > last, ag33_full[start + n - 1], _interp_linear_segment(xer, aref_full, ag33_full, start, n))
+    return jnp.asarray([x11, x13, x33])
+
+
 @jax.jit
 def _eval_high_branch(ir, xnu, efield, db):
     cmul = 10.0 ** xnu
@@ -493,6 +584,50 @@ def _eval_middle_branch(ir, xnu, xer, db, avgs_full, aref_full, ag11_full, ag13_
     noic = jnp.where((xnu <= avgs_full[1]) | (xnu >= avgs_full[icue - 2]), 3, 4)
     ic_idx = jnp.minimum(ic_l + jnp.arange(4, dtype=jnp.int32), icue - 1)
     atc = jax.vmap(lambda ic: _eval_group(ir, ic, xer, db, aref_full, ag11_full, ag13_full, ag33_full))(ic_idx)
+    no_data = jnp.asarray([db.x11_l, db.x13_l, ag33_full[db.inugr[ir, ic_l]]])
+
+    def lag3():
+        x0 = avgs_full[ic_l]
+        x1 = avgs_full[ic_l + 1]
+        x2 = avgs_full[ic_l + 2]
+        y11 = _lagrange3(xnu, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0])
+        y13 = _lagrange3(xnu, x0, x1, x2, atc[0, 1], atc[1, 1], atc[2, 1])
+        y33 = _lagrange3(xnu, x0, x1, x2, atc[0, 2], atc[1, 2], atc[2, 2])
+        interp = jnp.asarray([y11, y13, y33])
+        no_data_guard = (
+            (atc[2, 0] <= db.x11_l)
+            | ((atc[1, 0] <= db.x11_l) & (xnu <= avgs_full[ic_l + 1]))
+            | ((atc[0, 0] <= db.x11_l) & (xnu <= avgs_full[ic_l]))
+        )
+        return jnp.where(no_data_guard, no_data, interp)
+
+    def but4():
+        x0 = avgs_full[ic_l]
+        x1 = avgs_full[ic_l + 1]
+        x2 = avgs_full[ic_l + 2]
+        x3 = avgs_full[ic_l + 3]
+        y11 = _butland4(xnu, x0, x1, x2, x3, atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0], db.gmix_nu)
+        y13 = _butland4(xnu, x0, x1, x2, x3, atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1], db.gmix_nu)
+        y33 = _butland4(xnu, x0, x1, x2, x3, atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2], db.gmix_nu)
+        interp = jnp.asarray([y11, y13, y33])
+        return jnp.where(atc[2, 0] <= db.x11_l, no_data, interp)
+
+    return jax.lax.cond(noic == 3, lag3, but4)
+
+
+def _eval_middle_branch_linear(ir, xnu, xer, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, icue):
+    ic_l = jnp.where(
+        xnu <= avgs_full[1],
+        0,
+        jnp.where(
+            xnu >= avgs_full[icue - 2],
+            icue - 3,
+            jnp.sum(((jnp.arange(avgs_full.shape[0]) < icue) & (xnu >= avgs_full)).astype(jnp.int32)) - 2,
+        ),
+    )
+    noic = jnp.where((xnu <= avgs_full[1]) | (xnu >= avgs_full[icue - 2]), 3, 4)
+    ic_idx = jnp.minimum(ic_l + jnp.arange(4, dtype=jnp.int32), icue - 1)
+    atc = jax.vmap(lambda ic: _eval_group_linear(ir, ic, xer, db, aref_full, ag11_full, ag13_full, ag33_full))(ic_idx)
     no_data = jnp.asarray([db.x11_l, db.x13_l, ag33_full[db.inugr[ir, ic_l]]])
 
     def lag3():
@@ -578,13 +713,13 @@ def _eval_radius_node_fast(ir, xnu, xer, efield, db):
     aex_er_fit = db.aex_er_fit[ir]
 
     def zero_field():
-        return _eval_zero_field_node(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11_0_fit)
+        return _eval_zero_field_node_linear(ir, xnu, db, xs0, g110, g130, g330, icu0, lc_fit, ag11_0_fit)
 
     def positive_field():
         return jax.lax.cond(
             xnu < avgs_full[0],
-            lambda: _eval_low_branch(ir, xnu, xer, efield, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, lc_fit, ag11_0_fit, ag11_sq_fit, aefld_u_fit, aex_er_fit),
-            lambda: _eval_middle_branch(ir, xnu, xer, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, icue),
+            lambda: _eval_low_branch_linear(ir, xnu, xer, efield, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, lc_fit, ag11_0_fit, ag11_sq_fit, aefld_u_fit, aex_er_fit),
+            lambda: _eval_middle_branch_linear(ir, xnu, xer, db, avgs_full, aref_full, ag11_full, ag13_full, ag33_full, icue),
         )
 
     return jax.lax.cond(efield <= db.xref_l, zero_field, positive_field)
