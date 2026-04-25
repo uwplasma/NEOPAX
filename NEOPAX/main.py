@@ -159,13 +159,6 @@ def _build_database(config: dict, geometry):
             return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode in {"preprocessed_3d_b0", "preprocessed_3d_b00"}:
-            return PreprocessedMonoenergetic3D.read_monkes(
-                geometry.a_b,
-                neoclassical_file,
-                B0=geometry.B0,
-                divide_by_b0=True,
-            )
         if interp_mode in {"preprocessed_3d_ntss_radius", "preprocessed_3d_radial_stencil"}:
             return PreprocessedMonoenergetic3DNTSSRadius.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)

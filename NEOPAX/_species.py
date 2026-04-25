@@ -189,6 +189,109 @@ def collisionality_ntss_like_local(
     return 0.75 * jnp.sqrt(jnp.pi) * jnp.sum(kernel / tau_ab, axis=0)
 
 
+def _electron_index(species: Species) -> int:
+    if species.names and "e" in species.names:
+        return species.names.index("e")
+    negative = jnp.where(species.charge_qp < 0)[0]
+    return int(negative[0]) if negative.size else 0
+
+
+def zeff(species: Species, density, r_index: int) -> float:
+    """Effective charge Zeff = sum_i n_i Z_i^2 / n_e using ion species only."""
+    eidx = _electron_index(species)
+    ne = jnp.maximum(STATE_DENSITY_TO_PHYSICAL * density[eidx, r_index], 1.0e-30)
+    ion_mask = species.charge_qp > 0
+    n_phys = STATE_DENSITY_TO_PHYSICAL * density[:, r_index]
+    return jnp.sum(jnp.where(ion_mask, n_phys * species.charge_qp**2, 0.0)) / ne
+
+
+def zeff_local(species: Species, density_local) -> float:
+    """Local effective charge Zeff = sum_i n_i Z_i^2 / n_e using ion species only."""
+    eidx = _electron_index(species)
+    ne = jnp.maximum(STATE_DENSITY_TO_PHYSICAL * density_local[eidx], 1.0e-30)
+    ion_mask = species.charge_qp > 0
+    n_phys = STATE_DENSITY_TO_PHYSICAL * density_local
+    return jnp.sum(jnp.where(ion_mask, n_phys * species.charge_qp**2, 0.0)) / ne
+
+
+def collisionality_ntss_zeff(
+    species_a: int,
+    species: Species,
+    v: float,
+    r_index: int,
+    density,
+    temperature,
+    v_thermal,
+) -> float:
+    """Legacy NTSSfusion-like simplified electron collisionality using Zeff.
+
+    For electrons this follows the compact electron + Zeff form used in the
+    legacy DKES path. For ions we keep the explicit multispecies sum.
+    """
+    eidx = _electron_index(species)
+    if species_a != eidx:
+        return collisionality(
+            species_a,
+            species,
+            v,
+            r_index,
+            density,
+            temperature,
+            v_thermal,
+            COULOMB_LOG_MODEL_NTSS_LEGACY,
+        )
+    ne = STATE_DENSITY_TO_PHYSICAL * density[eidx, r_index]
+    vte = jnp.maximum(v_thermal[eidx, r_index], 1.0e-30)
+    prefactor = gamma_ab(
+        species,
+        eidx,
+        eidx,
+        v,
+        r_index,
+        temperature,
+        density,
+        v_thermal,
+        COULOMB_LOG_MODEL_NTSS_LEGACY,
+    ) * ne / jnp.maximum(v, 1.0e-30) ** 3
+    kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
+    return prefactor * (kernel_e + zeff(species, density, r_index))
+
+
+def collisionality_ntss_zeff_local(
+    species_a: int,
+    species: Species,
+    v: float,
+    density_local,
+    temperature_local,
+    v_thermal_local,
+) -> float:
+    """Local legacy NTSSfusion-like simplified electron collisionality using Zeff."""
+    eidx = _electron_index(species)
+    if species_a != eidx:
+        return collisionality_local(
+            species_a,
+            species,
+            v,
+            density_local,
+            temperature_local,
+            v_thermal_local,
+            COULOMB_LOG_MODEL_NTSS_LEGACY,
+        )
+    ne = STATE_DENSITY_TO_PHYSICAL * density_local[eidx]
+    vte = jnp.maximum(v_thermal_local[eidx], 1.0e-30)
+    prefactor = gamma_ab_local(
+        species,
+        eidx,
+        eidx,
+        temperature_local,
+        density_local,
+        v_thermal_local,
+        COULOMB_LOG_MODEL_NTSS_LEGACY,
+    ) * ne / jnp.maximum(v, 1.0e-30) ** 3
+    kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
+    return prefactor * (kernel_e + zeff_local(species, density_local))
+
+
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
            density, temperature, v_thermal, coulomb_log_model: int = COULOMB_LOG_MODEL_DEFAULT) -> float:
     """Pairwise pitch-angle scattering frequency for species a against species b."""

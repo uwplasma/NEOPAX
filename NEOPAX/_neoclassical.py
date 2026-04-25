@@ -27,6 +27,8 @@ from ._species import (
     collisionality_local,
     collisionality_ntss_like,
     collisionality_ntss_like_local,
+    collisionality_ntss_zeff,
+    collisionality_ntss_zeff_local,
 )
 from ._interpolators import get_Dij
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
@@ -40,6 +42,7 @@ COLLISIONALITY_MODEL_DEFAULT = 0
 COLLISIONALITY_MODEL_NTSS_LIKE = 1
 COLLISIONALITY_MODEL_NTSS_LEGACY = 2
 COLLISIONALITY_MODEL_FIRST_PRINCIPLES = 3
+COLLISIONALITY_MODEL_NTSS_ZEFF = 4
 
 
 
@@ -77,31 +80,6 @@ def _uses_ntss_preprocessed(database):
     return isinstance(database, NTSSPreprocessedMonoenergetic)
 
 
-def _preprocessed_b0_scale_center(database, geometry, r_index):
-    use_b0 = jnp.asarray(getattr(database, "divide_by_b0", False), dtype=bool)
-    return jax.lax.cond(
-        use_b0,
-        lambda _: jnp.maximum(geometry.B0[r_index], 1.0e-30),
-        lambda _: 1.0,
-        operand=None,
-    )
-
-
-def _preprocessed_b0_scale_radius(database, geometry, radius_value):
-    use_b0 = jnp.asarray(getattr(database, "divide_by_b0", False), dtype=bool)
-
-    def with_b0(_):
-        b0_interp = interpax.Interpolator1D(geometry.r_grid, geometry.B0, extrap=True)
-        return jnp.maximum(b0_interp(radius_value), 1.0e-30)
-
-    return jax.lax.cond(
-        use_b0,
-        with_b0,
-        lambda _: 1.0,
-        operand=None,
-    )
-
-
 def _collisionality_kind(collisionality_model: str | None) -> int:
     key = str(collisionality_model or "default").strip().lower()
     if key in {"ntss_like", "ntss", "ntssfusion"}:
@@ -110,6 +88,8 @@ def _collisionality_kind(collisionality_model: str | None) -> int:
         return COLLISIONALITY_MODEL_NTSS_LEGACY
     if key in {"first_principles", "first_principles_log", "impact_parameter", "impact_parameters"}:
         return COLLISIONALITY_MODEL_FIRST_PRINCIPLES
+    if key in {"ntss_zeff", "zeff", "ntss_simplified", "ntssfusion_zeff"}:
+        return COLLISIONALITY_MODEL_NTSS_ZEFF
     return COLLISIONALITY_MODEL_DEFAULT
 
 
@@ -125,6 +105,7 @@ def _nu_over_vnew(
     collisionality_kind,
 ):
     use_ntss_like = collisionality_kind == COLLISIONALITY_MODEL_NTSS_LIKE
+    use_ntss_zeff = collisionality_kind == COLLISIONALITY_MODEL_NTSS_ZEFF
     coulomb_log_model = jax.lax.switch(
         collisionality_kind,
         (
@@ -132,6 +113,7 @@ def _nu_over_vnew(
             lambda: COULOMB_LOG_MODEL_DEFAULT,
             lambda: COULOMB_LOG_MODEL_NTSS_LEGACY,
             lambda: COULOMB_LOG_MODEL_FIRST_PRINCIPLES,
+            lambda: COULOMB_LOG_MODEL_NTSS_LEGACY,
         ),
     )
     return jax.lax.cond(
@@ -141,16 +123,29 @@ def _nu_over_vnew(
             collisionality_ntss_like(index_species, species, v_new_a, r_index, density, temperature, v_thermal)
             / jnp.maximum(v_thermal[index_species, r_index], 1.0e-30),
         ),
-        lambda _: collisionality(
-            index_species,
-            species,
-            v_new_a,
-            r_index,
-            density,
-            temperature,
-            v_thermal,
-            coulomb_log_model,
-        ) / v_new_a,
+        lambda _: jax.lax.cond(
+            use_ntss_zeff,
+            lambda __: collisionality_ntss_zeff(
+                index_species,
+                species,
+                v_new_a,
+                r_index,
+                density,
+                temperature,
+                v_thermal,
+            ) / v_new_a,
+            lambda __: collisionality(
+                index_species,
+                species,
+                v_new_a,
+                r_index,
+                density,
+                temperature,
+                v_thermal,
+                coulomb_log_model,
+            ) / v_new_a,
+            operand=None,
+        ),
         operand=None,
     )
 
@@ -166,6 +161,7 @@ def _nu_over_vnew_local(
     collisionality_kind,
 ):
     use_ntss_like = collisionality_kind == COLLISIONALITY_MODEL_NTSS_LIKE
+    use_ntss_zeff = collisionality_kind == COLLISIONALITY_MODEL_NTSS_ZEFF
     coulomb_log_model = jax.lax.switch(
         collisionality_kind,
         (
@@ -173,6 +169,7 @@ def _nu_over_vnew_local(
             lambda: COULOMB_LOG_MODEL_DEFAULT,
             lambda: COULOMB_LOG_MODEL_NTSS_LEGACY,
             lambda: COULOMB_LOG_MODEL_FIRST_PRINCIPLES,
+            lambda: COULOMB_LOG_MODEL_NTSS_LEGACY,
         ),
     )
     return jax.lax.cond(
@@ -182,15 +179,27 @@ def _nu_over_vnew_local(
             collisionality_ntss_like_local(index_species, species, v_new_a, density_local, temperature_local, v_thermal_local)
             / jnp.maximum(v_thermal_local[index_species], 1.0e-30),
         ),
-        lambda _: collisionality_local(
-            index_species,
-            species,
-            v_new_a,
-            density_local,
-            temperature_local,
-            v_thermal_local,
-            coulomb_log_model,
-        ) / v_new_a,
+        lambda _: jax.lax.cond(
+            use_ntss_zeff,
+            lambda __: collisionality_ntss_zeff_local(
+                index_species,
+                species,
+                v_new_a,
+                density_local,
+                temperature_local,
+                v_thermal_local,
+            ) / v_new_a,
+            lambda __: collisionality_local(
+                index_species,
+                species,
+                v_new_a,
+                density_local,
+                temperature_local,
+                v_thermal_local,
+                coulomb_log_model,
+            ) / v_new_a,
+            operand=None,
+        ),
         operand=None,
     )
 
@@ -426,8 +435,7 @@ def _get_Lij_matrix_preprocessed(species, energy_grid, geometry, database, index
     Lij = jnp.zeros((3, 3))
     vth_a = v_thermal[index_species, r_index]
     v_new_a = energy_grid.v_norm * vth_a
-    b0_scale = _preprocessed_b0_scale_center(database, geometry, r_index)
-    Er_vnew_a = Er[r_index] * 1.0e3 / (v_new_a * b0_scale)
+    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
     nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
     L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
     L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
@@ -453,8 +461,7 @@ def _get_Lij_matrix_at_radius_preprocessed(species, energy_grid, geometry, datab
     Lij = jnp.zeros((3, 3))
     vth_a = v_thermal_local[index_species]
     v_new_a = energy_grid.v_norm * vth_a
-    b0_scale = _preprocessed_b0_scale_radius(database, geometry, radius_value)
-    Er_vnew_a = Er_value * 1.0e3 / (v_new_a * b0_scale)
+    Er_vnew_a = Er_value * 1.0e3 / v_new_a
     nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
     L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
     L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
