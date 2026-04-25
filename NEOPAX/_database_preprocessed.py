@@ -100,7 +100,7 @@ class PreprocessedMonoenergetic3D:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(eq=False)
-class PreprocessedMonoenergetic3DNTSSRadius:
+class PreprocessedMonoenergetic3DErFloor:
     a_b: float
     rho: Float[Array, "..."]
     r_grid: Float[Array, "..."]
@@ -146,7 +146,7 @@ class PreprocessedMonoenergetic3DNTSSRadius:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(eq=False)
-class PreprocessedMonoenergetic3DNTSSRadiusLocalState:
+class PreprocessedMonoenergetic3DNTSSRadius:
     a_b: float
     rho: Float[Array, "..."]
     r_grid: Float[Array, "..."]
