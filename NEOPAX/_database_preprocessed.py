@@ -150,3 +150,39 @@ class PreprocessedMonoenergetic3DNTSSRadius:
             divide_by_radius=True,
         )
         return cls(**data)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class PreprocessedMonoenergetic3DNTSSRadiusNTSS1D(PreprocessedMonoenergetic3DNTSSRadius):
+    @classmethod
+    def read_monkes(cls, a_b, monkes_file):
+        file = h5.File(monkes_file, "r")
+        data = _prepare_monkes_arrays(
+            a_b=a_b,
+            rho=file["rho"][()],
+            nu_v=file["nu_v"][()],
+            Er=file["Er"][()],
+            drds=file["drds"][()],
+            D11=file["D11"][()],
+            D13=file["D13"][()],
+            D33=file["D33"][()],
+            divide_by_radius=True,
+        )
+        file.close()
+        return cls(**data)
+
+    @classmethod
+    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
+        data = _prepare_monkes_arrays(
+            a_b=a_b,
+            rho=rho,
+            nu_v=nu_v,
+            Er=Er,
+            drds=drds,
+            D11=D11,
+            D13=D13,
+            D33=D33,
+            divide_by_radius=True,
+        )
+        return cls(**data)
