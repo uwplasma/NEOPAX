@@ -229,7 +229,7 @@ def collisionality_ntss_zeff(
     legacy DKES path. For ions we keep the explicit multispecies sum.
     """
     eidx = _electron_index(species)
-    if species_a != eidx:
+    def ion_like_branch(_):
         return collisionality(
             species_a,
             species,
@@ -240,21 +240,25 @@ def collisionality_ntss_zeff(
             v_thermal,
             COULOMB_LOG_MODEL_NTSS_LEGACY,
         )
-    ne = STATE_DENSITY_TO_PHYSICAL * density[eidx, r_index]
-    vte = jnp.maximum(v_thermal[eidx, r_index], 1.0e-30)
-    prefactor = gamma_ab(
-        species,
-        eidx,
-        eidx,
-        v,
-        r_index,
-        temperature,
-        density,
-        v_thermal,
-        COULOMB_LOG_MODEL_NTSS_LEGACY,
-    ) * ne / jnp.maximum(v, 1.0e-30) ** 3
-    kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
-    return prefactor * (kernel_e + zeff(species, density, r_index))
+
+    def electron_branch(_):
+        ne = STATE_DENSITY_TO_PHYSICAL * density[eidx, r_index]
+        vte = jnp.maximum(v_thermal[eidx, r_index], 1.0e-30)
+        prefactor = gamma_ab(
+            species,
+            eidx,
+            eidx,
+            v,
+            r_index,
+            temperature,
+            density,
+            v_thermal,
+            COULOMB_LOG_MODEL_NTSS_LEGACY,
+        ) * ne / jnp.maximum(v, 1.0e-30) ** 3
+        kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
+        return prefactor * (kernel_e + zeff(species, density, r_index))
+
+    return jax.lax.cond(species_a != eidx, ion_like_branch, electron_branch, operand=None)
 
 
 def collisionality_ntss_zeff_local(
@@ -267,7 +271,7 @@ def collisionality_ntss_zeff_local(
 ) -> float:
     """Local legacy NTSSfusion-like simplified electron collisionality using Zeff."""
     eidx = _electron_index(species)
-    if species_a != eidx:
+    def ion_like_branch(_):
         return collisionality_local(
             species_a,
             species,
@@ -277,19 +281,23 @@ def collisionality_ntss_zeff_local(
             v_thermal_local,
             COULOMB_LOG_MODEL_NTSS_LEGACY,
         )
-    ne = STATE_DENSITY_TO_PHYSICAL * density_local[eidx]
-    vte = jnp.maximum(v_thermal_local[eidx], 1.0e-30)
-    prefactor = gamma_ab_local(
-        species,
-        eidx,
-        eidx,
-        temperature_local,
-        density_local,
-        v_thermal_local,
-        COULOMB_LOG_MODEL_NTSS_LEGACY,
-    ) * ne / jnp.maximum(v, 1.0e-30) ** 3
-    kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
-    return prefactor * (kernel_e + zeff_local(species, density_local))
+
+    def electron_branch(_):
+        ne = STATE_DENSITY_TO_PHYSICAL * density_local[eidx]
+        vte = jnp.maximum(v_thermal_local[eidx], 1.0e-30)
+        prefactor = gamma_ab_local(
+            species,
+            eidx,
+            eidx,
+            temperature_local,
+            density_local,
+            v_thermal_local,
+            COULOMB_LOG_MODEL_NTSS_LEGACY,
+        ) * ne / jnp.maximum(v, 1.0e-30) ** 3
+        kernel_e = ntss_collision_kernel(species, eidx, eidx, v, vte)
+        return prefactor * (kernel_e + zeff_local(species, density_local))
+
+    return jax.lax.cond(species_a != eidx, ion_like_branch, electron_branch, operand=None)
 
 
 def nuD_ab(species: Species, species_a: int, species_b: int, v: float, r_index: int,
