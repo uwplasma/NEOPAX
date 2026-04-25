@@ -77,6 +77,31 @@ def _uses_ntss_preprocessed(database):
     return isinstance(database, NTSSPreprocessedMonoenergetic)
 
 
+def _preprocessed_b0_scale_center(database, geometry, r_index):
+    use_b0 = bool(getattr(database, "divide_by_b0", False))
+    return jax.lax.cond(
+        use_b0,
+        lambda _: jnp.maximum(geometry.B0[r_index], 1.0e-30),
+        lambda _: 1.0,
+        operand=None,
+    )
+
+
+def _preprocessed_b0_scale_radius(database, geometry, radius_value):
+    use_b0 = bool(getattr(database, "divide_by_b0", False))
+
+    def with_b0(_):
+        b0_interp = interpax.Interpolator1D(geometry.r_grid, geometry.B0, extrap=True)
+        return jnp.maximum(b0_interp(radius_value), 1.0e-30)
+
+    return jax.lax.cond(
+        use_b0,
+        with_b0,
+        lambda _: 1.0,
+        operand=None,
+    )
+
+
 def _collisionality_kind(collisionality_model: str | None) -> int:
     key = str(collisionality_model or "default").strip().lower()
     if key in {"ntss_like", "ntss", "ntssfusion"}:
@@ -401,7 +426,8 @@ def _get_Lij_matrix_preprocessed(species, energy_grid, geometry, database, index
     Lij = jnp.zeros((3, 3))
     vth_a = v_thermal[index_species, r_index]
     v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
+    b0_scale = _preprocessed_b0_scale_center(database, geometry, r_index)
+    Er_vnew_a = Er[r_index] * 1.0e3 / (v_new_a * b0_scale)
     nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
     L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
     L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
@@ -427,7 +453,8 @@ def _get_Lij_matrix_at_radius_preprocessed(species, energy_grid, geometry, datab
     Lij = jnp.zeros((3, 3))
     vth_a = v_thermal_local[index_species]
     v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
+    b0_scale = _preprocessed_b0_scale_radius(database, geometry, radius_value)
+    Er_vnew_a = Er_value * 1.0e3 / (v_new_a * b0_scale)
     nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
     L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
     L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2

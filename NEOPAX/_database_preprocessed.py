@@ -12,7 +12,7 @@ config.update("jax_enable_x64", True)
 DEL_R = 1.0e-3
 
 
-def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
+def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33, B0=None, divide_by_b0=False):
     rho = jnp.asarray(rho)
     nu_v = jnp.asarray(nu_v)
     Er = jnp.asarray(Er)
@@ -20,6 +20,9 @@ def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
     D11 = jnp.asarray(D11)
     D13 = jnp.asarray(D13)
     D33 = jnp.asarray(D33)
+    if B0 is None:
+        B0 = jnp.ones_like(rho)
+    B0 = jnp.asarray(B0)
 
     n_r = rho.shape[0]
     n_nu = nu_v.shape[0]
@@ -34,13 +37,15 @@ def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
         D11_scaled = D11_scaled.at[j, :, :].set(D11_scaled[j, :, :] * jnp.square(drds[j]))
         D13_scaled = D13_scaled.at[j, :, :].set(D13_scaled[j, :, :] * drds[j])
         D33_scaled = D33_scaled.at[j, :, :].set(D33_scaled[j, :, :] * nu_v[:, None])
-        er_row = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(Er[0, :]) / (a_b * rho[j])))
+        b0_scale = jnp.where(divide_by_b0, jnp.maximum(B0[j], 1.0e-30), 1.0)
+        er_row = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(Er[0, :]) / (b0_scale * a_b * rho[j])))
         Er_grid = Er_grid.at[j, :].set(er_row)
 
     return {
         "a_b": a_b,
         "rho": rho,
         "r_grid": a_b * rho,
+        "B0_grid": B0,
         "nu_log": jnp.log10(nu_v),
         "Er_grid": Er_grid,
         "D11_log": jnp.log10(D11_scaled),
@@ -49,6 +54,7 @@ def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33):
         "Er_lower_limit": jnp.array(1.0e-8),
         "low_limit_r": jnp.array(1.0e-3 * a_b),
         "del_r": jnp.array(DEL_R),
+        "divide_by_b0": bool(divide_by_b0),
     }
 
 
@@ -58,6 +64,7 @@ class PreprocessedMonoenergetic3D:
     a_b: float
     rho: Float[Array, "..."]
     r_grid: Float[Array, "..."]
+    B0_grid: Float[Array, "..."]
     nu_log: Float[Array, "..."]
     Er_grid: Float[Array, "..."]
     D11_log: Float[Array, "..."]
@@ -66,9 +73,10 @@ class PreprocessedMonoenergetic3D:
     Er_lower_limit: float
     low_limit_r: float
     del_r: float
+    divide_by_b0: bool
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
+    def read_monkes(cls, a_b, monkes_file, B0=None, divide_by_b0=False):
         file = h5.File(monkes_file, "r")
         data = _prepare_monkes_arrays(
             a_b=a_b,
@@ -79,12 +87,14 @@ class PreprocessedMonoenergetic3D:
             D11=file["D11"][()],
             D13=file["D13"][()],
             D33=file["D33"][()],
+            B0=B0,
+            divide_by_b0=divide_by_b0,
         )
         file.close()
         return cls(**data)
 
     @classmethod
-    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
+    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33, B0=None, divide_by_b0=False):
         data = _prepare_monkes_arrays(
             a_b=a_b,
             rho=rho,
@@ -94,6 +104,8 @@ class PreprocessedMonoenergetic3D:
             D11=D11,
             D13=D13,
             D33=D33,
+            B0=B0,
+            divide_by_b0=divide_by_b0,
         )
         return cls(**data)
 
@@ -104,6 +116,7 @@ class PreprocessedMonoenergetic3DNTSSRadius:
     a_b: float
     rho: Float[Array, "..."]
     r_grid: Float[Array, "..."]
+    B0_grid: Float[Array, "..."]
     nu_log: Float[Array, "..."]
     Er_grid: Float[Array, "..."]
     D11_log: Float[Array, "..."]
@@ -112,9 +125,10 @@ class PreprocessedMonoenergetic3DNTSSRadius:
     Er_lower_limit: float
     low_limit_r: float
     del_r: float
+    divide_by_b0: bool
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
+    def read_monkes(cls, a_b, monkes_file, B0=None, divide_by_b0=False):
         file = h5.File(monkes_file, "r")
         data = _prepare_monkes_arrays(
             a_b=a_b,
@@ -125,12 +139,14 @@ class PreprocessedMonoenergetic3DNTSSRadius:
             D11=file["D11"][()],
             D13=file["D13"][()],
             D33=file["D33"][()],
+            B0=B0,
+            divide_by_b0=divide_by_b0,
         )
         file.close()
         return cls(**data)
 
     @classmethod
-    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
+    def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33, B0=None, divide_by_b0=False):
         data = _prepare_monkes_arrays(
             a_b=a_b,
             rho=rho,
@@ -140,5 +156,7 @@ class PreprocessedMonoenergetic3DNTSSRadius:
             D11=D11,
             D13=D13,
             D33=D33,
+            B0=B0,
+            divide_by_b0=divide_by_b0,
         )
         return cls(**data)
