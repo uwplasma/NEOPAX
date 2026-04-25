@@ -404,6 +404,143 @@ def _maybe_print_ntss_er_coordinate_debug(config: dict, species, energy_grid, ge
         )
 
 
+def _maybe_print_ntss_branch_debug(config: dict, species, energy_grid, geometry, database, state) -> None:
+    solver_cfg = _normalize_solver_config(config)
+    if not bool(solver_cfg.get("debug_stage_markers", False)):
+        return
+
+    neoclassical_cfg = config.get("neoclassical", {})
+    interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
+    if interp_mode != "ntss_preprocessed":
+        return
+
+    if geometry is None or database is None or state is None:
+        return
+
+    rho_grid = jnp.asarray(geometry.rho_grid)
+    r_index = int(jnp.argmin(jnp.abs(rho_grid - 0.5)))
+    species_index = 0
+    species_name = species.names[species_index] if species.names and species_index < len(species.names) else str(species_index)
+    coll_model = str(neoclassical_cfg.get("collisionality_model", "default")).strip().lower()
+    v_thermal = get_v_thermal(species.mass, state.temperature)
+    vth = float(v_thermal[species_index, r_index])
+    vnorm = jnp.asarray(energy_grid.v_norm)
+    vvals = vnorm * vth
+    er_kvm = float(state.Er[r_index])
+    er_over_v = er_kvm * 1.0e3 / jnp.maximum(vvals, 1.0e-30)
+    xri = max(1.0e-2 * float(database.r_grid[0]), float(geometry.r_grid[r_index]))
+    efield = jnp.abs(er_over_v) / max(xri, 1.0e-30)
+    xer = jnp.log10(jnp.maximum(float(database.xref_l), efield))
+
+    if coll_model in {"ntss_like", "ntss", "ntssfusion"}:
+        nu_vals = collisionality_ntss_like(
+            species_index,
+            species,
+            jnp.asarray(vvals),
+            r_index,
+            state.density,
+            state.temperature,
+            v_thermal,
+        ) / jnp.maximum(vvals, 1.0e-30)
+    else:
+        nu_vals = collisionality(
+            species_index,
+            species,
+            jnp.asarray(vvals),
+            r_index,
+            state.density,
+            state.temperature,
+            v_thermal,
+        ) / jnp.maximum(vvals, 1.0e-30)
+    xnu = jnp.log10(jnp.maximum(1.0e-12, jnp.abs(nu_vals)))
+
+    icue = int(database.icnur[r_index])
+    icu0 = int(database.nval0[r_index])
+    avgs = jnp.asarray(database.axnuar[r_index])
+    aref = jnp.asarray(database.aref[r_index])
+    inulr = jnp.asarray(database.inulr[r_index])
+    inugr = jnp.asarray(database.inugr[r_index])
+
+    print(
+        "[NEOPAX] ntss branch debug: "
+        f"rho={float(rho_grid[r_index]):.5f} r_index={r_index} species={species_name} "
+        f"collisionality_model={coll_model} n_x={int(vnorm.size)}"
+    )
+    if icu0 > 0:
+        print(
+            "[NEOPAX] ntss branch debug: "
+            f"zero_field_xnu_range={[float(database.axnu0[r_index, 0]), float(database.axnu0[r_index, icu0 - 1])]}"
+        )
+    if icue > 0:
+        print(
+            "[NEOPAX] ntss branch debug: "
+            f"axnuar_active={jnp.asarray(avgs[:icue]).tolist()}"
+        )
+
+    for ix in range(int(vnorm.size)):
+        xnu_i = float(xnu[ix])
+        xer_i = float(xer[ix])
+        efield_i = float(efield[ix])
+
+        if efield_i <= float(database.xref_l):
+            branch = "zero_field"
+            ic_l = None
+            ic_u = None
+            aref_window = None
+        elif icue <= 0:
+            branch = "no_groups"
+            ic_l = None
+            ic_u = None
+            aref_window = None
+        elif xnu_i < float(avgs[0]):
+            branch = "low_branch"
+            ic_l = 0
+            ic_u = 0
+            start = int(inulr[0])
+            end = int(inugr[0])
+            aref_window = jnp.asarray(aref[start : end + 1]).tolist()
+        elif xnu_i > float(avgs[icue - 1]):
+            branch = "high_branch"
+            ic_l = icue - 1
+            ic_u = icue - 1
+            aref_window = None
+        else:
+            if icue >= 3 and xnu_i <= float(avgs[1]):
+                ic_l = 0
+                ic_u = 2
+            elif icue >= 3 and xnu_i >= float(avgs[icue - 2]):
+                ic_l = icue - 3
+                ic_u = icue - 1
+            else:
+                ic_l = 0
+                for ic in range(2, icue):
+                    if xnu_i < float(avgs[ic]):
+                        ic_l = ic - 2
+                        break
+                ic_u = min(ic_l + 3, icue - 1)
+            noic = ic_u - ic_l + 1
+            branch = f"middle_{noic}pt"
+            aref_window = []
+            for ic in range(ic_l, ic_u + 1):
+                start = int(inulr[ic])
+                end = int(inugr[ic])
+                aref_window.append(
+                    {
+                        "ic": ic,
+                        "xnu_avg": float(avgs[ic]),
+                        "aref_first": float(aref[start]),
+                        "aref_last": float(aref[end]),
+                        "n_er": end - start + 1,
+                    }
+                )
+
+        print(
+            "[NEOPAX] ntss branch debug: "
+            f"x_index={ix} vnorm={float(vnorm[ix]):.6g} xnu={xnu_i:.6f} xer={xer_i:.6f} "
+            f"efield={efield_i:.6e} branch={branch} ic_l={ic_l} ic_u={ic_u} aref_window={aref_window}"
+        )
+
+
 def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
@@ -625,6 +762,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     state = _build_state(config, geometry, species.number_species)
     _maybe_print_collisionality_debug(config, species, energy_grid, geometry, state)
     _maybe_print_ntss_er_coordinate_debug(config, species, energy_grid, geometry, database, state)
+    _maybe_print_ntss_branch_debug(config, species, energy_grid, geometry, database, state)
     solver_cfg = _normalize_solver_config(config)
     source_models = build_source_models_from_config(config, species)
     models = Models(
