@@ -12,7 +12,6 @@ config.update("jax_enable_x64", True)
 
 DXNU = 0.05
 XREF_L = 1.0e-8
-DREF = 0.7
 GMIX_ER = 0.1
 GMIX_NU = 0.2
 X11_L = -12.0
@@ -130,6 +129,8 @@ def _prepare_ntss_arrays(
                     zero_rows.append((xnu, row[2], row[3], row[4]))
                 finite_rows.append(row)
 
+        if zero_rows:
+            zero_rows.sort(key=lambda row: row[0])
         nv0 = min(len(zero_rows), n_nu)
         nval0[ir] = nv0
         for i, (xnu, g11, g13, g33) in enumerate(zero_rows[:nv0]):
@@ -137,33 +138,7 @@ def _prepare_ntss_arrays(
             ag110[ir, i] = g11
             ag130[ir, i] = g13
             ag330[ir, i] = g33
-        if nv0 >= 2:
-            min_idx = 0
-            max_idx = nv0 - 1
-            xnul = axnu0[ir, 0]
-            xnug = axnu0[ir, nv0 - 1]
-            for idx in range(nv0):
-                xnu = axnu0[ir, idx]
-                if xnu < xnul:
-                    xnul = xnu
-                    min_idx = idx
-                if xnu > xnug:
-                    xnug = xnu
-                    max_idx = idx
-
-            if min_idx > 0:
-                axnu0[ir, 0], axnu0[ir, min_idx] = axnu0[ir, min_idx], axnu0[ir, 0]
-                ag110[ir, 0], ag110[ir, min_idx] = ag110[ir, min_idx], ag110[ir, 0]
-                ag130[ir, 0], ag130[ir, min_idx] = ag130[ir, min_idx], ag130[ir, 0]
-                ag330[ir, 0], ag330[ir, min_idx] = ag330[ir, min_idx], ag330[ir, 0]
-                if max_idx == 0:
-                    max_idx = min_idx
-
-            if max_idx < nv0 - 1:
-                axnu0[ir, nv0 - 1], axnu0[ir, max_idx] = axnu0[ir, max_idx], axnu0[ir, nv0 - 1]
-                ag110[ir, nv0 - 1], ag110[ir, max_idx] = ag110[ir, max_idx], ag110[ir, nv0 - 1]
-                ag130[ir, nv0 - 1], ag130[ir, max_idx] = ag130[ir, max_idx], ag130[ir, nv0 - 1]
-                ag330[ir, nv0 - 1], ag330[ir, max_idx] = ag330[ir, max_idx], ag330[ir, nv0 - 1]
+        finite_rows.sort(key=lambda row: row[0])
 
         nve = len(finite_rows)
 
@@ -183,44 +158,14 @@ def _prepare_ntss_arrays(
                 inulr[ir, icnu] = start
                 inugr[ir, icnu] = end - 1
                 axnuar[ir, icnu] = float(xnuav / noe)
-                for local_idx, (xnu, xer, g11, g13, g33) in enumerate(finite_rows[ml : mg + 1]):
+                block_rows = sorted(finite_rows[ml : mg + 1], key=lambda row: row[1])
+                for local_idx, (xnu, xer, g11, g13, g33) in enumerate(block_rows):
                     idx = start + local_idx
                     axnu[ir, idx] = xnu
                     aref[ir, idx] = xer
                     ag11[ir, idx] = g11
                     ag13[ir, idx] = g13
                     ag33[ir, idx] = g33
-                if noe >= 2:
-                    min_idx = start
-                    max_idx = end - 1
-                    min_ref = aref[ir, start]
-                    max_ref = aref[ir, end - 1]
-                    for idx in range(start, end):
-                        ref = aref[ir, idx]
-                        if ref < min_ref:
-                            min_ref = ref
-                            min_idx = idx
-                        if ref > max_ref:
-                            max_ref = ref
-                            max_idx = idx
-
-                    if min_idx > start:
-                        axnu[ir, start], axnu[ir, min_idx] = axnu[ir, min_idx], axnu[ir, start]
-                        aref[ir, start], aref[ir, min_idx] = aref[ir, min_idx], aref[ir, start]
-                        ag11[ir, start], ag11[ir, min_idx] = ag11[ir, min_idx], ag11[ir, start]
-                        ag13[ir, start], ag13[ir, min_idx] = ag13[ir, min_idx], ag13[ir, start]
-                        ag33[ir, start], ag33[ir, min_idx] = ag33[ir, min_idx], ag33[ir, start]
-                        if max_idx == start:
-                            max_idx = min_idx
-
-                    if max_idx < end - 1:
-                        axnu[ir, end - 1], axnu[ir, max_idx] = axnu[ir, max_idx], axnu[ir, end - 1]
-                        aref[ir, end - 1], aref[ir, max_idx] = aref[ir, max_idx], aref[ir, end - 1]
-                        ag11[ir, end - 1], ag11[ir, max_idx] = ag11[ir, max_idx], ag11[ir, end - 1]
-                        ag13[ir, end - 1], ag13[ir, max_idx] = ag13[ir, max_idx], ag13[ir, end - 1]
-                        ag33[ir, end - 1], ag33[ir, max_idx] = ag33[ir, max_idx], ag33[ir, end - 1]
-
-                    aref[ir, start] = max(aref[ir, start], aref[ir, start + 1] - DREF)
                 pos = end
                 icnu += 1
             ml = mg + 1

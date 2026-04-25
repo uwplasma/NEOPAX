@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from jax import config
-import interpax
 
 # to use higher precision
 config.update("jax_enable_x64", True)
@@ -71,20 +70,6 @@ def _surface_bilinear(table, er_grid, ir, inu, ty, grid_er_internal):
     )
 
 
-def _surface_monotonic(table, nu_log, er_grid, ir, grid_nu_internal, grid_er_internal):
-    xq = jnp.asarray([jnp.clip(grid_nu_internal, nu_log[0], nu_log[-1])])
-    yq = jnp.asarray([jnp.clip(grid_er_internal, er_grid[ir, 0], er_grid[ir, -1])])
-    return interpax.interp2d(
-        xq,
-        yq,
-        nu_log,
-        er_grid[ir],
-        table[ir],
-        method="monotonic",
-        extrap=False,
-    )[0]
-
-
 @jax.jit
 def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
@@ -139,145 +124,6 @@ def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
         0.5 * (tz0 + tz1),
     )
 
-    return jnp.asarray([d11, d13, d33])
-
-
-@jax.jit
-def get_Dij_preprocessed_3d_er_raw(grid_x, grid_nu, grid_Er, database):
-    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-    er_ratio = jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er))
-    grid_er_internal = jnp.log10(er_ratio)
-
-    ir = _clamped_interval_index(database.r_grid, grid_x)
-    inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
-
-    tx = _fraction(database.r_grid, ir, grid_x)
-    ty = _fraction(database.nu_log, inu, grid_nu_internal)
-
-    er_grid0 = database.Er_grid[ir]
-    er_grid1 = database.Er_grid[ir + 1]
-    ier0 = _clamped_interval_index(er_grid0, grid_er_internal)
-    ier1 = _clamped_interval_index(er_grid1, grid_er_internal)
-    tz0 = _fraction(er_grid0, ier0, grid_er_internal)
-    tz1 = _fraction(er_grid1, ier1, grid_er_internal)
-
-    d11_r0 = _bilinear(
-        database.D11_log[ir, inu, ier0],
-        database.D11_log[ir, inu, ier0 + 1],
-        database.D11_log[ir, inu + 1, ier0],
-        database.D11_log[ir, inu + 1, ier0 + 1],
-        ty,
-        tz0,
-    )
-    d11_r1 = _bilinear(
-        database.D11_log[ir + 1, inu, ier1],
-        database.D11_log[ir + 1, inu, ier1 + 1],
-        database.D11_log[ir + 1, inu + 1, ier1],
-        database.D11_log[ir + 1, inu + 1, ier1 + 1],
-        ty,
-        tz1,
-    )
-    d11 = d11_r0 * (1.0 - tx) + d11_r1 * tx
-
-    d13 = _trilinear(
-        _corner_cube(database.D13, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-    d33 = _trilinear(
-        _corner_cube(database.D33, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-
-    return jnp.asarray([d11, d13, d33])
-
-
-@jax.jit
-def get_Dij_preprocessed_3d_ertilde(grid_x, grid_nu, grid_Er, database):
-    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-
-    ir = _clamped_interval_index(database.r_grid, grid_x)
-    tx = _fraction(database.r_grid, ir, grid_x)
-    ertilde_scale = database.Er_to_Ertilde_scale[ir] * (1.0 - tx) + database.Er_to_Ertilde_scale[ir + 1] * tx
-    grid_Er_tilde = grid_Er * ertilde_scale
-
-    er_ratio = jnp.where(
-        grid_x <= database.low_limit_r,
-        database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er_tilde / grid_x)),
-    )
-    grid_er_internal = jnp.log10(er_ratio)
-
-    inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
-    ty = _fraction(database.nu_log, inu, grid_nu_internal)
-
-    er_grid0 = database.Er_grid[ir]
-    er_grid1 = database.Er_grid[ir + 1]
-    ier0 = _clamped_interval_index(er_grid0, grid_er_internal)
-    ier1 = _clamped_interval_index(er_grid1, grid_er_internal)
-    tz0 = _fraction(er_grid0, ier0, grid_er_internal)
-    tz1 = _fraction(er_grid1, ier1, grid_er_internal)
-
-    d11_r0 = _bilinear(
-        database.D11_log[ir, inu, ier0],
-        database.D11_log[ir, inu, ier0 + 1],
-        database.D11_log[ir, inu + 1, ier0],
-        database.D11_log[ir, inu + 1, ier0 + 1],
-        ty,
-        tz0,
-    )
-    d11_r1 = _bilinear(
-        database.D11_log[ir + 1, inu, ier1],
-        database.D11_log[ir + 1, inu, ier1 + 1],
-        database.D11_log[ir + 1, inu + 1, ier1],
-        database.D11_log[ir + 1, inu + 1, ier1 + 1],
-        ty,
-        tz1,
-    )
-    d11 = d11_r0 * (1.0 - tx) + d11_r1 * tx
-
-    d13 = _trilinear(
-        _corner_cube(database.D13, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-    d33 = _trilinear(
-        _corner_cube(database.D33, ir, inu, inu + 1, ier0, ier1),
-        tx,
-        ty,
-        0.5 * (tz0 + tz1),
-    )
-
-    return jnp.asarray([d11, d13, d33])
-
-
-@jax.jit
-def get_Dij_preprocessed_3d_monotonic(grid_x, grid_nu, grid_Er, database):
-    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-    er_ratio = jnp.where(
-        grid_x <= database.low_limit_r,
-        database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_x)),
-    )
-    grid_er_internal = jnp.log10(er_ratio)
-
-    ir = _clamped_interval_index(database.r_grid, grid_x)
-    tx = _fraction(database.r_grid, ir, grid_x)
-
-    d11_r0 = _surface_monotonic(database.D11_log, database.nu_log, database.Er_grid, ir, grid_nu_internal, grid_er_internal)
-    d11_r1 = _surface_monotonic(database.D11_log, database.nu_log, database.Er_grid, ir + 1, grid_nu_internal, grid_er_internal)
-    d13_r0 = _surface_monotonic(database.D13, database.nu_log, database.Er_grid, ir, grid_nu_internal, grid_er_internal)
-    d13_r1 = _surface_monotonic(database.D13, database.nu_log, database.Er_grid, ir + 1, grid_nu_internal, grid_er_internal)
-    d33_r0 = _surface_monotonic(database.D33, database.nu_log, database.Er_grid, ir, grid_nu_internal, grid_er_internal)
-    d33_r1 = _surface_monotonic(database.D33, database.nu_log, database.Er_grid, ir + 1, grid_nu_internal, grid_er_internal)
-
-    d11 = d11_r0 * (1.0 - tx) + d11_r1 * tx
-    d13 = d13_r0 * (1.0 - tx) + d13_r1 * tx
-    d33 = d33_r0 * (1.0 - tx) + d33_r1 * tx
     return jnp.asarray([d11, d13, d33])
 
 

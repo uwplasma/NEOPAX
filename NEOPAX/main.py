@@ -24,9 +24,6 @@ from ._database import Monoenergetic
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
 from ._database_preprocessed import (
     PreprocessedMonoenergetic3D,
-    PreprocessedMonoenergetic3DErRaw,
-    PreprocessedMonoenergetic3DErTilde,
-    PreprocessedMonoenergetic3DMonotonic,
     PreprocessedMonoenergetic3DNTSSRadius,
 )
 from ._entropy_models import get_entropy_model
@@ -158,17 +155,11 @@ def _build_database(config: dict, geometry):
         interp_mode = str(
             config.get("neoclassical", {}).get("interpolation_mode", "generic")
         ).strip().lower()
-        if interp_mode == "ntss_preprocessed":
+        if interp_mode == "preprocessed_ntss":
             return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode in {"preprocessed_3d_ertilde", "preprocessed_3d_er_tilde", "preprocessed_3d_tilde"}:
-            return PreprocessedMonoenergetic3DErTilde.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode in {"preprocessed_3d_er", "preprocessed_3d_raw_er", "preprocessed_3d_no_r"}:
-            return PreprocessedMonoenergetic3DErRaw.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode in {"preprocessed_3d_monotonic", "preprocessed_3d_cubic_monotone"}:
-            return PreprocessedMonoenergetic3DMonotonic.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode in {"preprocessed_3d_ntss_radius", "preprocessed_3d_radial_stencil"}:
+        if interp_mode == "preprocessed_3d_ntss_radial":
             return PreprocessedMonoenergetic3DNTSSRadius.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
     return None
@@ -180,7 +171,7 @@ def _maybe_print_ntss_radial_grid_debug(config: dict, geometry, database) -> Non
     interp_mode = str(
         config.get("neoclassical", {}).get("interpolation_mode", "generic")
     ).strip().lower()
-    if interp_mode != "ntss_preprocessed":
+    if interp_mode != "preprocessed_ntss":
         return
 
     solver_cfg = _normalize_solver_config(config)
@@ -260,7 +251,7 @@ def _maybe_print_collisionality_debug(config: dict, species, energy_grid, geomet
 
     neoclassical_cfg = config.get("neoclassical", {})
     interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
-    if interp_mode != "ntss_preprocessed":
+    if interp_mode != "preprocessed_ntss":
         return
 
     if geometry is None or state is None:
@@ -304,7 +295,7 @@ def _maybe_print_ntss_transport_debug(config: dict, species, energy_grid, geomet
 
     neoclassical_cfg = config.get("neoclassical", {})
     interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
-    if interp_mode != "ntss_preprocessed":
+    if interp_mode != "preprocessed_ntss":
         return
 
     if geometry is None or database is None or state is None:
@@ -361,7 +352,7 @@ def _maybe_print_ntss_er_coordinate_debug(config: dict, species, energy_grid, ge
 
     neoclassical_cfg = config.get("neoclassical", {})
     interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
-    if interp_mode != "ntss_preprocessed":
+    if interp_mode != "preprocessed_ntss":
         return
 
     if geometry is None or database is None or state is None:
@@ -414,7 +405,7 @@ def _maybe_print_ntss_branch_debug(config: dict, species, energy_grid, geometry,
 
     neoclassical_cfg = config.get("neoclassical", {})
     interp_mode = str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower()
-    if interp_mode != "ntss_preprocessed":
+    if interp_mode != "preprocessed_ntss":
         return
 
     if geometry is None or database is None or state is None:
