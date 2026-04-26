@@ -438,12 +438,17 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     if str(args.backend).lower() == "gpu":
+        env["JAX_PLATFORMS"] = "gpu"
+        env["JAX_PLATFORM_NAME"] = "gpu"
         if gpu_id is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         env["SFINCS_JAX_SHARD"] = "0"
         env["SFINCS_JAX_AUTO_SHARD"] = "0"
         env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = "off"
     else:
+        env["JAX_PLATFORMS"] = "cpu"
+        env["JAX_PLATFORM_NAME"] = "cpu"
+        env["CUDA_VISIBLE_DEVICES"] = ""
         if int(args.cores_per_run) > 0:
             env["SFINCS_JAX_CORES"] = str(int(args.cores_per_run))
             env["SFINCS_JAX_SHARD"] = "0"
