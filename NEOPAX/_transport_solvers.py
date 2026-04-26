@@ -244,6 +244,8 @@ def _unpack_transport_state_arrays(
     species: Any = None,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ) -> Any:
     """Rebuild a TransportState-like object from an array-only pytree."""
     if (
@@ -268,6 +270,8 @@ def _unpack_transport_state_arrays(
                 template_state,
                 temperature_active_mask=temperature_active_mask,
                 fixed_temperature_profile=fixed_temperature_profile,
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
             )
         rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
         return _project_fixed_temperature_output(
@@ -275,6 +279,8 @@ def _unpack_transport_state_arrays(
             template_state,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
     return state_like
 
