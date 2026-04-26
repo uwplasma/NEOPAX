@@ -1871,27 +1871,28 @@ def plot_transport_solution(
             ax.plot(rho, er, label=label)
         if overlay_reference_er and rho is not None:
             try:
-                er_ref = ntss_reference.get("Er")
-                if er_ref is None:
-                    import h5py
-                    import interpax
+                er_ref = None
+                import h5py
+                import interpax
 
-                    if reference_er_file is None:
-                        candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
+                if reference_er_file is None:
+                    candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
+                else:
+                    candidate = Path(reference_er_file)
+                    if not candidate.is_absolute():
+                        candidate = (Path.cwd() / candidate).resolve()
+                if candidate.is_file():
+                    with h5py.File(candidate, "r") as f:
+                        r_data = f["r"][()]
+                        er_data = f["Er"][()]
+                    if len(er_data) != len(rho):
+                        r_data = jnp.asarray(r_data)
+                        rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
+                        er_ref = interpax.interp1d(rho_ref, er_data, rho)
                     else:
-                        candidate = Path(reference_er_file)
-                        if not candidate.is_absolute():
-                            candidate = (Path.cwd() / candidate).resolve()
-                    if candidate.is_file():
-                        with h5py.File(candidate, "r") as f:
-                            r_data = f["r"][()]
-                            er_data = f["Er"][()]
-                        if len(er_data) != len(rho):
-                            r_data = jnp.asarray(r_data)
-                            rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
-                            er_ref = interpax.interp1d(rho_ref, er_data, rho)
-                        else:
-                            er_ref = er_data
+                        er_ref = er_data
+                if er_ref is None:
+                    er_ref = ntss_reference.get("Er")
                 if er_ref is not None:
                     ax.plot(rho, er_ref, color="black", linewidth=2.2, linestyle="--", label=f"reference Er")
             except Exception as e:
