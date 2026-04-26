@@ -39,7 +39,7 @@ from ._source_models import (
     sum_source_components,
 )
 from ._species import Species
-from ._state import TransportState, safe_density
+from ._state import TransportState, safe_density, safe_temperature
 from ._transport_flux_models import (
     FluxesRFileTransportModel,
     ZeroTransportModel,
@@ -174,18 +174,24 @@ def _build_state(config: dict, geometry, n_species: int):
         return None
     profile_set = build_profiles(config.get("profiles", {}), geometry, n_species)
     density_state = profile_set.density / 1.0e20
+    temperature_state = profile_set.temperature / 1.0e3
     density_floor = float(
         config.get("transport_solver", {}).get(
             "density_floor",
             config.get("solver", {}).get("density_floor", 1.0e-6),
         )
     )
+    temperature_floor = config.get("transport_solver", {}).get(
+        "temperature_floor",
+        config.get("solver", {}).get("temperature_floor"),
+    )
+    temperature_state = safe_temperature(temperature_state, temperature_floor)
     return TransportState(
         density=density_state,
         # Keep configured temperatures well-defined even when a species starts at
         # zero concentration, so downstream Er initialization does not collapse
         # that species to T=0 through the pressure/density representation.
-        pressure=(profile_set.temperature / 1.0e3) * safe_density(density_state, density_floor),
+        pressure=temperature_state * safe_density(density_state, density_floor),
         Er=profile_set.Er,
     )
 
@@ -258,6 +264,57 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                 f"min={float(jnp.min(finite_roots)):.6e}",
                 f"max={float(jnp.max(finite_roots)):.6e}",
             )
+        if runtime.models.flux is not None and runtime.geometry is not None:
+            try:
+                local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+                if local_particle_flux is not None:
+                    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.density.dtype)
+                    er_min = float(amb_cfg.get("er_ambipolar_scan_min", -20.0))
+                    er_max = float(amb_cfg.get("er_ambipolar_scan_max", 20.0))
+                    n_coarse = int(amb_cfg.get("er_ambipolar_n_coarse", 24))
+                    er_grid = jnp.linspace(er_min, er_max, n_coarse, dtype=state.Er.dtype)
+                    sample_radii = jnp.asarray(
+                        sorted(
+                            set(
+                                int(v)
+                                for v in (
+                                    0,
+                                    max(0, state.Er.shape[0] // 2),
+                                    max(0, state.Er.shape[0] - 1),
+                                )
+                            )
+                        ),
+                        dtype=jnp.int32,
+                    )
+
+                    def gamma_scan_for_radius(i):
+                        def gamma_charge(er):
+                            gamma_species = local_particle_flux(i, er)
+                            return jnp.sum(charge_qp * gamma_species)
+                        gamma_grid = jax.vmap(gamma_charge)(er_grid)
+                        sign_change_count = jnp.sum((gamma_grid[:-1] * gamma_grid[1:]) < 0.0)
+                        minabs_idx = jnp.argmin(jnp.abs(gamma_grid))
+                        return (
+                            gamma_grid[0],
+                            gamma_grid[-1],
+                            gamma_grid[minabs_idx],
+                            er_grid[minabs_idx],
+                            sign_change_count,
+                        )
+
+                    gamma_debug = jax.vmap(gamma_scan_for_radius)(sample_radii)
+                    for radius_idx, vals in zip(sample_radii.tolist(), gamma_debug):
+                        g_left, g_right, g_best, er_best, n_changes = vals
+                        print(
+                            f"[NEOPAX] ambipolar scan diagnostic[r={int(radius_idx)}]:",
+                            f"gamma_at_scan_min={float(g_left):.6e}",
+                            f"gamma_at_scan_max={float(g_right):.6e}",
+                            f"minabs_gamma={float(g_best):.6e}",
+                            f"minabs_gamma_Er={float(er_best):.6e}",
+                            f"coarse_sign_changes={int(n_changes)}",
+                        )
+            except Exception as exc:
+                print(f"[NEOPAX] ambipolar scan diagnostic unavailable: {exc}")
     return dataclasses.replace(state, Er=er_init)
 
 
@@ -1995,7 +2052,12 @@ def plot_transport_solution(
 
             if flux_model is not None and geometry is not None and species is not None and hasattr(species, "species_idx"):
                 try:
-                    face_state = build_face_transport_state(snapshot_state, geometry)
+                    face_state = build_face_transport_state(
+                        snapshot_state,
+                        geometry,
+                        density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                        temperature_floor=solver_cfg.get("temperature_floor"),
+                    )
                     face_fluxes = flux_model.evaluate_face_fluxes(snapshot_state, face_state)
                     eidx = species.species_idx.get("e")
                     if eidx is not None and face_fluxes is not None:

@@ -467,6 +467,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
     collisionality_model: str = "default"
 
     def __call__(self, state) -> dict:
+        density = safe_density(state.density)
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
             self.species,
             self.energy_grid,
@@ -474,7 +475,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             self.database,
             state.Er,
             state.temperature,
-            state.density,
+            density,
             collisionality_model=self.collisionality_model,
         )
         return {
@@ -492,6 +493,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
         def evaluator(radius_index, er_value):
             er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
             er_profile = state.Er.at[radius_index].set(er_scalar)
+            density = safe_density(state.density)
             _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
                 species,
                 energy_grid,
@@ -499,7 +501,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
                 database,
                 er_profile,
                 state.temperature,
-                state.density,
+                density,
                 collisionality_model=self.collisionality_model,
             )
             return gamma_neo[:, radius_index]
@@ -507,12 +509,14 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        density = safe_density(state.density)
+        face_density = safe_density(face_state.density)
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
         particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
         if particle_face_closure_mode in {"ntss_like", "ntss", "half_point"}:
             dndr_faces = _ntss_like_face_gradient(
-                state.density,
+                density,
                 self.geometry.r_grid_half,
                 bc_model=bc_density,
             )
@@ -523,7 +527,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             )
         else:
             dndr_faces = _face_profile_gradient(
-                state.density,
+                density,
                 self.geometry.r_grid_half,
                 bc_model=bc_density,
             )
@@ -539,7 +543,7 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
             self.database,
             face_state.Er,
             face_state.temperature,
-            face_state.density,
+            face_density,
             dndr_faces,
             dTdr_faces,
             collisionality_model=self.collisionality_model,
