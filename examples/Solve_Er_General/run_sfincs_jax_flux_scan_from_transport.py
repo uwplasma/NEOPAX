@@ -22,8 +22,8 @@ Default sfincs_jax resolution overrides used by this bridge:
 - ``solverTolerance = 1e-6``
 
 Important note on normalization:
-The written ``Gamma`` and ``Q`` values are taken directly from sfincs_jax's
-SFINCS-style output fields, using the ``*_rN`` variants when available.
+The written ``Gamma`` and ``Q`` values are taken from sfincs_jax's
+SFINCS-style output fields, preferring the ``*_rHat`` variants when available.
 This makes the bridge practical for workflow prototyping, but exact
 normalization against NEOPAX's native flux units should still be verified
 carefully before treating the result as a strict physical replacement.
@@ -395,14 +395,17 @@ def _last_scalar(arr: np.ndarray) -> float:
     return float(np.ravel(data)[-1])
 
 
-def _extract_flux_triplet(results: dict[str, Any], n_species: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str]]:
+def _extract_flux_triplet(
+    results: dict[str, Any],
+    n_species: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float | None, dict[str, str]]:
     gamma_key = None
     q_key = None
-    for key in ("particleFlux_vm_rN", "particleFlux_vm_psiHat"):
+    for key in ("particleFlux_vm_rHat", "particleFlux_vm_rN", "particleFlux_vm_psiHat"):
         if key in results:
             gamma_key = key
             break
-    for key in ("heatFlux_vm_rN", "heatFlux_vm_psiHat"):
+    for key in ("heatFlux_vm_rHat", "heatFlux_vm_rN", "heatFlux_vm_psiHat"):
         if key in results:
             q_key = key
             break
@@ -430,7 +433,11 @@ def _extract_flux_triplet(results: dict[str, Any], n_species: int) -> tuple[np.n
         "Upar_bridge": "2*B0OverBBar/sqrt(pi)",
         "B0OverBBar": f"{b0_over_bbar:.16g}",
     }
-    return gamma, q, upar, meta
+    r_hat = None
+    if "rHat" in results:
+        r_hat = _last_scalar(np.asarray(results["rHat"], dtype=np.float64))
+        meta["rHat"] = f"{r_hat:.16g}"
+    return gamma, q, upar, r_hat, meta
 
 
 def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[str, str]:
@@ -438,10 +445,19 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     if str(args.backend).lower() == "gpu":
-        env["JAX_PLATFORMS"] = "gpu"
-        env["JAX_PLATFORM_NAME"] = "gpu"
+        # On NVIDIA-backed JAX installs, using the generic "gpu" alias can
+        # still let JAX probe other accelerator backends such as ROCm. Force
+        # CUDA explicitly for these worker processes.
+        env["JAX_PLATFORMS"] = "cuda"
+        env["JAX_PLATFORM_NAME"] = "cuda"
         if gpu_id is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Drop accelerator-selection variables inherited from the parent shell
+        # that can redirect JAX toward a different backend family.
+        env.pop("PJRT_DEVICE", None)
+        env.pop("JAX_BACKEND_TARGET", None)
+        env.pop("ROCM_VISIBLE_DEVICES", None)
+        env.pop("HIP_VISIBLE_DEVICES", None)
         env["SFINCS_JAX_SHARD"] = "0"
         env["SFINCS_JAX_AUTO_SHARD"] = "0"
         env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = "off"
@@ -482,10 +498,11 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
         verbose=bool(payload.get("verbose", False)),
     )
     results = read_sfincs_h5(output_path)
-    gamma, q, upar, meta = _extract_flux_triplet(results, n_species)
+    gamma, q, upar, r_hat, meta = _extract_flux_triplet(results, n_species)
     summary = {
         "radius_index": int(payload["radius_index"]),
         "rho": float(payload["rho"]),
+        "rHat": None if r_hat is None else float(r_hat),
         "Gamma": gamma.tolist(),
         "Q": q.tolist(),
         "Upar": upar.tolist(),
@@ -529,6 +546,23 @@ def _write_summary_plots(
         ax.legend()
         fig.savefig(path, dpi=180)
         plt.close(fig)
+
+
+def _suppress_benign_worker_stderr(stderr: str, args: argparse.Namespace) -> str:
+    if str(args.backend).lower() != "cpu":
+        return stderr
+    text = (stderr or "").strip()
+    if not text:
+        return ""
+    benign_markers = (
+        "Jax plugin configuration error",
+        "jax_plugins.xla_cuda12.initialize()",
+        "cuda_device_count()",
+        "operation cuInit(0) failed: CUDA_ERROR_NO_DEVICE",
+    )
+    if all(marker in text for marker in benign_markers):
+        return ""
+    return stderr
 
 
 def _launch_one_subprocess(
@@ -616,8 +650,9 @@ def _run_tasks_in_parallel(
                 if bool(args.verbose_workers) and not stream_output:
                     if stdout.strip():
                         print(f"[sfincs-worker stdout] {label}\n{stdout.strip()}", flush=True)
-                    if stderr.strip():
-                        print(f"[sfincs-worker stderr] {label}\n{stderr.strip()}", flush=True)
+                    stderr_to_print = _suppress_benign_worker_stderr(stderr, args)
+                    if stderr_to_print.strip():
+                        print(f"[sfincs-worker stderr] {label}\n{stderr_to_print.strip()}", flush=True)
                 completed += 1
                 rho_value = None
                 if payload_path is not None:
@@ -733,6 +768,7 @@ def cmd_main(args: argparse.Namespace) -> int:
     )
 
     rho_out = []
+    rhat_out = []
     gamma_out = []
     q_out = []
     upar_out = []
@@ -742,19 +778,26 @@ def cmd_main(args: argparse.Namespace) -> int:
         result_json = Path(payload["result_json"])
         summary = json.loads(result_json.read_text(encoding="utf-8"))
         rho_out.append(float(summary["rho"]))
+        rhat_value = summary.get("rHat")
+        if rhat_value is None:
+            raise KeyError(f"Worker summary {result_json} is missing rHat.")
+        rhat_out.append(float(rhat_value))
         gamma_out.append(np.asarray(summary["Gamma"], dtype=np.float64))
         q_out.append(np.asarray(summary["Q"], dtype=np.float64))
         upar_out.append(np.asarray(summary["Upar"], dtype=np.float64))
         raw_meta = dict(summary.get("meta", raw_meta))
 
     rho_arr = np.asarray(rho_out, dtype=np.float64)
+    rhat_arr = np.asarray(rhat_out, dtype=np.float64)
     gamma_arr = np.stack(gamma_out, axis=1)
     q_arr = np.stack(q_out, axis=1)
     upar_arr = np.stack(upar_out, axis=1)
 
     out_h5 = output_dir / "sfincs_jax_flux_profiles.h5"
     with h5py.File(out_h5, "w") as f:
-        f.create_dataset("r", data=rho_arr)
+        f.create_dataset("r", data=rhat_arr)
+        f.create_dataset("rHat", data=rhat_arr)
+        f.create_dataset("rho", data=rho_arr)
         f.create_dataset("Gamma", data=gamma_arr)
         f.create_dataset("Q", data=q_arr)
         f.create_dataset("Upar", data=upar_arr)
@@ -778,6 +821,10 @@ def cmd_main(args: argparse.Namespace) -> int:
             "with nbar=1e20 m^-3, Tbar=1 keV, mbar=mp, Rbar=1 m. "
             "Q is converted from heatFlux_vm_* using nbar*mbar*vbar^3/Rbar with the same references. "
             "Upar uses the NTX archive-backed observable bridge rather than a raw FSABFlow alias."
+        )
+        f.attrs["radius_note"] = (
+            "The saved coordinate r/rHat uses sfincs_jax's rHat output. "
+            "rho is also saved separately from the source NEOPAX transport file."
         )
 
     if bool(args.plot):
