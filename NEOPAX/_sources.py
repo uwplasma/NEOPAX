@@ -1,4 +1,5 @@
 # --- Physical source model functions (JAX-compatible, stateless) ---
+import jax
 import jax.numpy as jnp
 from jax import jit
 from ._constants import proton_mass, elementary_charge
@@ -105,22 +106,29 @@ def bremsstrahlung_radiation_generalized(
         Z = jnp.array([1.0, 1.0, 1.0, 2.0])[:n_species]
     n = state.density
     # Zeff: sum_s n_s Z_s^2 / n_e
-    if exclude_impurity_bremsstrahlung:
-        # Only main ions
-        n_main = n[jnp.array(main_ion_indices)]
-        Z_main = Z[jnp.array(main_ion_indices)]
-        Zeff = jnp.sum(n_main * Z_main**2, axis=0) / ne
-    else:
-        Zeff = jnp.sum(n * Z**2, axis=0) / ne
+    n_main = n[jnp.array(main_ion_indices)]
+    Z_main = Z[jnp.array(main_ion_indices)]
+    full_zeff = jnp.sum(n * Z**2, axis=0) / ne
+    main_ion_zeff = jnp.sum(n_main * Z_main**2, axis=0) / ne
+    Zeff = jax.lax.cond(
+        jnp.asarray(exclude_impurity_bremsstrahlung),
+        lambda _: main_ion_zeff,
+        lambda _: full_zeff,
+        operand=None,
+    )
     Zeff = Zeff + jnp.asarray(delta_zeff, dtype=ne.dtype)
     # Keep the NTSS-like transport normalization used by the original default
     # source, while upgrading Zeff to the full multispecies expression.
     PBrems = 3.16e-1 * Zeff * ne**2 * jnp.sqrt(Te)
-    if use_relativistic_correction:
-        Tm = 511.0 * 1e3  # eV
-        Te_eV = Te  # assume Te in eV
-        corr = (1.0 + 2.0 * Te_eV / Tm) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + Te_eV / Tm)))
-        PBrems = PBrems * corr
+    Tm = 511.0 * 1e3  # eV
+    Te_eV = Te  # assume Te in eV
+    corr = (1.0 + 2.0 * Te_eV / Tm) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + Te_eV / Tm)))
+    PBrems = jax.lax.cond(
+        jnp.asarray(use_relativistic_correction),
+        lambda val: val * corr,
+        lambda val: val,
+        PBrems,
+    )
     return PBrems, Zeff
 
 
