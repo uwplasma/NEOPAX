@@ -22,7 +22,6 @@ from ._ambipolarity import (
 )
 from ._database import Monoenergetic
 from ._database_ntss_preprocessed import (
-    NTSSPreprocessedFastMonoenergetic,
     NTSSPreprocessedMonoenergetic,
 )
 from ._database_preprocessed import (
@@ -30,7 +29,6 @@ from ._database_preprocessed import (
     PreprocessedMonoenergetic3DNTSSRadius,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
-    PreprocessedMonoenergetic3DNTSSRadiusNTSS1DGeneric,
 )
 from ._entropy_models import get_entropy_model
 from ._profiles import build_profiles
@@ -157,20 +155,16 @@ def _build_database(config: dict, geometry):
         interp_mode = str(
             config.get("neoclassical", {}).get("interpolation_mode", "generic")
         ).strip().lower()
-        if interp_mode == "preprocessed_ntss_fast":
-            return NTSSPreprocessedFastMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_ntss":
             return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
             return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_ntss_radial":
+        if interp_mode == "preprocessed_3d_radial":
             return PreprocessedMonoenergetic3DNTSSRadius.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_ntss_radial_ntss1d":
+        if interp_mode == "preprocessed_3d_radial_ntss1d":
             return PreprocessedMonoenergetic3DNTSSRadiusNTSS1D.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_ntss_radial_ntss1d_fixednu":
+        if interp_mode == "preprocessed_3d_ntss1d_fixed":
             return PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU.read_monkes(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_ntss_radial_ntss1d_generic":
-            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1DGeneric.read_monkes(geometry.a_b, neoclassical_file)
         return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
     return None
 

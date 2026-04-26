@@ -215,11 +215,5 @@ class PreprocessedMonoenergetic3DNTSSRadiusNTSS1D(PreprocessedMonoenergetic3DNTS
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(eq=False)
-class PreprocessedMonoenergetic3DNTSSRadiusNTSS1DGeneric(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D):
-    pass
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(eq=False)
 class PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D):
     pass

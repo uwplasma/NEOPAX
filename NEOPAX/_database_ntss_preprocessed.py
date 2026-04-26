@@ -298,9 +298,3 @@ class NTSSPreprocessedMonoenergetic:
         )
         file.close()
         return cls(**data)
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(eq=False)
-class NTSSPreprocessedFastMonoenergetic(NTSSPreprocessedMonoenergetic):
-    pass
