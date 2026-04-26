@@ -13,7 +13,12 @@ from ._source_models import (
     sum_source_components,
 )
 from ._transport_flux_models import build_face_transport_state, build_ntss_like_face_transport_state
-from ._state import DEFAULT_TRANSPORT_DENSITY_FLOOR, apply_transport_density_floor
+from ._state import (
+    DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    apply_transport_density_floor,
+    apply_transport_temperature_floor,
+)
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
@@ -272,6 +277,7 @@ def build_density_equation(
     particle_flux_reconstruction="closure_face_flux",
     particle_face_closure_mode="reconstructed",
     density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
 ):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
@@ -280,6 +286,7 @@ def build_density_equation(
         return _cell_centered_flux_faces(flux, face_reconstruction)
     def face_flux_builder(state):
         state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
         face_mode = str(particle_face_closure_mode).strip().lower()
         if face_mode in {"ntss_like", "ntss", "half_point"}:
             face_state = build_ntss_like_face_transport_state(
@@ -289,6 +296,7 @@ def build_density_equation(
                 bc_temperature=bc_temperature,
                 bc_er=bc_er,
                 density_floor=density_floor,
+                temperature_floor=temperature_floor,
             )
         else:
             face_state = build_face_transport_state(
@@ -299,6 +307,7 @@ def build_density_equation(
                 bc_er=bc_er,
                 reconstruction=reconstruction,
                 density_floor=density_floor,
+                temperature_floor=temperature_floor,
             )
         return flux_model.evaluate_face_fluxes(
             state,
@@ -630,6 +639,7 @@ def build_temperature_equation(
     heat_flux_reconstruction="tvd_mc",
     reconstruction="linear",
     density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
 ):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
@@ -638,6 +648,7 @@ def build_temperature_equation(
         return _cell_centered_flux_faces(flux, face_reconstruction)
     def face_flux_builder(state):
         state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
         face_state = build_face_transport_state(
             state,
             field,
@@ -646,6 +657,7 @@ def build_temperature_equation(
             bc_er=bc_er,
             reconstruction=reconstruction,
             density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         return flux_model.evaluate_face_fluxes(
             state,
@@ -960,6 +972,7 @@ def build_equation_system(
     convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
     heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
     density_floor = solver_cfg.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
+    temperature_floor = solver_cfg.get("temperature_floor", DEFAULT_TRANSPORT_TEMPERATURE_FLOOR)
 
     if any(eqn_flags["density"]):
         equations_to_evolve.append(build_density_equation(
@@ -974,6 +987,7 @@ def build_equation_system(
             particle_flux_reconstruction=density_flux_reconstruction,
             particle_face_closure_mode=density_particle_face_closure_mode,
             density_floor=density_floor,
+            temperature_floor=temperature_floor,
         ))
     if any(eqn_flags["temperature"]):
         equations_to_evolve.append(build_temperature_equation(
@@ -994,6 +1008,7 @@ def build_equation_system(
             convection_reconstruction=convection_reconstruction,
             heat_flux_reconstruction=heat_flux_reconstruction,
             density_floor=density_floor,
+            temperature_floor=temperature_floor,
         ))
     if eqn_flags["Er"]:
         equations_to_evolve.append(build_electric_field_equation(
@@ -1086,6 +1101,7 @@ class ComposedEquationSystem:
     species: object | None = None
     shared_flux_model: object | None = None
     density_floor: object = DEFAULT_TRANSPORT_DENSITY_FLOOR
+    temperature_floor: object = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
     temperature_active_mask: object | None = None
     fixed_temperature_profile: object | None = None
 
@@ -1103,6 +1119,11 @@ class ComposedEquationSystem:
             working_state,
             self.temperature_active_mask,
             self.fixed_temperature_profile,
+        )
+        working_state = apply_transport_temperature_floor(
+            working_state,
+            self.temperature_floor,
+            self.density_floor,
         )
         return working_state, eidx
 

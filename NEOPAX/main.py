@@ -482,6 +482,16 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         ),
         dtype=bool,
     )
+    fixed_temperature_profile = state.temperature
+    try:
+        configured_profiles = build_profiles(
+            config.get("profiles", {}),
+            runtime.geometry,
+            getattr(runtime.species, "number_species", state.temperature.shape[0]),
+        )
+        fixed_temperature_profile = configured_profiles.temperature / 1.0e3
+    except Exception:
+        fixed_temperature_profile = state.temperature
     equation_system = ComposedEquationSystem(
         tuple(equations_to_evolve),
         density_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None),
@@ -490,8 +500,9 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         species=runtime.species,
         shared_flux_model=shared_flux_model,
         density_floor=solver_cfg.get("density_floor", 1.0e-6),
+        temperature_floor=solver_cfg.get("temperature_floor"),
         temperature_active_mask=temperature_active_mask,
-        fixed_temperature_profile=state.temperature,
+        fixed_temperature_profile=fixed_temperature_profile,
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -1435,7 +1446,7 @@ def plot_transport_solution(
                 flux_qi_ano = _interp_dataset("FluxQiAno")
                 flux_qd_ano = _interp_dataset("FluxQDAno")
                 flux_qt_ano = _interp_dataset("FluxQTAno")
-                flux_ge_neo = _interp_first("FluxeNeo", "FluxGeNeo")
+                flux_ge_neo = _interp_first("FluxNeo", "FluxeNeo", "FluxGeNeo")
                 flux_gi_neo = _interp_first("FluxiNeo", "FluxGiNeo")
                 flux_gd_neo = _interp_first("FluxDNeo", "FluxGDNeo")
                 flux_gt_neo = _interp_first("FluxTNeo", "FluxGTNeo")
@@ -1466,6 +1477,8 @@ def plot_transport_solution(
                         profiles["scalar"]["Gamma_neo_ion_sum"] = flux_gi_neo * vr
                     elif flux_gd_neo is not None and flux_gt_neo is not None:
                         profiles["scalar"]["Gamma_neo_ion_sum"] = (flux_gd_neo + flux_gt_neo) * vr
+                    elif flux_ge_neo is not None:
+                        profiles["scalar"]["Gamma_neo_ion_sum"] = flux_ge_neo * vr
                     if flux_ge_ano is not None:
                         profiles["flux_species"]["Gamma_turb"]["e"] = flux_ge_ano * vr
                     if flux_gd_ano is not None:
@@ -1476,6 +1489,8 @@ def plot_transport_solution(
                         profiles["scalar"]["Gamma_turb_ion_sum"] = flux_gi_ano * vr
                     elif flux_gd_ano is not None and flux_gt_ano is not None:
                         profiles["scalar"]["Gamma_turb_ion_sum"] = (flux_gd_ano + flux_gt_ano) * vr
+                    elif flux_ge_ano is not None:
+                        profiles["scalar"]["Gamma_turb_ion_sum"] = flux_ge_ano * vr
                     if flux_qe is not None and flux_qi is not None:
                         profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
                         profiles["flux_species"]["Q_total"]["e"] = flux_qe * vr
@@ -1553,16 +1568,38 @@ def plot_transport_solution(
                 linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
                 ax.plot(rho, values[species_idx], color=color, linestyle=linestyle, linewidth=1.8)
         reference_kind = None
+        flux_reference_key = None
         out_name_lower = out_name.lower()
         if "density" in out_name_lower:
             reference_kind = "density"
         elif "temperature" in out_name_lower:
             reference_kind = "temperature"
+        elif "transport_flux_q_total" in out_name_lower:
+            flux_reference_key = "Q_total"
+        elif "transport_flux_q_neo" in out_name_lower:
+            flux_reference_key = "Q_neo"
+        elif "transport_flux_q_turb" in out_name_lower:
+            flux_reference_key = "Q_turb"
+        elif "transport_flux_gamma_neo" in out_name_lower:
+            flux_reference_key = "Gamma_neo"
+        elif "transport_flux_gamma_turb" in out_name_lower:
+            flux_reference_key = "Gamma_turb"
         if reference_kind is not None and ntss_reference:
             reference_profiles = ntss_reference.get(reference_kind, {})
             for species_idx in range(species_count):
                 species_name = _species_label(species_idx)
                 ref_values = reference_profiles.get(species_name)
+                if ref_values is not None:
+                    linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                    ax.plot(rho, ref_values, color="black", linestyle=linestyle, linewidth=2.2, alpha=0.9)
+        elif flux_reference_key is not None and ntss_reference:
+            reference_profiles = ntss_reference.get("flux_species", {}).get(flux_reference_key, {})
+            for species_idx in range(species_count):
+                species_name = _species_label(species_idx)
+                ref_values = reference_profiles.get(species_name)
+                if species_name in {"D", "T"} and ref_values is None and flux_reference_key in {"Gamma_neo", "Gamma_turb"}:
+                    scalar_key = f"{flux_reference_key}_ion_sum"
+                    ref_values = ntss_reference.get("scalar", {}).get(scalar_key)
                 if ref_values is not None:
                     linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
                     ax.plot(rho, ref_values, color="black", linestyle=linestyle, linewidth=2.2, alpha=0.9)
@@ -1579,10 +1616,24 @@ def plot_transport_solution(
             species_handles.append(
                 Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
             )
-        if reference_kind is not None and any(
-            ntss_reference.get(reference_kind, {}).get(_species_label(species_idx)) is not None
-            for species_idx in range(species_count)
-        ):
+        has_reference = False
+        if reference_kind is not None:
+            has_reference = any(
+                ntss_reference.get(reference_kind, {}).get(_species_label(species_idx)) is not None
+                for species_idx in range(species_count)
+            )
+        elif flux_reference_key is not None:
+            reference_profiles = ntss_reference.get("flux_species", {}).get(flux_reference_key, {})
+            has_reference = any(
+                reference_profiles.get(_species_label(species_idx)) is not None
+                or (
+                    _species_label(species_idx) in {"D", "T"}
+                    and flux_reference_key in {"Gamma_neo", "Gamma_turb"}
+                    and ntss_reference.get("scalar", {}).get(f"{flux_reference_key}_ion_sum") is not None
+                )
+                for species_idx in range(species_count)
+            )
+        if has_reference:
             species_handles.append(
                 Line2D([0], [0], color="black", linestyle="-", linewidth=2.2, label="NTSS reference")
             )
@@ -1635,10 +1686,14 @@ def plot_transport_solution(
                     ref_label = "NTSS ion reference"
             elif "transport_flux_gamma_neo" in out_stem.lower():
                 ref_values = ntss_reference.get("flux_species", {}).get("Gamma_neo", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is None:
+                    ref_values = ntss_reference.get("scalar", {}).get("Gamma_neo_ion_sum")
                 if species_name in {"D", "T"} and ref_values is not None:
                     ref_label = "NTSS ion reference"
             elif "transport_flux_gamma_turb" in out_stem.lower():
                 ref_values = ntss_reference.get("flux_species", {}).get("Gamma_turb", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is None:
+                    ref_values = ntss_reference.get("scalar", {}).get("Gamma_turb_ion_sum")
                 if species_name in {"D", "T"} and ref_values is not None:
                     ref_label = "NTSS ion reference"
             if ref_values is not None:

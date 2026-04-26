@@ -26,10 +26,13 @@ from ._neoclassical import (
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._state import (
     DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
     TransportState,
     apply_transport_density_floor,
+    apply_transport_temperature_floor,
     get_v_thermal,
     safe_density,
+    safe_temperature,
 )
 from ._source_models import assemble_pressure_source_components, sum_source_components
 
@@ -279,8 +282,10 @@ def build_face_transport_state(
     bc_er: Any = None,
     reconstruction: str = "linear",
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
 ) -> FaceTransportState:
     state = apply_transport_density_floor(state, density_floor)
+    state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
     density_faces = _face_profile(
         state.density,
         geometry.r_grid_half,
@@ -294,6 +299,7 @@ def build_face_transport_state(
         bc_model=bc_temperature,
         reconstruction=reconstruction,
     )
+    temperature_faces = safe_temperature(temperature_faces, temperature_floor)
     pressure_faces = density_faces * temperature_faces
     er_faces = _face_profile(
         state.Er,
@@ -359,8 +365,10 @@ def build_ntss_like_face_transport_state(
     bc_temperature: Any = None,
     bc_er: Any = None,
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
 ) -> FaceTransportState:
     state = apply_transport_density_floor(state, density_floor)
+    state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
     density_faces = _ntss_like_face_profile(
         state.density,
         geometry.r_grid_half,
@@ -372,6 +380,7 @@ def build_ntss_like_face_transport_state(
         geometry.r_grid_half,
         bc_model=bc_temperature,
     )
+    temperature_faces = safe_temperature(temperature_faces, temperature_floor)
     pressure_faces = density_faces * temperature_faces
     er_faces = _ntss_like_face_profile(
         state.Er,

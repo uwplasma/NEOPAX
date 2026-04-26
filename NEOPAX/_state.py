@@ -9,6 +9,7 @@ from ._constants import Boltzmann
 JOULE_PER_EV = 11606 * Boltzmann
 JOULE_PER_KEV = 1.0e3 * JOULE_PER_EV
 DEFAULT_TRANSPORT_DENSITY_FLOOR = 1.0e-6
+DEFAULT_TRANSPORT_TEMPERATURE_FLOOR = None
 
 
 def _broadcast_species_floor(reference: Array, floor) -> Array:
@@ -24,11 +25,33 @@ def safe_density(density: Array, floor=DEFAULT_TRANSPORT_DENSITY_FLOOR) -> Array
     return jnp.maximum(density, _broadcast_species_floor(density, floor))
 
 
+def safe_temperature(temperature: Array, floor) -> Array:
+    if floor is None:
+        return temperature
+    return jnp.maximum(temperature, _broadcast_species_floor(temperature, floor))
+
+
 def apply_transport_density_floor(state, density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR):
     density = getattr(state, "density", None)
     if density is None:
         return state
     return dataclasses.replace(state, density=safe_density(density, density_floor))
+
+
+def apply_transport_temperature_floor(
+    state,
+    temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+):
+    if temperature_floor is None:
+        return state
+    density = getattr(state, "density", None)
+    pressure = getattr(state, "pressure", None)
+    if density is None or pressure is None:
+        return state
+    safe_n = safe_density(density, density_floor)
+    safe_t = safe_temperature(pressure / safe_n, temperature_floor)
+    return dataclasses.replace(state, pressure=safe_n * safe_t)
 
 
 @jax.jit
