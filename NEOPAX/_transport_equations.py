@@ -186,6 +186,7 @@ class DensityEquation(EquationBase):
     active_species_mask: jax.Array = dataclasses.field(repr=False)
     independent_density_mask: jax.Array = dataclasses.field(repr=False)
     face_flux_builder: callable = dataclasses.field(repr=False, default=None)
+    density_bc_model: object = dataclasses.field(repr=False, default=None)
     particle_flux_reconstruction: str = "closure_face_flux"
     particle_face_closure_mode: str = "reconstructed"
     source_model: callable = dataclasses.field(repr=False, default=None)
@@ -198,6 +199,22 @@ class DensityEquation(EquationBase):
 
     def _use_model_face_particle_fluxes(self):
         return self._mode_requests_face_fluxes(self.particle_flux_reconstruction)
+
+    def enforce_dirichlet_boundary_rhs(self, state, density_rhs):
+        bc = self.density_bc_model
+        if bc is None:
+            return density_rhs
+
+        out = density_rhs
+        left_type = str(getattr(bc, "left_type", "")).strip().lower()
+        if left_type == "dirichlet":
+            out = out.at[:, 0].set(jnp.zeros_like(out[:, 0]))
+
+        right_type = str(getattr(bc, "right_type", "")).strip().lower()
+        if right_type == "dirichlet":
+            out = out.at[:, -1].set(jnp.zeros_like(out[:, -1]))
+
+        return out
 
     def debug_components(self, state, fluxes=None):
         if fluxes is None:
@@ -334,6 +351,7 @@ def build_density_equation(
         active_species_mask=active_species_mask,
         independent_density_mask=independent_density_mask,
         face_flux_builder=face_flux_builder,
+        density_bc_model=bc_density,
         particle_flux_reconstruction=str(particle_flux_reconstruction),
         particle_face_closure_mode=str(particle_face_closure_mode),
         species=species,
@@ -1178,6 +1196,9 @@ class ComposedEquationSystem:
         # but their transport RHS row is not evolved independently.
         if eidx is not None:
             density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+
+        if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+            density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
 
         if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
             pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
