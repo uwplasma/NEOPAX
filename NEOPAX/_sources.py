@@ -104,6 +104,9 @@ def bremsstrahlung_radiation_generalized(
     else:
         # fallback: e=1, D=1, T=1, He=2
         Z = jnp.array([1.0, 1.0, 1.0, 2.0])[:n_species]
+    Z = jnp.asarray(Z, dtype=ne.dtype)
+    if Z.ndim == 1:
+        Z = Z[:, None]
     n = state.density
     # Zeff: sum_s n_s Z_s^2 / n_e
     n_main = n[jnp.array(main_ion_indices)]
