@@ -1796,6 +1796,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        predictor_mode = getattr(self, "predictor_mode", "linearized")
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
         safety_factor = jnp.asarray(self.safety_factor, dtype=dtype)
         min_step_factor = jnp.asarray(self.min_step_factor, dtype=dtype)
