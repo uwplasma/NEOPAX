@@ -18,6 +18,7 @@ from ._state import (
     DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
     apply_transport_density_floor,
     apply_transport_temperature_floor,
+    safe_density,
 )
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20

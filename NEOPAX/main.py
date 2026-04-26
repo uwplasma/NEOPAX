@@ -251,6 +251,13 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
             f"[NEOPAX] finished Er initialization: mode={init_mode} "
             f"elapsed_s={dt:.3f} finite_roots={n_finite}/{best_roots.shape[0]}"
         )
+        finite_roots = best_roots[jnp.isfinite(best_roots)]
+        if finite_roots.size > 0:
+            print(
+                "[NEOPAX] ambipolar best_roots summary:",
+                f"min={float(jnp.min(finite_roots)):.6e}",
+                f"max={float(jnp.max(finite_roots)):.6e}",
+            )
     return dataclasses.replace(state, Er=er_init)
 
 
