@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import config
+from ._interpolators_ntss_preprocessed import _inpold_fixed
 
 # to use higher precision
 config.update("jax_enable_x64", True)
@@ -191,6 +192,30 @@ def _inpold_fixed12_er(x, xs, ys, gmix):
 
 
 def _surface_ntss1d(table, ir, inu, ty, grid_er_internal, database):
+    xs = database.Er_grid_ntss1d[ir]
+    n = database.er_count_ntss1d
+    first = xs[0]
+    last = xs[n - 1]
+
+    def interp_row(row):
+        ys = table[ir, row]
+        ys_padded = jnp.pad(ys, (0, xs.shape[0] - ys.shape[0]), constant_values=0.0)
+        return jnp.where(
+            grid_er_internal <= first,
+            ys_padded[0],
+            jnp.where(
+                grid_er_internal > last,
+                ys_padded[n - 1],
+                _inpold_fixed(grid_er_internal, xs, ys_padded, n, 0, 0.0, 1, 0.0, database.gmix_er_ntss1d),
+            ),
+        )
+
+    v0 = interp_row(inu)
+    v1 = interp_row(inu + 1)
+    return v0 * (1.0 - ty) + v1 * ty
+
+
+def _surface_ntss1d_fixed_er(table, ir, inu, ty, grid_er_internal, database):
     xs = database.Er_grid[ir]
     first = xs[0]
     last = xs[11]
@@ -547,9 +572,9 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu(grid_x, grid_nu, grid_Er,
     stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
 
     def eval_surface(ir):
-        d11 = _surface_ntss1d(database.D11_log, ir, inu, ty, grid_er_internal, database)
-        d13 = _surface_ntss1d(database.D13, ir, inu, ty, grid_er_internal, database)
-        d33 = _surface_ntss1d(database.D33, ir, inu, ty, grid_er_internal, database)
+        d11 = _surface_ntss1d_fixed_er(database.D11_log, ir, inu, ty, grid_er_internal, database)
+        d13 = _surface_ntss1d_fixed_er(database.D13, ir, inu, ty, grid_er_internal, database)
+        d33 = _surface_ntss1d_fixed_er(database.D33, ir, inu, ty, grid_er_internal, database)
         return jnp.asarray([d11, d13, d33])
 
     atc = jax.vmap(eval_surface)(stencil_idx)
@@ -630,4 +655,3 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu(grid_x, grid_nu, grid_Er,
             lambda: jax.lax.cond((xri >= arr[nr - 2]) | (noi == 3), edge3, interior4),
         ),
     )
-
