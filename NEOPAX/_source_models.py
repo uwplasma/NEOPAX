@@ -120,7 +120,7 @@ class PowerExchangeSource(SourceModelBase):
         mode = str(self.mode).strip().lower()
         if mode in {"all", "full", "multispecies"}:
             pair_active_mask = jnp.ones(idx_i.shape, dtype=bool)
-        elif mode in {"active_temperature_only", "active_only", "evolving_only", "ntss_like"}:
+        elif mode in {"exclude_frozen", "active_temperature_only", "active_only", "evolving_only", "ntss_like"}:
             if self.temperature_active_mask is None:
                 pair_active_mask = jnp.ones(idx_i.shape, dtype=bool)
             else:
@@ -129,7 +129,8 @@ class PowerExchangeSource(SourceModelBase):
         else:
             raise ValueError(
                 f"Unknown power_exchange mode '{self.mode}'. "
-                "Use 'all' or 'active_temperature_only' (alias: 'ntss_like')."
+                "Use 'all' or 'exclude_frozen' "
+                "(aliases: 'active_temperature_only', 'active_only', 'evolving_only', 'ntss_like')."
             )
         return {"power_exchange": power_exchange(state, species=active_species, pair_active_mask=pair_active_mask)}
 
