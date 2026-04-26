@@ -954,7 +954,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 n_times=plot_n_times,
                 reference_er_file=transport_cfg.get("transport_reference_er_file"),
                 overlay_reference_er=bool(transport_cfg.get("transport_overlay_reference_er", False)),
-                reference_profile_file=transport_cfg.get("transport_reference_profile_file", "./examples/inputs/NTSS_Test_init.h5"),
+                reference_profile_file=transport_cfg.get("transport_reference_profile_file"),
                 source_models=runtime.models.source,
                 species=runtime.species,
                 flux_model=runtime.models.flux,
@@ -1442,7 +1442,8 @@ def plot_transport_solution(
             print(f"Could not load NTSS benchmark profiles: {exc}")
             return {}
 
-    ntss_reference = _load_ntss_reference_profiles(reference_profile_file)
+    reference_dataset_file = reference_profile_file if reference_profile_file is not None else reference_er_file
+    ntss_reference = _load_ntss_reference_profiles(reference_dataset_file)
 
     def _species_label(species_idx):
         if species_idx < len(species_names):
@@ -1875,24 +1876,20 @@ def plot_transport_solution(
                 import h5py
                 import interpax
 
-                if reference_er_file is None:
-                    candidate = output_dir / "../inputs/NTSS_Initial_Er_Opt.h5"
-                else:
-                    candidate = Path(reference_er_file)
-                    if not candidate.is_absolute():
-                        candidate = (Path.cwd() / candidate).resolve()
-                if candidate.is_file():
+                candidate = _resolve_reference_path(
+                    reference_er_file if reference_er_file is not None else reference_profile_file
+                )
+                if candidate is not None:
                     with h5py.File(candidate, "r") as f:
-                        r_data = f["r"][()]
-                        er_data = f["Er"][()]
-                    if len(er_data) != len(rho):
-                        r_data = jnp.asarray(r_data)
-                        rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
-                        er_ref = interpax.interp1d(rho_ref, er_data, rho)
-                    else:
-                        er_ref = er_data
-                if er_ref is None:
-                    er_ref = ntss_reference.get("Er")
+                        if "r" in f and "Er" in f:
+                            r_data = f["r"][()]
+                            er_data = f["Er"][()]
+                            if len(er_data) != len(rho):
+                                r_data = jnp.asarray(r_data)
+                                rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
+                                er_ref = interpax.interp1d(rho_ref, er_data, rho)
+                            else:
+                                er_ref = er_data
                 if er_ref is not None:
                     ax.plot(rho, er_ref, color="black", linewidth=2.2, linestyle="--", label=f"reference Er")
             except Exception as e:
