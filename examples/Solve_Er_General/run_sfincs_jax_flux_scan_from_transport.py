@@ -550,6 +550,8 @@ def _run_tasks_in_parallel(
 ) -> None:
     max_parallel = max(1, int(args.max_parallel))
     script_path = Path(__file__).resolve()
+    total = len(task_payloads)
+    completed = 0
 
     def _submit(executor: ThreadPoolExecutor, payload_path: Path, slot: int):
         gpu_id = None
@@ -592,6 +594,17 @@ def _run_tasks_in_parallel(
                     if stderr.strip():
                         msg.append("stderr:\n" + stderr.strip())
                     raise RuntimeError("\n".join(msg))
+                completed += 1
+                rho_value = None
+                if payload_path is not None:
+                    try:
+                        payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+                        rho_value = float(payload.get("rho"))
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        rho_value = None
+                rho_note = f" rho={rho_value:.4f}" if rho_value is not None else ""
+                gpu_note = f" gpu={gpu_id}" if gpu_id is not None else ""
+                print(f"[sfincs-scan] completed {completed}/{total}:{rho_note}{gpu_note}")
 
 
 def cmd_main(args: argparse.Namespace) -> int:
@@ -674,6 +687,20 @@ def cmd_main(args: argparse.Namespace) -> int:
     gpu_ids = [token.strip() for token in str(args.gpu_ids).split(",") if token.strip()]
     if backend == "gpu" and not gpu_ids:
         gpu_ids = ["0"]
+
+    rho_min_val = float(np.min(snapshot.rho[radius_indices]))
+    rho_max_val = float(np.max(snapshot.rho[radius_indices]))
+    backend_note = f"backend={backend}"
+    parallel_note = f"max_parallel={int(args.max_parallel)}"
+    if backend == "gpu":
+        placement_note = f"gpu_ids={','.join(gpu_ids)}"
+    else:
+        placement_note = f"cores_per_run={int(args.cores_per_run)}"
+    print(
+        "[sfincs-scan] "
+        f"selected {len(radius_indices)} radii over rho in [{rho_min_val:.4f}, {rho_max_val:.4f}] "
+        f"({backend_note}, {parallel_note}, {placement_note})"
+    )
 
     _run_tasks_in_parallel(
         task_payloads=task_payloads,
