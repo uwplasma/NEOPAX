@@ -1466,6 +1466,7 @@ class _ThetaSolverConfig(TransportSolver):
     dt: float
     min_step: float = 1.0e-14
     theta_implicit: float = 1.0
+    predictor_mode: str = "linearized"
     use_predictor_corrector: bool = False
     n_corrector_steps: int = 1
     tol: float = 1.0e-8
@@ -1479,6 +1480,7 @@ class _ThetaSolverConfig(TransportSolver):
         dt: float = 1.0e-2,
         min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
+        predictor_mode: str = "linearized",
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
@@ -1491,6 +1493,13 @@ class _ThetaSolverConfig(TransportSolver):
         object.__setattr__(self, "dt", float(dt))
         object.__setattr__(self, "min_step", float(min_step))
         object.__setattr__(self, "theta_implicit", float(theta_implicit))
+        predictor_mode_norm = str(predictor_mode).strip().lower()
+        if predictor_mode_norm not in {"linearized", "euler"}:
+            raise ValueError(
+                f"Unsupported theta predictor_mode '{predictor_mode}'. "
+                "Expected 'linearized' or 'euler'."
+            )
+        object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         object.__setattr__(self, "use_predictor_corrector", bool(use_predictor_corrector))
         object.__setattr__(self, "n_corrector_steps", int(max(0, n_corrector_steps)))
         object.__setattr__(self, "tol", float(tol))
@@ -1518,6 +1527,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         dt: float = 1.0e-2,
         min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
+        predictor_mode: str = "linearized",
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
@@ -1538,6 +1548,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             dt=dt,
             min_step=min_step,
             theta_implicit=theta_implicit,
+            predictor_mode=predictor_mode,
             use_predictor_corrector=use_predictor_corrector,
             n_corrector_steps=n_corrector_steps,
             tol=tol,
@@ -1610,6 +1621,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        predictor_mode = getattr(self, "predictor_mode", "linearized")
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
 
         def _single_theta_step(flat_y, t_value, h_value):
@@ -1617,19 +1629,32 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             t_new = t_value + h_value
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
 
+            if predictor_mode == "euler":
+                y_new = guess0
+                linear_ok = jnp.asarray(True)
+                f_new = flat_rhs(t_new, y_new)
+                residual = y_new - flat_y - h_value * (
+                    (jnp.asarray(1.0, dtype=dtype) - theta) * f_old + theta * f_new
+                )
+                residual_norm = jnp.linalg.norm(residual)
+                converged = residual_norm <= self.tol
+                return y_new, converged
+
+            jacobian_guess0 = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0)
+            system0 = identity_n - h_value * theta * jacobian_guess0
+            lu0, piv0 = jax.scipy.linalg.lu_factor(system0)
+            linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
+
             def _corrector_body(_, carry):
                 guess, linear_ok = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
                 f_guess = flat_rhs(t_new, guess_proj)
-                jacobian_guess = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess_proj)
-                system = identity_n - h_value * theta * jacobian_guess
                 affine_rhs = flat_y + h_value * (
                     (jnp.asarray(1.0, dtype=dtype) - theta) * f_old
-                    + theta * (f_guess - jacobian_guess @ guess_proj)
+                    + theta * (f_guess - jacobian_guess0 @ guess_proj)
                 )
-                lu, piv = jax.scipy.linalg.lu_factor(system)
-                next_guess = jax.scipy.linalg.lu_solve((lu, piv), affine_rhs)
-                finite = jnp.logical_and(jnp.all(jnp.isfinite(next_guess)), jnp.all(jnp.isfinite(system)))
+                next_guess = jax.scipy.linalg.lu_solve((lu0, piv0), affine_rhs)
+                finite = jnp.logical_and(jnp.all(jnp.isfinite(next_guess)), linearization_finite)
                 next_guess = jnp.where(finite, next_guess, guess_proj)
                 next_guess = _project_flat_state_if_needed(next_guess, project_flat)
                 return next_guess, jnp.logical_and(linear_ok, finite)
@@ -1785,19 +1810,24 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             t_new = t_value + h_value
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
 
+            if predictor_mode == "euler":
+                return guess0, jnp.asarray(True)
+
+            jacobian_guess0 = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0)
+            system0 = identity_n - h_value * theta * jacobian_guess0
+            lu0, piv0 = jax.scipy.linalg.lu_factor(system0)
+            linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
+
             def _corrector_body(_, carry):
                 guess, linear_ok = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
                 f_guess = flat_rhs(t_new, guess_proj)
-                jacobian_guess = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess_proj)
-                system = identity_n - h_value * theta * jacobian_guess
                 affine_rhs = flat_y + h_value * (
                     (one - theta) * f_old
-                    + theta * (f_guess - jacobian_guess @ guess_proj)
+                    + theta * (f_guess - jacobian_guess0 @ guess_proj)
                 )
-                lu, piv = jax.scipy.linalg.lu_factor(system)
-                next_guess = jax.scipy.linalg.lu_solve((lu, piv), affine_rhs)
-                finite = jnp.logical_and(jnp.all(jnp.isfinite(next_guess)), jnp.all(jnp.isfinite(system)))
+                next_guess = jax.scipy.linalg.lu_solve((lu0, piv0), affine_rhs)
+                finite = jnp.logical_and(jnp.all(jnp.isfinite(next_guess)), linearization_finite)
                 next_guess = jnp.where(finite, next_guess, guess_proj)
                 next_guess = _project_flat_state_if_needed(next_guess, project_flat)
                 return next_guess, jnp.logical_and(linear_ok, finite)
@@ -2010,6 +2040,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             dt=dt,
             min_step=float(solver_parameters.get("min_step", 1.0e-14)),
             theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
+            predictor_mode=str(solver_parameters.get("theta_predictor_mode", "linearized")),
             use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
             n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
             tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),
@@ -2023,6 +2054,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             dt=dt,
             min_step=float(solver_parameters.get("min_step", 1.0e-14)),
             theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
+            predictor_mode=str(solver_parameters.get("theta_predictor_mode", "linearized")),
             use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
             n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
             tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),

@@ -770,6 +770,93 @@ Implementation ordering recommendation:
 3. wire it into theta before Radau
 4. only then add the lagged-response Radau mode and benchmark whether it preserves enough of Radau's transient advantages to justify its complexity
 
+### Theta Solver Upgrade Notes
+- Status: planned
+- Scope:
+  - capture near-term robustness and adaptive-timestep improvements for the current `theta_newton` path, distinct from the larger shared transport-response refactor above
+
+Current baseline:
+- `theta_newton` now has:
+  - Newton line search
+  - timestep retry / backtracking on failed Newton convergence
+  - accepted-step timestep adaptation based on nonlinear iteration count
+- this is meaningfully more robust than the earlier fixed-step-like behavior, but still not as mature as TORAX's overall theta/Newton ecosystem
+
+Candidate upgrades:
+- split line-search reduction from timestep-backtracking reduction
+  - rationale:
+    - `theta_delta_reduction_factor` is currently doing two jobs:
+      - shrinking the Newton step during line search
+      - shrinking the outer timestep during backtracking
+    - this should become two distinct controls
+  - TORAX similarity:
+    - similar in spirit to TORAX
+    - TORAX conceptually distinguishes `delta x` line search from `dt` backtracking
+
+- use a better accepted-step adaptation metric than nonlinear iteration count alone
+  - possible signals:
+    - final residual norm
+    - ratio of final to initial residual
+    - total line-search severity
+    - whether any retry/backtracking happened before acceptance
+  - rationale:
+    - current controller is practical, but still heuristic and relatively blind
+  - TORAX similarity:
+    - partly similar
+    - TORAX clearly uses nonlinear-solve quality to decide whether a timestep attempt is acceptable
+    - but this exact accepted-step growth policy would be a NEOPAX-specific design choice
+
+- add hysteresis / short memory before re-growing `dt`
+  - rationale:
+    - reduce grow-fail-shrink oscillation
+    - only allow aggressive regrowth after several easy accepted steps
+  - TORAX similarity:
+    - not directly from TORAX docs
+    - mainly a NEOPAX-specific solver-controller refinement
+
+- add explicit unphysical-state rejection checks inside the theta Newton path
+  - examples:
+    - reject negative temperatures before projection
+    - reject obviously nonphysical pressure states
+    - optionally reject extreme `Er` excursions if needed
+  - rationale:
+    - make acceptance logic more explicit instead of relying only on floors/projection and residual behavior
+  - TORAX similarity:
+    - similar to TORAX
+    - TORAX docs explicitly mention rejecting Newton steps that produce unphysical states
+
+- add a transport-informed timestep cap / calculator for theta
+  - possible direction:
+    - optional `theta_timestep_mode = "fixed" | "nonlinear" | "chi_transport"`
+    - in `chi_transport`, cap or propose `dt` using a transport timescale estimate based on the maximum effective heat diffusivity
+  - rationale:
+    - move beyond pure failure-driven timestep adaptation
+    - better protect against fast transients in stiff transport regimes
+  - TORAX similarity:
+    - strongly similar to TORAX
+    - TORAX has a separate adaptive timestep method based on `chi_max`
+
+- add richer theta diagnostics
+  - suggested outputs:
+    - min/max accepted `dt`
+    - number of retries
+    - number of reduced-`dt` recoveries
+    - number of hard failures at `min_step`
+    - typical nonlinear iteration counts
+  - rationale:
+    - make controller tuning and solver assessment much easier
+  - TORAX similarity:
+    - not specifically TORAX-derived
+    - mainly NEOPAX-specific usability / debugging infrastructure
+
+Recommended near-term execution order:
+1. split line-search reduction from timestep-backtracking reduction
+2. add explicit unphysical-state rejection checks
+3. improve the accepted-step controller using residual-based quality metrics
+4. add hysteresis for `dt` regrowth
+5. add an optional transport-informed `dt` cap / calculator
+6. expand theta diagnostics after the controller shape stabilizes
+
 ### Phase 11: Neoclassical Interpolation Parity Against NTSS
 - Status: in progress
 - Goal:

@@ -11,6 +11,15 @@ sfincs_jax. It:
 5. collects particle flux, heat flux, and parallel-flow diagnostics,
 6. writes an HDF5 profile file with datasets ``r``, ``Gamma``, ``Q``, and
    ``Upar`` that can be read by NEOPAX's ``FluxesRFileTransportModel``.
+7. optionally writes PNG summary plots for ``Gamma``, ``Q``, and ``Upar``.
+
+Default sfincs_jax resolution overrides used by this bridge:
+- ``Ntheta = 25``
+- ``Nzeta = 51``
+- ``Nxi = 100``
+- ``NL = 3``
+- ``Nx = 5``
+- ``solverTolerance = 1e-6``
 
 Important note on normalization:
 The written ``Gamma`` and ``Q`` values are taken directly from sfincs_jax's
@@ -34,6 +43,21 @@ from typing import Any
 
 import h5py
 import numpy as np
+from scipy.constants import elementary_charge, proton_mass
+
+NEOPAX_DENSITY_REFERENCE_M3 = 1.0e20
+NEOPAX_TEMPERATURE_REFERENCE_EV = 1.0e3
+SFINCS_REFERENCE_R_M = 1.0
+SFINCS_REFERENCE_MASS_KG = proton_mass
+SFINCS_REFERENCE_T_J = NEOPAX_TEMPERATURE_REFERENCE_EV * elementary_charge
+SFINCS_REFERENCE_V_MS = float(np.sqrt(2.0 * SFINCS_REFERENCE_T_J / SFINCS_REFERENCE_MASS_KG))
+SFINCS_GAMMA_TO_NEOPAX = NEOPAX_DENSITY_REFERENCE_M3 * SFINCS_REFERENCE_V_MS / SFINCS_REFERENCE_R_M
+SFINCS_Q_TO_NEOPAX = (
+    NEOPAX_DENSITY_REFERENCE_M3
+    * SFINCS_REFERENCE_MASS_KG
+    * SFINCS_REFERENCE_V_MS**3
+    / SFINCS_REFERENCE_R_M
+)
 
 try:
     import tomllib
@@ -170,7 +194,11 @@ def _choose_radius_indices(
                 raise IndexError(f"rho index {idx} out of range [0, {rho.size - 1}]")
         return idxs
 
+    # By default, skip the magnetic axis point. A local sfincs_jax solve at
+    # rho=0 is usually not the most useful first-pass transport postprocessing
+    # target, and users can still include it explicitly via --rho-indices.
     mask = np.ones_like(rho, dtype=bool)
+    mask &= ~np.isclose(rho, 0.0)
     if rho_min is not None:
         mask &= rho >= float(rho_min)
     if rho_max is not None:
@@ -230,6 +258,23 @@ def _patch_group_value(*, text: str, group: str, key: str, value: Any) -> str:
     return text[: start.end()] + group_txt2 + text[end_pos:]
 
 
+def _drop_group_key(*, text: str, group: str, key: str) -> str:
+    import re
+
+    start = re.search(rf"(?im)^\s*&{re.escape(group)}\s*$", text)
+    if start is None:
+        raise ValueError(f"Missing namelist group &{group}")
+    end = re.search(r"(?m)^\s*/\s*$", text[start.end() :])
+    if end is None:
+        raise ValueError(f"Missing '/' terminator for &{group}")
+    end_pos = start.end() + end.start()
+    group_txt = text[start.end() : end_pos]
+
+    pat = re.compile(rf"(?im)^[ \t]*{re.escape(key)}[ \t]*=[^!\n\r]*(?:![^\n\r]*)?[\r]?\n?")
+    group_txt2 = pat.sub("", group_txt)
+    return text[: start.end()] + group_txt2 + text[end_pos:]
+
+
 def _prepare_input_text(
     *,
     template_text: str,
@@ -251,7 +296,9 @@ def _prepare_input_text(
     text = template_text
     text = _patch_group_value(text=text, group="general", key="RHSMode", value=1)
     text = _patch_group_value(text=text, group="geometryParameters", key="inputRadialCoordinate", value=3)
-    text = _patch_group_value(text=text, group="geometryParameters", key="inputRadialCoordinateForGradients", value=3)
+    # Let sfincs_jax infer gradient coordinates separately:
+    # species from dNHatdrNs/dTHatdrNs -> mode 3, Phi from Er -> mode 4.
+    text = _drop_group_key(text=text, group="geometryParameters", key="inputRadialCoordinateForGradients")
     text = _patch_group_value(text=text, group="geometryParameters", key="rN_wish", value=float(rho[radius_index]))
 
     text = _patch_group_value(
@@ -341,6 +388,13 @@ def _last_species_vector(arr: np.ndarray, n_species: int) -> np.ndarray:
     raise ValueError(f"Unsupported diagnostic shape {data.shape} for n_species={n_species}")
 
 
+def _last_scalar(arr: np.ndarray) -> float:
+    data = np.asarray(arr, dtype=np.float64)
+    if data.ndim == 0:
+        return float(data)
+    return float(np.ravel(data)[-1])
+
+
 def _extract_flux_triplet(results: dict[str, Any], n_species: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str]]:
     gamma_key = None
     q_key = None
@@ -355,13 +409,26 @@ def _extract_flux_triplet(results: dict[str, Any], n_species: int) -> tuple[np.n
     if gamma_key is None or q_key is None or "FSABFlow" not in results:
         raise KeyError("sfincs_jax output is missing required flux/flow diagnostics.")
 
-    gamma = _last_species_vector(np.asarray(results[gamma_key]), n_species)
-    q = _last_species_vector(np.asarray(results[q_key]), n_species)
-    upar = _last_species_vector(np.asarray(results["FSABFlow"]), n_species)
+    gamma_hat = _last_species_vector(np.asarray(results[gamma_key]), n_species)
+    q_hat = _last_species_vector(np.asarray(results[q_key]), n_species)
+    gamma = SFINCS_GAMMA_TO_NEOPAX * gamma_hat
+    q = SFINCS_Q_TO_NEOPAX * q_hat
+
+    fsab_flow = _last_species_vector(np.asarray(results["FSABFlow"]), n_species)
+    b0_over_bbar = _last_scalar(np.asarray(results.get("B0OverBBar", 1.0), dtype=np.float64))
+    # NTX fixed-field parallel-flow audit bridge:
+    # NEOPAX's physical Upar closure matches the SFINCS hat-normalized FSABFlow
+    # after restoring the historical factor 2 * B0OverBBar / sqrt(pi).
+    flow_bridge = 2.0 * float(b0_over_bbar) / float(np.sqrt(np.pi))
+    upar = flow_bridge * fsab_flow
     meta = {
         "Gamma_key": gamma_key,
         "Q_key": q_key,
         "Upar_key": "FSABFlow",
+        "Gamma_scale_to_neopax": f"{SFINCS_GAMMA_TO_NEOPAX:.16g}",
+        "Q_scale_to_neopax": f"{SFINCS_Q_TO_NEOPAX:.16g}",
+        "Upar_bridge": "2*B0OverBBar/sqrt(pi)",
+        "B0OverBBar": f"{b0_over_bbar:.16g}",
     }
     return gamma, q, upar, meta
 
@@ -422,6 +489,41 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
     with result_json.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     return 0
+
+
+def _write_summary_plots(
+    *,
+    output_dir: Path,
+    rho: np.ndarray,
+    gamma: np.ndarray,
+    q: np.ndarray,
+    upar: np.ndarray,
+    species: list[SpeciesMeta],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "Plotting was requested but matplotlib is not installed."
+        ) from exc
+
+    traces = (
+        ("Gamma", np.asarray(gamma, dtype=np.float64), output_dir / "Gamma_vs_rho.png"),
+        ("Q", np.asarray(q, dtype=np.float64), output_dir / "Q_vs_rho.png"),
+        ("Upar", np.asarray(upar, dtype=np.float64), output_dir / "Upar_vs_rho.png"),
+    )
+
+    for label, values, path in traces:
+        fig, ax = plt.subplots(figsize=(7.0, 4.5), constrained_layout=True)
+        for i, sp in enumerate(species):
+            ax.plot(rho, values[i], marker="o", linewidth=1.5, markersize=4.0, label=sp.name)
+        ax.set_xlabel("rho")
+        ax.set_ylabel(label)
+        ax.set_title(f"{label} from sfincs_jax radial scan")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
 
 
 def _launch_one_subprocess(
@@ -616,10 +718,25 @@ def cmd_main(args: argparse.Namespace) -> int:
         for key, value in raw_meta.items():
             if value is not None:
                 f.attrs[f"raw_{key}"] = str(value)
-        f.attrs["Upar_note"] = "Upar is currently aliased to sfincs_jax FSABFlow."
+        f.attrs["Upar_note"] = (
+            "Upar is derived from sfincs_jax FSABFlow using the NTX fixed-field "
+            "parallel-flow bridge factor 2*B0OverBBar/sqrt(pi)."
+        )
         f.attrs["normalization_note"] = (
-            "Gamma and Q are taken directly from sfincs_jax SFINCS-style diagnostics. "
-            "Exact normalization against native NEOPAX flux units should be verified."
+            "Gamma is converted from sfincs_jax particleFlux_vm_* using nbar*vbar/Rbar "
+            "with nbar=1e20 m^-3, Tbar=1 keV, mbar=mp, Rbar=1 m. "
+            "Q is converted from heatFlux_vm_* using nbar*mbar*vbar^3/Rbar with the same references. "
+            "Upar uses the NTX archive-backed observable bridge rather than a raw FSABFlow alias."
+        )
+
+    if bool(args.plot):
+        _write_summary_plots(
+            output_dir=output_dir,
+            rho=rho_arr,
+            gamma=gamma_arr,
+            q=q_arr,
+            upar=upar_arr,
+            species=species,
         )
 
     print(f"wrote {out_h5}")
@@ -627,7 +744,15 @@ def cmd_main(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=(
+            __doc__
+            + "\n\n"
+            + "Unless overridden on the command line, this script forces the following "
+            + "sfincs_jax resolution settings: "
+            + "Ntheta=25, Nzeta=51, Nxi=100, NL=3, Nx=5, solverTolerance=1e-6."
+        )
+    )
     p.add_argument("--neopax-config", required=False, default=None, help="Path to the NEOPAX transport TOML.")
     p.add_argument(
         "--neopax-result",
@@ -645,16 +770,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-phi1", dest="include_phi1", action="store_true", help="Force includePhi1 = true.")
     p.add_argument("--no-include-phi1", dest="include_phi1", action="store_false", help="Force includePhi1 = false.")
     p.set_defaults(include_phi1=None)
-    p.add_argument("--ntheta", type=int, default=None, help="Override Ntheta.")
-    p.add_argument("--nzeta", type=int, default=None, help="Override Nzeta.")
-    p.add_argument("--nxi", type=int, default=None, help="Override Nxi.")
-    p.add_argument("--nl", type=int, default=None, help="Override NL.")
-    p.add_argument("--nx", type=int, default=None, help="Override Nx.")
-    p.add_argument("--solver-tolerance", type=float, default=None, help="Override solverTolerance.")
+    p.add_argument("--ntheta", type=int, default=25, help="Override Ntheta. Default: 25.")
+    p.add_argument("--nzeta", type=int, default=51, help="Override Nzeta. Default: 51.")
+    p.add_argument("--nxi", type=int, default=100, help="Override Nxi. Default: 100.")
+    p.add_argument("--nl", type=int, default=3, help="Override NL. Default: 3.")
+    p.add_argument("--nx", type=int, default=5, help="Override Nx. Default: 5.")
+    p.add_argument("--solver-tolerance", type=float, default=1.0e-6, help="Override solverTolerance. Default: 1e-6.")
     p.add_argument("--backend", choices=("cpu", "gpu"), default="cpu", help="Parallel execution backend.")
     p.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids for backend=gpu.")
     p.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent sfincs_jax runs.")
     p.add_argument("--cores-per-run", type=int, default=1, help="CPU cores per run for backend=cpu.")
+    p.add_argument("--plot", action="store_true", help="Write PNG plots of Gamma, Q, and Upar versus rho.")
     p.add_argument("--verbose-workers", action="store_true", help="Allow verbose sfincs_jax worker logging.")
     p.add_argument("--worker-payload", default=None, help=argparse.SUPPRESS)
     return p
