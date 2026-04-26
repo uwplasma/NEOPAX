@@ -1256,6 +1256,7 @@ def plot_transport_solution(
 ):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
+    from ._transport_flux_models import build_face_transport_state
 
     EV_TO_J = 1.602176634e-19
     HEAT_FLUX_W_TO_MW = 1.0e-6
@@ -1276,6 +1277,16 @@ def plot_transport_solution(
         if heat_power_scale_face is not None and arr.shape[-1] == heat_power_scale_face.shape[0]:
             return arr * heat_power_scale_face
         return EV_TO_J * HEAT_FLUX_W_TO_MW * arr
+
+    def _face_to_center(arr):
+        arr = jnp.asarray(arr)
+        if rho is None or arr.ndim == 0:
+            return arr
+        if arr.shape[-1] == len(rho):
+            return arr
+        if arr.shape[-1] == len(rho) + 1:
+            return 0.5 * (arr[..., :-1] + arr[..., 1:])
+        return arr
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -1405,10 +1416,16 @@ def plot_transport_solution(
                 vr = _interp_dataset("Vr")
                 flux_qe = _interp_dataset("FluxQe")
                 flux_qi = _interp_dataset("FluxQI")
+                flux_qd = _interp_dataset("FluxQD")
+                flux_qt = _interp_dataset("FluxQT")
                 flux_qe_neo = _interp_dataset("FluxQeNeo")
                 flux_qi_neo = _interp_dataset("FluxQiNeo")
+                flux_qd_neo = _interp_dataset("FluxQDNeo")
+                flux_qt_neo = _interp_dataset("FluxQTNeo")
                 flux_qe_ano = _interp_dataset("FluxQeAno")
                 flux_qi_ano = _interp_dataset("FluxQiAno")
+                flux_qd_ano = _interp_dataset("FluxQDAno")
+                flux_qt_ano = _interp_dataset("FluxQTAno")
                 alpha_power = _interp_dataset("AlphaPower")
                 ecrh_power = _interp_dataset("ECRHPower")
                 nbi_power_e = _interp_dataset("NBIPower_e")
@@ -1417,18 +1434,39 @@ def plot_transport_solution(
                     if flux_qe is not None and flux_qi is not None:
                         profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
                         profiles["flux_species"]["Q_total"]["e"] = flux_qe * vr
-                        profiles["flux_species"]["Q_total"]["D"] = flux_qi * vr
-                        profiles["flux_species"]["Q_total"]["T"] = flux_qi * vr
+                        if flux_qd is not None:
+                            profiles["flux_species"]["Q_total"]["D"] = flux_qd * vr
+                        elif density_d is not None:
+                            profiles["flux_species"]["Q_total"]["D"] = flux_qi * vr
+                        if flux_qt is not None:
+                            profiles["flux_species"]["Q_total"]["T"] = flux_qt * vr
+                        elif "nT" in f or density_d is not None:
+                            profiles["flux_species"]["Q_total"]["T"] = flux_qi * vr
+                        profiles["scalar"]["Q_total_ion_sum"] = flux_qi * vr
                     if flux_qe_neo is not None and flux_qi_neo is not None:
                         profiles["scalar"]["Q_neo_sum"] = (flux_qe_neo + flux_qi_neo) * vr
                         profiles["flux_species"]["Q_neo"]["e"] = flux_qe_neo * vr
-                        profiles["flux_species"]["Q_neo"]["D"] = flux_qi_neo * vr
-                        profiles["flux_species"]["Q_neo"]["T"] = flux_qi_neo * vr
+                        if flux_qd_neo is not None:
+                            profiles["flux_species"]["Q_neo"]["D"] = flux_qd_neo * vr
+                        elif density_d is not None:
+                            profiles["flux_species"]["Q_neo"]["D"] = flux_qi_neo * vr
+                        if flux_qt_neo is not None:
+                            profiles["flux_species"]["Q_neo"]["T"] = flux_qt_neo * vr
+                        elif "nT" in f or density_d is not None:
+                            profiles["flux_species"]["Q_neo"]["T"] = flux_qi_neo * vr
+                        profiles["scalar"]["Q_neo_ion_sum"] = flux_qi_neo * vr
                     if flux_qe_ano is not None and flux_qi_ano is not None:
                         profiles["scalar"]["Q_turb_sum"] = (flux_qe_ano + flux_qi_ano) * vr
                         profiles["flux_species"]["Q_turb"]["e"] = flux_qe_ano * vr
-                        profiles["flux_species"]["Q_turb"]["D"] = flux_qi_ano * vr
-                        profiles["flux_species"]["Q_turb"]["T"] = flux_qi_ano * vr
+                        if flux_qd_ano is not None:
+                            profiles["flux_species"]["Q_turb"]["D"] = flux_qd_ano * vr
+                        elif density_d is not None:
+                            profiles["flux_species"]["Q_turb"]["D"] = flux_qi_ano * vr
+                        if flux_qt_ano is not None:
+                            profiles["flux_species"]["Q_turb"]["T"] = flux_qt_ano * vr
+                        elif "nT" in f or density_d is not None:
+                            profiles["flux_species"]["Q_turb"]["T"] = flux_qi_ano * vr
+                        profiles["scalar"]["Q_turb_ion_sum"] = flux_qi_ano * vr
                 if alpha_power is not None:
                     profiles["scalar"]["alpha_power"] = alpha_power
                 power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
@@ -1583,6 +1621,56 @@ def plot_transport_solution(
         plt.close(fig)
         return out_png
 
+    def _plot_pair_time_series(
+        series_left,
+        series_right,
+        ylabel,
+        out_name,
+        left_label,
+        right_label,
+        title=None,
+        reference_left_key=None,
+        reference_right_key=None,
+        reference_left_values=None,
+        reference_right_values=None,
+    ):
+        if not series_left and not series_right:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for time_idx, (time_label, values) in enumerate(series_left):
+            label = f"{left_label} t={time_label:.3g}" if time_label is not None else left_label
+            ax.plot(rho, values, linewidth=1.8, label=label)
+        for time_idx, (time_label, values) in enumerate(series_right):
+            label = f"{right_label} t={time_label:.3g}" if time_label is not None else right_label
+            ax.plot(rho, values, linewidth=1.8, linestyle="--", label=label)
+        if reference_left_values is not None:
+            ref_values = reference_left_values
+        elif reference_left_key is not None:
+            ref_values = ntss_reference.get("scalar", {}).get(reference_left_key)
+        else:
+            ref_values = None
+        if ref_values is not None:
+            ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="-", label=f"NTSS {left_label}")
+        if reference_right_values is not None:
+            ref_values = reference_right_values
+        elif reference_right_key is not None:
+            ref_values = ntss_reference.get("scalar", {}).get(reference_right_key)
+        else:
+            ref_values = None
+        if ref_values is not None:
+            ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle=":", label=f"NTSS {right_label}")
+        ax.set_xlabel("rho")
+        ax.set_ylabel(ylabel)
+        if title is not None:
+            ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend(title="Series")
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=170)
+        plt.close(fig)
+        return out_png
+
     def _plot_geometry_profile(x, values, xlabel, ylabel, out_name, title=None):
         if x is None or values is None:
             return None
@@ -1615,6 +1703,14 @@ def plot_transport_solution(
     total_heat_flux_series = []
     neo_heat_flux_series = []
     turb_heat_flux_series = []
+    neo_ion_heat_flux_series = []
+    turb_ion_heat_flux_series = []
+    neo_electron_heat_flux_series = []
+    turb_electron_heat_flux_series = []
+    neo_energy_like_e_series = []
+    neo_energy_like_i_series = []
+    turb_energy_like_e_series = []
+    turb_energy_like_i_series = []
     chi_t_series = []
     chi_n_series = []
     if source_models is not None and density_series and pressure_series and er_series and species is not None:
@@ -1719,9 +1815,44 @@ def plot_transport_solution(
                         scalar_sum = jnp.sum(value_arr, axis=0) if value_arr.ndim == 2 else value_arr
                         if key == "Q_neo":
                             neo_heat_flux_series.append((time_label, scalar_sum))
+                            if value_arr.ndim == 2 and species is not None and hasattr(species, "species_idx"):
+                                eidx = species.species_idx.get("e")
+                                if eidx is not None:
+                                    neo_electron_heat_flux_series.append((time_label, value_arr[int(eidx)]))
+                                    ion_sum = jnp.sum(value_arr, axis=0) - value_arr[int(eidx)]
+                                    neo_ion_heat_flux_series.append((time_label, ion_sum))
                         elif key == "Q_turb":
                             turb_heat_flux_series.append((time_label, scalar_sum))
+                            if value_arr.ndim == 2 and species is not None and hasattr(species, "species_idx"):
+                                eidx = species.species_idx.get("e")
+                                if eidx is not None:
+                                    turb_electron_heat_flux_series.append((time_label, value_arr[int(eidx)]))
+                                    ion_sum = jnp.sum(value_arr, axis=0) - value_arr[int(eidx)]
+                                    turb_ion_heat_flux_series.append((time_label, ion_sum))
                     flux_component_series[key].append((time_label, value_arr))
+
+            if flux_model is not None and geometry is not None and species is not None and hasattr(species, "species_idx"):
+                try:
+                    face_state = build_face_transport_state(snapshot_state, geometry)
+                    face_fluxes = flux_model.evaluate_face_fluxes(snapshot_state, face_state)
+                    eidx = species.species_idx.get("e")
+                    if eidx is not None and face_fluxes is not None:
+                        for flux_key, gamma_key, e_store, i_store in (
+                            ("Q_neo", "Gamma_neo", neo_energy_like_e_series, neo_energy_like_i_series),
+                            ("Q_turb", "Gamma_turb", turb_energy_like_e_series, turb_energy_like_i_series),
+                        ):
+                            q_face = face_fluxes.get(flux_key)
+                            g_face = face_fluxes.get(gamma_key)
+                            if q_face is None or g_face is None:
+                                continue
+                            q_face = jnp.asarray(q_face)
+                            g_face = jnp.asarray(g_face)
+                            energy_like = _convert_heat_flux_density_to_mw(q_face + g_face * face_state.temperature)
+                            energy_like = _face_to_center(energy_like)
+                            e_store.append((time_label, energy_like[int(eidx)]))
+                            i_store.append((time_label, jnp.sum(energy_like, axis=0) - energy_like[int(eidx)]))
+                except Exception:
+                    pass
 
             if turbulence_plot_model is not None and hasattr(turbulence_plot_model, "chi_t"):
                 chi_t_base = jnp.asarray(getattr(turbulence_plot_model, "chi_t"))
@@ -1792,6 +1923,48 @@ def plot_transport_solution(
         "transport_flux_Q_turb_sum.png",
         title="Summed Turbulent Heat Flux vs rho",
         reference_key="Q_turb_sum",
+    )
+
+    neo_ion_heat_flux_png = _plot_scalar_time_series(
+        neo_ion_heat_flux_series,
+        "Ion Neo Heat Flux [MW]",
+        "transport_flux_Q_neo_ion_sum.png",
+        title="Summed Ion Neo Heat Flux vs rho",
+        reference_key="Q_neo_ion_sum",
+        reference_label="NTSS ion reference",
+    )
+
+    turb_ion_heat_flux_png = _plot_scalar_time_series(
+        turb_ion_heat_flux_series,
+        "Ion Turbulent Heat Flux [MW]",
+        "transport_flux_Q_turb_ion_sum.png",
+        title="Summed Ion Turbulent Heat Flux vs rho",
+        reference_key="Q_turb_ion_sum",
+        reference_label="NTSS ion reference",
+    )
+
+    neo_q_plus_conv_png = _plot_pair_time_series(
+        neo_energy_like_e_series,
+        neo_energy_like_i_series,
+        "Neo Energy Flux Approx. [MW]",
+        "transport_flux_Q_neo_plus_conv_ei.png",
+        "e",
+        "ions",
+        title="Neo Q + Gamma*T vs rho",
+        reference_left_values=ntss_reference.get("flux_species", {}).get("Q_neo", {}).get("e"),
+        reference_right_key="Q_neo_ion_sum",
+    )
+
+    turb_q_plus_conv_png = _plot_pair_time_series(
+        turb_energy_like_e_series,
+        turb_energy_like_i_series,
+        "Turbulent Energy Flux Approx. [MW]",
+        "transport_flux_Q_turb_plus_conv_ei.png",
+        "e",
+        "ions",
+        title="Turbulent Q + Gamma*T vs rho",
+        reference_left_values=ntss_reference.get("flux_species", {}).get("Q_turb", {}).get("e"),
+        reference_right_key="Q_turb_ion_sum",
     )
 
     alpha_power_png = _plot_scalar_time_series(
