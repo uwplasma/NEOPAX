@@ -465,8 +465,17 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
         env["JAX_PLATFORMS"] = "cpu"
         env["JAX_PLATFORM_NAME"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
-        if int(args.cores_per_run) > 0:
-            env["SFINCS_JAX_CORES"] = str(int(args.cores_per_run))
+        cores = int(args.cores_per_run)
+        if cores > 0:
+            env["SFINCS_JAX_CORES"] = str(cores)
+        if cores > 1:
+            # Let sfincs_jax expose multiple host CPU devices and keep its
+            # built-in auto-sharding path enabled for larger RHSMode=1 solves.
+            env["SFINCS_JAX_CPU_DEVICES"] = str(cores)
+            env.pop("SFINCS_JAX_SHARD", None)
+            env.pop("SFINCS_JAX_AUTO_SHARD", None)
+            env.pop("SFINCS_JAX_MATVEC_SHARD_AXIS", None)
+        else:
             env["SFINCS_JAX_SHARD"] = "0"
             env["SFINCS_JAX_AUTO_SHARD"] = "0"
             env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = "off"
