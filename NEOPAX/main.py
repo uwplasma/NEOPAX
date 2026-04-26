@@ -1392,6 +1392,13 @@ def plot_transport_solution(
                         return jnp.asarray(values)
                     return jnp.asarray(np.interp(rho_dst, rho_src, values))
 
+                def _interp_first(*names):
+                    for name in names:
+                        values = _interp_dataset(name)
+                        if values is not None:
+                            return values
+                    return None
+
                 density_d = _interp_dataset("nD")
                 profiles = {
                     "Er": _interp_dataset("Er"),
@@ -1408,6 +1415,8 @@ def plot_transport_solution(
                     },
                     "scalar": {},
                     "flux_species": {
+                        "Gamma_neo": {},
+                        "Gamma_turb": {},
                         "Q_total": {},
                         "Q_neo": {},
                         "Q_turb": {},
@@ -1426,11 +1435,47 @@ def plot_transport_solution(
                 flux_qi_ano = _interp_dataset("FluxQiAno")
                 flux_qd_ano = _interp_dataset("FluxQDAno")
                 flux_qt_ano = _interp_dataset("FluxQTAno")
-                alpha_power = _interp_dataset("AlphaPower")
+                flux_ge_neo = _interp_first("FluxeNeo", "FluxGeNeo")
+                flux_gi_neo = _interp_first("FluxiNeo", "FluxGiNeo")
+                flux_gd_neo = _interp_first("FluxDNeo", "FluxGDNeo")
+                flux_gt_neo = _interp_first("FluxTNeo", "FluxGTNeo")
+                flux_ge_ano = _interp_first("FluxAno", "FluxeAno", "FluxGeAno")
+                flux_gi_ano = _interp_first("FluxiAno", "FluxGiAno")
+                flux_gd_ano = _interp_first("FluxDAno", "FluxGDAno")
+                flux_gt_ano = _interp_first("FluxTAno", "FluxGTAno")
+                alpha_power = _interp_first("Pfusion", "AlphaPower")
+                pbrems_power = _interp_first("Prad", "PBrems", "Pbrems")
+                he_source = _interp_first("HeSource", "Hesource")
+                zeff = _interp_first("Zeff")
                 ecrh_power = _interp_dataset("ECRHPower")
                 nbi_power_e = _interp_dataset("NBIPower_e")
                 nbi_power_i = _interp_dataset("NBIPower_I")
+                if pbrems_power is None:
+                    ne_ref = _interp_dataset("ne")
+                    te_ref = _interp_first("Te")
+                    if zeff is not None and ne_ref is not None and te_ref is not None:
+                        pbrems_power = (3.16e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
                 if vr is not None:
+                    if flux_ge_neo is not None:
+                        profiles["flux_species"]["Gamma_neo"]["e"] = flux_ge_neo * vr
+                    if flux_gd_neo is not None:
+                        profiles["flux_species"]["Gamma_neo"]["D"] = flux_gd_neo * vr
+                    if flux_gt_neo is not None:
+                        profiles["flux_species"]["Gamma_neo"]["T"] = flux_gt_neo * vr
+                    if flux_gi_neo is not None:
+                        profiles["scalar"]["Gamma_neo_ion_sum"] = flux_gi_neo * vr
+                    elif flux_gd_neo is not None and flux_gt_neo is not None:
+                        profiles["scalar"]["Gamma_neo_ion_sum"] = (flux_gd_neo + flux_gt_neo) * vr
+                    if flux_ge_ano is not None:
+                        profiles["flux_species"]["Gamma_turb"]["e"] = flux_ge_ano * vr
+                    if flux_gd_ano is not None:
+                        profiles["flux_species"]["Gamma_turb"]["D"] = flux_gd_ano * vr
+                    if flux_gt_ano is not None:
+                        profiles["flux_species"]["Gamma_turb"]["T"] = flux_gt_ano * vr
+                    if flux_gi_ano is not None:
+                        profiles["scalar"]["Gamma_turb_ion_sum"] = flux_gi_ano * vr
+                    elif flux_gd_ano is not None and flux_gt_ano is not None:
+                        profiles["scalar"]["Gamma_turb_ion_sum"] = (flux_gd_ano + flux_gt_ano) * vr
                     if flux_qe is not None and flux_qi is not None:
                         profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
                         profiles["flux_species"]["Q_total"]["e"] = flux_qe * vr
@@ -1469,6 +1514,10 @@ def plot_transport_solution(
                         profiles["scalar"]["Q_turb_ion_sum"] = flux_qi_ano * vr
                 if alpha_power is not None:
                     profiles["scalar"]["alpha_power"] = alpha_power
+                if pbrems_power is not None:
+                    profiles["scalar"]["pbrems_power"] = pbrems_power
+                if he_source is not None:
+                    profiles["scalar"]["he_source"] = he_source
                 power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
                 if power_terms:
                     total_power_source = power_terms[0]
@@ -1582,6 +1631,14 @@ def plot_transport_solution(
                     ref_label = "NTSS ion reference"
             elif "transport_flux_q_turb" in out_stem.lower():
                 ref_values = ntss_reference.get("flux_species", {}).get("Q_turb", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is not None:
+                    ref_label = "NTSS ion reference"
+            elif "transport_flux_gamma_neo" in out_stem.lower():
+                ref_values = ntss_reference.get("flux_species", {}).get("Gamma_neo", {}).get(species_name)
+                if species_name in {"D", "T"} and ref_values is not None:
+                    ref_label = "NTSS ion reference"
+            elif "transport_flux_gamma_turb" in out_stem.lower():
+                ref_values = ntss_reference.get("flux_species", {}).get("Gamma_turb", {}).get(species_name)
                 if species_name in {"D", "T"} and ref_values is not None:
                     ref_label = "NTSS ion reference"
             if ref_values is not None:
@@ -1899,6 +1956,7 @@ def plot_transport_solution(
             "Alpha Particle Source [1e20 m^-3 s^-1]",
             "transport_density_source_HeSource.png",
             title="Alpha Particle Source vs rho",
+            reference_key="he_source",
         )
 
     total_heat_flux_png = _plot_scalar_time_series(
@@ -1980,6 +2038,7 @@ def plot_transport_solution(
         "Bremsstrahlung Power [MW/m^3]",
         "transport_pressure_source_PBrems.png",
         title="Bremsstrahlung Power vs rho",
+        reference_key="pbrems_power",
     )
 
     power_exchange_png = _plot_scalar_time_series(
