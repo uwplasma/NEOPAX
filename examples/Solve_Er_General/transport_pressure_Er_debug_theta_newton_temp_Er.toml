@@ -101,6 +101,7 @@ temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons
 
 [transport_solver]
 density_floor = 1.0e-6
+temperature_floor = 1.0e-6
 transport_solver_backend = "theta_newton"
 integrator = "theta_newton"
 theta_implicit = 1.0
@@ -112,7 +113,13 @@ theta_delta_reduction_factor = 0.5
 theta_tau_min = 0.01
 t0 = 0.0
 t_final = 0.01
-dt = 1.0e-4
+dt = 5.0e-5
+min_step = 1.0e-8
+max_step = 2.0e-4
+safety_factor = 0.9
+min_step_factor = 0.5
+max_step_factor = 1.5
+theta_target_nonlinear_iterations = 4
 max_steps = 20000
 throw = false
 debug_stage_markers = true

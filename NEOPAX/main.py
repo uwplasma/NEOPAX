@@ -1017,6 +1017,10 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             accepted_mask = result.get("accepted_mask", None)
             failed_mask = result.get("failed_mask", None)
             n_steps = result.get("n_steps", None)
+            done = result.get("done", None)
+            failed = result.get("failed", None)
+            fail_code = result.get("fail_code", None)
+            final_time = result.get("final_time", None)
             if accepted_mask is not None:
                 accepted_count = int(jnp.sum(jnp.asarray(accepted_mask)))
                 total_saved = int(jnp.asarray(accepted_mask).size)
@@ -1025,6 +1029,10 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"accepted_saved={accepted_count}/{total_saved}",
                     f"n_steps={int(n_steps) if n_steps is not None else 'na'}",
                     f"failed_any={bool(jnp.any(jnp.asarray(failed_mask))) if failed_mask is not None else False}",
+                    f"done={bool(done) if done is not None else 'na'}",
+                    f"failed={bool(failed) if failed is not None else 'na'}",
+                    f"fail_code={int(fail_code) if fail_code is not None else 'na'}",
+                    f"final_time={float(final_time):.6e}" if final_time is not None else "final_time=na",
                 )
         print("[NEOPAX] solver.solve(...) returned")
     transport_cfg = config.get("transport_output", {})

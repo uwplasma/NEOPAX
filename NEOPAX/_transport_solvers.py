@@ -1464,6 +1464,7 @@ class _ThetaSolverConfig(TransportSolver):
     t0: float
     t1: float
     dt: float
+    min_step: float = 1.0e-14
     theta_implicit: float = 1.0
     use_predictor_corrector: bool = False
     n_corrector_steps: int = 1
@@ -1476,6 +1477,7 @@ class _ThetaSolverConfig(TransportSolver):
         t0: float = 0.0,
         t1: float = 1.0,
         dt: float = 1.0e-2,
+        min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
@@ -1487,6 +1489,7 @@ class _ThetaSolverConfig(TransportSolver):
         object.__setattr__(self, "t0", float(t0))
         object.__setattr__(self, "t1", float(t1))
         object.__setattr__(self, "dt", float(dt))
+        object.__setattr__(self, "min_step", float(min_step))
         object.__setattr__(self, "theta_implicit", float(theta_implicit))
         object.__setattr__(self, "use_predictor_corrector", bool(use_predictor_corrector))
         object.__setattr__(self, "n_corrector_steps", int(max(0, n_corrector_steps)))
@@ -1500,6 +1503,11 @@ class _ThetaSolverConfig(TransportSolver):
 @dataclasses.dataclass(frozen=True, eq=False)
 class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
     maxiter: int = 20
+    max_step: float = 1.0
+    safety_factor: float = 0.9
+    min_step_factor: float = 0.5
+    max_step_factor: float = 2.0
+    target_nonlinear_iterations: int = 4
     delta_reduction_factor: float = 0.5
     tau_min: float = 0.01
 
@@ -1508,11 +1516,17 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         t0: float = 0.0,
         t1: float = 1.0,
         dt: float = 1.0e-2,
+        min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
         maxiter: int = 20,
+        max_step: float | None = None,
+        safety_factor: float = 0.9,
+        min_step_factor: float = 0.5,
+        max_step_factor: float = 2.0,
+        target_nonlinear_iterations: int = 4,
         delta_reduction_factor: float = 0.5,
         tau_min: float = 0.01,
         max_steps: int = 20000,
@@ -1522,6 +1536,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             t0=t0,
             t1=t1,
             dt=dt,
+            min_step=min_step,
             theta_implicit=theta_implicit,
             use_predictor_corrector=use_predictor_corrector,
             n_corrector_steps=n_corrector_steps,
@@ -1530,6 +1545,13 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             save_n=save_n,
         )
         object.__setattr__(self, "maxiter", int(max(1, maxiter)))
+        if max_step is None:
+            max_step = max(float(t1) - float(t0), float(dt))
+        object.__setattr__(self, "max_step", float(max_step))
+        object.__setattr__(self, "safety_factor", float(safety_factor))
+        object.__setattr__(self, "min_step_factor", float(min_step_factor))
+        object.__setattr__(self, "max_step_factor", float(max_step_factor))
+        object.__setattr__(self, "target_nonlinear_iterations", int(max(1, target_nonlinear_iterations)))
         object.__setattr__(self, "delta_reduction_factor", float(delta_reduction_factor))
         object.__setattr__(self, "tau_min", float(tau_min))
 
@@ -1583,6 +1605,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         t0 = jnp.asarray(self.t0, dtype=dtype)
         t_final = jnp.asarray(self.t1, dtype=dtype)
         base_dt = jnp.asarray(self.dt, dtype=dtype)
+        dt_min = jnp.asarray(self.min_step, dtype=dtype)
         max_total_steps = int(max(1, self.max_steps))
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
@@ -1741,12 +1764,18 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         one = jnp.asarray(1.0, dtype=dtype)
         t0 = jnp.asarray(self.t0, dtype=dtype)
         t_final = jnp.asarray(self.t1, dtype=dtype)
-        base_dt = jnp.asarray(self.dt, dtype=dtype)
+        dt_min = jnp.asarray(self.min_step, dtype=dtype)
+        dt_max = jnp.asarray(self.max_step, dtype=dtype)
+        base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(1, self.max_steps))
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
+        safety_factor = jnp.asarray(self.safety_factor, dtype=dtype)
+        min_step_factor = jnp.asarray(self.min_step_factor, dtype=dtype)
+        max_step_factor = jnp.asarray(self.max_step_factor, dtype=dtype)
+        target_nonlinear_iterations = jnp.asarray(self.target_nonlinear_iterations, dtype=dtype)
         delta_reduction_factor = jnp.asarray(self.delta_reduction_factor, dtype=dtype)
         tau_min = jnp.asarray(self.tau_min, dtype=dtype)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
@@ -1839,12 +1868,12 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 active = residual_norm > self.tol
                 return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
-            _, y_final, residual_norm_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_state)
+            iter_final, y_final, residual_norm_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_state)
             converged = jnp.logical_and(
                 jnp.logical_and(jnp.all(jnp.isfinite(y_final)), residual_norm_final <= self.tol),
                 jnp.logical_not(diverged_final),
             )
-            return _project_flat_state_if_needed(y_final, project_flat), converged
+            return _project_flat_state_if_needed(y_final, project_flat), converged, iter_final, residual_norm_final
 
         def step_fn(step_state: _ThetaStepState, _):
             failed = step_state.status[STATUS_FAILED] != 0
@@ -1862,9 +1891,32 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 )
 
             def _run(_):
-                trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
-                trial_y, converged = _single_theta_newton_step(step_state.y, step_state.t, trial_dt)
+                trial_dt0 = jnp.minimum(step_state.dt, t_final - step_state.t)
+
+                def retry_cond(carry):
+                    trial_dt, _trial_y, converged, _iter_count, _residual_norm = carry
+                    can_reduce = trial_dt > dt_min * (jnp.asarray(1.0, dtype=dtype) + jnp.asarray(1.0e-12, dtype=dtype))
+                    return jnp.logical_and(jnp.logical_not(converged), can_reduce)
+
+                def retry_body(carry):
+                    trial_dt, _trial_y, _converged, _iter_count, _residual_norm = carry
+                    reduced_dt = jnp.maximum(trial_dt * delta_reduction_factor, dt_min)
+                    next_y, next_converged, next_iter_count, next_residual_norm = _single_theta_newton_step(step_state.y, step_state.t, reduced_dt)
+                    return reduced_dt, next_y, next_converged, next_iter_count, next_residual_norm
+
+                trial_y0, converged0, iter_count0, residual_norm0 = _single_theta_newton_step(step_state.y, step_state.t, trial_dt0)
+                trial_dt, trial_y, converged, iter_count, residual_norm = jax.lax.while_loop(
+                    retry_cond,
+                    retry_body,
+                    (trial_dt0, trial_y0, converged0, iter_count0, residual_norm0),
+                )
                 t_new = step_state.t + trial_dt
+                effective_iters = jnp.maximum(jnp.asarray(1.0, dtype=dtype), iter_count.astype(dtype))
+                growth = safety_factor * (target_nonlinear_iterations / effective_iters) ** jnp.asarray(0.5, dtype=dtype)
+                growth = jnp.clip(growth, min_step_factor, max_step_factor)
+                retried = trial_dt < trial_dt0 * (jnp.asarray(1.0, dtype=dtype) - jnp.asarray(1.0e-12, dtype=dtype))
+                growth = jnp.where(retried, jnp.minimum(growth, one), growth)
+                next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
                 fail_now = jnp.logical_not(converged)
                 code = jnp.where(converged, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32))
                 status_next = jnp.asarray(
@@ -1874,7 +1926,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 next_state = _ThetaStepState(
                     t=jnp.where(converged, t_new, step_state.t),
                     y=jnp.where(converged, trial_y, step_state.y),
-                    dt=step_state.dt,
+                    dt=jnp.where(converged, next_dt_accept, step_state.dt),
                     status=status_next,
                 )
                 return next_state, _ThetaStepInfo(
@@ -1956,6 +2008,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             t0=t0,
             t1=t1,
             dt=dt,
+            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
             theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
             use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
             n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
@@ -1968,11 +2021,17 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             t0=t0,
             t1=t1,
             dt=dt,
+            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
             theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
             use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
             n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
             tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),
             maxiter=int(solver_parameters.get("nonlinear_solver_maxiter", solver_parameters.get("maxiter", 20))),
+            max_step=float(solver_parameters.get("max_step", max(t1 - t0, dt))),
+            safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
+            min_step_factor=float(solver_parameters.get("min_step_factor", 0.5)),
+            max_step_factor=float(solver_parameters.get("max_step_factor", 2.0)),
+            target_nonlinear_iterations=int(solver_parameters.get("theta_target_nonlinear_iterations", 4)),
             delta_reduction_factor=float(solver_parameters.get("theta_delta_reduction_factor", 0.5)),
             tau_min=float(solver_parameters.get("theta_tau_min", 0.01)),
             max_steps=int(solver_parameters.get("max_steps", 20000)),
