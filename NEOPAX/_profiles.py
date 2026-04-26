@@ -43,8 +43,8 @@ class AnalyticalProfileModel(ProfileModel):
     c_temperature: tuple[float, ...] | None = None
     density_shape_power: float = 2.0
     temperature_shape_power: float = 2.0
-    n_scale: float = 1.0
-    T_scale: float = 1.0
+    n_scale: float | tuple[float, ...] = 1.0
+    T_scale: float | tuple[float, ...] = 1.0
     er0_scale: float = 100.0
     er0_peak_rho: float = 0.8
     charge_qp: tuple[float, ...] | None = None
@@ -63,8 +63,8 @@ class AnalyticalProfileModel(ProfileModel):
         # Internally ProfileSet stores physical density [m^-3] and temperature [eV].
         density_scale_physical = 1.0e20
         temperature_scale_physical = 1.0e3
-        base_density = density_scale_physical * self.n_scale * ((self.n0-self.n_edge) * density_shape + self.n_edge)
-        base_temperature = temperature_scale_physical * self.T_scale * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
+        base_density = density_scale_physical * ((self.n0-self.n_edge) * density_shape + self.n_edge)
+        base_temperature = temperature_scale_physical * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
 
         charge_qp = None
         electron_index = -1
@@ -76,9 +76,11 @@ class AnalyticalProfileModel(ProfileModel):
                 if float(charge_qp[eidx]) < 0.0:
                     electron_index = eidx
 
-        def _expand_concentration(raw, default, include_electron):
+        def _expand_species_values(raw, default, include_electron):
             if raw is None:
                 return jnp.asarray([default] * n_species, dtype=float)
+            if isinstance(raw, (int, float)):
+                return jnp.asarray([float(raw)] * n_species, dtype=float)
             vals = [float(v) for v in raw]
             if len(vals) == n_species:
                 return jnp.asarray(vals, dtype=float)
@@ -92,11 +94,13 @@ class AnalyticalProfileModel(ProfileModel):
                     k += 1
                 return jnp.asarray(out, dtype=float)
             raise ValueError(
-                "Concentration array length must be n_species, or n_species-1 when electron is omitted."
+                "Species-resolved array length must be n_species, or n_species-1 when electron is omitted."
             )
 
-        c_density = _expand_concentration(self.c_density, default=1.0, include_electron=False)
-        c_temperature = _expand_concentration(self.c_temperature, default=1.0, include_electron=True)
+        c_density = _expand_species_values(self.c_density, default=1.0, include_electron=False)
+        c_temperature = _expand_species_values(self.c_temperature, default=1.0, include_electron=True)
+        n_scale = _expand_species_values(self.n_scale, default=1.0, include_electron=False)
+        T_scale = _expand_species_values(self.T_scale, default=1.0, include_electron=True)
 
         Er = self.er0_scale * field.rho_grid * (self.er0_peak_rho - field.rho_grid)
 
@@ -104,8 +108,8 @@ class AnalyticalProfileModel(ProfileModel):
         density = jnp.zeros((n_species, field.r_grid.shape[0]))
 
         for i in range(n_species):
-            temperature = temperature.at[i, :].set(c_temperature[i] * base_temperature)
-            density = density.at[i, :].set(c_density[i] * base_density)
+            temperature = temperature.at[i, :].set(c_temperature[i] * T_scale[i] * base_temperature)
+            density = density.at[i, :].set(c_density[i] * n_scale[i] * base_density)
 
         T_edge = temperature[:, -1]
         n_edge = density[:, -1]
@@ -189,8 +193,16 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
             else tuple(float(v) for v in profile_cfg.get("c_temperature")),
             density_shape_power=float(profile_cfg.get("density_shape_power", 2.0)),
             temperature_shape_power=float(profile_cfg.get("temperature_shape_power", 2.0)),
-            n_scale=float(profile_cfg.get("n_scale", 1.0)),
-            T_scale=float(profile_cfg.get("T_scale", 1.0)),
+            n_scale=(
+                float(profile_cfg.get("n_scale", 1.0))
+                if isinstance(profile_cfg.get("n_scale", 1.0), (int, float))
+                else tuple(float(v) for v in profile_cfg.get("n_scale", (1.0,)))
+            ),
+            T_scale=(
+                float(profile_cfg.get("T_scale", 1.0))
+                if isinstance(profile_cfg.get("T_scale", 1.0), (int, float))
+                else tuple(float(v) for v in profile_cfg.get("T_scale", (1.0,)))
+            ),
             er0_scale=float(profile_cfg.get("er0_scale", 100.0)),
             er0_peak_rho=float(profile_cfg.get("er0_peak_rho", 0.8)),
             charge_qp=None

@@ -217,6 +217,16 @@ def _extract_fixed_temperature_projection(vector_field: Callable) -> tuple[Any, 
     )
 
 
+def _extract_state_regularization(vector_field: Callable) -> tuple[Any, Any]:
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None, None
+    return (
+        getattr(owner, "density_floor", None),
+        getattr(owner, "temperature_floor", None),
+    )
+
+
 def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
     """Convert a TransportState-like object into an array-only pytree."""
     if dataclasses.is_dataclass(state) and hasattr(state, "density") and hasattr(state, "pressure") and hasattr(state, "Er"):
@@ -279,28 +289,32 @@ def _project_fixed_temperature_output(
     reference_state: Any,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ) -> Any:
     from ._transport_equations import project_fixed_temperature_species
+    from ._state import apply_transport_density_floor, apply_transport_temperature_floor
 
     density = getattr(state_like, "density", None)
     ref_density = getattr(reference_state, "density", None)
     if density is None or ref_density is None:
         return state_like
 
+    def _regularize_one(s):
+        s = apply_transport_density_floor(s, density_floor)
+        s = project_fixed_temperature_species(
+            s,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+        )
+        s = apply_transport_temperature_floor(s, temperature_floor, density_floor)
+        return s
+
     if density.ndim == ref_density.ndim + 1:
-        out = jax.vmap(
-            lambda s: project_fixed_temperature_species(
-                s,
-                temperature_active_mask=temperature_active_mask,
-                fixed_temperature_profile=fixed_temperature_profile,
-            )
-        )(state_like)
+        out = jax.vmap(_regularize_one)(state_like)
         return _restore_state_metadata(out, reference_state)
-    out = project_fixed_temperature_species(
-        state_like,
-        temperature_active_mask=temperature_active_mask,
-        fixed_temperature_profile=fixed_temperature_profile,
-    )
+    out = _regularize_one(state_like)
     return _restore_state_metadata(out, reference_state)
 
 
@@ -310,6 +324,8 @@ def _apply_quasi_neutrality_output(
     reference_state: Any,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ) -> Any:
     """Apply quasi-neutrality to either a single state or a saved time-series of states."""
     from ._transport_equations import enforce_quasi_neutrality
@@ -326,6 +342,8 @@ def _apply_quasi_neutrality_output(
             reference_state,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
     out = enforce_quasi_neutrality(state_like, species)
     return _project_fixed_temperature_output(
@@ -333,6 +351,8 @@ def _apply_quasi_neutrality_output(
         reference_state,
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
     )
 
 
@@ -341,28 +361,30 @@ def _project_state_to_quasi_neutrality(
     species: Any,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ) -> Any:
     from ._transport_equations import enforce_quasi_neutrality, project_fixed_temperature_species
+    from ._state import apply_transport_density_floor, apply_transport_temperature_floor
+
+    def _regularize_one(s):
+        s = apply_transport_density_floor(s, density_floor)
+        s = project_fixed_temperature_species(
+            s,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+        )
+        s = apply_transport_temperature_floor(s, temperature_floor, density_floor)
+        return s
 
     if species is None:
-        return project_fixed_temperature_species(
-            state_like,
-            temperature_active_mask=temperature_active_mask,
-            fixed_temperature_profile=fixed_temperature_profile,
-        )
+        return _regularize_one(state_like)
     density = getattr(state_like, "density", None)
     if density is None:
-        return project_fixed_temperature_species(
-            state_like,
-            temperature_active_mask=temperature_active_mask,
-            fixed_temperature_profile=fixed_temperature_profile,
-        )
+        return _regularize_one(state_like)
     projected = enforce_quasi_neutrality(state_like, species)
-    return project_fixed_temperature_species(
-        projected,
-        temperature_active_mask=temperature_active_mask,
-        fixed_temperature_profile=fixed_temperature_profile,
-    )
+    return _regularize_one(projected)
 
 
 def _project_packed_transport_state_arrays(
@@ -371,23 +393,23 @@ def _project_packed_transport_state_arrays(
     species: Any,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ) -> Any:
     """Project packed solver arrays without rebuilding a full TransportState."""
-    from ._state import safe_density
+    from ._state import safe_density, safe_temperature
 
     if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
 
     density, pressure, er = state_like
-    if temperature_active_mask is None or fixed_temperature_profile is None:
-        return state_like
-
+    packed_density = safe_density(density, density_floor)
     eidx = _electron_density_index(species)
-    if eidx is not None and density.shape[-2] == template_state.density.shape[0] - 1:
+    if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
         full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
         full_density = jnp.zeros(full_shape, dtype=pressure.dtype)
-        full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
-        full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
+        full_density = full_density.at[..., :eidx, :].set(packed_density[..., :eidx, :])
+        full_density = full_density.at[..., eidx + 1 :, :].set(packed_density[..., eidx:, :])
         charge_qp = jnp.asarray(species.charge_qp, dtype=pressure.dtype)
         ion_indices = jnp.asarray(getattr(species, "ion_indices", ()), dtype=int)
         if ion_indices.size > 0:
@@ -396,15 +418,21 @@ def _project_packed_transport_state_arrays(
             n_e = -jnp.sum(Z_i[..., None] * n_i, axis=-2) / charge_qp[int(eidx)]
             full_density = full_density.at[..., int(eidx), :].set(n_e)
     else:
-        full_density = density
+        full_density = packed_density
 
-    active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
-    fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure.dtype)
-    active_mask = active_mask.reshape((1,) * (pressure.ndim - 2) + (active_mask.shape[0], 1))
-    fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure.shape)
-    fixed_pressure = safe_density(full_density) * fixed_temperature
-    projected_pressure = jnp.where(active_mask, pressure, fixed_pressure)
-    return (density, projected_pressure, er)
+    floored_density = safe_density(full_density, density_floor)
+    projected_pressure = pressure
+    if temperature_active_mask is not None and fixed_temperature_profile is not None:
+        active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
+        fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure.dtype)
+        active_mask = active_mask.reshape((1,) * (pressure.ndim - 2) + (active_mask.shape[0], 1))
+        fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure.shape)
+        fixed_pressure = floored_density * fixed_temperature
+        projected_pressure = jnp.where(active_mask, projected_pressure, fixed_pressure)
+    if temperature_floor is not None:
+        projected_temperature = safe_temperature(projected_pressure / floored_density, temperature_floor)
+        projected_pressure = floored_density * projected_temperature
+    return (packed_density, projected_pressure, er)
 
 
 def _project_flat_state_if_needed(
@@ -421,6 +449,8 @@ def _make_solver_state_transform(
     species: Any,
     temperature_active_mask: Any = None,
     fixed_temperature_profile: Any = None,
+    density_floor: Any = None,
+    temperature_floor: Any = None,
 ):
     packed_state = _pack_transport_state_arrays(template_state, species)
     flat_state0, unravel_packed = jax.flatten_util.ravel_pytree(packed_state)
@@ -432,6 +462,8 @@ def _make_solver_state_transform(
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
 
     def unpack_packed(packed_state_like):
@@ -441,6 +473,8 @@ def _make_solver_state_transform(
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
 
     def pack_state(state_like):
@@ -454,6 +488,8 @@ def _make_solver_state_transform(
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_projected, _ = jax.flatten_util.ravel_pytree(projected_packed)
         return flat_projected
@@ -509,17 +545,22 @@ class DiffraxSolver(TransportSolver):
         import equinox as eqx
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
         state = _project_state_to_quasi_neutrality(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
 
@@ -578,6 +619,8 @@ class DiffraxSolver(TransportSolver):
                         state,
                         temperature_active_mask=temperature_active_mask,
                         fixed_temperature_profile=fixed_temperature_profile,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
                     ),
                 )
         else:
@@ -591,6 +634,8 @@ class DiffraxSolver(TransportSolver):
                         state,
                         temperature_active_mask=temperature_active_mask,
                         fixed_temperature_profile=fixed_temperature_profile,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
                     ),
                 )
         return sol
@@ -614,6 +659,8 @@ def _finalize_custom_solver_output(
     species,
     temperature_active_mask=None,
     fixed_temperature_profile=None,
+    density_floor=None,
+    temperature_floor=None,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
@@ -625,6 +672,8 @@ def _finalize_custom_solver_output(
         reference_state,
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
     )
     final_state = unpack_flat(y_final_flat)
     if species is not None:
@@ -634,6 +683,8 @@ def _finalize_custom_solver_output(
         reference_state,
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
     )
     return {
         "ys": ys_saved,
@@ -1048,17 +1099,22 @@ class RADAUSolver(_RadauSolverConfig):
         STATUS_N_ACCEPTED = 2
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
         state = _project_state_to_quasi_neutrality(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         if self.num_stages not in _RADAU_STAGE_CONFIGS:
             raise ValueError(
@@ -1391,6 +1447,8 @@ class RADAUSolver(_RadauSolverConfig):
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
 
 
@@ -1497,17 +1555,22 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         STATUS_N_ACCEPTED = 2
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
         state = _project_state_to_quasi_neutrality(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         dtype = flat_state0.dtype
         theta = jnp.asarray(self.theta_implicit, dtype=dtype)
@@ -1638,6 +1701,8 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
 
 
@@ -1648,17 +1713,22 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         STATUS_N_ACCEPTED = 2
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
         state = _project_state_to_quasi_neutrality(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
         dtype = flat_state0.dtype
         theta = jnp.asarray(self.theta_implicit, dtype=dtype)
@@ -1851,6 +1921,8 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             species,
             temperature_active_mask=temperature_active_mask,
             fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
         )
 
 def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> TransportSolver:
