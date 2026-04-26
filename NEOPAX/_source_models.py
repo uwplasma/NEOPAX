@@ -119,11 +119,14 @@ class PowerExchangeSource(SourceModelBase):
 @dataclasses.dataclass(frozen=True, eq=False)
 class BremsstrahlungRadiationSource(SourceModelBase):
     species: Any = dataclasses.field(repr=False, default=None)
-    ZD: float = None
-    ZT: float = None
+    delta_zeff: float = 0.0
     def __call__(self, state, species=None):
         active_species = self.species if self.species is not None else species
-        PBrems, Zeff = bremsstrahlung_radiation(state, species=active_species)
+        PBrems, Zeff = bremsstrahlung_radiation(
+            state,
+            species=active_species,
+            delta_zeff=self.delta_zeff,
+        )
         return {"PBrems": PBrems, "Zeff": Zeff}
 
 def get_source_model(name: str, **kwargs) -> SourceModelBase:

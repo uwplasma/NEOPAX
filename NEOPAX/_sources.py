@@ -70,19 +70,6 @@ def power_exchange(state, species):
     return out
 
 @jit
-def bremsstrahlung_radiation(state, species):
-    Te = state.temperature[species.species_idx['e']]
-    ne = state.density[species.species_idx['e']]
-    nD = state.density[species.species_idx['D']]
-    nT = state.density[species.species_idx['T']]
-    ZD = species.charge[species.species_idx['D']] / elementary_charge
-    ZT = species.charge[species.species_idx['T']] / elementary_charge
-    Zeff = (ZD ** 2 * nD + ZT ** 2 * nT) / ne
-    PBrems = 3.16e-1 * Zeff * ne * ne * jnp.sqrt(Te)
-    return PBrems, Zeff
-
-
-@jit
 def bremsstrahlung_radiation_generalized(
     state,
     species=None,
@@ -90,9 +77,10 @@ def bremsstrahlung_radiation_generalized(
     exclude_impurity_bremsstrahlung=False,
     main_ion_indices=(1, 2),  # default: D, T
     electron_index=0,
+    delta_zeff=0.0,
 ):
     """
-    Generalized bremsstrahlung radiation model (torax-style).
+    Generalized bremsstrahlung radiation model.
     Args:
         state: object with .density, .temperature arrays (shape: [n_species, ...])
         species: optional, with .charge
@@ -100,8 +88,11 @@ def bremsstrahlung_radiation_generalized(
         exclude_impurity_bremsstrahlung: bool, only main-ion Zeff
         main_ion_indices: tuple of indices for main ions
         electron_index: index for electrons
+        delta_zeff: additive Zeff offset, analogous to NTSSfusion DeltaZeff
     Returns:
-        PBrems: bremsstrahlung power density [W/m^3]
+        PBrems: bremsstrahlung power density in the normalized transport units
+            used elsewhere in NEOPAX, matching the NTSS-like
+            `3.16e-1 * Zeff * ne^2 * sqrt(Te)` form.
         Zeff: effective charge
     """
     ne = state.density[electron_index]
@@ -121,14 +112,26 @@ def bremsstrahlung_radiation_generalized(
         Zeff = jnp.sum(n_main * Z_main**2, axis=0) / ne
     else:
         Zeff = jnp.sum(n * Z**2, axis=0) / ne
-    # Wesson formula (see torax): 5.35e-37 * Zeff * n_e^2 * sqrt(T_e) [W/m^3]
-    PBrems = 5.35e-37 * Zeff * ne**2 * jnp.sqrt(Te)
+    Zeff = Zeff + jnp.asarray(delta_zeff, dtype=ne.dtype)
+    # Keep the NTSS-like transport normalization used by the original default
+    # source, while upgrading Zeff to the full multispecies expression.
+    PBrems = 3.16e-1 * Zeff * ne**2 * jnp.sqrt(Te)
     if use_relativistic_correction:
         Tm = 511.0 * 1e3  # eV
         Te_eV = Te  # assume Te in eV
         corr = (1.0 + 2.0 * Te_eV / Tm) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + Te_eV / Tm)))
         PBrems = PBrems * corr
     return PBrems, Zeff
+
+
+@jit
+def bremsstrahlung_radiation(state, species, delta_zeff=0.0):
+    return bremsstrahlung_radiation_generalized(
+        state,
+        species=species,
+        exclude_impurity_bremsstrahlung=False,
+        delta_zeff=delta_zeff,
+    )
 
 @jit
 def ecrh_source(
