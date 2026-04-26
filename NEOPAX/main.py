@@ -591,6 +591,10 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     getattr(temperature_equation, "heat_flux_reconstruction"),
                 )
         rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
+        try:
+            working_state_debug, _ = equation_system._prepare_working_state(state)
+        except Exception:
+            working_state_debug = state
         density_rhs0 = getattr(rhs0, "density", None)
         if density_rhs0 is not None:
             density_rhs0_arr = jnp.asarray(density_rhs0)
@@ -603,7 +607,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"max={float(jnp.max(arr)):.6e}",
                 )
             if density_equation is not None:
-                components = density_equation.debug_components(state)
+                components = density_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
                     if arr.ndim == 2:
@@ -690,20 +694,21 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                         from ._transport_flux_models import _face_profile_gradient, build_face_transport_state
 
                         face_state0 = build_face_transport_state(
-                            state,
+                            working_state_debug,
                             runtime.geometry,
                             bc_density=bc.get("density"),
                             bc_temperature=bc.get("temperature"),
                             bc_er=bc.get("Er"),
                             density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                            temperature_floor=solver_cfg.get("temperature_floor"),
                         )
                         dndr_faces0 = _face_profile_gradient(
-                            state.density,
+                            working_state_debug.density,
                             runtime.geometry.r_grid_half,
                             bc_model=bc.get("density"),
                         )
                         dTdr_faces0 = _face_profile_gradient(
-                            state.temperature,
+                            working_state_debug.temperature,
                             runtime.geometry.r_grid_half,
                             bc_model=bc.get("temperature"),
                         )
@@ -758,7 +763,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"max={float(jnp.max(arr)):.6e}",
                 )
             if temperature_equation is not None:
-                components = temperature_equation.debug_components(state)
+                components = temperature_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
                     if arr.ndim == 2:
@@ -851,7 +856,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 f"max={float(jnp.max(er_rhs0)):.6e}",
             )
             if er_equation is not None:
-                components = er_equation.debug_components(state)
+                components = er_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
                     finite_mask = jnp.isfinite(arr)
