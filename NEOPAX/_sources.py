@@ -28,7 +28,7 @@ def dt_reaction(state, species):
     return DTreactionRate, HeSource, AlphaPower
 
 @jit
-def power_exchange(state, species):
+def power_exchange(state, species, pair_active_mask):
     # JAX-jittable, differentiable: vectorized pairwise sum
     n_species = state.temperature.shape[0]
     idx_i, idx_j = jnp.triu_indices(n_species, k=1)
@@ -64,6 +64,8 @@ def power_exchange(state, species):
         * (TB - TA)
         / jnp.power(mA * TB + mB * TA, 1.5)
     )
+    pair_mask = jnp.asarray(pair_active_mask, dtype=Pab.dtype)[:, None]
+    Pab = Pab * pair_mask
     # For each pair (i, j): +Pab to i, -Pab to j
     out = jnp.zeros((n_species,) + Pab.shape[1:], dtype=Pab.dtype)
     out = out.at[idx_i].add(Pab)

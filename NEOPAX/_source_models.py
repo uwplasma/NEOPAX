@@ -109,11 +109,29 @@ class DTReactionSource(SourceModelBase):
 @dataclasses.dataclass(frozen=True, eq=False)
 class PowerExchangeSource(SourceModelBase):
     species: Any = dataclasses.field(repr=False, default=None)
+    mode: str = "all"
+    temperature_active_mask: Any = dataclasses.field(repr=False, default=None)
     idx_a: str = None
     idx_b: str = None
     def __call__(self, state, species=None):
         active_species = self.species if self.species is not None else species
-        return {"power_exchange": power_exchange(state, species=active_species)}
+        n_species = state.temperature.shape[0]
+        idx_i, idx_j = jnp.triu_indices(n_species, k=1)
+        mode = str(self.mode).strip().lower()
+        if mode in {"all", "full", "multispecies"}:
+            pair_active_mask = jnp.ones(idx_i.shape, dtype=bool)
+        elif mode in {"active_temperature_only", "active_only", "evolving_only", "ntss_like"}:
+            if self.temperature_active_mask is None:
+                pair_active_mask = jnp.ones(idx_i.shape, dtype=bool)
+            else:
+                active_mask = jnp.asarray(self.temperature_active_mask, dtype=bool)
+                pair_active_mask = active_mask[idx_i] & active_mask[idx_j]
+        else:
+            raise ValueError(
+                f"Unknown power_exchange mode '{self.mode}'. "
+                "Use 'all' or 'active_temperature_only' (alias: 'ntss_like')."
+            )
+        return {"power_exchange": power_exchange(state, species=active_species, pair_active_mask=pair_active_mask)}
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -149,13 +167,28 @@ def _as_name_list(value: Any) -> list[str]:
     v = str(value).strip()
     return [v] if len(v) > 0 else []
 
-def _builder_kwargs_for(source_name: str, params_cfg: dict[str, Any], species: Any | None = None) -> dict[str, Any]:
+def _builder_kwargs_for(
+    source_name: str,
+    params_cfg: dict[str, Any],
+    species: Any | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not isinstance(params_cfg, dict):
         out = {}
     else:
         out = dict(params_cfg.get(source_name, {})) if isinstance(params_cfg.get(source_name, {}), dict) else {}
     if species is not None and "species" not in out:
         out["species"] = species
+    if source_name == "power_exchange" and "temperature_active_mask" not in out and species is not None:
+        eq_cfg = (cfg or {}).get("equations", {}) if isinstance(cfg, dict) else {}
+        raw_mask = eq_cfg.get("toggle_temperature", [True] * getattr(species, "number_species", 0))
+        active_mask = jnp.asarray(raw_mask, dtype=bool)
+        if active_mask.ndim == 0:
+            active_mask = jnp.repeat(active_mask[None], getattr(species, "number_species", 0), axis=0)
+        if active_mask.shape[0] < getattr(species, "number_species", 0):
+            pad = getattr(species, "number_species", 0) - active_mask.shape[0]
+            active_mask = jnp.pad(active_mask, (0, pad), constant_values=True)
+        out["temperature_active_mask"] = active_mask[:getattr(species, "number_species", 0)]
     return out
 
 def _compose_sources(names: list[str], params_cfg: dict[str, Any] | None = None, species: Any | None = None) -> SourceModelBase | None:
@@ -163,7 +196,7 @@ def _compose_sources(names: list[str], params_cfg: dict[str, Any] | None = None,
         return None
     params_cfg = params_cfg or {}
     models = tuple(
-        get_source_model(name, **_builder_kwargs_for(name, params_cfg, species))
+        get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg=None))
         for name in names
     )
     return CombinedSourceModel(models)
@@ -286,8 +319,29 @@ def build_source_models_from_config(cfg: dict[str, Any], species: Any | None = N
         return None
 
     params_cfg = src_cfg.get("parameters", {})
-    density_src = _compose_sources(_as_name_list(src_cfg.get("density")), params_cfg, species)
-    temp_src = _compose_sources(_as_name_list(src_cfg.get("temperature")), params_cfg, species)
+    density_names = _as_name_list(src_cfg.get("density"))
+    temperature_names = _as_name_list(src_cfg.get("temperature"))
+
+    density_src = (
+        CombinedSourceModel(
+            tuple(
+                get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg))
+                for name in density_names
+            )
+        )
+        if density_names
+        else None
+    )
+    temp_src = (
+        CombinedSourceModel(
+            tuple(
+                get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg))
+                for name in temperature_names
+            )
+        )
+        if temperature_names
+        else None
+    )
 
     out: dict[str, SourceModelBase] = {}
     if density_src is not None:
