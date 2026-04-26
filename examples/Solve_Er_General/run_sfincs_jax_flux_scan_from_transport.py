@@ -531,9 +531,19 @@ def _launch_one_subprocess(
     script_path: Path,
     payload_path: Path,
     env: dict[str, str],
+    stream_output: bool,
 ) -> tuple[int, str, str]:
+    cmd = [sys.executable, str(script_path), "--worker-payload", str(payload_path)]
+    if stream_output:
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            text=True,
+            check=False,
+        )
+        return int(proc.returncode), "", ""
     proc = subprocess.run(
-        [sys.executable, str(script_path), "--worker-payload", str(payload_path)],
+        cmd,
         env=env,
         capture_output=True,
         text=True,
@@ -558,14 +568,17 @@ def _run_tasks_in_parallel(
         if str(args.backend).lower() == "gpu":
             gpu_id = gpu_ids[slot % len(gpu_ids)]
         env = _build_worker_env(args, gpu_id=gpu_id)
+        stream_output = bool(args.verbose_workers) and max_parallel == 1
         future = executor.submit(
             _launch_one_subprocess,
             script_path=script_path,
             payload_path=payload_path,
             env=env,
+            stream_output=stream_output,
         )
         future._codex_payload = payload_path  # type: ignore[attr-defined]
         future._codex_gpu_id = gpu_id  # type: ignore[attr-defined]
+        future._codex_stream_output = stream_output  # type: ignore[attr-defined]
         return future
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
@@ -582,6 +595,7 @@ def _run_tasks_in_parallel(
                 code, stdout, stderr = fut.result()
                 payload_path = getattr(fut, "_codex_payload", None)
                 gpu_id = getattr(fut, "_codex_gpu_id", None)
+                stream_output = getattr(fut, "_codex_stream_output", False)
                 label = str(payload_path) if payload_path is not None else "<payload>"
                 if code != 0:
                     msg = [
@@ -594,6 +608,11 @@ def _run_tasks_in_parallel(
                     if stderr.strip():
                         msg.append("stderr:\n" + stderr.strip())
                     raise RuntimeError("\n".join(msg))
+                if bool(args.verbose_workers) and not stream_output:
+                    if stdout.strip():
+                        print(f"[sfincs-worker stdout] {label}\n{stdout.strip()}", flush=True)
+                    if stderr.strip():
+                        print(f"[sfincs-worker stderr] {label}\n{stderr.strip()}", flush=True)
                 completed += 1
                 rho_value = None
                 if payload_path is not None:
@@ -604,7 +623,7 @@ def _run_tasks_in_parallel(
                         rho_value = None
                 rho_note = f" rho={rho_value:.4f}" if rho_value is not None else ""
                 gpu_note = f" gpu={gpu_id}" if gpu_id is not None else ""
-                print(f"[sfincs-scan] completed {completed}/{total}:{rho_note}{gpu_note}")
+                print(f"[sfincs-scan] completed {completed}/{total}:{rho_note}{gpu_note}", flush=True)
 
 
 def cmd_main(args: argparse.Namespace) -> int:
@@ -700,7 +719,7 @@ def cmd_main(args: argparse.Namespace) -> int:
         "[sfincs-scan] "
         f"selected {len(radius_indices)} radii over rho in [{rho_min_val:.4f}, {rho_max_val:.4f}] "
         f"({backend_note}, {parallel_note}, {placement_note})"
-    )
+    , flush=True)
 
     _run_tasks_in_parallel(
         task_payloads=task_payloads,
@@ -766,7 +785,7 @@ def cmd_main(args: argparse.Namespace) -> int:
             species=species,
         )
 
-    print(f"wrote {out_h5}")
+    print(f"wrote {out_h5}", flush=True)
     return 0
 
 
