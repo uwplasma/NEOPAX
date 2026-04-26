@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any
 
 import h5py
@@ -491,21 +492,28 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
     result_json = Path(payload["result_json"])
     wout_path = payload.get("wout_path")
     n_species = int(payload["n_species"])
+    benchmark_repeats = max(0, int(payload.get("benchmark_repeats", 0)))
+    benchmark_warmup = max(0, int(payload.get("benchmark_warmup", 0)))
 
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
     from sfincs_jax.io import read_sfincs_h5, write_sfincs_jax_output_h5
 
-    write_sfincs_jax_output_h5(
-        input_namelist=input_path,
-        output_path=output_path,
-        wout_path=None if wout_path in (None, "") else Path(wout_path),
-        compute_transport_matrix=False,
-        compute_solution=True,
-        overwrite=True,
-        verbose=bool(payload.get("verbose", False)),
-    )
+    solve_count = 1 if benchmark_repeats <= 0 else benchmark_warmup + benchmark_repeats
+    elapsed_s: list[float] = []
+    for _ in range(solve_count):
+        t0 = time.perf_counter()
+        write_sfincs_jax_output_h5(
+            input_namelist=input_path,
+            output_path=output_path,
+            wout_path=None if wout_path in (None, "") else Path(wout_path),
+            compute_transport_matrix=False,
+            compute_solution=True,
+            overwrite=True,
+            verbose=bool(payload.get("verbose", False)),
+        )
+        elapsed_s.append(time.perf_counter() - t0)
     results = read_sfincs_h5(output_path)
     gamma, q, upar, r_hat, meta = _extract_flux_triplet(results, n_species)
     summary = {
@@ -517,6 +525,17 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
         "Upar": upar.tolist(),
         "meta": meta,
     }
+    if benchmark_repeats > 0:
+        warm_runs = elapsed_s[benchmark_warmup:]
+        summary["benchmark"] = {
+            "warmup_runs": int(benchmark_warmup),
+            "repeats": int(benchmark_repeats),
+            "all_runs_s": [float(v) for v in elapsed_s],
+            "cold_run_s": float(elapsed_s[0]),
+            "warm_runs_s": [float(v) for v in warm_runs],
+            "warm_mean_s": float(np.mean(warm_runs)) if warm_runs else float("nan"),
+            "warm_min_s": float(np.min(warm_runs)) if warm_runs else float("nan"),
+        }
     with result_json.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     return 0
@@ -745,6 +764,8 @@ def cmd_main(args: argparse.Namespace) -> int:
             "wout_path": None if wout_path is None else str(wout_path),
             "n_species": len(species),
             "verbose": bool(args.verbose_workers),
+            "benchmark_repeats": int(args.benchmark_repeats),
+            "benchmark_warmup": int(args.benchmark_warmup),
         }
         payload_path = surface_dir / "payload.json"
         with payload_path.open("w", encoding="utf-8") as fh:
@@ -782,6 +803,7 @@ def cmd_main(args: argparse.Namespace) -> int:
     q_out = []
     upar_out = []
     raw_meta = {"Gamma_key": None, "Q_key": None, "Upar_key": None}
+    benchmark_rows: list[dict[str, Any]] = []
     for payload_path in sorted(task_payloads, key=lambda p: json.loads(p.read_text(encoding="utf-8"))["rho"]):
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         result_json = Path(payload["result_json"])
@@ -795,6 +817,14 @@ def cmd_main(args: argparse.Namespace) -> int:
         q_out.append(np.asarray(summary["Q"], dtype=np.float64))
         upar_out.append(np.asarray(summary["Upar"], dtype=np.float64))
         raw_meta = dict(summary.get("meta", raw_meta))
+        if "benchmark" in summary:
+            benchmark_rows.append(
+                {
+                    "rho": float(summary["rho"]),
+                    "radius_index": int(summary["radius_index"]),
+                    **dict(summary["benchmark"]),
+                }
+            )
 
     rho_arr = np.asarray(rho_out, dtype=np.float64)
     rhat_arr = np.asarray(rhat_out, dtype=np.float64)
@@ -835,6 +865,23 @@ def cmd_main(args: argparse.Namespace) -> int:
             "The saved coordinate r/rHat uses sfincs_jax's rHat output. "
             "rho is also saved separately from the source NEOPAX transport file."
         )
+        if benchmark_rows:
+            f.attrs["benchmark_note"] = (
+                "Timing benchmark mode was enabled. cold_run_s includes first-run JAX startup/compile effects; "
+                "warm_* fields are repeated same-process timings after the configured warmup runs."
+            )
+            f.create_dataset(
+                "benchmark_rho",
+                data=np.asarray([row["rho"] for row in benchmark_rows], dtype=np.float64),
+            )
+            f.create_dataset(
+                "benchmark_cold_run_s",
+                data=np.asarray([row["cold_run_s"] for row in benchmark_rows], dtype=np.float64),
+            )
+            f.create_dataset(
+                "benchmark_warm_mean_s",
+                data=np.asarray([row["warm_mean_s"] for row in benchmark_rows], dtype=np.float64),
+            )
 
     if bool(args.plot):
         _write_summary_plots(
@@ -845,6 +892,18 @@ def cmd_main(args: argparse.Namespace) -> int:
             upar=upar_arr,
             species=species,
         )
+
+    if benchmark_rows:
+        print("[sfincs-scan] benchmark summary (same-worker repeated solves):", flush=True)
+        for row in benchmark_rows:
+            print(
+                "[sfincs-scan] "
+                f"rho={float(row['rho']):.4f} cold={float(row['cold_run_s']):.3f}s "
+                f"warm_mean={float(row['warm_mean_s']):.3f}s "
+                f"warm_min={float(row['warm_min_s']):.3f}s "
+                f"repeats={int(row['repeats'])}",
+                flush=True,
+            )
 
     print(f"wrote {out_h5}", flush=True)
     return 0
@@ -887,6 +946,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids for backend=gpu.")
     p.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent sfincs_jax runs.")
     p.add_argument("--cores-per-run", type=int, default=1, help="CPU cores per run for backend=cpu.")
+    p.add_argument(
+        "--benchmark-repeats",
+        type=int,
+        default=0,
+        help="Repeat each selected surface this many extra times inside one worker and report warm timings.",
+    )
+    p.add_argument(
+        "--benchmark-warmup",
+        type=int,
+        default=1,
+        help="Number of same-worker warmup solves to discard before benchmark repeats.",
+    )
     p.add_argument("--plot", action="store_true", help="Write PNG plots of Gamma, Q, and Upar versus rho.")
     p.add_argument("--verbose-workers", action="store_true", help="Allow verbose sfincs_jax worker logging.")
     p.add_argument("--worker-payload", default=None, help=argparse.SUPPRESS)
