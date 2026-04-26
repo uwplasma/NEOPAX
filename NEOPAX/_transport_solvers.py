@@ -373,6 +373,8 @@ def _project_packed_transport_state_arrays(
     fixed_temperature_profile: Any = None,
 ) -> Any:
     """Project packed solver arrays without rebuilding a full TransportState."""
+    from ._state import safe_density
+
     if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
 
@@ -400,7 +402,7 @@ def _project_packed_transport_state_arrays(
     fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure.dtype)
     active_mask = active_mask.reshape((1,) * (pressure.ndim - 2) + (active_mask.shape[0], 1))
     fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure.shape)
-    fixed_pressure = full_density * fixed_temperature
+    fixed_pressure = safe_density(full_density) * fixed_temperature
     projected_pressure = jnp.where(active_mask, pressure, fixed_pressure)
     return (density, projected_pressure, er)
 

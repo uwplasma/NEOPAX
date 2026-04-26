@@ -92,7 +92,12 @@ def enforce_quasi_neutrality(state, species):
     return dataclasses.replace(state, density=density)
 
 
-def project_fixed_temperature_species(state, temperature_active_mask=None, fixed_temperature_profile=None):
+def project_fixed_temperature_species(
+    state,
+    temperature_active_mask=None,
+    fixed_temperature_profile=None,
+    density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+):
     """
     Keep the closure temperature fixed for species whose temperature equation
     is disabled by projecting pressure = n * T_fixed on the working state.
@@ -105,7 +110,7 @@ def project_fixed_temperature_species(state, temperature_active_mask=None, fixed
         active_mask = active_mask[None]
     active_mask = active_mask[:, None]
     fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=state.pressure.dtype)
-    fixed_pressure = state.density * fixed_temperature
+    fixed_pressure = safe_density(state.density, density_floor) * fixed_temperature
     pressure = jnp.where(active_mask, state.pressure, fixed_pressure)
     return dataclasses.replace(state, pressure=pressure)
 

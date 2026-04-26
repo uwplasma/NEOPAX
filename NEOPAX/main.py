@@ -39,7 +39,7 @@ from ._source_models import (
     sum_source_components,
 )
 from ._species import Species
-from ._state import TransportState
+from ._state import TransportState, safe_density
 from ._transport_flux_models import (
     FluxesRFileTransportModel,
     ZeroTransportModel,
@@ -173,9 +173,19 @@ def _build_state(config: dict, geometry, n_species: int):
     if geometry is None:
         return None
     profile_set = build_profiles(config.get("profiles", {}), geometry, n_species)
+    density_state = profile_set.density / 1.0e20
+    density_floor = float(
+        config.get("transport_solver", {}).get(
+            "density_floor",
+            config.get("solver", {}).get("density_floor", 1.0e-6),
+        )
+    )
     return TransportState(
-        density=profile_set.density / 1.0e20,
-        pressure=(profile_set.temperature / 1.0e3) * (profile_set.density / 1.0e20),
+        density=density_state,
+        # Keep configured temperatures well-defined even when a species starts at
+        # zero concentration, so downstream Er initialization does not collapse
+        # that species to T=0 through the pressure/density representation.
+        pressure=(profile_set.temperature / 1.0e3) * safe_density(density_state, density_floor),
         Er=profile_set.Er,
     )
 
@@ -514,6 +524,11 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
+        )
+        print(
+            "[NEOPAX] initial transport Er state:",
+            f"min={float(jnp.min(state.Er)):.6e}",
+            f"max={float(jnp.max(state.Er)):.6e}",
         )
         if hasattr(runtime.geometry, "Vprime") and hasattr(runtime.geometry, "r_grid"):
             total_volume = float(
@@ -1313,6 +1328,19 @@ def plot_transport_solution(
     ts = getattr(solution, "ts", None)
     if ts is None and isinstance(solution, dict):
         ts = solution.get("ts")
+    accepted_mask = getattr(solution, "accepted_mask", None)
+    if accepted_mask is None and isinstance(solution, dict):
+        accepted_mask = solution.get("accepted_mask")
+
+    def _valid_time_indices(n_saved):
+        if accepted_mask is not None:
+            mask_arr = jnp.asarray(accepted_mask, dtype=bool)
+            if mask_arr.ndim == 1 and mask_arr.shape[0] == n_saved:
+                idxs = jnp.nonzero(mask_arr, size=n_saved, fill_value=-1)[0]
+                idxs = idxs[idxs >= 0]
+                if idxs.size > 0:
+                    return idxs
+        return jnp.arange(n_saved)
 
     def _select_time_slices(arr, kind):
         if arr is None:
@@ -1329,11 +1357,16 @@ def plot_transport_solution(
                 return [(None, arr)]
             if arr.ndim == 2:
                 n_saved = arr.shape[0]
+                valid_idxs = _valid_time_indices(n_saved)
+                n_valid = int(valid_idxs.shape[0])
+                if n_valid == 0:
+                    return []
                 if int(n_times) < 0:
-                    n_pick = n_saved
+                    pick_pos = jnp.arange(n_valid)
                 else:
-                    n_pick = max(1, min(int(n_times), n_saved))
-                idxs = jnp.linspace(0, n_saved - 1, n_pick).round().astype(int)
+                    n_pick = max(1, min(int(n_times), n_valid))
+                    pick_pos = jnp.linspace(0, n_valid - 1, n_pick).round().astype(int)
+                idxs = valid_idxs[pick_pos]
                 idxs = jnp.unique(idxs)
                 labels = None
                 if ts is not None:
@@ -1351,11 +1384,16 @@ def plot_transport_solution(
         # time x species x rho
         if arr.ndim >= 3:
             n_saved = arr.shape[0]
+            valid_idxs = _valid_time_indices(n_saved)
+            n_valid = int(valid_idxs.shape[0])
+            if n_valid == 0:
+                return []
             if int(n_times) < 0:
-                n_pick = n_saved
+                pick_pos = jnp.arange(n_valid)
             else:
-                n_pick = max(1, min(int(n_times), n_saved))
-            idxs = jnp.linspace(0, n_saved - 1, n_pick).round().astype(int)
+                n_pick = max(1, min(int(n_times), n_valid))
+                pick_pos = jnp.linspace(0, n_valid - 1, n_pick).round().astype(int)
+            idxs = valid_idxs[pick_pos]
             idxs = jnp.unique(idxs)
             labels = None
             if ts is not None:
