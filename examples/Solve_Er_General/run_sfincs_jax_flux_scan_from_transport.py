@@ -510,6 +510,8 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if args.dense_fp_max is not None:
+        env["SFINCS_JAX_RHSMODE1_DENSE_FP_MAX"] = str(int(args.dense_fp_max))
     if str(args.backend).lower() == "gpu":
         # On NVIDIA-backed JAX installs, using the generic "gpu" alias can
         # still let JAX probe other accelerator backends such as ROCm. Force
@@ -1116,6 +1118,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nl", type=int, default=3, help="Override NL. Default: 3.")
     p.add_argument("--nx", type=int, default=5, help="Override Nx. Default: 5.")
     p.add_argument("--solver-tolerance", type=float, default=1.0e-6, help="Override solverTolerance. Default: 1e-6.")
+    p.add_argument(
+        "--dense-fp-max",
+        type=int,
+        default=None,
+        help="Set SFINCS_JAX_RHSMODE1_DENSE_FP_MAX for worker processes.",
+    )
     p.add_argument("--backend", choices=("cpu", "gpu"), default="cpu", help="Parallel execution backend.")
     p.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids for backend=gpu.")
     p.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent sfincs_jax runs.")
