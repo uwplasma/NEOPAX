@@ -37,6 +37,8 @@ from typing import Any
 
 import h5py
 import numpy as np
+from scipy.constants import elementary_charge, proton_mass
+from netCDF4 import Dataset
 
 try:
     import tomllib
@@ -46,6 +48,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_SPECTRAX_ROOT = Path(__file__).resolve().parents[3] / "SPECTRAX-GK"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "spectrax_flux_scan"
+NEOPAX_DENSITY_REFERENCE_M3 = 1.0e20
+NEOPAX_TEMPERATURE_REFERENCE_EV = 1.0e3
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,65 @@ def _infer_transport_snapshot(h5_path: Path, *, time_index: int) -> ProfileSnaps
     raise KeyError("This HDF5 file does not look like a NEOPAX transport_solution.h5 output")
 
 
+def _match_species_factors(raw: Any, n_species: int, *, default: float) -> np.ndarray:
+    if raw is None:
+        return np.full((n_species,), float(default), dtype=np.float64)
+    if isinstance(raw, (int, float)):
+        return np.full((n_species,), float(raw), dtype=np.float64)
+    arr = np.asarray(list(raw), dtype=np.float64)
+    if arr.size == 1:
+        return np.full((n_species,), float(arr[0]), dtype=np.float64)
+    if arr.size != n_species:
+        raise ValueError(f"Expected {n_species} profile factors, got {arr.size}")
+    return arr
+
+
+def _build_standard_analytical_snapshot(
+    cfg: dict[str, Any],
+    *,
+    n_species: int,
+    n_radial: int,
+) -> ProfileSnapshot:
+    profile_cfg = cfg.get("profiles", {})
+    rho = np.linspace(0.0, 1.0, int(n_radial), dtype=np.float64)
+
+    n0 = float(profile_cfg.get("n0", profile_cfg.get("ni0", profile_cfg.get("ne0", 4.21))))
+    n_edge = float(profile_cfg.get("n_edge", profile_cfg.get("nib", profile_cfg.get("neb", 0.6))))
+    t0 = float(profile_cfg.get("T0", profile_cfg.get("ti0", profile_cfg.get("te0", 17.8))))
+    t_edge = float(profile_cfg.get("T_edge", profile_cfg.get("tib", profile_cfg.get("teb", 0.7))))
+    density_shape_power = float(profile_cfg.get("density_shape_power", 2.0))
+    temperature_shape_power = float(profile_cfg.get("temperature_shape_power", 2.0))
+
+    c_density = profile_cfg.get("c_density")
+    if c_density is None and n_species == 3:
+        deuterium_ratio = float(profile_cfg.get("deuterium_ratio", 0.5))
+        tritium_ratio = float(profile_cfg.get("tritium_ratio", 0.5))
+        c_density = [1.0, deuterium_ratio, tritium_ratio]
+
+    density_species_scale = _match_species_factors(c_density, n_species, default=1.0)
+    temperature_species_scale = _match_species_factors(profile_cfg.get("c_temperature"), n_species, default=1.0)
+    density_global_scale = _match_species_factors(profile_cfg.get("n_scale", 1.0), n_species, default=1.0)
+    temperature_global_scale = _match_species_factors(profile_cfg.get("T_scale", 1.0), n_species, default=1.0)
+
+    density_base = n_edge + (n0 - n_edge) * (1.0 - rho**density_shape_power)
+    temperature_base = t_edge + (t0 - t_edge) * (1.0 - rho**temperature_shape_power)
+    density = density_species_scale[:, None] * density_global_scale[:, None] * density_base[None, :]
+    temperature = temperature_species_scale[:, None] * temperature_global_scale[:, None] * temperature_base[None, :]
+
+    er0_scale = float(profile_cfg.get("er0_scale", 100.0))
+    er0_peak_rho = float(profile_cfg.get("er0_peak_rho", 0.8))
+    width = max(0.05, 0.35 * max(er0_peak_rho, 1.0 - er0_peak_rho, 0.15))
+    er = er0_scale * rho * np.exp(-0.5 * ((rho - er0_peak_rho) / width) ** 2)
+
+    return ProfileSnapshot(
+        rho=np.asarray(rho, dtype=np.float64),
+        density=np.asarray(density, dtype=np.float64),
+        temperature=np.asarray(temperature, dtype=np.float64),
+        er=np.asarray(er, dtype=np.float64),
+        time_value=None,
+    )
+
+
 def _infer_ntss_snapshot(h5_path: Path, species: list[SpeciesMeta]) -> ProfileSnapshot:
     density_map = {
         "e": "ne",
@@ -187,6 +250,61 @@ def _safe_log_gradient_torflux(values: np.ndarray, rho: np.ndarray, *, floor: fl
     return -np.gradient(logr, torflux, edge_order=2)
 
 
+def _infer_vmec_minor_radius(vmec_path: str) -> float:
+    with Dataset(vmec_path, mode="r") as vfile:
+        if "Aminor_p" in vfile.variables:
+            return float(vfile.variables["Aminor_p"][:])
+        if "volume_p" in vfile.variables and "Rmajor_p" in vfile.variables:
+            volume_p = float(vfile.variables["volume_p"][:])
+            r_major = float(vfile.variables["Rmajor_p"][:])
+            return float(np.sqrt(volume_p / (2.0 * np.pi**2 * r_major)))
+    raise KeyError(f"Could not infer minor radius from VMEC file {vmec_path}")
+
+
+def _infer_local_rho_star(
+    *,
+    vmec_path: str,
+    booz_path: str | None,
+    a_minor: float | None,
+    rho_value: float,
+    temperature_keV: float,
+    mass_mp: float,
+    charge_qp: float,
+) -> float:
+    with Dataset(vmec_path, mode="r") as vfile:
+        if a_minor is None:
+            a_minor = _infer_vmec_minor_radius(vmec_path)
+        b0_scalar = float(vfile.variables["b0"][:]) if "b0" in vfile.variables else float("nan")
+        ns = int(np.asarray(vfile.variables["ns"][:]).reshape(())) if "ns" in vfile.variables else None
+
+    b_ref = b0_scalar
+    if booz_path is not None and ns is not None:
+        try:
+            with Dataset(booz_path, mode="r") as bfile:
+                bmnc_b = np.asarray(bfile.variables["bmnc_b"][:], dtype=float)
+                ixm_b = np.asarray(bfile.variables["ixm_b"][:], dtype=int)
+                ixn_b = np.asarray(bfile.variables["ixn_b"][:], dtype=int)
+            mode00 = None
+            for idx in range(ixm_b.size):
+                if int(ixm_b[idx]) == 0 and int(ixn_b[idx]) == 0:
+                    mode00 = idx
+                    break
+            if mode00 is not None:
+                s_half = (np.arange(ns, dtype=float) - 0.5) / float(ns - 1)
+                rho_half = np.sqrt(np.clip(s_half[1:], 0.0, None))
+                b00 = np.asarray(bmnc_b[:, mode00], dtype=float)
+                b_ref = float(np.interp(float(rho_value), rho_half, b00, left=b00[0], right=b00[-1]))
+        except Exception:
+            b_ref = b0_scalar
+
+    temperature_eV = float(temperature_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
+    mass_kg = float(mass_mp) * proton_mass
+    vth = float(np.sqrt(2.0 * temperature_eV * elementary_charge / mass_kg))
+    omega_c = float(abs(charge_qp) * elementary_charge * b_ref / mass_kg)
+    rho_i = vth / omega_c
+    return float(rho_i / a_minor)
+
+
 def _select_reference_ion_index(species: list[SpeciesMeta], preferred_name: str | None = None) -> int:
     if preferred_name is not None:
         key = _canonical_species_key(preferred_name)
@@ -227,6 +345,7 @@ def _choose_radius_indices(
                 raise IndexError(f"rho index {idx} out of range [0, {rho.size - 1}]")
         return idxs
     mask = (rho >= float(rho_min)) & (rho <= float(rho_max))
+    mask &= ~np.isclose(rho, 0.0, atol=1.0e-8)
     candidates = np.where(mask)[0]
     if candidates.size == 0:
         raise ValueError("No radii satisfy the requested rho range")
@@ -290,6 +409,7 @@ def _build_manifest(
         ])
 
     ref_idx = _select_reference_ion_index(species, preferred_name=reference_ion)
+    ref_species = species[ref_idx]
     ref_density = np.maximum(density[ref_idx], float(args.density_floor))
     ref_temperature = np.maximum(temperature[ref_idx], float(args.temperature_floor))
 
@@ -308,6 +428,7 @@ def _build_manifest(
         cfg = _load_toml(neopax_config)
         geometry_cfg = cfg.get("geometry", {})
         booz_path = _resolve_relative(neopax_root, geometry_cfg.get("boozer_file"))
+    a_minor = _infer_vmec_minor_radius(vmec_path)
 
     electron_idx = None
     for idx, sp in enumerate(species):
@@ -354,6 +475,8 @@ def _build_manifest(
                     "nu": float(args.nu_electron if is_electron else args.nu_ion),
                     "density_physical": float(density[sp_idx, rho_idx]),
                     "temperature_physical": float(temperature[sp_idx, rho_idx]),
+                    "density_reference_physical": ref_n,
+                    "temperature_reference_physical": ref_t,
                 }
             )
 
@@ -364,6 +487,20 @@ def _build_manifest(
         elif str(electron_model).lower() == "adiabatic":
             tau_e = float(args.tau_e_override)
 
+        rho_star_physical = (
+            float(args.rho_star_physical)
+            if args.rho_star_physical is not None
+            else _infer_local_rho_star(
+                vmec_path=vmec_path,
+                booz_path=booz_path,
+                a_minor=a_minor,
+                rho_value=rho_val,
+                temperature_keV=ref_t,
+                mass_mp=float(ref_species.mass_mp),
+                charge_qp=float(ref_species.charge),
+            )
+        )
+
         base_name = f"rho_{rho_idx:03d}_r{rho_val:.4f}".replace(".", "p")
         output_prefix = str((output_dir / base_name).resolve())
         geometry_file = str((generated_geom_dir / f"{base_name}.eik.nc").resolve())
@@ -372,18 +509,22 @@ def _build_manifest(
                 "index": ordinal,
                 "rho_index": int(rho_idx),
                 "rho": rho_val,
+                "r_physical": float(a_minor * rho_val),
                 "torflux": torflux,
                 "Er": float(er[rho_idx]),
                 "output_prefix": output_prefix,
                 "geometry_file": geometry_file,
                 "runtime_species": runtime_species,
                 "tau_e": tau_e,
+                "rho_star_physical": rho_star_physical,
+                "a_minor": float(a_minor),
             }
         )
 
     return {
         "schema_version": 1,
-        "neopax_result": str(neopax_result.resolve()),
+        "profiles_source": str(args.profiles_source).lower(),
+        "neopax_result": "" if neopax_result is None else str(neopax_result.resolve()),
         "neopax_config": str(neopax_config.resolve()),
         "spectrax_root": str(spectrax_root.resolve()),
         "output_dir": str(output_dir.resolve()),
@@ -436,6 +577,12 @@ def _build_manifest(
         "normalization": {
             "contract": str(args.normalization_contract),
             "diagnostic_norm": str(args.diagnostic_norm),
+            "rho_star_physical": None if args.rho_star_physical is None else float(args.rho_star_physical),
+            "reference_species_name": str(ref_species.name),
+            "reference_species_index": int(ref_idx),
+            "density_normalization": "n_s / n_ref_ion(rho)",
+            "temperature_normalization": "T_s / T_ref_ion(rho)",
+            "gradient_definition": "tprim/fprim are computed from physical profiles before normalization.",
         },
         "terms": {
             "streaming": 1.0,
@@ -471,6 +618,7 @@ def _build_manifest(
             "alpha": float(args.alpha),
             "npol": float(args.npol),
             "geometry_backend": "internal",
+            "a_minor": float(a_minor),
         },
         "species_meta": [
             {"name": sp.name, "charge": sp.charge, "mass_mp": sp.mass_mp}
@@ -510,6 +658,9 @@ def _build_normalization_audit_rows(manifest: dict[str, Any]) -> list[dict[str, 
     electron_model = str(manifest["electron_model"])
     gradient_coordinate = str(manifest.get("gradient_mapping", {}).get("coordinate", "rho"))
     gradient_scale = float(manifest.get("gradient_mapping", {}).get("scale", 1.0))
+    normalization = manifest.get("normalization", {})
+    ref_species_name = str(normalization.get("reference_species_name", ""))
+    ref_species_index = int(normalization.get("reference_species_index", -1))
     for run in manifest["runs"]:
         rho = float(run["rho"])
         torflux = float(run["torflux"])
@@ -535,6 +686,10 @@ def _build_normalization_audit_rows(manifest: dict[str, Any]) -> list[dict[str, 
                     "mass_mp": float(sp["mass"]),
                     "density_physical": float(sp["density_physical"]),
                     "temperature_physical": float(sp["temperature_physical"]),
+                    "reference_species_name": ref_species_name,
+                    "reference_species_index": ref_species_index,
+                    "reference_density_physical": float(sp["density_reference_physical"]),
+                    "reference_temperature_physical": float(sp["temperature_reference_physical"]),
                     "density_normalized_to_ref_ion": float(sp["density"]),
                     "temperature_normalized_to_ref_ion": float(sp["temperature"]),
                     "gradient_coordinate": gradient_coordinate,
@@ -716,14 +871,27 @@ def _build_runtime_config_from_manifest(manifest: dict[str, Any], run_spec: dict
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    neopax_result = Path(args.neopax_result).resolve()
     neopax_config = Path(args.neopax_config).resolve()
     spectrax_root = Path(args.spectrax_root).resolve()
     output_dir = Path(args.output_dir).resolve()
 
     cfg = _load_toml(neopax_config)
     species = _parse_species_from_neopax_config(cfg)
-    snapshot = load_neopax_snapshot(neopax_result, species, time_index=int(args.time_index))
+    profiles_source = str(args.profiles_source).strip().lower()
+    if profiles_source == "analytical":
+        snapshot = _build_standard_analytical_snapshot(
+            cfg,
+            n_species=len(species),
+            n_radial=int(args.analytical_n_radii),
+        )
+        neopax_result: Path | None = None
+    elif profiles_source == "transport_h5":
+        if args.neopax_result is None:
+            raise ValueError("--neopax-result is required when --profiles-source=transport_h5")
+        neopax_result = Path(args.neopax_result).resolve()
+        snapshot = load_neopax_snapshot(neopax_result, species, time_index=int(args.time_index))
+    else:
+        raise ValueError("--profiles-source must be 'transport_h5' or 'analytical'")
     rho_indices = _choose_radius_indices(
         snapshot.rho,
         explicit=_parse_index_list(args.rho_indices),
@@ -751,7 +919,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     print(f"Wrote manifest: {manifest_path}")
     print(f"Wrote run table: {csv_path}")
     print(f"Wrote normalization audit: {output_dir / 'normalization_audit.csv'}")
-    print(f"Prepared {len(manifest['runs'])} SPECTRAX-GK runs from {neopax_result.name}")
+    source_label = "analytical profiles from TOML" if neopax_result is None else neopax_result.name
+    print(f"Prepared {len(manifest['runs'])} SPECTRAX-GK runs from {source_label}")
     return 0
 
 
@@ -912,15 +1081,119 @@ def _read_last_row_csv(path: Path) -> dict[str, float]:
     return out
 
 
+def _read_diagnostics_csv(path: Path) -> dict[str, np.ndarray]:
+    data = np.genfromtxt(path, delimiter=",", names=True, dtype=float)
+    if data.size == 0:
+        raise ValueError(f"No rows found in diagnostics CSV {path}")
+    if getattr(data, "shape", ()) == ():
+        data = np.asarray([data], dtype=data.dtype)
+    out: dict[str, np.ndarray] = {}
+    for name in data.dtype.names or ():
+        out[str(name)] = np.asarray(data[name], dtype=float)
+    return out
+
+
+def _time_average_columns(
+    columns: dict[str, np.ndarray],
+    *,
+    average_window: float,
+    t_final_override: float | None,
+) -> tuple[dict[str, float], float, float]:
+    if "t" not in columns:
+        raise KeyError("Diagnostics CSV must contain a 't' column for time averaging")
+    times = np.asarray(columns["t"], dtype=float)
+    if times.size == 0:
+        raise ValueError("Diagnostics CSV has an empty time axis")
+    t_end_data = float(times[-1])
+    t_end = t_end_data if t_final_override is None else float(t_final_override)
+    if float(average_window) <= 0.0:
+        raise ValueError("--average-window must be > 0")
+    t_start = max(float(times[0]), t_end - float(average_window))
+    mask = times >= t_start
+    if not np.any(mask):
+        mask[-1] = True
+    out: dict[str, float] = {}
+    for name, values in columns.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim != 1:
+            continue
+        out[name] = float(np.nanmean(arr[mask]))
+    return out, t_start, t_end
+
+
+def _write_summary_plots(
+    *,
+    output_dir: Path,
+    rho: np.ndarray,
+    species_names: list[str],
+    gamma: np.ndarray,
+    q: np.ndarray,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "Plotting was requested but matplotlib is not installed."
+        ) from exc
+
+    traces = (
+        ("Gamma", np.asarray(gamma, dtype=np.float64), output_dir / "Gamma_vs_rho.png"),
+        ("Q", np.asarray(q, dtype=np.float64), output_dir / "Q_vs_rho.png"),
+    )
+
+    for label, values, path in traces:
+        fig, ax = plt.subplots(figsize=(7.0, 4.5), constrained_layout=True)
+        for i, name in enumerate(species_names):
+            ax.plot(rho, values[i], marker="o", linewidth=1.5, markersize=4.0, label=name)
+        ax.set_xlabel("rho")
+        ax.set_ylabel(label)
+        ax.set_title(f"{label} from SPECTRAX radial scan")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+
+
+def _thermal_speed_ms(temperature_keV: float, mass_mp: float) -> float:
+    temp_eV = float(temperature_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
+    mass_kg = float(mass_mp) * proton_mass
+    return float(np.sqrt(2.0 * temp_eV * elementary_charge / mass_kg))
+
+
+def _spectrax_flux_to_neopax_units(
+    flux_gb: float,
+    *,
+    density_ref_state: float,
+    temperature_ref_keV: float,
+    mass_ref_mp: float,
+    rho_star_physical: float,
+    kind: str,
+) -> float:
+    n_ref_m3 = float(density_ref_state) * NEOPAX_DENSITY_REFERENCE_M3
+    t_ref_eV = float(temperature_ref_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
+    vth_ref = _thermal_speed_ms(float(temperature_ref_keV), float(mass_ref_mp))
+    if kind == "Gamma":
+        scale = n_ref_m3 * vth_ref * float(rho_star_physical) ** 2
+    elif kind == "Q":
+        scale = n_ref_m3 * t_ref_eV * vth_ref * float(rho_star_physical) ** 2
+    else:
+        raise ValueError(f"Unknown flux kind {kind!r}")
+    return float(flux_gb) * float(scale)
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     manifest = _load_manifest(Path(args.manifest).resolve())
     runs = manifest["runs"]
-    species_names = list(manifest["runtime_species_names"])
+    species_meta = list(manifest.get("species_meta", []))
+    species_names = [str(sp["name"]) for sp in species_meta] if species_meta else list(manifest["runtime_species_names"])
+    runtime_species_names = list(manifest["runtime_species_names"])
+    runtime_to_full = {name: idx for idx, name in enumerate(species_names)}
     out_h5 = Path(args.out).resolve()
     out_h5.parent.mkdir(parents=True, exist_ok=True)
 
     n = len(runs)
     rho = np.full(n, np.nan, dtype=float)
+    r_physical = np.full(n, np.nan, dtype=float)
     rho_index = np.full(n, -1, dtype=int)
     torflux = np.full(n, np.nan, dtype=float)
     er = np.full(n, np.nan, dtype=float)
@@ -928,9 +1201,20 @@ def cmd_collect(args: argparse.Namespace) -> int:
     particle_flux = np.full(n, np.nan, dtype=float)
     heat_flux_species = np.full((n, len(species_names)), np.nan, dtype=float)
     particle_flux_species = np.full((n, len(species_names)), np.nan, dtype=float)
+    average_window_used = np.full(n, np.nan, dtype=float)
+    average_t_start = np.full(n, np.nan, dtype=float)
+    average_t_end = np.full(n, np.nan, dtype=float)
+    gamma_neopax = np.full((len(species_names), n), np.nan, dtype=float)
+    q_neopax = np.full((len(species_names), n), np.nan, dtype=float)
+
+    requested_t_final = args.t_final
+    if requested_t_final is None:
+        requested_t_final = manifest.get("time", {}).get("t_max")
+    requested_t_final = None if requested_t_final is None else float(requested_t_final)
 
     for i, run in enumerate(runs):
         rho[i] = float(run["rho"])
+        r_physical[i] = float(run.get("r_physical", run.get("a_minor", 1.0) * run["rho"]))
         rho_index[i] = int(run["rho_index"])
         torflux[i] = float(run["torflux"])
         er[i] = float(run["Er"])
@@ -938,20 +1222,60 @@ def cmd_collect(args: argparse.Namespace) -> int:
         if not diag_csv.exists():
             print(f"skipping missing diagnostics: {diag_csv}")
             continue
-        row = _read_last_row_csv(diag_csv)
+        columns = _read_diagnostics_csv(diag_csv)
+        row, t_start_used, t_end_used = _time_average_columns(
+            columns,
+            average_window=float(args.average_window),
+            t_final_override=requested_t_final,
+        )
+        average_window_used[i] = float(args.average_window)
+        average_t_start[i] = t_start_used
+        average_t_end[i] = t_end_used
         heat_flux[i] = row.get("heat_flux", math.nan)
         particle_flux[i] = row.get("particle_flux", math.nan)
-        for s_idx, _name in enumerate(species_names):
-            heat_flux_species[i, s_idx] = row.get(f"heat_flux_s{s_idx}", math.nan)
-            particle_flux_species[i, s_idx] = row.get(f"particle_flux_s{s_idx}", math.nan)
+        ref_name = str(manifest.get("normalization", {}).get("reference_species_name", ""))
+        ref_runtime_species = next(
+            (sp for sp in run["runtime_species"] if str(sp.get("name", "")).strip().lower() == ref_name.strip().lower()),
+            run["runtime_species"][0],
+        )
+        rho_star_physical = float(run.get("rho_star_physical", 1.0))
+        a_minor = float(run.get("a_minor", manifest.get("geometry", {}).get("a_minor", 1.0)))
+        for runtime_idx, runtime_name in enumerate(runtime_species_names):
+            full_idx = runtime_to_full.get(runtime_name)
+            if full_idx is None:
+                continue
+            heat_flux_species[i, full_idx] = row.get(f"heat_flux_s{runtime_idx}", math.nan)
+            particle_flux_species[i, full_idx] = row.get(f"particle_flux_s{runtime_idx}", math.nan)
+            q_neopax[full_idx, i] = _spectrax_flux_to_neopax_units(
+                heat_flux_species[i, full_idx],
+                density_ref_state=float(ref_runtime_species["density_reference_physical"]),
+                temperature_ref_keV=float(ref_runtime_species["temperature_reference_physical"]),
+                mass_ref_mp=float(ref_runtime_species["mass"]),
+                rho_star_physical=rho_star_physical,
+                kind="Q",
+            )
+            gamma_neopax[full_idx, i] = _spectrax_flux_to_neopax_units(
+                particle_flux_species[i, full_idx],
+                density_ref_state=float(ref_runtime_species["density_reference_physical"]),
+                temperature_ref_keV=float(ref_runtime_species["temperature_reference_physical"]),
+                mass_ref_mp=float(ref_runtime_species["mass"]),
+                rho_star_physical=rho_star_physical,
+                kind="Gamma",
+            )
+        q_neopax[:, i] *= a_minor
+        gamma_neopax[:, i] *= a_minor
 
     with h5py.File(out_h5, "w") as f:
         f.create_dataset("rho", data=rho)
+        f.create_dataset("r", data=r_physical)
         f.create_dataset("rho_index", data=rho_index)
         f.create_dataset("torflux", data=torflux)
         f.create_dataset("Er", data=er)
         f.create_dataset("heat_flux_total", data=heat_flux)
         f.create_dataset("particle_flux_total", data=particle_flux)
+        f.create_dataset("average_window", data=average_window_used)
+        f.create_dataset("average_t_start", data=average_t_start)
+        f.create_dataset("average_t_end", data=average_t_end)
         grp = f.create_group("species")
         dt = h5py.string_dtype(encoding="utf-8")
         grp.create_dataset("names", data=np.asarray(species_names, dtype=object), dtype=dt)
@@ -962,8 +1286,50 @@ def cmd_collect(args: argparse.Namespace) -> int:
         meta.attrs["electron_model"] = str(manifest["electron_model"])
         meta.attrs["neopax_result"] = str(manifest["neopax_result"])
         meta.attrs["neopax_config"] = str(manifest["neopax_config"])
+        meta.attrs["average_window"] = float(args.average_window)
+        if manifest.get("normalization", {}).get("rho_star_physical", None) is not None:
+            meta.attrs["rho_star_physical_override"] = float(manifest["normalization"]["rho_star_physical"])
+        if requested_t_final is not None:
+            meta.attrs["t_final_requested"] = requested_t_final
+
+    neopax_flux_out = Path(args.neopax_flux_out).resolve()
+    neopax_flux_out.parent.mkdir(parents=True, exist_ok=True)
+    order = np.argsort(rho)
+    rho_sorted = rho[order]
+    r_sorted = r_physical[order]
+    gamma_sorted = gamma_neopax[:, order]
+    q_sorted = q_neopax[:, order]
+    with h5py.File(neopax_flux_out, "w") as f:
+        f.create_dataset("rho", data=rho_sorted)
+        f.create_dataset("r", data=r_sorted)
+        f.create_dataset("Gamma", data=gamma_sorted)
+        f.create_dataset("Q", data=q_sorted)
+        f.create_dataset("Upar", data=np.zeros_like(gamma_sorted))
+        meta = f.create_group("meta")
+        dt = h5py.string_dtype(encoding="utf-8")
+        meta.create_dataset("species_names", data=np.asarray(species_names, dtype=object), dtype=dt)
+        meta.attrs["particle_flux_units"] = "m^-2 s^-1"
+        meta.attrs["heat_flux_units"] = "eV m^-2 s^-1"
+        meta.attrs["rho_star_source"] = "per-radius VMEC/profile derived" if manifest.get("normalization", {}).get("rho_star_physical", None) is None else "manual override"
+        if manifest.get("normalization", {}).get("rho_star_physical", None) is not None:
+            meta.attrs["rho_star_physical_override"] = float(manifest["normalization"]["rho_star_physical"])
+        meta.attrs["minor_radius_m"] = float(manifest.get("geometry", {}).get("a_minor", 1.0))
+        meta.attrs["radial_flux_coordinate"] = "saved Gamma/Q are converted to the physical minor-radius coordinate r = a*rho"
+        meta.attrs["conversion"] = "Gamma_r = a * Gamma_rho = a * Gamma_gB * n_ref[m^-3] * vth_ref[m/s] * rho_star^2; Q_r = a * Q_rho = a * Q_gB * T_ref[eV] * n_ref[m^-3] * vth_ref[m/s] * rho_star^2"
+        meta.attrs["reference_species_name"] = str(manifest.get("normalization", {}).get("reference_species_name", ""))
+        meta.attrs["manifest"] = str(Path(args.manifest).resolve())
+
+    if bool(args.plot):
+        _write_summary_plots(
+            output_dir=neopax_flux_out.parent,
+            rho=rho_sorted,
+            species_names=species_names,
+            gamma=gamma_sorted,
+            q=q_sorted,
+        )
 
     print(f"Wrote collected flux summary: {out_h5}")
+    print(f"Wrote NEOPAX flux profile: {neopax_flux_out}")
     return 0
 
 
@@ -972,11 +1338,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     prep = sub.add_parser("prepare", help="Create a SPECTRAX run manifest from a NEOPAX result")
-    prep.add_argument("--neopax-result", required=True, help="Path to a NEOPAX HDF5 result file")
+    prep.add_argument("--profiles-source", choices=("transport_h5", "analytical"), default="transport_h5")
+    prep.add_argument("--neopax-result", required=False, help="Path to a NEOPAX HDF5 result file")
     prep.add_argument("--neopax-config", required=True, help="Path to the originating NEOPAX TOML")
     prep.add_argument("--spectrax-root", default=str(DEFAULT_SPECTRAX_ROOT), help="Path to the SPECTRAX-GK checkout")
     prep.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for the manifest and SPECTRAX outputs")
     prep.add_argument("--time-index", type=int, default=-1, help="Time slice for transport_solution.h5 inputs; default: final")
+    prep.add_argument("--analytical-n-radii", type=int, default=51, help="Number of rho points to reconstruct when --profiles-source=analytical")
     prep.add_argument("--electron-model", choices=("adiabatic", "kinetic"), default="adiabatic")
     prep.add_argument("--reference-ion", default=None, help="Species name used as the normalization reference ion")
     prep.add_argument("--rho-indices", default=None, help="Explicit comma-separated rho indices, e.g. 5,10,20")
@@ -994,16 +1362,17 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--tau-e-override", type=float, default=1.0)
     prep.add_argument("--nu-ion", type=float, default=0.01)
     prep.add_argument("--nu-electron", type=float, default=0.0)
-    prep.add_argument("--nx", type=int, default=96)
-    prep.add_argument("--ny", type=int, default=96)
-    prep.add_argument("--nz", type=int, default=48)
+    prep.add_argument("--nx", type=int, default=96, help="Nonlinear spectral resolution in kx / x")
+    prep.add_argument("--ny", type=int, default=96, help="Nonlinear spectral resolution in ky / y")
+    prep.add_argument("--nz", type=int, default=48, help="Parallel/grid resolution in z")
     prep.add_argument("--lx", type=float, default=62.8)
     prep.add_argument("--ly", type=float, default=62.8)
     prep.add_argument("--boundary", default="fix aspect")
     prep.add_argument("--y0", type=float, default=21.0)
-    prep.add_argument("--ntheta", type=int, default=48)
+    prep.add_argument("--ntheta", type=int, default=48, help="Number of theta points for generated VMEC geometry")
     prep.add_argument("--nperiod", type=int, default=1)
     prep.add_argument("--t-max", type=float, default=200.0)
+    prep.add_argument("--t-final", dest="t_max", type=float, help="Alias for --t-max")
     prep.add_argument("--dt", type=float, default=0.1)
     prep.add_argument("--method", default="rk3")
     prep.add_argument("--use-diffrax", action="store_true")
@@ -1012,12 +1381,12 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--diagnostics-stride", type=int, default=50)
     prep.add_argument("--cfl", type=float, default=1.0)
     prep.add_argument("--state-sharding", default="none", help="none, auto, ky, ...; used inside a single SPECTRAX run")
-    prep.add_argument("--ky", type=float, default=1.0 / 21.0)
+    prep.add_argument("--ky", type=float, default=1.0 / 21.0, help="Default nonlinear reference ky retained unless overridden")
     prep.add_argument("--nl", type=int, default=4)
     prep.add_argument("--nm", type=int, default=8)
     prep.add_argument("--init-field", default="density")
     prep.add_argument("--init-amp", type=float, default=1.0e-3)
-    prep.add_argument("--alpha", type=float, default=0.0)
+    prep.add_argument("--alpha", type=float, default=0.0, help="Field-line label alpha for the local geometry")
     prep.add_argument("--npol", type=float, default=1.0)
     prep.add_argument("--beta", type=float, default=0.0)
     prep.add_argument("--nu-hermite", type=float, default=1.0)
@@ -1032,6 +1401,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--hyperdiffusion", type=float, default=1.0)
     prep.add_argument("--normalization-contract", default="kinetic")
     prep.add_argument("--diagnostic-norm", default="gx")
+    prep.add_argument("--rho-star-physical", type=float, default=None, help="Optional manual rho_star override; otherwise derive it per radius from VMEC geometry and the reference-ion profile")
     prep.set_defaults(func=cmd_prepare)
 
     run = sub.add_parser("run", help="Execute runs from a previously prepared manifest")
@@ -1051,6 +1421,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect = sub.add_parser("collect", help="Collect final SPECTRAX fluxes from diagnostics CSV files")
     collect.add_argument("--manifest", required=True)
     collect.add_argument("--out", default=str(DEFAULT_OUTPUT_DIR / "flux_summary.h5"))
+    collect.add_argument("--neopax-flux-out", default=str(DEFAULT_OUTPUT_DIR / "neopax_fluxes.h5"))
+    collect.add_argument("--average-window", type=float, default=20.0, help="Average fluxes over t in [t_final-average_window, t_final]")
+    collect.add_argument("--t-final", type=float, default=None, help="Optional explicit averaging end time; defaults to manifest time.t_max")
+    collect.add_argument("--plot", action="store_true", help="Write PNG plots of Gamma and Q versus rho.")
     collect.set_defaults(func=cmd_collect)
 
     return p

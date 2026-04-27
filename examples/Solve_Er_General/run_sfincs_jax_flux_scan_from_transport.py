@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
@@ -533,8 +532,17 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
         env["JAX_PLATFORM_NAME"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
         cores = int(args.cores_per_run)
+        threads = max(1, cores)
         if cores > 0:
             env["SFINCS_JAX_CORES"] = str(cores)
+        # Pin native thread pools so N parallel workers do not each try to use
+        # the whole machine. This matters a lot for medium/heavy CPU scans.
+        env["OMP_NUM_THREADS"] = str(threads)
+        env["OPENBLAS_NUM_THREADS"] = str(threads)
+        env["MKL_NUM_THREADS"] = str(threads)
+        env["VECLIB_MAXIMUM_THREADS"] = str(threads)
+        env["NUMEXPR_NUM_THREADS"] = str(threads)
+        env["SFINCS_JAX_XLA_THREADS"] = "1"
         if cores > 1:
             # Let sfincs_jax expose multiple host CPU devices and keep its
             # built-in auto-sharding path enabled for larger RHSMode=1 solves.
@@ -665,24 +673,88 @@ def _launch_one_subprocess(
     payload_path: Path,
     env: dict[str, str],
     stream_output: bool,
-) -> tuple[int, str, str]:
+) -> subprocess.Popen[str]:
     cmd = [sys.executable, str(script_path), "--worker-payload", str(payload_path)]
-    if stream_output:
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            text=True,
-            check=False,
-        )
-        return int(proc.returncode), "", ""
-    proc = subprocess.run(
+    kwargs: dict[str, Any] = {
+        "env": env,
+        "text": True,
+    }
+    if not stream_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(
         cmd,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
+        **kwargs,
     )
-    return int(proc.returncode), proc.stdout, proc.stderr
+
+
+def _terminate_worker_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, 15)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return
+
+
+def _kill_worker_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, 9)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            return
+
+
+def _cleanup_worker_processes(active: list[dict[str, Any]]) -> None:
+    for item in active:
+        _terminate_worker_process(item["proc"])
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        remaining = [item for item in active if item["proc"].poll() is None]
+        if not remaining:
+            return
+        time.sleep(0.1)
+    for item in active:
+        _kill_worker_process(item["proc"])
+    for item in active:
+        proc = item["proc"]
+        try:
+            proc.communicate(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _collect_worker_result(
+    proc: subprocess.Popen[str],
+    *,
+    stream_output: bool,
+) -> tuple[int, str, str]:
+    if stream_output:
+        code = proc.wait()
+        return int(code), "", ""
+    stdout, stderr = proc.communicate()
+    return int(proc.returncode), stdout or "", stderr or ""
 
 
 def _run_tasks_in_parallel(
@@ -696,41 +768,51 @@ def _run_tasks_in_parallel(
     total = len(task_payloads)
     completed = 0
 
-    def _submit(executor: ThreadPoolExecutor, payload_path: Path, slot: int):
+    def _spawn(payload_path: Path, slot: int) -> dict[str, Any]:
         gpu_id = None
         if str(args.backend).lower() == "gpu":
             gpu_id = gpu_ids[slot % len(gpu_ids)]
         env = _build_worker_env(args, gpu_id=gpu_id)
         stream_output = bool(args.verbose_workers) and max_parallel == 1
-        future = executor.submit(
-            _launch_one_subprocess,
+        proc = _launch_one_subprocess(
             script_path=script_path,
             payload_path=payload_path,
             env=env,
             stream_output=stream_output,
         )
-        future._codex_payload = payload_path  # type: ignore[attr-defined]
-        future._codex_gpu_id = gpu_id  # type: ignore[attr-defined]
-        future._codex_stream_output = stream_output  # type: ignore[attr-defined]
-        return future
+        return {
+            "proc": proc,
+            "payload_path": payload_path,
+            "gpu_id": gpu_id,
+            "stream_output": stream_output,
+        }
 
-    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-        running = set()
-        pending = list(task_payloads)
-        slot = 0
-        while pending or running:
-            while pending and len(running) < max_parallel:
+    active: list[dict[str, Any]] = []
+    pending = list(task_payloads)
+    slot = 0
+    try:
+        while pending or active:
+            while pending and len(active) < max_parallel:
                 payload_path = pending.pop(0)
-                running.add(_submit(executor, payload_path, slot))
+                active.append(_spawn(payload_path, slot))
                 slot += 1
-            done, running = wait(running, return_when=FIRST_COMPLETED)
-            for fut in done:
-                code, stdout, stderr = fut.result()
-                payload_path = getattr(fut, "_codex_payload", None)
-                gpu_id = getattr(fut, "_codex_gpu_id", None)
-                stream_output = getattr(fut, "_codex_stream_output", False)
+            time.sleep(0.1)
+            finished: list[dict[str, Any]] = []
+            for item in active:
+                if item["proc"].poll() is not None:
+                    finished.append(item)
+            if not finished:
+                continue
+            active = [item for item in active if item not in finished]
+            for item in finished:
+                proc = item["proc"]
+                payload_path = item["payload_path"]
+                gpu_id = item["gpu_id"]
+                stream_output = item["stream_output"]
+                code, stdout, stderr = _collect_worker_result(proc, stream_output=stream_output)
                 label = str(payload_path) if payload_path is not None else "<payload>"
                 if code != 0:
+                    _cleanup_worker_processes(active)
                     msg = [
                         f"sfincs_jax worker failed for {label}",
                     ]
@@ -758,6 +840,12 @@ def _run_tasks_in_parallel(
                 rho_note = f" rho={rho_value:.4f}" if rho_value is not None else ""
                 gpu_note = f" gpu={gpu_id}" if gpu_id is not None else ""
                 print(f"[sfincs-scan] completed {completed}/{total}:{rho_note}{gpu_note}", flush=True)
+    except KeyboardInterrupt:
+        _cleanup_worker_processes(active)
+        raise
+    except Exception:
+        _cleanup_worker_processes(active)
+        raise
 
 
 def cmd_main(args: argparse.Namespace) -> int:
