@@ -488,7 +488,7 @@ def _choose_radius_indices(
     candidates = np.where(mask)[0]
     if candidates.size == 0:
         raise ValueError("No radii satisfy the requested rho range")
-    if int(num_radii) >= candidates.size:
+    if int(num_radii) <= 0 or int(num_radii) >= candidates.size:
         return [int(v) for v in candidates]
     picks = np.linspace(0, candidates.size - 1, int(num_radii))
     return sorted(set(int(candidates[int(round(p))]) for p in picks))
@@ -1407,9 +1407,9 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--electron-model", choices=("adiabatic", "kinetic"), default="adiabatic")
     prep.add_argument("--reference-ion", default=None, help="Species name used as the normalization reference ion")
     prep.add_argument("--rho-indices", default=None, help="Explicit comma-separated rho indices, e.g. 5,10,20")
-    prep.add_argument("--rho-min", type=float, default=0.15)
-    prep.add_argument("--rho-max", type=float, default=0.85)
-    prep.add_argument("--num-radii", type=int, default=5)
+    prep.add_argument("--rho-min", type=float, default=0.0)
+    prep.add_argument("--rho-max", type=float, default=1.0)
+    prep.add_argument("--num-radii", type=int, default=-1, help="Number of radii to sample; use <=0 for all available nonzero radii")
     prep.add_argument("--vmec-file-override", default=None, help="Override the VMEC path from the NEOPAX config")
     prep.add_argument("--boozer-file-override", default=None, help="Reserved for later internal coupling metadata")
     prep.add_argument("--density-floor", type=float, default=1.0e-8)
