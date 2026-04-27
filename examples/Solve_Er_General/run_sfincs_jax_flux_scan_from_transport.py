@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run a radial sfincs_jax flux scan from a NEOPAX transport snapshot.
+"""Run a radial sfincs_jax flux scan from NEOPAX-style profile inputs.
 
-This script is a first-step bridge between NEOPAX transport outputs and
+This script is a first-step bridge between NEOPAX profile definitions/outputs and
 sfincs_jax. It:
 
-1. reads a NEOPAX ``transport_solution.h5`` file,
-2. extracts one saved time slice, defaulting to the final one,
+1. reads either a NEOPAX ``transport_solution.h5`` file or analytical profile
+   parameters from the NEOPAX TOML,
+2. extracts one saved time slice, defaulting to the final one, when using
+   ``transport_h5`` profiles,
 3. builds one local sfincs_jax run per selected radial point,
 4. launches those runs in parallel on CPUs or pinned GPUs,
 5. collects particle flux, heat flux, and parallel-flow diagnostics,
@@ -58,6 +60,7 @@ SFINCS_Q_TO_NEOPAX = (
     * SFINCS_REFERENCE_MASS_KG
     * SFINCS_REFERENCE_V_MS**3
     / SFINCS_REFERENCE_R_M
+    / elementary_charge
 )
 
 try:
@@ -167,6 +170,69 @@ def _load_transport_snapshot(h5_path: Path, *, time_index: int) -> TransportSnap
 
     time_value = None if ts is None else float(ts[idx])
     return TransportSnapshot(rho=rho, density=density, temperature=temperature, er=er, time_value=time_value)
+
+
+def _match_species_factors(raw: Any, n_species: int, *, default: float) -> np.ndarray:
+    if raw is None:
+        return np.full((n_species,), float(default), dtype=np.float64)
+    if isinstance(raw, (int, float)):
+        return np.full((n_species,), float(raw), dtype=np.float64)
+    arr = np.asarray(list(raw), dtype=np.float64)
+    if arr.size == 1:
+        return np.full((n_species,), float(arr[0]), dtype=np.float64)
+    if arr.size != n_species:
+        raise ValueError(f"Expected {n_species} profile factors, got {arr.size}")
+    return arr
+
+
+def _build_standard_analytical_snapshot(
+    cfg: dict[str, Any],
+    *,
+    n_species: int,
+    n_radial: int,
+) -> TransportSnapshot:
+    profile_cfg = cfg.get("profiles", {})
+    rho = np.linspace(0.0, 1.0, int(n_radial), dtype=np.float64)
+
+    n0 = float(profile_cfg.get("n0", profile_cfg.get("ni0", profile_cfg.get("ne0", 4.21))))
+    n_edge = float(profile_cfg.get("n_edge", profile_cfg.get("nib", profile_cfg.get("neb", 0.6))))
+    t0 = float(profile_cfg.get("T0", profile_cfg.get("ti0", profile_cfg.get("te0", 17.8))))
+    t_edge = float(profile_cfg.get("T_edge", profile_cfg.get("tib", profile_cfg.get("teb", 0.7))))
+    density_shape_power = float(profile_cfg.get("density_shape_power", 2.0))
+    temperature_shape_power = float(profile_cfg.get("temperature_shape_power", 2.0))
+
+    c_density = profile_cfg.get("c_density")
+    if c_density is None and n_species == 3:
+        deuterium_ratio = float(profile_cfg.get("deuterium_ratio", 0.5))
+        tritium_ratio = float(profile_cfg.get("tritium_ratio", 0.5))
+        c_density = [1.0, deuterium_ratio, tritium_ratio]
+
+    density_species_scale = _match_species_factors(c_density, n_species, default=1.0)
+    temperature_species_scale = _match_species_factors(profile_cfg.get("c_temperature"), n_species, default=1.0)
+    density_global_scale = _match_species_factors(profile_cfg.get("n_scale", 1.0), n_species, default=1.0)
+    temperature_global_scale = _match_species_factors(profile_cfg.get("T_scale", 1.0), n_species, default=1.0)
+
+    density_base = n_edge + (n0 - n_edge) * (1.0 - rho**density_shape_power)
+    temperature_base = t_edge + (t0 - t_edge) * (1.0 - rho**temperature_shape_power)
+    density = density_species_scale[:, None] * density_global_scale[:, None] * density_base[None, :]
+    temperature = (
+        temperature_species_scale[:, None]
+        * temperature_global_scale[:, None]
+        * temperature_base[None, :]
+    )
+
+    er0_scale = float(profile_cfg.get("er0_scale", 100.0))
+    er0_peak_rho = float(profile_cfg.get("er0_peak_rho", 0.8))
+    width = max(0.05, 0.35 * max(er0_peak_rho, 1.0 - er0_peak_rho, 0.15))
+    er = er0_scale * rho * np.exp(-0.5 * ((rho - er0_peak_rho) / width) ** 2)
+
+    return TransportSnapshot(
+        rho=rho,
+        density=np.asarray(density, dtype=np.float64),
+        temperature=np.asarray(temperature, dtype=np.float64),
+        er=np.asarray(er, dtype=np.float64),
+        time_value=None,
+    )
 
 
 def _parse_index_list(text: str | None) -> list[int] | None:
@@ -698,19 +764,25 @@ def cmd_main(args: argparse.Namespace) -> int:
     config_path = Path(args.neopax_config).resolve()
     cfg = _load_toml(config_path)
     species = _parse_species_from_config(cfg)
-
-    transport_solution = (
-        Path(args.neopax_result).resolve()
-        if args.neopax_result is not None
-        else _default_transport_solution_path(config_path, cfg)
-    )
-    if not transport_solution.exists():
-        raise FileNotFoundError(
-            f"Could not find NEOPAX transport result at {transport_solution}. "
-            "If needed, enable [transport_output].transport_write_hdf5 = true and rerun NEOPAX."
+    if str(args.profiles_source).lower() == "analytical":
+        transport_solution = None
+        snapshot = _build_standard_analytical_snapshot(
+            cfg,
+            n_species=len(species),
+            n_radial=int(args.analytical_n_radii),
         )
-
-    snapshot = _load_transport_snapshot(transport_solution, time_index=int(args.time_index))
+    else:
+        transport_solution = (
+            Path(args.neopax_result).resolve()
+            if args.neopax_result is not None
+            else _default_transport_solution_path(config_path, cfg)
+        )
+        if not transport_solution.exists():
+            raise FileNotFoundError(
+                f"Could not find NEOPAX transport result at {transport_solution}. "
+                "If needed, enable [transport_output].transport_write_hdf5 = true and rerun NEOPAX."
+            )
+        snapshot = _load_transport_snapshot(transport_solution, time_index=int(args.time_index))
     explicit_indices = _parse_index_list(args.rho_indices)
     radius_indices = _choose_radius_indices(
         snapshot.rho,
@@ -841,7 +913,8 @@ def cmd_main(args: argparse.Namespace) -> int:
         f.create_dataset("Q", data=q_arr)
         f.create_dataset("Upar", data=upar_arr)
         f.create_dataset("species_names", data=np.asarray([sp.name.encode("utf-8") for sp in species]))
-        f.attrs["source_transport_solution"] = str(transport_solution)
+        f.attrs["profiles_source"] = str(args.profiles_source)
+        f.attrs["source_transport_solution"] = "" if transport_solution is None else str(transport_solution)
         f.attrs["source_sfincs_template"] = str(template_path)
         f.attrs["time_index"] = int(args.time_index)
         f.attrs["time_value"] = np.nan if snapshot.time_value is None else float(snapshot.time_value)
@@ -858,7 +931,8 @@ def cmd_main(args: argparse.Namespace) -> int:
         f.attrs["normalization_note"] = (
             "Gamma is converted from sfincs_jax particleFlux_vm_* using nbar*vbar/Rbar "
             "with nbar=1e20 m^-3, Tbar=1 keV, mbar=mp, Rbar=1 m. "
-            "Q is converted from heatFlux_vm_* using nbar*mbar*vbar^3/Rbar with the same references. "
+            "Q is converted from heatFlux_vm_* using (nbar*mbar*vbar^3/Rbar)/e so the written "
+            "values match NEOPAX's eV-based physical heat-flux convention. "
             "Upar uses the NTX archive-backed observable bridge rather than a raw FSABFlow alias."
         )
         f.attrs["radius_note"] = (
@@ -921,9 +995,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--neopax-config", required=False, default=None, help="Path to the NEOPAX transport TOML.")
     p.add_argument(
+        "--profiles-source",
+        choices=("transport_h5", "analytical"),
+        default="transport_h5",
+        help="Choose whether profiles come from transport_solution.h5 or from the TOML analytical profile block.",
+    )
+    p.add_argument(
         "--neopax-result",
         default=None,
-        help="Optional explicit path to transport_solution.h5. If omitted, infer from the NEOPAX config.",
+        help="Optional explicit path to transport_solution.h5. Used only for profiles-source=transport_h5.",
+    )
+    p.add_argument(
+        "--analytical-n-radii",
+        type=int,
+        default=51,
+        help="Number of rho grid points to reconstruct for profiles-source=analytical.",
     )
     p.add_argument("--sfincs-template", required=False, default=None, help="Template sfincs_jax input.namelist.")
     p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory for runs and collected fluxes.")
