@@ -154,6 +154,7 @@ def cmd_all(args: argparse.Namespace) -> int:
         max_parallel=args.max_parallel,
         threads_per_run=args.threads_per_run,
         poll_interval=args.poll_interval,
+        verbose_workers=args.verbose_workers,
     )
     rc = bridge.cmd_run(run_args)
     if rc != 0:
@@ -247,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-parallel", type=int, default=1)
     p.add_argument("--threads-per-run", type=int, default=1)
     p.add_argument("--poll-interval", type=float, default=2.0)
+    p.add_argument("--verbose-workers", action="store_true", help="Show the stdout/stderr from each SPECTRAX worker run")
     p.set_defaults(func=cmd_all)
     return p
 

@@ -962,19 +962,22 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         str(config_path),
         "--out",
         output_prefix,
-        "--no-progress",
     ]
+    if bool(getattr(args, "verbose_worker", False)):
+        cmd.append("--progress")
+    else:
+        cmd.append("--no-progress")
     proc = subprocess.run(
         cmd,
         cwd=str(run_dir),
         env=env,
         text=True,
-        capture_output=True,
+        capture_output=not bool(getattr(args, "verbose_worker", False)),
     )
     if proc.returncode != 0:
-        if proc.stdout:
+        if not bool(getattr(args, "verbose_worker", False)) and proc.stdout:
             print(proc.stdout.rstrip())
-        if proc.stderr:
+        if not bool(getattr(args, "verbose_worker", False)) and proc.stderr:
             print(proc.stderr.rstrip(), file=sys.stderr)
         return int(proc.returncode)
     diag_csv = Path(f"{output_prefix}.diagnostics.csv")
@@ -1006,21 +1009,25 @@ def _launch_subprocess(
     manifest_path: Path,
     index: int,
     env_overrides: dict[str, str],
+    verbose_workers: bool,
 ) -> subprocess.Popen[str]:
     env = os.environ.copy()
     env.update(env_overrides)
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run-one",
+        "--manifest",
+        str(manifest_path),
+        "--index",
+        str(index),
+    ]
+    if verbose_workers:
+        cmd.append("--verbose-worker")
     return subprocess.Popen(
-        [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "run-one",
-            "--manifest",
-            str(manifest_path),
-            "--index",
-            str(index),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        cmd,
+        stdout=None if verbose_workers else subprocess.PIPE,
+        stderr=None if verbose_workers else subprocess.PIPE,
         text=True,
         env=env,
     )
@@ -1046,6 +1053,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     pending = list(range(len(runs)))
     active: dict[Any, tuple[subprocess.Popen[str], int, dict[str, str]]] = {}
     failures = 0
+    completed = 0
+    total = len(runs)
 
     def _env_for_slot(slot: int) -> dict[str, str]:
         env = {
@@ -1066,10 +1075,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 slot = len(active)
                 run_idx = pending.pop(0)
                 env = _env_for_slot(slot)
-                proc = _launch_subprocess(manifest_path=manifest_path, index=run_idx, env_overrides=env)
+                proc = _launch_subprocess(
+                    manifest_path=manifest_path,
+                    index=run_idx,
+                    env_overrides=env,
+                    verbose_workers=bool(getattr(args, "verbose_workers", False)),
+                )
                 active[proc] = (proc, run_idx, env)
                 where = env.get("CUDA_VISIBLE_DEVICES", f"cpu x{env.get('OMP_NUM_THREADS', '1')}")
-                print(f"started run {run_idx} on {where}")
+                print(f"started run {run_idx} on {where} ({completed}/{total} completed)")
 
             if not active:
                 break
@@ -1079,13 +1093,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                 rc = proc.poll()
                 if rc is None:
                     continue
-                stdout, stderr = proc.communicate()
+                if bool(getattr(args, "verbose_workers", False)):
+                    stdout = ""
+                    stderr = ""
+                else:
+                    stdout, stderr = proc.communicate()
                 if rc == 0:
-                    line = stdout.strip().splitlines()[-1] if stdout.strip() else ""
-                    print(f"finished run {run_idx}: {line}")
+                    completed += 1
+                    if bool(getattr(args, "verbose_workers", False)):
+                        print(f"completed run {run_idx} ({completed}/{total})")
+                    else:
+                        line = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+                        print(f"completed run {run_idx} ({completed}/{total}): {line}")
                 else:
                     failures += 1
-                    print(f"run {run_idx} failed with code {rc}")
+                    print(f"run {run_idx} failed with code {rc} ({completed}/{total} completed)")
                     if stdout.strip():
                         print(stdout.strip())
                     if stderr.strip():
@@ -1448,11 +1470,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-parallel", type=int, default=1)
     run.add_argument("--threads-per-run", type=int, default=1)
     run.add_argument("--poll-interval", type=float, default=2.0)
+    run.add_argument("--verbose-workers", action="store_true", help="Show full stdout/stderr from each SPECTRAX worker run")
     run.set_defaults(func=cmd_run)
 
     run_one = sub.add_parser("run-one", help=argparse.SUPPRESS)
     run_one.add_argument("--manifest", required=True)
     run_one.add_argument("--index", required=True, type=int)
+    run_one.add_argument("--verbose-worker", action="store_true")
     run_one.set_defaults(func=cmd_run_one)
 
     collect = sub.add_parser("collect", help="Collect final SPECTRAX fluxes from diagnostics CSV files")
