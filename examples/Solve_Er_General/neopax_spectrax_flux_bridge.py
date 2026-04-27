@@ -68,6 +68,145 @@ class ProfileSnapshot:
     time_value: float | None
 
 
+def _toml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            raise ValueError("NaN cannot be written to TOML")
+        if math.isinf(value):
+            raise ValueError("inf cannot be written to TOML")
+        return repr(float(value))
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def _runtime_toml_text(manifest: dict[str, Any], run_spec: dict[str, Any]) -> str:
+    grid = manifest["grid"]
+    time_cfg = manifest["time"]
+    geom = manifest["geometry"]
+    init = manifest["init"]
+    phys = manifest["physics"]
+    coll = manifest["collisions"]
+    norm = manifest["normalization"]
+    terms = manifest["terms"]
+    run = manifest["run"]
+
+    lines: list[str] = []
+    for species in run_spec["runtime_species"]:
+        lines.extend(
+            [
+                "[[species]]",
+                f"name = {_toml_scalar(species['name'])}",
+                f"charge = {_toml_scalar(species['charge'])}",
+                f"mass = {_toml_scalar(species['mass'])}",
+                f"density = {_toml_scalar(species['density'])}",
+                f"temperature = {_toml_scalar(species['temperature'])}",
+                f"tprim = {_toml_scalar(species['tprim'])}",
+                f"fprim = {_toml_scalar(species['fprim'])}",
+                f"nu = {_toml_scalar(species['nu'])}",
+                "kinetic = true",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "[grid]",
+            f"Nx = {_toml_scalar(grid['Nx'])}",
+            f"Ny = {_toml_scalar(grid['Ny'])}",
+            f"Nz = {_toml_scalar(grid['Nz'])}",
+            f"Lx = {_toml_scalar(grid['Lx'])}",
+            f"Ly = {_toml_scalar(grid['Ly'])}",
+            f"boundary = {_toml_scalar(grid['boundary'])}",
+            f"y0 = {_toml_scalar(grid['y0'])}",
+            f"ntheta = {_toml_scalar(grid['ntheta'])}",
+            f"nperiod = {_toml_scalar(grid['nperiod'])}",
+            "",
+            "[time]",
+            f"t_max = {_toml_scalar(time_cfg['t_max'])}",
+            f"dt = {_toml_scalar(time_cfg['dt'])}",
+            f"method = {_toml_scalar(time_cfg['method'])}",
+            f"use_diffrax = {_toml_scalar(time_cfg['use_diffrax'])}",
+            f"sample_stride = {_toml_scalar(time_cfg['sample_stride'])}",
+            f"diagnostics_stride = {_toml_scalar(time_cfg['diagnostics_stride'])}",
+            f"fixed_dt = {_toml_scalar(time_cfg['fixed_dt'])}",
+            f"cfl = {_toml_scalar(time_cfg['cfl'])}",
+            f"state_sharding = {_toml_scalar(time_cfg['state_sharding'])}" if time_cfg["state_sharding"] is not None else "",
+            "",
+            "[geometry]",
+            f"model = {_toml_scalar(geom['model'])}",
+            f"vmec_file = {_toml_scalar(manifest['vmec_file'])}",
+            f"geometry_file = {_toml_scalar(run_spec['geometry_file_toml'])}",
+            f"geometry_backend = {_toml_scalar(geom['geometry_backend'])}",
+            f"torflux = {_toml_scalar(run_spec['torflux'])}",
+            f"alpha = {_toml_scalar(geom['alpha'])}",
+            f"npol = {_toml_scalar(geom['npol'])}",
+            "",
+            "[init]",
+            f"init_field = {_toml_scalar(init['init_field'])}",
+            f"init_amp = {_toml_scalar(init['init_amp'])}",
+            f"gaussian_init = {_toml_scalar(init['gaussian_init'])}",
+            f"init_single = {_toml_scalar(init['init_single'])}",
+            "",
+            "[physics]",
+            "linear = false",
+            "nonlinear = true",
+            f"electrostatic = {_toml_scalar(phys['electrostatic'])}",
+            f"electromagnetic = {_toml_scalar(phys['electromagnetic'])}",
+            f"adiabatic_electrons = {_toml_scalar(phys['adiabatic_electrons'])}",
+            "adiabatic_ions = false",
+            f"tau_e = {_toml_scalar(1.0 if run_spec['tau_e'] is None else run_spec['tau_e'])}",
+            f"beta = {_toml_scalar(phys['beta'])}",
+            f"collisions = {_toml_scalar(phys['collisions'])}",
+            f"hypercollisions = {_toml_scalar(phys['hypercollisions'])}",
+            "",
+            "[collisions]",
+            f"nu_hermite = {_toml_scalar(coll['nu_hermite'])}",
+            f"nu_laguerre = {_toml_scalar(coll['nu_laguerre'])}",
+            f"nu_hyper = {_toml_scalar(coll['nu_hyper'])}",
+            f"p_hyper = {_toml_scalar(coll['p_hyper'])}",
+            f"hypercollisions_const = {_toml_scalar(coll['hypercollisions_const'])}",
+            f"hypercollisions_kz = {_toml_scalar(coll['hypercollisions_kz'])}",
+            f"D_hyper = {_toml_scalar(coll['D_hyper'])}",
+            f"damp_ends_amp = {_toml_scalar(coll['damp_ends_amp'])}",
+            f"damp_ends_widthfrac = {_toml_scalar(coll['damp_ends_widthfrac'])}",
+            "",
+            "[normalization]",
+            f"contract = {_toml_scalar(norm['contract'])}",
+            f"diagnostic_norm = {_toml_scalar(norm['diagnostic_norm'])}",
+            "",
+            "[terms]",
+            f"streaming = {_toml_scalar(terms['streaming'])}",
+            f"mirror = {_toml_scalar(terms['mirror'])}",
+            f"curvature = {_toml_scalar(terms['curvature'])}",
+            f"gradb = {_toml_scalar(terms['gradb'])}",
+            f"diamagnetic = {_toml_scalar(terms['diamagnetic'])}",
+            f"collisions = {_toml_scalar(terms['collisions'])}",
+            f"hypercollisions = {_toml_scalar(terms['hypercollisions'])}",
+            f"hyperdiffusion = {_toml_scalar(terms['hyperdiffusion'])}",
+            f"end_damping = {_toml_scalar(terms['end_damping'])}",
+            f"apar = {_toml_scalar(terms['apar'])}",
+            f"bpar = {_toml_scalar(terms['bpar'])}",
+            f"nonlinear = {_toml_scalar(terms['nonlinear'])}",
+            "",
+            "[run]",
+            f"ky = {_toml_scalar(run['ky'])}",
+            f"Nl = {_toml_scalar(run['Nl'])}",
+            f"Nm = {_toml_scalar(run['Nm'])}",
+            "",
+        ]
+    )
+    return "\n".join(line for line in lines if line != "")
+
+
+def _write_runtime_toml(path: Path, manifest: dict[str, Any], run_spec: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_runtime_toml_text(manifest, run_spec), encoding="utf-8")
+
+
 def _load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as fh:
         return tomllib.load(fh)
@@ -446,8 +585,8 @@ def _build_manifest(
         raise ValueError("electron_model must be either 'adiabatic' or 'kinetic'")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    generated_geom_dir = output_dir / "geometry_cache"
-    generated_geom_dir.mkdir(parents=True, exist_ok=True)
+    runs_root = output_dir / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
 
     for ordinal, rho_idx in enumerate(rho_indices):
         rho_val = float(rho[rho_idx])
@@ -502,26 +641,32 @@ def _build_manifest(
         )
 
         base_name = f"rho_{rho_idx:03d}_r{rho_val:.4f}".replace(".", "p")
-        output_prefix = str((output_dir / base_name).resolve())
-        geometry_file = str((generated_geom_dir / f"{base_name}.eik.nc").resolve())
-        runs.append(
-            {
-                "index": ordinal,
-                "rho_index": int(rho_idx),
-                "rho": rho_val,
-                "r_physical": float(a_minor * rho_val),
-                "torflux": torflux,
-                "Er": float(er[rho_idx]),
-                "output_prefix": output_prefix,
-                "geometry_file": geometry_file,
-                "runtime_species": runtime_species,
-                "tau_e": tau_e,
-                "rho_star_physical": rho_star_physical,
-                "a_minor": float(a_minor),
-            }
-        )
+        run_dir = (runs_root / base_name).resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        local_geom_name = f"{Path(vmec_path).stem}.eik.nc"
+        output_prefix = str((run_dir / "run").resolve())
+        geometry_file = str((run_dir / local_geom_name).resolve())
+        config_path = str((run_dir / "input.toml").resolve())
+        run_spec = {
+            "index": ordinal,
+            "rho_index": int(rho_idx),
+            "rho": rho_val,
+            "r_physical": float(a_minor * rho_val),
+            "torflux": torflux,
+            "Er": float(er[rho_idx]),
+            "run_dir": str(run_dir),
+            "config_path": config_path,
+            "output_prefix": output_prefix,
+            "geometry_file": geometry_file,
+            "geometry_file_toml": f"./{local_geom_name}",
+            "runtime_species": runtime_species,
+            "tau_e": tau_e,
+            "rho_star_physical": rho_star_physical,
+            "a_minor": float(a_minor),
+        }
+        runs.append(run_spec)
 
-    return {
+    manifest = {
         "schema_version": 1,
         "profiles_source": str(args.profiles_source).lower(),
         "neopax_result": "" if neopax_result is None else str(neopax_result.resolve()),
@@ -626,6 +771,9 @@ def _build_manifest(
         ],
         "runs": runs,
     }
+    for run_spec in runs:
+        _write_runtime_toml(Path(run_spec["config_path"]), manifest, run_spec)
+    return manifest
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -642,6 +790,8 @@ def _write_runs_csv(path: Path, manifest: dict[str, Any]) -> None:
             "rho": run["rho"],
             "torflux": run["torflux"],
             "Er": run["Er"],
+            "run_dir": run["run_dir"],
+            "config_path": run["config_path"],
             "output_prefix": run["output_prefix"],
             "geometry_file": run["geometry_file"],
         }
@@ -732,144 +882,6 @@ def _write_normalization_audit(output_dir: Path, manifest: dict[str, Any]) -> No
     _write_json(json_path, payload)
 
 
-def _import_spectrax_runtime(spectrax_root: Path):
-    src_path = spectrax_root / "src"
-    if str(src_path) not in sys.path:
-        sys.path.insert(0, str(src_path))
-    from spectraxgk.config import GeometryConfig, GridConfig, InitializationConfig, TimeConfig
-    from spectraxgk.runtime_artifacts import run_runtime_nonlinear_with_artifacts
-    from spectraxgk.runtime_config import (
-        RuntimeCollisionConfig,
-        RuntimeConfig,
-        RuntimeNormalizationConfig,
-        RuntimePhysicsConfig,
-        RuntimeSpeciesConfig,
-        RuntimeTermsConfig,
-    )
-
-    return {
-        "GeometryConfig": GeometryConfig,
-        "GridConfig": GridConfig,
-        "InitializationConfig": InitializationConfig,
-        "TimeConfig": TimeConfig,
-        "run_runtime_nonlinear_with_artifacts": run_runtime_nonlinear_with_artifacts,
-        "RuntimeCollisionConfig": RuntimeCollisionConfig,
-        "RuntimeConfig": RuntimeConfig,
-        "RuntimeNormalizationConfig": RuntimeNormalizationConfig,
-        "RuntimePhysicsConfig": RuntimePhysicsConfig,
-        "RuntimeSpeciesConfig": RuntimeSpeciesConfig,
-        "RuntimeTermsConfig": RuntimeTermsConfig,
-    }
-
-
-def _build_runtime_config_from_manifest(manifest: dict[str, Any], run_spec: dict[str, Any]):
-    spectrax_root = Path(manifest["spectrax_root"])
-    api = _import_spectrax_runtime(spectrax_root)
-    GridConfig = api["GridConfig"]
-    TimeConfig = api["TimeConfig"]
-    GeometryConfig = api["GeometryConfig"]
-    InitializationConfig = api["InitializationConfig"]
-    RuntimeConfig = api["RuntimeConfig"]
-    RuntimeSpeciesConfig = api["RuntimeSpeciesConfig"]
-    RuntimePhysicsConfig = api["RuntimePhysicsConfig"]
-    RuntimeCollisionConfig = api["RuntimeCollisionConfig"]
-    RuntimeNormalizationConfig = api["RuntimeNormalizationConfig"]
-    RuntimeTermsConfig = api["RuntimeTermsConfig"]
-
-    grid_cfg = manifest["grid"]
-    time_cfg = manifest["time"]
-    geom_cfg = manifest["geometry"]
-    init_cfg = manifest["init"]
-    phys_cfg = manifest["physics"]
-    coll_cfg = manifest["collisions"]
-    norm_cfg = manifest["normalization"]
-    terms_cfg = manifest["terms"]
-
-    species = tuple(
-        RuntimeSpeciesConfig(
-            name=str(sp["name"]),
-            charge=float(sp["charge"]),
-            mass=float(sp["mass"]),
-            density=float(sp["density"]),
-            temperature=float(sp["temperature"]),
-            tprim=float(sp["tprim"]),
-            fprim=float(sp["fprim"]),
-            nu=float(sp["nu"]),
-            kinetic=True,
-        )
-        for sp in run_spec["runtime_species"]
-    )
-
-    cfg = RuntimeConfig(
-        grid=GridConfig(
-            Nx=int(grid_cfg["Nx"]),
-            Ny=int(grid_cfg["Ny"]),
-            Nz=int(grid_cfg["Nz"]),
-            Lx=float(grid_cfg["Lx"]),
-            Ly=float(grid_cfg["Ly"]),
-            boundary=str(grid_cfg["boundary"]),
-            y0=float(grid_cfg["y0"]),
-            ntheta=int(grid_cfg["ntheta"]),
-            nperiod=int(grid_cfg["nperiod"]),
-        ),
-        time=TimeConfig(
-            t_max=float(time_cfg["t_max"]),
-            dt=float(time_cfg["dt"]),
-            method=str(time_cfg["method"]),
-            use_diffrax=bool(time_cfg["use_diffrax"]),
-            sample_stride=int(time_cfg["sample_stride"]),
-            diagnostics_stride=int(time_cfg["diagnostics_stride"]),
-            fixed_dt=bool(time_cfg["fixed_dt"]),
-            cfl=float(time_cfg["cfl"]),
-            state_sharding=time_cfg["state_sharding"],
-        ),
-        geometry=GeometryConfig(
-            model=str(geom_cfg["model"]),
-            vmec_file=str(manifest["vmec_file"]),
-            geometry_file=str(run_spec["geometry_file"]),
-            geometry_backend=str(geom_cfg["geometry_backend"]),
-            torflux=float(run_spec["torflux"]),
-            alpha=float(geom_cfg["alpha"]),
-            npol=float(geom_cfg["npol"]),
-        ),
-        init=InitializationConfig(
-            init_field=str(init_cfg["init_field"]),
-            init_amp=float(init_cfg["init_amp"]),
-            gaussian_init=bool(init_cfg["gaussian_init"]),
-            init_single=bool(init_cfg["init_single"]),
-        ),
-        species=species,
-        physics=RuntimePhysicsConfig(
-            linear=False,
-            nonlinear=True,
-            electrostatic=bool(phys_cfg["electrostatic"]),
-            electromagnetic=bool(phys_cfg["electromagnetic"]),
-            adiabatic_electrons=bool(phys_cfg["adiabatic_electrons"]),
-            tau_e=1.0 if run_spec["tau_e"] is None else float(run_spec["tau_e"]),
-            beta=float(phys_cfg["beta"]),
-            collisions=bool(phys_cfg["collisions"]),
-            hypercollisions=bool(phys_cfg["hypercollisions"]),
-        ),
-        collisions=RuntimeCollisionConfig(
-            nu_hermite=float(coll_cfg["nu_hermite"]),
-            nu_laguerre=float(coll_cfg["nu_laguerre"]),
-            nu_hyper=float(coll_cfg["nu_hyper"]),
-            p_hyper=float(coll_cfg["p_hyper"]),
-            hypercollisions_const=float(coll_cfg["hypercollisions_const"]),
-            hypercollisions_kz=float(coll_cfg["hypercollisions_kz"]),
-            D_hyper=float(coll_cfg["D_hyper"]),
-            damp_ends_amp=float(coll_cfg["damp_ends_amp"]),
-            damp_ends_widthfrac=float(coll_cfg["damp_ends_widthfrac"]),
-        ),
-        normalization=RuntimeNormalizationConfig(
-            contract=str(norm_cfg["contract"]),
-            diagnostic_norm=str(norm_cfg["diagnostic_norm"]),
-        ),
-        terms=RuntimeTermsConfig(**terms_cfg),
-    )
-    return cfg, api["run_runtime_nonlinear_with_artifacts"]
-
-
 def cmd_prepare(args: argparse.Namespace) -> int:
     neopax_config = Path(args.neopax_config).resolve()
     spectrax_root = Path(args.spectrax_root).resolve()
@@ -931,31 +943,56 @@ def _load_manifest(path: Path) -> dict[str, Any]:
 def cmd_run_one(args: argparse.Namespace) -> int:
     manifest = _load_manifest(Path(args.manifest).resolve())
     run_spec = manifest["runs"][int(args.index)]
-    cfg, runner = _build_runtime_config_from_manifest(manifest, run_spec)
-    result, paths = runner(
-        cfg,
-        out=run_spec["output_prefix"],
-        ky_target=float(manifest["run"]["ky"]),
-        Nl=int(manifest["run"]["Nl"]),
-        Nm=int(manifest["run"]["Nm"]),
-        dt=float(manifest["time"]["dt"]),
-        steps=None,
-        method=str(manifest["time"]["method"]),
-        sample_stride=int(manifest["time"]["sample_stride"]),
-        diagnostics_stride=int(manifest["time"]["diagnostics_stride"]),
-        diagnostics=True,
-        show_progress=False,
+    spectrax_root = Path(manifest["spectrax_root"]).resolve()
+    src_path = spectrax_root / "src"
+    run_dir = Path(run_spec["run_dir"]).resolve()
+    config_path = Path(run_spec["config_path"]).resolve()
+    output_prefix = str(run_spec["output_prefix"])
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = (
+        str(src_path) if not existing_pythonpath else os.pathsep.join([str(src_path), existing_pythonpath])
     )
-    diag = result.diagnostics
-    heat_last = float(np.asarray(diag.heat_flux_t)[-1]) if diag is not None and np.asarray(diag.heat_flux_t).size else float("nan")
-    pflux_last = float(np.asarray(diag.particle_flux_t)[-1]) if diag is not None and np.asarray(diag.particle_flux_t).size else float("nan")
+    cmd = [
+        sys.executable,
+        "-m",
+        "spectraxgk.cli",
+        "run",
+        "--config",
+        str(config_path),
+        "--out",
+        output_prefix,
+        "--no-progress",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(run_dir),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        if proc.stdout:
+            print(proc.stdout.rstrip())
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        return int(proc.returncode)
+    diag_csv = Path(f"{output_prefix}.diagnostics.csv")
+    heat_last = float("nan")
+    pflux_last = float("nan")
+    if diag_csv.exists():
+        row = _read_last_row_csv(diag_csv)
+        heat_last = row.get("heat_flux", math.nan)
+        pflux_last = row.get("particle_flux", math.nan)
     print(
         json.dumps(
             {
                 "index": int(run_spec["index"]),
                 "rho": float(run_spec["rho"]),
-                "output_prefix": run_spec["output_prefix"],
-                "paths": paths,
+                "run_dir": str(run_dir),
+                "config_path": str(config_path),
+                "output_prefix": output_prefix,
+                "geometry_file": str(run_spec["geometry_file"]),
                 "heat_flux_last": heat_last,
                 "particle_flux_last": pflux_last,
             }
