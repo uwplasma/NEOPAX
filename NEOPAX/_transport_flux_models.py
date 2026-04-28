@@ -13,6 +13,7 @@ from ._cell_variable import (
     get_gradient_temperature,
     make_profile_cell_variable,
 )
+from ._fem import cell_centered_from_faces, faces_from_cell_centered
 from ._boundary_conditions import (
     left_constraints_from_bc_model,
     right_constraints_from_bc_model,
@@ -656,6 +657,8 @@ def build_fluxes_r_file_transport_model(
     neoclassical_file=None,
     turbulence_file=None,
     classical_file=None,
+    grid_location="cell_centered",
+    profile_location=None,
     **kwargs,
 ):
     del kwargs
@@ -672,6 +675,7 @@ def build_fluxes_r_file_transport_model(
             "fluxes_r_file requires a flux file. "
             "Provide one of: fluxes_file, file, flux_file, neoclassical_file, turbulence_file, or classical_file."
         )
+    location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
     return FluxesRFileTransportModel(
         species=species,
@@ -680,6 +684,7 @@ def build_fluxes_r_file_transport_model(
         gamma_data=gamma_data,
         q_data=q_data,
         upar_data=upar_data,
+        profile_location=str(location).strip().lower(),
     )
 
 
@@ -691,22 +696,60 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     gamma_data: Any = None
     q_data: Any = None
     upar_data: Any = None
+    profile_location: str = "cell_centered"
 
     def _interp_species_profile(self, data, target_r):
         if data is None:
             return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
         return jax.vmap(lambda prof: interpax.interp1d(self.r_data, prof, target_r))(data)
 
+    def _normalize_profile_location(self):
+        location = str(self.profile_location).strip().lower()
+        aliases = {
+            "cell": "cell_centered",
+            "cells": "cell_centered",
+            "center": "cell_centered",
+            "centers": "cell_centered",
+            "cell_centered": "cell_centered",
+            "cell-centred": "cell_centered",
+            "cell_centred": "cell_centered",
+            "face": "face_centered",
+            "faces": "face_centered",
+            "face_centered": "face_centered",
+            "face-centred": "face_centered",
+            "face_centred": "face_centered",
+        }
+        if location not in aliases:
+            raise ValueError(
+                f"Unsupported fluxes_r_file profile_location '{self.profile_location}'. "
+                "Expected one of: cell_centered, face_centered."
+            )
+        return aliases[location]
+
+    def _data_on_cell_grid(self, data):
+        location = self._normalize_profile_location()
+        if location == "cell_centered":
+            return self._interp_species_profile(data, self.geometry.r_grid)
+        face_values = self._interp_species_profile(data, self.geometry.r_grid_half)
+        return jax.vmap(cell_centered_from_faces)(face_values)
+
+    def _data_on_face_grid(self, data):
+        location = self._normalize_profile_location()
+        if location == "face_centered":
+            return self._interp_species_profile(data, self.geometry.r_grid_half)
+        cell_values = self._interp_species_profile(data, self.geometry.r_grid)
+        return jax.vmap(faces_from_cell_centered)(cell_values)
+
     def __call__(self, state) -> dict:
         del state
-        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid)
-        q = self._interp_species_profile(self.q_data, self.geometry.r_grid)
-        upar = self._interp_species_profile(self.upar_data, self.geometry.r_grid)
+        gamma = self._data_on_cell_grid(self.gamma_data)
+        q = self._data_on_cell_grid(self.q_data)
+        upar = self._data_on_cell_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
     def build_local_particle_flux_evaluator(self, state):
         del state
-        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid)
+        gamma = self._data_on_cell_grid(self.gamma_data)
 
         def evaluator(radius_index, er_value):
             del er_value
@@ -716,9 +759,9 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         del state, face_state, kwargs
-        gamma = self._interp_species_profile(self.gamma_data, self.geometry.r_grid_half)
-        q = self._interp_species_profile(self.q_data, self.geometry.r_grid_half)
-        upar = self._interp_species_profile(self.upar_data, self.geometry.r_grid_half)
+        gamma = self._data_on_face_grid(self.gamma_data)
+        q = self._data_on_face_grid(self.q_data)
+        upar = self._data_on_face_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
 
