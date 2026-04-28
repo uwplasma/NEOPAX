@@ -34,3 +34,8 @@ except ImportError:
     import numpy as jnp
 
 register_entropy_model("monkes_database", monkes_database_entropy)
+# Flux-file transport currently uses the same simple ambipolar entropy proxy:
+# sum over absolute species particle fluxes. Registering this alias keeps
+# entropy-model resolution consistent when [neoclassical].flux_model is set
+# to "fluxes_r_file".
+register_entropy_model("fluxes_r_file", monkes_database_entropy)
