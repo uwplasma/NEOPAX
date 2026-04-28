@@ -29,11 +29,17 @@ New output layout written:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
+from scipy.constants import elementary_charge, proton_mass
+
+
+NEOPAX_DENSITY_REFERENCE_M3 = 1.0e20
+NEOPAX_TEMPERATURE_REFERENCE_EV = 1.0e3
 
 
 def _read_string_array(dataset: Any) -> list[str]:
@@ -75,7 +81,104 @@ def _prepend_axis_zero_if_needed(
     return rho, rho_index, torflux, er, heat_total, particle_total, gamma, q, upar
 
 
-def convert_file(src: Path, dst: Path) -> None:
+def _thermal_speed_ms(temperature_keV: float, mass_mp: float) -> float:
+    temp_eV = float(temperature_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
+    mass_kg = float(mass_mp) * proton_mass
+    return float(np.sqrt(2.0 * temp_eV * elementary_charge / mass_kg))
+
+
+def _spectrax_flux_to_neopax_units(
+    flux_gb: float,
+    *,
+    density_ref_state: float,
+    temperature_ref_keV: float,
+    mass_ref_mp: float,
+    rho_star_physical: float,
+    kind: str,
+) -> float:
+    n_ref_m3 = float(density_ref_state) * NEOPAX_DENSITY_REFERENCE_M3
+    t_ref_eV = float(temperature_ref_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
+    vth_ref = _thermal_speed_ms(float(temperature_ref_keV), float(mass_ref_mp))
+    if kind == "Gamma":
+        scale = n_ref_m3 * vth_ref * float(rho_star_physical) ** 2
+    elif kind == "Q":
+        scale = n_ref_m3 * t_ref_eV * vth_ref * float(rho_star_physical) ** 2
+    else:
+        raise ValueError(f"Unknown flux kind {kind!r}")
+    return float(flux_gb) * float(scale)
+
+
+def _load_manifest_for_legacy(fin: h5py.File, src: Path, manifest_override: Path | None) -> dict[str, Any] | None:
+    manifest_path = manifest_override
+    if manifest_path is None and "meta" in fin:
+        meta = fin["meta"]
+        manifest_attr = meta.attrs.get("manifest")
+        if manifest_attr is not None:
+            manifest_path = Path(str(manifest_attr))
+    if manifest_path is None:
+        return None
+    manifest_path = manifest_path.expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = (src.parent / manifest_path).resolve()
+    if not manifest_path.exists():
+        return None
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _normalized_from_manifest(
+    *,
+    manifest: dict[str, Any],
+    rho_index: np.ndarray,
+    species_names: list[str],
+    q_raw: np.ndarray,
+    gamma_raw: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    runs = list(manifest.get("runs", []))
+    runtime_species_names = list(manifest.get("runtime_species_names", []))
+    full_species_names = [str(sp["name"]) for sp in manifest.get("species_meta", [])] or species_names
+    runtime_to_full = {name: idx for idx, name in enumerate(full_species_names)}
+    runs_by_rho_index = {int(run["rho_index"]): run for run in runs}
+    q_out = np.zeros((len(full_species_names), q_raw.shape[1]), dtype=float)
+    gamma_out = np.zeros((len(full_species_names), gamma_raw.shape[1]), dtype=float)
+
+    ref_name = str(manifest.get("normalization", {}).get("reference_species_name", "")).strip().lower()
+    a_minor_default = float(manifest.get("geometry", {}).get("a_minor", 1.0))
+    for col, ridx in enumerate(rho_index):
+        if int(ridx) == 0:
+            continue
+        run = runs_by_rho_index.get(int(ridx))
+        if run is None:
+            continue
+        ref_runtime_species = next(
+            (sp for sp in run["runtime_species"] if str(sp.get("name", "")).strip().lower() == ref_name),
+            run["runtime_species"][0],
+        )
+        rho_star_physical = float(run.get("rho_star_physical", 1.0))
+        a_minor = float(run.get("a_minor", a_minor_default))
+        for runtime_idx, runtime_name in enumerate(runtime_species_names):
+            full_idx = runtime_to_full.get(runtime_name)
+            if full_idx is None or runtime_idx >= q_raw.shape[0] or runtime_idx >= gamma_raw.shape[0]:
+                continue
+            q_out[full_idx, col] = _spectrax_flux_to_neopax_units(
+                q_raw[runtime_idx, col],
+                density_ref_state=float(ref_runtime_species["density_reference_physical"]),
+                temperature_ref_keV=float(ref_runtime_species["temperature_reference_physical"]),
+                mass_ref_mp=float(ref_runtime_species["mass"]),
+                rho_star_physical=rho_star_physical,
+                kind="Q",
+            ) * a_minor
+            gamma_out[full_idx, col] = _spectrax_flux_to_neopax_units(
+                gamma_raw[runtime_idx, col],
+                density_ref_state=float(ref_runtime_species["density_reference_physical"]),
+                temperature_ref_keV=float(ref_runtime_species["temperature_reference_physical"]),
+                mass_ref_mp=float(ref_runtime_species["mass"]),
+                rho_star_physical=rho_star_physical,
+                kind="Gamma",
+            ) * a_minor
+    return q_out, gamma_out
+
+
+def convert_file(src: Path, dst: Path, *, manifest_override: Path | None = None) -> None:
     src = src.resolve()
     dst = dst.resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +221,32 @@ def convert_file(src: Path, dst: Path) -> None:
             q,
             upar,
         )
+        gamma = np.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
+        q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+        upar = np.nan_to_num(upar, nan=0.0, posinf=0.0, neginf=0.0)
+        er = np.nan_to_num(er, nan=0.0, posinf=0.0, neginf=0.0)
+        heat_total = np.nan_to_num(heat_total, nan=0.0, posinf=0.0, neginf=0.0)
+        particle_total = np.nan_to_num(particle_total, nan=0.0, posinf=0.0, neginf=0.0)
+        manifest = _load_manifest_for_legacy(fin, src, manifest_override)
+        normalized = False
+        output_species_names = list(species_names)
+        if manifest is not None:
+            try:
+                q_norm, gamma_norm = _normalized_from_manifest(
+                    manifest=manifest,
+                    rho_index=rho_index,
+                    species_names=species_names,
+                    q_raw=q,
+                    gamma_raw=gamma,
+                )
+                if q_norm.shape[1] == q.shape[1] and gamma_norm.shape[1] == gamma.shape[1]:
+                    q = np.nan_to_num(q_norm, nan=0.0, posinf=0.0, neginf=0.0)
+                    gamma = np.nan_to_num(gamma_norm, nan=0.0, posinf=0.0, neginf=0.0)
+                    upar = np.zeros_like(gamma)
+                    output_species_names = [str(sp["name"]) for sp in manifest.get("species_meta", [])] or output_species_names
+                    normalized = True
+            except Exception:
+                normalized = False
 
     with h5py.File(dst, "w") as fout:
         fout.create_dataset("r", data=rho)
@@ -132,9 +261,15 @@ def convert_file(src: Path, dst: Path) -> None:
         fout.create_dataset("particle_flux_total", data=particle_total)
         meta = fout.create_group("meta")
         dt = h5py.string_dtype(encoding="utf-8")
-        meta.create_dataset("species_names", data=np.asarray(species_names, dtype=object), dtype=dt)
+        meta.create_dataset("species_names", data=np.asarray(output_species_names, dtype=object), dtype=dt)
         meta.attrs["converted_from"] = str(src)
-        meta.attrs["conversion"] = "legacy species/(heat_flux,particle_flux) transposed to root /(Q,Gamma)"
+        meta.attrs["conversion"] = (
+            "legacy species/(heat_flux,particle_flux) transposed to root /(Q,Gamma)"
+            if not normalized
+            else "legacy raw species fluxes converted to NEOPAX physical Gamma/Q using the legacy manifest metadata"
+        )
+        meta.attrs["nan_policy"] = "all NaN/inf values replaced by 0.0 during conversion"
+        meta.attrs["normalized_to_neopax_units"] = bool(normalized)
         meta.attrs["root_flux_layout"] = "r:(n_radial,), Gamma/Q/Upar:(n_species,n_radial)"
 
 
@@ -142,12 +277,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Legacy collected flux HDF5 file")
     parser.add_argument("--output", required=True, help="Converted output HDF5 file")
+    parser.add_argument("--manifest", default=None, help="Optional explicit legacy manifest.json to use for physical Gamma/Q normalization")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    convert_file(Path(args.input), Path(args.output))
+    convert_file(
+        Path(args.input),
+        Path(args.output),
+        manifest_override=None if args.manifest is None else Path(args.manifest),
+    )
     print(f"Converted {Path(args.input).resolve()} -> {Path(args.output).resolve()}")
     return 0
 
