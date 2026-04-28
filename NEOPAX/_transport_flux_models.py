@@ -647,6 +647,47 @@ def read_flux_profile_file(path, n_species):
     return r_arr, gamma_arr, q_arr, upar_arr
 
 
+def _flux_profile_debug_summary(name, arr):
+    if arr is None:
+        return f"{name}=missing"
+
+    arr_np = jnp.asarray(arr)
+    pieces = [f"{name}.shape={tuple(arr_np.shape)}"]
+    if arr_np.ndim == 1:
+        finite = jnp.isfinite(arr_np)
+        nfinite = int(jnp.sum(finite))
+        if nfinite > 0:
+            pieces.append(
+                "finite={}/{} min={:.6e} max={:.6e}".format(
+                    nfinite,
+                    arr_np.shape[0],
+                    float(jnp.min(arr_np[finite])),
+                    float(jnp.max(arr_np[finite])),
+                )
+            )
+        else:
+            pieces.append(f"finite=0/{arr_np.shape[0]}")
+        return " ".join(pieces)
+
+    for idx in range(arr_np.shape[0]):
+        prof = arr_np[idx]
+        finite = jnp.isfinite(prof)
+        nfinite = int(jnp.sum(finite))
+        if nfinite > 0:
+            pieces.append(
+                "s{}:finite={}/{} min={:.6e} max={:.6e}".format(
+                    idx,
+                    nfinite,
+                    prof.shape[0],
+                    float(jnp.min(prof[finite])),
+                    float(jnp.max(prof[finite])),
+                )
+            )
+        else:
+            pieces.append(f"s{idx}:finite=0/{prof.shape[0]}")
+    return " ".join(pieces)
+
+
 def build_fluxes_r_file_transport_model(
     species,
     geometry,
@@ -674,9 +715,28 @@ def build_fluxes_r_file_transport_model(
         raise ValueError(
             "fluxes_r_file requires a flux file. "
             "Provide one of: fluxes_file, file, flux_file, neoclassical_file, turbulence_file, or classical_file."
-        )
+    )
     location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    r_finite = jnp.isfinite(r_data)
+    r_nfinite = int(jnp.sum(r_finite))
+    if r_nfinite > 0:
+        r_summary = "finite={}/{} min={:.6e} max={:.6e}".format(
+            r_nfinite,
+            r_data.shape[0],
+            float(jnp.min(r_data[r_finite])),
+            float(jnp.max(r_data[r_finite])),
+        )
+    else:
+        r_summary = f"finite=0/{r_data.shape[0]}"
+    print(
+        "[NEOPAX] fluxes_r_file loaded: "
+        f"path={path} profile_location={str(location).strip().lower()} "
+        f"r.shape={tuple(r_data.shape)} {r_summary}"
+    )
+    print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
+    print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Q', q_data)}")
+    print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Upar', upar_data)}")
     return FluxesRFileTransportModel(
         species=species,
         geometry=geometry,
