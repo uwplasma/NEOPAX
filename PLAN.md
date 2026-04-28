@@ -650,6 +650,11 @@ Primary tasks in this phase:
   - local response/Jacobian-like operator
 - make this decomposition available from the active transport state without breaking the current black-box RHS path
 - keep the current assembled-RHS path as a reference/validation mode
+- keep this new mode strictly modular and opt-in:
+  - do not let the transport-response path silently alter the existing `transport` / black-box solver behavior
+  - preserve the current assembled-RHS path as the baseline reference implementation for regression and physics checks
+  - share low-level flux/source decomposition helpers where useful, but avoid contaminating the existing solver path with mode-specific control flow
+  - prefer explicit config selection for any new execution mode rather than implicit fallback or auto-switching
 
 Theta-specific tasks:
 - add a transport-response-backed theta mode in addition to the current generic-RHS theta implementation
@@ -705,6 +710,35 @@ Implementation ordering recommendation:
 2. implement the decomposition in a Trinity3D-like direct response form first
 3. wire it into theta before Radau
 4. only then add the lagged-response Radau mode and benchmark whether it preserves enough of Radau's transient advantages to justify its complexity
+
+### Phase 10B: Optional Full Black-Box RHS Linearization
+- Status: future option
+- Goal:
+  - keep open the possibility of a solver mode based on linearizing the fully assembled semidiscrete RHS directly, rather than first decomposing transport into flux/source response pieces
+
+Why this is not the primary direction:
+- a full black-box RHS Jacobian would mix together:
+  - transport physics sensitivity
+  - source-model sensitivity
+  - geometry/divergence assembly
+  - boundary-condition reconstruction effects
+  - floors/projections/state-regularization effects
+- this is less physically structured than a Trinity3D-like transport-response decomposition
+- for expensive closures, it may also be less efficient than building targeted response information with respect to the dominant transport-gradient directions
+
+Possible use cases:
+- reference / comparison path against the transport-response formulation
+- fallback solver mode for cases where a structured transport decomposition is unavailable
+- future experimentation with fully linearized implicit solves for simpler model combinations
+
+Design constraints if pursued later:
+- keep it strictly optional and out of the hot path of the current black-box solver mode
+- do not let support for this mode worsen compile time or traced-graph complexity for the default transport execution path
+- prefer a clearly separated solver/execution path over adding large branched logic to the existing assembled-RHS kernels
+
+Expected tradeoff:
+- simpler conceptual interface from the solver perspective (`f(y)` plus `df/dy`)
+- but usually less interpretable and less transport-physics-aware than a structured flux/source response model
 
 ### Theta Solver Upgrade Notes
 - Status: planned
