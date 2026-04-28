@@ -434,6 +434,8 @@ def _build_manifest(
         "snapshot_time": snapshot.time_value,
         "electron_model": str(electron_model_value).lower(),
         "spectrax_template": None if spectrax_template is None else str(spectrax_template),
+        "source_rho": [float(v) for v in rho],
+        "source_er": [float(v) for v in er],
         "runtime_species_names": runtime_species_names,
         "booz_file": booz_path,
         "vmec_file": vmec_path,
@@ -959,6 +961,58 @@ def _read_last_row_csv(path: Path) -> dict[str, float]:
     return out
 
 
+def _expand_axis_zero_if_needed(
+    manifest: dict[str, Any],
+    rho: np.ndarray,
+    rho_index: np.ndarray,
+    torflux: np.ndarray,
+    er: np.ndarray,
+    heat_flux: np.ndarray,
+    particle_flux: np.ndarray,
+    heat_flux_species: np.ndarray,
+    particle_flux_species: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    source_rho = np.asarray(manifest.get("source_rho", []), dtype=float)
+    source_er = np.asarray(manifest.get("source_er", []), dtype=float)
+    if source_rho.size == 0:
+        return rho, rho_index, torflux, er, heat_flux, particle_flux, heat_flux_species, particle_flux_species
+    if source_rho.size != rho.size + 1:
+        return rho, rho_index, torflux, er, heat_flux, particle_flux, heat_flux_species, particle_flux_species
+    if not np.isclose(source_rho[0], 0.0):
+        return rho, rho_index, torflux, er, heat_flux, particle_flux, heat_flux_species, particle_flux_species
+    expected = np.arange(1, source_rho.size, dtype=int)
+    if not np.array_equal(np.sort(rho_index), expected):
+        return rho, rho_index, torflux, er, heat_flux, particle_flux, heat_flux_species, particle_flux_species
+
+    full_n = source_rho.size
+    full_rho = np.asarray(source_rho, dtype=float)
+    full_rho_index = np.arange(full_n, dtype=int)
+    full_torflux = full_rho**2
+    full_er = np.zeros(full_n, dtype=float)
+    if source_er.size == full_n:
+        full_er[:] = source_er
+
+    full_heat = np.zeros(full_n, dtype=float)
+    full_particle = np.zeros(full_n, dtype=float)
+    full_heat_species = np.zeros((full_n, heat_flux_species.shape[1]), dtype=float)
+    full_particle_species = np.zeros((full_n, particle_flux_species.shape[1]), dtype=float)
+
+    full_heat[1:] = heat_flux
+    full_particle[1:] = particle_flux
+    full_heat_species[1:, :] = heat_flux_species
+    full_particle_species[1:, :] = particle_flux_species
+    return (
+        full_rho,
+        full_rho_index,
+        full_torflux,
+        full_er,
+        full_heat,
+        full_particle,
+        full_heat_species,
+        full_particle_species,
+    )
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     manifest = _load_manifest(Path(args.manifest).resolve())
     runs = manifest["runs"]
@@ -997,6 +1051,27 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 continue
             heat_flux_species[i, full_idx] = row.get(f"heat_flux_s{runtime_idx}", 0.0)
             particle_flux_species[i, full_idx] = row.get(f"particle_flux_s{runtime_idx}", 0.0)
+
+    (
+        rho,
+        rho_index,
+        torflux,
+        er,
+        heat_flux,
+        particle_flux,
+        heat_flux_species,
+        particle_flux_species,
+    ) = _expand_axis_zero_if_needed(
+        manifest,
+        rho,
+        rho_index,
+        torflux,
+        er,
+        heat_flux,
+        particle_flux,
+        heat_flux_species,
+        particle_flux_species,
+    )
 
     gamma_out = np.asarray(particle_flux_species.T, dtype=float)
     q_out = np.asarray(heat_flux_species.T, dtype=float)

@@ -47,6 +47,34 @@ def _read_string_array(dataset: Any) -> list[str]:
     return out
 
 
+def _prepend_axis_zero_if_needed(
+    rho: np.ndarray,
+    rho_index: np.ndarray,
+    torflux: np.ndarray,
+    er: np.ndarray,
+    heat_total: np.ndarray,
+    particle_total: np.ndarray,
+    gamma: np.ndarray,
+    q: np.ndarray,
+    upar: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if rho.size == 0:
+        return rho, rho_index, torflux, er, heat_total, particle_total, gamma, q, upar
+    expected = np.arange(1, rho.size + 1, dtype=int)
+    if not np.array_equal(rho_index, expected):
+        return rho, rho_index, torflux, er, heat_total, particle_total, gamma, q, upar
+    rho = np.concatenate(([0.0], rho))
+    rho_index = np.concatenate(([0], rho_index))
+    torflux = np.concatenate(([0.0], torflux))
+    er = np.concatenate(([0.0], er))
+    heat_total = np.concatenate(([0.0], heat_total))
+    particle_total = np.concatenate(([0.0], particle_total))
+    gamma = np.concatenate((np.zeros((gamma.shape[0], 1), dtype=gamma.dtype), gamma), axis=1)
+    q = np.concatenate((np.zeros((q.shape[0], 1), dtype=q.dtype), q), axis=1)
+    upar = np.concatenate((np.zeros((upar.shape[0], 1), dtype=upar.dtype), upar), axis=1)
+    return rho, rho_index, torflux, er, heat_total, particle_total, gamma, q, upar
+
+
 def convert_file(src: Path, dst: Path) -> None:
     src = src.resolve()
     dst = dst.resolve()
@@ -79,6 +107,17 @@ def convert_file(src: Path, dst: Path) -> None:
         gamma = np.asarray(particle_species.T, dtype=float)
         q = np.asarray(heat_species.T, dtype=float)
         upar = np.zeros_like(gamma)
+        rho, rho_index, torflux, er, heat_total, particle_total, gamma, q, upar = _prepend_axis_zero_if_needed(
+            rho,
+            rho_index,
+            torflux,
+            er,
+            heat_total,
+            particle_total,
+            gamma,
+            q,
+            upar,
+        )
 
     with h5py.File(dst, "w") as fout:
         fout.create_dataset("r", data=rho)
