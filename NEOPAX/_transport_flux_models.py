@@ -761,7 +761,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     def _interp_species_profile(self, data, target_r):
         if data is None:
             return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
-        return jax.vmap(lambda prof: interpax.interp1d(self.r_data, prof, target_r))(data)
+        return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
     def _normalize_profile_location(self):
         location = str(self.profile_location).strip().lower()
