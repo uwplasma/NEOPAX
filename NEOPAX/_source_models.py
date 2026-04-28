@@ -110,6 +110,7 @@ class DTReactionSource(SourceModelBase):
 class PowerExchangeSource(SourceModelBase):
     species: Any = dataclasses.field(repr=False, default=None)
     mode: str = "all"
+    coulomb_log_mode: str = "neopax_simple"
     temperature_active_mask: Any = dataclasses.field(repr=False, default=None)
     idx_a: str = None
     idx_b: str = None
@@ -132,19 +133,30 @@ class PowerExchangeSource(SourceModelBase):
                 "Use 'all' or 'exclude_frozen' "
                 "(aliases: 'active_temperature_only', 'active_only', 'evolving_only', 'ntss_like')."
             )
-        return {"power_exchange": power_exchange(state, species=active_species, pair_active_mask=pair_active_mask)}
+        return {
+            "power_exchange": power_exchange(
+                state,
+                species=active_species,
+                pair_active_mask=pair_active_mask,
+                coulomb_log_mode=self.coulomb_log_mode,
+            )
+        }
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class BremsstrahlungRadiationSource(SourceModelBase):
     species: Any = dataclasses.field(repr=False, default=None)
     delta_zeff: float = 0.0
+    coefficient_mode: str = "astra"
+    brems_coefficient: float | None = None
     def __call__(self, state, species=None):
         active_species = self.species if self.species is not None else species
         PBrems, Zeff = bremsstrahlung_radiation(
             state,
             species=active_species,
             delta_zeff=self.delta_zeff,
+            coefficient_mode=self.coefficient_mode,
+            brems_coefficient=self.brems_coefficient,
         )
         return {"PBrems": PBrems, "Zeff": Zeff}
 

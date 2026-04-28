@@ -94,7 +94,8 @@ class AnalyticalProfileModel(ProfileModel):
                     k += 1
                 return jnp.asarray(out, dtype=float)
             raise ValueError(
-                "Species-resolved array length must be n_species, or n_species-1 when electron is omitted."
+                "Species-resolved array length must be n_species, or n_species-1 when electron is omitted. "
+                f"Got length {len(vals)} for n_species={n_species}."
             )
 
         c_density = _expand_species_values(self.c_density, default=1.0, include_electron=False)

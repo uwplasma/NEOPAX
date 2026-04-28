@@ -385,3 +385,58 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
         return None, robin_grad
 
     raise ValueError(f"Unsupported left BC type: {left_type}")
+
+
+def apply_cell_centered_boundary_state(profile, bc_model, face_centers):
+    """Project cell-centered profiles so boundary cells satisfy the configured BCs."""
+    if bc_model is None:
+        return jnp.asarray(profile)
+
+    prof = jnp.asarray(profile)
+    squeeze = prof.ndim == 1
+    if squeeze:
+        prof = prof[None, :]
+
+    dx_left = _boundary_cell_spacing(face_centers, side="left")
+    dx_right = _boundary_cell_spacing(face_centers, side="right")
+    out = prof
+
+    left_type = str(getattr(bc_model, "left_type", "dirichlet")).strip().lower()
+    left_default = prof[:, 0]
+    left_value = None if getattr(bc_model, "left_value", None) is None else _as_like_template(getattr(bc_model, "left_value"), left_default)
+    left_gradient = None if getattr(bc_model, "left_gradient", None) is None else _as_like_template(getattr(bc_model, "left_gradient"), left_default)
+    left_decay = None if getattr(bc_model, "left_decay_length", None) is None else _as_like_template(getattr(bc_model, "left_decay_length"), left_default)
+    u1 = prof[:, 1] if prof.shape[1] >= 2 else prof[:, 0]
+    u2 = prof[:, 2] if prof.shape[1] >= 3 else u1
+    if left_type == "dirichlet":
+        left_cell = left_default if left_value is None else left_value
+        out = out.at[:, 0].set(left_cell)
+    elif left_type == "neumann":
+        lg = jnp.zeros_like(left_default) if left_gradient is None else left_gradient
+        left_cell = (4.0 * u1 - u2 - 2.0 * dx_left * lg) / 3.0
+        out = out.at[:, 0].set(left_cell)
+    elif left_type == "robin":
+        decay = jnp.ones_like(left_default) if left_decay is None else left_decay
+        left_cell = (4.0 * u1 - u2) / (3.0 - 2.0 * dx_left / (decay + 1.0e-12))
+        out = out.at[:, 0].set(left_cell)
+
+    right_type = str(getattr(bc_model, "right_type", "dirichlet")).strip().lower()
+    right_default = prof[:, -1]
+    right_value = None if getattr(bc_model, "right_value", None) is None else _as_like_template(getattr(bc_model, "right_value"), right_default)
+    right_gradient = None if getattr(bc_model, "right_gradient", None) is None else _as_like_template(getattr(bc_model, "right_gradient"), right_default)
+    right_decay = None if getattr(bc_model, "right_decay_length", None) is None else _as_like_template(getattr(bc_model, "right_decay_length"), right_default)
+    u_nm1 = prof[:, -2] if prof.shape[1] >= 2 else prof[:, -1]
+    u_nm2 = prof[:, -3] if prof.shape[1] >= 3 else u_nm1
+    if right_type == "dirichlet":
+        right_cell = right_default if right_value is None else right_value
+        out = out.at[:, -1].set(right_cell)
+    elif right_type == "neumann":
+        rg = jnp.zeros_like(right_default) if right_gradient is None else right_gradient
+        right_cell = (4.0 * u_nm1 - u_nm2 + 2.0 * dx_right * rg) / 3.0
+        out = out.at[:, -1].set(right_cell)
+    elif right_type == "robin":
+        decay = jnp.ones_like(right_default) if right_decay is None else right_decay
+        right_cell = (4.0 * u_nm1 - u_nm2) / (3.0 + 2.0 * dx_right / (decay + 1.0e-12))
+        out = out.at[:, -1].set(right_cell)
+
+    return out[0] if squeeze else out

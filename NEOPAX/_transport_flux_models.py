@@ -465,6 +465,8 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
     geometry: Any
     database: Any
     collisionality_model: str = "default"
+    bc_density: Any = None
+    bc_temperature: Any = None
 
     def __call__(self, state) -> dict:
         density = safe_density(state.density)
@@ -489,19 +491,32 @@ class MonkesDatabaseTransportModel(TransportFluxModelBase):
         energy_grid = self.energy_grid
         geometry = self.geometry
         database = self.database
+        density = safe_density(state.density)
+        temperature = state.temperature
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density,
+            density,
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature,
+            temperature,
+        )
 
         def evaluator(radius_index, er_value):
             er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
             er_profile = state.Er.at[radius_index].set(er_scalar)
-            density = safe_density(state.density)
             _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
                 species,
                 energy_grid,
                 geometry,
                 database,
                 er_profile,
-                state.temperature,
+                temperature,
                 density,
+                density_right_constraint=density_right_constraint,
+                density_right_grad_constraint=density_right_grad_constraint,
+                temperature_right_constraint=temperature_right_constraint,
+                temperature_right_grad_constraint=temperature_right_grad_constraint,
                 collisionality_model=self.collisionality_model,
             )
             return gamma_neo[:, radius_index]
@@ -629,6 +644,43 @@ def read_flux_profile_file(path, n_species):
     q_arr = None if q is None else _normalize_flux_dataset(q, n_species)
     upar_arr = None if upar is None else _normalize_flux_dataset(upar, n_species)
     return r_arr, gamma_arr, q_arr, upar_arr
+
+
+def build_fluxes_r_file_transport_model(
+    species,
+    geometry,
+    *,
+    fluxes_file=None,
+    file=None,
+    flux_file=None,
+    neoclassical_file=None,
+    turbulence_file=None,
+    classical_file=None,
+    **kwargs,
+):
+    del kwargs
+    path = (
+        fluxes_file
+        or file
+        or flux_file
+        or neoclassical_file
+        or turbulence_file
+        or classical_file
+    )
+    if path is None:
+        raise ValueError(
+            "fluxes_r_file requires a flux file. "
+            "Provide one of: fluxes_file, file, flux_file, neoclassical_file, turbulence_file, or classical_file."
+        )
+    r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    return FluxesRFileTransportModel(
+        species=species,
+        geometry=geometry,
+        r_data=r_data,
+        gamma_data=gamma_data,
+        q_data=q_data,
+        upar_data=upar_data,
+    )
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -824,12 +876,14 @@ def build_transport_flux_model(neo_model: TransportFluxModelBase,
 
 register_transport_flux_model(
     "monkes_database",
-    lambda species, energy_grid, geometry, database, collisionality_model="default": MonkesDatabaseTransportModel(
+    lambda species, energy_grid, geometry, database, collisionality_model="default", bc_density=None, bc_temperature=None: MonkesDatabaseTransportModel(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,
         database=database,
         collisionality_model=collisionality_model,
+        bc_density=bc_density,
+        bc_temperature=bc_temperature,
     ),
 )
 
@@ -882,6 +936,15 @@ register_transport_flux_model(
         chi_n=chi_n,
         pressure_source_model=pressure_source_model,
         total_power_mw=total_power_mw,
+    ),
+)
+
+register_transport_flux_model(
+    "fluxes_r_file",
+    lambda species, energy_grid, geometry, database, **kwargs: build_fluxes_r_file_transport_model(
+        species=species,
+        geometry=geometry,
+        **kwargs,
     ),
 )
 

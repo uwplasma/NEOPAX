@@ -1,0 +1,62 @@
+[general]
+mode = "fluxes"
+
+[geometry]
+vmec_file = "./examples/inputs/wout_W7-X_standard_configuration.nc"
+boozer_file = "./examples/inputs/boozmn_wout_W7-X_standard_configuration.nc"
+n_radial = 51
+
+[neoclassical]
+flux_model = "monkes_database"
+neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_W7X.h5"
+
+[ambipolarity]
+er_ambipolar_method = "two_stage"
+er_ambipolar_scan_min = -50.0
+er_ambipolar_scan_max = 50.0
+er_ambipolar_n_coarse = 80
+er_ambipolar_n_refine = 8
+er_ambipolar_max_roots = 3
+er_ambipolar_tol = 1.0e-6
+er_ambipolar_x_tol = 1.0e-6
+er_ambipolar_maxiter = 12
+er_ambipolar_blocksize = 1
+
+[turbulence]
+flux_model = "none"
+
+[classical]
+flux_model = "none"
+
+[energy_grid]
+n_x = 64
+
+[species]
+n_species = 3
+names = ["e", "D", "T"]
+mass_mp = [0.000544617, 2.0, 3.0]
+charge_qp = [-1.0, 1.0, 1.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = 4.21
+n_edge = 0.6
+T0 = 17.8
+T_edge = 0.7
+c_density = [1.0, 0.5, 0.5]
+c_temperature = [1.0, 1.0, 1.0]
+density_shape_power = 10.0
+temperature_shape_power = 2.0
+n_scale = 1.0
+T_scale = 1.0
+er_initialization_mode = "ambipolar_min_entropy"
+er0_scale = 100.0
+er0_peak_rho = 0.8
+
+[fluxes]
+fluxes_plot = true
+fluxes_write_hdf5 = true
+fluxes_overlay_reference = true
+fluxes_reference_file = "./examples/inputs/NTSS_W7X_Initial.h5"
+fluxes_reference_label = "NTSS"
+fluxes_output_dir = "./outputs/fluxes_w7x_reference"

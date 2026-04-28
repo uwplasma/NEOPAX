@@ -116,6 +116,25 @@ def project_fixed_temperature_species(
     return dataclasses.replace(state, pressure=pressure)
 
 
+def apply_er_dirichlet_boundary_state(state, er_bc_model):
+    """Clamp Er state values at configured Dirichlet boundaries."""
+    if er_bc_model is None or getattr(state, "Er", None) is None:
+        return state
+
+    er = state.Er
+    left_type = str(getattr(er_bc_model, "left_type", "")).strip().lower()
+    if left_type == "dirichlet" and getattr(er_bc_model, "left_value", None) is not None:
+        left_value = jnp.asarray(getattr(er_bc_model, "left_value"), dtype=er.dtype).reshape(-1)[0]
+        er = er.at[0].set(left_value)
+
+    right_type = str(getattr(er_bc_model, "right_type", "")).strip().lower()
+    if right_type == "dirichlet" and getattr(er_bc_model, "right_value", None) is not None:
+        right_value = jnp.asarray(getattr(er_bc_model, "right_value"), dtype=er.dtype).reshape(-1)[0]
+        er = er.at[-1].set(right_value)
+
+    return dataclasses.replace(state, Er=er)
+
+
 def _expand_density_rhs_to_full_shape(density_rhs, template_density, species):
     """Expand a reduced density RHS back to full physical species ordering."""
     density_rhs = jnp.asarray(density_rhs)
@@ -730,11 +749,15 @@ class ElectricFieldEquation(EquationBase):
     permitivity_prefactor: jax.Array = dataclasses.field(repr=False)
     gamma_faces_builder: callable = dataclasses.field(repr=False)
     er_diffusive_flux_builder: callable = dataclasses.field(repr=False)
+    er_bc_model: object = dataclasses.field(repr=False, default=None)
     source_mode: str = "ambipolar_local"
+    permitivity_mode: str = "neopax_local"
     Er_relax: float = 1.0
     DEr: float = 1.0
     boundary_mode: str = "standard"
-    Er_edge_relax: float = 1.0
+    ntss_B0_mid: float = 0.0
+    ntss_psfactor_mid: float = 1.0
+    ntss_density_indices: jax.Array = dataclasses.field(repr=False, default=None)
     name: str = "Er"
 
     def _charge_flux_from_gamma(self, Gamma):
@@ -758,6 +781,27 @@ class ElectricFieldEquation(EquationBase):
             )
         return er_diffusive_flux, er_diffusion
 
+    def _charge_flux_and_ambi_term(self, state, Gamma, plasma_permitivity):
+        charge_flux = self._charge_flux_from_gamma(Gamma)
+        mode = str(self.permitivity_mode).strip().lower()
+        if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
+            density_indices = self.ntss_density_indices
+            if density_indices is None:
+                ni_mid = jnp.asarray(1.0, dtype=charge_flux.dtype)
+            else:
+                ni_mid = jnp.sum(state.density[density_indices, state.density.shape[1] // 2])
+            ni_mid = jnp.maximum(ni_mid, jnp.asarray(1.0e-30, dtype=charge_flux.dtype))
+            coeffG = (
+                jnp.asarray(95780.0, dtype=charge_flux.dtype)
+                * jnp.asarray(self.ntss_B0_mid, dtype=charge_flux.dtype) ** 2
+                / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux.dtype))
+            )
+            ambi_term = coeffG * (charge_flux * jnp.asarray(1.0e-20, dtype=charge_flux.dtype))
+            return charge_flux, ambi_term
+
+        ambi_term = charge_flux * elementary_charge * 1.0e-3 / plasma_permitivity
+        return charge_flux, ambi_term
+
     def debug_components(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
@@ -768,8 +812,7 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = fluxes["Gamma"]
-        charge_flux = self._charge_flux_from_gamma(Gamma)
-        ambi_term = charge_flux * elementary_charge * 1.e-3 / plasma_permitivity
+        charge_flux, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
         er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
         return {
             "charge_flux": charge_flux,
@@ -789,14 +832,29 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = fluxes["Gamma"]
-        charge_flux = self._charge_flux_from_gamma(Gamma)
-        ambi_term = charge_flux * elementary_charge * 1.e-3 / plasma_permitivity
+        _, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
         _, Er_diffusion = self._er_diffusion(Er)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
-        SourceEr = SourceEr.at[0].set(0.)
         if self.boundary_mode == "floating_ambipolar_edge":
-            SourceEr = SourceEr.at[-1].set(-self.Er_edge_relax * ambi_term[-1])
+            SourceEr = SourceEr.at[-1].set(-self.Er_relax * ambi_term[-1])
+        SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
+
+    def enforce_dirichlet_boundary_rhs(self, state, er_rhs):
+        bc = self.er_bc_model
+        if bc is None:
+            return er_rhs.at[0].set(0.0)
+
+        out = er_rhs
+        left_type = str(getattr(bc, "left_type", "")).strip().lower()
+        if left_type == "dirichlet":
+            out = out.at[0].set(jnp.asarray(0.0, dtype=out.dtype))
+
+        right_type = str(getattr(bc, "right_type", "")).strip().lower()
+        if right_type == "dirichlet" and self.boundary_mode != "floating_ambipolar_edge":
+            out = out.at[-1].set(jnp.asarray(0.0, dtype=out.dtype))
+
+        return out
 
     def ap_linear_split(self, state):
         """
@@ -816,6 +874,7 @@ class ElectricFieldEquation(EquationBase):
 # --- Factory function to build ElectricFieldEquation up front ---
 def build_electric_field_equation(
     field,
+    species_names,
     flux_model,
     species_mass,
     charge_qp,
@@ -824,9 +883,9 @@ def build_electric_field_equation(
     Er_relax=1.0,
     DEr=1.0,
     source_mode="ambipolar_local",
+    permitivity_mode="neopax_local",
     reconstruction="linear",
     boundary_mode="standard",
-    Er_edge_relax=1.0,
 ):
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
@@ -834,6 +893,16 @@ def build_electric_field_equation(
     psi_fac = 1.0 + 1.0 / (field.enlogation * jnp.square(field.iota))
     psi_fac = psi_fac.at[0].set(1.0)
     permitivity_prefactor = psi_fac / jnp.square(field.B0)
+    mid_idx = int(field.r_grid.shape[0] // 2)
+    ntss_B0_mid = jnp.asarray(field.B0[mid_idx])
+    ntss_psfactor_mid = jnp.asarray(psi_fac[mid_idx])
+    names = tuple(species_names) if species_names is not None else ()
+    dt_indices = [i for i, name in enumerate(names) if str(name) in {"D", "T"}]
+    if dt_indices:
+        ntss_density_indices = jnp.asarray(dt_indices, dtype=jnp.int32)
+    else:
+        ion_indices = [i for i, q in enumerate(jnp.asarray(charge_qp)) if float(q) > 0.0]
+        ntss_density_indices = jnp.asarray(ion_indices, dtype=jnp.int32)
     # Pre-build the gamma_faces_builder function for BC handling (density/Er)
     if bc_gamma is not None and hasattr(bc_gamma, "right_type"):
         def gamma_faces_builder(Gamma):
@@ -941,12 +1010,25 @@ def build_electric_field_equation(
         permitivity_prefactor=permitivity_prefactor,
         gamma_faces_builder=gamma_faces_builder,
         er_diffusive_flux_builder=er_diffusive_flux_builder,
+        er_bc_model=bc_er,
         source_mode=str(source_mode).strip().lower(),
+        permitivity_mode=str(permitivity_mode).strip().lower(),
         Er_relax=Er_relax,
         DEr=DEr,
         boundary_mode=str(boundary_mode).strip().lower(),
-        Er_edge_relax=Er_edge_relax,
+        ntss_B0_mid=ntss_B0_mid,
+        ntss_psfactor_mid=ntss_psfactor_mid,
+        ntss_density_indices=ntss_density_indices,
     )
+
+
+def _resolve_er_boundary_mode(config, solver_cfg):
+    er_right_cfg = config.get("boundary", {}).get("Er", {}).get("right", {})
+    if isinstance(er_right_cfg, dict):
+        right_type = er_right_cfg.get("type")
+        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+            return str(right_type).strip().lower()
+    return str(solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))).strip().lower()
 
 
 # --- Equation System Builder (torax-style) ---
@@ -985,8 +1067,11 @@ def build_equation_system(
     Er_relax = solver_cfg.get("Er_relax", 1.0)
     DEr = solver_cfg.get("DEr", 1.0)
     Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
-    Er_boundary_mode = solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))
-    Er_edge_relax = solver_cfg.get("Er_edge_relax", Er_relax)
+    Er_permitivity_mode = solver_cfg.get(
+        "Er_permittivity_mode",
+        solver_cfg.get("Er_permitivity_mode", "neopax_local"),
+    )
+    Er_boundary_mode = _resolve_er_boundary_mode(config, solver_cfg)
     density_flux_reconstruction = solver_cfg.get("density_flux_reconstruction", "closure_face_flux")
     density_particle_face_closure_mode = solver_cfg.get("density_particle_face_closure_mode", "reconstructed")
     include_neo_convection = solver_cfg.get("temperature_include_neo_convection", True)
@@ -1037,6 +1122,7 @@ def build_equation_system(
     if eqn_flags["Er"]:
         equations_to_evolve.append(build_electric_field_equation(
             field,
+            getattr(species, "names", ()),
             flux_model,
             species_mass,
             charge_qp,
@@ -1045,8 +1131,8 @@ def build_equation_system(
             Er_relax=Er_relax,
             DEr=DEr,
             source_mode=Er_source_mode,
+            permitivity_mode=Er_permitivity_mode,
             boundary_mode=Er_boundary_mode,
-            Er_edge_relax=Er_edge_relax,
         ))
     return equations_to_evolve
 
@@ -1088,7 +1174,19 @@ def build_equation_system_from_config(config, species):
     classical_model = classical_factory(species, energy_grid, field, database) if classical_factory is not None else ZeroTransportModel()
     flux_model = build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
 
-    boundary_cfg = config.get("boundary", {})
+    boundary_cfg = dict(config.get("boundary", {}))
+    er_cfg = boundary_cfg.get("Er")
+    if isinstance(er_cfg, dict):
+        er_cfg = dict(er_cfg)
+        right_cfg = er_cfg.get("right")
+        if isinstance(right_cfg, dict):
+            right_cfg = dict(right_cfg)
+            right_type = str(right_cfg.get("type", "")).strip().lower()
+            if right_type in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+                right_cfg["type"] = "neumann"
+                right_cfg.setdefault("gradient", 0.0)
+            er_cfg["right"] = right_cfg
+        boundary_cfg["Er"] = er_cfg
     dr = getattr(field, "dr", 1.0)
     boundary_models = {
         key: build_boundary_condition_model(
@@ -1128,6 +1226,7 @@ class ComposedEquationSystem:
     temperature_floor: object = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
     temperature_active_mask: object | None = None
     fixed_temperature_profile: object | None = None
+    er_bc_model: object | None = None
 
     def _prepare_working_state(self, state):
         working_state = state
@@ -1139,6 +1238,7 @@ class ComposedEquationSystem:
             except Exception:
                 working_state = state
         working_state = apply_transport_density_floor(working_state, self.density_floor)
+        working_state = apply_er_dirichlet_boundary_state(working_state, self.er_bc_model)
         working_state = project_fixed_temperature_species(
             working_state,
             self.temperature_active_mask,
@@ -1208,6 +1308,9 @@ class ComposedEquationSystem:
 
         if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
             pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+
+        if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+            Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
 
         return TransportState(
             density=density_rhs,

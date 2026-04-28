@@ -28,7 +28,7 @@ def dt_reaction(state, species):
     return DTreactionRate, HeSource, AlphaPower
 
 @jit
-def power_exchange(state, species, pair_active_mask):
+def _power_exchange_impl(state, species, pair_active_mask, use_ntssfusion_lnL):
     # JAX-jittable, differentiable: vectorized pairwise sum
     n_species = state.temperature.shape[0]
     idx_i, idx_j = jnp.triu_indices(n_species, k=1)
@@ -46,7 +46,65 @@ def power_exchange(state, species, pair_active_mask):
     mB = species.mass_mp[idx_j]
     qA = species.charge_qp[idx_i]
     qB = species.charge_qp[idx_j]
-    lnL = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
+    qA_col = qA[:, None]
+    qB_col = qB[:, None]
+    mA_col = mA[:, None]
+    mB_col = mB[:, None]
+    same_sign = (qA_col * qB_col) > 0.0
+    a_is_electron = qA_col < 0.0
+    b_is_electron = qB_col < 0.0
+
+    # NTSSfusion-style branch logic from CPlasma_Fluxes.cpp::lnLab.
+    lnL_ee = jnp.where(
+        TA < 0.01,
+        17.24 + 0.5 * jnp.log(TA**3 / nA),
+        16.1 + 0.5 * jnp.log(TA**2 / nA),
+    )
+    lnL_ii = 17.24 - jnp.log(
+        jnp.abs(qA_col * qB_col)
+        * (mA_col + mB_col)
+        / (mA_col * TB + mB_col * TA)
+        * jnp.sqrt(nA * qA_col**2 / TA + nB * qB_col**2 / TB)
+    )
+    cond_ei_1 = (TA < 0.01 * qB_col**2) & (TB * mA_col < TA * mB_col)
+    cond_ei_2 = (TA > 0.01 * qB_col**2) & (TB * mA_col < 0.01 * qB_col**2 * mB_col)
+    cond_ei_3 = TA * mB_col < TB * jnp.abs(qB_col) * mA_col
+    lnL_ei = jnp.where(
+        cond_ei_1,
+        17.24 + 0.5 * jnp.log(TA**3 / (nA * qB_col**2)),
+        jnp.where(
+            cond_ei_2,
+            16.1 + 0.5 * jnp.log(TA**2 / nA),
+            jnp.where(
+                cond_ei_3,
+                24.24 + 0.5 * jnp.log(TB * (TB * mB_col) ** 2 / (nB * (qB_col**2) ** 2)),
+                16.1 + 0.5 * jnp.log(TA**2 / nA),
+            ),
+        ),
+    )
+    cond_ie_1 = (TB < 0.01 * qA_col**2) & (TA * mB_col < TB * mA_col)
+    cond_ie_2 = (TB > 0.01 * qA_col**2) & (TA * mB_col < 0.01 * qA_col**2 * mA_col)
+    cond_ie_3 = TB * mA_col < TA * jnp.abs(qA_col) * mB_col
+    lnL_ie = jnp.where(
+        cond_ie_1,
+        17.24 + 0.5 * jnp.log(TB**3 / (nB * qA_col**2)),
+        jnp.where(
+            cond_ie_2,
+            16.1 + 0.5 * jnp.log(TB**2 / nB),
+            jnp.where(
+                cond_ie_3,
+                24.24 + 0.5 * jnp.log(TA * (TA * mA_col) ** 2 / (nA * (qA_col**2) ** 2)),
+                16.1 + 0.5 * jnp.log(TB**2 / nB),
+            ),
+        ),
+    )
+    lnL_simple = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
+    lnL_ntss = jnp.where(
+        same_sign,
+        jnp.where(a_is_electron & b_is_electron, lnL_ee, lnL_ii),
+        jnp.where(a_is_electron, lnL_ei, lnL_ie),
+    )
+    lnL = jnp.where(jnp.asarray(use_ntssfusion_lnL), lnL_ntss, lnL_simple)
     mA = mA[:, None]
     mB = mB[:, None]
     qA = qA[:, None]
@@ -72,6 +130,20 @@ def power_exchange(state, species, pair_active_mask):
     out = out.at[idx_j].add(-Pab)
     return out
 
+
+def power_exchange(state, species, pair_active_mask, coulomb_log_mode="neopax_simple"):
+    mode = str(coulomb_log_mode).strip().lower()
+    if mode in {"neopax_simple", "simple", "default"}:
+        use_ntssfusion_lnL = False
+    elif mode in {"ntssfusion", "ntss_like", "ntss", "pair_dependent"}:
+        use_ntssfusion_lnL = True
+    else:
+        raise ValueError(
+            f"Unknown power_exchange coulomb_log_mode '{coulomb_log_mode}'. "
+            "Use 'neopax_simple' or 'ntssfusion'."
+        )
+    return _power_exchange_impl(state, species, pair_active_mask, jnp.asarray(use_ntssfusion_lnL))
+
 @jit
 def bremsstrahlung_radiation_generalized(
     state,
@@ -81,6 +153,7 @@ def bremsstrahlung_radiation_generalized(
     main_ion_indices=(1, 2),  # default: D, T
     electron_index=0,
     delta_zeff=0.0,
+    brems_coefficient=3.16e-1,
 ):
     """
     Generalized bremsstrahlung radiation model.
@@ -92,10 +165,11 @@ def bremsstrahlung_radiation_generalized(
         main_ion_indices: tuple of indices for main ions
         electron_index: index for electrons
         delta_zeff: additive Zeff offset, analogous to NTSSfusion DeltaZeff
+        brems_coefficient: prefactor in `PBrems = C * Zeff * ne^2 * sqrt(Te)`
     Returns:
         PBrems: bremsstrahlung power density in the normalized transport units
             used elsewhere in NEOPAX, matching the NTSS-like
-            `3.16e-1 * Zeff * ne^2 * sqrt(Te)` form.
+            `C * Zeff * ne^2 * sqrt(Te)` form.
         Zeff: effective charge
     """
     ne = state.density[electron_index]
@@ -124,7 +198,7 @@ def bremsstrahlung_radiation_generalized(
     Zeff = Zeff + jnp.asarray(delta_zeff, dtype=ne.dtype)
     # Keep the NTSS-like transport normalization used by the original default
     # source, while upgrading Zeff to the full multispecies expression.
-    PBrems = 3.16e-1 * Zeff * ne**2 * jnp.sqrt(Te)
+    PBrems = jnp.asarray(brems_coefficient, dtype=ne.dtype) * Zeff * ne**2 * jnp.sqrt(Te)
     Tm = 511.0 * 1e3  # eV
     Te_eV = Te  # assume Te in eV
     corr = (1.0 + 2.0 * Te_eV / Tm) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + Te_eV / Tm)))
@@ -137,13 +211,31 @@ def bremsstrahlung_radiation_generalized(
     return PBrems, Zeff
 
 
-@jit
-def bremsstrahlung_radiation(state, species, delta_zeff=0.0):
+def bremsstrahlung_radiation(
+    state,
+    species,
+    delta_zeff=0.0,
+    coefficient_mode="astra",
+    brems_coefficient=None,
+):
+    mode = str(coefficient_mode).strip().lower()
+    if brems_coefficient is not None:
+        coefficient = float(brems_coefficient)
+    elif mode in {"astra", "default", "neopax"}:
+        coefficient = 3.16e-1
+    elif mode in {"ntssfusion", "ntss", "wobig", "nrl"}:
+        coefficient = 3.34e-1
+    else:
+        raise ValueError(
+            f"Unknown bremsstrahlung coefficient_mode '{coefficient_mode}'. "
+            "Use 'astra' or 'ntssfusion', or provide brems_coefficient explicitly."
+        )
     return bremsstrahlung_radiation_generalized(
         state,
         species=species,
         exclude_impurity_bremsstrahlung=False,
         delta_zeff=delta_zeff,
+        brems_coefficient=coefficient,
     )
 
 @jit

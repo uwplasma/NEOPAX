@@ -41,13 +41,11 @@ from ._source_models import (
 from ._species import Species
 from ._state import TransportState, safe_density, safe_temperature
 from ._transport_flux_models import (
-    FluxesRFileTransportModel,
     ZeroTransportModel,
     build_transport_flux_model,
     compute_total_power_breakdown_mw,
     compute_total_power_mw,
     get_transport_flux_model,
-    read_flux_profile_file,
 )
 
 try:
@@ -169,10 +167,13 @@ def _build_database(config: dict, geometry):
     return None
 
 
-def _build_state(config: dict, geometry, n_species: int):
+def _build_state(config: dict, geometry, species: Species):
     if geometry is None:
         return None
-    profile_set = build_profiles(config.get("profiles", {}), geometry, n_species)
+    profile_cfg = dict(config.get("profiles", {}))
+    if profile_cfg.get("charge_qp") is None:
+        profile_cfg["charge_qp"] = tuple(float(v) for v in jnp.asarray(species.charge_qp))
+    profile_set = build_profiles(profile_cfg, geometry, species.number_species)
     density_state = profile_set.density / 1.0e20
     temperature_state = profile_set.temperature / 1.0e3
     density_floor = float(
@@ -194,6 +195,97 @@ def _build_state(config: dict, geometry, n_species: int):
         pressure=temperature_state * safe_density(density_state, density_floor),
         Er=profile_set.Er,
     )
+
+
+def _apply_configured_er_dirichlet_boundaries(config: dict, state: TransportState | None):
+    if state is None:
+        return state
+
+    er_cfg = config.get("boundary", {}).get("Er", {})
+    if not isinstance(er_cfg, dict):
+        return state
+
+    er = state.Er
+    left_cfg = er_cfg.get("left", {})
+    if isinstance(left_cfg, dict) and str(left_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in left_cfg:
+        left_value = jnp.asarray(left_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
+        er = er.at[0].set(left_value)
+
+    right_cfg = er_cfg.get("right", {})
+    if isinstance(right_cfg, dict) and str(right_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in right_cfg:
+        right_value = jnp.asarray(right_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
+        er = er.at[-1].set(right_value)
+
+    return dataclasses.replace(state, Er=er)
+
+
+def _resolve_er_right_boundary_mode(config: dict, solver_cfg: dict) -> str:
+    er_right_cfg = config.get("boundary", {}).get("Er", {}).get("right", {})
+    if isinstance(er_right_cfg, dict):
+        right_type = er_right_cfg.get("type")
+        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+            return str(right_type).strip().lower()
+    return str(solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "config"))).strip().lower()
+
+
+def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
+    out = dict(boundary_cfg)
+    er_cfg = out.get("Er")
+    if not isinstance(er_cfg, dict):
+        return out
+
+    er_cfg = dict(er_cfg)
+    right_cfg = er_cfg.get("right")
+    if isinstance(right_cfg, dict):
+        right_cfg = dict(right_cfg)
+        right_type = str(right_cfg.get("type", "")).strip().lower()
+        if right_type in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+            right_cfg["type"] = "neumann"
+            right_cfg.setdefault("gradient", 0.0)
+        er_cfg["right"] = right_cfg
+    out["Er"] = er_cfg
+    return out
+
+
+def _apply_boundary_corrected_state_for_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
+    if state is None or runtime.geometry is None:
+        return state
+
+    from ._boundary_conditions import build_boundary_condition_model, apply_cell_centered_boundary_state
+
+    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
+    dr = getattr(runtime.geometry, "dr", 1.0)
+    face_centers = runtime.geometry.r_grid_half
+
+    density = state.density
+    pressure = state.pressure
+
+    density_bc_cfg = boundary_cfg.get("density")
+    if density_bc_cfg is not None:
+        density_bc = build_boundary_condition_model(
+            density_bc_cfg,
+            dr,
+            species_names=runtime.species.names,
+        )
+        density = apply_cell_centered_boundary_state(density, density_bc, face_centers)
+
+    temperature = pressure / safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6))
+    temperature_bc_cfg = boundary_cfg.get("temperature")
+    if temperature_bc_cfg is not None:
+        temperature_bc = build_boundary_condition_model(
+            temperature_bc_cfg,
+            dr,
+            species_names=runtime.species.names,
+        )
+        temperature = apply_cell_centered_boundary_state(temperature, temperature_bc, face_centers)
+
+    temperature = safe_temperature(temperature, runtime.solver_parameters.get("temperature_floor"))
+    corrected = dataclasses.replace(
+        state,
+        density=density,
+        pressure=safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6)) * temperature,
+    )
+    return _apply_configured_er_dirichlet_boundaries(config, corrected)
 
 
 def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
@@ -220,12 +312,25 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
     }:
         return state
 
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    preprocess_boundary_state = bool(
+        amb_cfg.get(
+            "er_initialization_preprocess_boundary_state",
+            True,
+        )
+    )
+
+    if preprocess_boundary_state:
+        state = _apply_boundary_corrected_state_for_ambipolarity(config, runtime, state)
+
     debug_stage_markers = bool(runtime.solver_parameters.get("debug_stage_markers", False))
     if debug_stage_markers:
-        print(f"[NEOPAX] starting Er initialization: mode={init_mode}")
+        print(
+            f"[NEOPAX] starting Er initialization: mode={init_mode} "
+            f"preprocess_boundary_state={preprocess_boundary_state}"
+        )
     t_start = time.perf_counter()
 
-    amb_cfg = dict(config.get("ambipolarity", {}))
     model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
     entropy_model_name = config.get("neoclassical", {}).get(
         "entropy_model",
@@ -315,61 +420,49 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                         )
             except Exception as exc:
                 print(f"[NEOPAX] ambipolar scan diagnostic unavailable: {exc}")
-    return dataclasses.replace(state, Er=er_init)
+    return _apply_configured_er_dirichlet_boundaries(config, dataclasses.replace(state, Er=er_init))
 
 
 def _build_flux_model(config: dict, species, energy_grid, geometry, database, source_models=None):
+    from ._boundary_conditions import build_boundary_condition_model
+
     def _model_name(section_cfg, default):
         return str(section_cfg.get("flux_model", section_cfg.get("model", default))).strip().lower()
-
-    def _file_path(section_name, section_cfg):
-        candidates = [
-            section_cfg.get("fluxes_file"),
-            section_cfg.get("file"),
-            section_cfg.get(f"{section_name}_file"),
-        ]
-        if section_name == "neoclassical":
-            candidates.insert(0, section_cfg.get("neoclassical_file"))
-        for candidate in candidates:
-            if candidate:
-                return candidate
-        return None
-
-    def _build_file_model(section_name, section_cfg):
-        path = _file_path(section_name, section_cfg)
-        if path is None:
-            raise ValueError(
-                f"[{section_name}] fluxes_r_file requires a flux file. "
-                f"Provide one of: fluxes_file, file, or {section_name}_file."
-            )
-        r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
-        return FluxesRFileTransportModel(
-            species=species,
-            geometry=geometry,
-            r_data=r_data,
-            gamma_data=gamma_data,
-            q_data=q_data,
-            upar_data=upar_data,
-        )
 
     neoclassical_cfg = config.get("neoclassical", {})
     turbulence_cfg = config.get("turbulence", {})
     classical_cfg = config.get("classical", {})
+    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
+    dr = getattr(geometry, "dr", 1.0)
+
+    bc_density = None
+    if "density" in boundary_cfg:
+        bc_density = build_boundary_condition_model(
+            boundary_cfg["density"],
+            dr,
+            species_names=species.names,
+        )
+    bc_temperature = None
+    if "temperature" in boundary_cfg:
+        bc_temperature = build_boundary_condition_model(
+            boundary_cfg["temperature"],
+            dr,
+            species_names=species.names,
+        )
 
     neoclassical_name = _model_name(neoclassical_cfg, "monkes_database")
-    neoclassical_factory = get_transport_flux_model(neoclassical_name) if neoclassical_name != "fluxes_r_file" else None
+    neoclassical_factory = get_transport_flux_model(neoclassical_name)
     turbulence_cfg = config.get("turbulence", {})
     turbulence_name = _model_name(turbulence_cfg, "none")
-    turbulence_factory = get_transport_flux_model(turbulence_name) if turbulence_name != "fluxes_r_file" else None
+    turbulence_factory = get_transport_flux_model(turbulence_name)
     classical_factory = (
         get_transport_flux_model(_model_name(classical_cfg, "none"))
         if "classical" in config
-        and _model_name(classical_cfg, "none") != "fluxes_r_file"
         else None
     )
 
     neoclassical_model = (
-        _build_file_model("neoclassical", neoclassical_cfg)
+        neoclassical_factory(species, energy_grid, geometry, database, **dict(neoclassical_cfg))
         if neoclassical_name == "fluxes_r_file"
         else neoclassical_factory(
             species,
@@ -377,14 +470,12 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             geometry,
             database,
             collisionality_model=neoclassical_cfg.get("collisionality_model", "default"),
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
         )
     )
-    if turbulence_factory is None:
-        turbulence_model = (
-            _build_file_model("turbulence", turbulence_cfg)
-            if turbulence_name == "fluxes_r_file"
-            else ZeroTransportModel()
-        )
+    if turbulence_name == "fluxes_r_file":
+        turbulence_model = turbulence_factory(species, energy_grid, geometry, database, **dict(turbulence_cfg))
     elif turbulence_name == "turbulent_analytical":
         chi_t = jnp.asarray(
             turbulence_cfg.get(
@@ -443,7 +534,7 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
     else:
         turbulence_model = turbulence_factory(species, energy_grid, geometry, database)
     classical_model = (
-        _build_file_model("classical", classical_cfg)
+        classical_factory(species, energy_grid, geometry, database, **dict(classical_cfg))
         if _model_name(classical_cfg, "none") == "fluxes_r_file"
         else (
             classical_factory(species, energy_grid, geometry, database)
@@ -459,7 +550,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     energy_grid = _build_energy_grid(config)
     geometry = _build_geometry(config)
     database = _build_database(config, geometry)
-    state = _build_state(config, geometry, species.number_species)
+    state = _build_state(config, geometry, species)
     solver_cfg = _normalize_solver_config(config)
     source_models = build_source_models_from_config(config, species)
     models = Models(
@@ -479,6 +570,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     # paying for the same radial solve here during state initialization.
     if mode != "ambipolarity":
         state = _maybe_initialize_er_from_ambipolarity(config, runtime, state)
+    state = _apply_configured_er_dirichlet_boundaries(config, state)
     return runtime, state
 
 
@@ -488,7 +580,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     from ._transport_solvers import build_time_solver
 
     field = runtime.geometry
-    boundary_cfg = config.get("boundary", {})
+    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
     bc = {}
     dr = getattr(field, "dr", 1.0)
     for key in ("density", "temperature", "Er", "gamma"):
@@ -499,7 +591,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
             )
 
-    er_bc_mode = str(runtime.solver_parameters.get("Er_right_boundary_mode", "config")).strip().lower()
+    er_bc_mode = _resolve_er_right_boundary_mode(config, runtime.solver_parameters)
     if er_bc_mode == "ambipolar_edge_root":
         amb_cfg = dict(config.get("ambipolarity", {}))
         model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
@@ -577,6 +669,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         temperature_floor=solver_cfg.get("temperature_floor"),
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
+        er_bc_model=bc.get("Er"),
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -1153,7 +1246,7 @@ def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportStat
 def calculate_fluxes_from_config(state, config, params, flux_model=None):
     """
     Config-driven entrypoint for direct flux calculation (no root-finding).
-    Returns (fluxes, do_plot, do_hdf5, output_dir)
+    Returns (fluxes, do_plot, do_hdf5, output_dir, overlay_reference, reference_file, reference_label)
     """
     fluxes_cfg = config.get("fluxes", {})
     if flux_model is None:
@@ -1168,7 +1261,190 @@ def calculate_fluxes_from_config(state, config, params, flux_model=None):
     do_plot = fluxes_cfg.get("fluxes_plot", False)
     do_hdf5 = fluxes_cfg.get("fluxes_write_hdf5", False)
     output_dir = fluxes_cfg.get("fluxes_output_dir", None)
-    return fluxes, do_plot, do_hdf5, output_dir
+    reference_file = fluxes_cfg.get("fluxes_reference_file")
+    overlay_reference = bool(
+        fluxes_cfg.get("fluxes_overlay_reference", reference_file is not None)
+    )
+    reference_label = str(fluxes_cfg.get("fluxes_reference_label", "reference")).strip() or "reference"
+    return fluxes, do_plot, do_hdf5, output_dir, overlay_reference, reference_file, reference_label
+
+
+def _resolve_reference_path(path_value):
+    if path_value is None:
+        return None
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    return candidate if candidate.is_file() else None
+
+
+def _load_ntss_reference_profiles(path_value, rho):
+    candidate = _resolve_reference_path(path_value)
+    if candidate is None or rho is None:
+        return {}
+    try:
+        import h5py
+        import numpy as np
+
+        with h5py.File(candidate, "r") as f:
+            if "r" not in f:
+                return {}
+            r_src = np.asarray(f["r"][()], dtype=float)
+            if r_src.ndim != 1 or r_src.size == 0:
+                return {}
+            rho_src = r_src / max(float(r_src[-1]), 1.0e-14)
+            rho_dst = np.asarray(rho, dtype=float)
+
+            def _interp_dataset(name):
+                if name not in f:
+                    return None
+                values = np.asarray(f[name][()], dtype=float)
+                if values.ndim != 1:
+                    return None
+                if values.shape[0] == rho_dst.shape[0] and np.allclose(rho_src, rho_dst):
+                    return jnp.asarray(values)
+                return jnp.asarray(np.interp(rho_dst, rho_src, values))
+
+            def _interp_first(*names):
+                for name in names:
+                    values = _interp_dataset(name)
+                    if values is not None:
+                        return values
+                return None
+
+            density_d = _interp_dataset("nD")
+            profiles = {
+                "Er": _interp_dataset("Er"),
+                "density": {
+                    "e": _interp_dataset("ne"),
+                    "D": density_d,
+                    "T": _interp_dataset("nT") if "nT" in f else density_d,
+                    "He": _interp_dataset("nHe"),
+                },
+                "temperature": {
+                    "e": _interp_dataset("Te"),
+                    "D": _interp_dataset("TD"),
+                    "T": _interp_dataset("Tt"),
+                },
+                "scalar": {},
+                "flux_species": {
+                    "Gamma_neo": {},
+                    "Gamma_turb": {},
+                    "Q_total": {},
+                    "Q_neo": {},
+                    "Q_turb": {},
+                },
+            }
+            vr = _interp_dataset("Vr")
+            flux_qe = _interp_dataset("FluxQe")
+            flux_qi = _interp_dataset("FluxQI")
+            flux_qd = _interp_dataset("FluxQD")
+            flux_qt = _interp_dataset("FluxQT")
+            flux_qe_neo = _interp_dataset("FluxQeNeo")
+            flux_qi_neo = _interp_dataset("FluxQiNeo")
+            flux_qd_neo = _interp_dataset("FluxQDNeo")
+            flux_qt_neo = _interp_dataset("FluxQTNeo")
+            flux_qe_ano = _interp_dataset("FluxQeAno")
+            flux_qi_ano = _interp_dataset("FluxQiAno")
+            flux_qd_ano = _interp_dataset("FluxQDAno")
+            flux_qt_ano = _interp_dataset("FluxQTAno")
+            flux_ge_neo = _interp_first("FluxNeo", "FluxeNeo", "FluxGeNeo")
+            flux_gi_neo = _interp_first("FluxiNeo", "FluxGiNeo")
+            flux_gd_neo = _interp_first("FluxDNeo", "FluxGDNeo")
+            flux_gt_neo = _interp_first("FluxTNeo", "FluxGTNeo")
+            flux_ge_ano = _interp_first("FluxAno", "FluxeAno", "FluxGeAno")
+            flux_gi_ano = _interp_first("FluxiAno", "FluxGiAno")
+            flux_gd_ano = _interp_first("FluxDAno", "FluxGDAno")
+            flux_gt_ano = _interp_first("FluxTAno", "FluxGTAno")
+            alpha_power = _interp_first("Pfusion", "AlphaPower")
+            pbrems_power = _interp_first("Prad", "PBrems", "Pbrems")
+            he_source = _interp_first("HeSource", "Hesource")
+            zeff = _interp_first("Zeff")
+            ecrh_power = _interp_dataset("ECRHPower")
+            nbi_power_e = _interp_dataset("NBIPower_e")
+            nbi_power_i = _interp_dataset("NBIPower_I")
+            if pbrems_power is None:
+                ne_ref = _interp_dataset("ne")
+                te_ref = _interp_first("Te")
+                if zeff is not None and ne_ref is not None and te_ref is not None:
+                    pbrems_power = (3.16e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
+            if vr is not None:
+                if flux_ge_neo is not None:
+                    profiles["flux_species"]["Gamma_neo"]["e"] = flux_ge_neo * vr
+                if flux_gd_neo is not None:
+                    profiles["flux_species"]["Gamma_neo"]["D"] = flux_gd_neo * vr
+                if flux_gt_neo is not None:
+                    profiles["flux_species"]["Gamma_neo"]["T"] = flux_gt_neo * vr
+                if flux_gi_neo is not None:
+                    profiles["scalar"]["Gamma_neo_ion_sum"] = flux_gi_neo * vr
+                elif flux_gd_neo is not None and flux_gt_neo is not None:
+                    profiles["scalar"]["Gamma_neo_ion_sum"] = (flux_gd_neo + flux_gt_neo) * vr
+                elif flux_ge_neo is not None:
+                    profiles["scalar"]["Gamma_neo_ion_sum"] = flux_ge_neo * vr
+                if flux_ge_ano is not None:
+                    profiles["flux_species"]["Gamma_turb"]["e"] = flux_ge_ano * vr
+                if flux_gd_ano is not None:
+                    profiles["flux_species"]["Gamma_turb"]["D"] = flux_gd_ano * vr
+                if flux_gt_ano is not None:
+                    profiles["flux_species"]["Gamma_turb"]["T"] = flux_gt_ano * vr
+                if flux_gi_ano is not None:
+                    profiles["scalar"]["Gamma_turb_ion_sum"] = flux_gi_ano * vr
+                elif flux_gd_ano is not None and flux_gt_ano is not None:
+                    profiles["scalar"]["Gamma_turb_ion_sum"] = (flux_gd_ano + flux_gt_ano) * vr
+                elif flux_ge_ano is not None:
+                    profiles["scalar"]["Gamma_turb_ion_sum"] = flux_ge_ano * vr
+                if flux_qe is not None and flux_qi is not None:
+                    profiles["scalar"]["Q_total_sum"] = (flux_qe + flux_qi) * vr
+                    profiles["flux_species"]["Q_total"]["e"] = flux_qe * vr
+                    if flux_qd is not None:
+                        profiles["flux_species"]["Q_total"]["D"] = flux_qd * vr
+                    elif density_d is not None:
+                        profiles["flux_species"]["Q_total"]["D"] = flux_qi * vr
+                    if flux_qt is not None:
+                        profiles["flux_species"]["Q_total"]["T"] = flux_qt * vr
+                    elif "nT" in f or density_d is not None:
+                        profiles["flux_species"]["Q_total"]["T"] = flux_qi * vr
+                    profiles["scalar"]["Q_total_ion_sum"] = flux_qi * vr
+                if flux_qe_neo is not None and flux_qi_neo is not None:
+                    profiles["scalar"]["Q_neo_sum"] = (flux_qe_neo + flux_qi_neo) * vr
+                    profiles["flux_species"]["Q_neo"]["e"] = flux_qe_neo * vr
+                    if flux_qd_neo is not None:
+                        profiles["flux_species"]["Q_neo"]["D"] = flux_qd_neo * vr
+                    elif density_d is not None:
+                        profiles["flux_species"]["Q_neo"]["D"] = flux_qi_neo * vr
+                    if flux_qt_neo is not None:
+                        profiles["flux_species"]["Q_neo"]["T"] = flux_qt_neo * vr
+                    elif "nT" in f or density_d is not None:
+                        profiles["flux_species"]["Q_neo"]["T"] = flux_qi_neo * vr
+                    profiles["scalar"]["Q_neo_ion_sum"] = flux_qi_neo * vr
+                if flux_qe_ano is not None and flux_qi_ano is not None:
+                    profiles["scalar"]["Q_turb_sum"] = (flux_qe_ano + flux_qi_ano) * vr
+                    profiles["flux_species"]["Q_turb"]["e"] = flux_qe_ano * vr
+                    if flux_qd_ano is not None:
+                        profiles["flux_species"]["Q_turb"]["D"] = flux_qd_ano * vr
+                    elif density_d is not None:
+                        profiles["flux_species"]["Q_turb"]["D"] = flux_qi_ano * vr
+                    if flux_qt_ano is not None:
+                        profiles["flux_species"]["Q_turb"]["T"] = flux_qt_ano * vr
+                    elif "nT" in f or density_d is not None:
+                        profiles["flux_species"]["Q_turb"]["T"] = flux_qi_ano * vr
+                    profiles["scalar"]["Q_turb_ion_sum"] = flux_qi_ano * vr
+            if alpha_power is not None:
+                profiles["scalar"]["alpha_power"] = alpha_power
+            if pbrems_power is not None:
+                profiles["scalar"]["pbrems_power"] = pbrems_power
+            if he_source is not None:
+                profiles["scalar"]["he_source"] = he_source
+            power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
+            if power_terms:
+                total_power_source = power_terms[0]
+                for term in power_terms[1:]:
+                    total_power_source = total_power_source + term
+                profiles["scalar"]["power_sources_total"] = total_power_source
+            return profiles
+    except Exception as exc:
+        print(f"Could not load reference profiles from '{candidate}': {exc}")
+        return {}
 
 
 def calculate_sources_from_config(state, config, params, source_models=None):
@@ -1197,12 +1473,42 @@ def calculate_sources_from_config(state, config, params, source_models=None):
     return sources, do_plot, do_hdf5, output_dir
 
 
-def plot_fluxes(rho, fluxes, output_dir):
+def plot_fluxes(
+    rho,
+    fluxes,
+    output_dir,
+    species=None,
+    overlay_reference=False,
+    reference_file=None,
+    reference_label="reference",
+):
     import matplotlib.pyplot as plt
+
+    species_names = list(getattr(species, "names", ())) if species is not None else []
+    ntss_reference = _load_ntss_reference_profiles(reference_file, rho) if overlay_reference else {}
+
+    def _species_label(index):
+        if 0 <= index < len(species_names):
+            return str(species_names[index])
+        return f"s{index}"
+
+    def _reference_flux_profile(quantity_key, species_index):
+        species_name = _species_label(species_index)
+        if quantity_key == "Q":
+            return ntss_reference.get("flux_species", {}).get("Q_total", {}).get(species_name)
+        if quantity_key in {"Q_neo", "Q_turb"}:
+            return ntss_reference.get("flux_species", {}).get(quantity_key, {}).get(species_name)
+        if quantity_key in {"Gamma_neo", "Gamma_turb"}:
+            ref_values = ntss_reference.get("flux_species", {}).get(quantity_key, {}).get(species_name)
+            if species_name in {"D", "T"} and ref_values is None:
+                return ntss_reference.get("scalar", {}).get(f"{quantity_key}_ion_sum")
+            return ref_values
+        return None
 
     def _plot_flux_group(quantity_keys, ylabel, title, out_name):
         fig, ax = plt.subplots(figsize=(9, 4))
         plotted = False
+        plotted_reference = False
         for key in quantity_keys:
             arr = fluxes.get(key, None)
             if arr is None:
@@ -1211,6 +1517,18 @@ def plot_fluxes(rho, fluxes, output_dir):
             if arr.ndim == 2:
                 for i in range(arr.shape[0]):
                     ax.plot(rho, arr[i], label=f"{key}[{i}]")
+                    if overlay_reference and ntss_reference:
+                        ref_values = _reference_flux_profile(key, i)
+                        if ref_values is not None:
+                            ax.plot(
+                                rho,
+                                ref_values,
+                                color="black",
+                                linewidth=2.2,
+                                alpha=0.9,
+                                label=f"{reference_label} {key}[{_species_label(i)}]",
+                            )
+                            plotted_reference = True
             else:
                 ax.plot(rho, arr, label=key)
             plotted = True
@@ -2554,7 +2872,7 @@ def main(config_path):
         return run_ambipolarity(config, runtime, state)
 
     if mode == "fluxes":
-        fluxes, do_plot, do_hdf5, output_dir = calculate_fluxes_from_config(
+        fluxes, do_plot, do_hdf5, output_dir, overlay_reference, reference_file, reference_label = calculate_fluxes_from_config(
             state,
             config,
             {
@@ -2573,7 +2891,15 @@ def main(config_path):
             output_dir = Path(str(output_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
         if do_plot:
-            plot_fluxes(rho, fluxes, output_dir)
+            plot_fluxes(
+                rho,
+                fluxes,
+                output_dir,
+                species=runtime.species,
+                overlay_reference=overlay_reference,
+                reference_file=reference_file,
+                reference_label=reference_label,
+            )
         if do_hdf5:
             write_fluxes_hdf5(rho, fluxes, output_dir)
         return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}

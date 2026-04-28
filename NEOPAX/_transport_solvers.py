@@ -1833,11 +1833,16 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 next_guess = _project_flat_state_if_needed(next_guess, project_flat)
                 return next_guess, jnp.logical_and(linear_ok, finite)
 
-            return jax.lax.fori_loop(
+            guess_pc, linear_ok_pc = jax.lax.fori_loop(
                 0,
                 n_linearized_solves,
                 _corrector_body,
                 (guess0, jnp.asarray(True)),
+            )
+            guess_fallback = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
+            return (
+                jnp.where(linear_ok_pc, guess_pc, guess_fallback),
+                jnp.asarray(True),
             )
 
         def _single_theta_newton_step(flat_y, t_value, h_value):
@@ -1854,12 +1859,14 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 iter_idx, y_cur, residual_norm, diverged = carry
                 y_proj = _project_flat_state_if_needed(y_cur, project_flat)
                 residual_cur = residual(y_proj)
-                jacobian_rhs = jax.jacfwd(lambda y: flat_rhs(t_new, y))(y_proj)
-                system = identity_n - h_value * theta * jacobian_rhs
+                system = jax.jacfwd(residual)(y_proj)
                 lu, piv = jax.scipy.linalg.lu_factor(system)
                 delta = jax.scipy.linalg.lu_solve((lu, piv), -residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
+                finite_system = jnp.logical_and(jnp.all(jnp.isfinite(system)), jnp.all(jnp.isfinite(lu)))
+                delta = jnp.where(finite_system, delta, jnp.zeros_like(delta))
                 base_norm = jnp.linalg.norm(residual_cur)
+                accept_factor = jnp.asarray(0.999, dtype=dtype)
 
                 def ls_cond(ls_state):
                     tau, cand_y, cand_norm, accepted = ls_state
@@ -1871,12 +1878,21 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                     tau_next = jnp.maximum(tau * delta_reduction_factor, tau_min)
                     trial_y = _project_flat_state_if_needed(y_proj + tau_next * delta, project_flat)
                     trial_norm = jnp.linalg.norm(residual(trial_y))
-                    accepted_next = jnp.logical_and(jnp.isfinite(trial_norm), trial_norm < base_norm)
+                    accepted_next = jnp.logical_and(
+                        jnp.isfinite(trial_norm),
+                        trial_norm <= base_norm * accept_factor,
+                    )
                     return tau_next, trial_y, trial_norm, accepted_next
 
                 trial_y0 = _project_flat_state_if_needed(y_proj + delta, project_flat)
                 trial_norm0 = jnp.linalg.norm(residual(trial_y0))
-                accepted0 = jnp.logical_and(jnp.isfinite(trial_norm0), trial_norm0 < base_norm)
+                accepted0 = jnp.logical_and(
+                    finite_system,
+                    jnp.logical_and(
+                        jnp.isfinite(trial_norm0),
+                        trial_norm0 <= base_norm * accept_factor,
+                    ),
+                )
                 tau_final, y_next, residual_next, accepted_final = jax.lax.while_loop(
                     ls_cond,
                     ls_body,

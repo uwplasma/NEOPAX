@@ -33,46 +33,6 @@
   - Robin/`DECAYLEN` uses the current boundary state with `du/dr = +/- u/L`
 - Keep the existing equation objects (`DensityEquation`, `TemperatureEquation`, `ErEquation`, `ComposedEquationSystem`) as the physics reference implementation.
 
-### Phase 1: Profile And Minimize The Diffrax Hot Path
-- Status: mostly completed
-- Refactor `DiffraxSolver.solve(...)` to use the same flat-state machinery already used by the custom solvers:
-  - `_make_solver_state_transform(...)`
-  - `_flat_rhs_factory(...)`
-- Remove repeated full dataclass unpack/repack inside the traced Diffrax RHS where possible.
-- Avoid repeated calls to:
-  - `enforce_quasi_neutrality(...)`
-  - `project_fixed_temperature_species(...)`
-  inside every traced stage via dataclass reconstruction.
-- Target result:
-  - smaller `jit_diffeqsolve` graph
-  - lower compile time
-  - lower per-step RHS overhead
-
-Completed in this phase:
-- `DiffraxSolver.solve(...)` now runs on flat packed arrays
-- Diffrax no longer rebuilds full `TransportState` objects inside every traced stage
-- Diffrax output reconstruction still preserves the same public state semantics after the solve
-
-Observed result:
-- major timing improvement for the Kvaerno `temperature + Er` benchmark
-
-### Phase 2: Add Array-Level Projection Helpers
-- Status: completed, but no additional measurable benchmark win yet
-- Implement packed/flat-array helpers for:
-  - quasi-neutral electron reconstruction
-  - fixed-temperature pressure projection
-- Use these helpers in solver hot loops before reconstructing full `TransportState` objects.
-- Keep the dataclass-based projection helpers for readability/debug/reference paths.
-- Ensure the array-level and dataclass-level implementations stay mathematically identical.
-
-Completed in this phase:
-- packed-array projection helper added in `_transport_solvers.py`
-- Diffrax, Radau, and Rosenbrock now all use the packed projection path
-
-Observed result:
-- cleaner architecture
-- no meaningful extra timing improvement on the current Kvaerno benchmark beyond Phase 1
-
 ### Phase 3: Specialize The Composed Vector Field For Active Equation Sets
 - Status: partially completed
 - Add an optimized execution adapter for common active equation combinations, starting with:
@@ -189,6 +149,21 @@ Expected validation in this phase:
 - compare near-edge profile shape against NTSS for temperature cases with `DecayLen`
 - compare endpoint gradient/flux behavior, not only cell-centered profiles
 - re-check the previously suspicious turbulent heat-flux amplitude after normalization consistency fixes
+
+Known issue / parity note:
+- ambipolar `Er` initialization still shows a small NTSS mismatch concentrated in the last one to two radial points, even after:
+  - pre-applying BC-corrected density/temperature state before ambipolar root finding
+  - passing right-boundary value/gradient constraints into the local `monkes_database` ambipolar flux evaluator
+- current diagnosis:
+  - the bulk ambipolar profile is now close, so this is likely an outer-edge reconstruction / edge-root-evaluation parity issue rather than a full-profile neoclassical mismatch
+  - transport RHS uses the boundary-aware face-flux path, while ambipolar initialization still relies on the local `get_Neoclassical_Fluxes(...)` path with internally reconstructed gradients
+  - the next likely parity improvement is a more NTSS-like outer-edge ambipolar evaluation for the last one to two points, or an optional face-based ambipolar evaluator for parity studies
+- separate known issue / parity note:
+  - transport-mode ambipolar `Er` initialization can still disagree with explicit `mode = "ambipolarity"` root-solving for the same starting profiles/configuration
+  - this mismatch appears to affect the root-transition position in the interior, not only the outermost boundary points
+  - user recollection suggests the discrepancy may predate the recent BC-gradient / boundary-preprocessing changes, so those edits should not be assumed to be the original cause
+  - next diagnostic target:
+    - compare transport-mode `best_roots`, `er_init`, and plotted `t=0` `Er` directly against the explicit ambipolarity-mode `best_roots` for the same effective runtime settings
 
 ### Phase 7: Radau Modernization Track
 - Status: in progress
@@ -592,45 +567,6 @@ Still open in this phase:
 7. Next Radau-specific checkpoint:
    - rerun `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml`
    - compare against the current transformed-direct baseline (`~574 s`, compile `~3m59s`, `1039` steps)
-
-### Phase 8: Replace Custom Rosenbrock With Standard RODAS5P
-- Status: not started
-- Goal:
-  - retire the current custom Rosenbrock backend and replace it with a literature-standard high-order Rosenbrock-Wanner method better suited to NEOPAX stiff transport problems
-
-Why this phase exists:
-- the current custom Rosenbrock path was useful as an experimental backend, but it has not been competitive enough in robustness/performance
-- a standard `RODAS5P`-style method is a much better target than continuing to evolve a nonstandard Rosenbrock variant
-- `RODAS5P` is closer to the class of mature stiff solvers expected for this problem class, while still being distinct from `Kvaerno5`
-
-Primary tasks in this phase:
-- remove or fully replace the current custom Rosenbrock step formulation in `_transport_solvers.py`
-- implement a standard `RODAS5P`-style Rosenbrock-Wanner method with:
-  - literature-standard tableau/coefficient set
-  - embedded error estimator
-  - adaptive step size control
-  - proper Jacobian reuse policy
-  - `save_n` support consistent with the other custom solvers
-- keep the implementation JAX/JIT/trace/differentiation friendly:
-  - static tableau constants outside the hot loop
-  - array-level stage/state operations
-  - no Python-side per-step control in traced loops
-- support the same NEOPAX solver-state transform machinery:
-  - flat packed state path
-  - quasi-neutral projection semantics
-  - fixed-temperature projection semantics
-
-Secondary tasks:
-- evaluate whether the `RODAS5P` path should prefer direct solves, GMRES, or a hybrid policy for NEOPAX state sizes
-- benchmark `RODAS5P` against:
-  - `diffrax_kvaerno5`
-  - custom `radau`
-  on the same lean `temperature + Er` benchmark first
-
-Validation targets:
-- confirm the new backend is materially more standard and robust than the current custom Rosenbrock implementation
-- compare compile time, wall time, step count, and survival on the lean benchmark case
-- only after lean-case validation, test fuller coupled cases
 
 ### Phase 9: Ambipolarity / Interpolation Compile Cleanup
 - Status: noted for later

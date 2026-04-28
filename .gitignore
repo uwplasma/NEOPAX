@@ -168,6 +168,9 @@ cython_debug/
 output/*
 tests/comparisons_SIMSOPT/output/*
 essos/version.py
+.last_plot_exit_code
+.plot_er_run.log
+debug.log
 *.json
 *.png
 *.vtu

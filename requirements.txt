@@ -10,4 +10,3 @@ h5py
 scipy
 netcdf4
 matplotlib
-inductiva
