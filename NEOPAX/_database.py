@@ -5,12 +5,14 @@ from jax import config
 # to use higher precision
 config.update("jax_enable_x64", True)
 from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
-import equinox as eqx
+import dataclasses
 import interpax
 
 
 #Monoenergetic database class
-class Monoenergetic(eqx.Module):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class Monoenergetic:
     """Monoenergetic database.
 
     """
@@ -45,6 +47,7 @@ class Monoenergetic(eqx.Module):
         D11_log: Float[Array,'...'],
         D13 : Float[Array,'...'],
         D33 : Float[Array,'...'],
+        **kwargs,
     ):
 
         self.a_b=a_b
@@ -54,6 +57,28 @@ class Monoenergetic(eqx.Module):
         self.D11_log=D11_log
         self.D13=D13
         self.D33=D33
+
+        # JAX dataclass pytree reconstruction may provide all derived fields
+        # as keyword payload. If present, use it directly.
+        derived_fields = [
+            "D11_lower_limit",
+            "Er_lower_limit",
+            "Er_lower_limit_log",
+            "low_limit_r",
+            "r1_lim",
+            "rmn2_lim",
+            "r1",
+            "r2",
+            "r3",
+            "rnm3",
+            "rnm2",
+            "rnm1",
+        ]
+        if all(name in kwargs for name in derived_fields):
+            for name in derived_fields:
+                setattr(self, name, kwargs[name])
+            return
+
         self.D11_lower_limit=jnp.array(-12.0)
         self.Er_lower_limit=1.e-8
         self.Er_lower_limit_log=jnp.log10(1.e-8)
@@ -132,7 +157,7 @@ class Monoenergetic(eqx.Module):
         drds,
         D11,
         D13,
-        D33
+        D33,
     ):
         """Construct Field from BOOZ_XFORM file.
 

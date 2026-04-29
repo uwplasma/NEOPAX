@@ -37,7 +37,7 @@
 
 
 ## Overview
-NEOPAX aims to be a simple JAX framework to solve radial transport equations for stellarators allowing for the optimization of different neoclassical quantities of interest.
+NEOPAX is a flexible JAX-native transport solver for the radial tranpsort equations in stellarators. It follows the modular philosophy of the tokamak transport solver torax, while specializing in stellarator physics. It can fulfill the roles of power balance steady state solver and predictive transport simulator using different solvers like kvaerno5 from diffrax, a custom implemented radau solver or a theta solver.
 
 ## Quick Start
 To install NEOPAX you just need to:
@@ -47,8 +47,6 @@ git clone https://github.com/uwplasma/NEOPAX.git
 cd NEOPAX 
 pip install .
 ```
-
-At the moment the code makes use of a Monkes-JAX monoenergetic database Dij(r,collisionality,Er). To obtain these you can use Monkes-JAX, see: https://github.com/monkes  
 
 ## Examples
 To run an exanmple simply do:
