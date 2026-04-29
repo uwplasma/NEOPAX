@@ -730,7 +730,15 @@ def build_fluxes_r_file_transport_model(
     profile_location=None,
     **kwargs,
 ):
-    del kwargs
+    q_scale = float(
+        kwargs.pop(
+            "debug_heat_flux_scale",
+            kwargs.pop(
+                "heat_flux_scale",
+                kwargs.pop("q_scale", 1.0),
+            ),
+        )
+    )
     path = (
         fluxes_file
         or file
@@ -760,7 +768,7 @@ def build_fluxes_r_file_transport_model(
     print(
         "[NEOPAX] fluxes_r_file loaded: "
         f"path={path} profile_location={str(location).strip().lower()} "
-        f"r.shape={tuple(r_data.shape)} {r_summary}"
+        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
     )
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Q', q_data)}")
@@ -773,6 +781,7 @@ def build_fluxes_r_file_transport_model(
         q_data=q_data,
         upar_data=upar_data,
         profile_location=str(location).strip().lower(),
+        q_scale=q_scale,
     )
 
 
@@ -785,6 +794,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     q_data: Any = None
     upar_data: Any = None
     profile_location: str = "cell_centered"
+    q_scale: float = 1.0
 
     def _interp_species_profile(self, data, target_r):
         if data is None:
@@ -831,7 +841,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     def __call__(self, state) -> dict:
         del state
         gamma = self._data_on_cell_grid(self.gamma_data)
-        q = self._data_on_cell_grid(self.q_data)
+        q = self.q_scale * self._data_on_cell_grid(self.q_data)
         upar = self._data_on_cell_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
@@ -848,7 +858,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         del state, face_state, kwargs
         gamma = self._data_on_face_grid(self.gamma_data)
-        q = self._data_on_face_grid(self.q_data)
+        q = self.q_scale * self._data_on_face_grid(self.q_data)
         upar = self._data_on_face_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 

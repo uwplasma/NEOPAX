@@ -104,6 +104,32 @@ def test_fluxes_r_file_model_cell_centered_reconstructs_faces(tmp_path):
     assert jnp.allclose(face_fluxes["Q"], jnp.vstack([faces_from_cell_centered(q[0]), faces_from_cell_centered(q[1])]))
 
 
+def test_fluxes_r_file_heat_flux_scaling_applies_only_to_q(tmp_path):
+    path = tmp_path / "scaled_fluxes.h5"
+    gamma = jnp.array([[1.0, 3.0], [2.0, 4.0]])
+    q = jnp.array([[10.0, 30.0], [20.0, 40.0]])
+    upar = jnp.array([[0.5, 1.5], [1.0, 2.0]])
+    _write_flux_file(path, r=[0.25, 0.75], gamma=gamma, q=q, upar=upar)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            grid_location="cell_centered",
+            debug_heat_flux_scale=2.5,
+        )
+
+    center_fluxes = model(state=None)
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+
+    assert jnp.allclose(center_fluxes["Gamma"], gamma)
+    assert jnp.allclose(center_fluxes["Upar"], upar)
+    assert jnp.allclose(center_fluxes["Q"], 2.5 * q)
+    assert jnp.allclose(face_fluxes["Gamma"], jnp.vstack([faces_from_cell_centered(gamma[0]), faces_from_cell_centered(gamma[1])]))
+    assert jnp.allclose(face_fluxes["Q"], 2.5 * jnp.vstack([faces_from_cell_centered(q[0]), faces_from_cell_centered(q[1])]))
+
+
 def test_fluxes_r_file_model_face_centered_reconstructs_cells(tmp_path):
     path = tmp_path / "face_fluxes.h5"
     gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
