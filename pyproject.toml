@@ -29,7 +29,7 @@ keywords = ["Plasma",
  
 dependencies = [ "jax", "jaxlib", "matplotlib","equinox","optimistix","lineax", "diffrax","interpax","orthax", "scipy","h5py", "netcdf4","inductiva"]
  
-requires-python = ">=3.5"
+requires-python = ">=3.10"
 
 [project.urls]
 Homepage = "https://github.com/uwplasma/NEOPAX"
