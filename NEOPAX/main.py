@@ -2054,10 +2054,17 @@ def plot_transport_solution(
         color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
         if not color_cycle:
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
-        species_count = int(jnp.asarray(series[0][1]).shape[0])
+        first_values = jnp.asarray(series[0][1])
+        if first_values.ndim == 0:
+            plt.close(fig)
+            return None
+        species_count = int(first_values.shape[0])
         linestyle_cycle = ["-", "--", ":", "-."]
 
         for time_idx, (time_label, values) in enumerate(series):
+            values = jnp.asarray(values)
+            if values.ndim == 0:
+                continue
             color = color_cycle[time_idx % len(color_cycle)]
             for species_idx in range(values.shape[0]):
                 linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
@@ -2494,8 +2501,8 @@ def plot_transport_solution(
                     face_state = build_face_transport_state(
                         snapshot_state,
                         geometry,
-                        density_floor=solver_cfg.get("density_floor", 1.0e-6),
-                        temperature_floor=solver_cfg.get("temperature_floor"),
+                        density_floor=1.0e-6,
+                        temperature_floor=None,
                     )
                     face_fluxes = flux_model.evaluate_face_fluxes(snapshot_state, face_state)
                     eidx = species.species_idx.get("e")

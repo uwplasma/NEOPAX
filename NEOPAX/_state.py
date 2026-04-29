@@ -76,9 +76,9 @@ class TransportState:
     JAX-compatible transport state for arbitrary number of species.
     All fields are JAX arrays for differentiability and vmap support.
     """
-    density: Float[Array, "n_species n_radial"]
-    pressure: Float[Array, "n_species n_radial"]
-    Er: Float[Array, "n_radial"]
+    density: Float[Array, "..."]
+    pressure: Float[Array, "..."]
+    Er: Float[Array, "..."]
 
     @property
     def temperature(self):

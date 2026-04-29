@@ -403,12 +403,25 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
     classical_model: TransportFluxModelBase
     include_turbulent_particle_flux: bool = True
 
+    @staticmethod
+    def _zero_like_flux(reference, fallback=0):
+        if reference is not None:
+            return jnp.zeros_like(jnp.asarray(reference))
+        return fallback
+
     def __call__(self, state, *args, **kwargs) -> dict:
         # Only pass 'state' to the model instances, as expected by their __call__
         neo = self.neoclassical_model(state)
         turb = self.turbulent_model(state)
         classical = self.classical_model(state)
-        gamma_turb = turb.get("Gamma", 0) if self.include_turbulent_particle_flux else 0
+        gamma_turb = (
+            turb.get("Gamma", 0)
+            if self.include_turbulent_particle_flux
+            else self._zero_like_flux(
+                turb.get("Gamma", None),
+                self._zero_like_flux(neo.get("Gamma", None), self._zero_like_flux(classical.get("Gamma", None), 0)),
+            )
+        )
         out = {
             "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q":     neo.get("Q", 0)     + turb.get("Q", 0)     + classical.get("Q", 0),
@@ -433,7 +446,11 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             return None
 
         def evaluator(radius_index, er_value):
-            gamma_turb = turb_eval(radius_index, er_value) if self.include_turbulent_particle_flux else 0
+            gamma_turb = (
+                turb_eval(radius_index, er_value)
+                if self.include_turbulent_particle_flux
+                else jnp.zeros_like(jnp.asarray(neo_eval(radius_index, er_value)))
+            )
             return neo_eval(radius_index, er_value) + gamma_turb + classical_eval(radius_index, er_value)
 
         return evaluator
@@ -444,7 +461,14 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
         if neo is None or turb is None or classical is None:
             return None
-        gamma_turb = turb.get("Gamma", 0) if self.include_turbulent_particle_flux else 0
+        gamma_turb = (
+            turb.get("Gamma", 0)
+            if self.include_turbulent_particle_flux
+            else self._zero_like_flux(
+                turb.get("Gamma", None),
+                self._zero_like_flux(neo.get("Gamma", None), self._zero_like_flux(classical.get("Gamma", None), 0)),
+            )
+        )
         return {
             "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
@@ -1006,15 +1030,13 @@ register_transport_flux_model(
     "monkes_database_with_momentum",
     lambda species, energy_grid, geometry, database,
            density_right_constraint=None, density_right_grad_constraint=None,
-           temperature_right_constraint=None, temperature_right_grad_constraint=None: MonkesDatabaseWithMomentumTransportModel(
+           temperature_right_constraint=None, temperature_right_grad_constraint=None: MonkesDatabaseTransportModel(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,
         database=database,
-        density_right_constraint=density_right_constraint,
-        density_right_grad_constraint=density_right_grad_constraint,
-        temperature_right_constraint=temperature_right_constraint,
-        temperature_right_grad_constraint=temperature_right_grad_constraint,
+        bc_density=None,
+        bc_temperature=None,
     ),
 )
 

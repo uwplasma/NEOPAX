@@ -58,8 +58,8 @@ class Species:
     """
     number_species: int
     species_indices: Array  # shape (n_species,)
-    mass_mp: Float[Array, "n_species"]
-    charge_qp: Float[Array, "n_species"]
+    mass_mp: Float[Array, "..."]
+    charge_qp: Float[Array, "..."]
     names: tuple[str, ...] = ()  # Optional: names for each species
     is_frozen: Array = None  # Optional: mask for frozen species (bool or int)
 

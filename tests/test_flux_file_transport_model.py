@@ -160,6 +160,14 @@ def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():
     assert jnp.allclose(out["Gamma_turb"], jnp.zeros_like(gamma_turb))
     assert jnp.allclose(out["Q"], q_neo + q_turb + q_classical)
 
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+    assert jnp.allclose(face_fluxes["Gamma_turb"], jnp.zeros_like(gamma_turb))
+    assert jnp.allclose(face_fluxes["Gamma"], gamma_neo + gamma_classical)
+
+    local_eval = model.build_local_particle_flux_evaluator(state=None)
+    gamma_local = local_eval(0, 0.0)
+    assert jnp.allclose(gamma_local, gamma_neo[:, 0] + gamma_classical[:, 0])
+
 
 def test_calculate_fluxes_from_config_uses_flux_output_flags():
     flux_model = lambda state: {"Gamma": jnp.asarray([[1.0]]), "Q": jnp.asarray([[2.0]]), "Upar": jnp.asarray([[3.0]])}
