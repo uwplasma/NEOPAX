@@ -168,6 +168,7 @@ def cmd_all(args: argparse.Namespace) -> int:
         average_window=args.average_window,
         t_final=args.t_max,
         plot=args.plot,
+        plot_run_heat_traces=args.plot_run_heat_traces,
     )
     return bridge.cmd_collect(collect_args)
 
@@ -245,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rho-star-physical", type=float, default=None, help="Optional manual rho_star override; otherwise derive it per radius from VMEC geometry and the reference-ion profile")
     p.add_argument("--average-window", type=float, default=20.0, help="Average turbulent fluxes over the final time window")
     p.add_argument("--plot", action="store_true", help="Write PNG plots of Gamma and Q versus rho.")
+    p.add_argument("--plot-run-heat-traces", action="store_true", help="Write per-run heat-flux time-trace PNGs from existing diagnostics CSV files.")
     p.add_argument("--backend", choices=("cpu", "gpu"), default="gpu")
     p.add_argument("--gpu-ids", default="0")
     p.add_argument("--max-parallel", type=int, default=1)

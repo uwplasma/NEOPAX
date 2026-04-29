@@ -1324,6 +1324,51 @@ def _write_summary_plots(
         plt.close(fig)
 
 
+def _write_run_heat_flux_trace_plots(
+    *,
+    manifest: dict[str, Any],
+    species_names: list[str],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "Plotting was requested but matplotlib is not installed."
+        ) from exc
+
+    runtime_species_names = list(manifest.get("runtime_species_names", []))
+    for run in manifest["runs"]:
+        diag_csv = Path(f"{run['output_prefix']}.diagnostics.csv")
+        if not diag_csv.exists():
+            continue
+        columns = _read_diagnostics_csv(diag_csv)
+        times = np.asarray(columns.get("t", []), dtype=float)
+        if times.size == 0:
+            continue
+
+        fig, ax = plt.subplots(figsize=(7.0, 4.5), constrained_layout=True)
+        total_heat = np.asarray(columns.get("heat_flux", []), dtype=float)
+        if total_heat.size == times.size:
+            ax.plot(times, total_heat, linewidth=2.0, label="total")
+
+        for runtime_idx, runtime_name in enumerate(runtime_species_names):
+            key = f"heat_flux_s{runtime_idx}"
+            values = np.asarray(columns.get(key, []), dtype=float)
+            if values.size != times.size:
+                continue
+            label = runtime_name if runtime_idx < len(species_names) else f"s{runtime_idx}"
+            ax.plot(times, values, linewidth=1.4, alpha=0.9, label=label)
+
+        ax.set_xlabel("t")
+        ax.set_ylabel("heat_flux")
+        ax.set_title(f"Heat flux trace: rho={float(run['rho']):.4f}")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        out_path = Path(run["run_dir"]).resolve() / "heat_flux_trace.png"
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
 def _thermal_speed_ms(temperature_keV: float, mass_mp: float) -> float:
     temp_eV = float(temperature_keV) * NEOPAX_TEMPERATURE_REFERENCE_EV
     mass_kg = float(mass_mp) * proton_mass
@@ -1588,6 +1633,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
             gamma=gamma_sorted,
             q=q_sorted,
         )
+    if bool(getattr(args, "plot_run_heat_traces", False)):
+        _write_run_heat_flux_trace_plots(
+            manifest=manifest,
+            species_names=species_names,
+        )
 
     print(f"Wrote collected flux summary: {out_h5}")
     print(f"Wrote NEOPAX flux profile: {neopax_flux_out}")
@@ -1689,6 +1739,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--average-window", type=float, default=20.0, help="Average fluxes over t in [t_final-average_window, t_final]")
     collect.add_argument("--t-final", type=float, default=None, help="Optional explicit averaging end time; defaults to manifest time.t_max")
     collect.add_argument("--plot", action="store_true", help="Write PNG plots of Gamma and Q versus rho.")
+    collect.add_argument("--plot-run-heat-traces", action="store_true", help="Write per-run heat-flux time-trace PNGs from existing diagnostics CSV files.")
     collect.set_defaults(func=cmd_collect)
 
     return p
