@@ -993,9 +993,44 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _diagnostics_csv_path(run_spec: dict[str, Any]) -> Path:
+    return Path(f"{run_spec['output_prefix']}.diagnostics.csv")
+
+
+def _has_completed_output(run_spec: dict[str, Any]) -> bool:
+    diag_csv = _diagnostics_csv_path(run_spec)
+    if not diag_csv.exists():
+        return False
+    try:
+        columns = _read_diagnostics_csv(diag_csv)
+    except Exception:
+        return False
+    times = np.asarray(columns.get("t", []), dtype=float)
+    return bool(times.size > 0)
+
+
 def cmd_run_one(args: argparse.Namespace) -> int:
     manifest = _load_manifest(Path(args.manifest).resolve())
     run_spec = manifest["runs"][int(args.index)]
+    if _has_completed_output(run_spec):
+        diag_csv = _diagnostics_csv_path(run_spec)
+        row = _read_last_row_csv(diag_csv)
+        print(
+            json.dumps(
+                {
+                    "index": int(run_spec["index"]),
+                    "rho": float(run_spec["rho"]),
+                    "run_dir": str(Path(run_spec["run_dir"]).resolve()),
+                    "config_path": str(Path(run_spec["config_path"]).resolve()),
+                    "output_prefix": str(run_spec["output_prefix"]),
+                    "geometry_file": str(run_spec["geometry_file"]),
+                    "heat_flux_last": row.get("heat_flux", math.nan),
+                    "particle_flux_last": row.get("particle_flux", math.nan),
+                    "status": "already_completed",
+                }
+            )
+        )
+        return 0
     spectrax_root = Path(manifest["spectrax_root"]).resolve()
     src_path = spectrax_root / "src"
     run_dir = Path(run_spec["run_dir"]).resolve()
@@ -1033,7 +1068,7 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         if not bool(getattr(args, "verbose_worker", False)) and proc.stderr:
             print(proc.stderr.rstrip(), file=sys.stderr)
         return int(proc.returncode)
-    diag_csv = Path(f"{output_prefix}.diagnostics.csv")
+    diag_csv = _diagnostics_csv_path(run_spec)
     heat_last = float("nan")
     pflux_last = float("nan")
     if diag_csv.exists():
@@ -1104,10 +1139,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_parallel = min(max_parallel, len(gpu_ids))
 
     pending = list(range(len(runs)))
+    already_done = [idx for idx, run in enumerate(runs) if _has_completed_output(run)]
+    if already_done:
+        pending = [idx for idx in pending if idx not in set(already_done)]
     active: dict[Any, tuple[subprocess.Popen[str], int, dict[str, str]]] = {}
     failures = 0
-    completed = 0
+    completed = len(already_done)
     total = len(runs)
+
+    if already_done:
+        print(f"skipping {len(already_done)} already completed runs")
 
     def _env_for_slot(slot: int) -> dict[str, str]:
         env = {

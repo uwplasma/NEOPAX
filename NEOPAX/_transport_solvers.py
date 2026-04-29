@@ -227,6 +227,27 @@ def _extract_state_regularization(vector_field: Callable) -> tuple[Any, Any]:
     )
 
 
+def _extract_rhs_mode(vector_field: Callable) -> str:
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return "black_box"
+    return str(getattr(owner, "rhs_mode", "black_box")).strip().lower()
+
+
+def _extract_transport_response_builder(vector_field: Callable) -> Callable | None:
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    return getattr(owner, "build_transport_response", None)
+
+
+def _extract_transport_response_vector_field(vector_field: Callable) -> Callable | None:
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    return getattr(owner, "response_vector_field", None)
+
+
 def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
     """Convert a TransportState-like object into an array-only pytree."""
     if dataclasses.is_dataclass(state) and hasattr(state, "density") and hasattr(state, "pressure") and hasattr(state, "Er"):
@@ -1768,6 +1789,9 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         species = _extract_species_from_args(args)
         temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
         density_floor, temperature_floor = _extract_state_regularization(vector_field)
+        rhs_mode = _extract_rhs_mode(vector_field)
+        transport_response_builder = _extract_transport_response_builder(vector_field)
+        transport_response_vector_field = _extract_transport_response_vector_field(vector_field)
         state = _project_state_to_quasi_neutrality(
             state,
             species,
@@ -1806,15 +1830,38 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         tau_min = jnp.asarray(self.tau_min, dtype=dtype)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
 
-        def _make_linearized_guess(flat_y, t_value, h_value):
-            f_old = flat_rhs(t_value, flat_y)
+        def _build_attempt_rhs_model(flat_y_ref, t_value):
+            if (
+                rhs_mode != "transport_response"
+                or transport_response_builder is None
+                or transport_response_vector_field is None
+            ):
+                return flat_rhs
+
+            response = transport_response_builder(unpack_flat(flat_y_ref), args[0] if len(args) > 0 else None, t=t_value)
+
+            def response_rhs(_t_unused, flat_y):
+                del _t_unused
+                state_trial = unpack_flat(flat_y)
+                rhs_state = transport_response_vector_field(
+                    response,
+                    t_value,
+                    state_trial,
+                    args[0] if len(args) > 0 else None,
+                )
+                return _project_flat_state_if_needed(_pack_state(rhs_state), project_flat)
+
+            return response_rhs
+
+        def _make_linearized_guess(rhs_fn, flat_y, t_value, h_value):
+            f_old = rhs_fn(t_value, flat_y)
             t_new = t_value + h_value
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
 
             if predictor_mode == "euler":
                 return guess0, jnp.asarray(True)
 
-            jacobian_guess0 = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0)
+            jacobian_guess0 = jax.jacfwd(lambda y: rhs_fn(t_new, y))(guess0)
             system0 = identity_n - h_value * theta * jacobian_guess0
             lu0, piv0 = jax.scipy.linalg.lu_factor(system0)
             linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
@@ -1822,7 +1869,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             def _corrector_body(_, carry):
                 guess, linear_ok = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
-                f_guess = flat_rhs(t_new, guess_proj)
+                f_guess = rhs_fn(t_new, guess_proj)
                 affine_rhs = flat_y + h_value * (
                     (one - theta) * f_old
                     + theta * (f_guess - jacobian_guess0 @ guess_proj)
@@ -1845,14 +1892,14 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 jnp.asarray(True),
             )
 
-        def _single_theta_newton_step(flat_y, t_value, h_value):
-            f_old = flat_rhs(t_value, flat_y)
+        def _single_theta_newton_step(rhs_fn, flat_y, t_value, h_value):
+            f_old = rhs_fn(t_value, flat_y)
             t_new = t_value + h_value
-            guess0, linear_ok0 = _make_linearized_guess(flat_y, t_value, h_value)
+            guess0, linear_ok0 = _make_linearized_guess(rhs_fn, flat_y, t_value, h_value)
 
             def residual(y_val):
                 y_proj = _project_flat_state_if_needed(y_val, project_flat)
-                f_new = flat_rhs(t_new, y_proj)
+                f_new = rhs_fn(t_new, y_proj)
                 return y_proj - flat_y - h_value * ((one - theta) * f_old + theta * f_new)
 
             def body_fn(carry):
@@ -1938,6 +1985,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 )
 
             def _run(_):
+                rhs_fn = _build_attempt_rhs_model(step_state.y, step_state.t)
                 trial_dt0 = jnp.minimum(step_state.dt, t_final - step_state.t)
 
                 def retry_cond(carry):
@@ -1948,10 +1996,10 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 def retry_body(carry):
                     trial_dt, _trial_y, _converged, _iter_count, _residual_norm = carry
                     reduced_dt = jnp.maximum(trial_dt * delta_reduction_factor, dt_min)
-                    next_y, next_converged, next_iter_count, next_residual_norm = _single_theta_newton_step(step_state.y, step_state.t, reduced_dt)
+                    next_y, next_converged, next_iter_count, next_residual_norm = _single_theta_newton_step(rhs_fn, step_state.y, step_state.t, reduced_dt)
                     return reduced_dt, next_y, next_converged, next_iter_count, next_residual_norm
 
-                trial_y0, converged0, iter_count0, residual_norm0 = _single_theta_newton_step(step_state.y, step_state.t, trial_dt0)
+                trial_y0, converged0, iter_count0, residual_norm0 = _single_theta_newton_step(rhs_fn, step_state.y, step_state.t, trial_dt0)
                 trial_dt, trial_y, converged, iter_count, residual_norm = jax.lax.while_loop(
                     retry_cond,
                     retry_body,

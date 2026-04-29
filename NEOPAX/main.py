@@ -84,6 +84,20 @@ def _normalize_solver_config(config: dict) -> dict:
         solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", "diffrax_kvaerno5"))
     )
     solver_cfg["integrator"] = solver_cfg["transport_solver_backend"]
+    rhs_mode = str(solver_cfg.get("rhs_mode", "black_box")).strip().lower()
+    rhs_mode_aliases = {
+        "black_box": "black_box",
+        "black-box": "black_box",
+        "assembled_rhs": "black_box",
+        "transport_response": "transport_response",
+        "response": "transport_response",
+    }
+    if rhs_mode not in rhs_mode_aliases:
+        raise ValueError(
+            f"Unsupported transport solver rhs_mode '{rhs_mode}'. "
+            "Expected one of: black_box, transport_response."
+        )
+    solver_cfg["rhs_mode"] = rhs_mode_aliases[rhs_mode]
     solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
     solver_cfg.setdefault("Er_relax", 1.0)
@@ -542,7 +556,19 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             else ZeroTransportModel()
         )
     )
-    return build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
+    solver_cfg = _normalize_solver_config(config)
+    include_turbulent_particle_flux = bool(
+        solver_cfg.get(
+            "include_turbulent_particle_flux",
+            solver_cfg.get("turbulence_include_particle_flux", True),
+        )
+    )
+    return build_transport_flux_model(
+        neoclassical_model,
+        turbulence_model,
+        classical_model,
+        include_turbulent_particle_flux=include_turbulent_particle_flux,
+    )
 
 
 def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState | None]:
@@ -670,6 +696,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
+        rhs_mode=str(solver_cfg.get("rhs_mode", "black_box")).strip().lower(),
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -679,6 +706,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         print(
             "[NEOPAX] transport setup complete:",
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
+            f"rhs_mode={solver_cfg.get('rhs_mode', 'black_box')}",
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )

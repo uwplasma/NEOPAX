@@ -618,6 +618,25 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
     return 0
 
 
+def _existing_result_is_usable(
+    result_json: Path,
+    *,
+    require_benchmark: bool,
+) -> bool:
+    if not result_json.exists():
+        return False
+    try:
+        summary = json.loads(result_json.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    required = ("rho", "rHat", "Gamma", "Q", "Upar")
+    if any(key not in summary for key in required):
+        return False
+    if require_benchmark and "benchmark" not in summary:
+        return False
+    return True
+
+
 def _write_summary_plots(
     *,
     output_dir: Path,
@@ -900,6 +919,8 @@ def cmd_main(args: argparse.Namespace) -> int:
     }
 
     task_payloads: list[Path] = []
+    pending_task_payloads: list[Path] = []
+    reused_runs = 0
     for radius_index in radius_indices:
         rho_value = float(snapshot.rho[radius_index])
         run_name = f"rho_{radius_index:03d}_r{rho_value:.4f}".replace(".", "p")
@@ -916,6 +937,20 @@ def cmd_main(args: argparse.Namespace) -> int:
             solver_tolerance=args.solver_tolerance,
         )
         input_path = surface_dir / "input.namelist"
+        result_json = surface_dir / "result.json"
+        existing_input_text = None
+        if input_path.exists():
+            try:
+                existing_input_text = input_path.read_text(encoding="utf-8")
+            except Exception:
+                existing_input_text = None
+        can_reuse = (
+            existing_input_text == input_text
+            and _existing_result_is_usable(
+                result_json,
+                require_benchmark=bool(int(args.benchmark_repeats) > 0),
+            )
+        )
         input_path.write_text(input_text, encoding="utf-8")
 
         payload = {
@@ -923,7 +958,7 @@ def cmd_main(args: argparse.Namespace) -> int:
             "rho": rho_value,
             "input_path": str(input_path),
             "output_path": str(surface_dir / "sfincsOutput.h5"),
-            "result_json": str(surface_dir / "result.json"),
+            "result_json": str(result_json),
             "wout_path": None if wout_path is None else str(wout_path),
             "n_species": len(species),
             "verbose": bool(args.verbose_workers),
@@ -934,6 +969,10 @@ def cmd_main(args: argparse.Namespace) -> int:
         with payload_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         task_payloads.append(payload_path)
+        if can_reuse:
+            reused_runs += 1
+        else:
+            pending_task_payloads.append(payload_path)
 
     backend = str(args.backend).lower()
     gpu_ids = [token.strip() for token in str(args.gpu_ids).split(",") if token.strip()]
@@ -953,12 +992,20 @@ def cmd_main(args: argparse.Namespace) -> int:
         f"selected {len(radius_indices)} radii over rho in [{rho_min_val:.4f}, {rho_max_val:.4f}] "
         f"({backend_note}, {parallel_note}, {placement_note})"
     , flush=True)
+    if reused_runs:
+        print(
+            "[sfincs-scan] "
+            f"reusing {reused_runs}/{len(radius_indices)} existing completed runs; "
+            f"launching {len(pending_task_payloads)} new workers.",
+            flush=True,
+        )
 
-    _run_tasks_in_parallel(
-        task_payloads=task_payloads,
-        args=args,
-        gpu_ids=gpu_ids,
-    )
+    if pending_task_payloads:
+        _run_tasks_in_parallel(
+            task_payloads=pending_task_payloads,
+            args=args,
+            gpu_ids=gpu_ids,
+        )
 
     rho_out = []
     rhat_out = []

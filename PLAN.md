@@ -599,9 +599,37 @@ Scope note:
 - treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
 
 ### Phase 10: Shared Transport-Response Decomposition For Theta / Radau
-- Status: planned
+- Status: in progress
 - Goal:
   - add a solver-facing transport decomposition layer, closer in spirit to Trinity3D and partly to TORAX, so both `theta` and `radau` can optionally run on a frozen local transport-response model instead of only on the current black-box assembled RHS
+
+Current state:
+- a new opt-in solver config flag exists:
+  - `rhs_mode = "black_box" | "transport_response"`
+- the default black-box path is still the baseline and remains behaviorally unchanged
+- `ComposedEquationSystem` now exposes:
+  - `build_transport_response(...)`
+  - `response_vector_field(...)`
+- a `TransportResponse` scaffold now captures:
+  - reference state / working state
+  - base assembled RHS
+  - base shared fluxes
+  - density / pressure source components
+  - per-equation component breakdowns from existing `debug_components(...)`
+- `theta_newton` now has a first response-backed path when:
+  - `rhs_mode = "transport_response"`
+- the current response-backed theta mode is still an early prototype:
+  - density transport is frozen from response components
+  - temperature uses frozen `Q_faces` and frozen `Gamma_*_faces`, but rebuilds convective energy fluxes with the current upwind temperature state and recomputes source terms against the current state
+  - `Er` uses frozen ambipolar drive with live diffusion on the current `Er`
+- this is already more structured than a frozen black-box affine RHS, but it is still not yet a true Trinity3D-style derivative-based transport operator
+
+What remains to reach the intended Phase 10 target:
+- replace frozen component reuse with explicit local response objects:
+  - derivative / operator information for `Gamma`, `Q`, and sources
+- move from frozen face fluxes toward coefficient- or derivative-based transport-response assembly
+- keep `radau` on the current black-box path until the response-backed theta path is validated
+- only then evaluate whether a lagged-response Radau mode is worthwhile
 
 Why this phase was added:
 - current NEOPAX modularity stops at:

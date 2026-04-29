@@ -401,20 +401,22 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
     neoclassical_model: TransportFluxModelBase
     turbulent_model: TransportFluxModelBase
     classical_model: TransportFluxModelBase
+    include_turbulent_particle_flux: bool = True
 
     def __call__(self, state, *args, **kwargs) -> dict:
         # Only pass 'state' to the model instances, as expected by their __call__
         neo = self.neoclassical_model(state)
         turb = self.turbulent_model(state)
         classical = self.classical_model(state)
+        gamma_turb = turb.get("Gamma", 0) if self.include_turbulent_particle_flux else 0
         out = {
-            "Gamma": neo.get("Gamma", 0) + turb.get("Gamma", 0) + classical.get("Gamma", 0),
+            "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q":     neo.get("Q", 0)     + turb.get("Q", 0)     + classical.get("Q", 0),
             "Upar":  neo.get("Upar", 0)  + turb.get("Upar", 0)  + classical.get("Upar", 0),
             "Gamma_neo": neo.get("Gamma", 0),
             "Q_neo":     neo.get("Q", 0),
             "Upar_neo":  neo.get("Upar", 0),
-            "Gamma_turb": turb.get("Gamma", 0),
+            "Gamma_turb": gamma_turb,
             "Q_turb":     turb.get("Q", 0),
             "Upar_turb":  turb.get("Upar", 0),
             "Gamma_classical": classical.get("Gamma", 0),
@@ -431,7 +433,8 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             return None
 
         def evaluator(radius_index, er_value):
-            return neo_eval(radius_index, er_value) + turb_eval(radius_index, er_value) + classical_eval(radius_index, er_value)
+            gamma_turb = turb_eval(radius_index, er_value) if self.include_turbulent_particle_flux else 0
+            return neo_eval(radius_index, er_value) + gamma_turb + classical_eval(radius_index, er_value)
 
         return evaluator
 
@@ -441,14 +444,15 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
         if neo is None or turb is None or classical is None:
             return None
+        gamma_turb = turb.get("Gamma", 0) if self.include_turbulent_particle_flux else 0
         return {
-            "Gamma": neo.get("Gamma", 0) + turb.get("Gamma", 0) + classical.get("Gamma", 0),
+            "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
             "Upar": neo.get("Upar", 0) + turb.get("Upar", 0) + classical.get("Upar", 0),
             "Gamma_neo": neo.get("Gamma", 0),
             "Q_neo": neo.get("Q", 0),
             "Upar_neo": neo.get("Upar", 0),
-            "Gamma_turb": turb.get("Gamma", 0),
+            "Gamma_turb": gamma_turb,
             "Q_turb": turb.get("Q", 0),
             "Upar_turb": turb.get("Upar", 0),
             "Gamma_classical": classical.get("Gamma", 0),
@@ -968,14 +972,21 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
 # --- Refactored: Only the orchestrator builds models; this function is now a pure factory ---
 def build_transport_flux_model(neo_model: TransportFluxModelBase,
                               turb_model: TransportFluxModelBase,
-                              classical_model: TransportFluxModelBase = None) -> CombinedTransportFluxModel:
+                              classical_model: TransportFluxModelBase = None,
+                              *,
+                              include_turbulent_particle_flux: bool = True) -> CombinedTransportFluxModel:
     """
     Build the composed transport model from explicit model instances.
     All models must be constructed up front by the orchestrator.
     """
     if classical_model is None:
         classical_model = ZeroTransportModel()
-    return CombinedTransportFluxModel(neo_model, turb_model, classical_model)
+    return CombinedTransportFluxModel(
+        neo_model,
+        turb_model,
+        classical_model,
+        include_turbulent_particle_flux=bool(include_turbulent_particle_flux),
+    )
 
 register_transport_flux_model(
     "monkes_database",
