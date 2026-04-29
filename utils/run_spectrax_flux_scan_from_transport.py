@@ -21,7 +21,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
-import NEOPAX.utils.neopax_spectrax_flux_bridge as bridge
+try:
+    import NEOPAX.utils.neopax_spectrax_flux_bridge as bridge
+except ModuleNotFoundError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import neopax_spectrax_flux_bridge as bridge  # type: ignore[no-redef]
 
 
 def _load_toml(path: Path) -> dict:
