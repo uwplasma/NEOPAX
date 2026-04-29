@@ -160,10 +160,15 @@ def _as_state_residual(vector_field: Callable) -> Callable:
 
 def _select_solver_family_and_backend(solver_parameters: Any) -> tuple[str, str]:
     """Pick the active Diffrax backend while preserving legacy integrator-only configs."""
+    def _cfg_get(key: str, default=None):
+        if isinstance(solver_parameters, dict):
+            return solver_parameters.get(key, default)
+        return getattr(solver_parameters, key, default)
+
     backend = str(
-        solver_parameters.get(
+        _cfg_get(
             "transport_solver_backend",
-            solver_parameters.get("integrator", "diffrax_kvaerno5"),
+            _cfg_get("integrator", "diffrax_kvaerno5"),
         )
     ).strip().lower()
     if backend not in ODE_SOLVER_BACKENDS:
@@ -2039,9 +2044,14 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
     """
     import diffrax
 
-    t0 = float(solver_parameters["t0"])
-    t1 = float(solver_parameters["t_final"])
-    dt = float(solver_parameters["dt"])
+    def _cfg_get(key: str, default=None):
+        if isinstance(solver_parameters, dict):
+            return solver_parameters.get(key, default)
+        return getattr(solver_parameters, key, default)
+
+    t0 = float(_cfg_get("t0"))
+    t1 = float(_cfg_get("t_final", _cfg_get("t1")))
+    dt = float(_cfg_get("dt"))
 
     if solver_override is not None:
         if hasattr(solver_override, "solve"):
@@ -2049,19 +2059,19 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
         return DiffraxSolver(integrator=lambda: solver_override, t0=t0, t1=t1, dt=dt)
 
     _, backend = _select_solver_family_and_backend(solver_parameters)
-    save_n = solver_parameters.get("save_n", solver_parameters.get("n_save"))
+    save_n = _cfg_get("save_n", _cfg_get("n_save"))
     if backend == "theta":
         return ThetaMethodSolver(
             t0=t0,
             t1=t1,
             dt=dt,
-            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
-            theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
-            predictor_mode=str(solver_parameters.get("theta_predictor_mode", "linearized")),
-            use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
-            n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
-            tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),
-            max_steps=int(solver_parameters.get("max_steps", 20000)),
+            min_step=float(_cfg_get("min_step", 1.0e-14)),
+            theta_implicit=float(_cfg_get("theta_implicit", 1.0)),
+            predictor_mode=str(_cfg_get("theta_predictor_mode", "linearized")),
+            use_predictor_corrector=bool(_cfg_get("use_predictor_corrector", False)),
+            n_corrector_steps=int(_cfg_get("n_corrector_steps", 1)),
+            tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
+            max_steps=int(_cfg_get("max_steps", 20000)),
             save_n=save_n,
         )
     if backend == "theta_newton":
@@ -2069,21 +2079,21 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             t0=t0,
             t1=t1,
             dt=dt,
-            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
-            theta_implicit=float(solver_parameters.get("theta_implicit", 1.0)),
-            predictor_mode=str(solver_parameters.get("theta_predictor_mode", "linearized")),
-            use_predictor_corrector=bool(solver_parameters.get("use_predictor_corrector", False)),
-            n_corrector_steps=int(solver_parameters.get("n_corrector_steps", 1)),
-            tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),
-            maxiter=int(solver_parameters.get("nonlinear_solver_maxiter", solver_parameters.get("maxiter", 20))),
-            max_step=float(solver_parameters.get("max_step", max(t1 - t0, dt))),
-            safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
-            min_step_factor=float(solver_parameters.get("min_step_factor", 0.5)),
-            max_step_factor=float(solver_parameters.get("max_step_factor", 2.0)),
-            target_nonlinear_iterations=int(solver_parameters.get("theta_target_nonlinear_iterations", 4)),
-            delta_reduction_factor=float(solver_parameters.get("theta_delta_reduction_factor", 0.5)),
-            tau_min=float(solver_parameters.get("theta_tau_min", 0.01)),
-            max_steps=int(solver_parameters.get("max_steps", 20000)),
+            min_step=float(_cfg_get("min_step", 1.0e-14)),
+            theta_implicit=float(_cfg_get("theta_implicit", 1.0)),
+            predictor_mode=str(_cfg_get("theta_predictor_mode", "linearized")),
+            use_predictor_corrector=bool(_cfg_get("use_predictor_corrector", False)),
+            n_corrector_steps=int(_cfg_get("n_corrector_steps", 1)),
+            tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
+            maxiter=int(_cfg_get("nonlinear_solver_maxiter", _cfg_get("maxiter", 20))),
+            max_step=float(_cfg_get("max_step", max(t1 - t0, dt))),
+            safety_factor=float(_cfg_get("safety_factor", 0.9)),
+            min_step_factor=float(_cfg_get("min_step_factor", 0.5)),
+            max_step_factor=float(_cfg_get("max_step_factor", 2.0)),
+            target_nonlinear_iterations=int(_cfg_get("theta_target_nonlinear_iterations", 4)),
+            delta_reduction_factor=float(_cfg_get("theta_delta_reduction_factor", 0.5)),
+            tau_min=float(_cfg_get("theta_tau_min", 0.01)),
+            max_steps=int(_cfg_get("max_steps", 20000)),
             save_n=save_n,
         )
     if backend == "radau":
@@ -2091,28 +2101,28 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             t0=t0,
             t1=t1,
             dt=dt,
-            rtol=float(solver_parameters.get("rtol", 1.0e-6)),
-            atol=float(solver_parameters.get("atol", 1.0e-8)),
-            max_step=float(solver_parameters.get("max_step", max(t1 - t0, dt))),
-            min_step=float(solver_parameters.get("min_step", 1.0e-14)),
-            tol=float(solver_parameters.get("nonlinear_solver_tol", solver_parameters.get("tol", 1.0e-8))),
-            maxiter=int(solver_parameters.get("nonlinear_solver_maxiter", solver_parameters.get("maxiter", 20))),
-            error_estimator=str(solver_parameters.get("radau_error_estimator", "embedded2")),
-            num_stages=int(solver_parameters.get("radau_num_stages", 3)),
-            safety_factor=float(solver_parameters.get("safety_factor", 0.9)),
-            min_step_factor=float(solver_parameters.get("min_step_factor", 0.1)),
-            max_step_factor=float(solver_parameters.get("max_step_factor", 5.0)),
-            max_steps=int(solver_parameters.get("max_steps", 20000)),
+            rtol=float(_cfg_get("rtol", 1.0e-6)),
+            atol=float(_cfg_get("atol", 1.0e-8)),
+            max_step=float(_cfg_get("max_step", max(t1 - t0, dt))),
+            min_step=float(_cfg_get("min_step", 1.0e-14)),
+            tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
+            maxiter=int(_cfg_get("nonlinear_solver_maxiter", _cfg_get("maxiter", 20))),
+            error_estimator=str(_cfg_get("radau_error_estimator", "embedded2")),
+            num_stages=int(_cfg_get("radau_num_stages", 3)),
+            safety_factor=float(_cfg_get("safety_factor", 0.9)),
+            min_step_factor=float(_cfg_get("min_step_factor", 0.1)),
+            max_step_factor=float(_cfg_get("max_step_factor", 5.0)),
+            max_steps=int(_cfg_get("max_steps", 20000)),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)
-    ts_list = solver_parameters.get("ts_list")
+    ts_list = _cfg_get("ts_list")
     saveat = diffrax.SaveAt(ts=ts_list) if ts_list is not None else diffrax.SaveAt(t1=True)
     stepsize_controller = diffrax.PIDController(
         pcoeff=0.3,
         icoeff=0.4,
-        rtol=float(solver_parameters.get("rtol")),
-        atol=float(solver_parameters.get("atol")),
+        rtol=float(_cfg_get("rtol")),
+        atol=float(_cfg_get("atol")),
     )
     return DiffraxSolver(
         integrator=integrator_ctor,
@@ -2122,8 +2132,8 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
         save_n=save_n,
         saveat=saveat,
         stepsize_controller=stepsize_controller,
-        max_steps=int(solver_parameters.get("max_steps", 20000)),
-        throw=bool(solver_parameters.get("throw", False)),
+        max_steps=int(_cfg_get("max_steps", 20000)),
+        throw=bool(_cfg_get("throw", False)),
     )
 
 register_time_solver("diffrax_kvaerno5", lambda **kw: DiffraxSolver(_get_diffrax_integrator("diffrax_kvaerno5"), **kw))

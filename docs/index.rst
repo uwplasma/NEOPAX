@@ -23,4 +23,5 @@ This is a Python package in JAX to perform optimization of Neoclassical and 1D t
    :maxdepth: 2
    :caption: Contents:
 
+   overview
    getting_started

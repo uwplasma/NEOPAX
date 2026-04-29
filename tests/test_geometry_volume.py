@@ -5,8 +5,8 @@ from NEOPAX._geometry_models import VmecBoozer
 
 
 def test_vmec_vprime_integrates_to_volume_p():
-    vmec_path = "NEOPAX/examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
-    booz_path = "NEOPAX/examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+    vmec_path = "examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
+    booz_path = "examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
 
     geometry = VmecBoozer(n_r=51, vmec=vmec_path, booz=booz_path)
 

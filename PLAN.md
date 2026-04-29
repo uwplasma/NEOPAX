@@ -598,6 +598,50 @@ Scope note:
 - do not mix this work into the current Radau optimization track
 - treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
 
+### Phase 9B: Unified Database / Interpolator Facades
+- Status: planned
+- Goal:
+  - replace the current parallel spread of database/interpolator entry points with one clear public database façade and one clear public interpolator façade, while preserving the existing physics modes and keeping internal implementations modular
+
+Why this phase was added:
+- the current structure has grown into several overlapping entry modules, for example:
+  - `_database.py`
+  - `_database_preprocessed.py`
+  - `_database_ntss_preprocessed.py`
+  - `_interpolators.py`
+  - `_interpolators_preprocessed.py`
+  - `_interpolators_ntss_preprocessed.py`
+- that makes it harder to:
+  - understand the supported interpolation/database modes
+  - keep imports consistent across the codebase
+  - deprecate or reorganize older pathways later
+- the intended cleanup is architectural, not a change in transport or neoclassical physics
+
+Target structure:
+- one public database façade module, e.g. `_databases.py`, that:
+  - exposes the supported database-loading/building entry points
+  - dispatches by database kind / preprocessing mode / interpolation mode
+- one public interpolator façade module, e.g. `_interpolators.py`, that:
+  - exposes the supported interpolator-building entry points
+  - dispatches by preprocessing kind / dimensionality / source layout
+- internal implementations may still remain split across specialized files where that keeps the code easier to maintain
+
+Primary tasks for this phase:
+- define the intended public database/interpolator entry points used by the rest of NEOPAX
+- move call sites toward those façade entry points rather than importing specialized implementation files directly
+- decide which current modules become:
+  - façade modules
+  - internal implementation modules
+  - legacy compatibility shims
+- reduce duplicated dispatch logic where multiple files currently encode similar mode selection
+- document the supported database/interpolator pathways in one place
+
+Scope notes:
+- this phase should not force everything into one giant physical source file
+- the goal is one unified interface per domain, not monolithic implementation
+- preserve existing database and interpolation capabilities during the refactor
+- prefer compatibility shims first, then retire older direct imports only after call sites are migrated
+
 ### Phase 10: Lagged Transport-Response Mode For Radau
 - Status: planned
 - Goal:
@@ -783,6 +827,142 @@ Design constraints if pursued later:
 Expected tradeoff:
 - simpler conceptual interface from the solver perspective (`f(y)` plus `df/dy`)
 - but usually less interpretable and less transport-physics-aware than a structured flux/source response model
+
+### Phase 11: Autodiff Sensitivity Analysis On Profile Characteristics
+- Status: planned
+- Goal:
+  - add a dedicated sensitivity-analysis workflow in NEOPAX using automatic differentiation, with the first focus on temperature and density profile characteristics rather than only raw state-vector entries
+
+Why this phase was added:
+- NEOPAX already has JAX-native building blocks, so it is well suited for autodiff-based sensitivity analysis without building a separate finite-difference framework from scratch
+- sensitivities with respect to low-dimensional profile characteristics can be more physically interpretable than sensitivities to every grid-point value, for example:
+  - core temperature level
+  - edge temperature level
+  - density peaking
+  - gradient amplitude
+  - width / shape parameters
+- this can support:
+  - physics interpretation
+  - reduced transport-drive selection
+  - future response-model construction
+  - later adaptive solver heuristics
+
+Initial scope:
+- begin with temperature and density only
+- define one or two low-dimensional profile parameterizations or characteristic sets
+- keep the first pass diagnostic / analysis focused rather than coupling it immediately into the solver
+
+Candidate input characteristics:
+- temperature amplitude parameters
+- density amplitude parameters
+- peaking / broadness parameters
+- gradient-scale-length-like parameters
+- optional low-dimensional basis coefficients for `T` and `n`
+
+Candidate outputs for sensitivity analysis:
+- particle fluxes
+- heat fluxes
+- ambipolar residuals
+- selected source integrals
+- selected transport RHS summaries
+- later:
+  - response-refresh indicators
+  - solver-level diagnostics
+
+Primary tasks for this phase:
+- choose a low-dimensional parameterization for temperature and density profiles
+- implement a clean JAX-differentiable map from profile characteristics to full profiles or transport drives
+- add sensitivity drivers using:
+  - `jax.grad`
+  - `jax.jacrev`
+  - `jax.jacfwd`
+  - directional derivatives where cheaper and more interpretable
+- compare autodiff sensitivities against finite-difference spot checks on small benchmark cases
+- identify which sensitivities are most useful for:
+  - physical interpretation
+  - later transport-response modeling
+  - future expensive-kernel surrogate design
+
+Scope notes:
+- prefer low-dimensional profile descriptors over dense full-state Jacobians in the first pass
+- keep this phase modular so it can later inform both solver development and external-kernel response design
+- do not let this become an excuse to thread giant full-Jacobian machinery through the default transport path
+
+### Phase 11A: JAX-Friendly User Model Extension API
+- Status: planned
+- Goal:
+  - add a clean Python extension interface so users can register custom flux models and source models with minimal boilerplate, while automatically validating that those models follow NEOPAX shape, purity, and JAX-compatibility expectations
+
+Why this phase was added:
+- NEOPAX is increasingly modular, but adding new flux and source models still requires understanding internal registries and implicit conventions
+- users should be able to contribute custom models without editing multiple internal files or guessing the required return structure
+- because NEOPAX is JAX-based, it is especially useful to validate early whether a user model is:
+  - shape-consistent
+  - JIT-safe
+  - array/pytree compatible
+  - optionally autodiff-safe
+
+Design direction:
+- define a formal extension contract for each model family:
+  - transport flux models
+  - source models
+- support both:
+  - class-based model registration
+  - simple function-based registration where appropriate
+- make validation explicit and reusable rather than burying it in runtime failures
+
+Core API pieces to introduce:
+- a small shared model API module, for example:
+  - `_model_api.py`
+  - or `_plugin_api.py`
+- transport model registration helpers, for example:
+  - `register_transport_flux_model(...)`
+  - `get_transport_flux_model_spec(...)`
+- source model registration helpers, for example:
+  - `register_source_model(...)`
+  - `get_source_model_spec(...)`
+- capability metadata describing whether a model is expected to be:
+  - `jit_safe`
+  - `autodiff_safe`
+  - `vmap_safe`
+  - local-evaluator capable
+  - face-flux capable
+
+Validation checks to support:
+- required output keys are present
+- returned arrays have expected rank and species/radial shape
+- outputs are JAX arrays or JAX-compatible pytrees
+- `jax.eval_shape(...)` succeeds on a lightweight mock state
+- optional `jax.jit(...)` smoke test succeeds
+- optional autodiff smoke test succeeds for models that declare autodiff support
+- finite-output checks on a small canonical toy state
+
+Primary tasks for this phase:
+- write down the explicit transport flux model contract:
+  - required inputs
+  - required outputs
+  - optional auxiliary evaluators
+- write down the explicit source model contract:
+  - required call signature
+  - expected output mapping structure
+  - allowed state/species dependencies
+- implement shared validator utilities so both registries use the same checks
+- refactor existing built-in flux/source registries to pass through the shared validation layer
+- add user-facing examples for one custom flux model and one custom source model
+- add CI tests covering:
+  - successful registration
+  - shape/key mismatch failures
+  - non-JAX output failures
+  - optional JIT/autodiff validation modes
+
+Scope notes:
+- keep this phase focused on extension ergonomics and validation, not on changing the underlying transport physics
+- prefer a small, explicit public API over broad implicit imports
+- keep strict validation configurable:
+  - warning mode for experimentation
+  - error mode for CI / production-like runs
+- do not force every model to support autodiff; make capabilities explicit instead
+- keep the default hot path lean by avoiding heavy validation in production execution unless requested
 
 ### Theta Solver Upgrade Notes
 - Status: planned

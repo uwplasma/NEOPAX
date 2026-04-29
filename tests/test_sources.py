@@ -1,24 +1,18 @@
 import jax
 import jax.numpy as jnp
-
 from NEOPAX._source_models import (
+    AnalyticSource,
     BremsstrahlungRadiationSource,
+    CombinedSourceModel,
     DTReactionSource,
     FusionPowerFractionElectronsSource,
     PowerExchangeSource,
+    SourceModelBase,
+    get_source,
+    register_source,
 )
-from NEOPAX._sources import AnalyticSource, CombinedSourceModel, SourceModelBase, get_source, register_source
+from NEOPAX._species import Species
 from NEOPAX._state import TransportState
-
-
-class DummySpecies:
-    def __init__(self):
-        self.mass = jnp.array([1.0, 2.014, 3.016, 4.0])
-        self.charge = jnp.array([-1.0, 1.0, 1.0, 2.0])
-        self.charge_qp = self.charge
-        self.number_species = 4
-        self.species_idx = {"e": 0, "D": 1, "T": 2, "He": 3}
-        self.names = ("e", "D", "T", "He")
 
 
 def make_dummy_state():
@@ -27,6 +21,16 @@ def make_dummy_state():
     pressure = density * temperature
     Er = jnp.zeros(10)
     return TransportState(density=density, pressure=pressure, Er=Er)
+
+
+def make_dummy_species():
+    return Species(
+        number_species=4,
+        species_indices=jnp.arange(4),
+        mass_mp=jnp.array([1.0 / 1836.15267343, 2.014, 3.016, 4.0]),
+        charge_qp=jnp.array([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
+    )
 
 
 def test_analytic_source_array():
@@ -47,11 +51,20 @@ def test_analytic_source_callable():
 
 
 def test_combined_source_model():
-    src1 = AnalyticSource(jnp.ones(3))
-    src2 = AnalyticSource(jnp.ones(3) * 2)
-    combined = CombinedSourceModel([src1, src2])
+    class DictSource(SourceModelBase):
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self, state):
+            del state
+            return {"src": jnp.asarray(self.value)}
+
+    src1 = DictSource(jnp.ones(3))
+    src2 = DictSource(jnp.ones(3) * 2)
+    combined = CombinedSourceModel((src1, src2))
     out = combined(None)
-    assert jnp.allclose(out, jnp.ones(3) * 3)
+    assert "src" in out
+    assert jnp.allclose(out["src"], jnp.ones(3) * 3)
 
 
 def test_register_and_get_source():
@@ -75,7 +88,7 @@ def test_jax_jit_compatibility():
 
 def test_fusion_power_fraction_electrons():
     state = make_dummy_state()
-    species = DummySpecies()
+    species = make_dummy_species()
     src = FusionPowerFractionElectronsSource()
     result = src(state, species)
     assert result["fusion_power_fraction_electrons"].shape == state.temperature[species.species_idx["e"]].shape
@@ -83,7 +96,7 @@ def test_fusion_power_fraction_electrons():
 
 def test_dt_reaction():
     state = make_dummy_state()
-    species = DummySpecies()
+    species = make_dummy_species()
     src = DTReactionSource()
     result = src(state, species)
     assert result["DTreactionRate"].shape == state.temperature[species.species_idx["T"]].shape
@@ -93,7 +106,7 @@ def test_dt_reaction():
 
 def test_power_exchange():
     state = make_dummy_state()
-    species = DummySpecies()
+    species = make_dummy_species()
     src = PowerExchangeSource(mode="all")
     result = src(state, species)
     assert result["power_exchange"].shape == state.temperature.shape
@@ -101,7 +114,7 @@ def test_power_exchange():
 
 def test_bremsstrahlung_radiation():
     state = make_dummy_state()
-    species = DummySpecies()
+    species = make_dummy_species()
     src = BremsstrahlungRadiationSource()
     result = src(state, species)
     assert result["PBrems"].shape == state.temperature[species.species_idx["e"]].shape

@@ -9,7 +9,7 @@ from NEOPAX._boundary_conditions import BoundaryConditionModel, right_constraint
 from NEOPAX._cell_variable import make_profile_cell_variable
 from NEOPAX._fem import conservative_update
 from NEOPAX._parameters import Solver_Parameters
-from NEOPAX._transport_solvers import ThetaNewtonSolver, RADAUSolver, build_time_solver
+from NEOPAX._transport_solvers import NewtonThetaMethodSolver, RADAUSolver, build_time_solver
 
 
 @dataclasses.dataclass
@@ -146,17 +146,13 @@ def _solve_diffusion_with_backend(backend, y0, t0, tf, dt, field, D, *, rtol=1e-
     vector_field = lambda t, y: _diffusion_rhs(y, field, D)
 
     if backend == "theta":
-        solver = ThetaNewtonSolver(
+        solver = NewtonThetaMethodSolver(
             t0=t0,
             t1=tf,
             dt=dt,
             theta_implicit=1.0,
             tol=1.0e-9,
             maxiter=20,
-            ptc_enabled=True,
-            line_search_enabled=True,
-            max_step_retries=8,
-            differentiable_mode=False,
         )
         out = solver.solve(y0, vector_field)
         return out["final_state"]

@@ -72,9 +72,10 @@ def test_load_ntss_reference_profiles_interpolates_scalar_and_species_profiles(t
         f["nD"] = jnp.array([1.0, 2.0, 3.0])
         f["Te"] = jnp.array([100.0, 200.0, 300.0])
         f["TD"] = jnp.array([400.0, 500.0, 600.0])
+        f["Tt"] = jnp.array([700.0, 800.0, 900.0])
         f["Vr"] = jnp.ones(3)
         f["FluxQe"] = jnp.array([7.0, 8.0, 9.0])
-        f["FluxQi"] = jnp.array([4.0, 5.0, 6.0])
+        f["FluxQI"] = jnp.array([4.0, 5.0, 6.0])
 
     monkeypatch.chdir(tmp_path)
     rho = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0])
@@ -86,4 +87,5 @@ def test_load_ntss_reference_profiles_interpolates_scalar_and_species_profiles(t
     assert jnp.allclose(out["density"]["T"], jnp.array([1.0, 1.5, 2.0, 2.5, 3.0]))
     assert jnp.allclose(out["temperature"]["e"], jnp.array([100.0, 150.0, 200.0, 250.0, 300.0]))
     assert jnp.allclose(out["temperature"]["D"], jnp.array([400.0, 450.0, 500.0, 550.0, 600.0]))
+    assert jnp.allclose(out["temperature"]["T"], jnp.array([700.0, 750.0, 800.0, 850.0, 900.0]))
     assert jnp.allclose(out["flux_species"]["Q_total"]["e"], jnp.array([7.0, 7.5, 8.0, 8.5, 9.0]))

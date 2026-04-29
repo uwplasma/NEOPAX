@@ -30,7 +30,7 @@ interpolation_mode = "preprocessed_3d_radial_ntss1d"
 er_ambipolar_method = "two_stage"
 er_ambipolar_scan_min = -50.0
 er_ambipolar_scan_max = 50.0
-er_ambipolar_n_coarse = 80
+er_ambipolar_n_coarse =180
 er_ambipolar_n_refine = 8
 er_ambipolar_max_roots = 3
 er_ambipolar_tol = 1.0e-6
@@ -39,9 +39,9 @@ er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
 er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
-er_ambipolar_reference_er_label = "reference Er"
+er_ambipolar_reference_er_label = "NTSS Er"
 er_ambipolar_plot = true
-er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux"
+er_ambipolar_output_dir = "./docs/benchmark/figures/"
 
 
 
