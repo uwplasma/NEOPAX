@@ -37,7 +37,7 @@
 
 
 ## Overview
-NEOPAX aims to be a flexible JAX transport solver for the radial tranpsort equations in stellarators. It follows the modular philosophy of the tokamak transport solver torax, while specializing in stellarator improtant physics. It is obtain fulfill the roles of power balance steady state solver and predictive transport simulator using different solvers like kvaerno5 from diffrax, a custom implemented radau solver, a theta solver.
+NEOPAX is a flexible JAX-native transport solver for the radial tranpsort equations in stellarators. It follows the modular philosophy of the tokamak transport solver torax, while specializing in stellarator physics. It can fulfill the roles of power balance steady state solver and predictive transport simulator using different solvers like kvaerno5 from diffrax, a custom implemented radau solver or a theta solver.
 
 ## Quick Start
 To install NEOPAX you just need to:

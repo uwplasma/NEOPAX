@@ -84,20 +84,6 @@ def _normalize_solver_config(config: dict) -> dict:
         solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", "diffrax_kvaerno5"))
     )
     solver_cfg["integrator"] = solver_cfg["transport_solver_backend"]
-    rhs_mode = str(solver_cfg.get("rhs_mode", "black_box")).strip().lower()
-    rhs_mode_aliases = {
-        "black_box": "black_box",
-        "black-box": "black_box",
-        "assembled_rhs": "black_box",
-        "transport_response": "transport_response",
-        "response": "transport_response",
-    }
-    if rhs_mode not in rhs_mode_aliases:
-        raise ValueError(
-            f"Unsupported transport solver rhs_mode '{rhs_mode}'. "
-            "Expected one of: black_box, transport_response."
-        )
-    solver_cfg["rhs_mode"] = rhs_mode_aliases[rhs_mode]
     solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
     solver_cfg.setdefault("Er_relax", 1.0)
@@ -696,7 +682,6 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
-        rhs_mode=str(solver_cfg.get("rhs_mode", "black_box")).strip().lower(),
     )
     solver = build_time_solver(solver_cfg)
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
@@ -706,7 +691,6 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         print(
             "[NEOPAX] transport setup complete:",
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
-            f"rhs_mode={solver_cfg.get('rhs_mode', 'black_box')}",
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )
@@ -1179,6 +1163,10 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 reference_er_file=transport_cfg.get("transport_reference_er_file"),
                 overlay_reference_er=bool(transport_cfg.get("transport_overlay_reference_er", False)),
                 reference_profile_file=transport_cfg.get("transport_reference_profile_file"),
+                initial_reference_file=transport_cfg.get("transport_initial_reference_file"),
+                final_reference_file=transport_cfg.get("transport_final_reference_file"),
+                initial_reference_label=transport_cfg.get("transport_initial_reference_label", "Initial ref"),
+                final_reference_label=transport_cfg.get("transport_final_reference_label", "Final ref"),
                 source_models=runtime.models.source,
                 species=runtime.species,
                 flux_model=runtime.models.flux,
@@ -1698,6 +1686,10 @@ def plot_transport_solution(
     reference_er_file=None,
     overlay_reference_er=False,
     reference_profile_file=None,
+    initial_reference_file=None,
+    final_reference_file=None,
+    initial_reference_label="Initial ref",
+    final_reference_label="Final ref",
     source_models=None,
     species=None,
     flux_model=None,
@@ -2005,8 +1997,50 @@ def plot_transport_solution(
             print(f"Could not load NTSS benchmark profiles: {exc}")
             return {}
 
-    reference_dataset_file = reference_profile_file if reference_profile_file is not None else reference_er_file
-    ntss_reference = _load_ntss_reference_profiles(reference_dataset_file)
+    def _reference_specs():
+        specs = []
+        if initial_reference_file is not None:
+            specs.append(
+                {
+                    "path": initial_reference_file,
+                    "label": str(initial_reference_label).strip() or "Initial ref",
+                    "linestyle": "--",
+                    "color": "black",
+                }
+            )
+        if final_reference_file is not None:
+            specs.append(
+                {
+                    "path": final_reference_file,
+                    "label": str(final_reference_label).strip() or "Final ref",
+                    "linestyle": ":",
+                    "color": "black",
+                }
+            )
+        if not specs:
+            reference_dataset_file = reference_profile_file if reference_profile_file is not None else reference_er_file
+            if reference_dataset_file is not None:
+                specs.append(
+                    {
+                        "path": reference_dataset_file,
+                        "label": "NTSS reference",
+                        "linestyle": "--",
+                        "color": "black",
+                    }
+                )
+        return specs
+
+    reference_profile_sets = []
+    for spec in _reference_specs():
+        data = _load_ntss_reference_profiles(spec["path"])
+        if data:
+            reference_profile_sets.append({**spec, "data": data})
+
+    overlay_reference_er = bool(
+        overlay_reference_er
+        or initial_reference_file is not None
+        or final_reference_file is not None
+    )
 
     def _species_label(species_idx):
         if species_idx < len(species_names):
@@ -2045,25 +2079,50 @@ def plot_transport_solution(
             flux_reference_key = "Gamma_neo"
         elif "transport_flux_gamma_turb" in out_name_lower:
             flux_reference_key = "Gamma_turb"
-        if reference_kind is not None and ntss_reference:
-            reference_profiles = ntss_reference.get(reference_kind, {})
-            for species_idx in range(species_count):
-                species_name = _species_label(species_idx)
-                ref_values = reference_profiles.get(species_name)
-                if ref_values is not None:
-                    linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
-                    ax.plot(rho, ref_values, color="black", linestyle=linestyle, linewidth=2.2, alpha=0.9)
-        elif flux_reference_key is not None and ntss_reference:
-            reference_profiles = ntss_reference.get("flux_species", {}).get(flux_reference_key, {})
-            for species_idx in range(species_count):
-                species_name = _species_label(species_idx)
-                ref_values = reference_profiles.get(species_name)
-                if species_name in {"D", "T"} and ref_values is None and flux_reference_key in {"Gamma_neo", "Gamma_turb"}:
-                    scalar_key = f"{flux_reference_key}_ion_sum"
-                    ref_values = ntss_reference.get("scalar", {}).get(scalar_key)
-                if ref_values is not None:
-                    linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
-                    ax.plot(rho, ref_values, color="black", linestyle=linestyle, linewidth=2.2, alpha=0.9)
+        reference_labels_present = []
+        if reference_kind is not None:
+            for ref_spec in reference_profile_sets:
+                reference_profiles = ref_spec["data"].get(reference_kind, {})
+                used = False
+                for species_idx in range(species_count):
+                    species_name = _species_label(species_idx)
+                    ref_values = reference_profiles.get(species_name)
+                    if ref_values is not None:
+                        linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                        ax.plot(
+                            rho,
+                            ref_values,
+                            color=ref_spec["color"],
+                            linestyle=linestyle,
+                            linewidth=2.2,
+                            alpha=0.9,
+                        )
+                        used = True
+                if used:
+                    reference_labels_present.append(ref_spec)
+        elif flux_reference_key is not None:
+            for ref_spec in reference_profile_sets:
+                reference_profiles = ref_spec["data"].get("flux_species", {}).get(flux_reference_key, {})
+                used = False
+                for species_idx in range(species_count):
+                    species_name = _species_label(species_idx)
+                    ref_values = reference_profiles.get(species_name)
+                    if species_name in {"D", "T"} and ref_values is None and flux_reference_key in {"Gamma_neo", "Gamma_turb"}:
+                        scalar_key = f"{flux_reference_key}_ion_sum"
+                        ref_values = ref_spec["data"].get("scalar", {}).get(scalar_key)
+                    if ref_values is not None:
+                        linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                        ax.plot(
+                            rho,
+                            ref_values,
+                            color=ref_spec["color"],
+                            linestyle=linestyle,
+                            linewidth=2.2,
+                            alpha=0.9,
+                        )
+                        used = True
+                if used:
+                    reference_labels_present.append(ref_spec)
 
         time_handles = []
         for time_idx, (time_label, _) in enumerate(series):
@@ -2077,26 +2136,16 @@ def plot_transport_solution(
             species_handles.append(
                 Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
             )
-        has_reference = False
-        if reference_kind is not None:
-            has_reference = any(
-                ntss_reference.get(reference_kind, {}).get(_species_label(species_idx)) is not None
-                for species_idx in range(species_count)
-            )
-        elif flux_reference_key is not None:
-            reference_profiles = ntss_reference.get("flux_species", {}).get(flux_reference_key, {})
-            has_reference = any(
-                reference_profiles.get(_species_label(species_idx)) is not None
-                or (
-                    _species_label(species_idx) in {"D", "T"}
-                    and flux_reference_key in {"Gamma_neo", "Gamma_turb"}
-                    and ntss_reference.get("scalar", {}).get(f"{flux_reference_key}_ion_sum") is not None
-                )
-                for species_idx in range(species_count)
-            )
-        if has_reference:
+        for ref_spec in reference_labels_present:
             species_handles.append(
-                Line2D([0], [0], color="black", linestyle="-", linewidth=2.2, label="NTSS reference")
+                Line2D(
+                    [0],
+                    [0],
+                    color=ref_spec["color"],
+                    linestyle=ref_spec["linestyle"],
+                    linewidth=2.2,
+                    label=ref_spec["label"],
+                )
             )
 
         ax.set_xlabel("rho")
@@ -2129,36 +2178,45 @@ def plot_transport_solution(
                 ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
             reference_kind = "density" if "density" in out_stem.lower() else "temperature" if "temperature" in out_stem.lower() else None
             species_name = _species_label(species_idx)
-            ref_values = None
-            ref_label = "NTSS reference"
-            if reference_kind is not None and ntss_reference:
-                ref_values = ntss_reference.get(reference_kind, {}).get(species_name)
-            elif "transport_flux_q_total" in out_stem.lower():
-                ref_values = ntss_reference.get("flux_species", {}).get("Q_total", {}).get(species_name)
-                if species_name in {"D", "T"} and ref_values is not None:
-                    ref_label = "NTSS ion reference"
-            elif "transport_flux_q_neo" in out_stem.lower():
-                ref_values = ntss_reference.get("flux_species", {}).get("Q_neo", {}).get(species_name)
-                if species_name in {"D", "T"} and ref_values is not None:
-                    ref_label = "NTSS ion reference"
-            elif "transport_flux_q_turb" in out_stem.lower():
-                ref_values = ntss_reference.get("flux_species", {}).get("Q_turb", {}).get(species_name)
-                if species_name in {"D", "T"} and ref_values is not None:
-                    ref_label = "NTSS ion reference"
-            elif "transport_flux_gamma_neo" in out_stem.lower():
-                ref_values = ntss_reference.get("flux_species", {}).get("Gamma_neo", {}).get(species_name)
-                if species_name in {"D", "T"} and ref_values is None:
-                    ref_values = ntss_reference.get("scalar", {}).get("Gamma_neo_ion_sum")
-                if species_name in {"D", "T"} and ref_values is not None:
-                    ref_label = "NTSS ion reference"
-            elif "transport_flux_gamma_turb" in out_stem.lower():
-                ref_values = ntss_reference.get("flux_species", {}).get("Gamma_turb", {}).get(species_name)
-                if species_name in {"D", "T"} and ref_values is None:
-                    ref_values = ntss_reference.get("scalar", {}).get("Gamma_turb_ion_sum")
-                if species_name in {"D", "T"} and ref_values is not None:
-                    ref_label = "NTSS ion reference"
-            if ref_values is not None:
-                ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label=ref_label)
+            for ref_spec in reference_profile_sets:
+                ref_values = None
+                ref_label = ref_spec["label"]
+                ref_data = ref_spec["data"]
+                if reference_kind is not None:
+                    ref_values = ref_data.get(reference_kind, {}).get(species_name)
+                elif "transport_flux_q_total" in out_stem.lower():
+                    ref_values = ref_data.get("flux_species", {}).get("Q_total", {}).get(species_name)
+                    if species_name in {"D", "T"} and ref_values is not None:
+                        ref_label = f"{ref_spec['label']} ion"
+                elif "transport_flux_q_neo" in out_stem.lower():
+                    ref_values = ref_data.get("flux_species", {}).get("Q_neo", {}).get(species_name)
+                    if species_name in {"D", "T"} and ref_values is not None:
+                        ref_label = f"{ref_spec['label']} ion"
+                elif "transport_flux_q_turb" in out_stem.lower():
+                    ref_values = ref_data.get("flux_species", {}).get("Q_turb", {}).get(species_name)
+                    if species_name in {"D", "T"} and ref_values is not None:
+                        ref_label = f"{ref_spec['label']} ion"
+                elif "transport_flux_gamma_neo" in out_stem.lower():
+                    ref_values = ref_data.get("flux_species", {}).get("Gamma_neo", {}).get(species_name)
+                    if species_name in {"D", "T"} and ref_values is None:
+                        ref_values = ref_data.get("scalar", {}).get("Gamma_neo_ion_sum")
+                    if species_name in {"D", "T"} and ref_values is not None:
+                        ref_label = f"{ref_spec['label']} ion"
+                elif "transport_flux_gamma_turb" in out_stem.lower():
+                    ref_values = ref_data.get("flux_species", {}).get("Gamma_turb", {}).get(species_name)
+                    if species_name in {"D", "T"} and ref_values is None:
+                        ref_values = ref_data.get("scalar", {}).get("Gamma_turb_ion_sum")
+                    if species_name in {"D", "T"} and ref_values is not None:
+                        ref_label = f"{ref_spec['label']} ion"
+                if ref_values is not None:
+                    ax.plot(
+                        rho,
+                        ref_values,
+                        color=ref_spec["color"],
+                        linewidth=2.2,
+                        linestyle=ref_spec["linestyle"],
+                        label=ref_label,
+                    )
             ax.set_xlabel("rho")
             ax.set_ylabel(ylabel)
             ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
@@ -2179,9 +2237,17 @@ def plot_transport_solution(
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
             ax.plot(rho, values, linewidth=1.8, label=label)
         if reference_key is not None:
-            ref_values = ntss_reference.get("scalar", {}).get(reference_key)
-            if ref_values is not None:
-                ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="--", label=reference_label)
+            for ref_spec in reference_profile_sets:
+                ref_values = ref_spec["data"].get("scalar", {}).get(reference_key)
+                if ref_values is not None:
+                    ax.plot(
+                        rho,
+                        ref_values,
+                        color=ref_spec["color"],
+                        linewidth=2.2,
+                        linestyle=ref_spec["linestyle"],
+                        label=ref_spec["label"] if reference_label == "NTSS reference" else f"{ref_spec['label']} {reference_label}",
+                    )
         ax.set_xlabel("rho")
         ax.set_ylabel(ylabel)
         if title is not None:
@@ -2203,6 +2269,7 @@ def plot_transport_solution(
         right_label,
         title=None,
         reference_left_key=None,
+        reference_left_flux_species_key=None,
         reference_right_key=None,
         reference_left_values=None,
         reference_right_values=None,
@@ -2216,22 +2283,40 @@ def plot_transport_solution(
         for time_idx, (time_label, values) in enumerate(series_right):
             label = f"{right_label} t={time_label:.3g}" if time_label is not None else right_label
             ax.plot(rho, values, linewidth=1.8, linestyle="--", label=label)
-        if reference_left_values is not None:
-            ref_values = reference_left_values
-        elif reference_left_key is not None:
-            ref_values = ntss_reference.get("scalar", {}).get(reference_left_key)
-        else:
-            ref_values = None
-        if ref_values is not None:
-            ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle="-", label=f"NTSS {left_label}")
-        if reference_right_values is not None:
-            ref_values = reference_right_values
-        elif reference_right_key is not None:
-            ref_values = ntss_reference.get("scalar", {}).get(reference_right_key)
-        else:
-            ref_values = None
-        if ref_values is not None:
-            ax.plot(rho, ref_values, color="black", linewidth=2.2, linestyle=":", label=f"NTSS {right_label}")
+        for ref_spec in reference_profile_sets:
+            if reference_left_values is not None:
+                ref_values = reference_left_values
+            elif reference_left_flux_species_key is not None:
+                ref_values = ref_spec["data"].get("flux_species", {}).get(reference_left_flux_species_key, {}).get(left_label)
+            elif reference_left_key is not None:
+                ref_values = ref_spec["data"].get("scalar", {}).get(reference_left_key)
+            else:
+                ref_values = None
+            if ref_values is not None:
+                ax.plot(
+                    rho,
+                    ref_values,
+                    color=ref_spec["color"],
+                    linewidth=2.2,
+                    linestyle=ref_spec["linestyle"],
+                    label=f"{ref_spec['label']} {left_label}",
+                )
+            if reference_right_values is not None:
+                ref_values = reference_right_values
+            elif reference_right_key is not None:
+                ref_values = ref_spec["data"].get("scalar", {}).get(reference_right_key)
+            else:
+                ref_values = None
+            if ref_values is not None:
+                ax.plot(
+                    rho,
+                    ref_values,
+                    color=ref_spec["color"],
+                    linewidth=2.2,
+                    linestyle=ref_spec["linestyle"],
+                    alpha=0.75,
+                    label=f"{ref_spec['label']} {right_label}",
+                )
         ax.set_xlabel("rho")
         ax.set_ylabel(ylabel)
         if title is not None:
@@ -2530,7 +2615,7 @@ def plot_transport_solution(
         "e",
         "ions",
         title="Neo Q + Gamma*T vs rho",
-        reference_left_values=ntss_reference.get("flux_species", {}).get("Q_neo", {}).get("e"),
+        reference_left_flux_species_key="Q_neo",
         reference_right_key="Q_neo_ion_sum",
     )
 
@@ -2542,7 +2627,7 @@ def plot_transport_solution(
         "e",
         "ions",
         title="Turbulent Q + Gamma*T vs rho",
-        reference_left_values=ntss_reference.get("flux_species", {}).get("Q_turb", {}).get("e"),
+        reference_left_flux_species_key="Q_turb",
         reference_right_key="Q_turb_ion_sum",
     )
 
@@ -2629,22 +2714,30 @@ def plot_transport_solution(
                 import h5py
                 import interpax
 
-                candidate = _resolve_reference_path(
-                    reference_er_file if reference_er_file is not None else reference_profile_file
-                )
-                if candidate is not None:
-                    with h5py.File(candidate, "r") as f:
-                        if "r" in f and "Er" in f:
-                            r_data = f["r"][()]
-                            er_data = f["Er"][()]
-                            if len(er_data) != len(rho):
-                                r_data = jnp.asarray(r_data)
-                                rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
-                                er_ref = interpax.interp1d(rho_ref, er_data, rho)
-                            else:
-                                er_ref = er_data
-                if er_ref is not None:
-                    ax.plot(rho, er_ref, color="black", linewidth=2.2, linestyle="--", label=f"reference Er")
+                er_reference_specs = _reference_specs()
+                for ref_spec in er_reference_specs:
+                    er_ref = None
+                    candidate = _resolve_reference_path(ref_spec["path"])
+                    if candidate is not None:
+                        with h5py.File(candidate, "r") as f:
+                            if "r" in f and "Er" in f:
+                                r_data = f["r"][()]
+                                er_data = f["Er"][()]
+                                if len(er_data) != len(rho):
+                                    r_data = jnp.asarray(r_data)
+                                    rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
+                                    er_ref = interpax.interp1d(rho, rho_ref, er_data)
+                                else:
+                                    er_ref = er_data
+                    if er_ref is not None:
+                        ax.plot(
+                            rho,
+                            er_ref,
+                            color=ref_spec["color"],
+                            linewidth=2.2,
+                            linestyle=ref_spec["linestyle"],
+                            label=ref_spec["label"],
+                        )
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
         ax.set_xlabel("rho")

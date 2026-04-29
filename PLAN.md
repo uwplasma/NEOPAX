@@ -598,146 +598,162 @@ Scope note:
 - do not mix this work into the current Radau optimization track
 - treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
 
-### Phase 10: Shared Transport-Response Decomposition For Theta / Radau
-- Status: in progress
+### Phase 10: Lagged Transport-Response Mode For Radau
+- Status: planned
 - Goal:
-  - add a solver-facing transport decomposition layer, closer in spirit to Trinity3D and partly to TORAX, so both `theta` and `radau` can optionally run on a frozen local transport-response model instead of only on the current black-box assembled RHS
+  - replace repeated expensive within-step transport-kernel reevaluations in `radau` with a frozen local transport-response model per step attempt, while preserving as much Radau fidelity as possible and keeping the default black-box path unchanged
 
-Current state:
-- a new opt-in solver config flag exists:
-  - `rhs_mode = "black_box" | "transport_response"`
-- the default black-box path is still the baseline and remains behaviorally unchanged
-- `ComposedEquationSystem` now exposes:
-  - `build_transport_response(...)`
-  - `response_vector_field(...)`
-- a `TransportResponse` scaffold now captures:
-  - reference state / working state
-  - base assembled RHS
-  - base shared fluxes
-  - density / pressure source components
-  - per-equation component breakdowns from existing `debug_components(...)`
-- `theta_newton` now has a first response-backed path when:
-  - `rhs_mode = "transport_response"`
-- the current response-backed theta mode is still an early prototype:
-  - density transport is frozen from response components
-  - temperature uses frozen `Q_faces` and frozen `Gamma_*_faces`, but rebuilds convective energy fluxes with the current upwind temperature state and recomputes source terms against the current state
-  - `Er` uses frozen ambipolar drive with live diffusion on the current `Er`
-- this is already more structured than a frozen black-box affine RHS, but it is still not yet a true Trinity3D-style derivative-based transport operator
+Why this phase is being reframed:
+- the real end goal is not a generic response abstraction for its own sake
+- the real end goal is:
+  - keep Radau as the outer high-fidelity implicit integrator
+  - reduce the number of expensive transport-kernel evaluations per step
+  - avoid dropping all the way to a crude frozen-flux scheme
+- for expensive kernels, the practical state-of-the-art compromise is:
+  - build a local response model around a reference state
+  - freeze it over one step attempt
+  - solve the Radau stages/Newton iterations against that cheaper response
+  - refresh only when the response is no longer trustworthy
 
-What remains to reach the intended Phase 10 target:
-- replace frozen component reuse with explicit local response objects:
-  - derivative / operator information for `Gamma`, `Q`, and sources
-- move from frozen face fluxes toward coefficient- or derivative-based transport-response assembly
-- keep `radau` on the current black-box path until the response-backed theta path is validated
-- only then evaluate whether a lagged-response Radau mode is worthwhile
+Core design principles:
+- keep the current black-box assembled-RHS mode as the reference implementation
+- keep any new response mode strictly modular and opt-in
+- do not worsen compile time or traced-graph complexity for the default path
+- prefer a compact array-only response object over large mode-specific branching inside the hot Radau kernel
+- use the lowest-dimensional physically meaningful transport-drive space possible:
+  - profile gradients first
+  - local profile values only when necessary
+  - source sensitivities only where they matter
 
-Why this phase was added:
-- current NEOPAX modularity stops at:
-  - `models/equations -> final semidiscrete RHS`
-- this is excellent for generic ODE solvers, but it hides:
-  - base flux vectors
-  - source vectors
-  - local transport response / Jacobian-like structure
-- both the future TORAX-like theta direction and a more transport-aware Radau path would benefit from an intermediate layer that exposes:
-  - local flux decomposition
-  - local source decomposition
-  - local linear response information
-- Trinity3D suggests a more reachable first target than a full TORAX `Block1DCoeffs` abstraction:
-  - compute base fluxes/sources
-  - compute perturbative local response / Jacobian-like operator
-  - assemble a transport linearization used by the solver
+Target mathematical form:
+- for one reference state `y_ref`, construct a local transport response
+- approximate expensive transport pieces as:
+  - `Gamma(y) ~= Gamma0 + J_Gamma * delta k`
+  - `Q(y) ~= Q0 + J_Q * delta k`
+  - `S(y) ~= S0 + J_S * delta y`
+- where `delta k` denotes the dominant transport-drive perturbations, ideally gradient-space perturbations rather than arbitrary full-state perturbations
+- assemble from these into a semidiscrete response operator used by Radau for the whole step attempt
 
-Primary design idea:
-- add a new optional solver mode where, for one step attempt or one outer nonlinear iterate:
-  - base transport flux/source terms are computed at a reference state
-  - a local transport response is built around that state
-  - that local response is frozen for the internal solve
-- use the same decomposition for:
-  - a Trinity/TORAX-like theta solve
-  - a lagged-response Radau solve
+What should be frozen over one Radau step attempt:
+- base particle fluxes
+- base heat fluxes
+- base source vectors
+- local response blocks / derivative information
+- any expensive transport-kernel internal surrogates
 
-Intended mathematical form:
-- locally approximate transport fluxes/sources as:
-  - `Q ~= Q0 + J_Q * delta y`
-  - `Gamma ~= Gamma0 + J_Gamma * delta y`
-- assemble from this a discrete transport response object containing items equivalent in spirit to:
-  - base flux/source vectors
-  - geometry/grid divergence factors
-  - local implicit response matrix / operator
-- keep this frozen over:
-  - one theta nonlinear iterate
-  - or one Radau step attempt, if running in the lagged-response mode
+What should remain live inside that attempt:
+- cheap stage/state algebra
+- divergence assembly from the frozen response representation
+- boundary-condition enforcement
+- state regularization / floors
+- any selected cheap pieces whose live recomputation materially improves fidelity
 
-Primary tasks in this phase:
-- define a NEOPAX transport-response interface sitting between:
-  - current equation/physics evaluation
-  - solver implementation
-- first target a Trinity3D-like decomposition rather than a full TORAX-style coefficient object:
-  - base particle/heat flux vectors
-  - source vectors
-  - local response/Jacobian-like operator
-- make this decomposition available from the active transport state without breaking the current black-box RHS path
-- keep the current assembled-RHS path as a reference/validation mode
-- keep this new mode strictly modular and opt-in:
-  - do not let the transport-response path silently alter the existing `transport` / black-box solver behavior
-  - preserve the current assembled-RHS path as the baseline reference implementation for regression and physics checks
-  - share low-level flux/source decomposition helpers where useful, but avoid contaminating the existing solver path with mode-specific control flow
-  - prefer explicit config selection for any new execution mode rather than implicit fallback or auto-switching
+Adaptive refresh criteria for the frozen response:
+- rebuild after any rejected Radau step
+- rebuild if nonlinear stage/Newton convergence is poor
+  - e.g. residual contraction stalls or stage solve iterations exceed a threshold
+- rebuild if the state drifts too far from the reference state
+  - absolute or relative thresholds in:
+    - temperature
+    - density
+    - `Er`
+    - transport gradients
+- rebuild if transport drives cross a threshold-like regime
+  - e.g. sign change or large jump in key gradients
+- rebuild if multiple-branch / hysteretic behavior is detected or suspected
+- optionally rebuild if an error-estimator-based metric says the frozen response is stale even when the step would otherwise be accepted
 
-Theta-specific tasks:
-- add a transport-response-backed theta mode in addition to the current generic-RHS theta implementation
-- let the solver:
-  - build one frozen local transport response per nonlinear iterate
-  - solve the resulting theta linearized system
-- use this as the path intended to move closer to Trinity3D/TORAX behavior
+Recommended response hierarchy:
+1. base flux/source capture
+2. frozen structured component reuse
+3. explicit local derivative blocks in transport-drive space
+4. optional database/surrogate-assisted response blocks for very expensive kernels
 
-Radau-specific tasks:
-- add an optional lagged-response Radau mode
-- in this mode:
-  - one local transport response is built per step attempt
-  - that response is frozen across all internal Radau stages and Newton iterations of that attempt
-- note carefully:
-  - the current custom Radau already freezes the black-box RHS Jacobian over a step attempt
-  - the new mode would go further by freezing the underlying transport-response model itself, not only `df/dy`
+Planned implementation stages:
 
-Expected benefits:
-- create one shared decomposition usable by multiple solvers
-- reduce expensive within-step transport-model reevaluations for:
-  - theta
-  - and especially Radau in future expensive-flux settings
-- make NEOPAX much better prepared for:
-  - perturbative/GK-style flux models
-  - Trinity3D-like response construction
-  - fuller TORAX-like coefficient abstractions later if desired
+Stage 10A: Response Scaffold
+- add an opt-in solver-facing response abstraction without altering the default black-box transport path
+- keep the response-build layer isolated from the hot traced default path so existing compile/runtime behavior stays unchanged unless the new mode is explicitly selected
+- define the minimal response contents needed for one frozen step attempt:
+  - base transport fluxes
+  - base source components
+  - reference state metadata
+- this stage should remain scaffolding only and should not yet change solver mathematics
 
-Expected tradeoffs / risks:
-- this is an approximation layer:
-  - the true nonlinear flux response may vary across Radau stages within a step
-- therefore a frozen-response Radau mode may sacrifice some of the full nonlinear collocation fidelity of the current black-box RHS Radau path
-- likely outcome:
-  - still better transient fidelity than theta
-  - cheaper than fully refreshed stage-by-stage nonlinear flux updates
-  - but not identical to the current fully nonlinear residual evaluation path
+Stage 10B: Theta Proving Ground
+- use `theta_newton` as the lower-risk proving path for the response abstraction
+- validate:
+  - response object shape
+  - frozen/live split of transport terms
+  - compile-time isolation from the default path
+- this stage is for proving the machinery, not the final destination
 
-Validation plan for this phase:
-- compare, for both theta and Radau:
-  - current black-box RHS mode
-  - new frozen transport-response mode
-- track:
+Stage 10C: Explicit Transport-Response Blocks
+- move beyond freezing whole assembled RHS pieces
+- expose more explicit local response pieces:
+  - frozen `Q_faces`, `Gamma_faces`, source objects
+  - then derivative blocks such as:
+    - `dGamma/dk`
+    - `dQ/dk`
+    - selected `dS/dy`
+- reduce reliance on autodiff of the whole response map
+- favor physically meaningful low-dimensional response coordinates
+
+Stage 10D: Lagged-Response Radau
+- add an optional Radau mode using one frozen local response per step attempt
+- keep that response fixed across:
+  - all internal Radau stages
+  - all Newton iterations of that attempt
+- do not rebuild inside a successful attempt unless an explicit refresh trigger fires
+- compare against the current black-box Radau path for:
+  - accepted-step count
+  - stage/Newton iteration count
+  - expensive transport-kernel call count
+  - transient and final-state agreement
+
+Stage 10E: Adaptive Response Refresh Policy
+- implement explicit refresh thresholds and diagnostics
+- make them configurable, for example:
+  - `response_refresh_on_reject = true`
+  - `response_refresh_max_delta_state = ...`
+  - `response_refresh_max_delta_grad = ...`
+  - `response_refresh_max_nonlinear_iters = ...`
+  - `response_refresh_on_branch_indicator = true`
+- track how often response rebuilds occur and whether they correlate with:
+  - rejected steps
+  - poor stage convergence
+  - branch transitions
+
+Stage 10F: Expensive-Kernel Readiness
+- prepare the response infrastructure for kernels such as:
+  - perturbative / quasi-linear turbulent models
+  - external neoclassical kernels
+  - future GK-informed response models
+- prefer targeted directional derivatives or surrogate/database derivatives over dense black-box Jacobians
+- keep the response object JAX-friendly and compact
+
+Validation plan:
+- always compare:
+  - the current black-box path
+  - the future response-backed path
+- benchmark:
   - compile time
   - total solve time
-  - step count / accepted steps
-  - physics agreement in transient and final state
-- pay special attention to cases with:
-  - hysteresis / multiple branches
-  - strongly state-dependent sources
+  - expensive transport-kernel evaluations per accepted step
+  - accepted/rejected step statistics
+  - nonlinear/stage iteration counts
+  - transient and final profile agreement
+- use difficult cases, especially:
   - threshold-like transport behavior
+  - strongly state-dependent sources
+  - branch/hysteresis-sensitive `Er` evolution
 
 Implementation ordering recommendation:
-1. define the shared transport-response decomposition API
-2. implement the decomposition in a Trinity3D-like direct response form first
-3. wire it into theta before Radau
-4. only then add the lagged-response Radau mode and benchmark whether it preserves enough of Radau's transient advantages to justify its complexity
+1. start with a minimal response scaffold and use theta as the proving ground
+2. move next to explicit local response blocks in transport-drive space
+3. only then add the lagged-response Radau mode
+4. implement adaptive refresh criteria alongside the first Radau response mode, not as an afterthought
+5. keep the black-box Radau path intact as the reference baseline throughout
 
 ### Phase 10B: Optional Full Black-Box RHS Linearization
 - Status: future option

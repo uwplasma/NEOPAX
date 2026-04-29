@@ -997,6 +997,10 @@ def _diagnostics_csv_path(run_spec: dict[str, Any]) -> Path:
     return Path(f"{run_spec['output_prefix']}.diagnostics.csv")
 
 
+def _summary_json_path(run_spec: dict[str, Any]) -> Path:
+    return Path(f"{run_spec['output_prefix']}.summary.json")
+
+
 def _has_completed_output(run_spec: dict[str, Any]) -> bool:
     diag_csv = _diagnostics_csv_path(run_spec)
     if not diag_csv.exists():
@@ -1069,12 +1073,25 @@ def cmd_run_one(args: argparse.Namespace) -> int:
             print(proc.stderr.rstrip(), file=sys.stderr)
         return int(proc.returncode)
     diag_csv = _diagnostics_csv_path(run_spec)
+    summary_json = _summary_json_path(run_spec)
+    if not diag_csv.exists():
+        message = (
+            "SPECTRAX worker exited successfully but did not write the expected "
+            f"diagnostics file: {diag_csv}"
+        )
+        if summary_json.exists():
+            message += f" (summary exists: {summary_json})"
+        if not bool(getattr(args, "verbose_worker", False)) and proc.stdout:
+            print(proc.stdout.rstrip())
+        if not bool(getattr(args, "verbose_worker", False)) and proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        print(message, file=sys.stderr)
+        return 2
     heat_last = float("nan")
     pflux_last = float("nan")
-    if diag_csv.exists():
-        row = _read_last_row_csv(diag_csv)
-        heat_last = row.get("heat_flux", math.nan)
-        pflux_last = row.get("particle_flux", math.nan)
+    row = _read_last_row_csv(diag_csv)
+    heat_last = row.get("heat_flux", math.nan)
+    pflux_last = row.get("particle_flux", math.nan)
     print(
         json.dumps(
             {
