@@ -1,13 +1,17 @@
 from pathlib import Path
+import types
 
 import h5py
 import jax.numpy as jnp
 
 from NEOPAX.main import (
+    _load_user_extensions,
     _load_ntss_reference_profiles,
     _normalize_solver_config,
     _resolve_reference_path,
 )
+from NEOPAX._source_models import get_source_model
+from NEOPAX._transport_flux_models import get_transport_flux_model
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():
@@ -89,3 +93,104 @@ def test_load_ntss_reference_profiles_interpolates_scalar_and_species_profiles(t
     assert jnp.allclose(out["temperature"]["D"], jnp.array([400.0, 450.0, 500.0, 550.0, 600.0]))
     assert jnp.allclose(out["temperature"]["T"], jnp.array([700.0, 750.0, 800.0, 850.0, 900.0]))
     assert jnp.allclose(out["flux_species"]["Q_total"]["e"], jnp.array([7.0, 7.5, 8.0, 8.5, 9.0]))
+
+
+def test_load_user_extensions_imports_python_modules(monkeypatch):
+    imported = []
+
+    def fake_import_module(name):
+        imported.append(name)
+        return types.SimpleNamespace(__name__=name)
+
+    monkeypatch.setattr("NEOPAX.main.importlib.import_module", fake_import_module)
+    _load_user_extensions({"extensions": {"python_modules": ["pkg.a", "pkg.b"]}})
+    assert imported == ["pkg.a", "pkg.b"]
+
+
+def test_load_user_extensions_imports_python_files_relative_to_config_dir(tmp_path):
+    mod_path = tmp_path / "user_models.py"
+    mod_path.write_text("MARKER = 1\n", encoding="utf-8")
+    _load_user_extensions(
+        {
+            "_config_dir": str(tmp_path),
+            "extensions": {"python_files": ["user_models.py"]},
+        }
+    )
+
+
+def test_load_user_extensions_registers_custom_models_from_python_file(tmp_path):
+    mod_path = tmp_path / "user_models.py"
+    mod_path.write_text(
+        "\n".join(
+            [
+                "import dataclasses",
+                "import jax.numpy as jnp",
+                "import NEOPAX",
+                "",
+                "@dataclasses.dataclass(frozen=True, eq=False)",
+                "class FileFluxModel:",
+                "    def __call__(self, state, geometry=None, params=None):",
+                "        del geometry, params",
+                "        base = jnp.ones_like(state.density)",
+                "        return {'Gamma': base, 'Q': 2.0 * base, 'Upar': jnp.zeros_like(base)}",
+                "",
+                "@dataclasses.dataclass(frozen=True, eq=False)",
+                "class FileSourceModel:",
+                "    def __call__(self, state):",
+                "        return {'pressure_source': jnp.ones_like(state.pressure)}",
+                "",
+                "NEOPAX.register_transport_flux_model('file_registered_flux', FileFluxModel)",
+                "NEOPAX.register_source_model('file_registered_source', FileSourceModel)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _load_user_extensions(
+        {
+            "_config_dir": str(tmp_path),
+            "extensions": {"python_files": ["user_models.py"]},
+        }
+    )
+
+    flux_builder = get_transport_flux_model("file_registered_flux")
+    source_builder = get_source_model("file_registered_source")
+    assert flux_builder is not None
+    assert source_builder is not None
+
+
+def test_load_user_extensions_registers_custom_models_from_python_module(tmp_path, monkeypatch):
+    pkg_dir = tmp_path / "userpkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import dataclasses",
+                "import jax.numpy as jnp",
+                "import NEOPAX",
+                "",
+                "@dataclasses.dataclass(frozen=True, eq=False)",
+                "class ModuleFluxModel:",
+                "    def __call__(self, state, geometry=None, params=None):",
+                "        del geometry, params",
+                "        base = jnp.ones_like(state.density)",
+                "        return {'Gamma': base, 'Q': 3.0 * base, 'Upar': jnp.zeros_like(base)}",
+                "",
+                "@dataclasses.dataclass(frozen=True, eq=False)",
+                "class ModuleSourceModel:",
+                "    def __call__(self, state):",
+                "        return {'pressure_source': 2.0 * jnp.ones_like(state.pressure)}",
+                "",
+                "NEOPAX.register_transport_flux_model('module_registered_flux', ModuleFluxModel)",
+                "NEOPAX.register_source_model('module_registered_source', ModuleSourceModel)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    _load_user_extensions({"extensions": {"python_modules": ["userpkg"]}})
+
+    flux_builder = get_transport_flux_model("module_registered_flux")
+    source_builder = get_source_model("module_registered_source")
+    assert flux_builder is not None
+    assert source_builder is not None

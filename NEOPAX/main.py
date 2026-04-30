@@ -6,6 +6,8 @@ transport, and direct flux evaluation.
 from __future__ import annotations
 
 import dataclasses
+import importlib
+import importlib.util
 import sys
 import time
 from pathlib import Path
@@ -73,6 +75,48 @@ class RuntimeContext:
 def load_config(path):
     text = Path(path).read_text(encoding="utf-8")
     return toml.loads(text)
+
+
+def _as_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    value = str(value).strip()
+    return [value] if value else []
+
+
+def _load_python_extension_file(path: Path) -> None:
+    resolved = path.resolve()
+    module_name = f"neopax_user_extension_{abs(hash(str(resolved)))}"
+    if module_name in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(module_name, resolved)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create import spec for extension file '{resolved}'.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+
+def _load_user_extensions(config: dict) -> None:
+    if not isinstance(config, dict):
+        return
+    ext_cfg = config.get("extensions", {})
+    if not isinstance(ext_cfg, dict):
+        return
+
+    config_dir = config.get("_config_dir")
+    config_dir = Path(config_dir) if config_dir is not None else None
+
+    for module_name in _as_string_list(ext_cfg.get("python_modules")):
+        importlib.import_module(module_name)
+
+    for file_name in _as_string_list(ext_cfg.get("python_files")):
+        file_path = Path(file_name)
+        if not file_path.is_absolute() and config_dir is not None:
+            file_path = config_dir / file_path
+        _load_python_extension_file(file_path)
 
 
 def _normalize_solver_config(config: dict) -> dict:
@@ -2988,6 +3032,7 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
 
 
 def run_config(config: dict):
+    _load_user_extensions(config)
     runtime, state = build_runtime_context(config)
     general = config.get("general", {})
     mode = general.get("mode", config.get("mode", "transport")).lower()
@@ -3061,6 +3106,9 @@ def run_config(config: dict):
 
 def run_config_path(config_path):
     config = load_config(config_path)
+    if isinstance(config, dict):
+        config = dict(config)
+        config["_config_dir"] = str(Path(config_path).resolve().parent)
     return run_config(config)
 
 

@@ -17,16 +17,42 @@ import jax
 import jax.numpy as jnp
 from typing import Any, Callable
 from ._sources import fusion_power_fraction_electrons, dt_reaction, power_exchange, bremsstrahlung_radiation
+from ._model_api import (
+    ModelValidationContext,
+    source_model as source_model_decorator,
+    validate_source_model_builder,
+)
 
 # Registry for modular selection
 SOURCE_MODEL_REGISTRY: dict[str, Callable[..., "SourceModelBase"]] = {}
+SOURCE_MODEL_VALIDATION: dict[str, bool] = {}
 _DEFAULTS_REGISTERED = False
 
-def register_source_model(name: str, builder: Callable[..., "SourceModelBase"]) -> None:
-    SOURCE_MODEL_REGISTRY[str(name).strip().lower()] = builder
+def register_source_model(
+    name: str,
+    builder: Callable[..., "SourceModelBase"],
+    *,
+    validate: bool = False,
+    validation_context: ModelValidationContext | None = None,
+) -> None:
+    key = str(name).strip().lower()
+    if validate:
+        if validation_context is None:
+            raise ValueError("validation_context is required when validate=True for a source model.")
+        validate_source_model_builder(
+            builder,
+            validation_context,
+            name=f"source model '{name}'",
+        )
+    SOURCE_MODEL_REGISTRY[key] = builder
+    SOURCE_MODEL_VALIDATION[key] = validate
 
 def register_source(name: str, builder: Callable[..., "SourceModelBase"]) -> None:
     register_source_model(name, builder)
+
+
+def source_model(name: str, **register_kwargs):
+    return source_model_decorator(name, register_source_model, **register_kwargs)
 
 def _ensure_default_source_models_registered() -> None:
     global _DEFAULTS_REGISTERED

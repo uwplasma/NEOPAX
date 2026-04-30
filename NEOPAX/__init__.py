@@ -20,7 +20,8 @@ from ._species import Species
 
 # Current transport/state API.
 from ._boundary_conditions import BoundaryConditionModel, DirichletBC, NeumannBC, RobinBC
-from ._source_models import build_source_models_from_config, get_source_model
+from ._model_api import ModelCapabilities, ModelValidationContext, make_validation_context
+from ._source_models import build_source_models_from_config, get_source_model, register_source_model, source_model
 from ._state import TransportState
 from ._turbulence import get_Turbulent_Fluxes_Analytical, get_Turbulent_Fluxes_PowerOverN
 from ._transport_equations import (
@@ -37,7 +38,10 @@ from ._transport_flux_models import (
     ZeroTransportModel,
     build_fluxes_r_file_transport_model,
     build_transport_flux_model,
+    get_transport_flux_model_capabilities,
     get_transport_flux_model,
+    register_transport_flux_model,
+    transport_flux_model,
 )
 from ._transport_solvers import (
     DiffraxSolver,
@@ -79,6 +83,9 @@ __all__ = [
     "ElectricFieldEquation",
     "FluxesRFileTransportModel",
     "Monoenergetic",
+    "ModelCapabilities",
+    "ModelValidationContext",
+    "make_validation_context",
     "NeumannBC",
     "NewtonThetaMethodSolver",
     "RADAUSolver",
@@ -103,9 +110,14 @@ __all__ = [
     "get_Turbulent_Fluxes_Analytical",
     "get_Turbulent_Fluxes_PowerOverN",
     "get_transport_flux_model",
+    "get_transport_flux_model_capabilities",
     "load_config",
     "prepare_config",
+    "register_transport_flux_model",
+    "register_source_model",
     "run",
     "run_config",
     "run_config_path",
+    "source_model",
+    "transport_flux_model",
 ]

@@ -33,7 +33,9 @@
   - Robin/`DECAYLEN` uses the current boundary state with `du/dr = +/- u/L`
 - Keep the existing equation objects (`DensityEquation`, `TemperatureEquation`, `ErEquation`, `ComposedEquationSystem`) as the physics reference implementation.
 
-### Phase 3: Specialize The Composed Vector Field For Active Equation Sets
+## Track A: Core Solver Performance And Structure
+
+### A1: Specialize The Composed Vector Field For Active Equation Sets
 - Status: partially completed
 - Add an optimized execution adapter for common active equation combinations, starting with:
   - `temperature + Er`
@@ -58,7 +60,7 @@ Still open in this phase:
 - a truly dedicated `temperature + Er` execution path, rather than only a lighter generic composed path
 - optionally later, a dedicated `density + temperature + Er` execution path
 
-### Phase 4: Preserve Modularity And Avoid Logic Duplication
+### A2: Preserve Modularity And Avoid Logic Duplication
 - Status: ongoing
 - Centralize shared solver-state transforms in `_transport_solvers.py`.
 - Keep projection and packing logic in shared helpers rather than per-backend custom code.
@@ -72,7 +74,7 @@ Current assessment:
 - equation objects remain the physics source of truth
 - future dedicated execution paths should still be written as thin adapters, not duplicate physics implementations
 
-### Phase 5: Benchmark And Validate
+### A3: Benchmark And Validate
 - Status: active
 - Benchmark first on:
   - `examples/Solve_Er_General/transport_pressure_Er_debug_kvaerno5_temp_Er.toml`
@@ -109,7 +111,7 @@ Interpretation:
   - shared flux-model / RHS cost
   - compile cost inside `jit_diffeqsolve`
 
-### Phase 6: Optional Follow-Up Improvements
+### A4: Optional Follow-Up Improvements
 - Status: not started
 - Enable and document persistent JAX compilation cache for repeated local runs.
 - Add lightweight timing instrumentation around:
@@ -121,7 +123,7 @@ Interpretation:
   - reduced rejected steps
   after the structural compile/runtime overhead has been lowered.
 
-### Phase 6B: NTSS Consistency Alignment
+### A5: NTSS Consistency Alignment
 - Status: not started
 - Goal:
   - tighten agreement between NEOPAX and NTSS on the specific implementation details already identified as likely sources of physics mismatch, without breaking the current modular/JAX-friendly architecture
@@ -165,7 +167,9 @@ Known issue / parity note:
   - next diagnostic target:
     - compare transport-mode `best_roots`, `er_init`, and plotted `t=0` `Er` directly against the explicit ambipolarity-mode `best_roots` for the same effective runtime settings
 
-### Phase 7: Radau Modernization Track
+## Track B: Radau Modernization
+
+### B1: Radau Modernization Track
 - Status: in progress
 - Keep this as a Radau-specific branch of the solver plan, distinct from the main Kvaerno efficiency work.
 - Use the classic Hairer/NTSS Radau implementation and the newer Julia `AdaptiveRadau` / `OrdinaryDiffEqFIRK` implementation as design references.
@@ -548,7 +552,7 @@ Still open in this phase:
     - then decide whether to start the Diffrax-like structural Radau refactor
     - `296` total steps (`239` accepted / `57` rejected)
 
-### Next Recommended Steps
+### B1 Next Recommended Steps
 1. Investigate shared flux-model / RHS cost, especially the neoclassical face/state evaluation path.
 2. Add or document persistent JAX compilation cache for repeated local benchmarking.
 3. If solver-wrapper work continues, implement a truly dedicated `temperature + Er` vector field path instead of only optimizing the generic composed system.
@@ -557,7 +561,7 @@ Still open in this phase:
 6. For custom Radau specifically, prioritize transformed-stage linear algebra and improved Newton/rejection logic before broader feature work.
 7. For custom Radau, continue benchmarking the lean `temperature + Er` case after each modernization step before moving back to the fuller coupled case.
 
-### Immediate Execution Order
+### B1 Immediate Execution Order
 1. Profile or simplify the shared flux-model evaluation path.
 2. Enable persistent JAX compilation cache for repeated benchmark runs.
 3. If needed, add a truly dedicated `temperature + Er` execution path.
@@ -568,7 +572,9 @@ Still open in this phase:
    - rerun `examples/Solve_Er_General/transport_pressure_Er_debug_radau_temp_Er.toml`
    - compare against the current transformed-direct baseline (`~574 s`, compile `~3m59s`, `1039` steps)
 
-### Phase 9: Ambipolarity / Interpolation Compile Cleanup
+## Track C: Ambipolarity And Interpolation Infrastructure
+
+### C1: Ambipolarity / Interpolation Compile Cleanup
 - Status: noted for later
 - Goal:
   - reduce compile-time noise and overhead in the ambipolar initialization / radial root-finding path, separate from the current Radau solver work
@@ -598,7 +604,7 @@ Scope note:
 - do not mix this work into the current Radau optimization track
 - treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
 
-### Phase 9B: Unified Database / Interpolator Facades
+### C2: Unified Database / Interpolator Facades
 - Status: planned
 - Goal:
   - replace the current parallel spread of database/interpolator entry points with one clear public database façade and one clear public interpolator façade, while preserving the existing physics modes and keeping internal implementations modular
@@ -642,7 +648,9 @@ Scope notes:
 - preserve existing database and interpolation capabilities during the refactor
 - prefer compatibility shims first, then retire older direct imports only after call sites are migrated
 
-### Phase 10: Lagged Transport-Response Mode For Radau
+## Track D: Expensive-Kernel Transport Response
+
+### D1: Lagged Transport-Response Mode For Radau
 - Status: planned
 - Goal:
   - replace repeated expensive within-step transport-kernel reevaluations in `radau` with a frozen local transport-response model per step attempt, while preserving as much Radau fidelity as possible and keeping the default black-box path unchanged
@@ -799,7 +807,7 @@ Implementation ordering recommendation:
 4. implement adaptive refresh criteria alongside the first Radau response mode, not as an afterthought
 5. keep the black-box Radau path intact as the reference baseline throughout
 
-### Phase 10B: Optional Full Black-Box RHS Linearization
+### D2: Optional Full Black-Box RHS Linearization
 - Status: future option
 - Goal:
   - keep open the possibility of a solver mode based on linearizing the fully assembled semidiscrete RHS directly, rather than first decomposing transport into flux/source response pieces
@@ -828,7 +836,9 @@ Expected tradeoff:
 - simpler conceptual interface from the solver perspective (`f(y)` plus `df/dy`)
 - but usually less interpretable and less transport-physics-aware than a structured flux/source response model
 
-### Phase 11: Autodiff Sensitivity Analysis On Profile Characteristics
+## Track E: Autodiff And Sensitivity Analysis
+
+### E1: Autodiff Sensitivity Analysis On Profile Characteristics
 - Status: planned
 - Goal:
   - add a dedicated sensitivity-analysis workflow in NEOPAX using automatic differentiation, with the first focus on temperature and density profile characteristics rather than only raw state-vector entries
@@ -888,8 +898,8 @@ Scope notes:
 - keep this phase modular so it can later inform both solver development and external-kernel response design
 - do not let this become an excuse to thread giant full-Jacobian machinery through the default transport path
 
-### Phase 11A: JAX-Friendly User Model Extension API
-- Status: planned
+### E2: JAX-Friendly User Model Extension API
+- Status: implemented, with follow-up polish planned
 - Goal:
   - add a clean Python extension interface so users can register custom flux models and source models with minimal boilerplate, while automatically validating that those models follow NEOPAX shape, purity, and JAX-compatibility expectations
 
@@ -910,6 +920,43 @@ Design direction:
   - class-based model registration
   - simple function-based registration where appropriate
 - make validation explicit and reusable rather than burying it in runtime failures
+
+Current implementation checkpoint:
+- added a shared `_model_api.py` layer with:
+  - `ModelCapabilities`
+  - `ModelValidationContext`
+  - `make_validation_context(...)`
+  - transport/source output validators
+  - lightweight `jax.eval_shape(...)` smoke tests
+- added decorator-style helpers so user models can be registered with less
+  boilerplate
+- extended validation so capability claims can be smoke-tested for:
+  - `jax.jit(...)`
+  - autodiff
+  - `vmap`
+  - local evaluator support
+  - face-flux support
+- extended transport-model registration so user models can be registered with:
+  - optional capability metadata
+  - optional validation at registration time
+- extended source-model registration with optional validation at registration time
+- added public-facing helpers/export paths so users can work from Python without modifying internal registries manually
+- added TOML-driven extension loading through:
+  - ``[extensions].python_modules``
+  - ``[extensions].python_files``
+  so config-driven runs can import user model definitions before model resolution
+- added example files for one custom flux model and one custom source model
+- added dedicated user documentation for:
+  - registration
+  - validation helpers
+  - TOML-driven extension loading
+- added tests covering:
+  - successful validated registration
+  - malformed transport-model outputs
+  - malformed source-model outputs
+  - capability validation paths
+  - end-to-end registration through temporary Python files/modules loaded from
+    the TOML extension hook
 
 Core API pieces to introduce:
 - a small shared model API module, for example:
@@ -938,22 +985,16 @@ Validation checks to support:
 - finite-output checks on a small canonical toy state
 
 Primary tasks for this phase:
-- write down the explicit transport flux model contract:
-  - required inputs
-  - required outputs
-  - optional auxiliary evaluators
-- write down the explicit source model contract:
-  - required call signature
-  - expected output mapping structure
-  - allowed state/species dependencies
-- implement shared validator utilities so both registries use the same checks
-- refactor existing built-in flux/source registries to pass through the shared validation layer
-- add user-facing examples for one custom flux model and one custom source model
-- add CI tests covering:
-  - successful registration
-  - shape/key mismatch failures
-  - non-JAX output failures
-  - optional JIT/autodiff validation modes
+- dogfood the public registration path on more built-in models where that
+  improves consistency without adding runtime complexity
+- decide whether capability metadata should become more visible in the user
+  docs/API reference
+- consider adding optional stricter validation modes or result reporting for:
+  - `jit_safe`
+  - `autodiff_safe`
+  - `vmap_safe`
+- keep refining the user ergonomics around validated registration without
+  making the production hot path heavier
 
 Scope notes:
 - keep this phase focused on extension ergonomics and validation, not on changing the underlying transport physics
@@ -964,8 +1005,10 @@ Scope notes:
 - do not force every model to support autodiff; make capabilities explicit instead
 - keep the default hot path lean by avoiding heavy validation in production execution unless requested
 
-### Phase 11B: CLI And Direct-API Split
-- Status: in progress
+## Track F: Interfaces And Documentation
+
+### F1: CLI And Direct-API Split
+- Status: implemented, with follow-up polish planned
 - Goal:
   - provide a practical command-line interface for common NEOPAX workflows while preserving a clean direct Python API path for autodiff-oriented and programmatic use
 
@@ -990,8 +1033,18 @@ Design direction:
 
 Current implementation checkpoint:
 - added a dedicated `NEOPAX/cli.py`
+- added console-script entry points:
+  - `NEOPAX`
+  - `neopax`
 - added `run_config(config)` and `run_config_path(path)` in `main.py`
 - `python -m NEOPAX ...` now routes through the CLI layer instead of directly hard-coding `<config.toml>` handling in `__main__.py`
+- added direct convenience API entry points:
+  - `NEOPAX.prepare_config(...)`
+  - `NEOPAX.run(...)`
+- added a structured `RunResult` object for direct API execution
+- added an ``[extensions]`` TOML import hook so TOML-driven runs can load
+  Python modules/files that register custom flux and source models before model
+  resolution
 - first CLI overrides now cover:
   - `mode`
   - `vmec_file`
@@ -1004,27 +1057,27 @@ Current implementation checkpoint:
   - output directory
   - generic dotted overrides through repeated `--set section.key=value`
 
-Primary tasks for this phase:
+Primary follow-up tasks for this phase:
 - keep extending the CLI only for high-value common overrides rather than mirroring every TOML field immediately
-- document the distinction between:
-  - CLI workflow
-  - direct Python API workflow
-- add usage examples for:
-  - plain TOML execution
-  - TOML plus a few CLI overrides
-  - in-memory `run_config({...})` programmatic execution
+- document mode-specific `RunResult` fields more explicitly so users know what to expect from:
+  - transport runs
+  - ambipolarity runs
+  - fluxes runs
+  - sources runs
 - decide whether later subcommands are worthwhile, for example:
   - `neopax run ...`
   - `neopax fluxes ...`
   - `neopax ambipolarity ...`
+- decide whether to expose a small number of additional high-frequency CLI overrides beyond the current set
+- keep the direct API stable enough that it can remain the preferred path for notebook, scan, and autodiff-oriented workflows
 
 Scope notes:
 - keep the direct Python API as the preferred path for autodiff-sensitive workflows
 - keep CLI overrides as a thin config-layer transformation, not a second physics orchestration path
 - prefer explicit override mapping over hidden side effects
 
-### Phase 11C: Documentation Consolidation For Usage And Inputs
-- Status: in progress
+### F2: Documentation Consolidation For Usage And Inputs
+- Status: active, with core user-facing documentation implemented
 - Goal:
   - turn the recent CLI/API and workflow refactors into a cleaner user-facing documentation set that explains how NEOPAX is used in practice
 
@@ -1056,7 +1109,22 @@ Current documentation checkpoint:
   - ambipolarity
   - fluxes
   - sources
+- added a custom-models page covering:
+  - custom flux model registration
+  - custom source model registration
+  - validation helpers
+  - TOML-driven extension loading through ``[extensions]``
 - wired these pages into the Sphinx docs index and getting-started page
+- updated the README to point more clearly to:
+  - CLI usage
+  - `python -m NEOPAX`
+  - direct `NEOPAX.run(...)` usage
+  - the fuller documentation pages
+- added clearer README/getting-started/worked-examples links so users can move
+  naturally from:
+  - basic run methods
+  - built-in examples
+  - custom model extension workflows
 
 Primary next tasks for this phase:
 - add a dedicated solver-backends page describing:
@@ -1068,7 +1136,6 @@ Primary next tasks for this phase:
   - flux model families
   - source model families
   - where file-driven versus database-driven models fit
-- improve the README so it acts as a lighter landing page and points clearly to the fuller docs pages
 - add mode-specific result-object documentation for the direct API:
   - transport outputs
   - ambipolarity outputs
@@ -1084,7 +1151,9 @@ Scope notes:
 - prefer practical “how to use NEOPAX today” guidance over exhaustive theory-first documentation
 - keep the CLI and direct API documented side-by-side so the project does not drift into a CLI-only presentation
 
-### Theta Solver Upgrade Notes
+## Track G: Theta Solver Upgrades
+
+### G1: Theta Solver Upgrade Notes
 - Status: planned
 - Scope:
   - capture near-term robustness and adaptive-timestep improvements for the current `theta_newton` path, distinct from the larger shared transport-response refactor above
@@ -1171,7 +1240,9 @@ Recommended near-term execution order:
 5. add an optional transport-informed `dt` cap / calculator
 6. expand theta diagnostics after the controller shape stabilizes
 
-### Phase 11: Neoclassical Interpolation Parity Against NTSS
+## Track H: Neoclassical Interpolation Parity Against NTSS
+
+### H1: Neoclassical Interpolation Parity Against NTSS
 - Status: in progress
 - Goal:
   - isolate and reduce the ambipolar root mismatch between NEOPAX and NTSS by comparing and evolving the monoenergetic interpolation model without destabilizing the current generic runtime path
@@ -1281,7 +1352,7 @@ Primary remaining tasks in this phase:
   - `n_roots_all[-5:]`
   - and grouped branch-selection behavior near the edge
 
-### Phase 11B: Optimize The NTSS 1D Kernel
+### H2: Optimize The NTSS 1D Kernel
 - Status: planned
 - Goal:
   - reduce compile/runtime cost of the NTSS-like `Er`-axis interpolation while preserving the root behavior that appears to come specifically from the NTSS 1D interpolation kernel

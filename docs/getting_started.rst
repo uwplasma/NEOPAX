@@ -71,3 +71,8 @@ For configuration details and example-driven walkthroughs, see also:
 
 - :doc:`input_file_reference`
 - :doc:`worked_examples`
+- :doc:`custom_models`
+
+If you want to add your own transport flux or source models, NEOPAX also
+supports Python-side registration and TOML-driven extension loading through an
+``[extensions]`` section. See :doc:`custom_models`.

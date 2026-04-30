@@ -36,6 +36,12 @@ from ._state import (
     safe_temperature,
 )
 from ._source_models import assemble_pressure_source_components, sum_source_components
+from ._model_api import (
+    ModelCapabilities,
+    ModelValidationContext,
+    transport_model as transport_model_decorator,
+    validate_transport_flux_builder,
+)
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
@@ -119,15 +125,45 @@ def compute_total_power_breakdown_mw(state, pressure_source_model, geometry):
 
 # Registry for modular selection
 TRANSPORT_FLUX_MODEL_REGISTRY: dict[str, Callable[[], "TransportFluxModelBase"]] = {}
+TRANSPORT_FLUX_MODEL_CAPABILITIES: dict[str, ModelCapabilities] = {}
 
-def register_transport_flux_model(name: str, builder: Callable[..., "TransportFluxModelBase"]) -> None:
-    TRANSPORT_FLUX_MODEL_REGISTRY[str(name).strip().lower()] = builder
+def register_transport_flux_model(
+    name: str,
+    builder: Callable[..., "TransportFluxModelBase"],
+    *,
+    capabilities: ModelCapabilities | None = None,
+    validate: bool = False,
+    validation_context: ModelValidationContext | None = None,
+) -> None:
+    key = str(name).strip().lower()
+    if validate:
+        if validation_context is None:
+            raise ValueError("validation_context is required when validate=True for a transport flux model.")
+        validate_transport_flux_builder(
+            builder,
+            validation_context,
+            capabilities=capabilities,
+            name=f"transport flux model '{name}'",
+        )
+    TRANSPORT_FLUX_MODEL_REGISTRY[key] = builder
+    TRANSPORT_FLUX_MODEL_CAPABILITIES[key] = capabilities or ModelCapabilities()
 
 def get_transport_flux_model(name: str) -> Callable[..., "TransportFluxModelBase"]:
     key = str(name).strip().lower()
     if key not in TRANSPORT_FLUX_MODEL_REGISTRY:
         raise ValueError(f"Unknown transport flux model '{name}'.")
     return TRANSPORT_FLUX_MODEL_REGISTRY[key]
+
+
+def get_transport_flux_model_capabilities(name: str) -> ModelCapabilities:
+    key = str(name).strip().lower()
+    if key not in TRANSPORT_FLUX_MODEL_CAPABILITIES:
+        raise ValueError(f"Unknown transport flux model '{name}'.")
+    return TRANSPORT_FLUX_MODEL_CAPABILITIES[key]
+
+
+def transport_flux_model(name: str, **register_kwargs):
+    return transport_model_decorator(name, register_transport_flux_model, **register_kwargs)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

@@ -185,4 +185,5 @@ See Also
 
 - :doc:`methods_of_use`
 - :doc:`input_file_reference`
+- :doc:`custom_models`
 - :doc:`overview`

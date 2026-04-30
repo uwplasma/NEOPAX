@@ -2,7 +2,7 @@
     <img src="https://github.com/uwplasma/NEOPAX/blob/main/docs/NEOPAX_logo_1.png" align="center" width="50%">
 </p>
 <p align="center">
-    <em><code>❯  NEOPAX - Neoclassical Transport Package in JAX</code></em>
+    <em><code>NEOPAX - Neoclassical Transport Package in JAX</code></em>
 </p>
 <p align="center">
     <img src="https://img.shields.io/github/license/uwplasma/NEOPAX?style=default&logo=opensourceinitiative&logoColor=white&color=0080ff" alt="license">
@@ -109,6 +109,29 @@ see:
 
 - `docs/methods_of_use.rst`
 - `docs/getting_started.rst`
+
+## Custom Models
+
+NEOPAX can load user-defined transport flux and source models without
+modifying the core package.
+
+The two main extension paths are:
+
+- direct Python registration through the extension API
+- TOML-driven loading through `[extensions]` with `python_modules` or
+  `python_files`
+
+This is useful when you want to:
+
+- prototype a new JAX-native closure
+- validate a custom source model in isolation
+- keep a direct Python path for JIT/autodiff-oriented workflows
+- run a normal TOML case while importing user model definitions first
+
+See:
+
+- `docs/custom_models.rst`
+- `docs/input_file_reference.rst`
 
 ## Examples
 To run an example simply do:

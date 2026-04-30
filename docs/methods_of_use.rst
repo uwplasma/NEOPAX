@@ -232,3 +232,16 @@ For advanced scripting or future JAX-centric compositions:
 
 This layering keeps the package usable both as a practical CLI tool and as a
 clean Python library.
+
+
+Extending NEOPAX
+----------------
+
+NEOPAX also supports custom flux and source model registration from Python.
+
+For TOML-driven runs, custom model modules can also be loaded through an
+``[extensions]`` section before model resolution.
+
+See:
+
+- :doc:`custom_models`

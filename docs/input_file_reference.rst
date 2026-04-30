@@ -25,6 +25,7 @@ A typical NEOPAX input file contains some subset of the following sections:
 - ``[energy_grid]``
 - ``[species]``
 - ``[profiles]``
+- ``[extensions]``
 - ``[boundary.*]``
 - ``[equations]``
 - ``[sources]``
@@ -225,6 +226,35 @@ Example:
     density_shape_power = 10.0
     temperature_shape_power = 2.0
     er_initialization_mode = "ambipolar_min_entropy"
+
+
+``[extensions]``
+----------------
+
+This optional section lets TOML-driven runs import Python modules or files
+before NEOPAX resolves custom flux or source model names.
+
+Common keys:
+
+- ``python_modules``
+- ``python_files``
+
+Example:
+
+.. code-block:: toml
+
+    [extensions]
+    python_modules = ["my_project.neopax_models"]
+
+or:
+
+.. code-block:: toml
+
+    [extensions]
+    python_files = ["./user_models.py"]
+
+This is mainly intended for custom registered models. See :doc:`custom_models`
+for the expected registration pattern.
 
 
 ``[boundary.*]``
