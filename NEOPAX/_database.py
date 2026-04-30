@@ -8,6 +8,14 @@ from jaxtyping import Array, Float  # https://github.com/google/jaxtyping
 import dataclasses
 import interpax
 
+D11_POSITIVE_FLOOR = 1.0e-20
+
+
+def _floor_positive_d11(D11):
+    d11 = jnp.asarray(D11)
+    floor = jnp.asarray(D11_POSITIVE_FLOOR, dtype=d11.dtype)
+    return jnp.where(d11 > floor, d11, floor)
+
 
 #Monoenergetic database class
 @jax.tree_util.register_dataclass
@@ -131,6 +139,7 @@ class Monoenergetic:
                 D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
         #Er_list=jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0])))
 
+        D11 = _floor_positive_d11(D11)
         D11_log=jnp.log10(D11)
         nu_log=jnp.log10(nu_v)
         D13=jnp.array(D13)
@@ -177,7 +186,7 @@ class Monoenergetic:
                 Er_list=Er_list.at[j,k].set(jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0,k])/(a_b*rho.at[j].get()))))
                 D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
 
-
+        D11 = _floor_positive_d11(D11)
         D11_log=jnp.log10(D11)
         nu_log=jnp.log10(nu_v)
         D13=jnp.array(D13)

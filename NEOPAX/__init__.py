@@ -21,7 +21,13 @@ from ._species import Species
 # Current transport/state API.
 from ._boundary_conditions import BoundaryConditionModel, DirichletBC, NeumannBC, RobinBC
 from ._model_api import ModelCapabilities, ModelValidationContext, make_validation_context
-from ._source_models import build_source_models_from_config, get_source_model, register_source_model, source_model
+from ._source_models import (
+    CombinedSourceModel,
+    build_source_models_from_config,
+    get_source_model,
+    register_source_model,
+    source_model,
+)
 from ._state import TransportState
 from ._turbulence import get_Turbulent_Fluxes_Analytical, get_Turbulent_Fluxes_PowerOverN
 from ._transport_equations import (
@@ -33,10 +39,20 @@ from ._transport_equations import (
     build_equation_system_from_config,
 )
 from ._transport_flux_models import (
+    AnalyticalTurbulentTransportModel,
     CombinedTransportFluxModel,
     FluxesRFileTransportModel,
+    NTXExactLijRuntimeSupport,
+    NTXExactLijRuntimeTransportModel,
+    NTXRuntimeScanChannels,
+    NTXRuntimeScanTransportModel,
+    PowerAnalyticalTurbulentTransportModel,
+    build_ntx_exact_lij_runtime_support,
+    build_ntx_exact_lij_runtime_transport_model,
+    build_ntx_runtime_scan_channels,
     ZeroTransportModel,
     build_fluxes_r_file_transport_model,
+    build_ntx_runtime_scan_transport_model,
     build_transport_flux_model,
     get_transport_flux_model_capabilities,
     get_transport_flux_model,
@@ -52,19 +68,19 @@ from ._transport_solvers import (
 )
 
 def load_config(*args, **kwargs):
-    from .main import load_config as _load_config
+    from ._orchestrator import load_config as _load_config
 
     return _load_config(*args, **kwargs)
 
 
 def run_config(*args, **kwargs):
-    from .main import run_config as _run_config
+    from ._orchestrator import run_config as _run_config
 
     return _run_config(*args, **kwargs)
 
 
 def run_config_path(*args, **kwargs):
-    from .main import run_config_path as _run_config_path
+    from ._orchestrator import run_config_path as _run_config_path
 
     return _run_config_path(*args, **kwargs)
 
@@ -74,7 +90,9 @@ __all__ = [
     "__version_tuple__",
     "version",
     "version_tuple",
+    "AnalyticalTurbulentTransportModel",
     "BoundaryConditionModel",
+    "CombinedSourceModel",
     "CombinedTransportFluxModel",
     "ComposedEquationSystem",
     "DensityEquation",
@@ -87,7 +105,12 @@ __all__ = [
     "ModelValidationContext",
     "make_validation_context",
     "NeumannBC",
+    "NTXExactLijRuntimeSupport",
+    "NTXExactLijRuntimeTransportModel",
+    "NTXRuntimeScanChannels",
+    "NTXRuntimeScanTransportModel",
     "NewtonThetaMethodSolver",
+    "PowerAnalyticalTurbulentTransportModel",
     "RADAUSolver",
     "RobinBC",
     "RunResult",
@@ -100,6 +123,10 @@ __all__ = [
     "build_equation_system",
     "build_equation_system_from_config",
     "build_fluxes_r_file_transport_model",
+    "build_ntx_exact_lij_runtime_support",
+    "build_ntx_exact_lij_runtime_transport_model",
+    "build_ntx_runtime_scan_channels",
+    "build_ntx_runtime_scan_transport_model",
     "build_source_models_from_config",
     "build_time_solver",
     "build_transport_flux_model",

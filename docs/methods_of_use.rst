@@ -234,6 +234,79 @@ This layering keeps the package usable both as a practical CLI tool and as a
 clean Python library.
 
 
+Runtime NTX Scan From Python
+----------------------------
+
+For the ``ntx_scan_runtime`` neoclassical model, the direct Python path now
+supports a more explicit split between:
+
+- static VMEC/Boozer-derived setup
+- array-valued scan inputs such as ``rho_scan``, ``nu_v_scan``, and
+  ``er_tilde_scan``
+
+This is useful when Python is orchestrating repeated evaluations and you want
+to avoid rebuilding the static channel data each time.
+
+Example:
+
+.. code-block:: python
+
+    import NEOPAX
+
+    channels = NEOPAX.build_ntx_runtime_scan_channels(
+        "examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc",
+        "examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc",
+        [0.25, 0.5, 0.75],
+    )
+
+    model = NEOPAX.build_ntx_runtime_scan_transport_model(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file="examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc",
+        boozer_file="examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc",
+        ntx_scan_rho=[0.25, 0.5, 0.75],
+        ntx_scan_nu_v=[1.0e-5, 1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-5, 3.0e-5, 1.0e-4],
+        ntx_scan_channels=channels,
+        prebuild_database=False,
+    )
+
+At that point:
+
+- the static channels are already attached to the model
+- the runtime monoenergetic database is still deferred
+- evaluation can build the database later through the model path
+
+For repeated scans in Python, the same model can also be reused with updated
+scan inputs:
+
+.. code-block:: python
+
+    model_2 = model.with_scan_inputs(
+        nu_v_scan=[2.0e-5, 2.0e-4, 2.0e-3],
+        er_tilde_scan=[0.0, 2.0e-5, 6.0e-5, 2.0e-4],
+    )
+
+If the ``rho`` grid is unchanged, the preloaded static channels are retained.
+If the ``rho`` grid changes, the model drops those cached channels so they can
+be rebuilt consistently for the new scan grid.
+
+The same general direct-Python idea now also appears in other built-in models:
+
+- ``FluxesRFileTransportModel.with_q_scale(...)``
+- ``AnalyticalTurbulentTransportModel.with_transport_coeffs(...)``
+- ``PowerAnalyticalTurbulentTransportModel.with_transport_coeffs(...)``
+- ``CombinedSourceModel.with_added_sources(...)``
+
+These helpers are intended to keep small model updates at the model-object
+level instead of forcing orchestration code to rebuild everything from scratch.
+
+See also:
+
+- ``examples/custom_models/ntx_runtime_scan_direct_api_example.py``
+
+
 Extending NEOPAX
 ----------------
 

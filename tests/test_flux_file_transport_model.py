@@ -8,13 +8,15 @@ import pytest
 
 from NEOPAX._entropy_models import get_entropy_model
 from NEOPAX._transport_flux_models import (
+    AnalyticalTurbulentTransportModel,
     CombinedTransportFluxModel,
     FluxesRFileTransportModel,
+    PowerAnalyticalTurbulentTransportModel,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
 )
 from NEOPAX._fem import cell_centered_from_faces, faces_from_cell_centered
-from NEOPAX.main import calculate_fluxes_from_config
+from NEOPAX._orchestrator import calculate_fluxes_from_config
 
 
 class DummySpecies:
@@ -152,6 +154,27 @@ def test_fluxes_r_file_model_face_centered_reconstructs_cells(tmp_path):
     assert jnp.allclose(center_fluxes["Q"], jnp.vstack([cell_centered_from_faces(q_faces[0]), cell_centered_from_faces(q_faces[1])]))
 
 
+def test_fluxes_r_file_with_q_scale_returns_updated_model(tmp_path):
+    path = tmp_path / "scale_update_fluxes.h5"
+    gamma = jnp.array([[1.0, 3.0], [2.0, 4.0]])
+    q = jnp.array([[10.0, 30.0], [20.0, 40.0]])
+    _write_flux_file(path, r=[0.25, 0.75], gamma=gamma, q=q)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            grid_location="cell_centered",
+        )
+
+    updated = model.with_q_scale(0.5)
+
+    assert model.q_scale == 1.0
+    assert updated.q_scale == 0.5
+    assert jnp.allclose(updated(state=None)["Q"], 0.5 * q)
+
+
 def test_fluxes_r_file_invalid_profile_location_raises():
     model = FluxesRFileTransportModel(
         species=DummySpecies(),
@@ -164,6 +187,45 @@ def test_fluxes_r_file_invalid_profile_location_raises():
     )
     with pytest.raises(ValueError):
         model._normalize_profile_location()
+
+
+def test_analytical_turbulent_transport_model_with_transport_coeffs_updates_coefficients():
+    model = AnalyticalTurbulentTransportModel(
+        species="species",
+        grid="grid",
+        chi_t=jnp.array([1.0, 2.0]),
+        chi_n=jnp.array([3.0, 4.0]),
+        field="field",
+    )
+
+    updated = model.with_transport_coeffs(chi_t=jnp.array([5.0, 6.0]))
+
+    assert jnp.allclose(model.chi_t, jnp.array([1.0, 2.0]))
+    assert jnp.allclose(updated.chi_t, jnp.array([5.0, 6.0]))
+    assert jnp.allclose(updated.chi_n, jnp.array([3.0, 4.0]))
+
+
+def test_power_analytical_turbulent_transport_model_with_transport_coeffs_updates_inputs():
+    model = PowerAnalyticalTurbulentTransportModel(
+        species="species",
+        field="field",
+        chi_t=jnp.array([1.0, 2.0]),
+        chi_n=jnp.array([3.0, 4.0]),
+        pressure_source_model="source_a",
+        total_power_mw=5.0,
+    )
+
+    updated = model.with_transport_coeffs(
+        chi_n=jnp.array([7.0, 8.0]),
+        pressure_source_model="source_b",
+        total_power_mw=9.0,
+    )
+
+    assert jnp.allclose(model.chi_n, jnp.array([3.0, 4.0]))
+    assert jnp.allclose(updated.chi_t, jnp.array([1.0, 2.0]))
+    assert jnp.allclose(updated.chi_n, jnp.array([7.0, 8.0]))
+    assert updated.pressure_source_model == "source_b"
+    assert updated.total_power_mw == 9.0
 
 
 def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():

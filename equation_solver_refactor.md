@@ -42,7 +42,7 @@
 3. Implement `make_vector_field` in _transport_equations.py.
 4. Move time integrator selection/config to _transport_equations.py or _transport_solver.py.
 5. Implement `run_transport_simulation` as the main entrypoint.
-6. Refactor main.py to only call `run_transport_simulation`.
+6. Refactor the orchestration layer (`_orchestrator.py`) to only call `run_transport_simulation`.
 
 ---
 

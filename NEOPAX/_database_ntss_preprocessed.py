@@ -17,6 +17,7 @@ GMIX_NU = 0.2
 X11_L = -12.0
 X13_L = 0.0
 DEL_R = 1.0e-3
+D11_POSITIVE_FLOOR = 1.0e-20
 
 
 def _prepare_ntss_arrays(
@@ -110,6 +111,7 @@ def _prepare_ntss_arrays(
         D11[ir, :, :] *= drds[ir] ** 2
         D13[ir, :, :] *= drds[ir]
         D33[ir, :, :] *= nu_v[:, None]
+        D11[ir, :, :] = np.where(D11[ir, :, :] > D11_POSITIVE_FLOOR, D11[ir, :, :], D11_POSITIVE_FLOOR)
 
         finite_rows = []
         zero_rows = []

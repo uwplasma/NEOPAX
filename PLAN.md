@@ -950,6 +950,48 @@ Current implementation checkpoint:
   - registration
   - validation helpers
   - TOML-driven extension loading
+- started moving model-specific setup out of the orchestrator and into
+  first-class model objects, including a dedicated
+  ``NTXRuntimeScanTransportModel`` that separates:
+  - static/runtime-configuration inputs
+  - array-valued scan inputs
+  - runtime database construction
+  - downstream flux evaluation
+- restored evaluator hooks on ``NTXDatabaseTransportModel`` and wired
+  ``NTXRuntimeScanTransportModel`` to delegate local/face evaluation through
+  that explicit database-backed model path
+- added an explicit ``NTXRuntimeScanChannels`` static-data object plus
+  ``build_ntx_runtime_scan_channels(...)`` so file-derived VMEC/Boozer channel
+  setup can be separated from later runtime scan evaluation
+- extended ``NTXRuntimeScanTransportModel`` with:
+  - ``with_static_channels()``
+  - ``with_runtime_database()``
+  - ``with_scan_inputs(...)`` for repeated Python-side scan updates
+  - optional ``preload_channels`` / ``ntx_scan_channels`` builder inputs
+  to better separate static setup from array-valued scan inputs in direct
+  Python workflows
+- added an experimental ``NTXExactLijRuntimeTransportModel`` path that:
+  - preloads static VMEC/Boozer-derived channels and surfaces on the active
+    NEOPAX center/face grids
+  - calls NTX directly on the active NEOPAX energy grid for local
+    ``nu / v`` and ``Er / v`` values
+  - assembles ``Lij`` in real time instead of going through an intermediate
+    monoenergetic interpolation database
+  - preserves the same flux-model interface so it can be swapped into the
+    modular transport-model stack like other flux models
+- documented the direct-Python runtime NTX path with:
+  - a dedicated example file
+  - methods-of-use guidance
+  - worked-example references
+- extended the same model-owned update pattern to additional built-in models:
+  - ``FluxesRFileTransportModel.with_q_scale(...)``
+  - ``AnalyticalTurbulentTransportModel.with_transport_coeffs(...)``
+  - ``PowerAnalyticalTurbulentTransportModel.with_transport_coeffs(...)``
+  - ``CombinedSourceModel`` composition helpers
+- added a focused runtime-scan test path covering:
+  - ``prebuild_database = false`` construction
+  - deferred runtime database use through evaluator delegation
+  - static-channel preload and helper construction
 - added tests covering:
   - successful validated registration
   - malformed transport-model outputs
@@ -957,6 +999,42 @@ Current implementation checkpoint:
   - capability validation paths
   - end-to-end registration through temporary Python files/modules loaded from
     the TOML extension hook
+
+Current status assessment:
+- the model-architecture groundwork for this track is now largely in place
+- the main remaining work is no longer interface reshaping, but deeper
+  numerical/autodiff-oriented follow-through
+
+Main remaining items for this track:
+- reduce file/path dependence further in the runtime NTX path so more of the
+  scan/evaluation stack can be treated as a clean numerical core
+- benchmark and validate the new exact-``Lij`` NTX runtime path against the
+  existing ``ntx_database`` / ``ntx_scan_runtime`` models for both numerical
+  agreement and runtime cost
+- add a focused exact-``Lij`` NTX follow-up sub-track covering:
+  - flux-level comparison of ``Gamma``, ``Q``, and ``Upar`` against the
+    existing NTX-backed models
+  - ambipolar-root / ``E_r`` behavior comparison on the same profiles
+  - verification of direct-NTX normalization/sign conventions for
+    ``D11``, ``D13``, and ``D33``
+  - characterization of whether the model is best treated as:
+    - a research/debug model
+    - a transport-evolution-capable model
+    - or a sensitivity-oriented experimental model
+- define and test what level of autodiff support is actually intended for NTX-
+  backed models:
+  - JIT-safe only
+  - partially autodiff-safe
+  - sensitivity-grade
+- add targeted gradient/sensitivity experiments for selected direct-Python
+  workflows
+- run full pytest validation for the new helpers and runtime NTX path in an
+  environment with the project test dependencies installed
+
+Recommended pause point:
+- this is a reasonable stopping point for the structural refactor work
+- the next substantial step should be taken only if we explicitly want to push
+  further into profile-sensitivity/autodiff support or full runtime validation
 
 Core API pieces to introduce:
 - a small shared model API module, for example:
@@ -1036,7 +1114,8 @@ Current implementation checkpoint:
 - added console-script entry points:
   - `NEOPAX`
   - `neopax`
-- added `run_config(config)` and `run_config_path(path)` in `main.py`
+- added `run_config(config)` and `run_config_path(path)` in `_orchestrator.py`
+- kept `NEOPAX.main` as a thin compatibility shim while moving the real orchestration implementation into `_orchestrator.py`
 - `python -m NEOPAX ...` now routes through the CLI layer instead of directly hard-coding `<config.toml>` handling in `__main__.py`
 - added direct convenience API entry points:
   - `NEOPAX.prepare_config(...)`

@@ -208,6 +208,8 @@ The currently registered transport flux models include:
 
 - ``ntx_database``
   - database-driven neoclassical model
+- ``ntx_scan_runtime``
+  - on-the-fly NTX monoenergetic scan built from VMEC/Boozer inputs and TOML scan grids
 - ``ntx_database_with_momentum``
   - database-driven neoclassical model with momentum-correction pathway
 - ``turbulent_analytical``

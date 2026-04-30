@@ -1010,15 +1010,19 @@ def plot_roots(
     overlay_reference_er: bool = True,
     reference_er_file: str | Path | None = None,
     reference_er_label: str | None = None,
+    debug: bool = False,
 ) -> Path:
-    # --- DEBUG: Print root/entropy arrays before plotting ---
     import numpy as np
-    print("[DEBUG] roots_3 shape:", np.shape(roots_3))
-    print("[DEBUG] roots_3 (first 5 radii):", np.array(roots_3)[:, :5])
-    print("[DEBUG] entropies_3 shape:", np.shape(entropies_3))
-    print("[DEBUG] entropies_3 (first 5 radii):", np.array(entropies_3)[:, :5])
-    print("[DEBUG] best_root shape:", np.shape(best_root))
-    print("[DEBUG] best_root (first 5):", np.array(best_root)[:5])
+
+    if debug:
+        # Print root/entropy arrays only when the plotting path is active and
+        # ambipolarity debug output was explicitly requested.
+        print("[DEBUG] roots_3 shape:", np.shape(roots_3))
+        print("[DEBUG] roots_3 (first 5 radii):", np.array(roots_3)[:, :5])
+        print("[DEBUG] entropies_3 shape:", np.shape(entropies_3))
+        print("[DEBUG] entropies_3 (first 5 radii):", np.array(entropies_3)[:, :5])
+        print("[DEBUG] best_root shape:", np.shape(best_root))
+        print("[DEBUG] best_root (first 5):", np.array(best_root)[:5])
 
     try:
         import matplotlib.pyplot as plt

@@ -8,6 +8,8 @@ import h5py
 import jax
 import jax.numpy as jnp
 import interpax
+import sys
+from pathlib import Path
 from ._cell_variable import (
     get_gradient_density,
     get_gradient_temperature,
@@ -19,6 +21,9 @@ from ._boundary_conditions import (
     right_constraints_from_bc_model,
 )
 from ._neoclassical import (
+    _as_species_constraint,
+    _collisionality_kind,
+    _nu_over_vnew_local,
     get_Lij_matrix_local,
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
@@ -633,6 +638,870 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             "Q": q_neo,
             "Upar": upar_neo,
         }
+
+
+def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
+    arr = jnp.asarray(value, dtype=jnp.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional list/array.")
+    if arr.shape[0] == 0:
+        raise ValueError(f"{name} must contain at least one value.")
+    if not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError(f"{name} contains non-finite values.")
+    if positive and not bool(jnp.all(arr > 0.0)):
+        raise ValueError(f"{name} values must be positive.")
+    return arr
+
+
+def _import_ntx():
+    try:
+        import ntx
+
+        return ntx
+    except ImportError:
+        repo_root = Path(__file__).resolve().parents[2]
+        ntx_src = repo_root / "NTX" / "src"
+        if ntx_src.is_dir() and str(ntx_src) not in sys.path:
+            sys.path.insert(0, str(ntx_src))
+        import ntx
+
+        return ntx
+
+
+def _load_ntx_vmec_boozer_channels(wout_path: Path, boozmn_path: Path, rho: jax.Array) -> dict[str, jax.Array | float]:
+    from netCDF4 import Dataset
+    import numpy as np
+    import interpax
+
+    rho = jnp.asarray(rho, dtype=jnp.float64)
+    if rho.ndim != 1 or rho.shape[0] == 0:
+        raise ValueError("ntx_scan_rho must be a non-empty one-dimensional array.")
+
+    with Dataset(wout_path, mode="r") as vfile:
+        ns = int(np.asarray(vfile.variables["ns"][:]).reshape(-1)[0])
+        s_full = jnp.linspace(0.0, 1.0, ns)
+        s_half = jnp.asarray([(i - 0.5) / (ns - 1) for i in range(ns)], dtype=jnp.float64)
+        rho_half = jnp.sqrt(s_half)
+        rho_full = jnp.sqrt(s_full)
+
+        volume_p = float(np.asarray(vfile.variables["volume_p"][:]).reshape(-1)[-1])
+        phi = np.asarray(vfile.variables["phi"][:], dtype=float)
+        iotaf = np.asarray(vfile.variables["iotaf"][:], dtype=float)
+        psia = float(jnp.abs(phi[-1]) / (2.0 * jnp.pi))
+
+    with Dataset(boozmn_path, mode="r") as bfile:
+        bmnc_b = np.asarray(bfile.variables["bmnc_b"][:], dtype=float)
+        rmnc_b = np.asarray(bfile.variables["rmnc_b"][:], dtype=float)
+        xm_b = np.asarray(bfile.variables["ixm_b"][:], dtype=float)
+        xn_b = np.asarray(bfile.variables["ixn_b"][:], dtype=float)
+        buco = np.asarray(bfile.variables["buco_b"][:], dtype=float)
+        bvco = np.asarray(bfile.variables["bvco_b"][:], dtype=float)
+
+    zero_mode = np.where((xm_b == 0) & (xn_b == 0))[0]
+    if zero_mode.size == 0:
+        raise ValueError("Could not find Boozer (m,n)=(0,0) mode in the boozmn file.")
+    mode00 = int(zero_mode[0])
+
+    r0_b = float(rmnc_b[-1, mode00])
+    a_b = float(np.sqrt(volume_p / (2.0 * np.pi**2 * r0_b)))
+
+    b00 = interpax.Interpolator1D(rho_half[1:], bmnc_b[:, mode00], extrap=True)
+    r00 = interpax.Interpolator1D(rho_full[1:], rmnc_b[:, mode00], extrap=True)
+    boozer_i = interpax.Interpolator1D(rho_half[1:], buco[1:], extrap=True)
+    boozer_g = interpax.Interpolator1D(rho_half[1:], bvco[1:], extrap=True)
+    iota = interpax.Interpolator1D(rho_full, iotaf, extrap=True)
+
+    b00_rho = b00(rho)
+    r00_rho = r00(rho)
+    i_rho = boozer_i(rho)
+    g_rho = boozer_g(rho)
+    iota_rho = iota(rho)
+
+    dpsidrtilde = rho * a_b * b00_rho
+    drds = a_b / (2.0 * rho)
+    dr_tildedr = 2.0 * psia / (a_b**2 * b00_rho)
+    dr_tildeds = dr_tildedr * drds
+
+    boozer_jacobian = g_rho + iota_rho * i_rho
+    sqrt_pi = jnp.sqrt(jnp.pi)
+    fac_reference_to_sfincs_11 = 8.0 * boozer_jacobian * b00_rho * psia**2 / (sqrt_pi * g_rho**2)
+    fac_reference_to_sfincs_31 = 4.0 * b00_rho * psia / (sqrt_pi * g_rho)
+    fac_reference_to_sfincs_33 = -2.0 * b00_rho / (boozer_jacobian * sqrt_pi)
+    fac_sfincs_to_dkes_11 = 1.0 / (
+        8.0 * boozer_jacobian * dpsidrtilde**2 / (g_rho**2 * b00_rho * sqrt_pi)
+    )
+    fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsidrtilde / (g_rho * sqrt_pi))
+    fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00_rho / (boozer_jacobian * sqrt_pi))
+
+    epsilon_t = rho * a_b / r00_rho
+    fac_dkes_to_d11star = -(8.0 / jnp.pi) * iota_rho * r00_rho
+    fac_dkes_to_d31star = -(3.0 / 1.46) * iota_rho * jnp.sqrt(epsilon_t) / 2.0
+    fac_dkes_to_d33star = jnp.asarray(1.0, dtype=jnp.float64)
+
+    return {
+        "a_b": a_b,
+        "psia": psia,
+        "b00": b00_rho,
+        "r00": r00_rho,
+        "boozer_i": i_rho,
+        "boozer_g": g_rho,
+        "iota": iota_rho,
+        "drds": drds,
+        "dr_tildedr": dr_tildedr,
+        "dr_tildeds": dr_tildeds,
+        "fac_reference_to_sfincs_11": fac_reference_to_sfincs_11,
+        "fac_reference_to_sfincs_31": fac_reference_to_sfincs_31,
+        "fac_reference_to_sfincs_33": fac_reference_to_sfincs_33,
+        "fac_sfincs_to_dkes_11": fac_sfincs_to_dkes_11,
+        "fac_sfincs_to_dkes_31": fac_sfincs_to_dkes_31,
+        "fac_sfincs_to_dkes_33": fac_sfincs_to_dkes_33,
+        "fac_dkes_to_d11star": fac_dkes_to_d11star,
+        "fac_dkes_to_d31star": fac_dkes_to_d31star,
+        "fac_dkes_to_d33star": fac_dkes_to_d33star,
+    }
+
+
+def _build_ntx_field_channels(rho: jax.Array, er_tilde: jax.Array, channels: dict[str, jax.Array | float]) -> tuple[jax.Array, jax.Array, jax.Array]:
+    b00 = jnp.asarray(channels["b00"], dtype=jnp.float64)
+    dr_tildedr = jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64)
+    dr_tildeds = jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64)
+    er = er_tilde[None, :] * dr_tildedr[:, None] * b00[:, None]
+    es = er_tilde[None, :] * dr_tildeds[:, None] * b00[:, None]
+    er_to_ertilde = jnp.broadcast_to(1.0 / dr_tildedr[:, None], er.shape)
+    return er, es, er_to_ertilde
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class NTXRuntimeScanChannels:
+    rho: Any
+    a_b: float
+    psia: float
+    b00: Any
+    r00: Any
+    boozer_i: Any
+    boozer_g: Any
+    iota: Any
+    drds: Any
+    dr_tildedr: Any
+    dr_tildeds: Any
+    fac_reference_to_sfincs_11: Any
+    fac_reference_to_sfincs_31: Any
+    fac_reference_to_sfincs_33: Any
+    fac_sfincs_to_dkes_11: Any
+    fac_sfincs_to_dkes_31: Any
+    fac_sfincs_to_dkes_33: Any
+    fac_dkes_to_d11star: Any
+    fac_dkes_to_d31star: Any
+    fac_dkes_to_d33star: Any
+
+    @classmethod
+    def from_mapping(cls, rho, channels: dict[str, jax.Array | float]) -> "NTXRuntimeScanChannels":
+        rho = _as_float_array(rho, name="rho_scan")
+        return cls(
+            rho=rho,
+            a_b=float(channels["a_b"]),
+            psia=float(channels["psia"]),
+            b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
+            r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
+            boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
+            boozer_g=jnp.asarray(channels["boozer_g"], dtype=jnp.float64),
+            iota=jnp.asarray(channels["iota"], dtype=jnp.float64),
+            drds=jnp.asarray(channels["drds"], dtype=jnp.float64),
+            dr_tildedr=jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64),
+            dr_tildeds=jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64),
+            fac_reference_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
+            fac_reference_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
+            fac_reference_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_11=jnp.asarray(channels["fac_sfincs_to_dkes_11"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_31=jnp.asarray(channels["fac_sfincs_to_dkes_31"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_33=jnp.asarray(channels["fac_sfincs_to_dkes_33"], dtype=jnp.float64),
+            fac_dkes_to_d11star=jnp.asarray(channels["fac_dkes_to_d11star"], dtype=jnp.float64),
+            fac_dkes_to_d31star=jnp.asarray(channels["fac_dkes_to_d31star"], dtype=jnp.float64),
+            fac_dkes_to_d33star=jnp.asarray(channels["fac_dkes_to_d33star"], dtype=jnp.float64),
+        )
+
+    def as_mapping(self) -> dict[str, jax.Array | float]:
+        return {
+            "a_b": self.a_b,
+            "psia": self.psia,
+            "b00": self.b00,
+            "r00": self.r00,
+            "boozer_i": self.boozer_i,
+            "boozer_g": self.boozer_g,
+            "iota": self.iota,
+            "drds": self.drds,
+            "dr_tildedr": self.dr_tildedr,
+            "dr_tildeds": self.dr_tildeds,
+            "fac_reference_to_sfincs_11": self.fac_reference_to_sfincs_11,
+            "fac_reference_to_sfincs_31": self.fac_reference_to_sfincs_31,
+            "fac_reference_to_sfincs_33": self.fac_reference_to_sfincs_33,
+            "fac_sfincs_to_dkes_11": self.fac_sfincs_to_dkes_11,
+            "fac_sfincs_to_dkes_31": self.fac_sfincs_to_dkes_31,
+            "fac_sfincs_to_dkes_33": self.fac_sfincs_to_dkes_33,
+            "fac_dkes_to_d11star": self.fac_dkes_to_d11star,
+            "fac_dkes_to_d31star": self.fac_dkes_to_d31star,
+            "fac_dkes_to_d33star": self.fac_dkes_to_d33star,
+        }
+
+
+def build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_scan) -> NTXRuntimeScanChannels:
+    rho = _as_float_array(rho_scan, name="rho_scan")
+    channels = _load_ntx_vmec_boozer_channels(Path(vmec_file), Path(boozer_file), rho)
+    return NTXRuntimeScanChannels.from_mapping(rho, channels)
+
+
+def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
+    ntx = _import_ntx()
+    backend = str(surface_backend).strip().lower()
+    vmec_file = str(vmec_file)
+    boozer_file = str(boozer_file)
+
+    def load(rho_value: float):
+        if backend == "vmec":
+            return ntx.surface_from_vmec_jax_vmec_wout_file(vmec_file, s=float(rho_value**2))
+        if backend == "boozmn":
+            return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
+        if backend == "auto":
+            try:
+                return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
+            except Exception:
+                return ntx.surface_from_vmec_jax_vmec_wout_file(vmec_file, s=float(rho_value**2))
+        raise ValueError("surface_backend must be one of: auto, boozmn, vmec")
+
+    return ntx, load
+
+
+def build_ntx_runtime_surfaces(vmec_file, boozer_file, rho_values, *, surface_backend="auto") -> tuple[Any, ...]:
+    rho_arr = _as_float_array(rho_values, name="rho_values")
+    _, loader = _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend=surface_backend)
+    return tuple(loader(float(rho_value)) for rho_value in rho_arr)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class NTXExactLijRuntimeSupport:
+    center_channels: NTXRuntimeScanChannels
+    face_channels: NTXRuntimeScanChannels
+    center_surfaces: tuple[Any, ...]
+    face_surfaces: tuple[Any, ...]
+    grid: Any
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class NTXRuntimeScanTransportModel(TransportFluxModelBase):
+    species: Any
+    energy_grid: Any
+    geometry: Any
+    vmec_file: str | None
+    boozer_file: str | None
+    rho_scan: Any
+    nu_v_scan: Any
+    er_tilde_scan: Any
+    n_theta: int = 25
+    n_zeta: int = 25
+    n_xi: int = 64
+    surface_backend: str = "auto"
+    source_name: str = "ntx_scan_runtime"
+    collisionality_model: str = "default"
+    bc_density: Any = None
+    bc_temperature: Any = None
+    channels: NTXRuntimeScanChannels | None = None
+    database: Any = None
+
+    def _scan_axes(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+        rho = _as_float_array(self.rho_scan, name="rho_scan")
+        nu_v = _as_float_array(self.nu_v_scan, name="nu_v_scan", positive=True)
+        er_tilde = _as_float_array(self.er_tilde_scan, name="er_tilde_scan")
+        if not bool(jnp.all((rho > 0.0) & (rho <= 1.0))):
+            raise ValueError("rho_scan values must satisfy 0 < rho <= 1.")
+        return rho, nu_v, er_tilde
+
+    def _static_channels(self) -> NTXRuntimeScanChannels:
+        rho, _, _ = self._scan_axes()
+        if self.channels is not None:
+            if self.channels.rho.shape != rho.shape or not bool(jnp.allclose(self.channels.rho, rho)):
+                raise ValueError("Provided ntx_scan_channels rho grid does not match rho_scan.")
+            return self.channels
+        if self.vmec_file is None or self.boozer_file is None:
+            raise ValueError("vmec_file and boozer_file are required when ntx_scan_channels are not provided.")
+        return build_ntx_runtime_scan_channels(self.vmec_file, self.boozer_file, rho)
+
+    def _surface_loader(self, ntx):
+        del ntx
+        if self.vmec_file is None or self.boozer_file is None:
+            raise ValueError("vmec_file and boozer_file are required to build NTX runtime scan surfaces.")
+        _, loader = _build_ntx_surface_loader(self.vmec_file, self.boozer_file, surface_backend=self.surface_backend)
+        return loader
+
+    def _build_runtime_database(self):
+        if self.database is not None:
+            return self.database
+
+        ntx = _import_ntx()
+        rho, nu_v, er_tilde = self._scan_axes()
+        static_channels = self._static_channels()
+        channels = static_channels.as_mapping()
+        er, es, er_to_ertilde = _build_ntx_field_channels(rho, er_tilde, channels)
+        grid = ntx.GridSpec(
+            n_theta=int(self.n_theta),
+            n_zeta=int(self.n_zeta),
+            n_xi=int(self.n_xi),
+        )
+        scan = ntx.build_ntx_neopax_scan(
+            self._surface_loader(ntx),
+            rho=rho,
+            nu_v=nu_v,
+            Es=es,
+            Er=er,
+            drds=jnp.asarray(channels["drds"], dtype=jnp.float64),
+            grid=grid,
+            source_name=self.source_name,
+        )
+        scan = dataclasses.replace(
+            scan,
+            Er_tilde=er_tilde,
+            Er_to_Ertilde=er_to_ertilde,
+            dr_tildedr=jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64),
+            dr_tildeds=jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64),
+            a_b=float(channels["a_b"]),
+            psia=float(channels["psia"]),
+            b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
+            r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
+            boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
+            boozer_g=jnp.asarray(channels["boozer_g"], dtype=jnp.float64),
+            iota=jnp.asarray(channels["iota"], dtype=jnp.float64),
+            fac_reference_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
+            fac_reference_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
+            fac_reference_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
+            fac_monkes_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
+            fac_monkes_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
+            fac_monkes_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_11=jnp.asarray(channels["fac_sfincs_to_dkes_11"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_31=jnp.asarray(channels["fac_sfincs_to_dkes_31"], dtype=jnp.float64),
+            fac_sfincs_to_dkes_33=jnp.asarray(channels["fac_sfincs_to_dkes_33"], dtype=jnp.float64),
+            fac_dkes_to_d11star=jnp.asarray(channels["fac_dkes_to_d11star"], dtype=jnp.float64),
+            fac_dkes_to_d31star=jnp.asarray(channels["fac_dkes_to_d31star"], dtype=jnp.float64),
+            fac_dkes_to_d33star=jnp.asarray(channels["fac_dkes_to_d33star"], dtype=jnp.float64),
+        )
+        print(
+            "[NEOPAX] built runtime NTX scan database: "
+            f"rho={int(rho.shape[0])} nu_v={int(nu_v.shape[0])} "
+            f"Er_tilde={int(er_tilde.shape[0])} "
+            f"grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi}) backend={str(self.surface_backend).strip().lower()}"
+        )
+        return ntx.to_neopax_monoenergetic(scan, a_b=float(channels["a_b"]))
+
+    def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
+        if self.channels is not None:
+            return self
+        return dataclasses.replace(self, channels=self._static_channels())
+
+    def with_scan_inputs(
+        self,
+        *,
+        rho_scan=None,
+        nu_v_scan=None,
+        er_tilde_scan=None,
+        clear_database: bool = True,
+    ) -> "NTXRuntimeScanTransportModel":
+        new_rho = self.rho_scan if rho_scan is None else rho_scan
+        new_nu_v = self.nu_v_scan if nu_v_scan is None else nu_v_scan
+        new_er_tilde = self.er_tilde_scan if er_tilde_scan is None else er_tilde_scan
+
+        new_channels = self.channels
+        if self.channels is not None and rho_scan is not None:
+            old_rho = _as_float_array(self.rho_scan, name="rho_scan")
+            candidate_rho = _as_float_array(new_rho, name="rho_scan")
+            same_rho = old_rho.shape == candidate_rho.shape and bool(jnp.allclose(old_rho, candidate_rho))
+            if not same_rho:
+                new_channels = None
+
+        return dataclasses.replace(
+            self,
+            rho_scan=new_rho,
+            nu_v_scan=new_nu_v,
+            er_tilde_scan=new_er_tilde,
+            channels=new_channels,
+            database=None if clear_database else self.database,
+        )
+
+    def _database_model(self) -> NTXDatabaseTransportModel:
+        return NTXDatabaseTransportModel(
+            species=self.species,
+            energy_grid=self.energy_grid,
+            geometry=self.geometry,
+            database=self._build_runtime_database(),
+            collisionality_model=self.collisionality_model,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+        )
+
+    def __call__(self, state) -> dict:
+        return self._database_model()(state)
+
+    def build_local_particle_flux_evaluator(self, state):
+        return self._database_model().build_local_particle_flux_evaluator(state)
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        return self._database_model().evaluate_face_fluxes(state, face_state, **kwargs)
+
+    def with_runtime_database(self) -> "NTXRuntimeScanTransportModel":
+        if self.database is not None:
+            return self
+        model = self.with_static_channels()
+        return dataclasses.replace(model, database=model._build_runtime_database())
+
+
+def build_ntx_exact_lij_runtime_support(
+    vmec_file,
+    boozer_file,
+    rho_center,
+    rho_face,
+    *,
+    surface_backend="auto",
+    n_theta=25,
+    n_zeta=25,
+    n_xi=64,
+) -> NTXExactLijRuntimeSupport:
+    ntx = _import_ntx()
+    center_channels = build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_center)
+    face_channels = build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_face)
+    center_surfaces = build_ntx_runtime_surfaces(
+        vmec_file,
+        boozer_file,
+        center_channels.rho,
+        surface_backend=surface_backend,
+    )
+    face_surfaces = build_ntx_runtime_surfaces(
+        vmec_file,
+        boozer_file,
+        face_channels.rho,
+        surface_backend=surface_backend,
+    )
+    return NTXExactLijRuntimeSupport(
+        center_channels=center_channels,
+        face_channels=face_channels,
+        center_surfaces=center_surfaces,
+        face_surfaces=face_surfaces,
+        grid=ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi)),
+    )
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
+    species: Any
+    energy_grid: Any
+    geometry: Any
+    vmec_file: str | None
+    boozer_file: str | None
+    n_theta: int = 25
+    n_zeta: int = 25
+    n_xi: int = 64
+    surface_backend: str = "auto"
+    collisionality_model: str = "default"
+    bc_density: Any = None
+    bc_temperature: Any = None
+    support: NTXExactLijRuntimeSupport | None = None
+
+    def _rho_center_face(self):
+        a_b = float(jnp.asarray(self.geometry.a_b))
+        rho_center = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64) / a_b
+        rho_face = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / a_b
+        return rho_center, rho_face
+
+    def _static_support(self) -> NTXExactLijRuntimeSupport:
+        if self.support is not None:
+            return self.support
+        if self.vmec_file is None or self.boozer_file is None:
+            raise ValueError("vmec_file and boozer_file are required when ntx_exact_lij_support is not provided.")
+        rho_center, rho_face = self._rho_center_face()
+        return build_ntx_exact_lij_runtime_support(
+            self.vmec_file,
+            self.boozer_file,
+            rho_center,
+            rho_face,
+            surface_backend=self.surface_backend,
+            n_theta=self.n_theta,
+            n_zeta=self.n_zeta,
+            n_xi=self.n_xi,
+        )
+
+    def with_static_support(self) -> "NTXExactLijRuntimeTransportModel":
+        if self.support is not None:
+            return self
+        return dataclasses.replace(self, support=self._static_support())
+
+    def with_transport_resolution(self, *, n_theta=None, n_zeta=None, n_xi=None) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(
+            self,
+            n_theta=self.n_theta if n_theta is None else int(n_theta),
+            n_zeta=self.n_zeta if n_zeta is None else int(n_zeta),
+            n_xi=self.n_xi if n_xi is None else int(n_xi),
+            support=None,
+        )
+
+    def _solve_lij_local(
+        self,
+        *,
+        surface,
+        drds_value,
+        species_index: int,
+        er_value,
+        temperature_local,
+        density_local,
+        vthermal_local,
+        collisionality_kind,
+        grid,
+    ):
+        ntx = _import_ntx()
+        vth_a = vthermal_local[species_index]
+        v_new_a = self.energy_grid.v_norm * vth_a
+        er_vnew_a = er_value * 1.0e3 / v_new_a
+        nu_vnew_a = _nu_over_vnew_local(
+            self.species,
+            species_index,
+            v_new_a,
+            density_local,
+            temperature_local,
+            vthermal_local,
+            collisionality_kind,
+        )
+        coeffs = ntx.solve_monoenergetic_scan(
+            surface,
+            grid,
+            nu_vnew_a,
+            epsi_hat=er_vnew_a * drds_value,
+        )
+        d11_a = -(jnp.asarray(coeffs["D11"], dtype=jnp.float64) * drds_value**2)
+        d13_a = -(jnp.asarray(coeffs["D13"], dtype=jnp.float64) * drds_value)
+        d33_a = -jnp.asarray(coeffs["D33"], dtype=jnp.float64)
+
+        charge = self.species.charge[species_index]
+        mass = self.species.mass[species_index]
+        l11_fac = -1.0 / jnp.sqrt(jnp.pi) * (mass / charge) ** 2 * vth_a**3
+        l13_fac = -1.0 / jnp.sqrt(jnp.pi) * (mass / charge) * vth_a**2
+        l33_fac = -1.0 / jnp.sqrt(jnp.pi) * vth_a
+
+        lij = jnp.zeros((3, 3), dtype=jnp.float64)
+        lij = lij.at[0, 0].set(l11_fac * jnp.sum(self.energy_grid.L11_weight * self.energy_grid.xWeights * d11_a))
+        lij = lij.at[0, 1].set(l11_fac * jnp.sum(self.energy_grid.L12_weight * self.energy_grid.xWeights * d11_a))
+        lij = lij.at[1, 0].set(lij[0, 1])
+        lij = lij.at[1, 1].set(l11_fac * jnp.sum(self.energy_grid.L22_weight * self.energy_grid.xWeights * d11_a))
+        lij = lij.at[0, 2].set(l13_fac * jnp.sum(self.energy_grid.L13_weight * self.energy_grid.xWeights * d13_a))
+        lij = lij.at[1, 2].set(l13_fac * jnp.sum(self.energy_grid.L23_weight * self.energy_grid.xWeights * d13_a))
+        lij = lij.at[2, 0].set(-lij[0, 2])
+        lij = lij.at[2, 1].set(-lij[1, 2])
+        lij = lij.at[2, 2].set(l33_fac * jnp.sum(self.energy_grid.L33_weight * self.energy_grid.xWeights * d33_a))
+        return lij
+
+    def _lij_center(self, Er, temperature, density):
+        support = self._static_support()
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        rows = []
+        for species_index in range(int(self.species.number_species)):
+            by_radius = []
+            for r_index, surface in enumerate(support.center_surfaces):
+                by_radius.append(
+                    self._solve_lij_local(
+                        surface=surface,
+                        drds_value=support.center_channels.drds[r_index],
+                        species_index=species_index,
+                        er_value=Er[r_index],
+                        temperature_local=temperature[:, r_index],
+                        density_local=density[:, r_index],
+                        vthermal_local=v_thermal[:, r_index],
+                        collisionality_kind=collisionality_kind,
+                        grid=support.grid,
+                    )
+                )
+            rows.append(jnp.stack(by_radius))
+        return jnp.stack(rows)
+
+    def _lij_faces(self, Er_faces, temperature_faces, density_faces):
+        support = self._static_support()
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        v_thermal_faces = get_v_thermal(self.species.mass, temperature_faces)
+        rows = []
+        for species_index in range(int(self.species.number_species)):
+            by_radius = []
+            for r_index, surface in enumerate(support.face_surfaces):
+                by_radius.append(
+                    self._solve_lij_local(
+                        surface=surface,
+                        drds_value=support.face_channels.drds[r_index],
+                        species_index=species_index,
+                        er_value=Er_faces[r_index],
+                        temperature_local=temperature_faces[:, r_index],
+                        density_local=density_faces[:, r_index],
+                        vthermal_local=v_thermal_faces[:, r_index],
+                        collisionality_kind=collisionality_kind,
+                        grid=support.grid,
+                    )
+                )
+            rows.append(jnp.stack(by_radius))
+        return jnp.stack(rows)
+
+    def __call__(self, state) -> dict:
+        density = safe_density(state.density)
+        temperature = state.temperature
+        n_species = int(temperature.shape[0])
+        n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
+        if n_right is None:
+            n_right = density[:, -1]
+        n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
+        if n_right_grad is None:
+            n_right_grad = jnp.zeros_like(n_right)
+        t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
+        if t_right is None:
+            t_right = temperature[:, -1]
+        t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
+        if t_right_grad is None:
+            t_right_grad = jnp.zeros_like(t_right)
+
+        lij = self._lij_center(state.Er, temperature, density)
+        gamma_rows = []
+        q_rows = []
+        upar_rows = []
+        for species_index in range(int(self.species.number_species)):
+            dndr = get_gradient_density(
+                density[species_index],
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=n_right[species_index],
+                right_face_grad_constraint=n_right_grad[species_index],
+            )
+            dTdr = get_gradient_temperature(
+                temperature[species_index],
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=t_right[species_index],
+                right_face_grad_constraint=t_right_grad[species_index],
+            )
+            a1 = get_Thermodynamical_Forces_A1(
+                self.species.charge[species_index],
+                density[species_index],
+                temperature[species_index],
+                dndr,
+                dTdr,
+                state.Er,
+            )
+            a2 = get_Thermodynamical_Forces_A2(temperature[species_index], dTdr)
+            a3 = get_Thermodynamical_Forces_A3(state.Er)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density[species_index]
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature[species_index]
+            gamma_rows.append(-density_phys * (lij[species_index, :, 0, 0] * a1 + lij[species_index, :, 0, 1] * a2 + lij[species_index, :, 0, 2] * a3))
+            q_rows.append(-temperature_phys * density_phys * (lij[species_index, :, 1, 0] * a1 + lij[species_index, :, 1, 1] * a2 + lij[species_index, :, 1, 2] * a3))
+            upar_rows.append(-density_phys * (lij[species_index, :, 2, 0] * a1 + lij[species_index, :, 2, 1] * a2 + lij[species_index, :, 2, 2] * a3))
+        return {
+            "Gamma": jnp.stack(gamma_rows),
+            "Q": jnp.stack(q_rows),
+            "Upar": jnp.stack(upar_rows),
+        }
+
+    def build_local_particle_flux_evaluator(self, state):
+        density = safe_density(state.density)
+        temperature = state.temperature
+        support = self._static_support()
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+
+        def evaluator(radius_index, er_value):
+            gamma_values = []
+            for species_index in range(int(self.species.number_species)):
+                lij = self._solve_lij_local(
+                    surface=support.center_surfaces[radius_index],
+                    drds_value=support.center_channels.drds[radius_index],
+                    species_index=species_index,
+                    er_value=jnp.asarray(er_value, dtype=state.Er.dtype),
+                    temperature_local=temperature[:, radius_index],
+                    density_local=density[:, radius_index],
+                    vthermal_local=v_thermal[:, radius_index],
+                    collisionality_kind=collisionality_kind,
+                    grid=support.grid,
+                )
+                dndr = get_gradient_density(
+                    density[species_index],
+                    self.geometry.r_grid,
+                    self.geometry.r_grid_half,
+                    self.geometry.dr,
+                )
+                dTdr = get_gradient_temperature(
+                    temperature[species_index],
+                    self.geometry.r_grid,
+                    self.geometry.r_grid_half,
+                    self.geometry.dr,
+                )
+                a1 = get_Thermodynamical_Forces_A1(
+                    self.species.charge[species_index],
+                    density[species_index],
+                    temperature[species_index],
+                    dndr,
+                    dTdr,
+                    state.Er.at[radius_index].set(jnp.asarray(er_value, dtype=state.Er.dtype)),
+                )
+                a2 = get_Thermodynamical_Forces_A2(temperature[species_index], dTdr)
+                a3 = get_Thermodynamical_Forces_A3(state.Er.at[radius_index].set(jnp.asarray(er_value, dtype=state.Er.dtype)))
+                density_phys = DENSITY_STATE_TO_PHYSICAL * density[species_index, radius_index]
+                gamma_values.append(
+                    -density_phys
+                    * (
+                        lij[0, 0] * a1[radius_index]
+                        + lij[0, 1] * a2[radius_index]
+                        + lij[0, 2] * a3[radius_index]
+                    )
+                )
+            return jnp.asarray(gamma_values)
+
+        return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        density = safe_density(state.density)
+        face_density = safe_density(face_state.density)
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
+        if particle_face_closure_mode in {"ntss_like", "ntss", "half_point"}:
+            dndr_faces = _ntss_like_face_gradient(
+                density,
+                self.geometry.r_grid_half,
+                bc_model=bc_density,
+            )
+            dTdr_faces = _ntss_like_face_gradient(
+                state.temperature,
+                self.geometry.r_grid_half,
+                bc_model=bc_temperature,
+            )
+        else:
+            dndr_faces = _face_profile_gradient(
+                density,
+                self.geometry.r_grid_half,
+                bc_model=bc_density,
+            )
+            dTdr_faces = _face_profile_gradient(
+                state.temperature,
+                self.geometry.r_grid_half,
+                bc_model=bc_temperature,
+            )
+        lij_faces = self._lij_faces(face_state.Er, face_state.temperature, face_density)
+        a1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge, density_a, temperature_a, dndr_a, dTdr_a, face_state.Er
+            ),
+            in_axes=(0, 0, 0, 0, 0),
+        )(self.species.charge, face_density, face_state.temperature, dndr_faces, dTdr_faces)
+        a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(face_state.temperature, dTdr_faces)
+        a3 = get_Thermodynamical_Forces_A3(face_state.Er)
+        density_phys = DENSITY_STATE_TO_PHYSICAL * face_density
+        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * face_state.temperature
+        gamma = -density_phys * (
+            lij_faces[:, :, 0, 0] * a1
+            + lij_faces[:, :, 0, 1] * a2
+            + lij_faces[:, :, 0, 2] * a3[None, :]
+        )
+        q = -temperature_phys * density_phys * (
+            lij_faces[:, :, 1, 0] * a1
+            + lij_faces[:, :, 1, 1] * a2
+            + lij_faces[:, :, 1, 2] * a3[None, :]
+        )
+        upar = -density_phys * (
+            lij_faces[:, :, 2, 0] * a1
+            + lij_faces[:, :, 2, 1] * a2
+            + lij_faces[:, :, 2, 2] * a3[None, :]
+        )
+        return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+
+def build_ntx_exact_lij_runtime_transport_model(
+    species,
+    energy_grid,
+    geometry,
+    *,
+    vmec_file,
+    boozer_file,
+    ntx_exact_n_theta=25,
+    ntx_exact_n_zeta=25,
+    ntx_exact_n_xi=64,
+    ntx_exact_surface_backend="auto",
+    ntx_exact_lij_support=None,
+    preload_support=False,
+    collisionality_model="default",
+    bc_density=None,
+    bc_temperature=None,
+    **kwargs,
+):
+    del kwargs
+    model = NTXExactLijRuntimeTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=str(vmec_file) if vmec_file is not None else None,
+        boozer_file=str(boozer_file) if boozer_file is not None else None,
+        n_theta=int(ntx_exact_n_theta),
+        n_zeta=int(ntx_exact_n_zeta),
+        n_xi=int(ntx_exact_n_xi),
+        surface_backend=str(ntx_exact_surface_backend),
+        collisionality_model=str(collisionality_model),
+        bc_density=bc_density,
+        bc_temperature=bc_temperature,
+        support=ntx_exact_lij_support,
+    )
+    if preload_support:
+        return model.with_static_support()
+    return model
+
+
+def build_ntx_runtime_scan_transport_model(
+    species,
+    energy_grid,
+    geometry,
+    *,
+    vmec_file,
+    boozer_file,
+    ntx_scan_rho,
+    ntx_scan_nu_v,
+    ntx_scan_er_tilde,
+    ntx_scan_n_theta=25,
+    ntx_scan_n_zeta=25,
+    ntx_scan_n_xi=64,
+    ntx_scan_surface_backend="auto",
+    ntx_scan_source_name="ntx_scan_runtime",
+    collisionality_model="default",
+    bc_density=None,
+    bc_temperature=None,
+    ntx_scan_channels=None,
+    preload_channels=False,
+    prebuild_database=True,
+    **kwargs,
+):
+    del kwargs
+    model = NTXRuntimeScanTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=str(vmec_file),
+        boozer_file=str(boozer_file),
+        rho_scan=ntx_scan_rho,
+        nu_v_scan=ntx_scan_nu_v,
+        er_tilde_scan=ntx_scan_er_tilde,
+        n_theta=int(ntx_scan_n_theta),
+        n_zeta=int(ntx_scan_n_zeta),
+        n_xi=int(ntx_scan_n_xi),
+        surface_backend=str(ntx_scan_surface_backend),
+        source_name=str(ntx_scan_source_name),
+        collisionality_model=str(collisionality_model),
+        bc_density=bc_density,
+        bc_temperature=bc_temperature,
+        channels=ntx_scan_channels,
+        database=None,
+    )
+    if preload_channels:
+        model = model.with_static_channels()
+    if not prebuild_database:
+        return model
+    return model.with_runtime_database()
     
 
 
@@ -832,6 +1701,9 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     profile_location: str = "cell_centered"
     q_scale: float = 1.0
 
+    def with_q_scale(self, q_scale: float) -> "FluxesRFileTransportModel":
+        return dataclasses.replace(self, q_scale=float(q_scale))
+
     def _interp_species_profile(self, data, target_r):
         if data is None:
             return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
@@ -912,6 +1784,13 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
     chi_n: Any
     field: Any
 
+    def with_transport_coeffs(self, *, chi_t=None, chi_n=None) -> "AnalyticalTurbulentTransportModel":
+        return dataclasses.replace(
+            self,
+            chi_t=self.chi_t if chi_t is None else chi_t,
+            chi_n=self.chi_n if chi_n is None else chi_n,
+        )
+
     def __call__(self, state) -> dict:
         gamma_turb, q_turb = get_Turbulent_Fluxes_Analytical(
             self.species,
@@ -969,6 +1848,22 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
     chi_n: Any
     pressure_source_model: Any = None
     total_power_mw: Any = None
+
+    def with_transport_coeffs(
+        self,
+        *,
+        chi_t=None,
+        chi_n=None,
+        pressure_source_model=None,
+        total_power_mw=None,
+    ) -> "PowerAnalyticalTurbulentTransportModel":
+        return dataclasses.replace(
+            self,
+            chi_t=self.chi_t if chi_t is None else chi_t,
+            chi_n=self.chi_n if chi_n is None else chi_n,
+            pressure_source_model=self.pressure_source_model if pressure_source_model is None else pressure_source_model,
+            total_power_mw=self.total_power_mw if total_power_mw is None else total_power_mw,
+        )
 
     def _effective_total_power_mw(self, state):
         if self.total_power_mw is not None:
@@ -1068,6 +1963,26 @@ register_transport_flux_model(
         collisionality_model=collisionality_model,
         bc_density=bc_density,
         bc_temperature=bc_temperature,
+    ),
+)
+
+register_transport_flux_model(
+    "ntx_scan_runtime",
+    lambda species, energy_grid, geometry, database=None, **kwargs: build_ntx_runtime_scan_transport_model(
+        species,
+        energy_grid,
+        geometry,
+        **kwargs,
+    ),
+)
+
+register_transport_flux_model(
+    "ntx_exact_lij_runtime",
+    lambda species, energy_grid, geometry, database=None, **kwargs: build_ntx_exact_lij_runtime_transport_model(
+        species,
+        energy_grid,
+        geometry,
+        **kwargs,
     ),
 )
 

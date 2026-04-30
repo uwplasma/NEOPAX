@@ -67,6 +67,39 @@ def test_combined_source_model():
     assert jnp.allclose(out["src"], jnp.ones(3) * 3)
 
 
+def test_combined_source_model_with_added_sources():
+    class DictSource(SourceModelBase):
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self, state):
+            del state
+            return {"src": jnp.asarray(self.value)}
+
+    base = CombinedSourceModel((DictSource(jnp.ones(3)),))
+    updated = base.with_added_sources(DictSource(jnp.ones(3) * 2))
+
+    assert len(base.sources) == 1
+    assert len(updated.sources) == 2
+    assert jnp.allclose(updated(None)["src"], jnp.ones(3) * 3)
+
+
+def test_combined_source_model_with_replaced_sources():
+    class DictSource(SourceModelBase):
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self, state):
+            del state
+            return {"src": jnp.asarray(self.value)}
+
+    base = CombinedSourceModel((DictSource(jnp.ones(3)),))
+    updated = base.with_replaced_sources((DictSource(jnp.ones(3) * 5),))
+
+    assert len(updated.sources) == 1
+    assert jnp.allclose(updated(None)["src"], jnp.ones(3) * 5)
+
+
 def test_register_and_get_source():
     class DummySource(SourceModelBase):
         def __call__(self, state):

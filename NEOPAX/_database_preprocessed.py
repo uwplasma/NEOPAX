@@ -11,6 +11,13 @@ config.update("jax_enable_x64", True)
 
 DEL_R = 1.0e-3
 NTSS1D_WIDTH = 16
+D11_POSITIVE_FLOOR = 1.0e-20
+
+
+def _floor_positive_d11(D11):
+    d11 = jnp.asarray(D11)
+    floor = jnp.asarray(D11_POSITIVE_FLOOR, dtype=d11.dtype)
+    return jnp.where(d11 > floor, d11, floor)
 
 
 def _prepare_ntx_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33, *, divide_by_radius: bool = True):
@@ -42,6 +49,7 @@ def _prepare_ntx_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33, *, divide_by_ra
         )
         Er_grid = Er_grid.at[j, :].set(er_row)
 
+    D11_scaled = _floor_positive_d11(D11_scaled)
     return {
         "a_b": a_b,
         "rho": rho,

@@ -162,6 +162,24 @@ This is useful for:
 - validating source parameter changes independently from transport stiffness
 
 
+Runtime NTX Direct-API Example
+------------------------------
+
+For the ``ntx_scan_runtime`` neoclassical model, a useful direct-Python pattern
+is to preload the static VMEC/Boozer-derived channel data once and then build
+the runtime scan model around it.
+
+Example file:
+
+- ``examples/custom_models/ntx_runtime_scan_direct_api_example.py``
+
+This example is useful when:
+
+- Python, rather than a pure TOML workflow, is controlling repeated model setup
+- you want a cleaner split between static geometry-derived data and scan inputs
+- you want to keep the direct-API path friendlier for future autodiff-oriented work
+
+
 Choosing A Usage Path
 ---------------------
 

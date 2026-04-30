@@ -6,7 +6,7 @@ import argparse
 from copy import deepcopy
 from pathlib import Path
 
-from .main import load_config, run_config
+from ._orchestrator import load_config, run_config
 
 
 def _coerce_cli_value(raw: str):

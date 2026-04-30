@@ -214,12 +214,17 @@ Minimal Flux Example
 See:
 
 - ``examples/custom_models/custom_flux_model_example.py``
+- ``examples/custom_models/ntx_runtime_scan_direct_api_example.py``
 
 This example shows:
 
 - a simple custom flux model
 - validated registration
 - lookup through the standard model registry
+
+The runtime NTX example is not a user-registered model example. Instead, it
+shows how a built-in model can expose a cleaner direct-Python workflow by
+separating static setup from later evaluation.
 
 
 Minimal Source Example

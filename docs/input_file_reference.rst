@@ -106,6 +106,44 @@ Typical patterns:
 
 .. code-block:: toml
 
+    [neoclassical]
+    flux_model = "ntx_scan_runtime"
+    entropy_model = "ntx_database"
+    ntx_scan_rho = [0.12247, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
+    ntx_scan_nu_v = [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]
+    ntx_scan_er_tilde = [0.0, 1.0e-6, 3.0e-6, 1.0e-5, 3.0e-5, 1.0e-4]
+    ntx_scan_n_theta = 25
+    ntx_scan_n_zeta = 25
+    ntx_scan_n_xi = 64
+    ntx_scan_surface_backend = "auto"
+
+This runtime NTX option builds the monoenergetic scan on the fly from the
+``vmec_file`` and ``boozer_file`` given in ``[geometry]`` instead of reading a
+precomputed NEOPAX HDF5 database.
+
+For direct Python usage, the same model also supports preloading the static
+VMEC/Boozer-derived channel data once through
+``NEOPAX.build_ntx_runtime_scan_channels(...)`` and then reusing it across
+evaluations through ``NEOPAX.NTXRuntimeScanTransportModel``.
+
+.. code-block:: toml
+
+    [neoclassical]
+    flux_model = "ntx_exact_lij_runtime"
+    ntx_exact_n_theta = 25
+    ntx_exact_n_zeta = 25
+    ntx_exact_n_xi = 64
+    ntx_exact_surface_backend = "auto"
+
+This experimental runtime NTX option skips the intermediate monoenergetic
+database interpolation step and instead solves NTX directly on the active
+NEOPAX energy grid to assemble ``Lij`` in real time from the local
+``nu / v`` and ``Er / v`` values. It is intended as a more
+autodiff-oriented path than the file-backed database route, while still
+reusing the same high-level flux-model interface.
+
+.. code-block:: toml
+
     [turbulence]
     flux_model = "turbulent_power_analytical"
     chi_density = [6.5e-05, 6.5e-05, 6.5e-05]

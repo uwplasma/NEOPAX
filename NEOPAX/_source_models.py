@@ -95,6 +95,29 @@ class ExampleStateDrivenSource(SourceModelBase):
 @dataclasses.dataclass(frozen=True, eq=False)
 class CombinedSourceModel(SourceModelBase):
     sources: tuple[SourceModelBase, ...] = dataclasses.field(default_factory=tuple)
+
+    @classmethod
+    def from_names(
+        cls,
+        names: list[str] | tuple[str, ...],
+        *,
+        params_cfg: dict[str, Any] | None = None,
+        species: Any | None = None,
+        cfg: dict[str, Any] | None = None,
+    ) -> "CombinedSourceModel":
+        params_cfg = params_cfg or {}
+        models = tuple(
+            get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg))
+            for name in names
+        )
+        return cls(models)
+
+    def with_added_sources(self, *sources: SourceModelBase) -> "CombinedSourceModel":
+        return dataclasses.replace(self, sources=self.sources + tuple(sources))
+
+    def with_replaced_sources(self, sources: tuple[SourceModelBase, ...]) -> "CombinedSourceModel":
+        return dataclasses.replace(self, sources=tuple(sources))
+
     def __call__(self, state: Any):
         outs = [src(state) for src in self.sources]
         merged: dict[str, Any] = {}
@@ -233,12 +256,7 @@ def _builder_kwargs_for(
 def _compose_sources(names: list[str], params_cfg: dict[str, Any] | None = None, species: Any | None = None) -> SourceModelBase | None:
     if len(names) == 0:
         return None
-    params_cfg = params_cfg or {}
-    models = tuple(
-        get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg=None))
-        for name in names
-    )
-    return CombinedSourceModel(models)
+    return CombinedSourceModel.from_names(names, params_cfg=params_cfg or {}, species=species, cfg=None)
 
 def _broadcast_profile(value: Any, template: jax.Array) -> jax.Array:
     arr = jnp.asarray(value, dtype=template.dtype)
@@ -362,21 +380,21 @@ def build_source_models_from_config(cfg: dict[str, Any], species: Any | None = N
     temperature_names = _as_name_list(src_cfg.get("temperature"))
 
     density_src = (
-        CombinedSourceModel(
-            tuple(
-                get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg))
-                for name in density_names
-            )
+        CombinedSourceModel.from_names(
+            density_names,
+            params_cfg=params_cfg,
+            species=species,
+            cfg=cfg,
         )
         if density_names
         else None
     )
     temp_src = (
-        CombinedSourceModel(
-            tuple(
-                get_source_model(name, **_builder_kwargs_for(name, params_cfg, species, cfg))
-                for name in temperature_names
-            )
+        CombinedSourceModel.from_names(
+            temperature_names,
+            params_cfg=params_cfg,
+            species=species,
+            cfg=cfg,
         )
         if temperature_names
         else None

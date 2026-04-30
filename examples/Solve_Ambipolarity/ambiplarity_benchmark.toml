@@ -1,8 +1,4 @@
-# Focused transport debug case:
-# - density frozen
-# - pressure evolved for e, D, T
-# - Er evolved
-# - startup prints thermal and Er term breakdowns
+# Ambipoalrity example/test for a NTX database calculated for the electron root/QI optimized eq.
 
 [general]
 mode = "ambipolarity"
@@ -15,11 +11,8 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_database"
 entropy_model = "ntx_database"
-neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
 interpolation_mode = "preprocessed_3d_radial_ntss1d"
-
-
-
 
 
 
@@ -41,8 +34,9 @@ er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
 er_ambipolar_reference_er_label = "NTSS Er"
 er_ambipolar_plot = true
-er_ambipolar_output_dir = "./docs/benchmark/figures/"
-
+er_ambipolar_output_dir = "./docs/benchmark/figures/Ambipolarity"
+debug = false
+debug_prints = false
 
 
 [energy_grid]

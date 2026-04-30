@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .cli import apply_cli_overrides
-from .main import load_config, run_config
+from ._orchestrator import load_config, run_config
 
 
 @dataclasses.dataclass(frozen=True)

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 
-import NEOPAX.main as main_module
+import NEOPAX._orchestrator as main_module
 import NEOPAX._transport_flux_models as flux_models_module
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._state import TransportState
