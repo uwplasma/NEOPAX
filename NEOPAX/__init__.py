@@ -6,6 +6,7 @@ of re-exporting every internal helper via wildcard imports.
 
 from __future__ import annotations
 
+from .api import RunResult, prepare_config, run
 from .version import __version__, __version_tuple__, version, version_tuple
 
 from ._database import Monoenergetic
@@ -52,6 +53,18 @@ def load_config(*args, **kwargs):
     return _load_config(*args, **kwargs)
 
 
+def run_config(*args, **kwargs):
+    from .main import run_config as _run_config
+
+    return _run_config(*args, **kwargs)
+
+
+def run_config_path(*args, **kwargs):
+    from .main import run_config_path as _run_config_path
+
+    return _run_config_path(*args, **kwargs)
+
+
 def main(*args, **kwargs):
     from .main import main as _main
 
@@ -76,6 +89,7 @@ __all__ = [
     "NewtonThetaMethodSolver",
     "RADAUSolver",
     "RobinBC",
+    "RunResult",
     "Solver_Parameters",
     "Species",
     "TemperatureEquation",
@@ -96,5 +110,9 @@ __all__ = [
     "get_Turbulent_Fluxes_PowerOverN",
     "get_transport_flux_model",
     "load_config",
+    "prepare_config",
+    "run",
+    "run_config",
+    "run_config_path",
     "main",
 ]

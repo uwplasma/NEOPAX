@@ -964,6 +964,65 @@ Scope notes:
 - do not force every model to support autodiff; make capabilities explicit instead
 - keep the default hot path lean by avoiding heavy validation in production execution unless requested
 
+### Phase 11B: CLI And Direct-API Split
+- Status: in progress
+- Goal:
+  - provide a practical command-line interface for common NEOPAX workflows while preserving a clean direct Python API path for autodiff-oriented and programmatic use
+
+Why this phase was added:
+- many NEOPAX runs are still launched from TOML files with manual edits for common changes such as:
+  - `mode`
+  - `vmec_file`
+  - `boozer_file`
+  - `n_radial`
+  - `n_x`
+- a CLI improves usability for common batch and scripting workflows
+- the direct Python API must remain valid and uncluttered so higher-level JAX workflows can still:
+  - construct configs in memory
+  - call NEOPAX programmatically
+  - preserve differentiable compositions around NEOPAX building blocks
+
+Design direction:
+- follow the same broad pattern used in `vmec_jax`:
+  - separate CLI parsing from the core runtime logic
+  - keep the direct callable API independent from argparse
+- avoid letting the CLI become the only supported user-facing entry path
+
+Current implementation checkpoint:
+- added a dedicated `NEOPAX/cli.py`
+- added `run_config(config)` and `run_config_path(path)` in `main.py`
+- `python -m NEOPAX ...` now routes through the CLI layer instead of directly hard-coding `<config.toml>` handling in `__main__.py`
+- first CLI overrides now cover:
+  - `mode`
+  - `vmec_file`
+  - `boozer_file`
+  - `n_radial`
+  - `n_x`
+  - solver backend
+  - `dt`
+  - `t_final`
+  - output directory
+  - generic dotted overrides through repeated `--set section.key=value`
+
+Primary tasks for this phase:
+- keep extending the CLI only for high-value common overrides rather than mirroring every TOML field immediately
+- document the distinction between:
+  - CLI workflow
+  - direct Python API workflow
+- add usage examples for:
+  - plain TOML execution
+  - TOML plus a few CLI overrides
+  - in-memory `run_config({...})` programmatic execution
+- decide whether later subcommands are worthwhile, for example:
+  - `neopax run ...`
+  - `neopax fluxes ...`
+  - `neopax ambipolarity ...`
+
+Scope notes:
+- keep the direct Python API as the preferred path for autodiff-sensitive workflows
+- keep CLI overrides as a thin config-layer transformation, not a second physics orchestration path
+- prefer explicit override mapping over hidden side effects
+
 ### Theta Solver Upgrade Notes
 - Status: planned
 - Scope:

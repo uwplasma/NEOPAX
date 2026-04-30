@@ -1,11 +1,7 @@
-"""
-NEOPAX module entry point: allows 'python -m NEOPAX <config.toml>'
-"""
-import sys
-from .main import main
+"""Module entry point for ``python -m NEOPAX``."""
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python -m NEOPAX <config.toml>")
-        sys.exit(1)
-    main(sys.argv[1])
+from .cli import main
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

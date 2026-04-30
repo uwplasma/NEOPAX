@@ -48,11 +48,73 @@ cd NEOPAX
 pip install .
 ```
 
-## Examples
-To run an exanmple simply do:
+## Usage
 
-'''
-python ./examples/Calculate_Fluxes/Fluxes_Calculation_comparison.py
-'''
+After installation, NEOPAX can be launched in three equivalent ways.
+
+### 1. Console script
+
+```bash
+NEOPAX examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml
+```
+
+Lowercase also works:
+
+```bash
+neopax examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml
+```
+
+### 2. Python module entry
+
+```bash
+python -m NEOPAX examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml
+```
+
+### 3. Direct Python API
+
+This is the preferred path when NEOPAX is being driven programmatically or
+embedded inside a larger JAX workflow:
+
+```python
+import NEOPAX
+
+result = NEOPAX.run(
+    "examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml",
+    backend="radau",
+    n_radial=65,
+)
+```
+
+You can also use the CLI override layer for common runtime changes:
+
+```bash
+NEOPAX examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml --mode fluxes --n-radial 65 --n-x 5
+```
+
+or generic dotted overrides:
+
+```bash
+NEOPAX my_case.toml --set turbulence.debug_heat_flux_scale=0.5 --set transport_solver.dt=1e-4
+```
+
+For the full usage guide, including:
+
+- CLI override conventions
+- direct API return objects
+- `NEOPAX.prepare_config(...)`
+- `NEOPAX.run_config(...)`
+- when to prefer CLI vs direct API
+
+see:
+
+- `docs/methods_of_use.rst`
+- `docs/getting_started.rst`
+
+## Examples
+To run an example simply do:
+
+```bash
+python examples/Calculate_Fluxes/Fluxes_Calculation.py
+```
 
 ## Contributing

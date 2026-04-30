@@ -2987,8 +2987,7 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
     return out_h5
 
 
-def main(config_path):
-    config = load_config(config_path)
+def run_config(config: dict):
     runtime, state = build_runtime_context(config)
     general = config.get("general", {})
     mode = general.get("mode", config.get("mode", "transport")).lower()
@@ -3058,6 +3057,15 @@ def main(config_path):
         return {"rho": rho, "sources": sources, "output_dir": output_dir}
 
     raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes', 'sources'.")
+
+
+def run_config_path(config_path):
+    config = load_config(config_path)
+    return run_config(config)
+
+
+def main(config_path):
+    return run_config_path(config_path)
 
 
 if __name__ == "__main__":
