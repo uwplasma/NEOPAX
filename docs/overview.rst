@@ -206,9 +206,9 @@ Built-in transport flux models
 
 The currently registered transport flux models include:
 
-- ``monkes_database``
+- ``ntx_database``
   - database-driven neoclassical model
-- ``monkes_database_with_momentum``
+- ``ntx_database_with_momentum``
   - database-driven neoclassical model with momentum-correction pathway
 - ``turbulent_analytical``
   - analytical turbulent transport model

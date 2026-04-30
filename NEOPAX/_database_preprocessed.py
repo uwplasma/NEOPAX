@@ -13,7 +13,7 @@ DEL_R = 1.0e-3
 NTSS1D_WIDTH = 16
 
 
-def _prepare_monkes_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33, *, divide_by_radius: bool = True):
+def _prepare_ntx_arrays(a_b, rho, nu_v, Er, drds, D11, D13, D33, *, divide_by_radius: bool = True):
     rho = jnp.asarray(rho)
     nu_v = jnp.asarray(nu_v)
     Er = jnp.asarray(Er)
@@ -90,9 +90,9 @@ class PreprocessedMonoenergetic3D:
     del_r: float
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
-        file = h5.File(monkes_file, "r")
-        data = _prepare_monkes_arrays(
+    def read_ntx(cls, a_b, ntx_file):
+        file = h5.File(ntx_file, "r")
+        data = _prepare_ntx_arrays(
             a_b=a_b,
             rho=file["rho"][()],
             nu_v=file["nu_v"][()],
@@ -108,7 +108,7 @@ class PreprocessedMonoenergetic3D:
 
     @classmethod
     def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
-        data = _prepare_monkes_arrays(
+        data = _prepare_ntx_arrays(
             a_b=a_b,
             rho=rho,
             nu_v=nu_v,
@@ -138,9 +138,9 @@ class PreprocessedMonoenergetic3DNTSSRadius:
     del_r: float
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
-        file = h5.File(monkes_file, "r")
-        data = _prepare_monkes_arrays(
+    def read_ntx(cls, a_b, ntx_file):
+        file = h5.File(ntx_file, "r")
+        data = _prepare_ntx_arrays(
             a_b=a_b,
             rho=file["rho"][()],
             nu_v=file["nu_v"][()],
@@ -156,7 +156,7 @@ class PreprocessedMonoenergetic3DNTSSRadius:
 
     @classmethod
     def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
-        data = _prepare_monkes_arrays(
+        data = _prepare_ntx_arrays(
             a_b=a_b,
             rho=rho,
             nu_v=nu_v,
@@ -181,9 +181,9 @@ class PreprocessedMonoenergetic3DNTSSRadiusNTSS1D(PreprocessedMonoenergetic3DNTS
     gmix_er_ntss1d: float
 
     @classmethod
-    def read_monkes(cls, a_b, monkes_file):
-        file = h5.File(monkes_file, "r")
-        data = _add_ntss1d_padding(_prepare_monkes_arrays(
+    def read_ntx(cls, a_b, ntx_file):
+        file = h5.File(ntx_file, "r")
+        data = _add_ntss1d_padding(_prepare_ntx_arrays(
             a_b=a_b,
             rho=file["rho"][()],
             nu_v=file["nu_v"][()],
@@ -199,7 +199,7 @@ class PreprocessedMonoenergetic3DNTSSRadiusNTSS1D(PreprocessedMonoenergetic3DNTS
 
     @classmethod
     def read_data(cls, a_b, rho, nu_v, Er, drds, D11, D13, D33):
-        data = _add_ntss1d_padding(_prepare_monkes_arrays(
+        data = _add_ntss1d_padding(_prepare_ntx_arrays(
             a_b=a_b,
             rho=rho,
             nu_v=nu_v,

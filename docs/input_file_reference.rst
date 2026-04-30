@@ -98,8 +98,8 @@ Typical patterns:
 .. code-block:: toml
 
     [neoclassical]
-    flux_model = "monkes_database"
-    entropy_model = "monkes_database"
+    flux_model = "ntx_database"
+    entropy_model = "ntx_database"
     neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
     interpolation_mode = "preprocessed_3d_radial_ntss1d"
 

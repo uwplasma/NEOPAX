@@ -7,7 +7,7 @@ boozer_file = "./examples/inputs/boozmn_wout_W7-X_standard_configuration.nc"
 n_radial = 51
 
 [neoclassical]
-flux_model = "monkes_database"
+flux_model = "ntx_database"
 neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_W7X.h5"
 
 [ambipolarity]

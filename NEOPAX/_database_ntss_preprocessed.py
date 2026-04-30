@@ -246,8 +246,8 @@ class NTSSPreprocessedMonoenergetic:
     xrm_fit: Float[Array, "..."]
 
     @classmethod
-    def read_monkes(cls, geometry, monkes_file):
-        file = h5.File(monkes_file, "r")
+    def read_ntx(cls, geometry, ntx_file):
+        file = h5.File(ntx_file, "r")
         rho_db = np.asarray(file["rho"][()], dtype=float)
         n_r = rho_db.shape[0]
         geom_rho = np.asarray(geometry.rho_grid, dtype=float)

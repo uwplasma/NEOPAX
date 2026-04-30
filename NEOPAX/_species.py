@@ -17,7 +17,7 @@ import interpax
 
 
 
-###This module uses some functions adapted from JAX-MONKES by R. Colin, but class structure was revamped to fit the overall package better#####
+###This module uses some functions adapted from JAX-NTX by R. Colin, but class structure was revamped to fit the overall package better#####
 
 JOULE_PER_EV = 11606 * Boltzmann
 JOULE_PER_KEV = 1.0e3 * JOULE_PER_EV

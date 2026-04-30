@@ -153,7 +153,7 @@ Expected validation in this phase:
 Known issue / parity note:
 - ambipolar `Er` initialization still shows a small NTSS mismatch concentrated in the last one to two radial points, even after:
   - pre-applying BC-corrected density/temperature state before ambipolar root finding
-  - passing right-boundary value/gradient constraints into the local `monkes_database` ambipolar flux evaluator
+  - passing right-boundary value/gradient constraints into the local `ntx_database` ambipolar flux evaluator
 - current diagnosis:
   - the bulk ambipolar profile is now close, so this is likely an outer-edge reconstruction / edge-root-evaluation parity issue rather than a full-profile neoclassical mismatch
   - transport RHS uses the boundary-aware face-flux path, while ambipolar initialization still relies on the local `get_Neoclassical_Fluxes(...)` path with internally reconstructed gradients
@@ -1023,6 +1023,67 @@ Scope notes:
 - keep CLI overrides as a thin config-layer transformation, not a second physics orchestration path
 - prefer explicit override mapping over hidden side effects
 
+### Phase 11C: Documentation Consolidation For Usage And Inputs
+- Status: in progress
+- Goal:
+  - turn the recent CLI/API and workflow refactors into a cleaner user-facing documentation set that explains how NEOPAX is used in practice
+
+Why this phase was added:
+- NEOPAX now supports:
+  - console-script execution
+  - `python -m NEOPAX`
+  - direct Python execution through `NEOPAX.run(...)`, `NEOPAX.prepare_config(...)`, and `NEOPAX.run_config(...)`
+- the documentation should make those paths easy to understand without forcing users to reverse-engineer examples or source files
+- the TOML input structure has grown enough that a dedicated reference page is now more useful than scattering section descriptions across examples
+
+Current documentation checkpoint:
+- added an overview page covering:
+  - capabilities
+  - advantages
+  - equations solved
+  - algorithms
+  - flux models
+  - source models
+  - current benchmark context
+- added a dedicated methods-of-use page covering:
+  - CLI usage
+  - `python -m NEOPAX`
+  - direct API usage
+  - common override patterns
+- added an input-file reference page documenting the main TOML sections used in current workflows
+- added a worked-examples page covering:
+  - transport
+  - ambipolarity
+  - fluxes
+  - sources
+- wired these pages into the Sphinx docs index and getting-started page
+
+Primary next tasks for this phase:
+- add a dedicated solver-backends page describing:
+  - `theta_newton`
+  - Radau
+  - Diffrax/Kvaerno usage
+  - strengths, tradeoffs, and typical use cases
+- add a dedicated physics-model page describing:
+  - flux model families
+  - source model families
+  - where file-driven versus database-driven models fit
+- improve the README so it acts as a lighter landing page and points clearly to the fuller docs pages
+- add mode-specific result-object documentation for the direct API:
+  - transport outputs
+  - ambipolarity outputs
+  - fluxes outputs
+  - sources outputs
+- later, add a short troubleshooting / diagnostics page for:
+  - common CLI mistakes
+  - missing-file issues
+  - mode-specific plotting/output expectations
+
+Scope notes:
+- keep the docs aligned with the current code rather than future designs
+- prefer practical “how to use NEOPAX today” guidance over exhaustive theory-first documentation
+- keep the CLI and direct API documented side-by-side so the project does not drift into a CLI-only presentation
+
 ### Theta Solver Upgrade Notes
 - Status: planned
 - Scope:
@@ -1171,7 +1232,7 @@ Confirmed remaining mismatches versus NTSS:
 - the positive-field high-PS / high-collisionality branch is still simplified
   - current `high_branch()` is not yet the NTSS `dkftte` fallback
 - the low-`nu`, finite-`Er` fit logic is only active when the optional fit arrays are present in the source HDF5
-- if those fit arrays are absent in the MONKES/HDF5 file, the newly added fit-aware branches fall back to defaults and therefore do not change results materially
+- if those fit arrays are absent in the NTX/HDF5 file, the newly added fit-aware branches fall back to defaults and therefore do not change results materially
 - last-radii root loss is still present
   - this is currently understood as a solver/interpolation edge mismatch, not a plotting truncation issue
 
@@ -1197,7 +1258,7 @@ Validation results recorded so far:
     - missing final tail roots at the last radii
 
 Primary remaining tasks in this phase:
-- inspect the actual HDF5 keys of the production MONKES file and confirm whether the optional fit arrays are present:
+- inspect the actual HDF5 keys of the production NTX file and confirm whether the optional fit arrays are present:
   - `lc_fit`
   - `ag11_0`
   - `ag11_sq`

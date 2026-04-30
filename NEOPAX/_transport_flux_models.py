@@ -488,7 +488,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
-class MonkesDatabaseTransportModel(TransportFluxModelBase):
+class NTXDatabaseTransportModel(TransportFluxModelBase):
     species: Any
     energy_grid: Any
     geometry: Any
@@ -1023,8 +1023,8 @@ def build_transport_flux_model(neo_model: TransportFluxModelBase,
     )
 
 register_transport_flux_model(
-    "monkes_database",
-    lambda species, energy_grid, geometry, database, collisionality_model="default", bc_density=None, bc_temperature=None: MonkesDatabaseTransportModel(
+    "ntx_database",
+    lambda species, energy_grid, geometry, database, collisionality_model="default", bc_density=None, bc_temperature=None: NTXDatabaseTransportModel(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,
@@ -1035,12 +1035,11 @@ register_transport_flux_model(
     ),
 )
 
-
 register_transport_flux_model(
-    "monkes_database_with_momentum",
+    "ntx_database_with_momentum",
     lambda species, energy_grid, geometry, database,
            density_right_constraint=None, density_right_grad_constraint=None,
-           temperature_right_constraint=None, temperature_right_grad_constraint=None: MonkesDatabaseTransportModel(
+           temperature_right_constraint=None, temperature_right_grad_constraint=None: NTXDatabaseTransportModel(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,

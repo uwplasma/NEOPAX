@@ -1353,7 +1353,7 @@ def solve_ambipolarity_roots_from_config(state, config, params, flux_model=None,
     if flux_model is None:
         from ._transport_flux_models import ZeroTransportModel, get_transport_flux_model
 
-        neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "monkes_database"))
+        neoclassical_factory = get_transport_flux_model(config.get("neoclassical", {}).get("flux_model", "ntx_database"))
         turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
         classical_factory = get_transport_flux_model(config.get("classical", {}).get("flux_model", "none")) if "classical" in config else None
 
@@ -1370,7 +1370,7 @@ def solve_ambipolarity_roots_from_config(state, config, params, flux_model=None,
     if entropy_model is None:
         entropy_model_name = neoclassical_cfg.get(
             "entropy_model",
-            params["solver_parameters"].get("neoclassical_flux_model", "monkes_database"),
+            params["solver_parameters"].get("neoclassical_flux_model", "ntx_database"),
         )
         entropy_model = get_entropy_model(entropy_model_name)
 

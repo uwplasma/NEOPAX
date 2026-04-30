@@ -225,4 +225,4 @@ def test_calculate_fluxes_from_config_uses_flux_output_flags():
 
 
 def test_fluxes_r_file_entropy_alias_is_registered():
-    assert get_entropy_model("fluxes_r_file") is get_entropy_model("monkes_database")
+    assert get_entropy_model("fluxes_r_file") is get_entropy_model("ntx_database")

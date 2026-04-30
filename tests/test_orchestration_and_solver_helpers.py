@@ -197,7 +197,7 @@ def test_extract_right_constraints_handles_bc_types():
     assert jnp.allclose(rg, jnp.array([-1.0, -1.0]))
 
 
-def test_monkes_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
+def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     species = _dummy_species()
     geometry = SimpleNamespace()
     state = _dummy_state()
@@ -225,7 +225,7 @@ def test_monkes_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch)
 
     bc_density = BoundaryConditionModel(dr=1.0, right_type="neumann", right_gradient=jnp.array([0.1, 0.2, 0.3]))
     bc_temperature = BoundaryConditionModel(dr=1.0, right_type="dirichlet", right_value=jnp.array([5.0, 6.0, 7.0]))
-    model = flux_models_module.MonkesDatabaseTransportModel(
+    model = flux_models_module.NTXDatabaseTransportModel(
         species=species,
         energy_grid="grid",
         geometry=geometry,

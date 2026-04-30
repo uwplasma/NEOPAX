@@ -94,19 +94,19 @@ class Monoenergetic:
 
 
     @classmethod
-    def read_monkes(cls,
+    def read_ntx(cls,
         a_b,                    
-        monkes_file,
+        ntx_file,
     ):
         """Construct Field from BOOZ_XFORM file.
 
         Parameters
         ----------
-        monkes_file : path-like
+        ntx_file : path-like
             Path to vmec wout file.
         """
 
-        file=h5.File(monkes_file ,'r')
+        file=h5.File(ntx_file ,'r')
         D11=file['D11'][()]
         D13=file['D13'][()]
         D33=file['D33'][()]
@@ -163,7 +163,7 @@ class Monoenergetic:
 
         Parameters
         ----------
-        monkes_file : path-like
+        ntx_file : path-like
             Path to vmec wout file.
         """
 
@@ -195,7 +195,7 @@ class Monoenergetic:
         return cls(**data)
 
 #    @classmethod
-#    def run_monkes(cls,
+#    def run_ntx(cls,
 #        a_b,                    
 #        vmec_file,
 #        field_neopax
@@ -229,13 +229,13 @@ class Monoenergetic:
         #Use internal solve as we do not care for species information in the monoenergetic database
         #Using normal for loop here as it serves only for benchmark-> put into vmap to speed up in real calculations
     #    for si in range(len(rho)):
-    #        field_monkes = monkes.Field.from_vmec_s(vmec_file, rho[si]**2, nt, nz)  
+    #        field_ntx = ntx.Field.from_vmec_s(vmec_file, rho[si]**2, nt, nz)  
     #        for j in range(len(nu_v)):       
     #            for i in range(len(Er_tilde)):
     #                #Here we use input 
     #                Es[si,i]=Er_tilde[i]*dr_tildeds[si]*B00_rho[si] #Notice we need to multiply by B00 and dr_tildeds factors due to IPP DKES weird coordinates
     #                #Calculate one Dij matrix 
-    #                Dij, f, s = monkes._core.monoenergetic_dke_solve_internal(field, nl=nl, Erhat=Es[si,i],nuhat=nu_v[j])
+    #                Dij, f, s = ntx._core.monoenergetic_dke_solve_internal(field, nl=nl, Erhat=Es[si,i],nuhat=nu_v[j])
     #                D11[si,j,i]=Dij[0,0]
     #                D13[si,j,i]=Dij[0,2]
     #                D31[si,j,i]=Dij[2,0]

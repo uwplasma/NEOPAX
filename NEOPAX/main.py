@@ -154,16 +154,16 @@ def _build_database(config: dict, geometry):
             config.get("neoclassical", {}).get("interpolation_mode", "generic")
         ).strip().lower()
         if interp_mode == "preprocessed_ntss":
-            return NTSSPreprocessedMonoenergetic.read_monkes(geometry, neoclassical_file)
+            return NTSSPreprocessedMonoenergetic.read_ntx(geometry, neoclassical_file)
         if interp_mode == "preprocessed_3d":
-            return PreprocessedMonoenergetic3D.read_monkes(geometry.a_b, neoclassical_file)
+            return PreprocessedMonoenergetic3D.read_ntx(geometry.a_b, neoclassical_file)
         if interp_mode == "preprocessed_3d_radial":
-            return PreprocessedMonoenergetic3DNTSSRadius.read_monkes(geometry.a_b, neoclassical_file)
+            return PreprocessedMonoenergetic3DNTSSRadius.read_ntx(geometry.a_b, neoclassical_file)
         if interp_mode == "preprocessed_3d_radial_ntss1d":
-            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1D.read_monkes(geometry.a_b, neoclassical_file)
+            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1D.read_ntx(geometry.a_b, neoclassical_file)
         if interp_mode == "preprocessed_3d_ntss1d_fixed":
-            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU.read_monkes(geometry.a_b, neoclassical_file)
-        return Monoenergetic.read_monkes(geometry.a_b, neoclassical_file)
+            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU.read_ntx(geometry.a_b, neoclassical_file)
+        return Monoenergetic.read_ntx(geometry.a_b, neoclassical_file)
     return None
 
 
@@ -334,7 +334,7 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
     model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
     entropy_model_name = config.get("neoclassical", {}).get(
         "entropy_model",
-        runtime.solver_parameters.get("neoclassical_flux_model", "monkes_database"),
+        runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
     )
     entropy_model = get_entropy_model(entropy_model_name)
     params = {
@@ -450,7 +450,7 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             species_names=species.names,
         )
 
-    neoclassical_name = _model_name(neoclassical_cfg, "monkes_database")
+    neoclassical_name = _model_name(neoclassical_cfg, "ntx_database")
     neoclassical_factory = get_transport_flux_model(neoclassical_name)
     turbulence_cfg = config.get("turbulence", {})
     turbulence_name = _model_name(turbulence_cfg, "none")
@@ -609,7 +609,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
         entropy_model_name = config.get("neoclassical", {}).get(
             "entropy_model",
-            runtime.solver_parameters.get("neoclassical_flux_model", "monkes_database"),
+            runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
         )
         entropy_model = get_entropy_model(entropy_model_name)
         _, _, best_roots, _, = solve_ambipolarity_roots_radial(

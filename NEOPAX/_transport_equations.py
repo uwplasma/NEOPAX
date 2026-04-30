@@ -1176,9 +1176,9 @@ def build_equation_system_from_config(config, species):
     database = None
     neoclassical_file = neoclassical_cfg.get("neoclassical_file")
     if neoclassical_file and field is not None:
-        database = Monoenergetic.read_monkes(field.a_b, neoclassical_file)
+        database = Monoenergetic.read_ntx(field.a_b, neoclassical_file)
 
-    neoclassical_factory = get_transport_flux_model(neoclassical_cfg.get("flux_model", "monkes_database"))
+    neoclassical_factory = get_transport_flux_model(neoclassical_cfg.get("flux_model", "ntx_database"))
     turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
     classical_factory = get_transport_flux_model(config.get("classical", {}).get("flux_model", "none")) if "classical" in config else None
     neoclassical_model = neoclassical_factory(species, energy_grid, field, database)

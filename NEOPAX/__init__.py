@@ -65,12 +65,6 @@ def run_config_path(*args, **kwargs):
     return _run_config_path(*args, **kwargs)
 
 
-def main(*args, **kwargs):
-    from .main import main as _main
-
-    return _main(*args, **kwargs)
-
-
 __all__ = [
     "__version__",
     "__version_tuple__",
@@ -114,5 +108,4 @@ __all__ = [
     "run",
     "run_config",
     "run_config_path",
-    "main",
 ]

@@ -19,14 +19,14 @@ def test_normalize_solver_config_prefers_transport_solver_section():
         "solver": {
             "integrator": "radau",
         },
-        "neoclassical": {"flux_model": "monkes_database"},
+        "neoclassical": {"flux_model": "ntx_database"},
         "turbulence": {"flux_model": "none"},
     }
 
     out = _normalize_solver_config(config)
     assert out["transport_solver_backend"] == "theta_newton"
     assert out["integrator"] == "theta_newton"
-    assert out["neoclassical_flux_model"] == "monkes_database"
+    assert out["neoclassical_flux_model"] == "ntx_database"
     assert out["turbulence_flux_model"] == "none"
     assert out["density_floor"] == 2.5e-6
     assert out["Er_relax"] == 1.0

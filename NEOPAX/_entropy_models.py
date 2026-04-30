@@ -18,8 +18,8 @@ def get_entropy_model(name: str) -> Callable[..., float]:
         raise ValueError(f"Unknown entropy model '{name}'.")
     return ENTROPY_MODEL_REGISTRY[key]
 
-# Example: Monkes-style entropy (sum of |Gamma|)
-def monkes_database_entropy(state, fluxes, **kwargs):
+# Example: NTX-style entropy (sum of |Gamma|)
+def ntx_database_entropy(state, fluxes, **kwargs):
     # Assume fluxes is a dict with 'Gamma_total' (shape: [species, ...])
     # and state has 'species' with 'charge_qp' attribute
     Gamma = fluxes.get("Gamma_total")
@@ -33,9 +33,9 @@ try:
 except ImportError:
     import numpy as jnp
 
-register_entropy_model("monkes_database", monkes_database_entropy)
+register_entropy_model("ntx_database", ntx_database_entropy)
 # Flux-file transport currently uses the same simple ambipolar entropy proxy:
 # sum over absolute species particle fluxes. Registering this alias keeps
 # entropy-model resolution consistent when [neoclassical].flux_model is set
 # to "fluxes_r_file".
-register_entropy_model("fluxes_r_file", monkes_database_entropy)
+register_entropy_model("fluxes_r_file", ntx_database_entropy)
