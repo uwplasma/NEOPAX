@@ -1418,8 +1418,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        radius_indices = jnp.arange(Er.shape[0], dtype=jnp.int32)
 
-        def _per_radius(prepared, drds_value, er_value, temperature_local, density_local, vthermal_local):
+        def _per_radius(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
             return jax.vmap(
                 lambda species_index: self._solve_lij_prepared_local(
                     prepared,
@@ -1433,14 +1443,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.vmap(_per_radius)(
-            support.center_prepared,
-            support.center_channels.drds,
-            Er,
-            jnp.swapaxes(temperature, 0, 1),
-            jnp.swapaxes(density, 0, 1),
-            jnp.swapaxes(v_thermal, 0, 1),
-        )
+        lij_by_radius = jax.vmap(_per_radius)(radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
@@ -1448,8 +1451,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal_faces = get_v_thermal(self.species.mass, temperature_faces)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        radius_indices = jnp.arange(Er_faces.shape[0], dtype=jnp.int32)
 
-        def _per_radius(prepared, drds_value, er_value, temperature_local, density_local, vthermal_local):
+        def _per_radius(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.face_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(support.face_channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(Er_faces, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature_faces, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density_faces, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal_faces, radius_index, axis=1, keepdims=False)
             return jax.vmap(
                 lambda species_index: self._solve_lij_prepared_local(
                     prepared,
@@ -1463,14 +1476,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.vmap(_per_radius)(
-            support.face_prepared,
-            support.face_channels.drds,
-            Er_faces,
-            jnp.swapaxes(temperature_faces, 0, 1),
-            jnp.swapaxes(density_faces, 0, 1),
-            jnp.swapaxes(v_thermal_faces, 0, 1),
-        )
+        lij_by_radius = jax.vmap(_per_radius)(radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
@@ -1568,8 +1574,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
-        def _per_radius(prepared, drds_value, er_value, temperature_local, density_local, vthermal_local):
+        def _per_radius(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
             return jax.vmap(
                 lambda species_index: self._build_coefficient_response_local(
                     prepared,
@@ -1583,14 +1599,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        response_by_radius = jax.vmap(_per_radius)(
-            support.center_prepared,
-            support.center_channels.drds,
-            state.Er,
-            jnp.swapaxes(temperature, 0, 1),
-            jnp.swapaxes(density, 0, 1),
-            jnp.swapaxes(v_thermal, 0, 1),
-        )
+        response_by_radius = jax.vmap(_per_radius)(radius_indices)
         center_response = jax.tree_util.tree_map(lambda arr: jnp.swapaxes(arr, 0, 1), response_by_radius)
         return NTXExactLijLaggedResponse(center_response=center_response)
 
@@ -1643,7 +1652,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         delta_nu_hat = current_nu_hat - center_response.reference_nu_hat
         delta_epsi_hat = current_epsi_hat - center_response.reference_epsi_hat
 
-        def _coeff_tangent_per_radius(prepared, ref_nu_radius, ref_epsi_radius, delta_nu_radius, delta_epsi_radius):
+        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+        def _coeff_tangent_per_radius(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            ref_nu_radius = jax.lax.dynamic_index_in_dim(jnp.swapaxes(center_response.reference_nu_hat, 0, 1), radius_index, axis=0, keepdims=False)
+            ref_epsi_radius = jax.lax.dynamic_index_in_dim(jnp.swapaxes(center_response.reference_epsi_hat, 0, 1), radius_index, axis=0, keepdims=False)
+            delta_nu_radius = jax.lax.dynamic_index_in_dim(jnp.swapaxes(delta_nu_hat, 0, 1), radius_index, axis=0, keepdims=False)
+            delta_epsi_radius = jax.lax.dynamic_index_in_dim(jnp.swapaxes(delta_epsi_hat, 0, 1), radius_index, axis=0, keepdims=False)
             return jax.vmap(
                 lambda ref_nu_species, ref_epsi_species, delta_nu_species, delta_epsi_species: jax.jvp(
                     lambda nu_hat_a, epsi_hat_a: self._coefficient_scan_from_inputs(prepared, nu_hat_a, epsi_hat_a),
@@ -1652,13 +1671,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )[1]
             )(ref_nu_radius, ref_epsi_radius, delta_nu_radius, delta_epsi_radius)
 
-        coeff_tangent_by_radius = jax.vmap(_coeff_tangent_per_radius)(
-            support.center_prepared,
-            jnp.swapaxes(center_response.reference_nu_hat, 0, 1),
-            jnp.swapaxes(center_response.reference_epsi_hat, 0, 1),
-            jnp.swapaxes(delta_nu_hat, 0, 1),
-            jnp.swapaxes(delta_epsi_hat, 0, 1),
-        )
+        coeff_tangent_by_radius = jax.vmap(_coeff_tangent_per_radius)(radius_indices)
         coeff_scan = center_response.reference_coeff_scan + jnp.swapaxes(coeff_tangent_by_radius, 0, 1)
 
         drds_species = jnp.broadcast_to(
