@@ -232,6 +232,13 @@ class LinearizedTransportFluxResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class JVPTransportFluxResponse:
+        reference_state: Any
+        reference_flux: dict
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class NTXPreparedCoefficientResponse:
         reference_coeff_scan: jax.Array
         reference_nu_hat: jax.Array
@@ -2311,6 +2318,31 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
         upar = jnp.zeros_like(gamma)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        return JVPTransportFluxResponse(
+            reference_state=state,
+            reference_flux=self(state),
+        )
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del kwargs
+        delta_state = jax.tree_util.tree_map(
+            lambda current, reference: current - reference,
+            state,
+            lagged_response.reference_state,
+        )
+        tangent_flux = jax.jvp(
+            self.__call__,
+            (lagged_response.reference_state,),
+            (delta_state,),
+        )[1]
+        return jax.tree_util.tree_map(
+            lambda reference, tangent: reference + tangent,
+            lagged_response.reference_flux,
+            tangent_flux,
+        )
+
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
@@ -2402,6 +2434,31 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         q = -(DENSITY_STATE_TO_PHYSICAL * face_state.density) * heat_coeff * dTdr_faces
         upar = jnp.zeros_like(gamma)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        return JVPTransportFluxResponse(
+            reference_state=state,
+            reference_flux=self(state),
+        )
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del kwargs
+        delta_state = jax.tree_util.tree_map(
+            lambda current, reference: current - reference,
+            state,
+            lagged_response.reference_state,
+        )
+        tangent_flux = jax.jvp(
+            self.__call__,
+            (lagged_response.reference_state,),
+            (delta_state,),
+        )[1]
+        return jax.tree_util.tree_map(
+            lambda reference, tangent: reference + tangent,
+            lagged_response.reference_flux,
+            tangent_flux,
+        )
 
 
 # --- PATCH: Accept [neoclassical]/flux_model and [turbulence]/model as defaults ---
