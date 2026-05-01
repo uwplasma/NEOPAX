@@ -172,6 +172,9 @@ def main():
     print("rhs_mode                 mean_s     best_s     n_steps  accepted  failed  fail_code  final_t   max|delta|")
     print("-" * 108)
     for row in mode_results:
+        final_time_str = str(None if row["final_time"] is None else round(row["final_time"], 6))
+        final_delta = row["final_state_max_abs_delta_vs_first"]
+        final_delta_str = "None" if final_delta is None else f"{final_delta:.3e}"
         print(
             f"{row['rhs_mode']:<23}"
             f"{row['mean_wall_seconds']:>10.3f}"
@@ -180,8 +183,8 @@ def main():
             f"{str(row['accepted_steps']):>10}"
             f"{str(row['failed']):>8}"
             f"{str(row['fail_code']):>11}"
-            f"{str(None if row['final_time'] is None else round(row['final_time'], 6)):>10}"
-            f"{str(None if row['final_state_max_abs_delta_vs_first'] is None else f'{row['final_state_max_abs_delta_vs_first']:.3e}'):>14}"
+            f"{final_time_str:>10}"
+            f"{final_delta_str:>14}"
         )
 
 

@@ -534,7 +534,8 @@ def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, data
     L13_fac_a=-1./jnp.sqrt(jnp.pi)*(species.mass[index_species]/species.charge[index_species])*vth_a**2#*B00(r_grid[r_index])
     L33_fac_a=-1./jnp.sqrt(jnp.pi)*vth_a#*B00(r_grid[r_index])    
     #Interpolate D11's, D13's and D33's 
-    Dij=jax.vmap(get_Dij,in_axes=(None,0,0,None))(geometry.r_grid[r_index],nu_vnew_a,Er_vnew_a,database)
+    kernel = monoenergetic_interpolation_kernel(database)
+    Dij = jax.vmap(kernel, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
     D11_a=-10**Dij.at[:,0].get()###+4.*nu_vnew_a/3.
     D13_a=-Dij.at[:,1].get()
     D33_a=-jnp.true_divide(Dij.at[:,2].get(),nu_vnew_a)
