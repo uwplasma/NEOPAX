@@ -53,7 +53,7 @@ chi_temperature = [0.0065, 0.0065, 0.0065]
 flux_model = "none"
 
 [energy_grid]
-n_x = 3
+n_x = 4
 
 [species]
 n_species = 3

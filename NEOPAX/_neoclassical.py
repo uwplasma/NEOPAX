@@ -8,25 +8,8 @@ from jax import jit
 import jax.numpy as jnp
 import lineax
 import interpax
+from typing import Any, Callable
 from ._constants import elementary_charge, epsilon_0
-from ._database_ntss_preprocessed import (
-    NTSSPreprocessedMonoenergetic,
-)
-from ._database_preprocessed import (
-    PreprocessedMonoenergetic3D,
-    PreprocessedMonoenergetic3DNTSSRadius,
-    PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
-    PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
-)
-from ._interpolators_ntss_preprocessed import (
-    get_Dij_ntss_preprocessed,
-)
-from ._interpolators_preprocessed import (
-    get_Dij_preprocessed_3d,
-    get_Dij_preprocessed_3d_ntss_radius,
-    get_Dij_preprocessed_3d_ntss_radius_ntss1d,
-    get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu,
-)
 from ._species import (
     COULOMB_LOG_MODEL_DEFAULT,
     COULOMB_LOG_MODEL_FIRST_PRINCIPLES,
@@ -38,7 +21,16 @@ from ._species import (
     collisionality_ntss_zeff,
     collisionality_ntss_zeff_local,
 )
-from ._interpolators import get_Dij
+from ._monoenergetic import (
+    MONOENERGETIC_KIND_GENERIC,
+    MONOENERGETIC_KIND_PREPROCESSED_3D,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
+    MONOENERGETIC_KIND_PREPROCESSED_NTSS,
+    monoenergetic_database_kind,
+)
+from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 from ._state import get_v_thermal
@@ -74,26 +66,6 @@ def _as_species_constraint(arr, n_species):
     if out.shape[0] < n_species:
         out = jnp.pad(out, (0, n_species - out.shape[0]), mode="edge")
     return out[:n_species]
-
-
-def _uses_preprocessed_3d(database):
-    return isinstance(database, PreprocessedMonoenergetic3D)
-
-
-def _uses_preprocessed_3d_ntss_radius(database):
-    return isinstance(database, PreprocessedMonoenergetic3DNTSSRadius)
-
-
-def _uses_preprocessed_3d_ntss_radius_ntss1d(database):
-    return isinstance(database, PreprocessedMonoenergetic3DNTSSRadiusNTSS1D)
-
-
-def _uses_preprocessed_3d_ntss_radius_ntss1d_fixednu(database):
-    return isinstance(database, PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU)
-
-
-def _uses_ntss_preprocessed(database):
-    return isinstance(database, NTSSPreprocessedMonoenergetic)
 
 
 def _collisionality_kind(collisionality_model: str | None) -> int:
@@ -219,17 +191,12 @@ def _nu_over_vnew_local(
         operand=None,
     )
 
-@jit
-def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
+
+def _assemble_lij_matrix(species, energy_grid, index_species, vth_a, nu_vnew_a, Dij):
     Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
     L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
     L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
     L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
     D11_a = -(10**Dij.at[:, 0].get())
     D13_a = -Dij.at[:, 1].get()
     D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
@@ -243,58 +210,73 @@ def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_in
     Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
     Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
     return Lij
+
+
+def _interpolated_lij_matrix(
+    species,
+    energy_grid,
+    database,
+    index_species,
+    radius_value,
+    Er_value,
+    vth_a,
+    nu_vnew_a,
+):
+    v_new_a = energy_grid.v_norm * vth_a
+    Er_vnew_a = Er_value * 1.0e3 / v_new_a
+    kernel = monoenergetic_interpolation_kernel(database)
+    Dij = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
+    return _assemble_lij_matrix(species, energy_grid, index_species, vth_a, nu_vnew_a, Dij)
+
+@jit
+def get_Lij_matrix(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
+    vth_a = v_thermal[index_species, r_index]
+    v_new_a = energy_grid.v_norm * vth_a
+    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
+    return _interpolated_lij_matrix(
+        species,
+        energy_grid,
+        database,
+        index_species,
+        geometry.r_grid[r_index],
+        Er[r_index],
+        vth_a,
+        nu_vnew_a,
+    )
 
 
 @jit
 def get_Lij_matrix_local(species, energy_grid, geometry, database, index_species, r_index, Er_value, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
     vth_a = v_thermal[index_species, r_index]
     v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
     nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
+    return _interpolated_lij_matrix(
+        species,
+        energy_grid,
+        database,
+        index_species,
+        geometry.r_grid[r_index],
+        Er_value,
+        vth_a,
+        nu_vnew_a,
+    )
 
 
 @jit
 def get_Lij_matrix_at_radius(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
     vth_a = v_thermal_local[index_species]
     v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
     nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
+    return _interpolated_lij_matrix(
+        species,
+        energy_grid,
+        database,
+        index_species,
+        radius_value,
+        Er_value,
+        vth_a,
+        nu_vnew_a,
+    )
 
 
 @jit
@@ -445,1114 +427,24 @@ def _get_Neoclassical_Fluxes_Faces_generic(
     )
     return Lij_faces, Gamma, Q, Upar
 
-
-@jit
-def _get_Lij_matrix_preprocessed(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_at_radius_preprocessed(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal_local[index_species]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-def _get_Lij_matrix_ntss_preprocessed(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_ntss_preprocessed, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_preprocessed_3d_ntss_radius(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_preprocessed_3d_ntss_radius_ntss1d(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius_ntss1d, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_preprocessed_3d_ntss_radius_ntss1d_fixednu(species, energy_grid, geometry, database, index_species, r_index, Er, temperature, density, v_thermal, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal[index_species, r_index]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er[r_index] * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew(species, index_species, v_new_a, r_index, density, temperature, v_thermal, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu, in_axes=(None, 0, 0, None))(geometry.r_grid[r_index], nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-def _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal_local[index_species]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius_ntss1d(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal_local[index_species]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius_ntss1d, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius_ntss1d_fixednu(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal_local[index_species]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-def _ntss_radius_stencil_indices(xri, arr, del_r):
-    exact_mask = jnp.abs(xri - arr) <= del_r
-    exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
-    is_exact = jnp.any(exact_mask)
-    nil = jnp.where(
-        xri < arr[1],
-        0,
-        jnp.where(
-            xri >= arr[arr.shape[0] - 2],
-            arr.shape[0] - 3,
-            jnp.searchsorted(arr[2:arr.shape[0] - 1], xri, side="left"),
-        ),
-    )
-    noi = jnp.where((xri < arr[1]) | (xri >= arr[arr.shape[0] - 2]), 3, 4)
-    nil = jnp.where(is_exact, exact_idx, nil)
-    noi = jnp.where(is_exact, 1, noi)
-    stencil_idx = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), arr.shape[0] - 1)
-    return stencil_idx, nil, noi
-
-
-def _ntss_radius_blend_values(xri, arr, atc, nil, noi):
-    def exact():
-        return atc[0]
-
-    def small_r():
-        xr2 = xri * xri
-        xr3 = xr2 * xri
-        r1 = arr[0]
-        r2 = arr[1]
-        r3 = arr[2]
-        r12 = r1 * r1
-        r22 = r2 * r2
-        r32 = r3 * r3
-        r13 = r1 * r12
-        r23 = r2 * r22
-        r33 = r3 * r32
-
-        def comp(v0, v1, v2):
-            ha = ((v2 - v1) / (r33 - r23) - (v2 - v0) / (r33 - r13)) / (
-                (r32 - r22) / (r33 - r23) - (r32 - r12) / (r33 - r13)
-            )
-            hb = ((v2 - v1) / (r32 - r22) - (v2 - v0) / (r32 - r12)) / (
-                (r33 - r23) / (r32 - r22) - (r33 - r13) / (r32 - r12)
-            )
-            hg = v0 - r12 * ha - r13 * hb
-            return hg + xr2 * ha + xr3 * hb
-
-        return jnp.asarray(
-            [
-                comp(atc[0, 0], atc[1, 0], atc[2, 0]),
-                comp(atc[0, 1], atc[1, 1], atc[2, 1]),
-                comp(atc[0, 2], atc[1, 2], atc[2, 2]),
-            ]
-        )
-
-    def edge3():
-        x0 = arr[nil]
-        x1 = arr[nil + 1]
-        x2 = arr[nil + 2]
-
-        def lagrange3(y0, y1, y2):
-            h0 = (xri - x1) * (xri - x2) / ((x0 - x1) * (x0 - x2))
-            h1 = (xri - x0) * (xri - x2) / ((x1 - x0) * (x1 - x2))
-            h2 = (xri - x0) * (xri - x1) / ((x2 - x0) * (x2 - x1))
-            return h0 * y0 + h1 * y1 + h2 * y2
-
-        return jnp.asarray(
-            [
-                lagrange3(atc[0, 0], atc[1, 0], atc[2, 0]),
-                lagrange3(atc[0, 1], atc[1, 1], atc[2, 1]),
-                lagrange3(atc[0, 2], atc[1, 2], atc[2, 2]),
-            ]
-        )
-
-    def interior4():
-        x0 = arr[nil]
-        x1 = arr[nil + 1]
-        x2 = arr[nil + 2]
-        x3 = arr[nil + 3]
-
-        def lagrange4(y0, y1, y2, y3):
-            h0 = (xri - x1) * (xri - x2) * (xri - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3))
-            h1 = (xri - x0) * (xri - x2) * (xri - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3))
-            h2 = (xri - x0) * (xri - x1) * (xri - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3))
-            h3 = (xri - x0) * (xri - x1) * (xri - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2))
-            return h0 * y0 + h1 * y1 + h2 * y2 + h3 * y3
-
-        return jnp.asarray(
-            [
-                lagrange4(atc[0, 0], atc[1, 0], atc[2, 0], atc[3, 0]),
-                lagrange4(atc[0, 1], atc[1, 1], atc[2, 1], atc[3, 1]),
-                lagrange4(atc[0, 2], atc[1, 2], atc[2, 2], atc[3, 2]),
-            ]
-        )
-
-    return jax.lax.cond(
-        noi == 1,
-        exact,
-        lambda: jax.lax.cond(
-            xri < arr[1],
-            small_r,
-            lambda: jax.lax.cond((xri >= arr[arr.shape[0] - 2]) | (noi == 3), edge3, interior4),
-        ),
-    )
-
-
-@jit
-def _get_Lij_matrix_at_radius_ntss_preprocessed(species, energy_grid, geometry, database, index_species, radius_value, Er_value, temperature_local, density_local, v_thermal_local, collisionality_kind=COLLISIONALITY_MODEL_DEFAULT):
-    Lij = jnp.zeros((3, 3))
-    vth_a = v_thermal_local[index_species]
-    v_new_a = energy_grid.v_norm * vth_a
-    Er_vnew_a = Er_value * 1.0e3 / v_new_a
-    nu_vnew_a = _nu_over_vnew_local(species, index_species, v_new_a, density_local, temperature_local, v_thermal_local, collisionality_kind)
-    L11_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
-    L13_fac_a = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
-    L33_fac_a = -1.0 / jnp.sqrt(jnp.pi) * vth_a
-    Dij = jax.vmap(get_Dij_ntss_preprocessed, in_axes=(None, 0, 0, None))(radius_value, nu_vnew_a, Er_vnew_a, database)
-    D11_a = -(10**Dij.at[:, 0].get())
-    D13_a = -Dij.at[:, 1].get()
-    D33_a = -jnp.true_divide(Dij.at[:, 2].get(), nu_vnew_a)
-    Lij = Lij.at[0, 0].set(L11_fac_a * jnp.sum(energy_grid.L11_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 1].set(L11_fac_a * jnp.sum(energy_grid.L12_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[1, 0].set(Lij.at[0, 1].get())
-    Lij = Lij.at[1, 1].set(L11_fac_a * jnp.sum(energy_grid.L22_weight * energy_grid.xWeights * D11_a))
-    Lij = Lij.at[0, 2].set(L13_fac_a * jnp.sum(energy_grid.L13_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[1, 2].set(L13_fac_a * jnp.sum(energy_grid.L23_weight * energy_grid.xWeights * D13_a))
-    Lij = Lij.at[2, 0].set(-Lij.at[0, 2].get())
-    Lij = Lij.at[2, 1].set(-Lij.at[1, 2].get())
-    Lij = Lij.at[2, 2].set(L33_fac_a * jnp.sum(energy_grid.L33_weight * energy_grid.xWeights * D33_a))
-    return Lij
-
-
-@jit
-def _get_Neoclassical_Fluxes_preprocessed(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        density_phys = DENSITY_STATE_TO_PHYSICAL * density
-        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
-        return Gamma, Q, Upar
-
-    Lij = jax.vmap(
-        lambda a: jax.vmap(
-            lambda r: _get_Lij_matrix_preprocessed(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal, collisionality_kind),
-            in_axes=(0),
-        )(geometry.full_grid_indices),
-        in_axes=(0),
-    )(species.species_indices)
-    results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
-        Lij,
-        temperature,
-        density,
-        Er,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    Gamma, Q, Upar = results
-    return Lij, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_Faces_preprocessed(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er_faces,
-    temperature_faces,
-    density_faces,
-    dndr_faces,
-    dTdr_faces,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
-    radius_values = geometry.r_grid_half
-
-    Lij_faces = jax.vmap(
-        lambda a: jax.vmap(
-            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: _get_Lij_matrix_at_radius_preprocessed(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                a,
-                radius_value,
-                er_value,
-                temperature_local,
-                density_local,
-                vthermal_local,
-                collisionality_kind,
-            ),
-            in_axes=(0, 0, 1, 1, 1),
-        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
-        in_axes=(0,),
-    )(species.species_indices)
-
-    A1 = jax.vmap(
-        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
-        ),
-        in_axes=(0, 0, 0, 0, 0),
-    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
-    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
-    A3 = get_Thermodynamical_Forces_A3(Er_faces)
-
-    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
-    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
-
-    Gamma = -density_phys * (
-        Lij_faces[:, :, 0, 0] * A1
-        + Lij_faces[:, :, 0, 1] * A2
-        + Lij_faces[:, :, 0, 2] * A3[None, :]
-    )
-    Q = -temperature_phys * density_phys * (
-        Lij_faces[:, :, 1, 0] * A1
-        + Lij_faces[:, :, 1, 1] * A2
-        + Lij_faces[:, :, 1, 2] * A3[None, :]
-    )
-    Upar = -density_phys * (
-        Lij_faces[:, :, 2, 0] * A1
-        + Lij_faces[:, :, 2, 1] * A2
-        + Lij_faces[:, :, 2, 2] * A3[None, :]
-    )
-    return Lij_faces, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_ntss_preprocessed(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        density_phys = DENSITY_STATE_TO_PHYSICAL * density
-        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
-        return Gamma, Q, Upar
-
-    Lij = jax.vmap(
-        lambda a: jax.vmap(
-            lambda r: _get_Lij_matrix_ntss_preprocessed(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal, collisionality_kind),
-            in_axes=(0),
-        )(geometry.full_grid_indices),
-        in_axes=(0),
-    )(species.species_indices)
-    results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
-        Lij,
-        temperature,
-        density,
-        Er,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    Gamma, Q, Upar = results
-    return Lij, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        density_phys = DENSITY_STATE_TO_PHYSICAL * density
-        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
-        return Gamma, Q, Upar
-
-    Lij = jax.vmap(
-        lambda a: jax.vmap(
-            lambda r: _get_Lij_matrix_preprocessed_3d_ntss_radius(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal, collisionality_kind),
-            in_axes=(0),
-        )(geometry.full_grid_indices),
-        in_axes=(0),
-    )(species.species_indices)
-    results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
-        Lij,
-        temperature,
-        density,
-        Er,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    Gamma, Q, Upar = results
-    return Lij, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius_ntss1d(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        density_phys = DENSITY_STATE_TO_PHYSICAL * density
-        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
-        return Gamma, Q, Upar
-
-    Lij = jax.vmap(
-        lambda a: jax.vmap(
-            lambda r: _get_Lij_matrix_preprocessed_3d_ntss_radius_ntss1d(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal, collisionality_kind),
-            in_axes=(0),
-        )(geometry.full_grid_indices),
-        in_axes=(0),
-    )(species.species_indices)
-    results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
-        Lij,
-        temperature,
-        density,
-        Er,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    Gamma, Q, Upar = results
-    return Lij, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius_ntss1d_fixednu(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er,
-    temperature,
-    density,
-    density_right_constraint=None,
-    density_right_grad_constraint=None,
-    temperature_right_constraint=None,
-    temperature_right_grad_constraint=None,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = geometry.r_grid
-    r_grid_half = geometry.r_grid_half
-    dr = geometry.dr
-
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(density_right_constraint, n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(temperature_right_constraint, n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    def get_Neoclassical_Fluxes_internal(a, Lij, temperature, density, Er, n_rc, n_rg, t_rc, t_rg):
-        dndr = get_gradient_density(
-            density,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=n_rc,
-            right_face_grad_constraint=n_rg,
-        )
-        dTdr = get_gradient_temperature(
-            temperature,
-            r_grid,
-            r_grid_half,
-            dr,
-            right_face_constraint=t_rc,
-            right_face_grad_constraint=t_rg,
-        )
-        A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
-        A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        density_phys = DENSITY_STATE_TO_PHYSICAL * density
-        temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-        Gamma = -density_phys * (Lij[:, 0, 0] * A1 + Lij[:, 0, 1] * A2 + Lij[:, 0, 2] * A3)
-        Q = -temperature_phys * density_phys * (Lij[:, 1, 0] * A1 + Lij[:, 1, 1] * A2 + Lij[:, 1, 2] * A3)
-        Upar = -density_phys * (Lij[:, 2, 0] * A1 + Lij[:, 2, 1] * A2 + Lij[:, 2, 2] * A3)
-        return Gamma, Q, Upar
-
-    Lij = jax.vmap(
-        lambda a: jax.vmap(
-            lambda r: _get_Lij_matrix_preprocessed_3d_ntss_radius_ntss1d_fixednu(species, energy_grid, geometry, database, a, r, Er, temperature, density, v_thermal, collisionality_kind),
-            in_axes=(0),
-        )(geometry.full_grid_indices),
-        in_axes=(0),
-    )(species.species_indices)
-    results = jax.vmap(get_Neoclassical_Fluxes_internal, in_axes=(0, 0, 0, 0, None, 0, 0, 0, 0))(
-        species.species_indices,
-        Lij,
-        temperature,
-        density,
-        Er,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    Gamma, Q, Upar = results
-    return Lij, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_Faces_ntss_preprocessed(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er_faces,
-    temperature_faces,
-    density_faces,
-    dndr_faces,
-    dTdr_faces,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
-    radius_values = geometry.r_grid_half
-
-    Lij_faces = jax.vmap(
-        lambda a: jax.vmap(
-            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: _get_Lij_matrix_at_radius_ntss_preprocessed(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                a,
-                radius_value,
-                er_value,
-                temperature_local,
-                density_local,
-                vthermal_local,
-                collisionality_kind,
-            ),
-            in_axes=(0, 0, 1, 1, 1),
-        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
-        in_axes=(0,),
-    )(species.species_indices)
-
-    A1 = jax.vmap(
-        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
-        ),
-        in_axes=(0, 0, 0, 0, 0),
-    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
-    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
-    A3 = get_Thermodynamical_Forces_A3(Er_faces)
-
-    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
-    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
-
-    Gamma = -density_phys * (
-        Lij_faces[:, :, 0, 0] * A1
-        + Lij_faces[:, :, 0, 1] * A2
-        + Lij_faces[:, :, 0, 2] * A3[None, :]
-    )
-    Q = -temperature_phys * density_phys * (
-        Lij_faces[:, :, 1, 0] * A1
-        + Lij_faces[:, :, 1, 1] * A2
-        + Lij_faces[:, :, 1, 2] * A3[None, :]
-    )
-    Upar = -density_phys * (
-        Lij_faces[:, :, 2, 0] * A1
-        + Lij_faces[:, :, 2, 1] * A2
-        + Lij_faces[:, :, 2, 2] * A3[None, :]
-    )
-    return Lij_faces, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er_faces,
-    temperature_faces,
-    density_faces,
-    dndr_faces,
-    dTdr_faces,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
-    radius_values = geometry.r_grid_half
-
-    Lij_faces = jax.vmap(
-        lambda a: jax.vmap(
-            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                a,
-                radius_value,
-                er_value,
-                temperature_local,
-                density_local,
-                vthermal_local,
-                collisionality_kind,
-            ),
-            in_axes=(0, 0, 1, 1, 1),
-        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
-        in_axes=(0,),
-    )(species.species_indices)
-
-    A1 = jax.vmap(
-        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
-        ),
-        in_axes=(0, 0, 0, 0, 0),
-    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
-    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
-    A3 = get_Thermodynamical_Forces_A3(Er_faces)
-
-    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
-    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
-
-    Gamma = -density_phys * (
-        Lij_faces[:, :, 0, 0] * A1
-        + Lij_faces[:, :, 0, 1] * A2
-        + Lij_faces[:, :, 0, 2] * A3[None, :]
-    )
-    Q = -temperature_phys * density_phys * (
-        Lij_faces[:, :, 1, 0] * A1
-        + Lij_faces[:, :, 1, 1] * A2
-        + Lij_faces[:, :, 1, 2] * A3[None, :]
-    )
-    Upar = -density_phys * (
-        Lij_faces[:, :, 2, 0] * A1
-        + Lij_faces[:, :, 2, 1] * A2
-        + Lij_faces[:, :, 2, 2] * A3[None, :]
-    )
-    return Lij_faces, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius_ntss1d(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er_faces,
-    temperature_faces,
-    density_faces,
-    dndr_faces,
-    dTdr_faces,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
-    radius_values = geometry.r_grid_half
-
-    Lij_faces = jax.vmap(
-        lambda a: jax.vmap(
-            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius_ntss1d(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                a,
-                radius_value,
-                er_value,
-                temperature_local,
-                density_local,
-                vthermal_local,
-                collisionality_kind,
-            ),
-            in_axes=(0, 0, 1, 1, 1),
-        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
-        in_axes=(0,),
-    )(species.species_indices)
-
-    A1 = jax.vmap(
-        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
-        ),
-        in_axes=(0, 0, 0, 0, 0),
-    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
-    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
-    A3 = get_Thermodynamical_Forces_A3(Er_faces)
-
-    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
-    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
-
-    Gamma = -density_phys * (
-        Lij_faces[:, :, 0, 0] * A1
-        + Lij_faces[:, :, 0, 1] * A2
-        + Lij_faces[:, :, 0, 2] * A3[None, :]
-    )
-    Q = -temperature_phys * density_phys * (
-        Lij_faces[:, :, 1, 0] * A1
-        + Lij_faces[:, :, 1, 1] * A2
-        + Lij_faces[:, :, 1, 2] * A3[None, :]
-    )
-    Upar = -density_phys * (
-        Lij_faces[:, :, 2, 0] * A1
-        + Lij_faces[:, :, 2, 1] * A2
-        + Lij_faces[:, :, 2, 2] * A3[None, :]
-    )
-    return Lij_faces, Gamma, Q, Upar
-
-
-@jit
-def _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius_ntss1d_fixednu(
-    species,
-    energy_grid,
-    geometry,
-    database,
-    Er_faces,
-    temperature_faces,
-    density_faces,
-    dndr_faces,
-    dTdr_faces,
-    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
-):
-    v_thermal_faces = get_v_thermal(species.mass, temperature_faces)
-    radius_values = geometry.r_grid_half
-
-    Lij_faces = jax.vmap(
-        lambda a: jax.vmap(
-            lambda radius_value, er_value, temperature_local, density_local, vthermal_local: _get_Lij_matrix_at_radius_preprocessed_3d_ntss_radius_ntss1d_fixednu(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                a,
-                radius_value,
-                er_value,
-                temperature_local,
-                density_local,
-                vthermal_local,
-                collisionality_kind,
-            ),
-            in_axes=(0, 0, 1, 1, 1),
-        )(radius_values, Er_faces, temperature_faces, density_faces, v_thermal_faces),
-        in_axes=(0,),
-    )(species.species_indices)
-
-    A1 = jax.vmap(
-        lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-            charge, density_a, temperature_a, dndr_a, dTdr_a, Er_faces
-        ),
-        in_axes=(0, 0, 0, 0, 0),
-    )(species.charge, density_faces, temperature_faces, dndr_faces, dTdr_faces)
-    A2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature_faces, dTdr_faces)
-    A3 = get_Thermodynamical_Forces_A3(Er_faces)
-
-    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
-    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
-
-    Gamma = -density_phys * (
-        Lij_faces[:, :, 0, 0] * A1
-        + Lij_faces[:, :, 0, 1] * A2
-        + Lij_faces[:, :, 0, 2] * A3[None, :]
-    )
-    Q = -temperature_phys * density_phys * (
-        Lij_faces[:, :, 1, 0] * A1
-        + Lij_faces[:, :, 1, 1] * A2
-        + Lij_faces[:, :, 1, 2] * A3[None, :]
-    )
-    Upar = -density_phys * (
-        Lij_faces[:, :, 2, 0] * A1
-        + Lij_faces[:, :, 2, 1] * A2
-        + Lij_faces[:, :, 2, 2] * A3[None, :]
-    )
-    return Lij_faces, Gamma, Q, Upar
+_CENTER_FLUX_DISPATCH: dict[str, Callable[..., Any]] = {
+    MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED: _get_Neoclassical_Fluxes_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D: _get_Neoclassical_Fluxes_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_NTSS: _get_Neoclassical_Fluxes_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL: _get_Neoclassical_Fluxes_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D: _get_Neoclassical_Fluxes_generic,
+    MONOENERGETIC_KIND_GENERIC: _get_Neoclassical_Fluxes_generic,
+}
+
+
+_FACE_FLUX_DISPATCH: dict[str, Callable[..., Any]] = {
+    MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED: _get_Neoclassical_Fluxes_Faces_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D: _get_Neoclassical_Fluxes_Faces_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_NTSS: _get_Neoclassical_Fluxes_Faces_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL: _get_Neoclassical_Fluxes_Faces_generic,
+    MONOENERGETIC_KIND_PREPROCESSED_3D: _get_Neoclassical_Fluxes_Faces_generic,
+    MONOENERGETIC_KIND_GENERIC: _get_Neoclassical_Fluxes_Faces_generic,
+}
 
 
 def get_Neoclassical_Fluxes(
@@ -1570,82 +462,8 @@ def get_Neoclassical_Fluxes(
     collisionality_model="default",
 ):
     collisionality_kind = _collisionality_kind(collisionality_model)
-    if _uses_preprocessed_3d_ntss_radius_ntss1d_fixednu(database):
-        return _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius_ntss1d_fixednu(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er,
-            temperature,
-            density,
-            density_right_constraint,
-            density_right_grad_constraint,
-            temperature_right_constraint,
-            temperature_right_grad_constraint,
-            collisionality_kind,
-        )
-    if _uses_preprocessed_3d_ntss_radius_ntss1d(database):
-        return _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius_ntss1d(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er,
-            temperature,
-            density,
-            density_right_constraint,
-            density_right_grad_constraint,
-            temperature_right_constraint,
-            temperature_right_grad_constraint,
-            collisionality_kind,
-        )
-    if _uses_ntss_preprocessed(database):
-        return _get_Neoclassical_Fluxes_ntss_preprocessed(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er,
-            temperature,
-            density,
-            density_right_constraint=density_right_constraint,
-            density_right_grad_constraint=density_right_grad_constraint,
-            temperature_right_constraint=temperature_right_constraint,
-            temperature_right_grad_constraint=temperature_right_grad_constraint,
-            collisionality_kind=collisionality_kind,
-        )
-    if _uses_preprocessed_3d_ntss_radius(database):
-        return _get_Neoclassical_Fluxes_preprocessed_3d_ntss_radius(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er,
-            temperature,
-            density,
-            density_right_constraint=density_right_constraint,
-            density_right_grad_constraint=density_right_grad_constraint,
-            temperature_right_constraint=temperature_right_constraint,
-            temperature_right_grad_constraint=temperature_right_grad_constraint,
-            collisionality_kind=collisionality_kind,
-        )
-    if _uses_preprocessed_3d(database):
-        return _get_Neoclassical_Fluxes_preprocessed(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er,
-            temperature,
-            density,
-            density_right_constraint=density_right_constraint,
-            density_right_grad_constraint=density_right_grad_constraint,
-            temperature_right_constraint=temperature_right_constraint,
-            temperature_right_grad_constraint=temperature_right_grad_constraint,
-            collisionality_kind=collisionality_kind,
-        )
-    return _get_Neoclassical_Fluxes_generic(
+    flux_fn = _CENTER_FLUX_DISPATCH[monoenergetic_database_kind(database)]
+    return flux_fn(
         species,
         energy_grid,
         geometry,
@@ -1674,72 +492,8 @@ def get_Neoclassical_Fluxes_Faces(
     collisionality_model="default",
 ):
     collisionality_kind = _collisionality_kind(collisionality_model)
-    if _uses_preprocessed_3d_ntss_radius_ntss1d_fixednu(database):
-        return _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius_ntss1d_fixednu(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er_faces,
-            temperature_faces,
-            density_faces,
-            dndr_faces,
-            dTdr_faces,
-            collisionality_kind,
-        )
-    if _uses_preprocessed_3d_ntss_radius_ntss1d(database):
-        return _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius_ntss1d(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er_faces,
-            temperature_faces,
-            density_faces,
-            dndr_faces,
-            dTdr_faces,
-            collisionality_kind,
-        )
-    if _uses_ntss_preprocessed(database):
-        return _get_Neoclassical_Fluxes_Faces_ntss_preprocessed(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er_faces,
-            temperature_faces,
-            density_faces,
-            dndr_faces,
-            dTdr_faces,
-            collisionality_kind=collisionality_kind,
-        )
-    if _uses_preprocessed_3d_ntss_radius(database):
-        return _get_Neoclassical_Fluxes_Faces_preprocessed_3d_ntss_radius(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er_faces,
-            temperature_faces,
-            density_faces,
-            dndr_faces,
-            dTdr_faces,
-            collisionality_kind=collisionality_kind,
-        )
-    if _uses_preprocessed_3d(database):
-        return _get_Neoclassical_Fluxes_Faces_preprocessed(
-            species,
-            energy_grid,
-            geometry,
-            database,
-            Er_faces,
-            temperature_faces,
-            density_faces,
-            dndr_faces,
-            dTdr_faces,
-            collisionality_kind=collisionality_kind,
-        )
-    return _get_Neoclassical_Fluxes_Faces_generic(
+    flux_fn = _FACE_FLUX_DISPATCH[monoenergetic_database_kind(database)]
+    return flux_fn(
         species,
         energy_grid,
         geometry,

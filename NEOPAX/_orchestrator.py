@@ -23,15 +23,7 @@ from ._ambipolarity import (
     write_ambipolarity_hdf5,
 )
 from ._database import Monoenergetic
-from ._database_ntss_preprocessed import (
-    NTSSPreprocessedMonoenergetic,
-)
-from ._database_preprocessed import (
-    PreprocessedMonoenergetic3D,
-    PreprocessedMonoenergetic3DNTSSRadius,
-    PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
-    PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
-)
+from ._monoenergetic import load_monoenergetic_database
 from ._entropy_models import get_entropy_model
 from ._profiles import build_profiles
 from ._source_models import (
@@ -194,20 +186,8 @@ def _build_geometry(config: dict):
 def _build_database(config: dict, geometry):
     neoclassical_file = config.get("neoclassical", {}).get("neoclassical_file")
     if neoclassical_file and geometry is not None:
-        interp_mode = str(
-            config.get("neoclassical", {}).get("interpolation_mode", "generic")
-        ).strip().lower()
-        if interp_mode == "preprocessed_ntss":
-            return NTSSPreprocessedMonoenergetic.read_ntx(geometry, neoclassical_file)
-        if interp_mode == "preprocessed_3d":
-            return PreprocessedMonoenergetic3D.read_ntx(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_radial":
-            return PreprocessedMonoenergetic3DNTSSRadius.read_ntx(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_radial_ntss1d":
-            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1D.read_ntx(geometry.a_b, neoclassical_file)
-        if interp_mode == "preprocessed_3d_ntss1d_fixed":
-            return PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU.read_ntx(geometry.a_b, neoclassical_file)
-        return Monoenergetic.read_ntx(geometry.a_b, neoclassical_file)
+        interp_mode = config.get("neoclassical", {}).get("interpolation_mode", "generic")
+        return load_monoenergetic_database(geometry, neoclassical_file, interp_mode)
     return None
 
 
@@ -2100,6 +2080,8 @@ def plot_transport_solution(
         data = _load_ntss_reference_profiles(spec["path"])
         if data:
             reference_profile_sets.append({**spec, "data": data})
+        else:
+            print(f"[NEOPAX] transport reference skipped: could not load usable profiles from {spec['path']}")
 
     overlay_reference_er = bool(
         overlay_reference_er
@@ -2782,34 +2764,22 @@ def plot_transport_solution(
             ax.plot(rho, er, label=label)
         if overlay_reference_er and rho is not None:
             try:
-                er_ref = None
-                import h5py
-                import interpax
-
-                er_reference_specs = _reference_specs()
-                for ref_spec in er_reference_specs:
-                    er_ref = None
-                    candidate = _resolve_reference_path(ref_spec["path"])
-                    if candidate is not None:
-                        with h5py.File(candidate, "r") as f:
-                            if "r" in f and "Er" in f:
-                                r_data = f["r"][()]
-                                er_data = f["Er"][()]
-                                if len(er_data) != len(rho):
-                                    r_data = jnp.asarray(r_data)
-                                    rho_ref = r_data / jnp.maximum(r_data[-1], 1.0e-14)
-                                    er_ref = interpax.interp1d(rho, rho_ref, er_data)
-                                else:
-                                    er_ref = er_data
-                    if er_ref is not None:
-                        ax.plot(
-                            rho,
-                            er_ref,
-                            color=ref_spec["color"],
-                            linewidth=2.2,
-                            linestyle=ref_spec["linestyle"],
-                            label=ref_spec["label"],
-                        )
+                plotted_reference = False
+                for ref_spec in reference_profile_sets:
+                    er_ref = ref_spec["data"].get("Er")
+                    if er_ref is None:
+                        continue
+                    ax.plot(
+                        rho,
+                        er_ref,
+                        color=ref_spec["color"],
+                        linewidth=2.2,
+                        linestyle=ref_spec["linestyle"],
+                        label=ref_spec["label"],
+                    )
+                    plotted_reference = True
+                if not plotted_reference:
+                    print("[NEOPAX] transport Er overlay requested, but no usable reference Er profiles were loaded.")
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
         ax.set_xlabel("rho")

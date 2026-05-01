@@ -5,12 +5,26 @@ import h5py
 import jax.numpy as jnp
 
 from NEOPAX._orchestrator import (
+    _build_database,
     _build_flux_model,
     _load_user_extensions,
     _load_ntss_reference_profiles,
     _normalize_solver_config,
     _resolve_reference_path,
 )
+from NEOPAX._monoenergetic import (
+    MONOENERGETIC_KIND_GENERIC,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
+    load_monoenergetic_database,
+    monoenergetic_database_kind,
+)
+from NEOPAX._database_preprocessed import (
+    PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
+    PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
+)
+from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from NEOPAX._interpolators import get_Dij
 from NEOPAX._source_models import get_source_model
 from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeTransportModel,
@@ -74,6 +88,57 @@ def test_resolve_reference_path_handles_relative_paths(tmp_path, monkeypatch):
 def test_resolve_reference_path_returns_none_for_missing_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert _resolve_reference_path("missing.h5") is None
+
+
+def test_load_monoenergetic_database_dispatches_from_mode(monkeypatch):
+    geometry = types.SimpleNamespace(a_b=1.2)
+
+    monkeypatch.setattr(
+        "NEOPAX._monoenergetic.PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU.read_ntx",
+        classmethod(lambda cls, a_b, ntx_file: {"kind": "fixed", "a_b": a_b, "file": ntx_file}),
+    )
+
+    out = load_monoenergetic_database(
+        geometry,
+        "db.h5",
+        "preprocessed_3d_ntss1d_fixed",
+    )
+
+    assert out == {"kind": "fixed", "a_b": 1.2, "file": "db.h5"}
+
+
+def test_build_database_uses_shared_monoenergetic_loader(monkeypatch):
+    captured = {}
+
+    def fake_loader(geometry, ntx_file, interpolation_mode):
+        captured["geometry"] = geometry
+        captured["file"] = ntx_file
+        captured["mode"] = interpolation_mode
+        return "database"
+
+    monkeypatch.setattr("NEOPAX._orchestrator.load_monoenergetic_database", fake_loader)
+
+    geometry = types.SimpleNamespace(a_b=1.5)
+    config = {"neoclassical": {"neoclassical_file": "scan.h5", "interpolation_mode": "preprocessed_ntss"}}
+    out = _build_database(config, geometry)
+
+    assert out == "database"
+    assert captured == {"geometry": geometry, "file": "scan.h5", "mode": "preprocessed_ntss"}
+
+
+def test_monoenergetic_database_kind_defaults_to_generic():
+    assert monoenergetic_database_kind(object()) == MONOENERGETIC_KIND_GENERIC
+
+
+def test_monoenergetic_database_kind_prefers_most_specific_subclass():
+    fixed = object.__new__(PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU)
+    ntss1d = object.__new__(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D)
+    assert monoenergetic_database_kind(fixed) == MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED
+    assert monoenergetic_database_kind(ntss1d) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D
+
+
+def test_monoenergetic_interpolation_kernel_defaults_to_generic():
+    assert monoenergetic_interpolation_kernel(object()) is get_Dij
 
 
 def test_load_ntss_reference_profiles_interpolates_scalar_and_species_profiles(tmp_path, monkeypatch):

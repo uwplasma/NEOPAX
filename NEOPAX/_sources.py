@@ -178,16 +178,18 @@ def bremsstrahlung_radiation_generalized(
     if species is not None:
         Z = species.charge / elementary_charge
     else:
-        # fallback: e=1, D=1, T=1, He=2
-        Z = jnp.array([1.0, 1.0, 1.0, 2.0])[:n_species]
+        # Signed fallback charges so electron can be excluded from Zeff.
+        Z = jnp.array([-1.0, 1.0, 1.0, 2.0])[:n_species]
     Z = jnp.asarray(Z, dtype=ne.dtype)
     if Z.ndim == 1:
         Z = Z[:, None]
     n = state.density
-    # Zeff: sum_s n_s Z_s^2 / n_e
+    # Zeff should only include ion species. Including the electron row would
+    # add an unphysical +1 offset and double the pure D/T Zeff from 1 to 2.
+    ion_mask = Z > 0.0
     n_main = n[jnp.array(main_ion_indices)]
     Z_main = Z[jnp.array(main_ion_indices)]
-    full_zeff = jnp.sum(n * Z**2, axis=0) / ne
+    full_zeff = jnp.sum(jnp.where(ion_mask, n * Z**2, 0.0), axis=0) / ne
     main_ion_zeff = jnp.sum(n_main * Z_main**2, axis=0) / ne
     Zeff = jax.lax.cond(
         jnp.asarray(exclude_impurity_bremsstrahlung),

@@ -15,7 +15,7 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_database"
 entropy_model = "ntx_database"
-neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
 interpolation_mode = "preprocessed_3d_radial_ntss1d"
 
 
@@ -67,7 +67,7 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.4, 0.4,0.1]
+c_density = [1.0, 0.5, 0.5,0.0]
 c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
@@ -118,8 +118,10 @@ temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons
 density = ["dt_reaction"]
 [sources.parameters.power_exchange]
 mode = "exclude_frozen"
-
-
+coulomb_log_mode = "ntssfusion"
+[sources.parameters.bremsstrahlung_radiation]
+coefficient_mode = "neopax"
+delta_zeff = 0.0
 
 [transport_solver]
 density_floor = 1.0e-3
@@ -153,6 +155,8 @@ Er_source_mode = "ambipolar_local"
 work_source_mode = "local"
 Er_relax = 0.1
 DEr = 2.0
+Er_permittivity_mode = "ntss_like_midpoint"
+
 
 [transport_output]
 transport_plot = true
@@ -160,8 +164,8 @@ transport_write_hdf5 = false
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
-transport_initial_reference_file = ""./examples/inputs/NTSS_Test_Initial_scaled_flux.h5""
-transport_final_reference_file = "./path/to/final_ref.h5"
+transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
 transport_initial_reference_label = "Initial ref"
 transport_final_reference_label = "Final ref"
 transport_output_dir = "./docs/benchmark/figures/transport_solver_radau_wHe"

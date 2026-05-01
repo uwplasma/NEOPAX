@@ -15,7 +15,7 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_database"
 entropy_model = "ntx_database"
-neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
+neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
 interpolation_mode = "preprocessed_3d_radial_ntss1d"
 
 
@@ -53,7 +53,7 @@ chi_temperature = [0.0065, 0.0065, 0.0065]
 flux_model = "none"
 
 [energy_grid]
-n_x = 3
+n_x = 4
 
 [species]
 n_species = 3
@@ -157,6 +157,7 @@ Er_source_mode = "ambipolar_local"
 work_source_mode = "local"
 Er_relax = 0.1
 DEr = 2.0
+Er_permittivity_mode = "ntss_like_midpoint"
 
 [transport_output]
 transport_plot = true
@@ -164,7 +165,9 @@ transport_write_hdf5 = false
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
-transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_flux_scaled_noHe.h5"
 transport_initial_reference_label = "Initial ref"
+transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_noHe.h5"
+transport_final_reference_label = "Final ref"
 transport_output_dir = "./docs/benchmark/figures/transport_solver_radau_noHe"
 transport_plot_n_times = -1

@@ -170,7 +170,7 @@ Known issue / parity note:
 ## Track B: Radau Modernization
 
 ### B1: Radau Modernization Track
-- Status: in progress
+- Status: largely implemented, with naming/docs/validation follow-up planned
 - Keep this as a Radau-specific branch of the solver plan, distinct from the main Kvaerno efficiency work.
 - Use the classic Hairer/NTSS Radau implementation and the newer Julia `AdaptiveRadau` / `OrdinaryDiffEqFIRK` implementation as design references.
 
@@ -605,7 +605,7 @@ Scope note:
 - treat it as a separate compile/initialization cleanup phase once the current solver improvements are checkpointed
 
 ### C2: Unified Database / Interpolator Facades
-- Status: planned
+- Status: in progress
 - Goal:
   - replace the current parallel spread of database/interpolator entry points with one clear public database façade and one clear public interpolator façade, while preserving the existing physics modes and keeping internal implementations modular
 
@@ -638,9 +638,30 @@ Primary tasks for this phase:
 - decide which current modules become:
   - façade modules
   - internal implementation modules
+
+Progress so far:
+- added a first shared monoenergetic façade in `NEOPAX/_monoenergetic.py`
+  - centralizes `interpolation_mode -> database loader`
+  - centralizes `database instance -> database kind`
+- added a shared interpolator façade in `NEOPAX/_monoenergetic_interpolators.py`
+  - centralizes `database kind -> interpolation kernel`
+- switched `_orchestrator.py::_build_database(...)` to use the shared loader façade instead of open-coded `if/elif` selection
+- switched `_neoclassical.py` center/face flux backend selection to a shared dispatch keyed by database kind instead of repeated `isinstance(...)` chains
+- switched the main `get_Lij_matrix(...)` / `get_Lij_matrix_at_radius(...)` path to the shared interpolator façade
+- collapsed the preprocessed/NTSS-specific neoclassical flux wrappers into direct shared dispatch, removing the old compatibility shells from `_neoclassical.py`
+- added regression coverage for the shared monoenergetic loader path in `tests/test_main_helpers.py`
+- added a regression check for the default shared interpolation-kernel selection
+
+What is still left:
+- decide whether the longer-term public name should stay `_monoenergetic.py` or be folded into a broader `_databases.py` / `_interpolators.py` façade pair
   - legacy compatibility shims
-- reduce duplicated dispatch logic where multiple files currently encode similar mode selection
+- check for any remaining duplicated mode-selection logic in smaller side paths outside the main orchestrator/neoclassical flow
 - document the supported database/interpolator pathways in one place
+- run full test validation in a proper environment, beyond the current parse checks and focused regression additions
+
+Current checkpoint assessment:
+- the main structural unification for database loading, interpolator selection, and neoclassical dispatch is now in place
+- this track is at a good pause point unless we want to immediately push into public naming cleanup and documentation consolidation
 
 Scope notes:
 - this phase should not force everything into one giant physical source file
@@ -1011,6 +1032,10 @@ Main remaining items for this track:
 - benchmark and validate the new exact-``Lij`` NTX runtime path against the
   existing ``ntx_database`` / ``ntx_scan_runtime`` models for both numerical
   agreement and runtime cost
+- keep as an explicit end goal a live-geometry path in which ``vmec_jax`` and
+  Boozer-transform output states can be passed directly into NEOPAX as an
+  alternative to ``vmec_file`` / ``boozer_file`` workflows, so geometry and
+  downstream transport quantities can remain inside a differentiable JAX graph
 - add a focused exact-``Lij`` NTX follow-up sub-track covering:
   - flux-level comparison of ``Gamma``, ``Q``, and ``Upar`` against the
     existing NTX-backed models
