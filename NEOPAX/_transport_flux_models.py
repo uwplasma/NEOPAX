@@ -1244,6 +1244,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     n_xi: int = 64
     surface_backend: str = "auto"
     face_response_mode: str = "face_local_response"
+    radial_batch_size: int | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
     bc_temperature: Any = None
@@ -1288,6 +1289,41 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def with_face_response_mode(self, face_response_mode: str) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, face_response_mode=str(face_response_mode))
+
+    def with_radial_batch_size(self, radial_batch_size: int | None) -> "NTXExactLijRuntimeTransportModel":
+        normalized = None if radial_batch_size in (None, 0) else int(radial_batch_size)
+        return dataclasses.replace(self, radial_batch_size=normalized)
+
+    def _map_radius_axis(self, fn, radius_indices):
+        batch_size = self.radial_batch_size
+        if batch_size is None or int(batch_size) <= 1:
+            return jax.lax.map(fn, radius_indices)
+
+        n_radius = int(radius_indices.shape[0])
+        batch_size = int(batch_size)
+        if batch_size >= n_radius:
+            return jax.vmap(fn)(radius_indices)
+
+        n_full = n_radius // batch_size
+        remainder = n_radius % batch_size
+        outputs = []
+
+        if n_full > 0:
+            chunked = radius_indices[: n_full * batch_size].reshape((n_full, batch_size))
+            mapped = jax.lax.map(lambda chunk: jax.vmap(fn)(chunk), chunked)
+            mapped = jax.tree_util.tree_map(
+                lambda arr: arr.reshape((n_full * batch_size,) + arr.shape[2:]),
+                mapped,
+            )
+            outputs.append(mapped)
+
+        if remainder > 0:
+            tail = radius_indices[n_full * batch_size :]
+            outputs.append(jax.vmap(fn)(tail))
+
+        if len(outputs) == 1:
+            return outputs[0]
+        return jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
 
     def _local_scan_inputs(
         self,
@@ -1443,7 +1479,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.lax.map(_per_radius, radius_indices)
+        lij_by_radius = self._map_radius_axis(_per_radius, radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
@@ -1476,7 +1512,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.lax.map(_per_radius, radius_indices)
+        lij_by_radius = self._map_radius_axis(_per_radius, radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
@@ -1599,7 +1635,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        response_by_radius = jax.lax.map(_per_radius, radius_indices)
+        response_by_radius = self._map_radius_axis(_per_radius, radius_indices)
         center_response = jax.tree_util.tree_map(lambda arr: jnp.swapaxes(arr, 0, 1), response_by_radius)
         return NTXExactLijLaggedResponse(center_response=center_response)
 
@@ -1671,7 +1707,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )[1]
             )(ref_nu_radius, ref_epsi_radius, delta_nu_radius, delta_epsi_radius)
 
-        coeff_tangent_by_radius = jax.lax.map(_coeff_tangent_per_radius, radius_indices)
+        coeff_tangent_by_radius = self._map_radius_axis(_coeff_tangent_per_radius, radius_indices)
         coeff_scan = center_response.reference_coeff_scan + jnp.swapaxes(coeff_tangent_by_radius, 0, 1)
 
         drds_species = jnp.broadcast_to(
@@ -1854,6 +1890,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_n_xi=64,
     ntx_exact_surface_backend="auto",
     ntx_exact_face_response_mode="face_local_response",
+    ntx_exact_radial_batch_size=None,
     ntx_exact_lij_support=None,
     preload_support=False,
     collisionality_model="default",
@@ -1873,6 +1910,11 @@ def build_ntx_exact_lij_runtime_transport_model(
         n_xi=int(ntx_exact_n_xi),
         surface_backend=str(ntx_exact_surface_backend),
         face_response_mode=str(ntx_exact_face_response_mode),
+        radial_batch_size=(
+            None
+            if ntx_exact_radial_batch_size in (None, "", 0, "0")
+            else int(ntx_exact_radial_batch_size)
+        ),
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,

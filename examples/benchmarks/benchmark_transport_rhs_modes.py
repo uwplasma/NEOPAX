@@ -38,6 +38,7 @@ DEFAULT_NTX_EXACT_N_THETA = 5
 DEFAULT_NTX_EXACT_N_ZETA = 21
 DEFAULT_NTX_EXACT_N_XI = 32
 DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
+DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
 DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
 
@@ -79,6 +80,7 @@ def _build_config(
     n_zeta: int | None,
     n_xi: int | None,
     ntx_face_response_mode: str,
+    ntx_radial_batch_size: int | None,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
@@ -108,6 +110,8 @@ def _build_config(
             neoclassical["ntx_exact_n_zeta"] = int(n_zeta)
         if n_xi is not None:
             neoclassical["ntx_exact_n_xi"] = int(n_xi)
+        if ntx_radial_batch_size not in (None, 0):
+            neoclassical["ntx_exact_radial_batch_size"] = int(ntx_radial_batch_size)
         if rhs_mode in {"lagged_response", "lagged_transport_response"}:
             neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
 
@@ -207,6 +211,16 @@ def main():
             "Black-box mode continues to use the normal live face-local path."
         ),
     )
+    parser.add_argument(
+        "--ntx-radial-batch-size",
+        type=int,
+        default=DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE,
+        help=(
+            "Exact-runtime NTX radial hybrid batch size. "
+            "Unset or 0 keeps the default unbatched lax.map path; values >1 use "
+            "lax.map over chunks and vmap within each chunk."
+        ),
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -220,6 +234,7 @@ def main():
     print(f"[benchmark] requested_flux_model={args.flux_model}")
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
+    print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for rhs_mode in args.rhs_modes:
@@ -234,6 +249,7 @@ def main():
             n_zeta=args.ntx_n_zeta,
             n_xi=args.ntx_n_xi,
             ntx_face_response_mode=args.ntx_face_response_mode,
+            ntx_radial_batch_size=args.ntx_radial_batch_size,
         )
 
         if rhs_mode == args.rhs_modes[0]:
@@ -246,6 +262,7 @@ def main():
                     f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
                     f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
                     f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
+                    f"radial_batch_size={config['neoclassical'].get('ntx_exact_radial_batch_size', 0)}",
                 )
             if active_flux_model == "ntx_exact_lij_runtime":
                 print(
