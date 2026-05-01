@@ -64,6 +64,7 @@ def _build_config(
     config_path: Path,
     *,
     backend: str,
+    device: str,
     rhs_mode: str,
     flux_model: str,
     er_init_mode: str,
@@ -71,7 +72,7 @@ def _build_config(
     n_zeta: int | None,
     n_xi: int | None,
 ):
-    config = NEOPAX.prepare_config(config_path, backend=backend)
+    config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
 
     general = config.setdefault("general", {})
@@ -137,6 +138,12 @@ def main():
         help="Transport solver backend to benchmark.",
     )
     parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="Execution device to request from NEOPAX/JAX.",
+    )
+    parser.add_argument(
         "--flux-model",
         default=DEFAULT_FLUX_MODEL,
         choices=["keep", "ntx_database", "ntx_exact_lij_runtime", "ntx_scan_runtime"],
@@ -151,8 +158,8 @@ def main():
         choices=["keep", "analytical", "ambipolar_min_entropy"],
         help=(
             "Override profiles.er_initialization_mode for the benchmark. "
-            "Default is 'analytical' to avoid paying for a full ambipolar startup "
-            "when timing RHS modes."
+            "Default is 'keep', so the benchmark TOML controls whether Er starts "
+            "from the ambipolar root finder or an analytical profile."
         ),
     )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs per rhs_mode before timing.")
@@ -190,6 +197,7 @@ def main():
 
     print(f"[benchmark] config={config_path}")
     print(f"[benchmark] backend={args.backend}")
+    print(f"[benchmark] device={args.device}")
     print(f"[benchmark] requested_flux_model={args.flux_model}")
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
@@ -198,6 +206,7 @@ def main():
         config, active_flux_model = _build_config(
             config_path,
             backend=args.backend,
+            device=args.device,
             rhs_mode=rhs_mode,
             flux_model=args.flux_model,
             er_init_mode=args.er_init_mode,
@@ -219,6 +228,7 @@ def main():
                 )
 
         for _ in range(max(0, args.warmup)):
+            print(f"[benchmark] warmup compile/run rhs_mode={rhs_mode}")
             _run_once(config)
 
         timed_runs = []

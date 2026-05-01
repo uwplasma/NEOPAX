@@ -676,6 +676,16 @@ Scope notes:
 - Goal:
   - replace repeated expensive within-step transport-kernel reevaluations in `radau` with a frozen local transport-response model per step attempt, while preserving as much Radau fidelity as possible and keeping the default black-box path unchanged
 
+Current top priority for this track:
+- replace the current generic explicit Jacobian materialization path for expensive NTX runtime models with a prepared-solve response path built around NTX's native differentiated solver interfaces
+- preferred method:
+  - prebuild `PreparedMonoenergeticSystem` objects outside the hot solver loop
+  - use NTX prepared coefficient solves as the response kernel
+  - store only the reference response point in the lagged object
+  - apply the lagged response with a single tangent-on-demand pushforward for the actual within-step perturbation
+- do **not** treat the current full Jacobian materialization as the long-term design for expensive models
+- keep this as the reference pattern for later expensive-path work beyond the first NTX exact-`Lij` model
+
 Why this phase is being reframed:
 - the real end goal is not a generic response abstraction for its own sake
 - the real end goal is:
@@ -764,15 +774,44 @@ Planned implementation stages:
     - `examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py`
     - compares `black_box` vs `lagged_response` on the NTX exact-`Lij` runtime path without transport plotting / HDF5 output noise
 - still needed next:
+  - make the NTX prepared-solve JVP response the active priority implementation for expensive NTX runtime models
+    - prefer tangent-on-demand application of the lagged response over storing full local Jacobians
+    - keep the expensive response centered on the NTX coefficient solve, not on a broader NEOPAX-side full-state surrogate
+    - preserve a `vmap`/array-level scan path with no Python scan loop in the active runtime kernel
   - run and record benchmark results for `black_box` vs `lagged_response` on the NTX energy-convolution model
   - benchmark `lagged_response` on `radau`, `theta`, and `theta_newton`, not only on the synthetic/unit-test paths
   - add adaptive refresh / stale-response criteria beyond the current per-attempt frozen linearization
   - implement model-specific lagged-response overrides for the expensive flux models so they do not have to rely on the generic AD-built flux Jacobian
+    - first target:
+      - `ntx_exact_lij_runtime`
+    - next target:
+      - the NTX energy-convolution / scan-backed realtime path
   - decide whether any face-flux closures need their own lagged-response treatment when `evaluate_face_fluxes(...)` is materially more expensive or structurally different than the center-flux path
   - document the intended difference between:
     - `black_box`
     - `lagged_response`
     - `lagged_linear_state`
+
+Method decision after NTX prepared-solver review:
+- the NTX repository already provides the right AD contract point in
+  - `solve_prepared_coefficient_vector_vjp(...)`
+  with a custom-VJP implementation over the prepared monoenergetic solve
+- the NTX repository also already uses the right active scan style for repeated solves:
+  - flatten arrays
+  - `jax.vmap(...)`
+  - `jax.jit(...)`
+- current recommendation for NEOPAX expensive-kernel lagged response:
+  - linearize or push forward at the NTX prepared coefficient-solve level
+  - then map coefficient tangents into `Lij`
+  - then assemble NEOPAX fluxes and transport terms live
+- preferred JAX rule:
+  - if only the actual perturbation direction is needed, use a single on-demand `jax.jvp(...)`
+  - avoid storing a full explicit Jacobian unless repeated many-direction probes are truly required
+- reason:
+  - JAX `linearize(...)` is useful when reusing one linearization point for many tangent vectors
+  - but it carries stored-linearization memory cost
+  - for the `D1` use case, the per-step perturbation direction is usually the only one needed
+  - so a single tangent-on-demand pushforward is the preferred default for compile and memory control
 
 Stage 10A: Response Scaffold
 - add an opt-in solver-facing response abstraction without altering the default black-box transport path

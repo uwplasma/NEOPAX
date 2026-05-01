@@ -26,6 +26,7 @@ This is a Python package in JAX to perform optimization of Neoclassical and 1D t
    overview
    transport_physics_and_flux_models
    solver_backends
+   expensive_response_methods
    getting_started
    methods_of_use
    custom_models

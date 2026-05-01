@@ -183,6 +183,9 @@ the flux response and then still assembles live:
 This is the intended path for expensive flux kernels such as the NTX runtime
 models.
 
+The detailed implementation guidance for building these expensive lagged
+responses is documented in :doc:`expensive_response_methods`.
+
 
 ``lagged_linear_state``
 ^^^^^^^^^^^^^^^^^^^^^^^
