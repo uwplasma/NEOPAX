@@ -1422,53 +1422,71 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
+        dndr_all = jax.vmap(
+            lambda density_a: get_gradient_density(
+                density_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+            )
+        )(density)
+        dTdr_all = jax.vmap(
+            lambda temperature_a: get_gradient_temperature(
+                temperature_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+            )
+        )(temperature)
+
+        radius_branches = []
+        for radius_index, surface in enumerate(support.center_surfaces):
+            drds_value = support.center_channels.drds[radius_index]
+
+            def _make_radius_branch(radius_index=radius_index, surface=surface, drds_value=drds_value):
+                def _radius_branch(er_value):
+                    er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
+                    er_profile = state.Er.at[radius_index].set(er_scalar)
+                    gamma_values = []
+                    for species_index in range(int(self.species.number_species)):
+                        lij = self._solve_lij_local(
+                            surface=surface,
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_scalar,
+                            temperature_local=temperature[:, radius_index],
+                            density_local=density[:, radius_index],
+                            vthermal_local=v_thermal[:, radius_index],
+                            collisionality_kind=collisionality_kind,
+                            grid=support.grid,
+                        )
+                        a1 = get_Thermodynamical_Forces_A1(
+                            self.species.charge[species_index],
+                            density[species_index],
+                            temperature[species_index],
+                            dndr_all[species_index],
+                            dTdr_all[species_index],
+                            er_profile,
+                        )
+                        a2 = get_Thermodynamical_Forces_A2(temperature[species_index], dTdr_all[species_index])
+                        a3 = get_Thermodynamical_Forces_A3(er_profile)
+                        density_phys = DENSITY_STATE_TO_PHYSICAL * density[species_index, radius_index]
+                        gamma_values.append(
+                            -density_phys
+                            * (
+                                lij[0, 0] * a1[radius_index]
+                                + lij[0, 1] * a2[radius_index]
+                                + lij[0, 2] * a3[radius_index]
+                            )
+                        )
+                    return jnp.asarray(gamma_values)
+
+                return _radius_branch
+
+            radius_branches.append(_make_radius_branch())
 
         def evaluator(radius_index, er_value):
-            gamma_values = []
-            for species_index in range(int(self.species.number_species)):
-                lij = self._solve_lij_local(
-                    surface=support.center_surfaces[radius_index],
-                    drds_value=support.center_channels.drds[radius_index],
-                    species_index=species_index,
-                    er_value=jnp.asarray(er_value, dtype=state.Er.dtype),
-                    temperature_local=temperature[:, radius_index],
-                    density_local=density[:, radius_index],
-                    vthermal_local=v_thermal[:, radius_index],
-                    collisionality_kind=collisionality_kind,
-                    grid=support.grid,
-                )
-                dndr = get_gradient_density(
-                    density[species_index],
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                )
-                dTdr = get_gradient_temperature(
-                    temperature[species_index],
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                )
-                a1 = get_Thermodynamical_Forces_A1(
-                    self.species.charge[species_index],
-                    density[species_index],
-                    temperature[species_index],
-                    dndr,
-                    dTdr,
-                    state.Er.at[radius_index].set(jnp.asarray(er_value, dtype=state.Er.dtype)),
-                )
-                a2 = get_Thermodynamical_Forces_A2(temperature[species_index], dTdr)
-                a3 = get_Thermodynamical_Forces_A3(state.Er.at[radius_index].set(jnp.asarray(er_value, dtype=state.Er.dtype)))
-                density_phys = DENSITY_STATE_TO_PHYSICAL * density[species_index, radius_index]
-                gamma_values.append(
-                    -density_phys
-                    * (
-                        lij[0, 0] * a1[radius_index]
-                        + lij[0, 1] * a2[radius_index]
-                        + lij[0, 2] * a3[radius_index]
-                    )
-                )
-            return jnp.asarray(gamma_values)
+            return jax.lax.switch(radius_index, tuple(radius_branches), er_value)
 
         return evaluator
 

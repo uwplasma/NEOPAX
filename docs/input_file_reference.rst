@@ -40,11 +40,13 @@ Not every mode uses every section.
 ``[general]``
 -------------
 
-This section selects the top-level runtime mode.
+This section selects the top-level runtime mode and optional JAX execution
+placement.
 
 Common key:
 
 - ``mode``
+- ``device``
 
 Supported values:
 
@@ -53,12 +55,23 @@ Supported values:
 - ``fluxes``
 - ``sources``
 
+Supported ``device`` values:
+
+- ``auto``
+- ``cpu``
+- ``gpu``
+
 Example:
 
 .. code-block:: toml
 
     [general]
     mode = "transport"
+    device = "gpu"
+
+When ``device = "cpu"`` or ``device = "gpu"``, NEOPAX places JAX execution
+on the first local device of that platform using JAX's default-device context.
+``auto`` leaves the normal JAX device selection unchanged.
 
 
 ``[geometry]``
@@ -93,6 +106,10 @@ Common keys include:
 - ``flux_model``
 - model-specific file paths or coefficients
 - interpolation settings for database-driven models
+
+For the mathematical meaning of these models and how the built-in NTX-backed
+paths assemble transport coefficients and fluxes, see
+:doc:`transport_physics_and_flux_models`.
 
 Typical patterns:
 
@@ -393,6 +410,9 @@ Common keys include:
 - ``save_n``
 - density/temperature floors
 - transport-physics toggles such as work/convection switches
+
+For the solver algorithms themselves, especially the custom Radau backend and
+the shared ``rhs_mode`` options, see :doc:`solver_backends`.
 
 Example:
 

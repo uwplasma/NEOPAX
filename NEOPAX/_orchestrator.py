@@ -5,6 +5,7 @@ transport, and direct flux evaluation.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import importlib.util
@@ -67,6 +68,39 @@ class RuntimeContext:
 def load_config(path):
     text = Path(path).read_text(encoding="utf-8")
     return toml.loads(text)
+
+
+def _normalized_general_device(config: dict) -> str:
+    general_cfg = config.get("general", {})
+    if not isinstance(general_cfg, dict):
+        return "auto"
+    device = str(general_cfg.get("device", "auto")).strip().lower()
+    if device in {"", "none", "null"}:
+        return "auto"
+    if device not in {"auto", "cpu", "gpu"}:
+        raise ValueError("general.device must be one of: auto, cpu, gpu")
+    return device
+
+
+def _execution_device_context(config: dict):
+    device = _normalized_general_device(config)
+    if device == "auto":
+        return contextlib.nullcontext()
+    try:
+        devices = jax.local_devices(backend=device)
+    except Exception as exc:
+        available = sorted({device.platform for device in jax.local_devices()})
+        raise ValueError(
+            f"Requested general.device='{device}', but JAX could not query that backend. "
+            f"Available local platforms: {available}"
+        ) from exc
+    if not devices:
+        available = sorted({device.platform for device in jax.local_devices()})
+        raise ValueError(
+            f"Requested general.device='{device}', but no local JAX devices were found for it. "
+            f"Available local platforms: {available}"
+        )
+    return jax.default_device(devices[0])
 
 
 def _as_string_list(value):
@@ -3028,76 +3062,77 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
 
 
 def run_config(config: dict):
-    _load_user_extensions(config)
-    runtime, state = build_runtime_context(config)
-    general = config.get("general", {})
-    mode = general.get("mode", config.get("mode", "transport")).lower()
+    with _execution_device_context(config):
+        _load_user_extensions(config)
+        runtime, state = build_runtime_context(config)
+        general = config.get("general", {})
+        mode = general.get("mode", config.get("mode", "transport")).lower()
 
-    if mode == "transport":
-        return run_transport(config, runtime, state)
+        if mode == "transport":
+            return run_transport(config, runtime, state)
 
-    if mode == "ambipolarity":
-        return run_ambipolarity(config, runtime, state)
+        if mode == "ambipolarity":
+            return run_ambipolarity(config, runtime, state)
 
-    if mode == "fluxes":
-        fluxes, do_plot, do_hdf5, output_dir, overlay_reference, reference_file, reference_label = calculate_fluxes_from_config(
-            state,
-            config,
-            {
-                "species": runtime.species,
-                "energy_grid": runtime.energy_grid,
-                "geometry": runtime.geometry,
-                "database": runtime.database,
-                "solver_parameters": runtime.solver_parameters,
-            },
-            flux_model=runtime.models.flux,
-        )
-        rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
-        if output_dir is None:
-            output_dir = Path("outputs")
-        elif not isinstance(output_dir, Path):
-            output_dir = Path(str(output_dir))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if do_plot:
-            plot_fluxes(
-                rho,
-                fluxes,
-                output_dir,
-                species=runtime.species,
-                overlay_reference=overlay_reference,
-                reference_file=reference_file,
-                reference_label=reference_label,
+        if mode == "fluxes":
+            fluxes, do_plot, do_hdf5, output_dir, overlay_reference, reference_file, reference_label = calculate_fluxes_from_config(
+                state,
+                config,
+                {
+                    "species": runtime.species,
+                    "energy_grid": runtime.energy_grid,
+                    "geometry": runtime.geometry,
+                    "database": runtime.database,
+                    "solver_parameters": runtime.solver_parameters,
+                },
+                flux_model=runtime.models.flux,
             )
-        if do_hdf5:
-            write_fluxes_hdf5(rho, fluxes, output_dir)
-        return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}
+            rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+            if output_dir is None:
+                output_dir = Path("outputs")
+            elif not isinstance(output_dir, Path):
+                output_dir = Path(str(output_dir))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if do_plot:
+                plot_fluxes(
+                    rho,
+                    fluxes,
+                    output_dir,
+                    species=runtime.species,
+                    overlay_reference=overlay_reference,
+                    reference_file=reference_file,
+                    reference_label=reference_label,
+                )
+            if do_hdf5:
+                write_fluxes_hdf5(rho, fluxes, output_dir)
+            return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}
 
-    if mode == "sources":
-        sources, do_plot, do_hdf5, output_dir = calculate_sources_from_config(
-            state,
-            config,
-            {
-                "species": runtime.species,
-                "energy_grid": runtime.energy_grid,
-                "geometry": runtime.geometry,
-                "database": runtime.database,
-                "solver_parameters": runtime.solver_parameters,
-            },
-            source_models=runtime.models.source,
-        )
-        rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
-        if output_dir is None:
-            output_dir = Path("outputs")
-        elif not isinstance(output_dir, Path):
-            output_dir = Path(str(output_dir))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if do_plot:
-            plot_sources(rho, sources, output_dir)
-        if do_hdf5:
-            write_sources_hdf5(rho, sources, output_dir)
-        return {"rho": rho, "sources": sources, "output_dir": output_dir}
+        if mode == "sources":
+            sources, do_plot, do_hdf5, output_dir = calculate_sources_from_config(
+                state,
+                config,
+                {
+                    "species": runtime.species,
+                    "energy_grid": runtime.energy_grid,
+                    "geometry": runtime.geometry,
+                    "database": runtime.database,
+                    "solver_parameters": runtime.solver_parameters,
+                },
+                source_models=runtime.models.source,
+            )
+            rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
+            if output_dir is None:
+                output_dir = Path("outputs")
+            elif not isinstance(output_dir, Path):
+                output_dir = Path(str(output_dir))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if do_plot:
+                plot_sources(rho, sources, output_dir)
+            if do_hdf5:
+                write_sources_hdf5(rho, sources, output_dir)
+            return {"rho": rho, "sources": sources, "output_dir": output_dir}
 
-    raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes', 'sources'.")
+        raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes', 'sources'.")
 
 
 def run_config_path(config_path):

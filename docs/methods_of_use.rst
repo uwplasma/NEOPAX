@@ -79,6 +79,10 @@ Examples:
 
 .. code-block:: console
 
+    NEOPAX my_case.toml --device cpu
+
+.. code-block:: console
+
     NEOPAX my_case.toml --output-dir ./outputs/debug_run
 
 Generic dotted overrides
@@ -132,6 +136,7 @@ The simplest direct entry point is:
     result = NEOPAX.run(
         "examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_theta.toml",
         backend="radau",
+        device="cpu",
         n_radial=65,
         n_x=5,
         dt=1e-4,
@@ -189,6 +194,7 @@ If you want more explicit control, use the lower-level API:
     config = NEOPAX.prepare_config(
         config,
         mode="transport",
+        device="gpu",
         n_radial=51,
         set_values=["turbulence.debug_heat_flux_scale=0.5"],
     )
@@ -229,6 +235,17 @@ For programmatic workflows:
 For advanced scripting or future JAX-centric compositions:
 
 - use ``NEOPAX.prepare_config(...)`` plus ``NEOPAX.run_config(...)``
+
+Naming note
+^^^^^^^^^^^
+
+There are now two different ``backend`` concepts:
+
+- ``--backend`` / ``backend=...``
+  - selects the transport solver backend such as ``radau`` or
+    ``theta_newton``
+- ``--device`` / ``device=...`` / ``general.device``
+  - selects JAX execution placement on ``cpu``, ``gpu``, or ``auto``
 
 This layering keeps the package usable both as a practical CLI tool and as a
 clean Python library.

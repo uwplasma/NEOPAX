@@ -58,14 +58,16 @@ Useful overrides during development:
 Lagged-Response Benchmark Example
 ---------------------------------
 
-To compare the new shared transport ``rhs_mode`` values on the expensive NTX
-exact-``Lij`` runtime model, use:
+To compare the shared transport ``rhs_mode`` values on the expensive NTX
+paths, use:
 
-- ``examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py``
+- ``examples/benchmarks/benchmark_transport_rhs_modes.py``
 
 This script:
 
-- forces ``flux_model = "ntx_exact_lij_runtime"``
+- defaults to ``flux_model = "ntx_exact_lij_runtime"``
+- can also benchmark ``ntx_database`` or keep the flux model already present in
+  the base TOML
 - disables plots/HDF5 output to reduce benchmark noise
 - compares ``black_box`` against ``lagged_response`` by default
 - works with ``radau``, ``theta``, or ``theta_newton``
@@ -74,17 +76,24 @@ Example:
 
 .. code-block:: console
 
-    python examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py --backend radau
+    python examples/benchmarks/benchmark_transport_rhs_modes.py --backend radau
 
 or:
 
 .. code-block:: console
 
-    python examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py --backend theta_newton
+    python examples/benchmarks/benchmark_transport_rhs_modes.py --backend theta_newton
+
+To benchmark the NTX energy-convolution database route instead of the exact
+runtime ``Lij`` path:
+
+.. code-block:: console
+
+    python examples/benchmarks/benchmark_transport_rhs_modes.py --flux-model ntx_database
 
 The script defaults to the no-helium Radau transport example as its base input
-file, but rewires the neoclassical model internally so it benchmarks the
-runtime NTX exact-``Lij`` path rather than the file-backed database route.
+file, but can rewire the neoclassical model internally so it benchmarks either
+the runtime NTX exact-``Lij`` path or the file-backed NTX database route.
 
 
 Ambipolarity Example

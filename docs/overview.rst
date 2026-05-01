@@ -53,89 +53,80 @@ NEOPAX currently offers the following strengths.
 Equations Solved
 ----------------
 
-NEOPAX currently solves a radial 1D transport system built from density,
-pressure/temperature, and radial-electric-field evolution equations.
-
-Density equation
-^^^^^^^^^^^^^^^^
-
-For each independently evolved species, the density equation is assembled in
-conservative finite-volume form as
+NEOPAX solves a flux-surface-averaged 1D transport system for densities,
+pressures, and optionally the radial electric field. The underlying transport
+equations have the conservative form
 
 .. math::
 
-   \partial_t n_s = \mathcal{D}_r\!\left(\Gamma_s\right) + S^{(n)}_s,
+   \partial_t u + \nabla \cdot \mathbf{F} = S.
 
-where:
+In the radial 1D representation used by NEOPAX, the conservative operator is
+written as
 
-- :math:`\Gamma_s` is the particle flux
-- :math:`\mathcal{D}_r(\cdot)` is the radial finite-volume divergence operator
-- :math:`S^{(n)}_s` is the assembled density-source contribution
+.. math::
 
-The implementation supports:
+   \mathcal{V}_{\rho}[F]
+   :=
+   -\frac{1}{V'(\rho)}
+   \frac{\partial}{\partial \rho}
+   \left( V'(\rho)\,F(\rho) \right).
 
-- face-flux reconstruction from cell-centered fluxes
-- direct model-supplied face fluxes
-- masking of non-independent species in quasi-neutral configurations
+With this notation:
 
-Temperature / pressure equation
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.. math::
 
-The thermal equation is evolved in pressure form, with thermal conduction,
-convective transport, source terms, and an optional work term:
+   \partial_t n_s = \mathcal{V}_{\rho}(\Gamma_s) + S^{(n)}_s,
 
 .. math::
 
    \partial_t p_s =
    \frac{2}{3}
    \left[
-      \mathcal{D}_r\!\left(Q_s + T_s \Gamma_s^{\mathrm{neo}}
-      + T_s \Gamma_s^{\mathrm{turb}}
-      + T_s \Gamma_s^{\mathrm{class}}\right)
+      \mathcal{V}_{\rho}
+      \left(
+         Q_s
+         + T_s \Gamma_s^{\mathrm{neo}}
+         + T_s \Gamma_s^{\mathrm{turb}}
+         + T_s \Gamma_s^{\mathrm{class}}
+      \right)
       + S^{(p)}_s
       + q_s \Gamma_s E_r
-   \right].
-
-In the code this is assembled from:
-
-- conductive heat flux :math:`Q_s`
-- optional neoclassical convective transport
-- optional turbulent convective transport
-- optional classical convective transport
-- assembled pressure-source components
-- optional work term :math:`q_s \Gamma_s E_r`
-
-This design allows the user to switch individual transport contributions on and
-off while keeping the transport discretization structure unchanged.
-
-Radial electric field equation
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-The :math:`E_r` equation is formulated as a relaxation-diffusion equation
-driven by ambipolar charge balance:
+   \right],
 
 .. math::
 
    \partial_t E_r =
    \tau_{E_r}
    \left[
-      D_{E_r}\,\mathcal{D}_r\!\left(F_{E_r}\right)
+      D_{E_r}\,\mathcal{V}_{\rho}(F_{E_r})
       - \mathcal{A}
-   \right],
+   \right].
 
-where:
+The particle and heat fluxes are decomposed as
 
-- :math:`F_{E_r}` is the diffusive electric-field flux
-- :math:`D_{E_r}` is the configured electric-field diffusivity factor
-- :math:`\mathcal{A}` is the ambipolar source term built from the charge-weighted
-  particle fluxes
+.. math::
 
-Supported modes include:
+   \Gamma_s
+   =
+   \Gamma_s^{\mathrm{neo}}
+   +
+   \Gamma_s^{\mathrm{turb}}
+   +
+   \Gamma_s^{\mathrm{class}},
 
-- local ambipolar source construction
-- transport-centered ambipolar source construction
-- multiple permitivity scalings, including NTSS-like midpoint options
-- standard and floating-edge ambipolar boundary handling
+.. math::
+
+   Q_s
+   =
+   Q_s^{\mathrm{neo}}
+   +
+   Q_s^{\mathrm{turb}}
+   +
+   Q_s^{\mathrm{class}}.
+
+For the full mathematical description of the transport equations and the
+built-in flux models, see :doc:`transport_physics_and_flux_models`.
 
 
 Algorithms And Numerical Methods
@@ -163,16 +154,15 @@ Time integration
 The active solver backends currently include:
 
 - ``theta``
-  - fixed-form implicit theta method
 - ``theta_newton``
-  - Newton-based implicit theta method with predictor support
 - ``radau``
-  - custom implicit Radau backend
-- Diffrax backends
-  - including ``diffrax_kvaerno5``, ``diffrax_tsit5``, and ``diffrax_dopri5``
+- Diffrax backends such as ``diffrax_kvaerno5``
 
-The common runtime builder is ``build_time_solver(...)`` in
-``NEOPAX/_transport_solvers.py``.
+The custom Radau implementation is a fixed-stage Radau IIA collocation method
+with Newton stage solves, embedded error control, and optional lagged-response
+RHS modes.
+
+For a solver-focused description, see :doc:`solver_backends`.
 
 Ambipolarity algorithms
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -200,6 +190,10 @@ Flux models are assembled through the transport-flux registry in
 
 This gives a unified interface returning species-resolved particle and heat
 fluxes, with optional face-flux evaluation support.
+
+For the mathematical structure of the NTX/NTSS-inspired neoclassical models
+and the built-in turbulent closures, see
+:doc:`transport_physics_and_flux_models`.
 
 Built-in transport flux models
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -296,14 +290,10 @@ The repository currently includes the ambipolar root benchmark figure below.
    the main benchmark plot currently available in ``docs/benchmark/figures``.
 
 
-Current Documentation Gaps
---------------------------
+See Also
+--------
 
-This overview is intentionally the first consolidation page, not the final
-manual. The most useful next documentation expansions would be:
-
-- a dedicated input-file reference
-- a page for transport solver backends and recommended use cases
-- a page for flux-model configuration examples
-- a page for source-model configuration examples
-- a benchmark page collecting more figures as they are added
+- :doc:`transport_physics_and_flux_models`
+- :doc:`solver_backends`
+- :doc:`input_file_reference`
+- :doc:`worked_examples`

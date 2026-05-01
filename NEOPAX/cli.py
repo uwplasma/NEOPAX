@@ -45,6 +45,8 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
 
     if getattr(args, "mode", None) is not None:
         out.setdefault("general", {})["mode"] = str(args.mode)
+    if getattr(args, "device", None) is not None:
+        out.setdefault("general", {})["device"] = str(args.device)
 
     geometry = out.setdefault("geometry", {})
     if getattr(args, "vmec_file", None) is not None:
@@ -93,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("config", type=str, help="Path to the NEOPAX TOML configuration file.")
     parser.add_argument("--mode", choices=["transport", "ambipolarity", "fluxes", "sources"], help="Override general.mode.")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "gpu"],
+        help="Override general.device for JAX execution placement.",
+    )
     parser.add_argument("--vmec-file", type=str, help="Override geometry.vmec_file.")
     parser.add_argument("--boozer-file", type=str, help="Override geometry.boozer_file.")
     parser.add_argument("--n-radial", type=int, help="Override geometry.n_radial.")

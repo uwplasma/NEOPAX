@@ -38,6 +38,7 @@ def prepare_config(
     config_or_path: dict[str, Any] | str | Path,
     *,
     mode: str | None = None,
+    device: str | None = None,
     vmec_file: str | None = None,
     boozer_file: str | None = None,
     n_radial: int | None = None,
@@ -58,6 +59,7 @@ def prepare_config(
     args = argparse.Namespace(
         config=str(config_or_path) if isinstance(config_or_path, (str, Path)) else "<in-memory>",
         mode=mode,
+        device=device,
         vmec_file=vmec_file,
         boozer_file=boozer_file,
         n_radial=n_radial,
@@ -87,6 +89,7 @@ def run(
     config_or_path: dict[str, Any] | str | Path,
     *,
     mode: str | None = None,
+    device: str | None = None,
     vmec_file: str | None = None,
     boozer_file: str | None = None,
     n_radial: int | None = None,
@@ -106,6 +109,7 @@ def run(
     config = prepare_config(
         config_or_path,
         mode=mode,
+        device=device,
         vmec_file=vmec_file,
         boozer_file=boozer_file,
         n_radial=n_radial,
