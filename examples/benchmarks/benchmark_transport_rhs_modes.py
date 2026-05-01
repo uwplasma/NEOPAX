@@ -39,6 +39,8 @@ DEFAULT_NTX_EXACT_N_ZETA = 21
 DEFAULT_NTX_EXACT_N_XI = 32
 DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
 DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
+DEFAULT_NTX_EXACT_SCAN_BATCH_SIZE = None
+DEFAULT_NTX_EXACT_USE_REMAT = False
 DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
 
@@ -90,6 +92,8 @@ def _build_config(
     n_xi: int | None,
     ntx_face_response_mode: str,
     ntx_radial_batch_size: int | None,
+    ntx_scan_batch_size: int | None,
+    ntx_use_remat: bool,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
@@ -121,6 +125,10 @@ def _build_config(
             neoclassical["ntx_exact_n_xi"] = int(n_xi)
         if ntx_radial_batch_size not in (None, 0):
             neoclassical["ntx_exact_radial_batch_size"] = int(ntx_radial_batch_size)
+        if ntx_scan_batch_size not in (None, 0):
+            neoclassical["ntx_exact_scan_batch_size"] = int(ntx_scan_batch_size)
+        if ntx_use_remat:
+            neoclassical["ntx_exact_use_remat"] = True
         if rhs_mode in {"lagged_response", "lagged_transport_response"}:
             neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
 
@@ -232,6 +240,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ntx-scan-batch-size",
+        type=int,
+        default=DEFAULT_NTX_EXACT_SCAN_BATCH_SIZE,
+        help=(
+            "Exact-runtime NTX coefficient-scan batch size across the energy-grid cases. "
+            "Unset or 0 keeps the default full vmap over n_x; values >1 apply NTX-style "
+            "chunking to reduce peak memory."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-use-remat",
+        action="store_true",
+        default=DEFAULT_NTX_EXACT_USE_REMAT,
+        help=(
+            "Enable jax.checkpoint/rematerialization on the local exact-runtime NTX solve path. "
+            "This can reduce peak memory at the cost of extra recomputation."
+        ),
+    )
+    parser.add_argument(
         "--compute-final-state-delta",
         action="store_true",
         help=(
@@ -253,6 +280,8 @@ def main():
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
     print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
+    print(f"[benchmark] ntx_scan_batch_size={args.ntx_scan_batch_size}")
+    print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
@@ -269,6 +298,8 @@ def main():
             n_xi=args.ntx_n_xi,
             ntx_face_response_mode=args.ntx_face_response_mode,
             ntx_radial_batch_size=args.ntx_radial_batch_size,
+            ntx_scan_batch_size=args.ntx_scan_batch_size,
+            ntx_use_remat=args.ntx_use_remat,
         )
 
         if rhs_mode == args.rhs_modes[0]:
@@ -282,6 +313,8 @@ def main():
                     f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
                     f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
                     f"radial_batch_size={config['neoclassical'].get('ntx_exact_radial_batch_size', 0)}",
+                    f"scan_batch_size={config['neoclassical'].get('ntx_exact_scan_batch_size', 0)}",
+                    f"use_remat={config['neoclassical'].get('ntx_exact_use_remat', False)}",
                 )
             if active_flux_model == "ntx_exact_lij_runtime":
                 print(

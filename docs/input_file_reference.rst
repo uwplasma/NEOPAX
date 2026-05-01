@@ -151,6 +151,8 @@ evaluations through ``NEOPAX.NTXRuntimeScanTransportModel``.
     ntx_exact_n_zeta = 25
     ntx_exact_n_xi = 64
     ntx_exact_radial_batch_size = 0
+    ntx_exact_scan_batch_size = 0
+    ntx_exact_use_remat = false
     ntx_exact_surface_backend = "auto"
 
 This experimental runtime NTX option skips the intermediate monoenergetic
