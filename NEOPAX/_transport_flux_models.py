@@ -1219,7 +1219,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     support: NTXExactLijRuntimeSupport | None = None
 
     def _rho_center_face(self):
-        a_b = float(jnp.asarray(self.geometry.a_b))
+        a_b = jnp.asarray(self.geometry.a_b, dtype=jnp.float64)
         rho_center = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64) / a_b
         rho_face = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / a_b
         return rho_center, rho_face

@@ -534,6 +534,8 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         runtime_kwargs.setdefault("collisionality_model", neoclassical_cfg.get("collisionality_model", "default"))
         runtime_kwargs.setdefault("bc_density", bc_density)
         runtime_kwargs.setdefault("bc_temperature", bc_temperature)
+        if neoclassical_name == "ntx_exact_lij_runtime":
+            runtime_kwargs.setdefault("preload_support", True)
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
