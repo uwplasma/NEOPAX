@@ -22,6 +22,7 @@ import sys
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -40,6 +41,10 @@ DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
 DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
 
+def _tree_to_host_numpy(tree):
+    return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
+
+
 def _leaf_max_abs_delta(reference, other) -> float:
     ref_leaves = jax.tree_util.tree_leaves(reference)
     other_leaves = jax.tree_util.tree_leaves(other)
@@ -47,11 +52,11 @@ def _leaf_max_abs_delta(reference, other) -> float:
         return float("nan")
     max_delta = 0.0
     for ref_leaf, other_leaf in zip(ref_leaves, other_leaves):
-        ref_arr = jnp.asarray(ref_leaf)
-        other_arr = jnp.asarray(other_leaf)
+        ref_arr = np.asarray(ref_leaf)
+        other_arr = np.asarray(other_leaf)
         if ref_arr.shape != other_arr.shape:
             return float("nan")
-        delta = float(jnp.max(jnp.abs(other_arr - ref_arr)))
+        delta = float(np.max(np.abs(other_arr - ref_arr)))
         max_delta = max(max_delta, delta)
     return max_delta
 
@@ -259,11 +264,11 @@ def main():
             timed_runs.append(wall_seconds)
 
         if reference_final_state is None and last_result is not None:
-            reference_final_state = last_result.final_state
+            reference_final_state = _tree_to_host_numpy(last_result.final_state)
 
         final_state_delta = None
         if reference_final_state is not None and last_result is not None:
-            final_state_delta = _leaf_max_abs_delta(reference_final_state, last_result.final_state)
+            final_state_delta = _leaf_max_abs_delta(reference_final_state, _tree_to_host_numpy(last_result.final_state))
 
         mode_results.append(
             {

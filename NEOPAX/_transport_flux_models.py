@@ -1443,7 +1443,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.vmap(_per_radius)(radius_indices)
+        lij_by_radius = jax.lax.map(_per_radius, radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
@@ -1476,7 +1476,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = jax.vmap(_per_radius)(radius_indices)
+        lij_by_radius = jax.lax.map(_per_radius, radius_indices)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
@@ -1599,7 +1599,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        response_by_radius = jax.vmap(_per_radius)(radius_indices)
+        response_by_radius = jax.lax.map(_per_radius, radius_indices)
         center_response = jax.tree_util.tree_map(lambda arr: jnp.swapaxes(arr, 0, 1), response_by_radius)
         return NTXExactLijLaggedResponse(center_response=center_response)
 
@@ -1671,7 +1671,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )[1]
             )(ref_nu_radius, ref_epsi_radius, delta_nu_radius, delta_epsi_radius)
 
-        coeff_tangent_by_radius = jax.vmap(_coeff_tangent_per_radius)(radius_indices)
+        coeff_tangent_by_radius = jax.lax.map(_coeff_tangent_per_radius, radius_indices)
         coeff_scan = center_response.reference_coeff_scan + jnp.swapaxes(coeff_tangent_by_radius, 0, 1)
 
         drds_species = jnp.broadcast_to(
