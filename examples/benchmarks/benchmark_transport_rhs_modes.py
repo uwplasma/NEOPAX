@@ -30,8 +30,12 @@ if str(ROOT) not in sys.path:
 import NEOPAX
 
 
-DEFAULT_CONFIG = Path("examples/Solve_Transport_Equations/Solve_Transport_equations_noHe_radau.toml")
+DEFAULT_CONFIG = Path("examples/benchmarks/Solve_Transport_equations_noHe_radau_benchmark.toml")
 DEFAULT_FLUX_MODEL = "ntx_exact_lij_runtime"
+DEFAULT_ER_INIT_MODE = "keep"
+DEFAULT_NTX_EXACT_N_THETA = 5
+DEFAULT_NTX_EXACT_N_ZETA = 21
+DEFAULT_NTX_EXACT_N_XI = 32
 
 
 def _leaf_max_abs_delta(reference, other) -> float:
@@ -62,6 +66,7 @@ def _build_config(
     backend: str,
     rhs_mode: str,
     flux_model: str,
+    er_init_mode: str,
     n_theta: int | None,
     n_zeta: int | None,
     n_xi: int | None,
@@ -77,7 +82,17 @@ def _build_config(
         neoclassical["flux_model"] = str(flux_model)
     active_flux_model = neoclassical.get("flux_model", "ntx_database")
 
+    profiles = config.setdefault("profiles", {})
+    if er_init_mode != "keep":
+        profiles["er_initialization_mode"] = str(er_init_mode)
+
     if active_flux_model == "ntx_exact_lij_runtime":
+        if n_theta is None:
+            n_theta = DEFAULT_NTX_EXACT_N_THETA
+        if n_zeta is None:
+            n_zeta = DEFAULT_NTX_EXACT_N_ZETA
+        if n_xi is None:
+            n_xi = DEFAULT_NTX_EXACT_N_XI
         if n_theta is not None:
             neoclassical["ntx_exact_n_theta"] = int(n_theta)
         if n_zeta is not None:
@@ -87,6 +102,7 @@ def _build_config(
 
     ambipolarity = config.setdefault("ambipolarity", {})
     ambipolarity["er_ambipolar_plot"] = False
+    ambipolarity["er_ambipolar_overlay_reference_er"] = False
 
     solver = config.setdefault("transport_solver", {})
     solver["transport_solver_backend"] = str(backend)
@@ -129,6 +145,16 @@ def main():
             "'keep' preserves whatever the base TOML already uses."
         ),
     )
+    parser.add_argument(
+        "--er-init-mode",
+        default=DEFAULT_ER_INIT_MODE,
+        choices=["keep", "analytical", "ambipolar_min_entropy"],
+        help=(
+            "Override profiles.er_initialization_mode for the benchmark. "
+            "Default is 'analytical' to avoid paying for a full ambipolar startup "
+            "when timing RHS modes."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs per rhs_mode before timing.")
     parser.add_argument("--repeat", type=int, default=1, help="Timed runs per rhs_mode.")
     parser.add_argument(
@@ -165,6 +191,7 @@ def main():
     print(f"[benchmark] config={config_path}")
     print(f"[benchmark] backend={args.backend}")
     print(f"[benchmark] requested_flux_model={args.flux_model}")
+    print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for rhs_mode in args.rhs_modes:
@@ -173,6 +200,7 @@ def main():
             backend=args.backend,
             rhs_mode=rhs_mode,
             flux_model=args.flux_model,
+            er_init_mode=args.er_init_mode,
             n_theta=args.ntx_n_theta,
             n_zeta=args.ntx_n_zeta,
             n_xi=args.ntx_n_xi,
@@ -185,9 +213,9 @@ def main():
             ):
                 print(
                     "[benchmark] ntx exact runtime resolution overrides:",
-                    f"n_theta={args.ntx_n_theta}",
-                    f"n_zeta={args.ntx_n_zeta}",
-                    f"n_xi={args.ntx_n_xi}",
+                    f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
+                    f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
+                    f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
                 )
 
         for _ in range(max(0, args.warmup)):
