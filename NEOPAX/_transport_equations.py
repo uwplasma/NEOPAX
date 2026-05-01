@@ -202,6 +202,12 @@ def list_equations():
 @register_equation("density")
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class TransportLaggedResponse:
+    flux_response: object = dataclasses.field(repr=False, default=None)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class DensityEquation(EquationBase):
     dr_cells: jax.Array = dataclasses.field(repr=False)
     Vprime: jax.Array = dataclasses.field(repr=False)
@@ -241,7 +247,7 @@ class DensityEquation(EquationBase):
 
         return out
 
-    def debug_components(self, state, fluxes=None):
+    def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
@@ -257,7 +263,7 @@ class DensityEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(Gamma_faces_raw)
         source_components = assemble_density_source_components(
-            None if self.source_model is None else self.source_model(state),
+            source_outputs if self.source_model is not None else None,
             state,
             self.species,
         )
@@ -279,7 +285,7 @@ class DensityEquation(EquationBase):
             "density_rhs": density_rhs,
         }
 
-    def __call__(self, state, fluxes=None):
+    def __call__(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
@@ -297,7 +303,7 @@ class DensityEquation(EquationBase):
         source_rhs = jnp.zeros_like(gamma_divergence)
         if self.source_model is not None:
             source_components = assemble_density_source_components(
-                self.source_model(state),
+                self.source_model(state) if source_outputs is None else source_outputs,
                 state,
                 self.species,
             )
@@ -450,7 +456,7 @@ class TemperatureEquation(EquationBase):
 
         return out
 
-    def debug_components(self, state, fluxes=None):
+    def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
@@ -513,7 +519,7 @@ class TemperatureEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(total_energy_flux_faces)
         source_components = assemble_pressure_source_components(
-            None if self.source_model is None else self.source_model(state),
+            source_outputs if self.source_model is not None else None,
             state,
             self.species,
         )
@@ -546,7 +552,7 @@ class TemperatureEquation(EquationBase):
             "pressure_rhs": total_rhs * self.active_species_mask[:, None],
         }
 
-    def __call__(self, state, fluxes=None):
+    def __call__(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
@@ -589,7 +595,7 @@ class TemperatureEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(total_energy_flux_faces)
         source_components = assemble_pressure_source_components(
-            None if self.source_model is None else self.source_model(state),
+            None if self.source_model is None else (self.source_model(state) if source_outputs is None else source_outputs),
             state,
             self.species,
         )
@@ -1275,25 +1281,35 @@ class ComposedEquationSystem:
             er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
         return density_eq, temperature_eq, er_eq
 
-    def __call__(self, t, state, runtime):
-        """
-        Call all equations with state, return a TransportState matching the state structure.
-        Always output all three fields, setting missing ones to zero arrays of the correct shape.
-        When electrons are present, evaluate the RHS on a quasi-neutral working
-        state, but keep electron density out of the solved density subsystem.
-        This matches the NTSS-style pattern: evolve independent ion/impurity
-        density rows, reconstruct electron density algebraically for the working
-        state and accepted/output states.
-        """
+    def build_lagged_response(self, state):
+        working_state, _ = self._prepare_working_state(state)
+        flux_response = None
+        if self.shared_flux_model is not None:
+            flux_response = self.shared_flux_model.build_lagged_response(working_state)
+        return TransportLaggedResponse(
+            flux_response=flux_response,
+        )
+
+    def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
+        del t, runtime
+        return self._evaluate_state(state, lagged_response=lagged_response)
+
+    def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState
         working_state, eidx = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
 
         shared_fluxes = None
-        if self.shared_flux_model is not None:
-            shared_fluxes = self.shared_flux_model(working_state)
-
-        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        if lagged_response is None:
+            if self.shared_flux_model is not None:
+                shared_fluxes = self.shared_flux_model(working_state)
+        else:
+            if self.shared_flux_model is not None:
+                shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    lagged_response.flux_response,
+                )
 
         density_rhs = (
             density_eq(working_state, fluxes=shared_fluxes)
@@ -1313,9 +1329,6 @@ class ComposedEquationSystem:
 
         density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
 
-        # Keep the returned full density RHS aligned with the reduced solved
-        # subsystem: electrons are reconstructed in the working/output state,
-        # but their transport RHS row is not evolved independently.
         if eidx is not None:
             density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
 
@@ -1333,6 +1346,19 @@ class ComposedEquationSystem:
             pressure=pressure_rhs,
             Er=Er_rhs,
         )
+
+    def __call__(self, t, state, runtime):
+        """
+        Call all equations with state, return a TransportState matching the state structure.
+        Always output all three fields, setting missing ones to zero arrays of the correct shape.
+        When electrons are present, evaluate the RHS on a quasi-neutral working
+        state, but keep electron density out of the solved density subsystem.
+        This matches the NTSS-style pattern: evolve independent ion/impurity
+        density rows, reconstruct electron density algebraically for the working
+        state and accepted/output states.
+        """
+        del t, runtime
+        return self._evaluate_state(state)
 
     def vector_field(self, t, y, args):
         """

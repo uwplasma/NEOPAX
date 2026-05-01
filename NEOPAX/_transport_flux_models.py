@@ -192,6 +192,43 @@ class TransportFluxModelBase(abc.ABC):
                 del state, face_state, kwargs
                 return None
 
+        def build_lagged_response(self, state, **kwargs):
+                del kwargs
+                state_flat, state_unravel = jax.flatten_util.ravel_pytree(state)
+                reference_flux = self(state)
+                flux_flat, _ = _flatten_flux_dict(reference_flux)
+
+                def _flux_from_flat(flat_state):
+                        test_state = state_unravel(flat_state)
+                        out = self(test_state)
+                        flat_out, _ = _flatten_flux_dict(out)
+                        return flat_out
+
+                jacobian = jax.jacfwd(_flux_from_flat)(state_flat)
+                return LinearizedTransportFluxResponse(
+                        reference_state_flat=state_flat,
+                        reference_flux=reference_flux,
+                        reference_flux_flat=flux_flat,
+                        flux_jacobian=jacobian,
+                )
+
+        def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+                del kwargs
+                state_flat, _ = jax.flatten_util.ravel_pytree(state)
+                flux_flat = lagged_response.reference_flux_flat + lagged_response.flux_jacobian @ (
+                        state_flat - lagged_response.reference_state_flat
+                )
+                return _unflatten_flux_dict(flux_flat, lagged_response.reference_flux)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class LinearizedTransportFluxResponse:
+        reference_state_flat: jax.Array
+        reference_flux: dict
+        reference_flux_flat: jax.Array
+        flux_jacobian: jax.Array
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -203,6 +240,31 @@ class FaceTransportState:
     @property
     def temperature(self):
         return self.pressure / safe_density(self.density)
+
+
+def _flatten_flux_dict(fluxes: dict) -> tuple[jax.Array, tuple[str, ...]]:
+    ordered_keys = tuple(sorted(str(key) for key in fluxes.keys()))
+    flat_parts = []
+    dtype = None
+    for key in ordered_keys:
+        arr = jnp.asarray(fluxes[key])
+        dtype = arr.dtype if dtype is None else dtype
+        flat_parts.append(arr.reshape((-1,)))
+    if not flat_parts:
+        return jnp.zeros((0,), dtype=jnp.float64), ordered_keys
+    return jnp.concatenate(flat_parts, axis=0).astype(dtype), ordered_keys
+
+
+def _unflatten_flux_dict(flat_flux: jax.Array, reference_flux: dict) -> dict:
+    ordered_keys = tuple(sorted(str(key) for key in reference_flux.keys()))
+    out: dict[str, jax.Array] = {}
+    offset = 0
+    for key in ordered_keys:
+        reference_arr = jnp.asarray(reference_flux[key])
+        size = int(reference_arr.size)
+        out[key] = jnp.asarray(flat_flux[offset:offset + size], dtype=reference_arr.dtype).reshape(reference_arr.shape)
+        offset += size
+    return out
 
 
 def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -436,6 +498,13 @@ def build_ntss_like_face_transport_state(
     )
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class CombinedTransportLaggedResponse:
+    neoclassical_response: object = dataclasses.field(repr=False)
+    turbulent_response: object = dataclasses.field(repr=False)
+    classical_response: object = dataclasses.field(repr=False)
+
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class CombinedTransportFluxModel(TransportFluxModelBase):
@@ -502,6 +571,52 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
         if neo is None or turb is None or classical is None:
             return None
+        gamma_turb = (
+            turb.get("Gamma", 0)
+            if self.include_turbulent_particle_flux
+            else self._zero_like_flux(
+                turb.get("Gamma", None),
+                self._zero_like_flux(neo.get("Gamma", None), self._zero_like_flux(classical.get("Gamma", None), 0)),
+            )
+        )
+        return {
+            "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
+            "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
+            "Upar": neo.get("Upar", 0) + turb.get("Upar", 0) + classical.get("Upar", 0),
+            "Gamma_neo": neo.get("Gamma", 0),
+            "Q_neo": neo.get("Q", 0),
+            "Upar_neo": neo.get("Upar", 0),
+            "Gamma_turb": gamma_turb,
+            "Q_turb": turb.get("Q", 0),
+            "Upar_turb": turb.get("Upar", 0),
+            "Gamma_classical": classical.get("Gamma", 0),
+            "Q_classical": classical.get("Q", 0),
+            "Upar_classical": classical.get("Upar", 0),
+        }
+
+    def build_lagged_response(self, state, **kwargs):
+        return CombinedTransportLaggedResponse(
+            neoclassical_response=self.neoclassical_model.build_lagged_response(state, **kwargs),
+            turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
+            classical_response=self.classical_model.build_lagged_response(state, **kwargs),
+        )
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        neo = self.neoclassical_model.evaluate_with_lagged_response(
+            state,
+            lagged_response.neoclassical_response,
+            **kwargs,
+        )
+        turb = self.turbulent_model.evaluate_with_lagged_response(
+            state,
+            lagged_response.turbulent_response,
+            **kwargs,
+        )
+        classical = self.classical_model.evaluate_with_lagged_response(
+            state,
+            lagged_response.classical_response,
+            **kwargs,
+        )
         gamma_turb = (
             turb.get("Gamma", 0)
             if self.include_turbulent_particle_flux

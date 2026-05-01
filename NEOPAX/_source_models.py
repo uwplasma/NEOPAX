@@ -73,6 +73,14 @@ class SourceModelBase:
     def __call__(self, state: Any):
         raise NotImplementedError
 
+    def build_lagged_response(self, state: Any, **kwargs):
+        del kwargs
+        return self(state)
+
+    def evaluate_with_lagged_response(self, state: Any, lagged_response: Any, **kwargs):
+        del state, kwargs
+        return lagged_response
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class AnalyticSource(SourceModelBase):
@@ -126,6 +134,27 @@ class CombinedSourceModel(SourceModelBase):
                 continue
             if not isinstance(out, dict):
                 raise TypeError("CombinedSourceModel expects each source to return a dict.")
+            for key, value in out.items():
+                if key in merged:
+                    merged[key] = merged[key] + value
+                else:
+                    merged[key] = value
+        return merged
+
+    def build_lagged_response(self, state: Any, **kwargs):
+        return tuple(src.build_lagged_response(state, **kwargs) for src in self.sources)
+
+    def evaluate_with_lagged_response(self, state: Any, lagged_response: Any, **kwargs):
+        outs = [
+            src.evaluate_with_lagged_response(state, response, **kwargs)
+            for src, response in zip(self.sources, tuple(lagged_response))
+        ]
+        merged: dict[str, Any] = {}
+        for out in outs:
+            if out is None:
+                continue
+            if not isinstance(out, dict):
+                raise TypeError("CombinedSourceModel expects each lagged source response to evaluate to a dict.")
             for key, value in out.items():
                 if key in merged:
                     merged[key] = merged[key] + value

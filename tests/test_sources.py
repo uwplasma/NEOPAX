@@ -67,6 +67,38 @@ def test_combined_source_model():
     assert jnp.allclose(out["src"], jnp.ones(3) * 3)
 
 
+def test_source_model_default_lagged_response_reuses_outputs():
+    class DictSource(SourceModelBase):
+        def __call__(self, state):
+            del state
+            return {"src": jnp.asarray([1.0, 2.0])}
+
+    src = DictSource()
+    lagged = src.build_lagged_response(None)
+    out = src.evaluate_with_lagged_response(None, lagged)
+    assert jnp.allclose(out["src"], jnp.asarray([1.0, 2.0]))
+
+
+def test_combined_source_model_lagged_response_reuses_component_outputs():
+    class DictSource(SourceModelBase):
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self, state):
+            del state
+            return {"src": jnp.asarray(self.value)}
+
+    combined = CombinedSourceModel(
+        (
+            DictSource(jnp.ones(3)),
+            DictSource(jnp.ones(3) * 2),
+        )
+    )
+    lagged = combined.build_lagged_response(None)
+    out = combined.evaluate_with_lagged_response(None, lagged)
+    assert jnp.allclose(out["src"], jnp.ones(3) * 3)
+
+
 def test_combined_source_model_with_added_sources():
     class DictSource(SourceModelBase):
         def __init__(self, value):

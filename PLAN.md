@@ -672,7 +672,7 @@ Scope notes:
 ## Track D: Expensive-Kernel Transport Response
 
 ### D1: Lagged Transport-Response Mode For Radau
-- Status: planned
+- Status: in progress
 - Goal:
   - replace repeated expensive within-step transport-kernel reevaluations in `radau` with a frozen local transport-response model per step attempt, while preserving as much Radau fidelity as possible and keeping the default black-box path unchanged
 
@@ -743,6 +743,36 @@ Recommended response hierarchy:
 4. optional database/surrogate-assisted response blocks for very expensive kernels
 
 Planned implementation stages:
+- initial slice implemented:
+  - new shared opt-in `rhs_mode`, with `radau_rhs_mode` and `theta_rhs_mode` kept as backend-specific compatibility aliases
+  - default remains `black_box`
+  - `lagged_response` now freezes transport components at the equation-system level:
+    - active D1 path is now flux-response-only
+    - shared flux response is requested through the transport-model interface rather than being hard-wired to any specific NTX path
+    - convection, work, ambipolar assembly, divergence, BC handling, and source-model evaluation stay live around the current working state
+  - the default transport-model lagged hook now builds a generic flux-level linearization with respect to the transport state
+    - this gives a model-agnostic baseline response for whichever flux model is active
+    - expensive models can later override this with cheaper/more structured response builders
+  - `lagged_linear_state` is retained separately as a full-RHS affine fallback / comparison mode
+    - `f(y) ~= f_ref + J_ref (y - y_ref)`
+  - initial backend coverage now includes:
+    - `radau`
+    - `theta`
+    - `theta_newton`
+  - this preserves the existing black-box benchmark path while giving a first JAX-friendly lagged-response mode to test on expensive NTX kernels
+  - added a first benchmark harness:
+    - `examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py`
+    - compares `black_box` vs `lagged_response` on the NTX exact-`Lij` runtime path without transport plotting / HDF5 output noise
+- still needed next:
+  - run and record benchmark results for `black_box` vs `lagged_response` on the NTX energy-convolution model
+  - benchmark `lagged_response` on `radau`, `theta`, and `theta_newton`, not only on the synthetic/unit-test paths
+  - add adaptive refresh / stale-response criteria beyond the current per-attempt frozen linearization
+  - implement model-specific lagged-response overrides for the expensive flux models so they do not have to rely on the generic AD-built flux Jacobian
+  - decide whether any face-flux closures need their own lagged-response treatment when `evaluate_face_fluxes(...)` is materially more expensive or structurally different than the center-flux path
+  - document the intended difference between:
+    - `black_box`
+    - `lagged_response`
+    - `lagged_linear_state`
 
 Stage 10A: Response Scaffold
 - add an opt-in solver-facing response abstraction without altering the default black-box transport path

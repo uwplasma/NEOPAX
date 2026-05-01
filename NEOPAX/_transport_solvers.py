@@ -767,6 +767,37 @@ def _flat_rhs_factory(unravel, vector_field, args, kwargs, project_flat=None):
     return _flat_rhs
 
 
+def _lagged_response_hooks(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None, None
+    build_fn = getattr(owner, "build_lagged_response", None)
+    eval_fn = getattr(owner, "evaluate_with_lagged_response", None)
+    if callable(build_fn) and callable(eval_fn):
+        return build_fn, eval_fn
+    return None, None
+
+
+def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
+    species = _extract_species_from_args(args)
+    _, eval_fn = _lagged_response_hooks(vector_field)
+
+    def _flat_rhs(t_value, flat_y, lagged_response):
+        projected_flat_y = _project_flat_state_if_needed(
+            flat_y,
+            project_flat,
+        )
+        state_y = unravel(projected_flat_y)
+        if eval_fn is not None:
+            rhs_tree = eval_fn(t_value, state_y, *args, lagged_response=lagged_response, **kwargs)
+        else:
+            rhs_tree = vector_field(t_value, state_y, *args, **kwargs)
+        rhs_flat, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(rhs_tree, species))
+        return rhs_flat
+
+    return _flat_rhs
+
+
 def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float):
     scale = atol + rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
     normalized = err_vec / scale
@@ -1027,6 +1058,7 @@ class _RadauSolverConfig(TransportSolver):
     max_step_factor: float = 5.0
     jacobian_reuse_rtol: float = 0.1
     max_jacobian_age: int = 8
+    rhs_mode: str = "black_box"
     max_steps: int = 20000
     n_steps: int = 0
 
@@ -1048,6 +1080,7 @@ class _RadauSolverConfig(TransportSolver):
         max_step_factor: float = 5.0,
         jacobian_reuse_rtol: float = 0.1,
         max_jacobian_age: int = 8,
+        rhs_mode: str = "black_box",
         max_steps: int = 20000,
         save_n=None,
     ):
@@ -1068,6 +1101,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
         object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
+        object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "save_n", save_n)
@@ -1148,6 +1182,27 @@ class RADAUSolver(_RadauSolverConfig):
         max_total_steps = int(max(1, self.max_steps))
         state_dim = flat_state0.shape[0]
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
+        if rhs_mode not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
+            raise ValueError(
+                f"Unsupported Radau rhs_mode '{rhs_mode}'. "
+                "Expected one of ['black_box', 'lagged_linear_state', 'lagged_transport_response', 'lagged_response']."
+            )
+        use_lagged_linear_response = rhs_mode == "lagged_linear_state"
+        use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+        if use_transport_lagged_response and build_lagged_response is None:
+            raise ValueError(
+                "Radau lagged transport response mode requires a vector field with "
+                "build_lagged_response(...) and evaluate_with_lagged_response(...)."
+            )
         error_order = float(stage_cfg.embedded_order if stage_cfg.has_embedded_estimator else stage_cfg.order)
         controller_alpha = 0.7 / (error_order + 1.0)
         zero_scalar = jnp.asarray(0.0, dtype=dtype)
@@ -1194,6 +1249,11 @@ class RADAUSolver(_RadauSolverConfig):
             complex_piv_cache,
         ):
             f0 = flat_rhs(t_value, flat_y)
+            lagged_response = (
+                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
+                if (use_transport_lagged_response and build_lagged_response is not None)
+                else None
+            )
             z0 = _make_radau_stage_predictor(
                 f0,
                 prev_stages,
@@ -1203,20 +1263,12 @@ class RADAUSolver(_RadauSolverConfig):
                 dtype,
             )
 
-            def _evaluate_stage_model(z_flat):
-                stages = z_flat.reshape((num_stages, state_dim))
-                stage_states = flat_y[None, :] + h_value * (a @ stages)
-                stage_times = t_value + c * h_value
-                evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
-                return stages, evals
-
-            def residual(z_flat):
-                stages, evals = _evaluate_stage_model(z_flat)
-                return (stages - evals).reshape((-1,))
-
             jacobian_dt_scale = jnp.maximum(jnp.abs(cache_dt), jnp.asarray(1.0e-14, dtype=dtype))
             dt_close = jnp.abs(h_value - cache_dt) <= self.jacobian_reuse_rtol * jacobian_dt_scale
-            reuse_linearization = jnp.logical_and(cache_valid, dt_close)
+            reuse_linearization = jnp.logical_and(
+                jnp.logical_and(cache_valid, dt_close),
+                jnp.logical_not(jnp.asarray(jnp.logical_or(use_lagged_linear_response, use_transport_lagged_response))),
+            )
 
             def _reuse_linearization(_):
                 return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
@@ -1253,6 +1305,26 @@ class RADAUSolver(_RadauSolverConfig):
                 _recompute_linearization,
                 operand=None,
             )
+
+            def _evaluate_stage_model(z_flat):
+                stages = z_flat.reshape((num_stages, state_dim))
+                stage_states = flat_y[None, :] + h_value * (a @ stages)
+                if lagged_response is not None:
+                    stage_times = t_value + c * h_value
+                    evals = jax.vmap(lambda ti, yi: flat_rhs_with_lagged_response(ti, yi, lagged_response), in_axes=(0, 0))(stage_times, stage_states)
+                elif use_lagged_linear_response:
+                    # Freeze a step-local affine response around (t_n, y_n):
+                    # f(y) ~= f_ref + J_ref (y - y_ref)
+                    state_delta = stage_states - flat_y[None, :]
+                    evals = f0[None, :] + state_delta @ jacobian_ref.T
+                else:
+                    stage_times = t_value + c * h_value
+                    evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+                return stages, evals
+
+            def residual(z_flat):
+                stages, evals = _evaluate_stage_model(z_flat)
+                return (stages - evals).reshape((-1,))
 
             def stage_solver(rhs):
                 rhs_stages = rhs.reshape((num_stages, state_dim))
@@ -1472,6 +1544,7 @@ class _ThetaSolverConfig(TransportSolver):
     min_step: float = 1.0e-14
     theta_implicit: float = 1.0
     predictor_mode: str = "linearized"
+    rhs_mode: str = "black_box"
     use_predictor_corrector: bool = False
     n_corrector_steps: int = 1
     tol: float = 1.0e-8
@@ -1486,6 +1559,7 @@ class _ThetaSolverConfig(TransportSolver):
         min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
         predictor_mode: str = "linearized",
+        rhs_mode: str = "black_box",
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
@@ -1504,7 +1578,14 @@ class _ThetaSolverConfig(TransportSolver):
                 f"Unsupported theta predictor_mode '{predictor_mode}'. "
                 "Expected 'linearized' or 'euler'."
             )
+        rhs_mode_norm = str(rhs_mode).strip().lower()
+        if rhs_mode_norm not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
+            raise ValueError(
+                f"Unsupported theta rhs_mode '{rhs_mode}'. "
+                "Expected one of ['black_box', 'lagged_linear_state', 'lagged_transport_response', 'lagged_response']."
+            )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
+        object.__setattr__(self, "rhs_mode", rhs_mode_norm)
         object.__setattr__(self, "use_predictor_corrector", bool(use_predictor_corrector))
         object.__setattr__(self, "n_corrector_steps", int(max(0, n_corrector_steps)))
         object.__setattr__(self, "tol", float(tol))
@@ -1533,6 +1614,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         min_step: float = 1.0e-14,
         theta_implicit: float = 1.0,
         predictor_mode: str = "linearized",
+        rhs_mode: str = "black_box",
         use_predictor_corrector: bool = False,
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
@@ -1554,6 +1636,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             min_step=min_step,
             theta_implicit=theta_implicit,
             predictor_mode=predictor_mode,
+            rhs_mode=rhs_mode,
             use_predictor_corrector=use_predictor_corrector,
             n_corrector_steps=n_corrector_steps,
             tol=tol,
@@ -1626,18 +1709,49 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
         predictor_mode = getattr(self, "predictor_mode", "linearized")
+        rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
+        use_lagged_linear_response = rhs_mode == "lagged_linear_state"
+        use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+        if use_transport_lagged_response and build_lagged_response is None:
+            raise ValueError(
+                "Theta lagged transport response mode requires a vector field with "
+                "build_lagged_response(...) and evaluate_with_lagged_response(...)."
+            )
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
 
         def _single_theta_step(flat_y, t_value, h_value):
             f_old = flat_rhs(t_value, flat_y)
             t_new = t_value + h_value
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
+            lagged_response = (
+                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
+                if (use_transport_lagged_response and build_lagged_response is not None)
+                else None
+            )
+            f_ref_new = flat_rhs(t_new, flat_y)
+            jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
+
+            def _eval_new_rhs(y_value):
+                y_proj = _project_flat_state_if_needed(y_value, project_flat)
+                if lagged_response is not None:
+                    return flat_rhs_with_lagged_response(t_new, y_proj, lagged_response)
+                if use_lagged_linear_response:
+                    return f_ref_new + jacobian_ref @ (y_proj - flat_y)
+                return flat_rhs(t_new, y_proj)
 
             if predictor_mode == "euler":
                 y_new = guess0
                 linear_ok = jnp.asarray(True)
-                f_new = flat_rhs(t_new, y_new)
+                f_new = _eval_new_rhs(y_new)
                 residual = y_new - flat_y - h_value * (
                     (jnp.asarray(1.0, dtype=dtype) - theta) * f_old + theta * f_new
                 )
@@ -1645,7 +1759,11 @@ class ThetaMethodSolver(_ThetaSolverConfig):
                 converged = residual_norm <= self.tol
                 return y_new, converged
 
-            jacobian_guess0 = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0)
+            jacobian_guess0 = jnp.where(
+                use_lagged_linear_response,
+                jacobian_ref,
+                jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0),
+            )
             system0 = identity_n - h_value * theta * jacobian_guess0
             lu0, piv0 = jax.scipy.linalg.lu_factor(system0)
             linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
@@ -1653,7 +1771,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             def _corrector_body(_, carry):
                 guess, linear_ok = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
-                f_guess = flat_rhs(t_new, guess_proj)
+                f_guess = _eval_new_rhs(guess_proj)
                 affine_rhs = flat_y + h_value * (
                     (jnp.asarray(1.0, dtype=dtype) - theta) * f_old
                     + theta * (f_guess - jacobian_guess0 @ guess_proj)
@@ -1670,7 +1788,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
                 _corrector_body,
                 (guess0, jnp.asarray(True)),
             )
-            f_new = flat_rhs(t_new, y_new)
+            f_new = _eval_new_rhs(y_new)
             residual = y_new - flat_y - h_value * (
                 (jnp.asarray(1.0, dtype=dtype) - theta) * f_old + theta * f_new
             )
@@ -1801,7 +1919,23 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
         predictor_mode = getattr(self, "predictor_mode", "linearized")
+        rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
+        use_lagged_linear_response = rhs_mode == "lagged_linear_state"
+        use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+        if use_transport_lagged_response and build_lagged_response is None:
+            raise ValueError(
+                "Theta lagged transport response mode requires a vector field with "
+                "build_lagged_response(...) and evaluate_with_lagged_response(...)."
+            )
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
         safety_factor = jnp.asarray(self.safety_factor, dtype=dtype)
         min_step_factor = jnp.asarray(self.min_step_factor, dtype=dtype)
@@ -1815,11 +1949,30 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             f_old = flat_rhs(t_value, flat_y)
             t_new = t_value + h_value
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
+            lagged_response = (
+                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
+                if (use_transport_lagged_response and build_lagged_response is not None)
+                else None
+            )
+            f_ref_new = flat_rhs(t_new, flat_y)
+            jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
+
+            def _eval_new_rhs(y_value):
+                y_proj = _project_flat_state_if_needed(y_value, project_flat)
+                if lagged_response is not None:
+                    return flat_rhs_with_lagged_response(t_new, y_proj, lagged_response)
+                if use_lagged_linear_response:
+                    return f_ref_new + jacobian_ref @ (y_proj - flat_y)
+                return flat_rhs(t_new, y_proj)
 
             if predictor_mode == "euler":
                 return guess0, jnp.asarray(True)
 
-            jacobian_guess0 = jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0)
+            jacobian_guess0 = jnp.where(
+                use_lagged_linear_response,
+                jacobian_ref,
+                jax.jacfwd(lambda y: flat_rhs(t_new, y))(guess0),
+            )
             system0 = identity_n - h_value * theta * jacobian_guess0
             lu0, piv0 = jax.scipy.linalg.lu_factor(system0)
             linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
@@ -1827,7 +1980,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             def _corrector_body(_, carry):
                 guess, linear_ok = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
-                f_guess = flat_rhs(t_new, guess_proj)
+                f_guess = _eval_new_rhs(guess_proj)
                 affine_rhs = flat_y + h_value * (
                     (one - theta) * f_old
                     + theta * (f_guess - jacobian_guess0 @ guess_proj)
@@ -1854,10 +2007,25 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             f_old = flat_rhs(t_value, flat_y)
             t_new = t_value + h_value
             guess0, linear_ok0 = _make_linearized_guess(flat_y, t_value, h_value)
+            lagged_response = (
+                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
+                if (use_transport_lagged_response and build_lagged_response is not None)
+                else None
+            )
+            f_ref_new = flat_rhs(t_new, flat_y)
+            jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
+
+            def _eval_new_rhs(y_value):
+                y_proj = _project_flat_state_if_needed(y_value, project_flat)
+                if lagged_response is not None:
+                    return flat_rhs_with_lagged_response(t_new, y_proj, lagged_response)
+                if use_lagged_linear_response:
+                    return f_ref_new + jacobian_ref @ (y_proj - flat_y)
+                return flat_rhs(t_new, y_proj)
 
             def residual(y_val):
                 y_proj = _project_flat_state_if_needed(y_val, project_flat)
-                f_new = flat_rhs(t_new, y_proj)
+                f_new = _eval_new_rhs(y_proj)
                 return y_proj - flat_y - h_value * ((one - theta) * f_old + theta * f_new)
 
             def body_fn(carry):
@@ -2060,6 +2228,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
 
     _, backend = _select_solver_family_and_backend(solver_parameters)
     save_n = _cfg_get("save_n", _cfg_get("n_save"))
+    generic_rhs_mode = _cfg_get("rhs_mode", "black_box")
     if backend == "theta":
         return ThetaMethodSolver(
             t0=t0,
@@ -2068,6 +2237,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             min_step=float(_cfg_get("min_step", 1.0e-14)),
             theta_implicit=float(_cfg_get("theta_implicit", 1.0)),
             predictor_mode=str(_cfg_get("theta_predictor_mode", "linearized")),
+            rhs_mode=str(_cfg_get("theta_rhs_mode", generic_rhs_mode)),
             use_predictor_corrector=bool(_cfg_get("use_predictor_corrector", False)),
             n_corrector_steps=int(_cfg_get("n_corrector_steps", 1)),
             tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
@@ -2082,6 +2252,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             min_step=float(_cfg_get("min_step", 1.0e-14)),
             theta_implicit=float(_cfg_get("theta_implicit", 1.0)),
             predictor_mode=str(_cfg_get("theta_predictor_mode", "linearized")),
+            rhs_mode=str(_cfg_get("theta_rhs_mode", generic_rhs_mode)),
             use_predictor_corrector=bool(_cfg_get("use_predictor_corrector", False)),
             n_corrector_steps=int(_cfg_get("n_corrector_steps", 1)),
             tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
@@ -2112,6 +2283,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             safety_factor=float(_cfg_get("safety_factor", 0.9)),
             min_step_factor=float(_cfg_get("min_step_factor", 0.1)),
             max_step_factor=float(_cfg_get("max_step_factor", 5.0)),
+            rhs_mode=str(_cfg_get("radau_rhs_mode", generic_rhs_mode)),
             max_steps=int(_cfg_get("max_steps", 20000)),
             save_n=save_n,
         )

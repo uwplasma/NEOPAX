@@ -17,6 +17,7 @@ from NEOPAX._transport_flux_models import (
 )
 from NEOPAX._fem import cell_centered_from_faces, faces_from_cell_centered
 from NEOPAX._orchestrator import calculate_fluxes_from_config
+from NEOPAX._state import TransportState
 
 
 class DummySpecies:
@@ -51,6 +52,38 @@ class DummyFluxModel:
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         del state, face_state, kwargs
         return {"Gamma": self.gamma, "Q": self.q, "Upar": self.upar}
+
+
+def test_transport_flux_base_lagged_response_is_flux_linearization():
+    from NEOPAX._transport_flux_models import TransportFluxModelBase
+
+    class LinearFluxModel(TransportFluxModelBase):
+        def __call__(self, state, geometry=None, params=None):
+            del geometry, params
+            gamma = 2.0 * state.density
+            q = 3.0 * state.pressure
+            upar = 4.0 * state.Er[None, :]
+            return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+    model = LinearFluxModel()
+    state0 = TransportState(
+        density=jnp.array([[1.0, 2.0], [3.0, 4.0]]),
+        pressure=jnp.array([[5.0, 6.0], [7.0, 8.0]]),
+        Er=jnp.array([0.25, 0.5]),
+    )
+    state1 = TransportState(
+        density=state0.density + 0.1,
+        pressure=state0.pressure - 0.2,
+        Er=state0.Er + 0.05,
+    )
+
+    lagged = model.build_lagged_response(state0)
+    out = model.evaluate_with_lagged_response(state1, lagged)
+    exact = model(state1)
+
+    assert jnp.allclose(out["Gamma"], exact["Gamma"])
+    assert jnp.allclose(out["Q"], exact["Q"])
+    assert jnp.allclose(out["Upar"], exact["Upar"])
 
 
 def _write_flux_file(path: Path, r, gamma=None, q=None, upar=None):

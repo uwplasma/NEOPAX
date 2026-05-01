@@ -5,6 +5,7 @@ from NEOPAX._transport_solvers import (
     DiffraxSolver,
     NewtonThetaMethodSolver,
     RADAUSolver,
+    ThetaMethodSolver,
     build_time_solver,
 )
 
@@ -35,6 +36,31 @@ def test_build_time_solver_theta_newton_backend():
     assert isinstance(solver, NewtonThetaMethodSolver)
     assert float(solver.t0) == 0.0
     assert float(solver.t1) == 1.0
+    assert solver.rhs_mode == "black_box"
+
+
+def test_build_time_solver_theta_backend_accepts_shared_lagged_rhs_mode():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="theta",
+            rhs_mode="lagged_linear_state",
+        )
+    )
+    assert isinstance(solver, ThetaMethodSolver)
+    assert solver.rhs_mode == "lagged_linear_state"
+
+
+def test_build_time_solver_theta_newton_backend_accepts_shared_lagged_rhs_mode():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="theta_newton",
+            rhs_mode="lagged_linear_state",
+        )
+    )
+    assert isinstance(solver, NewtonThetaMethodSolver)
+    assert solver.rhs_mode == "lagged_linear_state"
 
 
 def test_build_time_solver_radau_backend():
@@ -43,6 +69,31 @@ def test_build_time_solver_radau_backend():
     assert isinstance(solver, RADAUSolver)
     assert float(solver.t0) == 0.0
     assert float(solver.t1) == 1.0
+    assert solver.rhs_mode == "black_box"
+
+
+def test_build_time_solver_radau_accepts_lagged_rhs_mode():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_linear_state",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.rhs_mode == "lagged_linear_state"
+
+
+def test_build_time_solver_radau_accepts_shared_lagged_rhs_mode():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            rhs_mode="lagged_linear_state",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.rhs_mode == "lagged_linear_state"
 
 
 def test_build_time_solver_legacy_integrator_fallback():

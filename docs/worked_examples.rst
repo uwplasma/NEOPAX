@@ -55,6 +55,38 @@ Useful overrides during development:
 - ``--set turbulence.debug_heat_flux_scale=0.5``
 
 
+Lagged-Response Benchmark Example
+---------------------------------
+
+To compare the new shared transport ``rhs_mode`` values on the expensive NTX
+exact-``Lij`` runtime model, use:
+
+- ``examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py``
+
+This script:
+
+- forces ``flux_model = "ntx_exact_lij_runtime"``
+- disables plots/HDF5 output to reduce benchmark noise
+- compares ``black_box`` against ``lagged_response`` by default
+- works with ``radau``, ``theta``, or ``theta_newton``
+
+Example:
+
+.. code-block:: console
+
+    python examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py --backend radau
+
+or:
+
+.. code-block:: console
+
+    python examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py --backend theta_newton
+
+The script defaults to the no-helium Radau transport example as its base input
+file, but rewires the neoclassical model internally so it benchmarks the
+runtime NTX exact-``Lij`` path rather than the file-backed database route.
+
+
 Ambipolarity Example
 --------------------
 

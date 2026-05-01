@@ -731,9 +731,14 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     debug_markers = bool(solver_cfg.get("debug_stage_markers", False))
     debug_disable_jit = bool(solver_cfg.get("debug_disable_jit", False))
     if debug_markers:
+        rhs_mode = solver_cfg.get(
+            "theta_rhs_mode" if backend_name in {"theta", "theta_newton"} else "radau_rhs_mode",
+            solver_cfg.get("rhs_mode", "black_box"),
+        ) if backend_name in {"theta", "theta_newton", "radau"} else "default"
         print(
             "[NEOPAX] transport setup complete:",
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
+            f"rhs_mode={rhs_mode}",
             f"n_equations={len(equations_to_evolve)}",
             f"state_size={_state_num_elements(state)}",
         )
