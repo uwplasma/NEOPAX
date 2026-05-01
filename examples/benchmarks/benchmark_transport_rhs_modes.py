@@ -42,6 +42,15 @@ DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
 DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
 
+def _block_on_result(result) -> None:
+    for candidate in (result.final_time, result.n_steps, result.done, result.fail_code):
+        if candidate is not None:
+            jax.block_until_ready(candidate)
+            return
+    if result.accepted_mask is not None:
+        jax.block_until_ready(result.accepted_mask)
+
+
 def _tree_to_host_numpy(tree):
     return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
 
@@ -134,6 +143,7 @@ def _build_config(
 def _run_once(config):
     t_start = time.perf_counter()
     result = NEOPAX.run(config)
+    _block_on_result(result)
     wall_seconds = time.perf_counter() - t_start
     return result, wall_seconds
 
@@ -221,6 +231,14 @@ def main():
             "lax.map over chunks and vmap within each chunk."
         ),
     )
+    parser.add_argument(
+        "--compute-final-state-delta",
+        action="store_true",
+        help=(
+            "Compute max|delta| of final_state versus the first rhs_mode. "
+            "Disabled by default because materializing the full final state can be very expensive."
+        ),
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -235,6 +253,7 @@ def main():
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
     print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
+    print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for rhs_mode in args.rhs_modes:
@@ -280,12 +299,12 @@ def main():
             last_result, wall_seconds = _run_once(config)
             timed_runs.append(wall_seconds)
 
-        if reference_final_state is None and last_result is not None:
-            reference_final_state = _tree_to_host_numpy(last_result.final_state)
-
         final_state_delta = None
-        if reference_final_state is not None and last_result is not None:
-            final_state_delta = _leaf_max_abs_delta(reference_final_state, _tree_to_host_numpy(last_result.final_state))
+        if args.compute_final_state_delta and last_result is not None:
+            if reference_final_state is None:
+                reference_final_state = _tree_to_host_numpy(last_result.final_state)
+            else:
+                final_state_delta = _leaf_max_abs_delta(reference_final_state, _tree_to_host_numpy(last_result.final_state))
 
         mode_results.append(
             {
