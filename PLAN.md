@@ -778,6 +778,12 @@ Planned implementation stages:
     - prefer tangent-on-demand application of the lagged response over storing full local Jacobians
     - keep the expensive response centered on the NTX coefficient solve, not on a broader NEOPAX-side full-state surrogate
     - preserve a `vmap`/array-level scan path with no Python scan loop in the active runtime kernel
+  - benchmark the new exact-runtime face-response options:
+    - `face_local_response`
+    - `interpolate_center_response`
+  - use `interpolate_center_response` as the aggressive reduced-cost benchmark mode for exact-runtime NTX face fluxes
+    - it should reuse already-computed center fluxes when available instead of triggering a second expensive NTX face solve
+    - treat it as a benchmark/performance mode first, not an assumed universal default
   - run and record benchmark results for `black_box` vs `lagged_response` on the NTX energy-convolution model
   - benchmark `lagged_response` on `radau`, `theta`, and `theta_newton`, not only on the synthetic/unit-test paths
   - add adaptive refresh / stale-response criteria beyond the current per-attempt frozen linearization

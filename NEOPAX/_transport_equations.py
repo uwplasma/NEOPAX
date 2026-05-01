@@ -252,7 +252,7 @@ class DensityEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
+        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
         Gamma_faces_raw = (
             PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
@@ -290,7 +290,7 @@ class DensityEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
+        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
         Gamma_faces = (
             PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
@@ -332,7 +332,7 @@ def build_density_equation(
     Vprime_half = field.Vprime_half
     def flux_faces_builder(flux, face_reconstruction="centered"):
         return _cell_centered_flux_faces(flux, face_reconstruction)
-    def face_flux_builder(state):
+    def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
         face_mode = str(particle_face_closure_mode).strip().lower()
@@ -364,6 +364,7 @@ def build_density_equation(
             bc_temperature=bc_temperature,
             bc_er=bc_er,
             particle_face_closure_mode=face_mode,
+            center_fluxes=center_fluxes,
         )
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
@@ -462,7 +463,7 @@ class TemperatureEquation(EquationBase):
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
+        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
@@ -558,7 +559,7 @@ class TemperatureEquation(EquationBase):
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state) if (self.face_flux_builder is not None and need_face_fluxes) else None
+        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
@@ -704,7 +705,7 @@ def build_temperature_equation(
     Vprime_half = field.Vprime_half
     def flux_faces_builder(flux, face_reconstruction="centered"):
         return _cell_centered_flux_faces(flux, face_reconstruction)
-    def face_flux_builder(state):
+    def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
         face_state = build_face_transport_state(
@@ -723,6 +724,7 @@ def build_temperature_equation(
             bc_density=bc_density,
             bc_temperature=bc_temperature,
             bc_er=bc_er,
+            center_fluxes=center_fluxes,
         )
     temperature_ghost_builder = _build_species_ghost_builder(bc_temperature)
     if active_species_mask is None:

@@ -36,6 +36,8 @@ DEFAULT_ER_INIT_MODE = "keep"
 DEFAULT_NTX_EXACT_N_THETA = 5
 DEFAULT_NTX_EXACT_N_ZETA = 21
 DEFAULT_NTX_EXACT_N_XI = 32
+DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
+DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
 
 def _leaf_max_abs_delta(reference, other) -> float:
@@ -71,6 +73,7 @@ def _build_config(
     n_theta: int | None,
     n_zeta: int | None,
     n_xi: int | None,
+    ntx_face_response_mode: str,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
@@ -100,6 +103,8 @@ def _build_config(
             neoclassical["ntx_exact_n_zeta"] = int(n_zeta)
         if n_xi is not None:
             neoclassical["ntx_exact_n_xi"] = int(n_xi)
+        if rhs_mode in {"lagged_response", "lagged_transport_response"}:
+            neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
 
     ambipolarity = config.setdefault("ambipolarity", {})
     ambipolarity["er_ambipolar_plot"] = False
@@ -167,7 +172,7 @@ def main():
     parser.add_argument(
         "--rhs-modes",
         nargs="+",
-        default=["black_box", "lagged_response"],
+        default=DEFAULT_RHS_MODES,
         help="RHS modes to compare.",
     )
     parser.add_argument(
@@ -188,6 +193,15 @@ def main():
         default=None,
         help="Override ntx_exact_n_xi when benchmarking ntx_exact_lij_runtime.",
     )
+    parser.add_argument(
+        "--ntx-face-response-mode",
+        default=DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE,
+        choices=["face_local_response", "interpolate_center_response"],
+        help=(
+            "Exact-runtime NTX face response mode to use for lagged_response benchmarks. "
+            "Black-box mode continues to use the normal live face-local path."
+        ),
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -200,6 +214,7 @@ def main():
     print(f"[benchmark] device={args.device}")
     print(f"[benchmark] requested_flux_model={args.flux_model}")
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
+    print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for rhs_mode in args.rhs_modes:
@@ -213,6 +228,7 @@ def main():
             n_theta=args.ntx_n_theta,
             n_zeta=args.ntx_n_zeta,
             n_xi=args.ntx_n_xi,
+            ntx_face_response_mode=args.ntx_face_response_mode,
         )
 
         if rhs_mode == args.rhs_modes[0]:
@@ -225,6 +241,11 @@ def main():
                     f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
                     f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
                     f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
+                )
+            if active_flux_model == "ntx_exact_lij_runtime":
+                print(
+                    "[benchmark] ntx exact runtime face response mode:",
+                    config["neoclassical"].get("ntx_exact_face_response_mode", "face_local_response"),
                 )
 
         for _ in range(max(0, args.warmup)):

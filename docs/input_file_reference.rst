@@ -405,6 +405,7 @@ Common keys include:
 - ``min_step``
 - ``max_step``
 - ``max_steps``
+- ``stop_after_accepted_steps``
 - ``nonlinear_solver_tol``
 - ``nonlinear_solver_maxiter``
 - ``save_n``
@@ -426,6 +427,7 @@ Example:
     t_final = 20.0
     nonlinear_solver_tol = 1.0e-7
     nonlinear_solver_maxiter = 20
+    stop_after_accepted_steps = 1
     save_n = 10
 
 

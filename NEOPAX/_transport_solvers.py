@@ -842,6 +842,14 @@ def _custom_loop_active(step_state, t_final, step_idx, max_total_steps):
     return jnp.logical_and(step_idx < max_total_steps, active)
 
 
+def _accepted_step_limit_reached(step_state, stop_after_accepted_steps):
+    if stop_after_accepted_steps is None:
+        return jnp.asarray(False)
+    accepted_steps = step_state.status[2]
+    accepted_limit = jnp.asarray(stop_after_accepted_steps, dtype=accepted_steps.dtype)
+    return accepted_steps >= accepted_limit
+
+
 def _run_saved_loop(
     *,
     step_state0,
@@ -852,6 +860,7 @@ def _run_saved_loop(
     state_dim,
     dtype,
     max_total_steps,
+    stop_after_accepted_steps=None,
 ):
     save_times = jnp.linspace(t0, t_final, save_n)
     ys_saved = jnp.zeros((save_n, state_dim), dtype=dtype)
@@ -866,7 +875,8 @@ def _run_saved_loop(
 
     def cond_fun(loop_carry):
         step_state, step_idx, *_ = loop_carry
-        return _custom_loop_active(step_state, t_final, step_idx, max_total_steps)
+        active = _custom_loop_active(step_state, t_final, step_idx, max_total_steps)
+        return jnp.logical_and(active, jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)))
 
     def body_fun(loop_carry):
         step_state, step_idx, save_idx, ys, ts, dts, accs, fails, codes = loop_carry
@@ -1060,6 +1070,7 @@ class _RadauSolverConfig(TransportSolver):
     max_jacobian_age: int = 8
     rhs_mode: str = "black_box"
     max_steps: int = 20000
+    stop_after_accepted_steps: int | None = None
     n_steps: int = 0
 
     def __init__(
@@ -1082,6 +1093,7 @@ class _RadauSolverConfig(TransportSolver):
         max_jacobian_age: int = 8,
         rhs_mode: str = "black_box",
         max_steps: int = 20000,
+        stop_after_accepted_steps: int | None = None,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -1103,6 +1115,9 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
         object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
+        if stop_after_accepted_steps is not None:
+            stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
+        object.__setattr__(self, "stop_after_accepted_steps", stop_after_accepted_steps)
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "save_n", save_n)
 
@@ -1504,6 +1519,7 @@ class RADAUSolver(_RadauSolverConfig):
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
+        stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
         step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -1513,15 +1529,17 @@ class RADAUSolver(_RadauSolverConfig):
             state_dim=state_dim,
             dtype=dtype,
             max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
         )
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
         n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
+        accepted_limit_hit = _accepted_step_limit_reached(step_state_f, stop_after_accepted_steps)
         return _finalize_custom_solver_output(
             ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
             step_state_f.y,
             step_state_f.t,
-            step_state_f.t >= (t_final - 1.0e-15),
+            jnp.logical_or(step_state_f.t >= (t_final - 1.0e-15), accepted_limit_hit),
             failed_f,
             fail_code_f,
             n_acc_f,
@@ -1549,6 +1567,7 @@ class _ThetaSolverConfig(TransportSolver):
     n_corrector_steps: int = 1
     tol: float = 1.0e-8
     max_steps: int = 20000
+    stop_after_accepted_steps: int | None = None
     n_steps: int = 0
 
     def __init__(
@@ -1564,6 +1583,7 @@ class _ThetaSolverConfig(TransportSolver):
         n_corrector_steps: int = 1,
         tol: float = 1.0e-8,
         max_steps: int = 20000,
+        stop_after_accepted_steps: int | None = None,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -1590,6 +1610,9 @@ class _ThetaSolverConfig(TransportSolver):
         object.__setattr__(self, "n_corrector_steps", int(max(0, n_corrector_steps)))
         object.__setattr__(self, "tol", float(tol))
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
+        if stop_after_accepted_steps is not None:
+            stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
+        object.__setattr__(self, "stop_after_accepted_steps", stop_after_accepted_steps)
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "save_n", save_n)
 
@@ -1627,6 +1650,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         delta_reduction_factor: float = 0.5,
         tau_min: float = 0.01,
         max_steps: int = 20000,
+        stop_after_accepted_steps: int | None = None,
         save_n=None,
     ):
         super().__init__(
@@ -1641,6 +1665,7 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             n_corrector_steps=n_corrector_steps,
             tol=tol,
             max_steps=max_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
             save_n=save_n,
         )
         object.__setattr__(self, "maxiter", int(max(1, maxiter)))
@@ -1847,6 +1872,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
+        stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
         step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -1856,10 +1882,12 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             state_dim=state_dim,
             dtype=dtype,
             max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
         )
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
         n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
+        accepted_limit_hit = _accepted_step_limit_reached(step_state_f, stop_after_accepted_steps)
         return _finalize_custom_solver_output(
             ys_saved,
             ts_saved,
@@ -1869,7 +1897,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             fail_codes_saved,
             step_state_f.y,
             step_state_f.t,
-            step_state_f.t >= (t_final - 1.0e-15),
+            jnp.logical_or(step_state_f.t >= (t_final - 1.0e-15), accepted_limit_hit),
             failed_f,
             fail_code_f,
             n_acc_f,
@@ -2168,6 +2196,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
+        stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
         step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -2177,10 +2206,12 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             state_dim=state_dim,
             dtype=dtype,
             max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
         )
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
         n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
+        accepted_limit_hit = _accepted_step_limit_reached(step_state_f, stop_after_accepted_steps)
         return _finalize_custom_solver_output(
             ys_saved,
             ts_saved,
@@ -2190,7 +2221,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             fail_codes_saved,
             step_state_f.y,
             step_state_f.t,
-            step_state_f.t >= (t_final - 1.0e-15),
+            jnp.logical_or(step_state_f.t >= (t_final - 1.0e-15), accepted_limit_hit),
             failed_f,
             fail_code_f,
             n_acc_f,
@@ -2229,6 +2260,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
     _, backend = _select_solver_family_and_backend(solver_parameters)
     save_n = _cfg_get("save_n", _cfg_get("n_save"))
     generic_rhs_mode = _cfg_get("rhs_mode", "black_box")
+    stop_after_accepted_steps = _cfg_get("stop_after_accepted_steps")
     if backend == "theta":
         return ThetaMethodSolver(
             t0=t0,
@@ -2242,6 +2274,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             n_corrector_steps=int(_cfg_get("n_corrector_steps", 1)),
             tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
             max_steps=int(_cfg_get("max_steps", 20000)),
+            stop_after_accepted_steps=stop_after_accepted_steps,
             save_n=save_n,
         )
     if backend == "theta_newton":
@@ -2265,6 +2298,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             delta_reduction_factor=float(_cfg_get("theta_delta_reduction_factor", 0.5)),
             tau_min=float(_cfg_get("theta_tau_min", 0.01)),
             max_steps=int(_cfg_get("max_steps", 20000)),
+            stop_after_accepted_steps=stop_after_accepted_steps,
             save_n=save_n,
         )
     if backend == "radau":
@@ -2285,6 +2319,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             max_step_factor=float(_cfg_get("max_step_factor", 5.0)),
             rhs_mode=str(_cfg_get("radau_rhs_mode", generic_rhs_mode)),
             max_steps=int(_cfg_get("max_steps", 20000)),
+            stop_after_accepted_steps=stop_after_accepted_steps,
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)

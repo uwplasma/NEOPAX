@@ -153,6 +153,10 @@ RHS Modes
 ---------
 
 The implicit backends share the concept of ``rhs_mode``.
+They also share the optional ``stop_after_accepted_steps`` limiter, which
+terminates the solve after a chosen number of accepted timesteps. This is most
+useful for fast benchmark runs that should include a real accepted implicit
+step without integrating all the way to ``t_final``.
 
 ``black_box``
 ^^^^^^^^^^^^^

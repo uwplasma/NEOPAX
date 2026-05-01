@@ -220,6 +220,48 @@ This is the key distinction between:
 The former is the intended ``D1`` design.
 
 
+Face-Flux Strategy
+------------------
+
+Face fluxes deserve separate treatment because the transport discretization
+actually consumes face quantities in the conservative update. For expensive
+models there are two useful modes:
+
+- ``face_local_response``
+  - evaluate the expensive response at the face state directly
+  - this is the safer and more faithful choice
+- ``interpolate_center_response``
+  - reuse already-computed center fluxes and interpolate them radially to the
+    faces
+  - this is the aggressive reduced-cost option
+
+The second mode is attractive because in the transport equations the center
+fluxes are often already available. Reusing them avoids a second expensive
+face-local solve in the same RHS evaluation.
+
+However, it is still an additional approximation, because it replaces:
+
+- face-local expensive response evaluation
+
+with:
+
+- center response followed by radial interpolation
+
+So the recommended policy is:
+
+- treat ``face_local_response`` as the safer reference mode
+- treat ``interpolate_center_response`` as the performance benchmark mode
+- compare them explicitly against the black-box reference on:
+  - accepted/rejected steps
+  - edge behavior
+  - ambipolar response
+  - profile drift
+
+This is the right place to save extra expensive NTX evaluations, but only
+after verifying that the reduced-cost mode is numerically acceptable for the
+target regime.
+
+
 No-Python-Loop Scan Principle
 -----------------------------
 

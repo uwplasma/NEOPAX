@@ -132,6 +132,7 @@ atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
+stop_after_accepted_steps = 1
 throw = false
 debug_stage_markers = false
 debug_disable_jit = false
