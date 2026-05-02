@@ -26,6 +26,31 @@ under a benchmark that isolates:
 
 and then compare the initial-state `Er` and produced fluxes against the usual database interpolation path.
 
+## Current Findings
+
+The latest single-attempt tests already showed two important facts:
+
+1. `jax.lax.map` over the full `51` radii is probably **not** the primary problem.
+2. The main issue appears to be that the initial Radau step attempt is being **rejected**.
+
+Evidence:
+
+- in single-attempt mode, both:
+  - coarse-anchor lagged response
+  - full `51`-radius lagged response
+  ended with:
+  - `n_steps = 0`
+  - `final_t = 0.0`
+- that means the first attempt did not advance time
+- this points to step rejection rather than simply “too many radii” or “`lax.map` is too slow”
+
+So the next session should prioritize:
+
+- diagnosing why the first Radau attempt is rejected
+- comparing the initial `Er` and fluxes against the database interpolation baseline
+
+before making more NTX batching changes.
+
 ## Benchmark Set A: One Step Attempt Only
 
 Run timing benchmarks for exactly one Radau step attempt, without mixing in repeated retries.
@@ -58,6 +83,11 @@ Reason:
 
 - the current `stop_after_accepted_steps = 1` benchmark still allows multiple rejected attempts
 - that contaminates the comparison between lagged-response variants
+
+Important interpretation:
+
+- if `n_steps = 0` and `final_t = 0.0`, the one attempt was rejected
+- that is now the main condition to diagnose
 
 ## Benchmark Set B: One Accepted Step
 
@@ -102,6 +132,22 @@ Questions to answer:
 2. Are the initial fluxes effectively identical?
 3. If not, where do they first diverge?
 4. Is the divergence already present before Radau iteration begins?
+5. If the initial `Er` and fluxes are effectively identical to the database interpolation path, why is the lagged path still rejecting the first attempt?
+
+Important initialization detail:
+
+- the ambipolar `Er` root initialization uses the **active run flux model** for flux/root evaluation
+- in the current benchmark override, that means:
+  - `flux_model = ntx_exact_lij_runtime`
+- but the entropy ranking used to choose among valid roots still comes from:
+  - `neoclassical.entropy_model = ntx_database`
+
+So the initialization split is:
+
+1. root candidate flux evaluations:
+   - active transport flux model
+2. entropy-based root selection:
+   - configured entropy model
 
 ## Interpretation Rule
 
@@ -142,6 +188,47 @@ Optional:
 2. database interpolation black-box vs coarse `7` lagged
 3. full `51` lagged vs coarse `7` lagged
 
+### Rejection Diagnosis
+
+For the first single attempt, determine whether rejection comes mainly from:
+
+1. nonlinear solve non-convergence
+2. error-estimator rejection after convergence
+3. an initial `dt` that is too aggressive for the lagged path
+
+Expose, if possible:
+
+- converged / not converged
+- `err_norm`
+- rejection reason / fail code
+- number of lagged RHS evaluations in the attempt
+
+### Ambipolarity Comparison
+
+Run ambipolarity-mode benchmarks directly, using the same exact-runtime and coarse-anchor settings, to compare against the transport-step benchmarks.
+
+Goals:
+
+1. measure the cost of the initial `Er` root solve separately from Radau transport stepping
+2. compare the roots and flux evaluations obtained with:
+   - database interpolation
+   - full `51` exact-runtime lagged-related settings
+   - coarse-anchor exact-runtime lagged-related settings
+3. determine whether the initialization itself is already producing differences that can later trigger Radau rejection
+
+Suggested comparisons:
+
+1. ambipolarity mode with database interpolation baseline
+2. ambipolarity mode with exact-runtime full radial response
+3. ambipolarity mode with exact-runtime coarse-anchor response where applicable
+
+Compare:
+
+- best-root `Er` profile
+- candidate roots if available
+- ambipolar flux values near the chosen root
+- runtime / GPU usage
+
 ## Desired Outputs For Next Session
 
 Prepare a small table or note with:
@@ -161,3 +248,4 @@ Prepare a small table or note with:
 3. Are the lagged-response variants reproducing the same initial flux state as the database interpolation baseline?
 4. If yes, why does Radau still reject more often?
 5. If no, which quantity first causes the divergence?
+6. Is the rejection happening even when full `51` `lax.map` response is used, confirming that the problem is not just the coarse-anchor reduction?
