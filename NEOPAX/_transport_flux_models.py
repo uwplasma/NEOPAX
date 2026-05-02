@@ -235,8 +235,18 @@ class NTXPreparedCoefficientResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class NTXInterpolatedMomentResponse:
+    reference_er: jax.Array
+    reference_log_nu_star: jax.Array
+    reference_transport_moments: jax.Array
+    dtransport_moments_d_er: jax.Array
+    dtransport_moments_d_log_nu_star: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class NTXExactLijLaggedResponse:
-        center_response: NTXPreparedCoefficientResponse
+        center_response: Any
 
 
 @jax.tree_util.register_dataclass
@@ -1249,6 +1259,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     face_response_mode: str = "face_local_response"
     radial_batch_size: int | None = None
     scan_batch_size: int | None = None
+    response_anchor_count: int | None = None
     use_remat: bool = False
     collisionality_model: str = "default"
     bc_density: Any = None
@@ -1303,6 +1314,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         normalized = None if scan_batch_size in (None, 0) else int(scan_batch_size)
         return dataclasses.replace(self, scan_batch_size=normalized)
 
+    def with_response_anchor_count(self, response_anchor_count: int | None) -> "NTXExactLijRuntimeTransportModel":
+        normalized = None if response_anchor_count in (None, 0) else int(response_anchor_count)
+        return dataclasses.replace(self, response_anchor_count=normalized)
+
     def with_use_remat(self, use_remat: bool) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, use_remat=bool(use_remat))
 
@@ -1336,6 +1351,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if len(outputs) == 1:
             return outputs[0]
         return jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
+
+    def _response_anchor_indices(self, n_radius: int) -> jax.Array:
+        anchor_count = self.response_anchor_count
+        if anchor_count is None or int(anchor_count) >= n_radius or int(anchor_count) < 2:
+            return jnp.arange(n_radius, dtype=jnp.int32)
+        anchor_count = int(anchor_count)
+        raw = [round(i * (n_radius - 1) / (anchor_count - 1)) for i in range(anchor_count)]
+        anchor_indices = []
+        for idx in raw:
+            idx_i = int(idx)
+            if not anchor_indices or idx_i != anchor_indices[-1]:
+                anchor_indices.append(idx_i)
+        if anchor_indices[-1] != n_radius - 1:
+            anchor_indices[-1] = n_radius - 1
+        return jnp.asarray(anchor_indices, dtype=jnp.int32)
+
+    def _interpolate_anchor_values(self, anchor_indices, anchor_values, target_rho):
+        anchor_rho = target_rho[anchor_indices]
+        n_target = int(target_rho.shape[0])
+        flat_anchor = anchor_values.reshape((anchor_values.shape[0], -1)).T
+        flat_full = jax.vmap(lambda values: jnp.interp(target_rho, anchor_rho, values))(flat_anchor)
+        return flat_full.T.reshape((n_target,) + anchor_values.shape[1:])
+
+    def _log_nu_star_from_nu_hat(self, nu_hat_a):
+        weights = jnp.asarray(self.energy_grid.xWeights, dtype=jnp.float64)
+        weights = weights / jnp.maximum(jnp.sum(weights), 1.0e-30)
+        safe_nu_hat = jnp.maximum(jnp.asarray(nu_hat_a, dtype=jnp.float64), 1.0e-30)
+        return jnp.sum(weights * jnp.log(safe_nu_hat))
 
     def _local_scan_inputs(
         self,
@@ -1598,6 +1641,68 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_epsi_hat=ref_epsi_hat,
         )
 
+    def _build_interpolated_moment_response_local(
+        self,
+        prepared,
+        *,
+        drds_value,
+        species_index: int,
+        er_value,
+        temperature_local,
+        density_local,
+        vthermal_local,
+        collisionality_kind,
+    ):
+        reference_nu_hat, reference_epsi_hat, _ = self._local_scan_inputs(
+            drds_value=drds_value,
+            species_index=species_index,
+            er_value=er_value,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            vthermal_local=vthermal_local,
+            collisionality_kind=collisionality_kind,
+        )
+        reference_log_nu_star = self._log_nu_star_from_nu_hat(reference_nu_hat)
+        reference_transport_moments = self._transport_moments_from_inputs(
+            prepared,
+            reference_nu_hat,
+            reference_epsi_hat,
+            drds_value=drds_value,
+        )
+        dtransport_moments_d_er = jax.jvp(
+            lambda er_scalar: self._transport_moments_from_inputs(
+                prepared,
+                *self._local_scan_inputs(
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_scalar,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                )[:2],
+                drds_value=drds_value,
+            ),
+            (er_value,),
+            (jnp.asarray(1.0, dtype=jnp.asarray(er_value).dtype),),
+        )[1]
+        dtransport_moments_d_log_nu_star = jax.jvp(
+            lambda log_nu_shift: self._transport_moments_from_inputs(
+                prepared,
+                reference_nu_hat * jnp.exp(log_nu_shift),
+                reference_epsi_hat,
+                drds_value=drds_value,
+            ),
+            (jnp.asarray(0.0, dtype=jnp.float64),),
+            (jnp.asarray(1.0, dtype=jnp.float64),),
+        )[1]
+        return (
+            reference_log_nu_star,
+            reference_transport_moments,
+            dtransport_moments_d_er,
+            dtransport_moments_d_log_nu_star,
+        )
+
     def _lij_center(self, Er, temperature, density):
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -1759,7 +1864,70 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
-        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+        n_radius = int(state.Er.shape[0])
+        radius_indices = jnp.arange(n_radius, dtype=jnp.int32)
+        anchor_indices = self._response_anchor_indices(n_radius)
+
+        if int(anchor_indices.shape[0]) < n_radius:
+            target_rho = jnp.asarray(support.center_channels.rho, dtype=jnp.float64)
+
+            def _per_anchor(radius_index):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.center_prepared,
+                )
+                drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            anchor_response = self._map_radius_axis(_per_anchor, anchor_indices)
+            anchor_reference_log_nu_star = anchor_response[0]
+            anchor_reference_transport_moments = anchor_response[1]
+            anchor_dtransport_moments_d_er = anchor_response[2]
+            anchor_dtransport_moments_d_log_nu_star = anchor_response[3]
+            reference_log_nu_star = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_reference_log_nu_star,
+                target_rho,
+            )
+            reference_transport_moments = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_reference_transport_moments,
+                target_rho,
+            )
+            dtransport_moments_d_er = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_dtransport_moments_d_er,
+                target_rho,
+            )
+            dtransport_moments_d_log_nu_star = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_dtransport_moments_d_log_nu_star,
+                target_rho,
+            )
+            return NTXExactLijLaggedResponse(
+                center_response=NTXInterpolatedMomentResponse(
+                    reference_er=state.Er,
+                    reference_log_nu_star=jnp.swapaxes(reference_log_nu_star, 0, 1),
+                    reference_transport_moments=jnp.swapaxes(reference_transport_moments, 0, 1),
+                    dtransport_moments_d_er=jnp.swapaxes(dtransport_moments_d_er, 0, 1),
+                    dtransport_moments_d_log_nu_star=jnp.swapaxes(dtransport_moments_d_log_nu_star, 0, 1),
+                )
+            )
 
         def _per_radius(radius_index):
             prepared = jax.tree_util.tree_map(
@@ -1810,6 +1978,57 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
         center_response = lagged_response.center_response
+
+        if isinstance(center_response, NTXInterpolatedMomentResponse):
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+            def _current_log_nu_star_per_radius(radius_index):
+                drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                return jax.vmap(
+                    lambda species_index: self._log_nu_star_from_nu_hat(
+                        self._local_scan_inputs(
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )[0]
+                    )
+                )(species_indices)
+
+            current_log_nu_star = jnp.swapaxes(
+                self._map_radius_axis(_current_log_nu_star_per_radius, radius_indices),
+                0,
+                1,
+            )
+            delta_er = state.Er - center_response.reference_er
+            delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
+            transport_moments = (
+                center_response.reference_transport_moments
+                + center_response.dtransport_moments_d_er * delta_er[None, :, None]
+                + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+            )
+            lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
+            gamma, q, upar = self._assemble_center_fluxes(
+                state.Er,
+                temperature,
+                density,
+                lij,
+                n_right,
+                n_right_grad,
+                t_right,
+                t_right_grad,
+            )
+            return {"Gamma": gamma, "Q": q, "Upar": upar}
 
         radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
@@ -2022,6 +2241,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_face_response_mode="face_local_response",
     ntx_exact_radial_batch_size=None,
     ntx_exact_scan_batch_size=None,
+    ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -2051,6 +2271,11 @@ def build_ntx_exact_lij_runtime_transport_model(
             None
             if ntx_exact_scan_batch_size in (None, "", 0, "0")
             else int(ntx_exact_scan_batch_size)
+        ),
+        response_anchor_count=(
+            None
+            if ntx_exact_response_anchor_count in (None, "", 0, "0")
+            else int(ntx_exact_response_anchor_count)
         ),
         use_remat=bool(ntx_exact_use_remat),
         collisionality_model=str(collisionality_model),

@@ -40,6 +40,7 @@ DEFAULT_NTX_EXACT_N_XI = 32
 DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
 DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
 DEFAULT_NTX_EXACT_SCAN_BATCH_SIZE = None
+DEFAULT_NTX_EXACT_RESPONSE_ANCHOR_COUNT = None
 DEFAULT_NTX_EXACT_USE_REMAT = False
 DEFAULT_RHS_MODES = ["black_box", "lagged_response", "lagged_linear_state"]
 
@@ -93,6 +94,7 @@ def _build_config(
     ntx_face_response_mode: str,
     ntx_radial_batch_size: int | None,
     ntx_scan_batch_size: int | None,
+    ntx_response_anchor_count: int | None,
     ntx_use_remat: bool,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
@@ -127,6 +129,8 @@ def _build_config(
             neoclassical["ntx_exact_radial_batch_size"] = int(ntx_radial_batch_size)
         if ntx_scan_batch_size not in (None, 0):
             neoclassical["ntx_exact_scan_batch_size"] = int(ntx_scan_batch_size)
+        if ntx_response_anchor_count not in (None, 0):
+            neoclassical["ntx_exact_response_anchor_count"] = int(ntx_response_anchor_count)
         if ntx_use_remat:
             neoclassical["ntx_exact_use_remat"] = True
         if rhs_mode in {"lagged_response", "lagged_transport_response"}:
@@ -250,6 +254,27 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ntx-response-anchor-count",
+        type=int,
+        default=DEFAULT_NTX_EXACT_RESPONSE_ANCHOR_COUNT,
+        help=(
+            "If set below the full transport radial count, build the lagged exact-runtime NTX "
+            "response only on that many radial anchor points and interpolate the reduced "
+            "transport-moment response back to the full transport grid."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-response-anchor-counts",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Run a sweep over multiple exact-runtime lagged-response anchor counts. "
+            "Useful for comparisons such as 7 vs 14 anchors. "
+            "When set, each anchor count is benchmarked as a separate configuration."
+        ),
+    )
+    parser.add_argument(
         "--ntx-use-remat",
         action="store_true",
         default=DEFAULT_NTX_EXACT_USE_REMAT,
@@ -269,9 +294,12 @@ def main():
     args = parser.parse_args()
 
     config_path = Path(args.config)
+    sweep_anchor_counts = args.ntx_response_anchor_counts
+    if sweep_anchor_counts is None:
+        sweep_anchor_counts = [args.ntx_response_anchor_count]
+
     mode_results = []
     reference_final_state = None
-    active_flux_model = None
 
     print(f"[benchmark] config={config_path}")
     print(f"[benchmark] backend={args.backend}")
@@ -281,88 +309,109 @@ def main():
     print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
     print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
     print(f"[benchmark] ntx_scan_batch_size={args.ntx_scan_batch_size}")
+    print(f"[benchmark] ntx_response_anchor_counts={sweep_anchor_counts}")
     print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
-    for rhs_mode in args.rhs_modes:
-        config, active_flux_model = _build_config(
-            config_path,
-            backend=args.backend,
-            device=args.device,
-            rhs_mode=rhs_mode,
-            flux_model=args.flux_model,
-            er_init_mode=args.er_init_mode,
-            n_theta=args.ntx_n_theta,
-            n_zeta=args.ntx_n_zeta,
-            n_xi=args.ntx_n_xi,
-            ntx_face_response_mode=args.ntx_face_response_mode,
-            ntx_radial_batch_size=args.ntx_radial_batch_size,
-            ntx_scan_batch_size=args.ntx_scan_batch_size,
-            ntx_use_remat=args.ntx_use_remat,
-        )
+    for sweep_anchor_count in sweep_anchor_counts:
+        active_flux_model = None
+        for rhs_mode in args.rhs_modes:
+            config, active_flux_model = _build_config(
+                config_path,
+                backend=args.backend,
+                device=args.device,
+                rhs_mode=rhs_mode,
+                flux_model=args.flux_model,
+                er_init_mode=args.er_init_mode,
+                n_theta=args.ntx_n_theta,
+                n_zeta=args.ntx_n_zeta,
+                n_xi=args.ntx_n_xi,
+                ntx_face_response_mode=args.ntx_face_response_mode,
+                ntx_radial_batch_size=args.ntx_radial_batch_size,
+                ntx_scan_batch_size=args.ntx_scan_batch_size,
+                ntx_response_anchor_count=sweep_anchor_count,
+                ntx_use_remat=args.ntx_use_remat,
+            )
 
-        if rhs_mode == args.rhs_modes[0]:
-            print(f"[benchmark] active_flux_model={active_flux_model}")
-            if active_flux_model == "ntx_exact_lij_runtime" and (
-                args.ntx_n_theta is not None or args.ntx_n_zeta is not None or args.ntx_n_xi is not None
-            ):
+            if rhs_mode == args.rhs_modes[0]:
+                print(f"[benchmark] active_flux_model={active_flux_model}")
+                if active_flux_model == "ntx_exact_lij_runtime" and (
+                    args.ntx_n_theta is not None or args.ntx_n_zeta is not None or args.ntx_n_xi is not None
+                ):
+                    print(
+                        "[benchmark] ntx exact runtime resolution overrides:",
+                        f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
+                        f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
+                        f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
+                        f"radial_batch_size={config['neoclassical'].get('ntx_exact_radial_batch_size', 0)}",
+                        f"scan_batch_size={config['neoclassical'].get('ntx_exact_scan_batch_size', 0)}",
+                        f"response_anchor_count={config['neoclassical'].get('ntx_exact_response_anchor_count', 0)}",
+                        f"use_remat={config['neoclassical'].get('ntx_exact_use_remat', False)}",
+                    )
+                if active_flux_model == "ntx_exact_lij_runtime":
+                    print(
+                        "[benchmark] ntx exact runtime face response mode:",
+                        config["neoclassical"].get("ntx_exact_face_response_mode", "face_local_response"),
+                    )
+                    anchor_count = config["neoclassical"].get("ntx_exact_response_anchor_count", 0)
+                    if int(anchor_count) > 0:
+                        print(
+                            "[benchmark] ntx exact runtime lagged response mode:",
+                            f"coarse_anchor_interpolated(anchor_count={anchor_count}, derivatives=Er+log_nu_star)",
+                        )
+                    else:
+                        print(
+                            "[benchmark] ntx exact runtime lagged response mode:",
+                            "full_radius_response",
+                        )
+
+            for _ in range(max(0, args.warmup)):
                 print(
-                    "[benchmark] ntx exact runtime resolution overrides:",
-                    f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
-                    f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
-                    f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
-                    f"radial_batch_size={config['neoclassical'].get('ntx_exact_radial_batch_size', 0)}",
-                    f"scan_batch_size={config['neoclassical'].get('ntx_exact_scan_batch_size', 0)}",
-                    f"use_remat={config['neoclassical'].get('ntx_exact_use_remat', False)}",
+                    f"[benchmark] warmup compile/run rhs_mode={rhs_mode}"
+                    f" anchor_count={sweep_anchor_count}"
                 )
-            if active_flux_model == "ntx_exact_lij_runtime":
-                print(
-                    "[benchmark] ntx exact runtime face response mode:",
-                    config["neoclassical"].get("ntx_exact_face_response_mode", "face_local_response"),
-                )
+                _run_once(config)
 
-        for _ in range(max(0, args.warmup)):
-            print(f"[benchmark] warmup compile/run rhs_mode={rhs_mode}")
-            _run_once(config)
+            timed_runs = []
+            last_result = None
+            for _ in range(max(1, args.repeat)):
+                last_result, wall_seconds = _run_once(config)
+                timed_runs.append(wall_seconds)
 
-        timed_runs = []
-        last_result = None
-        for _ in range(max(1, args.repeat)):
-            last_result, wall_seconds = _run_once(config)
-            timed_runs.append(wall_seconds)
+            final_state_delta = None
+            if args.compute_final_state_delta and last_result is not None:
+                if reference_final_state is None:
+                    reference_final_state = _tree_to_host_numpy(last_result.final_state)
+                else:
+                    final_state_delta = _leaf_max_abs_delta(reference_final_state, _tree_to_host_numpy(last_result.final_state))
 
-        final_state_delta = None
-        if args.compute_final_state_delta and last_result is not None:
-            if reference_final_state is None:
-                reference_final_state = _tree_to_host_numpy(last_result.final_state)
-            else:
-                final_state_delta = _leaf_max_abs_delta(reference_final_state, _tree_to_host_numpy(last_result.final_state))
-
-        mode_results.append(
-            {
-                "rhs_mode": rhs_mode,
-                "flux_model": active_flux_model,
-                "mean_wall_seconds": sum(timed_runs) / len(timed_runs),
-                "best_wall_seconds": min(timed_runs),
-                "n_steps": None if last_result is None or last_result.n_steps is None else int(last_result.n_steps),
-                "accepted_steps": None if last_result is None else _accepted_count(last_result),
-                "failed": None if last_result is None or last_result.failed is None else bool(last_result.failed),
-                "fail_code": None if last_result is None or last_result.fail_code is None else int(last_result.fail_code),
-                "final_time": None if last_result is None or last_result.final_time is None else float(last_result.final_time),
-                "final_state_max_abs_delta_vs_first": final_state_delta,
-            }
-        )
+            mode_results.append(
+                {
+                    "rhs_mode": rhs_mode,
+                    "flux_model": active_flux_model,
+                    "response_anchor_count": sweep_anchor_count,
+                    "mean_wall_seconds": sum(timed_runs) / len(timed_runs),
+                    "best_wall_seconds": min(timed_runs),
+                    "n_steps": None if last_result is None or last_result.n_steps is None else int(last_result.n_steps),
+                    "accepted_steps": None if last_result is None else _accepted_count(last_result),
+                    "failed": None if last_result is None or last_result.failed is None else bool(last_result.failed),
+                    "fail_code": None if last_result is None or last_result.fail_code is None else int(last_result.fail_code),
+                    "final_time": None if last_result is None or last_result.final_time is None else float(last_result.final_time),
+                    "final_state_max_abs_delta_vs_first": final_state_delta,
+                }
+            )
 
     print()
-    print("rhs_mode                 mean_s     best_s     n_steps  accepted  failed  fail_code  final_t   max|delta|")
-    print("-" * 108)
+    print("rhs_mode                 anchors     mean_s     best_s     n_steps  accepted  failed  fail_code  final_t   max|delta|")
+    print("-" * 118)
     for row in mode_results:
         final_time_str = str(None if row["final_time"] is None else round(row["final_time"], 6))
         final_delta = row["final_state_max_abs_delta_vs_first"]
         final_delta_str = "None" if final_delta is None else f"{final_delta:.3e}"
         print(
             f"{row['rhs_mode']:<23}"
+            f"{str(row['response_anchor_count']):>9}"
             f"{row['mean_wall_seconds']:>10.3f}"
             f"{row['best_wall_seconds']:>11.3f}"
             f"{str(row['n_steps']):>12}"

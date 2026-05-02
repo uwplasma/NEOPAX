@@ -774,10 +774,33 @@ Planned implementation stages:
     - `examples/benchmarks/benchmark_ntx_exact_lij_rhs_modes.py`
     - compares `black_box` vs `lagged_response` on the NTX exact-`Lij` runtime path without transport plotting / HDF5 output noise
 - still needed next:
-  - make the NTX prepared-solve JVP response the active priority implementation for expensive NTX runtime models
-    - prefer tangent-on-demand application of the lagged response over storing full local Jacobians
-    - keep the expensive response centered on the NTX coefficient solve, not on a broader NEOPAX-side full-state surrogate
-    - preserve a `vmap`/array-level scan path with no Python scan loop in the active runtime kernel
+  - continue tightening the NTX prepared-solve JVP response for expensive NTX runtime models
+    - current implementation status:
+      - exact-runtime lagged response is no longer based on a generic dense Jacobian
+      - full reference NTX solve over the active `x` grid is still performed at the reference point
+      - the active reduced response now stores convolved transport moments rather than full coefficient scans
+      - the exact-runtime path now supports:
+        - radial batching:
+          - `ntx_exact_radial_batch_size`
+        - inner scan batching:
+          - `ntx_exact_scan_batch_size`
+        - optional checkpointing:
+          - `ntx_exact_use_remat`
+        - optional coarse response anchors:
+          - `ntx_exact_response_anchor_count`
+    - active coarse-anchor reduced-response path:
+      - transport solve remains on the full radial grid
+      - expensive exact-runtime lagged response may be built only on anchor radii
+      - reduced transport moments are then interpolated back to the full transport grid
+      - current derivative-informed coarse response includes:
+        - `dM / dE_r`
+        - `dM / dlog(nu_*)`
+      - where `M` denotes the reduced convolved transport moments used to reconstruct local `Lij`
+    - preferred response philosophy:
+      - keep the full `x`-grid NTX solve and convolution at the reference point
+      - reduce only the within-step perturbation representation
+      - keep profile autodiff alive through the `nu_*(n,T)` path
+    - preserve a JAX-friendly mapped scan path with no Python scan loop in the active runtime kernel
   - benchmark the new exact-runtime face-response options:
     - `face_local_response`
     - `interpolate_center_response`
@@ -787,9 +810,13 @@ Planned implementation stages:
   - run and record benchmark results for `black_box` vs `lagged_response` on the NTX energy-convolution model
   - benchmark `lagged_response` on `radau`, `theta`, and `theta_newton`, not only on the synthetic/unit-test paths
   - add adaptive refresh / stale-response criteria beyond the current per-attempt frozen linearization
-  - implement model-specific lagged-response overrides for the expensive flux models so they do not have to rely on the generic AD-built flux Jacobian
+  - continue refining the model-specific lagged-response overrides for the expensive flux models so they do not have to rely on the generic AD-built flux Jacobian
     - first target:
       - `ntx_exact_lij_runtime`
+      - next refinement priorities inside that model:
+        - decide whether `dM / dlog(nu_*)` is sufficient as the first collisionality-response coordinate or whether an additional reduced local drive coordinate is needed
+        - evaluate whether coarse-anchor reduced responses should become the preferred D1 benchmark mode for exact-runtime NTX
+        - compare coarse-anchor reduced responses against full-radius reduced responses for accuracy and memory/runtime savings
     - next target:
       - the NTX energy-convolution / scan-backed realtime path
   - decide whether any face-flux closures need their own lagged-response treatment when `evaluate_face_fluxes(...)` is materially more expensive or structurally different than the center-flux path
@@ -931,6 +958,124 @@ Design constraints if pursued later:
 Expected tradeoff:
 - simpler conceptual interface from the solver perspective (`f(y)` plus `df/dy`)
 - but usually less interpretable and less transport-physics-aware than a structured flux/source response model
+
+### D3: Optimization-Oriented AD Architecture
+- Status: newly prioritized planning item
+- Goal:
+  - make final-state profile optimization practical by separating:
+    - forward expensive-kernel acceleration
+    - optimization-gradient architecture
+
+Core design decision:
+- `lagged_response` remains the forward-solve acceleration mechanism
+- do **not** rely on naive reverse-mode differentiation through:
+  - all Radau stages
+  - all Newton iterations
+  - all local NTX solves
+  - the full rollout trace
+- instead, move toward:
+  - custom differentiation at the accepted-step map level first
+  - then custom differentiation at the rollout level
+
+Target abstraction hierarchy:
+1. local flux-response model
+   - keep reduced NTX/neoclassical response objects compact
+   - prefer directional derivatives / `jvp(...)`
+   - avoid dense full-state Jacobians unless they are explicitly needed
+2. accepted-step transport map
+   - treat one accepted step as:
+     - `Y_{n+1} = Phi(Y_n, theta)`
+   - give this step map a custom VJP / implicit-differentiation rule
+3. full transport rollout
+   - treat the full solve as:
+     - `Y_final = RunTransport(Y0, theta)`
+   - give the rollout a custom VJP / adjoint-style backward path using accepted-step checkpoints or replay
+
+Why this sub-track is needed:
+- the current D1 work improves the forward solve
+- but profile optimization through the final state will still be too expensive if gradients are taken by tracing through the full implicit solver internals
+- the real state-of-the-art path for this problem is:
+  - forward acceleration with lagged local responses
+  - custom step/rollout differentiation for optimization
+
+Primary implementation checklist:
+
+Step 1: Formalize the accepted-step AD contract
+- define the optimization-facing timestep map:
+  - `Phi(Y_n, theta) -> Y_{n+1}`
+- document what data must be saved per accepted step for the backward pass:
+  - accepted state
+  - accepted next state
+  - accepted `dt`
+  - any compact response/linearization data needed by the backward rule
+- explicitly avoid saving every Newton/stage iterate unless proven necessary
+
+Step 2: Implement a custom VJP for one accepted step
+- first target:
+  - the transport step map, not the full rollout
+- forward pass:
+  - use the normal accepted-step solver path
+  - allow `black_box` and `lagged_response` as forward modes
+- backward pass:
+  - do not backpropagate through every Newton iteration directly
+  - instead use an implicit / linearized step equation
+- validate:
+  - gradient agreement against finite differences on short one-step cases
+
+Step 3: Reuse reduced response objects in the backward rule
+- keep using the smallest physically meaningful local response object:
+  - reduced transport moments
+  - compact NTX prepared-solve response data
+- prefer:
+  - local pushforwards / pullbacks at the reduced-response level
+- avoid:
+  - full coefficient-history or full solver-trace adjoints
+
+Step 4: Connect NTX custom derivative interfaces cleanly
+- use NTX prepared-solve derivative contract points where needed, especially:
+  - `solve_prepared_coefficient_vector_vjp(...)`
+- keep NTX responsible for:
+  - local solve-level derivative information
+- keep NEOPAX responsible for:
+  - step-map and rollout-map differentiation
+
+Step 5: Implement a rollout-level custom VJP
+- define:
+  - `RunTransport(Y0, theta) -> Y_final`
+- backward strategy options:
+  - accepted-step checkpoint/replay
+  - adjoint-style reverse sweep over accepted steps
+- do not rely on storing the full internal reverse trace of the whole solver rollout
+
+Step 6: Add selective lagging by transport component
+- allow:
+  - lag neoclassical NTX response
+  - keep analytical turbulence live
+  - keep other cheap components live where helpful
+- this keeps the forward lagged model targeted at the expensive physics and simplifies backward sensitivity interpretation
+
+Step 7: Benchmark optimization-relevant cost, not only forward solve cost
+- measure:
+  - forward solve wall time
+  - backward/gradient wall time
+  - peak memory during gradient evaluation
+  - gradient agreement against finite differences on small cases
+- compare:
+  - naive autodiff through the full solve
+  - step-VJP path
+  - eventual rollout-VJP path
+
+Recommended ordering:
+1. complete D1 forward lagged-response stabilization
+2. implement one-step custom VJP
+3. validate one-step gradients against finite differences
+4. implement rollout-level custom VJP / replay strategy
+5. then return to further local kernel tuning only where profiling still justifies it
+
+Success criteria for this sub-track:
+- gradients of final-state objectives with respect to initial profiles become practical in memory and runtime
+- the AD path no longer depends on naive reverse-mode through the full implicit solver internals
+- D1 remains the forward acceleration layer used by the optimization workflow rather than being overloaded as the entire gradient solution
 
 ## Track E: Autodiff And Sensitivity Analysis
 
