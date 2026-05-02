@@ -1656,10 +1656,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_tangent = (jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a) * drds_value
         zero_epsi_tangent = jnp.zeros_like(reference_epsi_hat)
         dtransport_moments_d_er = transport_moment_pushforward(
-            (zero_nu_tangent, epsi_hat_tangent)
+            zero_nu_tangent,
+            epsi_hat_tangent,
         )
         dtransport_moments_d_log_nu_star = transport_moment_pushforward(
-            (reference_nu_hat, zero_epsi_tangent)
+            reference_nu_hat,
+            zero_epsi_tangent,
         )
         return (
             reference_log_nu_star,
