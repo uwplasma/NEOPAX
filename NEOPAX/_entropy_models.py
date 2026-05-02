@@ -34,6 +34,8 @@ except ImportError:
     import numpy as jnp
 
 register_entropy_model("ntx_database", ntx_database_entropy)
+register_entropy_model("ntx_exact_lij_runtime", ntx_database_entropy)
+register_entropy_model("ntx_scan_runtime", ntx_database_entropy)
 # Flux-file transport currently uses the same simple ambipolar entropy proxy:
 # sum over absolute species particle fluxes. Registering this alias keeps
 # entropy-model resolution consistent when [neoclassical].flux_model is set
