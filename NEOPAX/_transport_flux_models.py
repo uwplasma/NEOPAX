@@ -47,6 +47,7 @@ from ._model_api import (
     transport_model as transport_model_decorator,
     validate_transport_flux_builder,
 )
+from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
@@ -1825,6 +1826,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def build_lagged_response(self, state, **kwargs):
         del kwargs
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_start("ntx.build_lagged_response"), ordered=True)
         density = safe_density(state.density)
         temperature = state.temperature
         support = self._static_support()
@@ -1886,6 +1889,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 anchor_dtransport_moments_d_log_nu_star,
                 target_rho,
             )
+            if lagged_timing_enabled():
+                jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
             return NTXExactLijLaggedResponse(
                 center_response=NTXInterpolatedMomentResponse(
                     reference_er=state.Er,
@@ -1920,6 +1925,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )(species_indices)
 
         response_by_radius = self._map_radius_axis(_per_radius, radius_indices)
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
         return NTXExactLijLaggedResponse(center_response=response_by_radius)
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
@@ -1947,6 +1954,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_response = lagged_response.center_response
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
+            if lagged_timing_enabled():
+                jax.debug.callback(lambda: lagged_timing_start("ntx.evaluate_with_lagged_response.coarse"), ordered=True)
             radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
             def _current_log_nu_star_per_radius(radius_index):
@@ -1992,6 +2001,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 t_right,
                 t_right_grad,
             )
+            if lagged_timing_enabled():
+                jax.debug.callback(lambda: lagged_timing_end("ntx.evaluate_with_lagged_response.coarse"), ordered=True)
             return {"Gamma": gamma, "Q": q, "Upar": upar}
 
         radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)

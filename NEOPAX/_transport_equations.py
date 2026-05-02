@@ -13,6 +13,7 @@ from ._source_models import (
     sum_source_components,
 )
 from ._transport_flux_models import build_face_transport_state, build_ntss_like_face_transport_state
+from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
 from ._state import (
     DEFAULT_TRANSPORT_DENSITY_FLOOR,
     DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
@@ -1285,9 +1286,13 @@ class ComposedEquationSystem:
 
     def build_lagged_response(self, state):
         working_state, _ = self._prepare_working_state(state)
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
         flux_response = None
         if self.shared_flux_model is not None:
             flux_response = self.shared_flux_model.build_lagged_response(working_state)
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_end("equations.build_lagged_response"), ordered=True)
         return TransportLaggedResponse(
             flux_response=flux_response,
         )

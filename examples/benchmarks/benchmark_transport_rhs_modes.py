@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import time
 from pathlib import Path
 import sys
@@ -291,7 +292,20 @@ def main():
             "Disabled by default because materializing the full final state can be very expensive."
         ),
     )
+    parser.add_argument(
+        "--debug-lagged-timing",
+        action="store_true",
+        help=(
+            "Print runtime timing callbacks for lagged-response build/evaluation sections. "
+            "Useful to separate compile delay from actual lagged NTX work."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.debug_lagged_timing:
+        os.environ["NEOPAX_DEBUG_LAGGED_TIMING"] = "1"
+    else:
+        os.environ.pop("NEOPAX_DEBUG_LAGGED_TIMING", None)
 
     config_path = Path(args.config)
     sweep_anchor_counts = args.ntx_response_anchor_counts
@@ -312,6 +326,7 @@ def main():
     print(f"[benchmark] ntx_response_anchor_counts={sweep_anchor_counts}")
     print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
+    print(f"[benchmark] debug_lagged_timing={args.debug_lagged_timing}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for sweep_anchor_count in sweep_anchor_counts:
