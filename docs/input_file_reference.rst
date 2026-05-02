@@ -224,6 +224,18 @@ Example:
     er_ambipolar_max_roots = 3
     er_ambipolar_tol = 1.0e-6
 
+Optional batching controls for the trial-``Er`` scan:
+
+- ``er_ambipolar_scan_batch_mode = "vmap"``:
+  default full vectorization over the trial ``Er`` grid
+- ``er_ambipolar_scan_batch_mode = "lax_map"``:
+  evaluate the trial ``Er`` grid sequentially with ``jax.lax.map``
+- ``er_ambipolar_scan_batch_mode = "hybrid"``:
+  evaluate the trial ``Er`` grid in chunks, using ``jax.lax.map`` over
+  chunks and ``jax.vmap`` inside each chunk
+- ``er_ambipolar_scan_batch_size``:
+  chunk size used when ``er_ambipolar_scan_batch_mode = "hybrid"``
+
 
 ``[energy_grid]``
 -----------------

@@ -10,6 +10,59 @@ from ._transport_flux_models import build_transport_flux_model
 from ._entropy_models import get_entropy_model
 
 
+def _normalize_er_scan_batch_mode(mode: str | None) -> str:
+    normalized = "vmap" if mode in (None, "") else str(mode).strip().lower()
+    aliases = {
+        "full_vmap": "vmap",
+        "map": "lax_map",
+        "laxmap": "lax_map",
+        "lax.map": "lax_map",
+        "chunked": "hybrid",
+        "batch": "hybrid",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"vmap", "lax_map", "hybrid"}:
+        raise ValueError(
+            "[ambipolarity].er_ambipolar_scan_batch_mode must be one of: vmap, lax_map, hybrid"
+        )
+    return normalized
+
+
+def _map_er_scan_axis(fn, values, *, batch_mode: str = "vmap", batch_size: int | None = None):
+    mode = _normalize_er_scan_batch_mode(batch_mode)
+    if mode == "lax_map":
+        return jax.lax.map(fn, values)
+    if mode == "vmap":
+        return jax.vmap(fn)(values)
+
+    if batch_size is None or int(batch_size) <= 1:
+        return jax.lax.map(fn, values)
+
+    batch_size = int(batch_size)
+    n_values = int(values.shape[0])
+    if n_values <= batch_size:
+        return jax.vmap(fn)(values)
+
+    n_full = (n_values // batch_size) * batch_size
+    full_values = values[:n_full]
+    full_chunks = full_values.reshape((n_full // batch_size, batch_size) + values.shape[1:])
+    chunk_outputs = jax.lax.map(lambda chunk: jax.vmap(fn)(chunk), full_chunks)
+    flat_outputs = jax.tree_util.tree_map(
+        lambda arr: arr.reshape((n_full,) + arr.shape[2:]),
+        chunk_outputs,
+    )
+    if n_full == n_values:
+        return flat_outputs
+
+    tail_values = values[n_full:]
+    tail_outputs = jax.vmap(fn)(tail_values)
+    return jax.tree_util.tree_map(
+        lambda full_arr, tail_arr: jnp.concatenate([full_arr, tail_arr], axis=0),
+        flat_outputs,
+        tail_outputs,
+    )
+
+
 def find_ambipolar_Er_min_entropy_jit(
     Gamma_func,
     entropy_func,
@@ -18,6 +71,8 @@ def find_ambipolar_Er_min_entropy_jit(
     tol=1e-6,
     x_tol=1e-6,
     maxiter=30,
+    er_scan_batch_mode="vmap",
+    er_scan_batch_size=None,
 ):
     """JIT-friendly ambipolar root search without Python loops.
 
@@ -33,13 +88,17 @@ def find_ambipolar_Er_min_entropy_jit(
     er_min, er_max = float(Er_range[0]), float(Er_range[1])
     er_grid = jnp.linspace(er_min, er_max, n_scan)
 
-    gamma_grid = jax.vmap(Gamma_func)(er_grid)
+    gamma_grid = _map_er_scan_axis(
+        Gamma_func,
+        er_grid,
+        batch_mode=er_scan_batch_mode,
+        batch_size=er_scan_batch_size,
+    )
     left = er_grid[:-1]
     right = er_grid[1:]
     g_left = gamma_grid[:-1]
     g_right = gamma_grid[1:]
 
-    # Candidate intervals: strict sign change or a near-zero endpoint.
     left_zero = jnp.abs(g_left) <= tol
     right_zero = jnp.abs(g_right) <= tol
     sign_change = (g_left * g_right) < 0.0
@@ -54,7 +113,12 @@ def find_ambipolar_Er_min_entropy_jit(
         x_bisect = 0.5 * (xl + xr)
         use_newton = active & jnp.isfinite(x_newton) & (x_newton > xl) & (x_newton < xr)
         x_trial = jnp.where(use_newton, x_newton, x_bisect)
-        g_trial = jax.vmap(Gamma_func)(x_trial)
+        g_trial = _map_er_scan_axis(
+            Gamma_func,
+            x_trial,
+            batch_mode=er_scan_batch_mode,
+            batch_size=er_scan_batch_size,
+        )
 
         same_sign_as_left = (gl * g_trial) > 0.0
         xl_next = jnp.where(active & same_sign_as_left, x_trial, xl)
@@ -66,12 +130,29 @@ def find_ambipolar_Er_min_entropy_jit(
         active_next = active & ~converged
         return (x_trial, g_trial, xl_next, xr_next, gl_next, gr_next, active_next)
 
-    carry0 = (x0, jax.vmap(Gamma_func)(x0), left, right, g_left, g_right, valid_init)
+    carry0 = (
+        x0,
+        _map_er_scan_axis(
+            Gamma_func,
+            x0,
+            batch_mode=er_scan_batch_mode,
+            batch_size=er_scan_batch_size,
+        ),
+        left,
+        right,
+        g_left,
+        g_right,
+        valid_init,
+    )
     x_final, _, _, _, _, _, active_final = lax.fori_loop(0, maxiter, body, carry0)
 
-    # Keep initially valid candidates; non-converged values remain as best effort.
     valid_mask = valid_init
-    entropy_all = jax.vmap(entropy_func)(x_final)
+    entropy_all = _map_er_scan_axis(
+        entropy_func,
+        x_final,
+        batch_mode=er_scan_batch_mode,
+        batch_size=er_scan_batch_size,
+    )
     entropy_masked = jnp.where(valid_mask, entropy_all, jnp.inf)
 
     best_idx = jnp.argmin(entropy_masked)
@@ -163,6 +244,8 @@ def find_ambipolar_Er_min_entropy_jit_multires(
     tol=1e-6,
     x_tol=1e-6,
     maxiter=12,
+    er_scan_batch_mode="vmap",
+    er_scan_batch_size=None,
 ):
     """
     Two-stage (coarse/fine) JIT-friendly ambipolar root search for a single radius.
@@ -173,23 +256,27 @@ def find_ambipolar_Er_min_entropy_jit_multires(
     er_min = jnp.asarray(Er_range[0], dtype=jnp.float64)
     er_max = jnp.asarray(Er_range[1], dtype=jnp.float64)
     er_grid = jnp.linspace(er_min, er_max, n_coarse, dtype=jnp.float64)
-    gamma_grid = jax.vmap(Gamma_func)(er_grid)
+    gamma_grid = _map_er_scan_axis(
+        Gamma_func,
+        er_grid,
+        batch_mode=er_scan_batch_mode,
+        batch_size=er_scan_batch_size,
+    )
     left = er_grid[:-1]
     right = er_grid[1:]
     g_left = gamma_grid[:-1]
     g_right = gamma_grid[1:]
 
-    # Bracket intervals with sign change or near-zero endpoint
     left_zero = jnp.abs(g_left) <= tol
     right_zero = jnp.abs(g_right) <= tol
     sign_change = (g_left * g_right) < 0.0
     valid = sign_change | left_zero | right_zero
-    # --- JAX-friendly static-shape bracket gathering ---
     idxs = jnp.arange(left.shape[0])
-    valid_idxs = jnp.where(valid, idxs, left.shape[0])  # invalids get out-of-bounds index
+    valid_idxs = jnp.where(valid, idxs, left.shape[0])
     sorted_valid_idxs = jnp.sort(valid_idxs)
+
     def safe_gather(arr):
-        arr_ext = jnp.concatenate([arr, jnp.zeros((1,), arr.dtype)], axis=0)  # pad for out-of-bounds
+        arr_ext = jnp.concatenate([arr, jnp.zeros((1,), arr.dtype)], axis=0)
         return arr_ext[sorted_valid_idxs[:max_roots]]
 
     xl = safe_gather(left)
@@ -208,6 +295,7 @@ def find_ambipolar_Er_min_entropy_jit_multires(
     def _roots():
         x = 0.5 * (xl + xr)
         active = jnp.arange(max_roots) < n_found
+
         def body(_, carry):
             x, gx, xl, xr, gl, gr, active = carry
             dgx = (gr - gl) / (xr - xl + 1e-12)
@@ -215,24 +303,53 @@ def find_ambipolar_Er_min_entropy_jit_multires(
             x_bisect = 0.5 * (xl + xr)
             use_newton = active & jnp.isfinite(x_newton) & (x_newton > xl) & (x_newton < xr)
             x_trial = jnp.where(use_newton, x_newton, x_bisect)
-            g_trial = jax.vmap(Gamma_func)(x_trial)
+            g_trial = _map_er_scan_axis(
+                Gamma_func,
+                x_trial,
+                batch_mode=er_scan_batch_mode,
+                batch_size=er_scan_batch_size,
+            )
             same_sign_left = (gl * g_trial) > 0.0
-            xl_n = jnp.where(active & same_sign_left,  x_trial, xl)
-            gl_n = jnp.where(active & same_sign_left,  g_trial, gl)
+            xl_n = jnp.where(active & same_sign_left, x_trial, xl)
+            gl_n = jnp.where(active & same_sign_left, g_trial, gl)
             xr_n = jnp.where(active & ~same_sign_left, x_trial, xr)
             gr_n = jnp.where(active & ~same_sign_left, g_trial, gr)
-            converged   = active & ((jnp.abs(g_trial) <= tol) | (jnp.abs(xr_n - xl_n) <= x_tol))
+            converged = active & ((jnp.abs(g_trial) <= tol) | (jnp.abs(xr_n - xl_n) <= x_tol))
             active_next = active & ~converged
             return (x_trial, g_trial, xl_n, xr_n, gl_n, gr_n, active_next)
-        carry0 = (x, jax.vmap(Gamma_func)(x), xl, xr, gl, gr, active)
+
+        carry0 = (
+            x,
+            _map_er_scan_axis(
+                Gamma_func,
+                x,
+                batch_mode=er_scan_batch_mode,
+                batch_size=er_scan_batch_size,
+            ),
+            xl,
+            xr,
+            gl,
+            gr,
+            active,
+        )
         x_final, _, _, _, _, _, active_final = lax.fori_loop(0, n_refine, body, carry0)
-        entropies = jax.vmap(entropy_func)(x_final)
+        entropies = _map_er_scan_axis(
+            entropy_func,
+            x_final,
+            batch_mode=er_scan_batch_mode,
+            batch_size=er_scan_batch_size,
+        )
         roots_padded = jnp.where(jnp.arange(max_roots) < n_found, x_final, jnp.nan)
         entropies_padded = jnp.where(jnp.arange(max_roots) < n_found, entropies, jnp.nan)
         n_roots = jnp.asarray(n_found, dtype=jnp.int32)
         entropy_masked = jnp.where(jnp.arange(max_roots) < n_found, entropies_padded, jnp.inf)
         best_idx = jnp.argmin(entropy_masked)
-        best_root = lax.cond(n_found > 0, lambda _: roots_padded[best_idx], lambda _: jnp.asarray(0.0, dtype=jnp.float64), None)
+        best_root = lax.cond(
+            n_found > 0,
+            lambda _: roots_padded[best_idx],
+            lambda _: jnp.asarray(0.0, dtype=jnp.float64),
+            None,
+        )
         return roots_padded, entropies_padded, best_root, n_roots
 
     roots, entropies, best_root, n_roots = lax.cond(jnp.sum(valid) == 0, _empty, _roots)
@@ -862,6 +979,8 @@ def find_ambipolar_Er_min_entropy_jit_adaptive(
     tol=1e-6,
     x_tol=1e-6,
     maxiter=12,
+    er_scan_batch_mode="vmap",
+    er_scan_batch_size=None,
 ):
     """
     JAX-compatible adaptive bracketing root-finder with static padding.
@@ -882,8 +1001,8 @@ def find_ambipolar_Er_min_entropy_jit_adaptive(
 
     def bracket_signs(brackets):
         l, r = brackets[:, 0], brackets[:, 1]
-        g_l = jax.vmap(Gamma_func)(l)
-        g_r = jax.vmap(Gamma_func)(r)
+        g_l = _map_er_scan_axis(Gamma_func, l, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
+        g_r = _map_er_scan_axis(Gamma_func, r, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
         left_zero = jnp.abs(g_l) <= tol
         right_zero = jnp.abs(g_r) <= tol
         sign_change = (g_l * g_r) < 0.0
@@ -929,14 +1048,16 @@ def find_ambipolar_Er_min_entropy_jit_adaptive(
     active = jnp.isfinite(x)
     def body(_, carry):
         x, l, r, active = carry
-        gx = jax.vmap(Gamma_func)(x)
-        dgx = jax.vmap(jax.grad(Gamma_func))(x)
+        gx = _map_er_scan_axis(Gamma_func, x, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
+        dgx = _map_er_scan_axis(jax.grad(Gamma_func), x, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
         x_newton = x - gx / (dgx + 1e-12)
         x_bisect = 0.5 * (l + r)
         use_newton = active & jnp.isfinite(x_newton) & (x_newton > l) & (x_newton < r)
         x_trial = jnp.where(use_newton, x_newton, x_bisect)
-        g_trial = jax.vmap(Gamma_func)(x_trial)
-        same_sign_left = (jax.vmap(Gamma_func)(l) * g_trial) > 0.0
+        g_trial = _map_er_scan_axis(Gamma_func, x_trial, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
+        same_sign_left = (
+            _map_er_scan_axis(Gamma_func, l, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size) * g_trial
+        ) > 0.0
         l_n = jnp.where(active & same_sign_left, x_trial, l)
         r_n = jnp.where(active & ~same_sign_left, x_trial, r)
         converged = active & ((jnp.abs(g_trial) <= tol) | (jnp.abs(r_n - l_n) <= x_tol))
@@ -944,7 +1065,7 @@ def find_ambipolar_Er_min_entropy_jit_adaptive(
         return (x_trial, l_n, r_n, active_next)
     carry0 = (x, l, r, active)
     x_final, _, _, active_final = lax.fori_loop(0, n_refine, body, carry0)
-    entropies = jax.vmap(entropy_func)(x_final)
+    entropies = _map_er_scan_axis(entropy_func, x_final, batch_mode=er_scan_batch_mode, batch_size=er_scan_batch_size)
     # Only keep finite roots
     roots_padded = jnp.where(jnp.isfinite(x_final), x_final, jnp.nan)
     entropies_padded = jnp.where(jnp.isfinite(x_final), entropies, jnp.nan)
@@ -1127,6 +1248,18 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
     else:
         er_ambipolar_blocksize = None
 
+    er_ambipolar_scan_batch_mode = _normalize_er_scan_batch_mode(
+        amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap")
+    )
+    er_ambipolar_scan_batch_size = amb_cfg.get("er_ambipolar_scan_batch_size", None)
+    if er_ambipolar_scan_batch_size is not None:
+        try:
+            er_ambipolar_scan_batch_size = int(er_ambipolar_scan_batch_size)
+        except Exception:
+            raise ValueError("[ambipolarity].er_ambipolar_scan_batch_size must be an integer if specified.")
+        if er_ambipolar_scan_batch_size == 0:
+            er_ambipolar_scan_batch_size = None
+
     charge_qp = jnp.asarray(params["species"].charge_qp)
     t_flux_build = __import__("time").perf_counter() if debug_stage_markers else None
     local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
@@ -1187,6 +1320,8 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
                 'tol': float(amb_cfg.get("er_ambipolar_tol", 1e-6)),
                 'x_tol': float(amb_cfg.get("er_ambipolar_x_tol", 1e-6)),
                 'maxiter': int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                'er_scan_batch_mode': er_ambipolar_scan_batch_mode,
+                'er_scan_batch_size': er_ambipolar_scan_batch_size,
             })
         elif model_name == "adaptive":
             args.update({
@@ -1203,6 +1338,8 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
                 'tol': float(amb_cfg.get("er_ambipolar_tol", 1e-6)),
                 'x_tol': float(amb_cfg.get("er_ambipolar_x_tol", 1e-6)),
                 'maxiter': int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                'er_scan_batch_mode': er_ambipolar_scan_batch_mode,
+                'er_scan_batch_size': er_ambipolar_scan_batch_size,
             })
         elif model_name in ("multistart", "multistart_clustered"):
             args.update({
@@ -1334,7 +1471,9 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
                         f"n_coarse={int(amb_cfg.get('er_ambipolar_n_coarse', 24))} "
                         f"n_refine={int(amb_cfg.get('er_ambipolar_n_refine', 8))} "
                         f"max_roots={int(amb_cfg.get('er_ambipolar_max_roots', 3))} "
-                        f"block_size={block_size}"
+                        f"block_size={block_size} "
+                        f"er_scan_batch_mode={er_ambipolar_scan_batch_mode} "
+                        f"er_scan_batch_size={er_ambipolar_scan_batch_size}"
                     )
         return tuple(np.asarray(arr)[:n_radial] for arr in (roots_all, entropies_all, best_roots, n_roots_all))
 

@@ -23,6 +23,7 @@ er_ambipolar_tol = 1.0e-6
 er_ambipolar_x_tol = 1.0e-6
 er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
+er_ambipolar_scan_batch_mode = "vmap"
 er_ambipolar_overlay_reference_er = false
 er_ambipolar_plot = true
 er_ambipolar_write_hdf5 = false
