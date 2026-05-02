@@ -1325,32 +1325,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         batch_size = self.radial_batch_size
         if batch_size is None or int(batch_size) <= 1:
             return jax.lax.map(fn, radius_indices)
-
-        n_radius = int(radius_indices.shape[0])
-        batch_size = int(batch_size)
-        if batch_size >= n_radius:
-            return jax.vmap(fn)(radius_indices)
-
-        n_full = n_radius // batch_size
-        remainder = n_radius % batch_size
-        outputs = []
-
-        if n_full > 0:
-            chunked = radius_indices[: n_full * batch_size].reshape((n_full, batch_size))
-            mapped = jax.lax.map(lambda chunk: jax.vmap(fn)(chunk), chunked)
-            mapped = jax.tree_util.tree_map(
-                lambda arr: arr.reshape((n_full * batch_size,) + arr.shape[2:]),
-                mapped,
-            )
-            outputs.append(mapped)
-
-        if remainder > 0:
-            tail = radius_indices[n_full * batch_size :]
-            outputs.append(jax.vmap(fn)(tail))
-
-        if len(outputs) == 1:
-            return outputs[0]
-        return jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
+        return jax.vmap(fn)(radius_indices)
 
     def _map_radius_axis_unbatched(self, fn, radius_indices):
         return jax.lax.map(fn, radius_indices)
@@ -1666,35 +1641,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             collisionality_kind=collisionality_kind,
         )
         reference_log_nu_star = self._log_nu_star_from_nu_hat(reference_nu_hat)
-        reference_transport_moments = self._transport_moments_from_inputs(
-            prepared,
-            reference_nu_hat,
-            reference_epsi_hat,
-            drds_value=drds_value,
-        )
-        v_new_a = self.energy_grid.v_norm * vth_a
-        zero_nu_tangent = jnp.zeros_like(reference_nu_hat)
-        epsi_hat_tangent = (jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a) * drds_value
-        dtransport_moments_d_er = jax.jvp(
+        reference_transport_moments, transport_moment_pushforward = jax.linearize(
             lambda nu_hat_a, epsi_hat_a: self._transport_moments_from_inputs(
                 prepared,
                 nu_hat_a,
                 epsi_hat_a,
                 drds_value=drds_value,
             ),
-            (reference_nu_hat, reference_epsi_hat),
-            (zero_nu_tangent, epsi_hat_tangent),
-        )[1]
-        dtransport_moments_d_log_nu_star = jax.jvp(
-            lambda log_nu_shift: self._transport_moments_from_inputs(
-                prepared,
-                reference_nu_hat * jnp.exp(log_nu_shift),
-                reference_epsi_hat,
-                drds_value=drds_value,
-            ),
-            (jnp.asarray(0.0, dtype=jnp.float64),),
-            (jnp.asarray(1.0, dtype=jnp.float64),),
-        )[1]
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        v_new_a = self.energy_grid.v_norm * vth_a
+        zero_nu_tangent = jnp.zeros_like(reference_nu_hat)
+        epsi_hat_tangent = (jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a) * drds_value
+        zero_epsi_tangent = jnp.zeros_like(reference_epsi_hat)
+        dtransport_moments_d_er = transport_moment_pushforward(
+            (zero_nu_tangent, epsi_hat_tangent)
+        )
+        dtransport_moments_d_log_nu_star = transport_moment_pushforward(
+            (reference_nu_hat, zero_epsi_tangent)
+        )
         return (
             reference_log_nu_star,
             reference_transport_moments,
