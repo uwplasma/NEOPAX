@@ -97,6 +97,7 @@ def _build_config(
     ntx_scan_batch_size: int | None,
     ntx_response_anchor_count: int | None,
     ntx_use_remat: bool,
+    single_attempt: bool = False,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
@@ -145,6 +146,9 @@ def _build_config(
     solver["transport_solver_backend"] = str(backend)
     solver["rhs_mode"] = str(rhs_mode)
     solver["debug_stage_markers"] = False
+    if single_attempt:
+        solver["max_steps"] = 1
+        solver.pop("stop_after_accepted_steps", None)
 
     transport_output = config.setdefault("transport_output", {})
     transport_output["transport_plot"] = False
@@ -300,6 +304,14 @@ def main():
             "Useful to separate compile delay from actual lagged NTX work."
         ),
     )
+    parser.add_argument(
+        "--single-attempt",
+        action="store_true",
+        help=(
+            "Benchmark exactly one solver step attempt by forcing transport_solver.max_steps=1 "
+            "and clearing stop_after_accepted_steps."
+        ),
+    )
     args = parser.parse_args()
 
     if args.debug_lagged_timing:
@@ -327,6 +339,7 @@ def main():
     print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] debug_lagged_timing={args.debug_lagged_timing}")
+    print(f"[benchmark] single_attempt={args.single_attempt}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for sweep_anchor_count in sweep_anchor_counts:
@@ -347,6 +360,7 @@ def main():
                 ntx_scan_batch_size=args.ntx_scan_batch_size,
                 ntx_response_anchor_count=sweep_anchor_count,
                 ntx_use_remat=args.ntx_use_remat,
+                single_attempt=args.single_attempt,
             )
 
             if rhs_mode == args.rhs_modes[0]:

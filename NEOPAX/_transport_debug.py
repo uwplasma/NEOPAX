@@ -30,11 +30,10 @@ def lagged_timing_start(label: str) -> None:
 def lagged_timing_end(label: str) -> None:
     if not lagged_timing_enabled():
         return
-    now = time.perf_counter()
     with _TIMER_LOCK:
         stack = _TIMER_STACKS.get(label, [])
         if not stack:
             print(f"[lagged-timing] {label} end #? (no-start)", flush=True)
             return
-        count, start = stack.pop()
-    print(f"[lagged-timing] {label} end   #{count} dt={now - start:.3f}s", flush=True)
+        count, _start = stack.pop()
+    print(f"[lagged-timing] {label} end   #{count}", flush=True)
