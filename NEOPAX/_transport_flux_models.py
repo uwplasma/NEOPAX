@@ -1259,6 +1259,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     surface_backend: str = "auto"
     face_response_mode: str = "face_local_response"
     radial_batch_size: int | None = None
+    radial_batch_mode: str = "simple"
     scan_batch_size: int | None = None
     response_anchor_count: int | None = None
     use_remat: bool = False
@@ -1311,6 +1312,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         normalized = None if radial_batch_size in (None, 0) else int(radial_batch_size)
         return dataclasses.replace(self, radial_batch_size=normalized)
 
+    def with_radial_batch_mode(self, radial_batch_mode: str | None) -> "NTXExactLijRuntimeTransportModel":
+        mode = self._normalize_radial_batch_mode(radial_batch_mode)
+        return dataclasses.replace(self, radial_batch_mode=mode)
+
     def with_scan_batch_size(self, scan_batch_size: int | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if scan_batch_size in (None, 0) else int(scan_batch_size)
         return dataclasses.replace(self, scan_batch_size=normalized)
@@ -1322,8 +1327,66 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def with_use_remat(self, use_remat: bool) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, use_remat=bool(use_remat))
 
-    def _map_radius_axis(self, fn, radius_indices):
+    @staticmethod
+    def _normalize_radial_batch_mode(radial_batch_mode: str | None) -> str:
+        mode = "simple" if radial_batch_mode in (None, "") else str(radial_batch_mode).strip().lower()
+        aliases = {
+            "default": "simple",
+            "auto": "simple",
+            "lax.map": "lax_map",
+            "laxmap": "lax_map",
+            "map": "lax_map",
+            "scan": "lax_map",
+            "vmapped": "vmap",
+            "chunked": "hybrid",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"simple", "lax_map", "vmap", "hybrid"}:
+            raise ValueError(
+                "ntx_exact_radial_batch_mode must be one of: simple, lax_map, vmap, hybrid"
+            )
+        return mode
+
+    def _map_radius_axis_hybrid(self, fn, radius_indices):
         batch_size = self.radial_batch_size
+        if batch_size is None or int(batch_size) <= 1:
+            return jax.lax.map(fn, radius_indices)
+
+        batch_size = int(batch_size)
+        n_radius = int(radius_indices.shape[0])
+        if n_radius <= batch_size:
+            return jax.vmap(fn)(radius_indices)
+
+        n_full = (n_radius // batch_size) * batch_size
+        full_indices = radius_indices[:n_full]
+        full_chunks = full_indices.reshape((n_full // batch_size, batch_size))
+
+        chunk_outputs = jax.lax.map(lambda chunk: jax.vmap(fn)(chunk), full_chunks)
+        flat_outputs = jax.tree_util.tree_map(
+            lambda arr: arr.reshape((n_full,) + arr.shape[2:]),
+            chunk_outputs,
+        )
+
+        if n_full == n_radius:
+            return flat_outputs
+
+        tail_indices = radius_indices[n_full:]
+        tail_outputs = jax.vmap(fn)(tail_indices)
+        return jax.tree_util.tree_map(
+            lambda full_arr, tail_arr: jnp.concatenate([full_arr, tail_arr], axis=0),
+            flat_outputs,
+            tail_outputs,
+        )
+
+    def _map_radius_axis(self, fn, radius_indices):
+        mode = self._normalize_radial_batch_mode(self.radial_batch_mode)
+        batch_size = self.radial_batch_size
+        if mode == "lax_map":
+            return jax.lax.map(fn, radius_indices)
+        if mode == "vmap":
+            return jax.vmap(fn)(radius_indices)
+        if mode == "hybrid":
+            return self._map_radius_axis_hybrid(fn, radius_indices)
         if batch_size is None or int(batch_size) <= 1:
             return jax.lax.map(fn, radius_indices)
         return jax.vmap(fn)(radius_indices)
@@ -2215,6 +2278,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_surface_backend="auto",
     ntx_exact_face_response_mode="face_local_response",
     ntx_exact_radial_batch_size=None,
+    ntx_exact_radial_batch_mode="simple",
     ntx_exact_scan_batch_size=None,
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
@@ -2241,6 +2305,9 @@ def build_ntx_exact_lij_runtime_transport_model(
             None
             if ntx_exact_radial_batch_size in (None, "", 0, "0")
             else int(ntx_exact_radial_batch_size)
+        ),
+        radial_batch_mode=NTXExactLijRuntimeTransportModel._normalize_radial_batch_mode(
+            ntx_exact_radial_batch_mode
         ),
         scan_batch_size=(
             None

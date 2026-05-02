@@ -9,9 +9,9 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_exact_lij_runtime"
 entropy_model = "ntx_exact_lij_runtime"
-ntx_exact_n_theta = 5
-ntx_exact_n_zeta = 21
-ntx_exact_n_xi = 32
+ntx_exact_n_theta = 25
+ntx_exact_n_zeta = 25
+ntx_exact_n_xi = 63
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"

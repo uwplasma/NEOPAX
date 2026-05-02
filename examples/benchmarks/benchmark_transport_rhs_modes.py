@@ -40,6 +40,7 @@ DEFAULT_NTX_EXACT_N_ZETA = 21
 DEFAULT_NTX_EXACT_N_XI = 32
 DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
 DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
+DEFAULT_NTX_EXACT_RADIAL_BATCH_MODE = "simple"
 DEFAULT_NTX_EXACT_SCAN_BATCH_SIZE = None
 DEFAULT_NTX_EXACT_RESPONSE_ANCHOR_COUNT = None
 DEFAULT_NTX_EXACT_USE_REMAT = False
@@ -94,6 +95,7 @@ def _build_config(
     n_xi: int | None,
     ntx_face_response_mode: str,
     ntx_radial_batch_size: int | None,
+    ntx_radial_batch_mode: str,
     ntx_scan_batch_size: int | None,
     ntx_response_anchor_count: int | None,
     ntx_use_remat: bool,
@@ -129,6 +131,8 @@ def _build_config(
             neoclassical["ntx_exact_n_xi"] = int(n_xi)
         if ntx_radial_batch_size not in (None, 0):
             neoclassical["ntx_exact_radial_batch_size"] = int(ntx_radial_batch_size)
+        if str(ntx_radial_batch_mode).strip().lower() != DEFAULT_NTX_EXACT_RADIAL_BATCH_MODE:
+            neoclassical["ntx_exact_radial_batch_mode"] = str(ntx_radial_batch_mode)
         if ntx_scan_batch_size not in (None, 0):
             neoclassical["ntx_exact_scan_batch_size"] = int(ntx_scan_batch_size)
         if ntx_response_anchor_count not in (None, 0):
@@ -243,9 +247,21 @@ def main():
         type=int,
         default=DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE,
         help=(
-            "Exact-runtime NTX radial hybrid batch size. "
-            "Unset or 0 keeps the default unbatched lax.map path; values >1 use "
-            "lax.map over chunks and vmap within each chunk."
+            "Exact-runtime NTX radial batch size. "
+            "With radial-batch-mode=simple, unset/0 keeps lax.map and values >1 use vmap. "
+            "With radial-batch-mode=hybrid, values >1 use chunked lax.map+vmap."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-radial-batch-mode",
+        default=DEFAULT_NTX_EXACT_RADIAL_BATCH_MODE,
+        choices=["simple", "lax_map", "vmap", "hybrid"],
+        help=(
+            "Exact-runtime NTX radial mapper. "
+            "simple: current default (lax.map if batch unset, otherwise vmap). "
+            "lax_map: always lax.map. "
+            "vmap: always full vmap over the provided radii. "
+            "hybrid: chunked lax.map over radial batches with vmap inside each chunk."
         ),
     )
     parser.add_argument(
@@ -334,6 +350,7 @@ def main():
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
     print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
     print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
+    print(f"[benchmark] ntx_radial_batch_mode={args.ntx_radial_batch_mode}")
     print(f"[benchmark] ntx_scan_batch_size={args.ntx_scan_batch_size}")
     print(f"[benchmark] ntx_response_anchor_counts={sweep_anchor_counts}")
     print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
@@ -357,6 +374,7 @@ def main():
                 n_xi=args.ntx_n_xi,
                 ntx_face_response_mode=args.ntx_face_response_mode,
                 ntx_radial_batch_size=args.ntx_radial_batch_size,
+                ntx_radial_batch_mode=args.ntx_radial_batch_mode,
                 ntx_scan_batch_size=args.ntx_scan_batch_size,
                 ntx_response_anchor_count=sweep_anchor_count,
                 ntx_use_remat=args.ntx_use_remat,
@@ -374,6 +392,7 @@ def main():
                         f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
                         f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",
                         f"radial_batch_size={config['neoclassical'].get('ntx_exact_radial_batch_size', 0)}",
+                        f"radial_batch_mode={config['neoclassical'].get('ntx_exact_radial_batch_mode', 'simple')}",
                         f"scan_batch_size={config['neoclassical'].get('ntx_exact_scan_batch_size', 0)}",
                         f"response_anchor_count={config['neoclassical'].get('ntx_exact_response_anchor_count', 0)}",
                         f"use_remat={config['neoclassical'].get('ntx_exact_use_remat', False)}",

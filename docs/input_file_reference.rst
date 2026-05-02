@@ -151,6 +151,7 @@ evaluations through ``NEOPAX.NTXRuntimeScanTransportModel``.
     ntx_exact_n_zeta = 25
     ntx_exact_n_xi = 64
     ntx_exact_radial_batch_size = 0
+    ntx_exact_radial_batch_mode = "simple"
     ntx_exact_scan_batch_size = 0
     ntx_exact_response_anchor_count = 0
     ntx_exact_use_remat = false
@@ -162,6 +163,16 @@ NEOPAX energy grid to assemble ``Lij`` in real time from the local
 ``nu / v`` and ``Er / v`` values. It is intended as a more
 autodiff-oriented path than the file-backed database route, while still
 reusing the same high-level flux-model interface.
+
+``ntx_exact_radial_batch_mode`` controls how the real-time ``Lij`` path maps
+over radii:
+
+- ``simple``: current default. ``ntx_exact_radial_batch_size = 0`` uses
+  ``jax.lax.map``; values greater than 1 use full ``jax.vmap``.
+- ``lax_map``: always use ``jax.lax.map`` over radii.
+- ``vmap``: always use full ``jax.vmap`` over the provided radii.
+- ``hybrid``: use ``jax.lax.map`` over radial chunks and ``jax.vmap`` inside
+  each chunk, with chunk size set by ``ntx_exact_radial_batch_size``.
 
 .. code-block:: toml
 
