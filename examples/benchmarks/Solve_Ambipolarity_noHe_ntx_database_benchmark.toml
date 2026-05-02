@@ -97,3 +97,14 @@ value = 0.0
 
 [boundary.Er.right]
 type = "floating_ambipolar_edge"
+
+[sources]
+temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+
+[sources.parameters.power_exchange]
+mode = "all"
+coulomb_log_mode = "ntssfusion"
+
+[sources.parameters.bremsstrahlung_radiation]
+coefficient_mode = "ntssfusion"
+delta_zeff = 0.0
