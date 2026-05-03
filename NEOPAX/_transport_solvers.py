@@ -669,6 +669,9 @@ def _finalize_custom_solver_output(
     last_attempt_converged,
     last_attempt_err_norm,
     last_attempt_fail_code,
+    last_attempt_diverged,
+    last_attempt_nonfinite_stage_state,
+    last_attempt_nonfinite_stage_residual,
     unpack_flat,
     reference_state,
     species,
@@ -716,6 +719,9 @@ def _finalize_custom_solver_output(
         "last_attempt_converged": last_attempt_converged,
         "last_attempt_err_norm": last_attempt_err_norm,
         "last_attempt_fail_code": last_attempt_fail_code,
+        "last_attempt_diverged": last_attempt_diverged,
+        "last_attempt_nonfinite_stage_state": last_attempt_nonfinite_stage_state,
+        "last_attempt_nonfinite_stage_residual": last_attempt_nonfinite_stage_residual,
         "final_state": final_state,
         "final_time": t_final,
     }
@@ -884,6 +890,9 @@ def _run_saved_loop(
     last_attempt_converged0 = jnp.asarray(False)
     last_attempt_err_norm0 = jnp.asarray(jnp.inf, dtype=dtype)
     last_attempt_fail_code0 = jnp.asarray(0, dtype=jnp.int32)
+    last_attempt_diverged0 = jnp.asarray(False)
+    last_attempt_nonfinite_stage_state0 = jnp.asarray(False)
+    last_attempt_nonfinite_stage_residual0 = jnp.asarray(False)
 
     def cond_fun(loop_carry):
         step_state, step_idx, *_ = loop_carry
@@ -905,6 +914,9 @@ def _run_saved_loop(
             _last_converged,
             _last_err_norm,
             _last_fail_code,
+            _last_diverged,
+            _last_nonfinite_stage_state,
+            _last_nonfinite_stage_residual,
         ) = loop_carry
         step_state, step_info = step_fn(step_state, None)
         save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
@@ -937,6 +949,9 @@ def _run_saved_loop(
             jnp.asarray(False if getattr(step_info, "converged", None) is None else getattr(step_info, "converged")),
             jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype),
             jnp.asarray(step_info.fail_code, dtype=jnp.int32),
+            jnp.asarray(False if getattr(step_info, "diverged", None) is None else getattr(step_info, "diverged")),
+            jnp.asarray(False if getattr(step_info, "nonfinite_stage_state", None) is None else getattr(step_info, "nonfinite_stage_state")),
+            jnp.asarray(False if getattr(step_info, "nonfinite_stage_residual", None) is None else getattr(step_info, "nonfinite_stage_residual")),
         )
 
     loop_carry = (
@@ -953,6 +968,9 @@ def _run_saved_loop(
         last_attempt_converged0,
         last_attempt_err_norm0,
         last_attempt_fail_code0,
+        last_attempt_diverged0,
+        last_attempt_nonfinite_stage_state0,
+        last_attempt_nonfinite_stage_residual0,
     )
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
@@ -994,6 +1012,9 @@ def _apply_radau_lean_timestep_controller(
     complex_lu_out,
     complex_piv_out,
     newton_shrink,
+    diverged_final,
+    nonfinite_stage_state,
+    nonfinite_stage_residual,
     fail_code,
     n_accepted,
     dtype,
@@ -1041,6 +1062,9 @@ def _apply_radau_lean_timestep_controller(
             fail_code=fail_code,
             converged=converged,
             err_norm=err_norm,
+            diverged=diverged_final,
+            nonfinite_stage_state=nonfinite_stage_state,
+            nonfinite_stage_residual=nonfinite_stage_residual,
         )
 
     def _reject(_):
@@ -1083,6 +1107,9 @@ def _apply_radau_lean_timestep_controller(
             fail_code=code,
             converged=converged,
             err_norm=err_norm,
+            diverged=diverged_final,
+            nonfinite_stage_state=nonfinite_stage_state,
+            nonfinite_stage_residual=nonfinite_stage_residual,
         )
 
     return jax.lax.cond(accepted, _accept, _reject, operand=None)
@@ -1190,6 +1217,9 @@ class _RadauStepInfo:
     fail_code: Any
     converged: Any = None
     err_norm: Any = None
+    diverged: Any = None
+    nonfinite_stage_state: Any = None
+    nonfinite_stage_residual: Any = None
 
 
 class RADAUSolver(_RadauSolverConfig):
@@ -1449,6 +1479,8 @@ class RADAUSolver(_RadauSolverConfig):
             _, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
             stages_final = z_final.reshape((num_stages, state_dim))
             final_residual = residual(z_final)
+            nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
+            nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
             converged = jnp.logical_and(
                 jnp.logical_and(jnp.all(jnp.isfinite(z_final)), jnp.linalg.norm(final_residual) <= self.tol),
                 jnp.logical_not(diverged_final),
@@ -1481,6 +1513,9 @@ class RADAUSolver(_RadauSolverConfig):
                 complex_lu_out,
                 complex_piv_out,
                 newton_shrink,
+                diverged_final,
+                nonfinite_stage_state,
+                nonfinite_stage_residual,
             )
 
         def _attempt_step_lean(step_state: _RadauStepState):
@@ -1492,7 +1527,7 @@ class RADAUSolver(_RadauSolverConfig):
                 trial_y, err_norm, converged, stage_history, theta_final,
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
-                newton_shrink,
+                newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
@@ -1514,6 +1549,9 @@ class RADAUSolver(_RadauSolverConfig):
                 complex_lu_out=complex_lu_out,
                 complex_piv_out=complex_piv_out,
                 newton_shrink=newton_shrink,
+                diverged_final=diverged_final,
+                nonfinite_stage_state=nonfinite_stage_state,
+                nonfinite_stage_residual=nonfinite_stage_residual,
                 fail_code=fail_code,
                 n_accepted=n_accepted,
                 dtype=dtype,
@@ -1540,6 +1578,9 @@ class RADAUSolver(_RadauSolverConfig):
                     fail_code=fail_code,
                     converged=jnp.asarray(False),
                     err_norm=jnp.asarray(jnp.inf, dtype=dtype),
+                    diverged=jnp.asarray(False),
+                    nonfinite_stage_state=jnp.asarray(False),
+                    nonfinite_stage_residual=jnp.asarray(False),
                 )
 
             def _run(_):
@@ -1576,6 +1617,9 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -1603,6 +1647,9 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
             unpack_flat,
             state,
             species,
@@ -1947,6 +1994,9 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -1979,6 +2029,9 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
             unpack_flat,
             state,
             species,
@@ -2289,6 +2342,9 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -2321,6 +2377,9 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_converged,
             last_attempt_err_norm,
             last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
             unpack_flat,
             state,
             species,

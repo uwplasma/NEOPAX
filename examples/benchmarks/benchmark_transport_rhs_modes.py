@@ -172,6 +172,9 @@ def _run_once(config):
         last_attempt_converged = raw.get("last_attempt_converged")
         last_attempt_err_norm = raw.get("last_attempt_err_norm")
         last_attempt_fail_code = raw.get("last_attempt_fail_code")
+        last_attempt_diverged = raw.get("last_attempt_diverged")
+        last_attempt_nonfinite_stage_state = raw.get("last_attempt_nonfinite_stage_state")
+        last_attempt_nonfinite_stage_residual = raw.get("last_attempt_nonfinite_stage_residual")
         if any(value is not None for value in (last_attempt_accepted, last_attempt_converged, last_attempt_err_norm, last_attempt_fail_code)):
             err_text = "None" if last_attempt_err_norm is None else f"{float(last_attempt_err_norm):.6e}"
             print(
@@ -180,6 +183,9 @@ def _run_once(config):
                 f"converged={last_attempt_converged}",
                 f"fail_code={last_attempt_fail_code}",
                 f"err_norm={err_text}",
+                f"diverged={last_attempt_diverged}",
+                f"nonfinite_stage_state={last_attempt_nonfinite_stage_state}",
+                f"nonfinite_stage_residual={last_attempt_nonfinite_stage_residual}",
             )
     return result, wall_seconds
 
