@@ -102,6 +102,8 @@ def _build_config(
     ntx_scan_batch_size: int | None,
     ntx_response_anchor_count: int | None,
     ntx_use_remat: bool,
+    radau_newton_divergence_mode: str,
+    radau_newton_residual_norm: str,
     single_attempt: bool = False,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
@@ -152,6 +154,9 @@ def _build_config(
     solver["transport_solver_backend"] = str(backend)
     solver["rhs_mode"] = str(rhs_mode)
     solver["debug_stage_markers"] = False
+    if str(backend).strip().lower() == "radau":
+        solver["radau_newton_divergence_mode"] = str(radau_newton_divergence_mode)
+        solver["radau_newton_residual_norm"] = str(radau_newton_residual_norm)
     if single_attempt:
         solver["max_steps"] = 1
         solver.pop("stop_after_accepted_steps", None)
@@ -484,6 +489,18 @@ def main():
             "summaries for center fluxes, equation debug components, and rhs0."
         ),
     )
+    parser.add_argument(
+        "--radau-newton-divergence-mode",
+        default="legacy",
+        choices=["legacy", "conservative"],
+        help="Custom Radau Newton divergence policy. 'conservative' is less aggressive and more Hairer-like.",
+    )
+    parser.add_argument(
+        "--radau-newton-residual-norm",
+        default="raw",
+        choices=["raw", "rms"],
+        help="Residual norm used by the custom Radau Newton convergence test.",
+    )
     args = parser.parse_args()
 
     if args.debug_lagged_timing:
@@ -510,6 +527,8 @@ def main():
     print(f"[benchmark] ntx_scan_batch_size={args.ntx_scan_batch_size}")
     print(f"[benchmark] ntx_response_anchor_counts={sweep_anchor_counts}")
     print(f"[benchmark] ntx_use_remat={args.ntx_use_remat}")
+    print(f"[benchmark] radau_newton_divergence_mode={args.radau_newton_divergence_mode}")
+    print(f"[benchmark] radau_newton_residual_norm={args.radau_newton_residual_norm}")
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] debug_lagged_timing={args.debug_lagged_timing}")
     print(f"[benchmark] single_attempt={args.single_attempt}")
@@ -535,6 +554,8 @@ def main():
                 ntx_scan_batch_size=args.ntx_scan_batch_size,
                 ntx_response_anchor_count=sweep_anchor_count,
                 ntx_use_remat=args.ntx_use_remat,
+                radau_newton_divergence_mode=args.radau_newton_divergence_mode,
+                radau_newton_residual_norm=args.radau_newton_residual_norm,
                 single_attempt=args.single_attempt,
             )
 

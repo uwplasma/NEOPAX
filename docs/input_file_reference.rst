@@ -435,6 +435,8 @@ Common keys include:
 - ``stop_after_accepted_steps``
 - ``nonlinear_solver_tol``
 - ``nonlinear_solver_maxiter``
+- ``radau_newton_divergence_mode``
+- ``radau_newton_residual_norm``
 - ``save_n``
 - density/temperature floors
 - transport-physics toggles such as work/convection switches
@@ -454,8 +456,28 @@ Example:
     t_final = 20.0
     nonlinear_solver_tol = 1.0e-7
     nonlinear_solver_maxiter = 20
+    radau_newton_divergence_mode = "legacy"
+    radau_newton_residual_norm = "raw"
     stop_after_accepted_steps = 1
     save_n = 10
+
+For the custom ``radau`` backend, two optional solver-side controls are
+available:
+
+- ``radau_newton_divergence_mode``
+  - ``"legacy"`` keeps the original aggressive slow-contraction divergence
+    heuristic
+  - ``"conservative"`` uses a less aggressive, more Hairer-like policy that
+    requires repeated slow contraction before declaring Newton divergence
+
+- ``radau_newton_residual_norm``
+  - ``"raw"`` uses the original global ``L2`` residual norm
+  - ``"rms"`` uses an RMS-style normalized residual norm
+
+These options are intended mainly for the custom exact-runtime NTX Radau
+investigations, where the legacy Newton divergence heuristic can be too
+aggressive even when the transport RHS is finite and the timestep error is
+already small.
 
 
 ``[transport_output]``

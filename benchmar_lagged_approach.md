@@ -251,6 +251,25 @@ Expose or inspect:
 - whether the solver is simply hitting `max_iter`
 - whether the divergence heuristic is too aggressive for the exact-runtime RHS scaling
 
+New solver controls now available for these tests:
+
+- `radau_newton_divergence_mode = "legacy" | "conservative"`
+- `radau_newton_residual_norm = "raw" | "rms"`
+
+Recommended next comparison:
+
+1. exact-runtime `black_box` with:
+   - `radau_newton_divergence_mode = "legacy"`
+   - `radau_newton_residual_norm = "raw"`
+2. exact-runtime `black_box` with:
+   - `radau_newton_divergence_mode = "conservative"`
+   - `radau_newton_residual_norm = "rms"`
+
+This should show whether the remaining rejection is primarily caused by:
+
+- the aggressive slow-contraction divergence heuristic
+- or residual-norm scaling
+
 ## Interpretation Rule
 
 If exact-runtime `black_box` and exact-runtime lagged-response variants all produce finite and physically reasonable initial states, then:

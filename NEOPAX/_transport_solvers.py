@@ -1224,6 +1224,8 @@ class _RadauSolverConfig(TransportSolver):
     jacobian_reuse_rtol: float = 0.1
     max_jacobian_age: int = 8
     rhs_mode: str = "black_box"
+    newton_divergence_mode: str = "legacy"
+    newton_residual_norm: str = "raw"
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -1247,6 +1249,8 @@ class _RadauSolverConfig(TransportSolver):
         jacobian_reuse_rtol: float = 0.1,
         max_jacobian_age: int = 8,
         rhs_mode: str = "black_box",
+        newton_divergence_mode: str = "legacy",
+        newton_residual_norm: str = "raw",
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         save_n=None,
@@ -1269,6 +1273,8 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
         object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
+        object.__setattr__(self, "newton_divergence_mode", str(newton_divergence_mode).strip().lower())
+        object.__setattr__(self, "newton_residual_norm", str(newton_residual_norm).strip().lower())
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -1392,7 +1398,12 @@ class RADAUSolver(_RadauSolverConfig):
         controller_alpha = 0.7 / (error_order + 1.0)
         zero_scalar = jnp.asarray(0.0, dtype=dtype)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
-        theta_diverge_threshold = jnp.asarray(0.95, dtype=dtype)
+        divergence_mode = str(getattr(self, "newton_divergence_mode", "legacy")).strip().lower()
+        residual_norm_mode = str(getattr(self, "newton_residual_norm", "raw")).strip().lower()
+        conservative_divergence = divergence_mode in {"conservative", "hairer_like", "hairer"}
+        use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
+        theta_diverge_threshold = jnp.asarray(0.98 if conservative_divergence else 0.95, dtype=dtype)
+        slow_contraction_required = jnp.asarray(2 if conservative_divergence else 1, dtype=jnp.int32)
         residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
         theta_clip_min = jnp.asarray(0.1, dtype=dtype)
         theta_clip_max = jnp.asarray(1.5, dtype=dtype)
@@ -1411,6 +1422,15 @@ class RADAUSolver(_RadauSolverConfig):
         complex_dim = 2 * state_dim
         complex_lu0 = jnp.broadcast_to(jnp.eye(complex_dim, dtype=dtype), (num_complex_pairs, complex_dim, complex_dim))
         complex_piv0 = jnp.broadcast_to(jnp.arange(complex_dim, dtype=jnp.int32), (num_complex_pairs, complex_dim))
+        residual_size_sqrt = jnp.sqrt(jnp.asarray(num_stages * state_dim, dtype=dtype))
+
+        def _residual_norm_fn(residual_vec):
+            raw_norm = jnp.linalg.norm(residual_vec)
+            return jnp.where(
+                use_rms_residual_norm,
+                raw_norm / jnp.maximum(residual_size_sqrt, jnp.asarray(1.0, dtype=dtype)),
+                raw_norm,
+            )
 
         def _transform_stage_stack(stage_stack):
             return radau_inv_transform @ stage_stack
@@ -1548,6 +1568,7 @@ class RADAUSolver(_RadauSolverConfig):
                     prev_residual_norm,
                     theta_est,
                     diverged,
+                    slow_count,
                     slow_contraction_any,
                     residual_blowup_any,
                     newton_nonfinite_any,
@@ -1556,7 +1577,7 @@ class RADAUSolver(_RadauSolverConfig):
                 delta = stage_solver(-residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
                 z_next = z_cur + delta
-                current_residual_norm = jnp.linalg.norm(residual_cur)
+                current_residual_norm = _residual_norm_fn(residual_cur)
                 safe_prev_residual = jnp.maximum(prev_residual_norm, tiny_scalar)
                 theta_raw = current_residual_norm / safe_prev_residual
                 theta_candidate = jnp.where(iter_idx > 0, theta_raw, zero_scalar)
@@ -1564,7 +1585,9 @@ class RADAUSolver(_RadauSolverConfig):
                 slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > theta_diverge_threshold)
                 residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * residual_blowup_factor)
                 nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)))
-                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_contraction, jnp.logical_or(residual_blowup, nonfinite_state)))
+                slow_count_next = jnp.where(slow_contraction, slow_count + 1, jnp.asarray(0, dtype=jnp.int32))
+                diverged_by_slow = slow_count_next >= slow_contraction_required
+                diverged_next = jnp.logical_or(diverged, jnp.logical_or(diverged_by_slow, jnp.logical_or(residual_blowup, nonfinite_state)))
                 return (
                     iter_idx + 1,
                     z_next,
@@ -1573,13 +1596,14 @@ class RADAUSolver(_RadauSolverConfig):
                     current_residual_norm,
                     theta_next,
                     diverged_next,
+                    slow_count_next,
                     jnp.logical_or(slow_contraction_any, slow_contraction),
                     jnp.logical_or(residual_blowup_any, residual_blowup),
                     jnp.logical_or(newton_nonfinite_any, nonfinite_state),
                 )
 
             def cond_fn(newton_state):
-                iter_idx, _, delta_norm, residual_norm, _, _, diverged, _, _, _ = newton_state
+                iter_idx, _, delta_norm, residual_norm, _, _, diverged, _, _, _, _ = newton_state
                 active = jnp.logical_or(residual_norm > self.tol, delta_norm > self.tol)
                 return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
@@ -1591,6 +1615,7 @@ class RADAUSolver(_RadauSolverConfig):
                 jnp.asarray(jnp.inf, dtype=dtype),
                 zero_scalar,
                 jnp.asarray(False),
+                jnp.asarray(0, dtype=jnp.int32),
                 jnp.asarray(False),
                 jnp.asarray(False),
                 jnp.asarray(False),
@@ -1605,6 +1630,7 @@ class RADAUSolver(_RadauSolverConfig):
                 _prev_residual_final,
                 theta_final,
                 diverged_final,
+                _slow_count_final,
                 slow_contraction_final,
                 residual_blowup_final,
                 newton_nonfinite_final,
@@ -1613,7 +1639,7 @@ class RADAUSolver(_RadauSolverConfig):
             final_residual = residual(z_final)
             nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
             nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
-            final_residual_norm = jnp.linalg.norm(final_residual)
+            final_residual_norm = _residual_norm_fn(final_residual)
             converged = jnp.logical_and(
                 jnp.logical_and(jnp.all(jnp.isfinite(z_final)), final_residual_norm <= self.tol),
                 jnp.logical_not(diverged_final),
@@ -2698,6 +2724,8 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             min_step_factor=float(_cfg_get("min_step_factor", 0.1)),
             max_step_factor=float(_cfg_get("max_step_factor", 5.0)),
             rhs_mode=str(_cfg_get("radau_rhs_mode", generic_rhs_mode)),
+            newton_divergence_mode=str(_cfg_get("radau_newton_divergence_mode", "legacy")),
+            newton_residual_norm=str(_cfg_get("radau_newton_residual_norm", "raw")),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             save_n=save_n,
