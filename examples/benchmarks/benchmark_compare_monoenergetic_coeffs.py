@@ -227,8 +227,8 @@ def main():
         collisionality_kind=_collisionality_kind(exact_model.collisionality_model),
     )
 
-    er_vnew_a = jnp.asarray(er_value * 1.0e3 / v_new_a, dtype=jnp.float64)
-    db_coeffs_raw = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_value, nu_hat_a, er_vnew_a, runtime.database)
+    er_database = jnp.full_like(nu_hat_a, jnp.asarray(er_value, dtype=jnp.float64))
+    db_coeffs_raw = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_value, nu_hat_a, er_database, runtime.database)
 
     support = exact_model._static_support()
     prepared = jax.tree_util.tree_map(
@@ -299,6 +299,8 @@ def main():
     print(f"[mono-compare] species_index={species_index} ({_species_label(runtime, species_index)})")
     print(f"[mono-compare] resolution={resolution}")
     print(f"[mono-compare] drds={float(drds_value):.6e}")
+    print(f"[mono-compare] database_field_input=Er (kernel normalizes as log10(|Er|/r))")
+    print(f"[mono-compare] exact_field_input=epsi_hat or er_hat in NTX prepared solve")
     print(f"[mono-compare] plot={plot_path}")
     print()
     print("raw exact coefficients vs database")
