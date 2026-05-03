@@ -30,6 +30,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX
+from NEOPAX._orchestrator import build_runtime_context, _normalized_boundary_cfg_for_transport
+from NEOPAX._boundary_conditions import build_boundary_condition_model
+from NEOPAX._transport_equations import ComposedEquationSystem, build_equation_system
 
 
 DEFAULT_CONFIG = Path("examples/benchmarks/Solve_Transport_equations_noHe_radau_benchmark.toml")
@@ -196,6 +199,103 @@ def _run_once(config):
     return result, wall_seconds
 
 
+def _print_array_finiteness(label: str, arr) -> None:
+    arr = jnp.asarray(arr)
+    finite_mask = jnp.isfinite(arr)
+    finite_count = int(jnp.sum(finite_mask))
+    total = int(arr.size)
+    if finite_count == 0:
+        print(f"[benchmark] {label}: finite=0/{total} all_nonfinite=true")
+        return
+    vals = arr[finite_mask]
+    print(
+        f"[benchmark] {label}: finite={finite_count}/{total} "
+        f"min={float(jnp.min(vals)):.6e} max={float(jnp.max(vals)):.6e}"
+    )
+
+
+def _print_tree_finiteness(prefix: str, tree) -> None:
+    if isinstance(tree, dict):
+        for key, value in tree.items():
+            _print_array_finiteness(f"{prefix}.{key}", value)
+        return
+    _print_array_finiteness(prefix, tree)
+
+
+def _print_initial_finiteness_probe(config: dict) -> None:
+    runtime, state = build_runtime_context(config)
+    if runtime.geometry is None or state is None:
+        print("[benchmark] initial_probe: geometry_or_state_unavailable")
+        return
+
+    field = runtime.geometry
+    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
+    bc = {}
+    dr = getattr(field, "dr", 1.0)
+    for key in ("density", "temperature", "Er", "gamma"):
+        if key in boundary_cfg:
+            bc[key] = build_boundary_condition_model(
+                boundary_cfg[key],
+                dr,
+                species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
+            )
+
+    equations_to_evolve = build_equation_system(
+        config=config,
+        species=runtime.species,
+        field=runtime.geometry,
+        flux_model=runtime.models.flux,
+        source_models=runtime.models.source,
+        solver_cfg=runtime.solver_parameters,
+        boundary_models=bc,
+    )
+    shared_flux_model = runtime.models.flux if len(equations_to_evolve) > 1 else None
+    temperature_active_mask = jnp.asarray(
+        config.get("equations", {}).get(
+            "toggle_temperature",
+            [True] * getattr(runtime.species, "number_species", state.temperature.shape[0]),
+        ),
+        dtype=bool,
+    )
+    equation_system = ComposedEquationSystem(
+        tuple(equations_to_evolve),
+        density_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None),
+        temperature_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "temperature"), None),
+        er_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "Er"), None),
+        species=runtime.species,
+        shared_flux_model=shared_flux_model,
+        density_floor=runtime.solver_parameters.get("density_floor", 1.0e-6),
+        temperature_floor=runtime.solver_parameters.get("temperature_floor"),
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=state.temperature,
+        er_bc_model=bc.get("Er"),
+    )
+
+    working_state, _ = equation_system._prepare_working_state(state)
+    print("[benchmark] initial_probe: start")
+    _print_array_finiteness("initial_probe.state.Er", state.Er)
+    _print_array_finiteness("initial_probe.working_state.Er", working_state.Er)
+
+    center_fluxes = None
+    if shared_flux_model is not None:
+        center_fluxes = shared_flux_model(working_state)
+        _print_tree_finiteness("initial_probe.center_flux", center_fluxes)
+
+    density_eq, temperature_eq, er_eq = equation_system._resolve_equations()
+    if density_eq is not None:
+        _print_tree_finiteness("initial_probe.density", density_eq.debug_components(working_state, fluxes=center_fluxes))
+    if temperature_eq is not None:
+        _print_tree_finiteness("initial_probe.temperature", temperature_eq.debug_components(working_state, fluxes=center_fluxes))
+    if er_eq is not None:
+        _print_tree_finiteness("initial_probe.er", er_eq.debug_components(working_state, fluxes=center_fluxes))
+
+    rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
+    _print_array_finiteness("initial_probe.rhs0.density", rhs0.density)
+    _print_array_finiteness("initial_probe.rhs0.pressure", rhs0.pressure)
+    _print_array_finiteness("initial_probe.rhs0.Er", rhs0.Er)
+    print("[benchmark] initial_probe: end")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -355,6 +455,14 @@ def main():
             "and clearing stop_after_accepted_steps."
         ),
     )
+    parser.add_argument(
+        "--debug-initial-finiteness",
+        action="store_true",
+        help=(
+            "Before each timed run, probe the initialized transport state and print finiteness "
+            "summaries for center fluxes, equation debug components, and rhs0."
+        ),
+    )
     args = parser.parse_args()
 
     if args.debug_lagged_timing:
@@ -384,6 +492,7 @@ def main():
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] debug_lagged_timing={args.debug_lagged_timing}")
     print(f"[benchmark] single_attempt={args.single_attempt}")
+    print(f"[benchmark] debug_initial_finiteness={args.debug_initial_finiteness}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
     for sweep_anchor_count in sweep_anchor_counts:
@@ -451,6 +560,8 @@ def main():
             timed_runs = []
             last_result = None
             for _ in range(max(1, args.repeat)):
+                if args.debug_initial_finiteness:
+                    _print_initial_finiteness_probe(config)
                 last_result, wall_seconds = _run_once(config)
                 timed_runs.append(wall_seconds)
 
