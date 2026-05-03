@@ -208,10 +208,15 @@ def _print_array_finiteness(label: str, arr) -> None:
         print(f"[benchmark] {label}: finite=0/{total} all_nonfinite=true")
         return
     vals = arr[finite_mask]
-    print(
+    message = (
         f"[benchmark] {label}: finite={finite_count}/{total} "
         f"min={float(jnp.min(vals)):.6e} max={float(jnp.max(vals)):.6e}"
     )
+    if finite_count < total:
+        nonfinite_idx = np.argwhere(~np.asarray(jax.device_get(finite_mask)))
+        preview = nonfinite_idx[:6].tolist()
+        message += f" nonfinite_idx={preview}"
+    print(message)
 
 
 def _print_tree_finiteness(prefix: str, tree) -> None:
