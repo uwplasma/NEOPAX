@@ -23,10 +23,11 @@ DEFAULT_DATABASE_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_da
 DEFAULT_EXACT_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_exact_lij_runtime_benchmark.toml")
 
 
-def _run_config(config_path: Path, *, device: str):
+def _run_config(config_path: Path, *, device: str, er_init_mode: str):
     config = NEOPAX.prepare_config(config_path, device=device)
     config = copy.deepcopy(config)
     config.setdefault("general", {})["mode"] = "fluxes"
+    config.setdefault("profiles", {})["er_initialization_mode"] = str(er_init_mode)
     t0 = time.perf_counter()
     result = NEOPAX.run(config)
     raw = result.raw_result if hasattr(result, "raw_result") else {}
@@ -87,6 +88,12 @@ def main():
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
     parser.add_argument("--database-config", default=str(DEFAULT_DATABASE_CONFIG))
     parser.add_argument("--exact-config", default=str(DEFAULT_EXACT_CONFIG))
+    parser.add_argument(
+        "--er-init-mode",
+        default="keep",
+        choices=["keep", "analytical", "ambipolar_min_entropy"],
+        help="Override profiles.er_initialization_mode for both native fluxes-mode runs.",
+    )
     args = parser.parse_args()
 
     db_cfg = Path(args.database_config)
@@ -94,9 +101,10 @@ def main():
     print(f"[flux-compare] device={args.device}")
     print(f"[flux-compare] database_config={db_cfg}")
     print(f"[flux-compare] exact_config={ex_cfg}")
+    print(f"[flux-compare] er_init_mode={args.er_init_mode}")
 
-    rho_db, fluxes_db, dt_db, out_db = _run_config(db_cfg, device=args.device)
-    rho_ex, fluxes_ex, dt_ex, out_ex = _run_config(ex_cfg, device=args.device)
+    rho_db, fluxes_db, dt_db, out_db = _run_config(db_cfg, device=args.device, er_init_mode=args.er_init_mode)
+    rho_ex, fluxes_ex, dt_ex, out_ex = _run_config(ex_cfg, device=args.device, er_init_mode=args.er_init_mode)
 
     rho_delta = float(jnp.max(jnp.abs(rho_ex - rho_db)))
     flux_delta = _max_delta(fluxes_db, fluxes_ex)
