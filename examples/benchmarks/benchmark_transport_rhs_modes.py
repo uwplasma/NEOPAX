@@ -142,8 +142,7 @@ def _build_config(
             neoclassical["ntx_exact_response_anchor_count"] = int(ntx_response_anchor_count)
         if ntx_use_remat:
             neoclassical["ntx_exact_use_remat"] = True
-        if rhs_mode in {"lagged_response", "lagged_transport_response"}:
-            neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
+        neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
 
     ambipolarity = config.setdefault("ambipolarity", {})
     ambipolarity["er_ambipolar_plot"] = False
