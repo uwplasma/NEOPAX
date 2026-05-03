@@ -180,8 +180,18 @@ def _run_once(config):
         last_attempt_finite_f0 = raw.get("last_attempt_finite_f0")
         last_attempt_finite_z0 = raw.get("last_attempt_finite_z0")
         last_attempt_finite_initial_residual = raw.get("last_attempt_finite_initial_residual")
+        last_attempt_newton_iter_count = raw.get("last_attempt_newton_iter_count")
+        last_attempt_final_residual_norm = raw.get("last_attempt_final_residual_norm")
+        last_attempt_final_delta_norm = raw.get("last_attempt_final_delta_norm")
+        last_attempt_theta_final = raw.get("last_attempt_theta_final")
+        last_attempt_slow_contraction = raw.get("last_attempt_slow_contraction")
+        last_attempt_residual_blowup = raw.get("last_attempt_residual_blowup")
+        last_attempt_newton_nonfinite = raw.get("last_attempt_newton_nonfinite")
         if any(value is not None for value in (last_attempt_accepted, last_attempt_converged, last_attempt_err_norm, last_attempt_fail_code)):
             err_text = "None" if last_attempt_err_norm is None else f"{float(last_attempt_err_norm):.6e}"
+            final_residual_text = "None" if last_attempt_final_residual_norm is None else f"{float(last_attempt_final_residual_norm):.6e}"
+            final_delta_text = "None" if last_attempt_final_delta_norm is None else f"{float(last_attempt_final_delta_norm):.6e}"
+            theta_text = "None" if last_attempt_theta_final is None else f"{float(last_attempt_theta_final):.6e}"
             print(
                 "[benchmark] last_attempt:",
                 f"accepted={last_attempt_accepted}",
@@ -194,6 +204,13 @@ def _run_once(config):
                 f"finite_f0={last_attempt_finite_f0}",
                 f"finite_z0={last_attempt_finite_z0}",
                 f"finite_initial_residual={last_attempt_finite_initial_residual}",
+                f"newton_iter_count={last_attempt_newton_iter_count}",
+                f"final_residual_norm={final_residual_text}",
+                f"final_delta_norm={final_delta_text}",
+                f"theta_final={theta_text}",
+                f"slow_contraction={last_attempt_slow_contraction}",
+                f"residual_blowup={last_attempt_residual_blowup}",
+                f"newton_nonfinite={last_attempt_newton_nonfinite}",
             )
     return result, wall_seconds
 

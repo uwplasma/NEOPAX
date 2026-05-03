@@ -675,6 +675,13 @@ def _finalize_custom_solver_output(
     last_attempt_finite_f0,
     last_attempt_finite_z0,
     last_attempt_finite_initial_residual,
+    last_attempt_newton_iter_count,
+    last_attempt_final_residual_norm,
+    last_attempt_final_delta_norm,
+    last_attempt_theta_final,
+    last_attempt_slow_contraction,
+    last_attempt_residual_blowup,
+    last_attempt_newton_nonfinite,
     unpack_flat,
     reference_state,
     species,
@@ -728,6 +735,13 @@ def _finalize_custom_solver_output(
         "last_attempt_finite_f0": last_attempt_finite_f0,
         "last_attempt_finite_z0": last_attempt_finite_z0,
         "last_attempt_finite_initial_residual": last_attempt_finite_initial_residual,
+        "last_attempt_newton_iter_count": last_attempt_newton_iter_count,
+        "last_attempt_final_residual_norm": last_attempt_final_residual_norm,
+        "last_attempt_final_delta_norm": last_attempt_final_delta_norm,
+        "last_attempt_theta_final": last_attempt_theta_final,
+        "last_attempt_slow_contraction": last_attempt_slow_contraction,
+        "last_attempt_residual_blowup": last_attempt_residual_blowup,
+        "last_attempt_newton_nonfinite": last_attempt_newton_nonfinite,
         "final_state": final_state,
         "final_time": t_final,
     }
@@ -902,6 +916,13 @@ def _run_saved_loop(
     last_attempt_finite_f00 = jnp.asarray(True)
     last_attempt_finite_z00 = jnp.asarray(True)
     last_attempt_finite_initial_residual0 = jnp.asarray(True)
+    last_attempt_newton_iter_count0 = jnp.asarray(0, dtype=jnp.int32)
+    last_attempt_final_residual_norm0 = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_final_delta_norm0 = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_theta_final0 = jnp.asarray(0.0, dtype=dtype)
+    last_attempt_slow_contraction0 = jnp.asarray(False)
+    last_attempt_residual_blowup0 = jnp.asarray(False)
+    last_attempt_newton_nonfinite0 = jnp.asarray(False)
 
     def cond_fun(loop_carry):
         step_state, step_idx, *_ = loop_carry
@@ -929,6 +950,13 @@ def _run_saved_loop(
             _last_finite_f0,
             _last_finite_z0,
             _last_finite_initial_residual,
+            _last_newton_iter_count,
+            _last_final_residual_norm,
+            _last_final_delta_norm,
+            _last_theta_final,
+            _last_slow_contraction,
+            _last_residual_blowup,
+            _last_newton_nonfinite,
         ) = loop_carry
         step_state, step_info = step_fn(step_state, None)
         save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
@@ -967,6 +995,13 @@ def _run_saved_loop(
             jnp.asarray(True if getattr(step_info, "finite_f0", None) is None else getattr(step_info, "finite_f0")),
             jnp.asarray(True if getattr(step_info, "finite_z0", None) is None else getattr(step_info, "finite_z0")),
             jnp.asarray(True if getattr(step_info, "finite_initial_residual", None) is None else getattr(step_info, "finite_initial_residual")),
+            jnp.asarray(0 if getattr(step_info, "newton_iter_count", None) is None else getattr(step_info, "newton_iter_count"), dtype=jnp.int32),
+            jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "final_residual_norm", None) is None else jnp.asarray(getattr(step_info, "final_residual_norm"), dtype=dtype),
+            jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "final_delta_norm", None) is None else jnp.asarray(getattr(step_info, "final_delta_norm"), dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype) if getattr(step_info, "theta_final", None) is None else jnp.asarray(getattr(step_info, "theta_final"), dtype=dtype),
+            jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction")),
+            jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup")),
+            jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite")),
         )
 
     loop_carry = (
@@ -989,6 +1024,13 @@ def _run_saved_loop(
         last_attempt_finite_f00,
         last_attempt_finite_z00,
         last_attempt_finite_initial_residual0,
+        last_attempt_newton_iter_count0,
+        last_attempt_final_residual_norm0,
+        last_attempt_final_delta_norm0,
+        last_attempt_theta_final0,
+        last_attempt_slow_contraction0,
+        last_attempt_residual_blowup0,
+        last_attempt_newton_nonfinite0,
     )
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
@@ -1036,6 +1078,13 @@ def _apply_radau_lean_timestep_controller(
     finite_f0,
     finite_z0,
     finite_initial_residual,
+    newton_iter_count,
+    final_residual_norm,
+    final_delta_norm,
+    theta_final,
+    slow_contraction,
+    residual_blowup,
+    newton_nonfinite,
     fail_code,
     n_accepted,
     dtype,
@@ -1089,6 +1138,13 @@ def _apply_radau_lean_timestep_controller(
             finite_f0=finite_f0,
             finite_z0=finite_z0,
             finite_initial_residual=finite_initial_residual,
+            newton_iter_count=newton_iter_count,
+            final_residual_norm=final_residual_norm,
+            final_delta_norm=final_delta_norm,
+            theta_final=theta_final,
+            slow_contraction=slow_contraction,
+            residual_blowup=residual_blowup,
+            newton_nonfinite=newton_nonfinite,
         )
 
     def _reject(_):
@@ -1137,6 +1193,13 @@ def _apply_radau_lean_timestep_controller(
             finite_f0=finite_f0,
             finite_z0=finite_z0,
             finite_initial_residual=finite_initial_residual,
+            newton_iter_count=newton_iter_count,
+            final_residual_norm=final_residual_norm,
+            final_delta_norm=final_delta_norm,
+            theta_final=theta_final,
+            slow_contraction=slow_contraction,
+            residual_blowup=residual_blowup,
+            newton_nonfinite=newton_nonfinite,
         )
 
     return jax.lax.cond(accepted, _accept, _reject, operand=None)
@@ -1250,6 +1313,13 @@ class _RadauStepInfo:
     finite_f0: Any = None
     finite_z0: Any = None
     finite_initial_residual: Any = None
+    newton_iter_count: Any = None
+    final_residual_norm: Any = None
+    final_delta_norm: Any = None
+    theta_final: Any = None
+    slow_contraction: Any = None
+    residual_blowup: Any = None
+    newton_nonfinite: Any = None
 
 
 class RADAUSolver(_RadauSolverConfig):
@@ -1470,7 +1540,18 @@ class RADAUSolver(_RadauSolverConfig):
                 return _inverse_transform_stage_stack(delta_transformed).reshape((-1,))
 
             def body_fn(newton_state):
-                iter_idx, z_cur, delta_norm, residual_norm, prev_residual_norm, theta_est, diverged = newton_state
+                (
+                    iter_idx,
+                    z_cur,
+                    delta_norm,
+                    residual_norm,
+                    prev_residual_norm,
+                    theta_est,
+                    diverged,
+                    slow_contraction_any,
+                    residual_blowup_any,
+                    newton_nonfinite_any,
+                ) = newton_state
                 residual_cur = residual(z_cur)
                 delta = stage_solver(-residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
@@ -1492,10 +1573,13 @@ class RADAUSolver(_RadauSolverConfig):
                     current_residual_norm,
                     theta_next,
                     diverged_next,
+                    jnp.logical_or(slow_contraction_any, slow_contraction),
+                    jnp.logical_or(residual_blowup_any, residual_blowup),
+                    jnp.logical_or(newton_nonfinite_any, nonfinite_state),
                 )
 
             def cond_fn(newton_state):
-                iter_idx, _, delta_norm, residual_norm, _, _, diverged = newton_state
+                iter_idx, _, delta_norm, residual_norm, _, _, diverged, _, _, _ = newton_state
                 active = jnp.logical_or(residual_norm > self.tol, delta_norm > self.tol)
                 return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
@@ -1507,16 +1591,31 @@ class RADAUSolver(_RadauSolverConfig):
                 jnp.asarray(jnp.inf, dtype=dtype),
                 zero_scalar,
                 jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(False),
             )
             initial_residual = residual(z0)
             finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
-            _, z_final, _, _, _, theta_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_newton)
+            (
+                iter_final,
+                z_final,
+                delta_norm_final,
+                _residual_norm_loop_final,
+                _prev_residual_final,
+                theta_final,
+                diverged_final,
+                slow_contraction_final,
+                residual_blowup_final,
+                newton_nonfinite_final,
+            ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
             stages_final = z_final.reshape((num_stages, state_dim))
             final_residual = residual(z_final)
             nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
             nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
+            final_residual_norm = jnp.linalg.norm(final_residual)
             converged = jnp.logical_and(
-                jnp.logical_and(jnp.all(jnp.isfinite(z_final)), jnp.linalg.norm(final_residual) <= self.tol),
+                jnp.logical_and(jnp.all(jnp.isfinite(z_final)), final_residual_norm <= self.tol),
                 jnp.logical_not(diverged_final),
             )
             flat_next = flat_y + h_value * (b @ stages_final)
@@ -1538,6 +1637,12 @@ class RADAUSolver(_RadauSolverConfig):
                 converged,
                 z_final,
                 theta_final,
+                iter_final,
+                final_residual_norm,
+                delta_norm_final,
+                slow_contraction_final,
+                residual_blowup_final,
+                newton_nonfinite_final,
                 jacobian_out,
                 cache_valid_out,
                 cache_dt_out,
@@ -1562,6 +1667,8 @@ class RADAUSolver(_RadauSolverConfig):
             trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
             (
                 trial_y, err_norm, converged, stage_history, theta_final,
+                newton_iter_count, final_residual_norm, final_delta_norm,
+                slow_contraction_final, residual_blowup_final, newton_nonfinite_final,
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
@@ -1593,6 +1700,13 @@ class RADAUSolver(_RadauSolverConfig):
                 finite_f0=finite_f0,
                 finite_z0=finite_z0,
                 finite_initial_residual=finite_initial_residual,
+                newton_iter_count=newton_iter_count,
+                final_residual_norm=final_residual_norm,
+                final_delta_norm=final_delta_norm,
+                theta_final=theta_final,
+                slow_contraction=slow_contraction_final,
+                residual_blowup=residual_blowup_final,
+                newton_nonfinite=newton_nonfinite_final,
                 fail_code=fail_code,
                 n_accepted=n_accepted,
                 dtype=dtype,
@@ -1625,6 +1739,13 @@ class RADAUSolver(_RadauSolverConfig):
                     finite_f0=jnp.asarray(True),
                     finite_z0=jnp.asarray(True),
                     finite_initial_residual=jnp.asarray(True),
+                    newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+                    final_residual_norm=jnp.asarray(jnp.inf, dtype=dtype),
+                    final_delta_norm=jnp.asarray(jnp.inf, dtype=dtype),
+                    theta_final=jnp.asarray(0.0, dtype=dtype),
+                    slow_contraction=jnp.asarray(False),
+                    residual_blowup=jnp.asarray(False),
+                    newton_nonfinite=jnp.asarray(False),
                 )
 
             def _run(_):
@@ -1667,6 +1788,13 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -1700,6 +1828,13 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
             unpack_flat,
             state,
             species,
@@ -2050,6 +2185,13 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -2088,6 +2230,13 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
             unpack_flat,
             state,
             species,
@@ -2404,6 +2553,13 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -2442,6 +2598,13 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_finite_f0,
             last_attempt_finite_z0,
             last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
             unpack_flat,
             state,
             species,
