@@ -82,7 +82,7 @@ def _species_label(runtime, species_index: int) -> str:
 
 def _plot_coefficients(output_dir: Path, x_grid, curves: dict[str, np.ndarray], title: str, stem: str):
     fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
-    quantity_order = [("D11", 0), ("D13", 2), ("D33", 3)]
+    quantity_order = [("D11", 0), ("D13", 1), ("D33", 2)]
     styles = {
         "database": ("solid", 2.4),
         "exact_epsihat": ("--", 2.0),
@@ -103,6 +103,30 @@ def _plot_coefficients(output_dir: Path, x_grid, curves: dict[str, np.ndarray], 
     fig.savefig(out, dpi=170)
     plt.close(fig)
     return out
+
+
+def _database_channels_to_physical(db_coeffs: jax.Array, nu_hat_a: jax.Array) -> jax.Array:
+    """Convert stored database channels to physical D11/D13/D33."""
+    return jnp.stack(
+        (
+            -10.0 ** jnp.asarray(db_coeffs[:, 0], dtype=jnp.float64),
+            -jnp.asarray(db_coeffs[:, 1], dtype=jnp.float64),
+            -jnp.asarray(db_coeffs[:, 2], dtype=jnp.float64) / jnp.maximum(jnp.asarray(nu_hat_a, dtype=jnp.float64), 1.0e-30),
+        ),
+        axis=1,
+    )
+
+
+def _exact_coeff_vector_to_physical(exact_coeffs: jax.Array) -> jax.Array:
+    """Select the comparable D11/D13/D33 channels from the NTX coefficient vector."""
+    return jnp.stack(
+        (
+            jnp.asarray(exact_coeffs[:, 0], dtype=jnp.float64),
+            jnp.asarray(exact_coeffs[:, 2], dtype=jnp.float64),
+            jnp.asarray(exact_coeffs[:, 3], dtype=jnp.float64),
+        ),
+        axis=1,
+    )
 
 
 def main():
@@ -187,14 +211,14 @@ def main():
     )
 
     er_vnew_a = jnp.asarray(er_value * 1.0e3 / v_new_a, dtype=jnp.float64)
-    db_coeffs = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_value, nu_hat_a, er_vnew_a, runtime.database)
+    db_coeffs_raw = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_value, nu_hat_a, er_vnew_a, runtime.database)
 
     support = exact_model._static_support()
     prepared = jax.tree_util.tree_map(
         lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
         support.center_prepared,
     )
-    exact_epsihat = jax.vmap(
+    exact_epsihat_raw = jax.vmap(
         lambda nu_hat_value, epsi_hat_value: exact_model._solve_coefficient_scan_prepared(
             prepared,
             jnp.asarray([nu_hat_value], dtype=jnp.float64),
@@ -205,7 +229,7 @@ def main():
     transport_scale = jnp.asarray(prepared.geometry.transport_psi_scale, dtype=jnp.float64)
     er_hat_a = epsi_hat_a * transport_scale
     ntx = _import_ntx()
-    exact_erhat = jax.vmap(
+    exact_erhat_raw = jax.vmap(
         lambda nu_hat_value, er_hat_value: ntx.solve_prepared_coefficient_vector(
             prepared,
             ntx.MonoenergeticCase(
@@ -214,6 +238,10 @@ def main():
             ),
         )
     )(nu_hat_a, er_hat_a)
+
+    db_coeffs = _database_channels_to_physical(db_coeffs_raw, nu_hat_a)
+    exact_epsihat = _exact_coeff_vector_to_physical(exact_epsihat_raw)
+    exact_erhat = _exact_coeff_vector_to_physical(exact_erhat_raw)
 
     jax.block_until_ready(db_coeffs)
     jax.block_until_ready(exact_epsihat)
@@ -255,7 +283,7 @@ def main():
     print()
     print("quantity        exact_epsihat_abs   exact_epsihat_rel     exact_erhat_abs     exact_erhat_rel")
     print("-----------------------------------------------------------------------------------------------")
-    for name, idx in (("D11", 0), ("D13", 2), ("D33", 3)):
+    for name, idx in (("D11", 0), ("D13", 1), ("D33", 2)):
         abs_eps, rel_eps = _delta(db_coeffs, exact_epsihat, idx)
         abs_erh, rel_erh = _delta(db_coeffs, exact_erhat, idx)
         print(f"{name:<12}{abs_eps:>18.6e}{rel_eps:>20.6e}{abs_erh:>20.6e}{rel_erh:>20.6e}")
