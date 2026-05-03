@@ -9,6 +9,10 @@ This diagnostic is intentionally local:
 It also compares two exact-runtime input conventions:
 - current NEOPAX transport path: `epsi_hat = (Er / v) * drds`
 - explicit `er_hat` path, derived from the same resolved `epsi_hat`
+
+It reports both:
+- raw exact NTX coefficients
+- exact coefficients mapped through the same NEOPAX bridge convention as the database
 """
 
 from __future__ import annotations
@@ -129,6 +133,18 @@ def _exact_coeff_vector_to_physical(exact_coeffs: jax.Array) -> jax.Array:
     )
 
 
+def _exact_coeff_vector_to_neopax_physical(exact_coeffs: jax.Array, drds_value: jax.Array) -> jax.Array:
+    drds_value = jnp.asarray(drds_value, dtype=jnp.float64)
+    return jnp.stack(
+        (
+            jnp.asarray(exact_coeffs[:, 0], dtype=jnp.float64) * drds_value**2,
+            jnp.asarray(exact_coeffs[:, 2], dtype=jnp.float64) * drds_value,
+            jnp.asarray(exact_coeffs[:, 3], dtype=jnp.float64),
+        ),
+        axis=1,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
@@ -198,10 +214,11 @@ def main():
     vthermal_local = v_thermal[:, radius_index]
     vth_a = vthermal_local[species_index]
     v_new_a = runtime.energy_grid.v_norm * vth_a
+    drds_value = jnp.asarray(exact_model._static_support().center_channels.drds[radius_index], dtype=jnp.float64)
 
     kernel = monoenergetic_interpolation_kernel(runtime.database)
     nu_hat_a, epsi_hat_a, _ = exact_model._local_scan_inputs(
-        drds_value=jnp.asarray(exact_model._static_support().center_channels.drds[radius_index], dtype=jnp.float64),
+        drds_value=drds_value,
         species_index=species_index,
         er_value=jnp.asarray(er_value, dtype=jnp.float64),
         temperature_local=temperature_local,
@@ -240,8 +257,10 @@ def main():
     )(nu_hat_a, er_hat_a)
 
     db_coeffs = _database_channels_to_physical(db_coeffs_raw, nu_hat_a)
-    exact_epsihat = _exact_coeff_vector_to_physical(exact_epsihat_raw)
-    exact_erhat = _exact_coeff_vector_to_physical(exact_erhat_raw)
+    exact_epsihat_raw_phys = _exact_coeff_vector_to_physical(exact_epsihat_raw)
+    exact_erhat_raw_phys = _exact_coeff_vector_to_physical(exact_erhat_raw)
+    exact_epsihat = _exact_coeff_vector_to_neopax_physical(exact_epsihat_raw, drds_value)
+    exact_erhat = _exact_coeff_vector_to_neopax_physical(exact_erhat_raw, drds_value)
 
     jax.block_until_ready(db_coeffs)
     jax.block_until_ready(exact_epsihat)
@@ -279,14 +298,24 @@ def main():
     print(f"[mono-compare] radius_index={radius_index}")
     print(f"[mono-compare] species_index={species_index} ({_species_label(runtime, species_index)})")
     print(f"[mono-compare] resolution={resolution}")
+    print(f"[mono-compare] drds={float(drds_value):.6e}")
     print(f"[mono-compare] plot={plot_path}")
     print()
-    print("quantity        exact_epsihat_abs   exact_epsihat_rel     exact_erhat_abs     exact_erhat_rel")
-    print("-----------------------------------------------------------------------------------------------")
+    print("raw exact coefficients vs database")
+    print("quantity    epsihat_abs      epsihat_rel        erhat_abs        erhat_rel")
+    print("---------------------------------------------------------------------------")
+    for name, idx in (("D11", 0), ("D13", 1), ("D33", 2)):
+        abs_eps, rel_eps = _delta(db_coeffs, exact_epsihat_raw_phys, idx)
+        abs_erh, rel_erh = _delta(db_coeffs, exact_erhat_raw_phys, idx)
+        print(f"{name:<10}{abs_eps:>14.6e}{rel_eps:>18.6e}{abs_erh:>18.6e}{rel_erh:>18.6e}")
+    print()
+    print("NEOPAX-bridge-scaled exact coefficients vs database")
+    print("quantity    epsihat_abs      epsihat_rel        erhat_abs        erhat_rel")
+    print("---------------------------------------------------------------------------")
     for name, idx in (("D11", 0), ("D13", 1), ("D33", 2)):
         abs_eps, rel_eps = _delta(db_coeffs, exact_epsihat, idx)
         abs_erh, rel_erh = _delta(db_coeffs, exact_erhat, idx)
-        print(f"{name:<12}{abs_eps:>18.6e}{rel_eps:>20.6e}{abs_erh:>20.6e}{rel_erh:>20.6e}")
+        print(f"{name:<10}{abs_eps:>14.6e}{rel_eps:>18.6e}{abs_erh:>18.6e}{rel_erh:>18.6e}")
 
 
 if __name__ == "__main__":
