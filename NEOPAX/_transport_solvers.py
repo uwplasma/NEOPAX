@@ -665,6 +665,10 @@ def _finalize_custom_solver_output(
     failed_f,
     fail_code_f,
     n_steps_f,
+    last_attempt_accepted,
+    last_attempt_converged,
+    last_attempt_err_norm,
+    last_attempt_fail_code,
     unpack_flat,
     reference_state,
     species,
@@ -708,6 +712,10 @@ def _finalize_custom_solver_output(
         "done": done_f,
         "failed": failed_f,
         "fail_code": fail_code_f,
+        "last_attempt_accepted": last_attempt_accepted,
+        "last_attempt_converged": last_attempt_converged,
+        "last_attempt_err_norm": last_attempt_err_norm,
+        "last_attempt_fail_code": last_attempt_fail_code,
         "final_state": final_state,
         "final_time": t_final,
     }
@@ -872,6 +880,10 @@ def _run_saved_loop(
     ys_saved = ys_saved.at[0].set(step_state0.y)
     ts_saved = ts_saved.at[0].set(t0)
     accepted_mask_saved = accepted_mask_saved.at[0].set(True)
+    last_attempt_accepted0 = jnp.asarray(False)
+    last_attempt_converged0 = jnp.asarray(False)
+    last_attempt_err_norm0 = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_fail_code0 = jnp.asarray(0, dtype=jnp.int32)
 
     def cond_fun(loop_carry):
         step_state, step_idx, *_ = loop_carry
@@ -879,7 +891,21 @@ def _run_saved_loop(
         return jnp.logical_and(active, jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)))
 
     def body_fun(loop_carry):
-        step_state, step_idx, save_idx, ys, ts, dts, accs, fails, codes = loop_carry
+        (
+            step_state,
+            step_idx,
+            save_idx,
+            ys,
+            ts,
+            dts,
+            accs,
+            fails,
+            codes,
+            _last_accepted,
+            _last_converged,
+            _last_err_norm,
+            _last_fail_code,
+        ) = loop_carry
         step_state, step_info = step_fn(step_state, None)
         save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
             save_idx,
@@ -907,6 +933,10 @@ def _run_saved_loop(
             accs,
             fails,
             codes,
+            jnp.asarray(step_info.accepted),
+            jnp.asarray(False if getattr(step_info, "converged", None) is None else getattr(step_info, "converged")),
+            jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype),
+            jnp.asarray(step_info.fail_code, dtype=jnp.int32),
         )
 
     loop_carry = (
@@ -919,6 +949,10 @@ def _run_saved_loop(
         accepted_mask_saved,
         failed_mask_saved,
         fail_codes_saved,
+        last_attempt_accepted0,
+        last_attempt_converged0,
+        last_attempt_err_norm0,
+        last_attempt_fail_code0,
     )
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
@@ -1005,6 +1039,8 @@ def _apply_radau_lean_timestep_controller(
             accepted=jnp.asarray(True),
             failed=jnp.asarray(False),
             fail_code=fail_code,
+            converged=converged,
+            err_norm=err_norm,
         )
 
     def _reject(_):
@@ -1045,6 +1081,8 @@ def _apply_radau_lean_timestep_controller(
             accepted=jnp.asarray(False),
             failed=fail_now,
             fail_code=code,
+            converged=converged,
+            err_norm=err_norm,
         )
 
     return jax.lax.cond(accepted, _accept, _reject, operand=None)
@@ -1150,6 +1188,8 @@ class _RadauStepInfo:
     accepted: Any
     failed: Any
     fail_code: Any
+    converged: Any = None
+    err_norm: Any = None
 
 
 class RADAUSolver(_RadauSolverConfig):
@@ -1498,6 +1538,8 @@ class RADAUSolver(_RadauSolverConfig):
                     accepted=jnp.asarray(False),
                     failed=failed,
                     fail_code=fail_code,
+                    converged=jnp.asarray(False),
+                    err_norm=jnp.asarray(jnp.inf, dtype=dtype),
                 )
 
             def _run(_):
@@ -1520,7 +1562,21 @@ class RADAUSolver(_RadauSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
-        step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
+        (
+            step_state_f,
+            _,
+            _,
+            ys_saved,
+            ts_saved,
+            dts_saved,
+            accepted_mask_saved,
+            failed_mask_saved,
+            fail_codes_saved,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
+        ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
             save_n=save_n,
@@ -1543,6 +1599,10 @@ class RADAUSolver(_RadauSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
             unpack_flat,
             state,
             species,
@@ -1873,7 +1933,21 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
-        step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
+        (
+            step_state_f,
+            _,
+            _,
+            ys_saved,
+            ts_saved,
+            dts_saved,
+            accepted_mask_saved,
+            failed_mask_saved,
+            fail_codes_saved,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
+        ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
             save_n=save_n,
@@ -1901,6 +1975,10 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
             unpack_flat,
             state,
             species,
@@ -2197,7 +2275,21 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
-        step_state_f, _, _, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _run_saved_loop(
+        (
+            step_state_f,
+            _,
+            _,
+            ys_saved,
+            ts_saved,
+            dts_saved,
+            accepted_mask_saved,
+            failed_mask_saved,
+            fail_codes_saved,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
+        ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
             save_n=save_n,
@@ -2225,6 +2317,10 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_err_norm,
+            last_attempt_fail_code,
             unpack_flat,
             state,
             species,

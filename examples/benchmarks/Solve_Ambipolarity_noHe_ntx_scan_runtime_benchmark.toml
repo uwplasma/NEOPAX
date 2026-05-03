@@ -7,14 +7,14 @@ boozer_file = "./examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
 n_radial = 51
 
 [neoclassical]
-flux_model = "ntx_exact_lij_runtime"
-entropy_model = "ntx_exact_lij_runtime"
-ntx_exact_n_theta = 11
-ntx_exact_n_zeta = 25
-ntx_exact_n_xi = 32
-
-
-
+flux_model = "ntx_scan_runtime"
+entropy_model = "ntx_scan_runtime"
+ntx_scan_rho = [0.12247, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
+ntx_scan_nu_v = [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]
+ntx_scan_er_tilde = [0.0, 1.0e-6, 3.0e-6, 1.0e-5, 3.0e-5, 1.0e-4]
+ntx_scan_n_theta = 25
+ntx_scan_n_zeta = 25
+ntx_scan_n_xi = 32
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -27,14 +27,12 @@ er_ambipolar_tol = 1.0e-6
 er_ambipolar_x_tol = 1.0e-6
 er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
+er_ambipolar_scan_batch_mode = "vmap"
 er_ambipolar_overlay_reference_er = false
 er_ambipolar_plot = true
 er_ambipolar_write_hdf5 = false
-er_ambipolar_output_dir = "./outputs/benchmark_ambipolarity_ntx_exact_lij_runtime"
+er_ambipolar_output_dir = "./outputs/benchmark_ambipolarity_ntx_scan_runtime"
 er_initialization_preprocess_boundary_state = false
-er_ambipolar_scan_batch_mode = "vmap"    # or "lax_map" or "hybrid"
-er_ambipolar_scan_batch_size = 40         # used when mode = "hybrid"
-
 
 [turbulence]
 flux_model = "turbulent_power_analytical"

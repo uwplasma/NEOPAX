@@ -446,17 +446,23 @@ def main():
                     "failed": None if last_result is None or last_result.failed is None else bool(last_result.failed),
                     "fail_code": None if last_result is None or last_result.fail_code is None else int(last_result.fail_code),
                     "final_time": None if last_result is None or last_result.final_time is None else float(last_result.final_time),
+                    "last_attempt_accepted": None if last_result is None else last_result.raw_result.get("last_attempt_accepted"),
+                    "last_attempt_converged": None if last_result is None else last_result.raw_result.get("last_attempt_converged"),
+                    "last_attempt_err_norm": None if last_result is None else last_result.raw_result.get("last_attempt_err_norm"),
+                    "last_attempt_fail_code": None if last_result is None else last_result.raw_result.get("last_attempt_fail_code"),
                     "final_state_max_abs_delta_vs_first": final_state_delta,
                 }
             )
 
     print()
-    print("rhs_mode                 anchors     mean_s     best_s     n_steps  accepted  failed  fail_code  final_t   max|delta|")
-    print("-" * 118)
+    print("rhs_mode                 anchors     mean_s     best_s     n_steps  accepted  failed  fail_code  final_t  att_acc  att_conv  att_code     att_err   max|delta|")
+    print("-" * 157)
     for row in mode_results:
         final_time_str = str(None if row["final_time"] is None else round(row["final_time"], 6))
         final_delta = row["final_state_max_abs_delta_vs_first"]
         final_delta_str = "None" if final_delta is None else f"{final_delta:.3e}"
+        att_err = row["last_attempt_err_norm"]
+        att_err_str = "None" if att_err is None else f"{float(att_err):.3e}"
         print(
             f"{row['rhs_mode']:<23}"
             f"{str(row['response_anchor_count']):>9}"
@@ -467,6 +473,10 @@ def main():
             f"{str(row['failed']):>8}"
             f"{str(row['fail_code']):>11}"
             f"{final_time_str:>10}"
+            f"{str(row['last_attempt_accepted']):>9}"
+            f"{str(row['last_attempt_converged']):>10}"
+            f"{str(row['last_attempt_fail_code']):>10}"
+            f"{att_err_str:>12}"
             f"{final_delta_str:>14}"
         )
 

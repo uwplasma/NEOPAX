@@ -22,6 +22,9 @@ import NEOPAX
 from NEOPAX._orchestrator import build_runtime_context, run_ambipolarity
 
 DEFAULT_CONFIG = Path("examples/benchmarks/Solve_Transport_equations_noHe_radau_benchmark.toml")
+DEFAULT_NTX_SCAN_RHO = [0.12247, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
+DEFAULT_NTX_SCAN_NU_V = [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]
+DEFAULT_NTX_SCAN_ER_TILDE = [0.0, 1.0e-6, 3.0e-6, 1.0e-5, 3.0e-5, 1.0e-4]
 
 
 def _build_config(
@@ -45,6 +48,16 @@ def _build_config(
             neo["ntx_exact_n_zeta"] = int(n_zeta)
         if n_xi is not None:
             neo["ntx_exact_n_xi"] = int(n_xi)
+    elif flux_model == "ntx_scan_runtime":
+        neo.setdefault("ntx_scan_rho", list(DEFAULT_NTX_SCAN_RHO))
+        neo.setdefault("ntx_scan_nu_v", list(DEFAULT_NTX_SCAN_NU_V))
+        neo.setdefault("ntx_scan_er_tilde", list(DEFAULT_NTX_SCAN_ER_TILDE))
+        if n_theta is not None:
+            neo["ntx_scan_n_theta"] = int(n_theta)
+        if n_zeta is not None:
+            neo["ntx_scan_n_zeta"] = int(n_zeta)
+        if n_xi is not None:
+            neo["ntx_scan_n_xi"] = int(n_xi)
     amb = config.setdefault("ambipolarity", {})
     amb["er_ambipolar_plot"] = False
     amb["er_ambipolar_write_hdf5"] = False
