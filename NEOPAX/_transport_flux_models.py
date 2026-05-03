@@ -1416,6 +1416,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         flat_full = jax.vmap(lambda values: jnp.interp(target_rho, anchor_rho, values))(flat_anchor)
         return flat_full.T.reshape((n_target,) + anchor_values.shape[1:])
 
+    def _regularize_axis_radius0(self, values_by_radius, radius_coordinates):
+        radius_coordinates = jnp.asarray(radius_coordinates, dtype=jnp.float64)
+        if int(radius_coordinates.shape[0]) < 4:
+            return values_by_radius
+
+        def _regularize_leaf(leaf):
+            arr = jnp.asarray(leaf)
+            if arr.ndim == 0 or int(arr.shape[0]) < 4:
+                return arr
+
+            xr = jnp.asarray(radius_coordinates[0], dtype=arr.dtype)
+            r1 = jnp.asarray(radius_coordinates[1], dtype=arr.dtype)
+            r2 = jnp.asarray(radius_coordinates[2], dtype=arr.dtype)
+            r3 = jnp.asarray(radius_coordinates[3], dtype=arr.dtype)
+            xr2 = xr * xr
+            xr3 = xr2 * xr
+            r12 = r1 * r1
+            r22 = r2 * r2
+            r32 = r3 * r3
+            r13 = r1 * r12
+            r23 = r2 * r22
+            r33 = r3 * r32
+            v1 = arr[1]
+            v2 = arr[2]
+            v3 = arr[3]
+
+            ha = ((v3 - v2) / (r33 - r23) - (v3 - v1) / (r33 - r13)) / (
+                (r32 - r22) / (r33 - r23) - (r32 - r12) / (r33 - r13)
+            )
+            hb = ((v3 - v2) / (r32 - r22) - (v3 - v1) / (r32 - r12)) / (
+                (r33 - r23) / (r32 - r22) - (r33 - r13) / (r32 - r12)
+            )
+            hg = v1 - r12 * ha - r13 * hb
+            axis_value = hg + xr2 * ha + xr3 * hb
+            return arr.at[0].set(axis_value)
+
+        return jax.tree_util.tree_map(_regularize_leaf, values_by_radius)
+
     def _log_nu_star_from_nu_hat(self, nu_hat_a):
         weights = jnp.asarray(self.energy_grid.xWeights, dtype=jnp.float64)
         weights = weights / jnp.maximum(jnp.sum(weights), 1.0e-30)
@@ -1765,6 +1803,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )(species_indices)
 
         lij_by_radius = self._map_radius_axis(_per_radius, radius_indices)
+        lij_by_radius = self._regularize_axis_radius0(lij_by_radius, self.geometry.r_grid)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
@@ -1928,6 +1967,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )(species_indices)
 
             anchor_response = self._map_radius_axis(_per_anchor, anchor_indices)
+            anchor_response = self._regularize_axis_radius0(
+                anchor_response,
+                jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices],
+            )
             anchor_reference_log_nu_star = anchor_response[0]
             anchor_reference_transport_moments = anchor_response[1]
             anchor_dtransport_moments_d_er = anchor_response[2]
@@ -1988,6 +2031,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )(species_indices)
 
         response_by_radius = self._map_radius_axis(_per_radius, radius_indices)
+        response_by_radius = self._regularize_axis_radius0(response_by_radius, self.geometry.r_grid)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
         return NTXExactLijLaggedResponse(center_response=response_by_radius)
