@@ -166,6 +166,21 @@ def _run_once(config):
     result = NEOPAX.run(config)
     _block_on_result(result)
     wall_seconds = time.perf_counter() - t_start
+    raw = result.raw_result if hasattr(result, "raw_result") else None
+    if isinstance(raw, dict):
+        last_attempt_accepted = raw.get("last_attempt_accepted")
+        last_attempt_converged = raw.get("last_attempt_converged")
+        last_attempt_err_norm = raw.get("last_attempt_err_norm")
+        last_attempt_fail_code = raw.get("last_attempt_fail_code")
+        if any(value is not None for value in (last_attempt_accepted, last_attempt_converged, last_attempt_err_norm, last_attempt_fail_code)):
+            err_text = "None" if last_attempt_err_norm is None else f"{float(last_attempt_err_norm):.6e}"
+            print(
+                "[benchmark] last_attempt:",
+                f"accepted={last_attempt_accepted}",
+                f"converged={last_attempt_converged}",
+                f"fail_code={last_attempt_fail_code}",
+                f"err_norm={err_text}",
+            )
     return result, wall_seconds
 
 
