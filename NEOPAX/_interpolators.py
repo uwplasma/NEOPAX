@@ -293,33 +293,30 @@ def get_Dij_alt(grid_x, grid_nu, grid_Er,database):
 @jit
 def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
-    grid_Er_internal = jnp.select(
-        condlist=[grid_x <= database.low_limit_r, grid_x > database.low_limit_r],
-        choicelist=[
-            jnp.log10(database.Er_lower_limit),
-            jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_x))),
-        ],
-        default=0,
-    )
+    # A true 3D tensor grid cannot use database.Er_list directly because that
+    # axis is radius-dependent (it stores log10(|Er|/r)). Reconstruct a common
+    # log10(|Er|) axis from the first radius row and use that for the 3D query.
+    grid_Er_internal = jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er)))
     r_grid = database.rho * database.a_b
+    er_raw_log_grid = database.Er_list[0, :] + jnp.log10(jnp.maximum(r_grid[0], 1.0e-30))
     xg11 = interpax.Interpolator3D(
         r_grid,
         database.nu_log,
-        database.Er_list[:],
+        er_raw_log_grid,
         database.D11_log[:, :, :],
         extrap=True,
     )(grid_x, grid_nu_internal, grid_Er_internal)
     xg13 = interpax.Interpolator3D(
         r_grid,
         database.nu_log,
-        database.Er_list[:],
+        er_raw_log_grid,
         database.D13[:, :, :],
         extrap=True,
     )(grid_x, grid_nu_internal, grid_Er_internal)
     xg33 = interpax.Interpolator3D(
         r_grid,
         database.nu_log,
-        database.Er_list[:],
+        er_raw_log_grid,
         database.D33[:, :, :],
         extrap=True,
     )(grid_x, grid_nu_internal, grid_Er_internal)
