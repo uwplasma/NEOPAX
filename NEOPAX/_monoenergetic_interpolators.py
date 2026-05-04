@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from ._interpolators import get_Dij
+from ._interpolators import get_Dij, get_Dij_loger_no_r
 from ._interpolators_ntss_preprocessed import get_Dij_ntss_preprocessed
 from ._interpolators_preprocessed import (
     get_Dij_preprocessed_3d,
@@ -12,6 +12,7 @@ from ._interpolators_preprocessed import (
 )
 from ._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
+    MONOENERGETIC_KIND_GENERIC_LOGER_NO_R,
     MONOENERGETIC_KIND_PREPROCESSED_3D,
     MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
     MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL,
@@ -28,6 +29,7 @@ MONOENERGETIC_INTERPOLATION_KERNELS: dict[str, Callable[..., Any]] = {
     MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL: get_Dij_preprocessed_3d_ntss_radius,
     MONOENERGETIC_KIND_PREPROCESSED_3D: get_Dij_preprocessed_3d,
     MONOENERGETIC_KIND_GENERIC: get_Dij,
+    MONOENERGETIC_KIND_GENERIC_LOGER_NO_R: get_Dij_loger_no_r,
 }
 
 

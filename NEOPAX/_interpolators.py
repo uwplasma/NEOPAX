@@ -310,3 +310,26 @@ def get_Dij(grid_x, grid_nu, grid_Er,database):
     #xg=xg.at[2].set(monodata3(grid_x,grid_nu_internal,grid_Er_internal))
     return xg
 
+
+@jit
+def get_Dij_loger_no_r(grid_x, grid_nu, grid_Er, database):
+    xg = jnp.zeros(3)
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    grid_Er_internal = jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er)))
+    I = jnp.identity(3)
+    array = jnp.select(
+        condlist=[
+            grid_x < database.r1_lim,
+            (grid_x >= database.r1_lim) & (grid_x < database.rmn2_lim),
+            grid_x >= database.rmn2_lim,
+        ],
+        choicelist=[I.at[0].get(), I.at[1].get(), I.at[2].get()],
+        default=0,
+    )
+    xg = (
+        array.at[0].get() * interpolation_small_r(grid_x, grid_nu_internal, grid_Er_internal, database)
+        + array.at[1].get() * interpolation_mid_r(grid_x, grid_nu_internal, grid_Er_internal, database)
+        + array.at[2].get() * interpolation_large_r(grid_x, grid_nu_internal, grid_Er_internal, database)
+    )
+    return xg
+

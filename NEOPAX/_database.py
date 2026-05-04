@@ -157,6 +157,16 @@ class Monoenergetic:
         return cls(**data)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False)
+class MonoenergeticLogErNoR(Monoenergetic):
+    """Monoenergetic database using log10(|Er|) instead of log10(|Er|/r).
+
+    The stored arrays are identical to the generic database; only the query-side
+    interpolation kernel differs.
+    """
+
+
     @classmethod
     def read_data(cls,
         a_b,  

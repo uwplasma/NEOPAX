@@ -41,6 +41,7 @@ DEFAULT_DATABASE_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_da
 DEFAULT_EXACT_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_exact_lij_runtime_benchmark.toml")
 DEFAULT_MODES = (
     "generic",
+    "generic_loger_no_r",
     "preprocessed_3d",
     "preprocessed_3d_radial_ntss1d",
 )
