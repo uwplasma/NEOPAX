@@ -158,7 +158,7 @@ class Monoenergetic:
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(eq=False)
+@dataclasses.dataclass(eq=False, init=False)
 class MonoenergeticLogErNoR(Monoenergetic):
     """Monoenergetic database using log10(|Er|) instead of log10(|Er|/r).
 
