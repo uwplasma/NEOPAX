@@ -72,6 +72,11 @@ def _find_vmec_path(config: dict) -> Path:
     return Path(config["geometry"]["vmec_file"])
 
 
+def _scalar0(value) -> float:
+    arr = np.asarray(jax.device_get(value), dtype=float)
+    return float(arr.reshape(-1)[0])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
@@ -152,11 +157,11 @@ def main():
     )
     scan_raw = np.asarray(
         [
-            float(jnp.asarray(scan_result["D11"])[0, 0]),
-            float(jnp.asarray(scan_result["D31"])[0, 0]),
-            float(jnp.asarray(scan_result["D13"])[0, 0]),
-            float(jnp.asarray(scan_result["D33"])[0, 0]),
-            float(jnp.asarray(scan_result["D33_spitzer"])[0, 0]),
+            _scalar0(scan_result["D11"]),
+            _scalar0(scan_result["D31"]),
+            _scalar0(scan_result["D13"]),
+            _scalar0(scan_result["D33"]),
+            _scalar0(scan_result["D33_spitzer"]),
         ],
         dtype=float,
     )
