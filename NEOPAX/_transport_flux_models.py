@@ -1473,7 +1473,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         vth_a = vthermal_local[species_index]
         v_new_a = self.energy_grid.v_norm * vth_a
-        epsi_hat_a = (er_value * 1.0e3 / v_new_a) * drds_value
+        # Match the NEOPAX database runtime convention:
+        # the monoenergetic database is queried with Er / v_new, while the
+        # drds bridge factor is applied later in the D11/D13 mapping.
+        epsi_hat_a = er_value * 1.0e3 / v_new_a
         nu_hat_a = _nu_over_vnew_local(
             self.species,
             species_index,
@@ -1755,7 +1758,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         v_new_a = self.energy_grid.v_norm * vth_a
         zero_nu_tangent = jnp.zeros_like(reference_nu_hat)
-        epsi_hat_tangent = (jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a) * drds_value
+        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a
         zero_epsi_tangent = jnp.zeros_like(reference_epsi_hat)
         dtransport_moments_d_er = transport_moment_pushforward(
             zero_nu_tangent,
