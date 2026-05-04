@@ -503,3 +503,73 @@ Only after those reruns should we decide whether the remaining mismatch is:
 1. still present at true nodes
 2. mainly off-node
 3. or largely a diagnostic artifact from the earlier mixed `rho` vs `r` usage
+
+## Latest rerun status after correcting `rho` vs `r`
+
+After rerunning the corrected diagnostics, the picture improved substantially.
+
+### What changed
+
+The earlier catastrophic "node mismatch" was mostly a diagnostic artifact from mixing:
+
+- `rho_surface = sqrt(s)`
+- and physical radius `r = a_b * rho_surface`
+
+After correcting that in the benchmark scripts:
+
+1. `D11` at nodes became much closer to exact NTX
+2. scalar off-node comparisons improved significantly
+3. the main remaining discrepancy is no longer a general database failure
+
+### Current residual mismatch
+
+The remaining differences are now concentrated mainly in:
+
+1. `D13`
+2. secondarily `D33`
+3. much less in `D11`
+
+This is true both:
+
+- at selected exact nodes
+- and in the scalar off-node audit
+
+### Important mode-comparison result
+
+The corrected node comparison was rerun with:
+
+1. `generic`
+2. `preprocessed_3d`
+
+and they showed very similar residual mismatches.
+
+So the remaining issue is **not mainly caused by the interpolation algorithm family** itself.
+
+What this means:
+
+- changing between `generic` and `preprocessed_3d` does not remove the residual problem
+- the common issue must live in something they share
+
+### Shared layers now most suspect
+
+The remaining candidates are the shared database-side conventions:
+
+1. the bridge/scaling convention for `D13`
+2. the bridge/scaling convention for `D33`
+3. the exact-side reconstruction used for comparison
+
+### Focused next objective
+
+The next session should focus on tracing `D13` through the whole chain at:
+
+1. one exact stored node
+2. one nearby off-node scalar case
+
+For each case, compare:
+
+1. raw file `D13`
+2. bridged stored `D13`
+3. database queried `D13`
+4. exact NTX reconstructed `D13`
+
+Do the same for `D33` if needed, but `D13` is now the highest-priority residual discrepancy.

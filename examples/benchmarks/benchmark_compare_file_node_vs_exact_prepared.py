@@ -1,7 +1,7 @@
-"""Compare one raw HDF5 scan node against an exact prepared NTX solve at that same node.
+"""Compare one raw HDF5 scan node against NTX scan and prepared solves at that same node.
 
 This isolates whether the remaining mismatch is:
-- already present between the stored scan node and the exact prepared solve, or
+- already present between the stored scan node and current NTX solves, or
 - introduced later by NEOPAX exact-runtime bridge/assembly.
 """
 
@@ -68,6 +68,10 @@ def _find_database_path(config: dict) -> Path:
     return Path(config["neoclassical"]["neoclassical_file"])
 
 
+def _find_vmec_path(config: dict) -> Path:
+    return Path(config["geometry"]["vmec_file"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
@@ -126,21 +130,39 @@ def main():
         n_zeta=int(neo["ntx_exact_n_zeta"]),
         n_xi=int(neo["ntx_exact_n_xi"]),
     )
-    vmec_path = Path(ex_cfg["geometry"]["vmec_file"])
+    vmec_path = _find_vmec_path(ex_cfg)
     vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
     surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_value**2))
     prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
 
-    exact_raw = ntx.solve_prepared_coefficient_vector(
+    prepared_raw = ntx.solve_prepared_coefficient_vector(
         prepared,
         ntx.MonoenergeticCase(
             nu_hat=jnp.asarray(nu_hat_value, dtype=jnp.float64),
             epsi_hat=jnp.asarray(epsi_hat_value, dtype=jnp.float64),
         ),
     )
-    exact_raw = np.asarray(jax.device_get(exact_raw), dtype=float)
+    prepared_raw = np.asarray(jax.device_get(prepared_raw), dtype=float)
+
+    scan_result = ntx.solve_monoenergetic_scan(
+        surface,
+        grid_spec,
+        jnp.asarray([nu_hat_value], dtype=jnp.float64),
+        epsi_hat=jnp.asarray([epsi_hat_value], dtype=jnp.float64),
+    )
+    scan_raw = np.asarray(
+        [
+            float(jnp.asarray(scan_result["D11"])[0, 0]),
+            float(jnp.asarray(scan_result["D31"])[0, 0]),
+            float(jnp.asarray(scan_result["D13"])[0, 0]),
+            float(jnp.asarray(scan_result["D33"])[0, 0]),
+            float(jnp.asarray(scan_result["D33_spitzer"])[0, 0]),
+        ],
+        dtype=float,
+    )
 
     print(f"[file-vs-exact] database_file={db_abs}")
+    print(f"[file-vs-exact] vmec_file={vmec_abs}")
     print(f"[file-vs-exact] requested_node=(rho_idx={ir}, nu_idx={inu}, er_idx={ier})")
     print(f"[file-vs-exact] rho_file={rho_value:.12e}")
     print(f"[file-vs-exact] rho_exact={rho_value:.12e}")
@@ -155,19 +177,39 @@ def main():
     print(f"  D13_file = {D13[ir, inu, ier]:.12e}")
     print(f"  D33_file = {D33[ir, inu, ier]:.12e}")
     print()
-    print("exact prepared raw")
-    print(f"  D11_exact = {exact_raw[0]:.12e}")
-    print(f"  D31_exact = {exact_raw[1]:.12e}")
-    print(f"  D13_exact = {exact_raw[2]:.12e}")
-    print(f"  D33_exact = {exact_raw[3]:.12e}")
-    print(f"  D33_spitzer_exact = {exact_raw[4]:.12e}")
+    print("NTX scan raw")
+    print(f"  D11_scan = {scan_raw[0]:.12e}")
+    print(f"  D31_scan = {scan_raw[1]:.12e}")
+    print(f"  D13_scan = {scan_raw[2]:.12e}")
+    print(f"  D33_scan = {scan_raw[3]:.12e}")
+    print(f"  D33_spitzer_scan = {scan_raw[4]:.12e}")
     print()
-    print("absolute deltas")
-    print(f"  D11 = {abs(exact_raw[0] - D11[ir, inu, ier]):.12e}")
+    print("NTX prepared raw")
+    print(f"  D11_prepared = {prepared_raw[0]:.12e}")
+    print(f"  D31_prepared = {prepared_raw[1]:.12e}")
+    print(f"  D13_prepared = {prepared_raw[2]:.12e}")
+    print(f"  D33_prepared = {prepared_raw[3]:.12e}")
+    print(f"  D33_spitzer_prepared = {prepared_raw[4]:.12e}")
+    print()
+    print("absolute deltas: file vs scan")
+    print(f"  D11 = {abs(scan_raw[0] - D11[ir, inu, ier]):.12e}")
     if D31 is not None:
-        print(f"  D31 = {abs(exact_raw[1] - D31[ir, inu, ier]):.12e}")
-    print(f"  D13 = {abs(exact_raw[2] - D13[ir, inu, ier]):.12e}")
-    print(f"  D33 = {abs(exact_raw[3] - D33[ir, inu, ier]):.12e}")
+        print(f"  D31 = {abs(scan_raw[1] - D31[ir, inu, ier]):.12e}")
+    print(f"  D13 = {abs(scan_raw[2] - D13[ir, inu, ier]):.12e}")
+    print(f"  D33 = {abs(scan_raw[3] - D33[ir, inu, ier]):.12e}")
+    print()
+    print("absolute deltas: file vs prepared")
+    print(f"  D11 = {abs(prepared_raw[0] - D11[ir, inu, ier]):.12e}")
+    if D31 is not None:
+        print(f"  D31 = {abs(prepared_raw[1] - D31[ir, inu, ier]):.12e}")
+    print(f"  D13 = {abs(prepared_raw[2] - D13[ir, inu, ier]):.12e}")
+    print(f"  D33 = {abs(prepared_raw[3] - D33[ir, inu, ier]):.12e}")
+    print()
+    print("absolute deltas: scan vs prepared")
+    print(f"  D11 = {abs(prepared_raw[0] - scan_raw[0]):.12e}")
+    print(f"  D31 = {abs(prepared_raw[1] - scan_raw[1]):.12e}")
+    print(f"  D13 = {abs(prepared_raw[2] - scan_raw[2]):.12e}")
+    print(f"  D33 = {abs(prepared_raw[3] - scan_raw[3]):.12e}")
 
 
 if __name__ == "__main__":
