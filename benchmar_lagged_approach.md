@@ -412,3 +412,94 @@ in:
 2. `NTX/src/ntx/_neopax_bridge.py`
 
 Then rerun the node-level database-vs-exact `Dij` audit before changing any more solver logic.
+
+## Correction / Superseding Note
+
+This note supersedes the previous "Most likely root cause" subsection above.
+
+### Corrected status
+
+The remaining problem is **not yet** tied to a confirmed single-line bug.
+
+What is still solid:
+
+1. raw NTX scan vs raw NTX prepared/direct solve is consistent
+2. raw NTX file nodes vs raw exact prepared NTX is consistent
+3. NEOPAX database load/bridge at exact stored nodes is internally consistent
+4. database-queried vs exact NTX `Dij` can still mismatch, including at selected nodes
+
+### Important correction to the earlier field-axis hypothesis
+
+The previous suspicion about using `Er[0,k]` instead of `Er[j,k]` is probably **not** the main explanation for the current NTX-built file.
+
+For this builder:
+
+- `Er = Er_tilde * dr_tildedr * B00`
+- `dr_tildedr = 2 * Psia / (a_b^2 * B00)`
+
+so the `B00` factor cancels and `Er` becomes effectively radius-independent for a fixed `Er_tilde` grid.
+
+Therefore, in this dataset:
+
+- `Er[j,k] ~= Er[0,k]`
+
+and that specific detail is likely benign here.
+
+### Focused objective for the next session
+
+The next session should focus on the **database-query/evaluation path**, because the mismatch:
+
+1. is already present at the `Dij` level
+2. is not explained by raw NTX, raw file contents, or a simple bridge-at-node inconsistency
+3. is not fixed by low-`Er` flooring, high-`Er` edge behavior alone, or interpolation mode choice alone
+
+So the concrete next goal is to trace:
+
+1. how runtime query coordinates are built from `rho`, `nu/v`, and `Er/v`
+2. how the database path decides a query is "at a node"
+3. how queried `D11/D13/D33` are reconstructed before comparison to exact NTX
+
+### Recommended next action
+
+Before changing NTX or rebuilding the scan:
+
+1. inspect `NEOPAX/_interpolators_preprocessed.py`
+2. inspect `NEOPAX/_interpolators.py`
+3. inspect `NEOPAX/_database.py`
+4. trace one or two scalar node cases all the way through the database-query path
+
+Only after that should any code patch be attempted.
+
+## New diagnostic correction
+
+During follow-up inspection, a concrete issue was found in several benchmark scripts:
+
+- the preprocessed database kernels expect `grid_x = r = a_b * rho`
+- but some node/scalar benchmark scripts were passing `rho` from the file instead
+- and some exact-side benchmark solves were also using physical `r` where `rho = sqrt(s)` was required to build the VMEC surface
+
+So some of the previous "database vs exact mismatch at nodes" evidence was contaminated by the diagnostics themselves.
+
+### Scripts corrected
+
+The following benchmark scripts were corrected to distinguish:
+
+1. `rho_surface = sqrt(s)` for VMEC/NTX surface construction
+2. `r = a_b * rho_surface` for database-kernel queries
+
+Corrected scripts:
+
+- `examples/benchmarks/benchmark_compare_database_nodes_vs_exact.py`
+- `examples/benchmarks/benchmark_scalar_database_vs_exact.py`
+- `examples/benchmarks/benchmark_isolate_database_interpolation_axes.py`
+- `examples/benchmarks/benchmark_compare_database_interpolation_modes.py`
+
+### Immediate next step
+
+Before continuing any new database-physics hypothesis, rerun the corrected node/scalar database-vs-exact audits.
+
+Only after those reruns should we decide whether the remaining mismatch is:
+
+1. still present at true nodes
+2. mainly off-node
+3. or largely a diagnostic artifact from the earlier mixed `rho` vs `r` usage

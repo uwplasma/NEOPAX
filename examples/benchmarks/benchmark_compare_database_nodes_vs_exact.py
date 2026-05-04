@@ -201,7 +201,8 @@ def main():
                 er_value = float(Er[ir, ier])
                 es_value = float(Es[ir, ier])
 
-                db_coeff = kernel(float(rho[ir]), nu_value, er_value, runtime.database)
+                r_value = float(runtime.geometry.a_b * rho[ir])
+                db_coeff = kernel(r_value, nu_value, er_value, runtime.database)
                 db_phys = _database_channels_to_physical(db_coeff, nu_value)
 
                 exact_raw = np.asarray(

@@ -156,7 +156,8 @@ def main():
     v_thermal = get_v_thermal(runtime.species.mass, temperature)
     er_profile = state.Er
 
-    rho_runtime = float(runtime.geometry.r_grid[radius_index])
+    rho_runtime_surface = float(runtime.geometry.rho_grid[radius_index])
+    r_runtime = float(runtime.geometry.r_grid[radius_index])
     er_runtime = float(er_profile[radius_index])
     density_local = density[:, radius_index]
     temperature_local = temperature[:, radius_index]
@@ -177,16 +178,17 @@ def main():
     drds_runtime = float(support.center_channels.drds[radius_index])
     es_over_v_runtime = er_over_v_runtime * drds_runtime
 
-    rho_node_idx = _nearest_index(rho_nodes, rho_runtime)
+    rho_node_idx = _nearest_index(rho_nodes, rho_runtime_surface)
     rho_node = float(rho_nodes[rho_node_idx])
+    r_node = float(runtime.geometry.a_b * rho_node)
     er_over_v_node = float(er_nodes[rho_node_idx, field_node_index])
     es_over_v_node = float(es_nodes[rho_node_idx, field_node_index])
 
     kernel = monoenergetic_interpolation_kernel(runtime.database)
-    db_raw_runtime = kernel(rho_runtime, nu_runtime, er_over_v_runtime, runtime.database)
+    db_raw_runtime = kernel(r_runtime, nu_runtime, er_over_v_runtime, runtime.database)
     db_phys_runtime = _database_channels_to_physical(db_raw_runtime, jnp.asarray(nu_runtime, dtype=jnp.float64))
 
-    db_raw_node = kernel(rho_node, nu_runtime, er_over_v_node, runtime.database)
+    db_raw_node = kernel(r_node, nu_runtime, er_over_v_node, runtime.database)
     db_phys_node = _database_channels_to_physical(db_raw_node, jnp.asarray(nu_runtime, dtype=jnp.float64))
 
     neo = exact_cfg["neoclassical"]
@@ -197,7 +199,7 @@ def main():
     )
     vmec_path = Path(exact_cfg["geometry"]["vmec_file"])
     vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
-    surface_runtime = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime**2))
+    surface_runtime = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime_surface**2))
     prepared_runtime = ntx.prepare_monoenergetic_system(surface_runtime, grid_spec)
     exact_raw_runtime = ntx.solve_prepared_coefficient_vector(
         prepared_runtime,
@@ -221,13 +223,14 @@ def main():
     exact_phys_node = _exact_raw_to_physical(exact_raw_node, jnp.asarray(drds_node, dtype=jnp.float64))
 
     print("[scalar-audit] runtime off-node case")
-    print(f"  rho_runtime         = {rho_runtime:.12e}")
+    print(f"  rho_runtime_surface = {rho_runtime_surface:.12e}")
+    print(f"  r_runtime           = {r_runtime:.12e}")
     print(f"  nu_runtime          = {nu_runtime:.12e}")
     print(f"  Er_runtime          = {er_runtime:.12e}")
     print(f"  Er_over_v_runtime   = {er_over_v_runtime:.12e}")
     print(f"  Es_over_v_runtime   = {es_over_v_runtime:.12e}")
     print(f"  drds_runtime        = {drds_runtime:.12e}")
-    print(f"  grid_er_internal    = {float(jnp.log10(max(1.0e-8, abs(er_over_v_runtime / rho_runtime)))):.12e}")
+    print(f"  grid_er_internal    = {float(jnp.log10(max(1.0e-8, abs(er_over_v_runtime / r_runtime)))):.12e}")
     print("  database physical   =", np.asarray(db_phys_runtime, dtype=float))
     print("  exact physical      =", np.asarray(exact_phys_runtime, dtype=float))
     print("  abs delta           =", np.asarray(jnp.abs(exact_phys_runtime - db_phys_runtime), dtype=float))
@@ -235,11 +238,12 @@ def main():
     print("[scalar-audit] nearby nonzero stored-field case")
     print(f"  rho_node_idx        = {rho_node_idx}")
     print(f"  rho_node            = {rho_node:.12e}")
+    print(f"  r_node              = {r_node:.12e}")
     print(f"  field_node_index    = {field_node_index}")
     print(f"  Er_over_v_node      = {er_over_v_node:.12e}")
     print(f"  Es_over_v_node      = {es_over_v_node:.12e}")
     print(f"  drds_node           = {drds_node:.12e}")
-    print(f"  grid_er_internal    = {float(jnp.log10(max(1.0e-8, abs(er_over_v_node / rho_node)))):.12e}")
+    print(f"  grid_er_internal    = {float(jnp.log10(max(1.0e-8, abs(er_over_v_node / r_node)))):.12e}")
     print("  database physical   =", np.asarray(db_phys_node, dtype=float))
     print("  exact physical      =", np.asarray(exact_phys_node, dtype=float))
     print("  abs delta           =", np.asarray(jnp.abs(exact_phys_node - db_phys_node), dtype=float))

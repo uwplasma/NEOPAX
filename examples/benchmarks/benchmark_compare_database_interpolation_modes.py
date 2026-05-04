@@ -172,7 +172,8 @@ def main():
     temperature = state.temperature
     v_thermal = get_v_thermal(runtime.species.mass, temperature)
 
-    rho_runtime = float(runtime.geometry.r_grid[radius_index])
+    rho_runtime_surface = float(runtime.geometry.rho_grid[radius_index])
+    r_runtime = float(runtime.geometry.r_grid[radius_index])
     density_local = density[:, radius_index]
     temperature_local = temperature[:, radius_index]
     vthermal_local = v_thermal[:, radius_index]
@@ -188,7 +189,7 @@ def main():
         _collisionality_kind(exact_model.collisionality_model),
     )
     nu_runtime = float(nu_hat_a[energy_index])
-    rho_node_idx = int(np.argmin(np.abs(rho_nodes - rho_runtime)))
+    rho_node_idx = int(np.argmin(np.abs(rho_nodes - rho_runtime_surface)))
     rho_field = float(rho_nodes[rho_node_idx])
 
     node_count = min(int(args.num_field_nodes), int(er_nodes.shape[1]))
@@ -204,7 +205,7 @@ def main():
     )
     vmec_path = Path(exact_config["geometry"]["vmec_file"])
     vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
-    surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime**2))
+    surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime_surface**2))
     prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
     drds_value = jnp.asarray(support.center_channels.drds[radius_index], dtype=jnp.float64)
 
@@ -250,7 +251,7 @@ def main():
             values.append(
                 np.asarray(
                     _database_channels_to_physical(
-                        kernel(rho_runtime, nu_runtime, er_over_v_value, mode_runtime.database),
+                        kernel(r_runtime, nu_runtime, er_over_v_value, mode_runtime.database),
                         jnp.asarray(nu_runtime, dtype=jnp.float64),
                     ),
                     dtype=float,
@@ -282,7 +283,7 @@ def main():
         ax.legend()
     axes[-1].set_xlabel("Er / v node")
     fig.suptitle(
-        f"rho_runtime={rho_runtime:.4f}, nu_runtime={nu_runtime:.4e}, "
+        f"rho_runtime={rho_runtime_surface:.4f}, r_runtime={r_runtime:.4f}, nu_runtime={nu_runtime:.4e}, "
         f"rho_field={rho_field:.4f}, resolution={resolution}"
     )
     fig.tight_layout()
@@ -291,7 +292,7 @@ def main():
     plt.close(fig)
 
     print(f"[mode-compare] radius_index={radius_index} species_index={species_index} energy_index={energy_index}")
-    print(f"[mode-compare] rho_runtime={rho_runtime:.12e} rho_field_nodes={rho_field:.12e}")
+    print(f"[mode-compare] rho_runtime_surface={rho_runtime_surface:.12e} r_runtime={r_runtime:.12e} rho_field_nodes={rho_field:.12e}")
     print(f"[mode-compare] nu_runtime={nu_runtime:.12e}")
     print(f"[mode-compare] plot={plot_path}")
     print()

@@ -171,7 +171,8 @@ def main():
     er_profile = state.Er
     v_thermal = get_v_thermal(runtime.species.mass, temperature)
 
-    rho_runtime = float(runtime.geometry.r_grid[radius_index])
+    rho_runtime_surface = float(runtime.geometry.rho_grid[radius_index])
+    r_runtime = float(runtime.geometry.r_grid[radius_index])
     density_local = density[:, radius_index]
     temperature_local = temperature[:, radius_index]
     vthermal_local = v_thermal[:, radius_index]
@@ -187,9 +188,10 @@ def main():
         _collisionality_kind(exact_model.collisionality_model),
     )
     nu_runtime = float(nu_hat_a[energy_index])
-    rho_node_idx = _nearest_index(rho_nodes, rho_runtime)
+    rho_node_idx = _nearest_index(rho_nodes, rho_runtime_surface)
     nu_node_idx = _nearest_index(nu_nodes, nu_runtime)
     rho_on = float(rho_nodes[rho_node_idx])
+    r_on = float(runtime.geometry.a_b * rho_on)
     nu_on = float(nu_nodes[nu_node_idx])
 
     node_count = min(int(args.num_field_nodes), int(er_nodes.shape[1]))
@@ -205,8 +207,8 @@ def main():
     vmec_path = Path(exact_config["geometry"]["vmec_file"])
     vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
 
-    def _solve_slice(rho_value: float, nu_value: float, rho_index_for_field: int):
-        surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_value**2))
+    def _solve_slice(r_surface_value: float, rho_surface_value: float, nu_value: float, rho_index_for_field: int):
+        surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_surface_value**2))
         prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
         drds_value = jnp.asarray(es_nodes[rho_index_for_field, 1] / np.maximum(er_nodes[rho_index_for_field, 1], 1.0e-30), dtype=jnp.float64)
 
@@ -217,7 +219,7 @@ def main():
             er_over_v_value = float(er_nodes[rho_index_for_field, ier])
             es_over_v_value = float(es_nodes[rho_index_for_field, ier])
             db_coeff = _database_channels_to_physical(
-                kernel(rho_value, nu_value, er_over_v_value, runtime.database),
+                kernel(r_surface_value, nu_value, er_over_v_value, runtime.database),
                 jnp.asarray(nu_value, dtype=jnp.float64),
             )
             exact_coeff = _exact_raw_to_physical(
@@ -236,22 +238,23 @@ def main():
         return np.asarray(er_over_v_list), np.asarray(db_list), np.asarray(exact_list)
 
     cases = [
-        ("on_rho_off_nu", rho_on, nu_runtime, rho_node_idx),
-        ("off_rho_on_nu", rho_runtime, nu_on, rho_node_idx),
-        ("off_rho_off_nu", rho_runtime, nu_runtime, rho_node_idx),
+        ("on_rho_off_nu", r_on, rho_on, nu_runtime, rho_node_idx),
+        ("off_rho_on_nu", r_runtime, rho_runtime_surface, nu_on, rho_node_idx),
+        ("off_rho_off_nu", r_runtime, rho_runtime_surface, nu_runtime, rho_node_idx),
     ]
 
     output_dir = Path("outputs/benchmark_interpolation_isolation")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[interp-isolation] rho_runtime={rho_runtime:.12e} rho_on={rho_on:.12e} rho_node_idx={rho_node_idx}")
+    print(f"[interp-isolation] rho_runtime_surface={rho_runtime_surface:.12e} r_runtime={r_runtime:.12e}")
+    print(f"[interp-isolation] rho_on={rho_on:.12e} r_on={r_on:.12e} rho_node_idx={rho_node_idx}")
     print(f"[interp-isolation] nu_runtime={nu_runtime:.12e} nu_on={nu_on:.12e} nu_node_idx={nu_node_idx}")
     print(f"[interp-isolation] species_index={species_index} energy_index={energy_index}")
     print(f"[interp-isolation] resolution={resolution}")
     print()
 
-    for case_name, rho_value, nu_value, rho_field_idx in cases:
-        x, db_vals, exact_vals = _solve_slice(rho_value, nu_value, rho_field_idx)
+    for case_name, r_value, rho_surface_value, nu_value, rho_field_idx in cases:
+        x, db_vals, exact_vals = _solve_slice(r_value, rho_surface_value, nu_value, rho_field_idx)
         abs_delta = np.abs(exact_vals - db_vals)
         rel_delta = abs_delta / np.maximum(np.abs(db_vals), 1.0e-30)
 
@@ -263,13 +266,13 @@ def main():
             ax.grid(True, alpha=0.3)
             ax.legend()
         axes[-1].set_xlabel("Er / v node")
-        fig.suptitle(f"{case_name}: rho={rho_value:.4f}, nu={nu_value:.4e}")
+        fig.suptitle(f"{case_name}: rho={rho_surface_value:.4f}, r={r_value:.4f}, nu={nu_value:.4e}")
         fig.tight_layout()
         plot_path = output_dir / f"{case_name}_{resolution[0]}_{resolution[1]}_{resolution[2]}.png"
         fig.savefig(plot_path, dpi=170)
         plt.close(fig)
 
-        print(f"[{case_name}] rho={rho_value:.12e} nu={nu_value:.12e} plot={plot_path}")
+        print(f"[{case_name}] rho_surface={rho_surface_value:.12e} r={r_value:.12e} nu={nu_value:.12e} plot={plot_path}")
         print(f"{'quantity':<8} {'abs_max':>14} {'rel_max':>14}")
         print("-" * 40)
         for idx, label in enumerate(("D11", "D13", "D33")):
