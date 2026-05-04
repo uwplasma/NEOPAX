@@ -23,6 +23,7 @@ against:
 Datasets shown:
 - exact
 - generic
+- generic_3d
 - generic_loger_no_r
 - preprocessed_3d
 - preprocessed_3d_radial_ntss1d
@@ -54,6 +55,7 @@ DEFAULT_DATABASE_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_da
 DEFAULT_EXACT_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_exact_lij_runtime_benchmark.toml")
 DEFAULT_MODES = (
     "generic",
+    "generic_3d",
     "generic_loger_no_r",
     "preprocessed_3d",
     "preprocessed_3d_radial_ntss1d",
@@ -157,6 +159,7 @@ def _plot_one(
     colors = {
         "exact": "black",
         "generic": "C0",
+        "generic_3d": "C4",
         "generic_loger_no_r": "C3",
         "preprocessed_3d": "C1",
         "preprocessed_3d_radial_ntss1d": "C2",

@@ -167,6 +167,16 @@ class MonoenergeticLogErNoR(Monoenergetic):
     """
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False, init=False)
+class Monoenergetic3D(Monoenergetic):
+    """Monoenergetic database using direct 3D interpolation in generic coordinates.
+
+    The stored arrays are identical to the generic database; only the query-side
+    interpolation kernel differs.
+    """
+
+
     @classmethod
     def read_data(cls,
         a_b,  

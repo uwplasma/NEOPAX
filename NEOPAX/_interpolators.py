@@ -289,6 +289,42 @@ def get_Dij_alt(grid_x, grid_nu, grid_Er,database):
     return xg
     #return interpax.Interpolator3D(rho*a_b,nu_log,Er_list,D11_log,extrap=True)(grid_x,grid_nu_internal,grid_Er_internal)
 
+
+@jit
+def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    grid_Er_internal = jnp.select(
+        condlist=[grid_x <= database.low_limit_r, grid_x > database.low_limit_r],
+        choicelist=[
+            jnp.log10(database.Er_lower_limit),
+            jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_x))),
+        ],
+        default=0,
+    )
+    r_grid = database.rho * database.a_b
+    xg11 = interpax.Interpolator3D(
+        r_grid,
+        database.nu_log,
+        database.Er_list[:],
+        database.D11_log[:, :, :],
+        extrap=True,
+    )(grid_x, grid_nu_internal, grid_Er_internal)
+    xg13 = interpax.Interpolator3D(
+        r_grid,
+        database.nu_log,
+        database.Er_list[:],
+        database.D13[:, :, :],
+        extrap=True,
+    )(grid_x, grid_nu_internal, grid_Er_internal)
+    xg33 = interpax.Interpolator3D(
+        r_grid,
+        database.nu_log,
+        database.Er_list[:],
+        database.D33[:, :, :],
+        extrap=True,
+    )(grid_x, grid_nu_internal, grid_Er_internal)
+    return jnp.asarray([xg11, xg13, xg33])
+
 @jit
 def get_Dij(grid_x, grid_nu, grid_Er,database):
     xg=jnp.zeros(3)
