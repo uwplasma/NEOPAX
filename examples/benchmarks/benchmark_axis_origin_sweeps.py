@@ -108,6 +108,12 @@ def _nearest_idx(values: np.ndarray, target: float) -> int:
     return int(np.argmin(np.abs(values - target)))
 
 
+def _midpoint_sweep_indices(center_idx: int, window: int, n_values: int) -> list[int]:
+    lo = max(0, center_idx - window)
+    hi = min(n_values - 1, center_idx + window + 1)
+    return list(range(lo, hi))
+
+
 def _print_mode_table(name: str, results: dict[str, np.ndarray], exact_vals: np.ndarray):
     print(f"[{name}]")
     for mode, vals in results.items():
@@ -241,19 +247,19 @@ def main():
     print(f"[axis-sweeps] nearest nodes: rho_idx={rho_node_idx} rho_node={rho_node:.6e} nu_idx={nu_node_idx} nu_node={nu_node:.6e} field_idx={field_index} Er/v_node={er_node:.6e}")
     print()
 
-    # 1. Vary rho only
-    rho_lo = max(0, rho_node_idx - args.rho_window)
-    rho_hi = min(len(rho_nodes), rho_node_idx + args.rho_window + 1)
-    rho_sweep_idx = list(range(rho_lo, rho_hi))
+    # 1. Vary rho only: use rho midpoints, keep nu and Er/v fixed on node values.
+    rho_sweep_idx = _midpoint_sweep_indices(rho_node_idx, args.rho_window, len(rho_nodes))
     rho_exact = []
     rho_results = {mode: [] for mode in modes}
     for ir in rho_sweep_idx:
-        rho_val = float(rho_nodes[ir])
+        if ir + 1 >= len(rho_nodes):
+            continue
+        rho_val = 0.5 * float(rho_nodes[ir] + rho_nodes[ir + 1])
         r_val = float(runtime.geometry.a_b * rho_val)
-        es_val = float(es_nodes[ir, field_index])
-        drds_val = float(es_nodes[ir, field_index] / er_nodes[ir, field_index])
         surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_val**2))
         prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
+        drds_val = float(prepared.geometry.transport_psi_scale)
+        es_val = float(er_node * drds_val)
         rho_exact.append(
             np.asarray(
                 _exact_raw_to_physical(
@@ -282,17 +288,17 @@ def main():
             )
     _print_mode_table("vary-rho-only", {k: np.asarray(v) for k, v in rho_results.items()}, np.asarray(rho_exact))
 
-    # 2. Vary nu only
-    nu_lo = max(0, nu_node_idx - args.nu_window)
-    nu_hi = min(len(nu_nodes), nu_node_idx + args.nu_window + 1)
-    nu_sweep_idx = list(range(nu_lo, nu_hi))
+    # 2. Vary nu only: use nu midpoints, keep rho and field on node values.
+    nu_sweep_idx = _midpoint_sweep_indices(nu_node_idx, args.nu_window, len(nu_nodes))
     surface_node = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_node**2))
     prepared_node = ntx.prepare_monoenergetic_system(surface_node, grid_spec)
     drds_node = float(es_node / er_node)
     nu_exact = []
     nu_results = {mode: [] for mode in modes}
     for inu in nu_sweep_idx:
-        nu_val = float(nu_nodes[inu])
+        if inu + 1 >= len(nu_nodes):
+            continue
+        nu_val = float(np.sqrt(nu_nodes[inu] * nu_nodes[inu + 1]))
         nu_exact.append(
             np.asarray(
                 _exact_raw_to_physical(
@@ -321,15 +327,15 @@ def main():
             )
     _print_mode_table("vary-nu-only", {k: np.asarray(v) for k, v in nu_results.items()}, np.asarray(nu_exact))
 
-    # 3. Vary field only
-    er_lo = max(0, field_index - args.field_window)
-    er_hi = min(er_nodes.shape[1], field_index + args.field_window + 1)
-    er_sweep_idx = list(range(er_lo, er_hi))
+    # 3. Vary field only: use field midpoints on the nearest rho row, keep rho and nu on node values.
+    er_sweep_idx = _midpoint_sweep_indices(field_index, args.field_window, er_nodes.shape[1])
     er_exact = []
     er_results = {mode: [] for mode in modes}
     for ier in er_sweep_idx:
-        er_val = float(er_nodes[rho_node_idx, ier])
-        es_val = float(es_nodes[rho_node_idx, ier])
+        if ier + 1 >= er_nodes.shape[1]:
+            continue
+        er_val = 0.5 * float(er_nodes[rho_node_idx, ier] + er_nodes[rho_node_idx, ier + 1])
+        es_val = 0.5 * float(es_nodes[rho_node_idx, ier] + es_nodes[rho_node_idx, ier + 1])
         er_exact.append(
             np.asarray(
                 _exact_raw_to_physical(
