@@ -208,6 +208,7 @@ def main():
         rho = np.asarray(handle["rho"][()], dtype=float)
         nu_v = np.asarray(handle["nu_v"][()], dtype=float)
         er_nodes = np.asarray(handle["Er"][()], dtype=float)
+        es_nodes = np.asarray(handle["Es"][()], dtype=float)
 
     rho_index = int(args.rho_index)
     if rho_index < 0 or rho_index + 1 >= len(rho):
@@ -271,6 +272,10 @@ def main():
         drds_value = float(prepared.geometry.transport_psi_scale)
 
         for field_label, er_value in field_samples:
+            drds_plot = drds_value
+            if rho_label == "rho_node" and field_label.startswith("node_"):
+                field_idx = int(field_label.split("_")[1])
+                drds_plot = float(es_nodes[rho_index, field_idx] / er_nodes[rho_index, field_idx])
             curves: dict[str, np.ndarray] = {}
             exact_vals = []
             for nu_value in nu_samples:
@@ -281,10 +286,10 @@ def main():
                                 prepared,
                                 ntx.MonoenergeticCase(
                                     nu_hat=jnp.asarray(nu_value, dtype=jnp.float64),
-                                    epsi_hat=jnp.asarray(er_value * drds_value, dtype=jnp.float64),
+                                    epsi_hat=jnp.asarray(er_value * drds_plot, dtype=jnp.float64),
                                 ),
                             ),
-                            jnp.asarray(drds_value, dtype=jnp.float64),
+                            jnp.asarray(drds_plot, dtype=jnp.float64),
                         ),
                         dtype=float,
                     )
