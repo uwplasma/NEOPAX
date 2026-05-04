@@ -243,26 +243,26 @@ def main():
     print(f"[offnode-modes] modes={modes}")
     print()
 
-        for radius_index in radius_indices:
-            rho_runtime_surface = float(runtime.geometry.rho_grid[radius_index])
-            r_runtime = float(runtime.geometry.r_grid[radius_index])
-            rho_node_idx = int(np.argmin(np.abs(rho_nodes - rho_runtime_surface)))
-            rho_node = float(rho_nodes[rho_node_idx])
-            r_node = float(runtime.geometry.a_b * rho_node)
-            er_over_v_axis = np.asarray(er_nodes[rho_node_idx, field_indices], dtype=float)
-            es_over_v_axis = np.asarray(es_nodes[rho_node_idx, field_indices], dtype=float)
+    for radius_index in radius_indices:
+        rho_runtime_surface = float(runtime.geometry.rho_grid[radius_index])
+        r_runtime = float(runtime.geometry.r_grid[radius_index])
+        rho_node_idx = int(np.argmin(np.abs(rho_nodes - rho_runtime_surface)))
+        rho_node = float(rho_nodes[rho_node_idx])
+        r_node = float(runtime.geometry.a_b * rho_node)
+        er_over_v_axis = np.asarray(er_nodes[rho_node_idx, field_indices], dtype=float)
+        es_over_v_axis = np.asarray(es_nodes[rho_node_idx, field_indices], dtype=float)
 
-            surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime_surface**2))
-            prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
-            drds_value = jnp.asarray(support.center_channels.drds[radius_index], dtype=jnp.float64)
+        surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_runtime_surface**2))
+        prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
+        drds_value = jnp.asarray(support.center_channels.drds[radius_index], dtype=jnp.float64)
 
-            surface_node = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_node**2))
-            prepared_node = ntx.prepare_monoenergetic_system(surface_node, grid_spec)
+        surface_node = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_node**2))
+        prepared_node = ntx.prepare_monoenergetic_system(surface_node, grid_spec)
 
-            for species_index in species_indices:
-                density_local = density[:, radius_index]
-                temperature_local = temperature[:, radius_index]
-                vthermal_local = v_thermal[:, radius_index]
+        for species_index in species_indices:
+            density_local = density[:, radius_index]
+            temperature_local = temperature[:, radius_index]
+            vthermal_local = v_thermal[:, radius_index]
             vth_a = jnp.asarray(vthermal_local[species_index], dtype=jnp.float64)
             v_new_a = runtime.energy_grid.v_norm * vth_a
             nu_hat_a = _nu_over_vnew_local(
@@ -349,10 +349,10 @@ def main():
                         baseline_rel = np.asarray(baseline_rel)
                         print(f"  [{mode}] node-baseline")
                         print(f"    {'quantity':<8} {'abs_max':>14} {'rel_max':>14}")
-                        for idx, label in enumerate((\"D11\", \"D13\", \"D33\")):
+                        for idx, label in enumerate(("D11", "D13", "D33")):
                             print(
-                                f\"    {label:<8} {float(np.max(baseline_abs[:, idx])):14.6e} "
-                                f\"{float(np.max(baseline_rel[:, idx])):14.6e}\"
+                                f"    {label:<8} {float(np.max(baseline_abs[:, idx])):14.6e} "
+                                f"{float(np.max(baseline_rel[:, idx])):14.6e}"
                             )
                 for mode in modes:
                     mode_runtime, kernel = mode_runtimes[mode]
