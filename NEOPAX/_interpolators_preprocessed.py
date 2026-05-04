@@ -54,10 +54,10 @@ def _corner_cube(table, ir, inu0, inu1, ier0_lo, ier1_lo):
         [
             [
                 [table[ir, inu0, ier0_lo], table[ir, inu0, ier0_lo + 1]],
-                [table[ir, inu1, ier1_lo], table[ir, inu1, ier1_lo + 1]],
+                [table[ir, inu1, ier0_lo], table[ir, inu1, ier0_lo + 1]],
             ],
             [
-                [table[ir + 1, inu0, ier0_lo], table[ir + 1, inu0, ier0_lo + 1]],
+                [table[ir + 1, inu0, ier1_lo], table[ir + 1, inu0, ier1_lo + 1]],
                 [table[ir + 1, inu1, ier1_lo], table[ir + 1, inu1, ier1_lo + 1]],
             ],
         ]
@@ -278,18 +278,41 @@ def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
     )
     d11 = d11_r0 * (1.0 - tx) + d11_r1 * tx
 
-    d13 = _trilinear(
-        _corner_cube(database.D13, ir, inu, inu + 1, ier0, ier1),
-        tx,
+    d13_r0 = _bilinear(
+        database.D13[ir, inu, ier0],
+        database.D13[ir, inu, ier0 + 1],
+        database.D13[ir, inu + 1, ier0],
+        database.D13[ir, inu + 1, ier0 + 1],
         ty,
-        0.5 * (tz0 + tz1),
+        tz0,
     )
-    d33 = _trilinear(
-        _corner_cube(database.D33, ir, inu, inu + 1, ier0, ier1),
-        tx,
+    d13_r1 = _bilinear(
+        database.D13[ir + 1, inu, ier1],
+        database.D13[ir + 1, inu, ier1 + 1],
+        database.D13[ir + 1, inu + 1, ier1],
+        database.D13[ir + 1, inu + 1, ier1 + 1],
         ty,
-        0.5 * (tz0 + tz1),
+        tz1,
     )
+    d13 = d13_r0 * (1.0 - tx) + d13_r1 * tx
+
+    d33_r0 = _bilinear(
+        database.D33[ir, inu, ier0],
+        database.D33[ir, inu, ier0 + 1],
+        database.D33[ir, inu + 1, ier0],
+        database.D33[ir, inu + 1, ier0 + 1],
+        ty,
+        tz0,
+    )
+    d33_r1 = _bilinear(
+        database.D33[ir + 1, inu, ier1],
+        database.D33[ir + 1, inu, ier1 + 1],
+        database.D33[ir + 1, inu + 1, ier1],
+        database.D33[ir + 1, inu + 1, ier1 + 1],
+        ty,
+        tz1,
+    )
+    d33 = d33_r0 * (1.0 - tx) + d33_r1 * tx
 
     return jnp.asarray([d11, d13, d33])
 
