@@ -356,7 +356,6 @@ def main():
                     dtype=float,
                 )
             )
-        )
     _print_mode_table("vary-field-only", {k: np.asarray(v) for k, v in er_results.items()}, np.asarray(er_exact))
 
 
