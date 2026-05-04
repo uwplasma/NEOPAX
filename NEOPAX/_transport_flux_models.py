@@ -1263,6 +1263,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     scan_batch_size: int | None = None
     response_anchor_count: int | None = None
     use_remat: bool = False
+    er_v_floor: float | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
     bc_temperature: Any = None
@@ -1326,6 +1327,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def with_use_remat(self, use_remat: bool) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, use_remat=bool(use_remat))
+
+    def with_er_v_floor(self, er_v_floor: float | None) -> "NTXExactLijRuntimeTransportModel":
+        normalized = None if er_v_floor in (None, "", 0, "0") else float(er_v_floor)
+        return dataclasses.replace(self, er_v_floor=normalized)
 
     @staticmethod
     def _normalize_radial_batch_mode(radial_batch_mode: str | None) -> str:
@@ -1474,9 +1479,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a = vthermal_local[species_index]
         v_new_a = self.energy_grid.v_norm * vth_a
         # Match the NEOPAX database runtime convention:
-        # the monoenergetic database is queried with Er / v_new, while the
-        # drds bridge factor is applied later in the D11/D13 mapping.
+        # the monoenergetic database is queried with Er / v_new. When an
+        # explicit floor is requested, apply the same minimum magnitude before
+        # feeding the exact NTX runtime solve.
         epsi_hat_a = er_value * 1.0e3 / v_new_a
+        if self.er_v_floor is not None:
+            er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
+            sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
+            epsi_hat_a = sign * jnp.maximum(jnp.abs(jnp.asarray(epsi_hat_a, dtype=jnp.float64)), er_v_floor)
         nu_hat_a = _nu_over_vnew_local(
             self.species,
             species_index,
@@ -2329,6 +2339,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_scan_batch_size=None,
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
+    ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
     preload_support=False,
     collisionality_model="default",
@@ -2367,6 +2378,11 @@ def build_ntx_exact_lij_runtime_transport_model(
             else int(ntx_exact_response_anchor_count)
         ),
         use_remat=bool(ntx_exact_use_remat),
+        er_v_floor=(
+            None
+            if ntx_exact_er_v_floor in (None, "", 0, "0")
+            else float(ntx_exact_er_v_floor)
+        ),
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,

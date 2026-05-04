@@ -47,6 +47,7 @@ def _run_config(
     flux_model: str | None = None,
     face_mode: str | None = None,
     resolution: tuple[int, int, int] | None = None,
+    exact_er_v_floor: float | None = None,
     output_dir: Path | None = None,
 ):
     config = NEOPAX.prepare_config(config_path, device=device)
@@ -63,6 +64,8 @@ def _run_config(
         neoclassical["ntx_exact_n_theta"] = int(n_theta)
         neoclassical["ntx_exact_n_zeta"] = int(n_zeta)
         neoclassical["ntx_exact_n_xi"] = int(n_xi)
+    if exact_er_v_floor is not None:
+        neoclassical["ntx_exact_er_v_floor"] = float(exact_er_v_floor)
     if output_dir is not None:
         config.setdefault("fluxes", {})["fluxes_output_dir"] = str(output_dir)
 
@@ -155,6 +158,12 @@ def main():
         default=DEFAULT_RESOLUTIONS,
         help="Exact-runtime resolution sweep entries in 'n_theta,n_zeta,n_xi' format.",
     )
+    parser.add_argument(
+        "--exact-er-v-floor",
+        type=float,
+        default=None,
+        help="Optional minimum |Er/v| to apply in the exact-runtime NTX path, e.g. 1e-8 to match the database floor.",
+    )
     args = parser.parse_args()
 
     db_cfg = Path(args.database_config)
@@ -167,6 +176,7 @@ def main():
     print(f"[flux-compare] er_init_mode={args.er_init_mode}")
     print(f"[flux-compare] face_modes={args.face_modes}")
     print(f"[flux-compare] resolutions={resolutions}")
+    print(f"[flux-compare] exact_er_v_floor={args.exact_er_v_floor}")
 
     compare_output_dir = Path("outputs/benchmark_fluxes_compare")
     compare_output_dir.mkdir(parents=True, exist_ok=True)
@@ -203,11 +213,16 @@ def main():
                 flux_model="ntx_exact_lij_runtime",
                 face_mode=face_mode,
                 resolution=resolution,
+                exact_er_v_floor=args.exact_er_v_floor,
                 output_dir=compare_output_dir / f"native_{slug}",
             )
             cases.append(
                 {
-                    "label": label,
+                    "label": (
+                        label
+                        if args.exact_er_v_floor is None
+                        else f"{label}:floor={args.exact_er_v_floor:.1e}"
+                    ),
                     "rho": rho_ex,
                     "fluxes": fluxes_ex,
                     "wall_s": dt_ex,
