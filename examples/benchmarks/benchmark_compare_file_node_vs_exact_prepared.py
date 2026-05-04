@@ -120,12 +120,16 @@ def main():
     ex_model = ex_model.with_static_support()
     ntx = _import_ntx()
 
-    radius_index = int(np.argmin(np.abs(np.asarray(ex_runtime.geometry.r_grid) - rho_value)))
-    support = ex_model._static_support()
-    prepared = jax.tree_util.tree_map(
-        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-        support.center_prepared,
+    neo = ex_cfg["neoclassical"]
+    grid_spec = ntx.GridSpec(
+        n_theta=int(neo["ntx_exact_n_theta"]),
+        n_zeta=int(neo["ntx_exact_n_zeta"]),
+        n_xi=int(neo["ntx_exact_n_xi"]),
     )
+    vmec_path = Path(ex_cfg["geometry"]["vmec_file"])
+    vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
+    surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_value**2))
+    prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
 
     exact_raw = ntx.solve_prepared_coefficient_vector(
         prepared,
@@ -139,8 +143,8 @@ def main():
     print(f"[file-vs-exact] database_file={db_abs}")
     print(f"[file-vs-exact] requested_node=(rho_idx={ir}, nu_idx={inu}, er_idx={ier})")
     print(f"[file-vs-exact] rho_file={rho_value:.12e}")
-    print(f"[file-vs-exact] radius_index_exact={radius_index}")
-    print(f"[file-vs-exact] rho_exact={float(ex_runtime.geometry.r_grid[radius_index]):.12e}")
+    print(f"[file-vs-exact] rho_exact={rho_value:.12e}")
+    print(f"[file-vs-exact] s_exact={float(rho_value**2):.12e}")
     print(f"[file-vs-exact] nu_hat={nu_hat_value:.12e}")
     print(f"[file-vs-exact] epsi_hat_from_file_Es={epsi_hat_value:.12e}")
     print()
