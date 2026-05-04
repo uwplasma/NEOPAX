@@ -122,8 +122,15 @@ def _plot_quantity(output_dir: Path, rho, cases: list[dict], quantity: str):
         for case_idx, case in enumerate(cases):
             arr = jnp.asarray(case["fluxes"][quantity])
             linestyle, linewidth = styles[case_idx % len(styles)]
-            ax.plot(rho, arr[i], linestyle=linestyle, linewidth=linewidth, label=case["label"])
-        ax.set_ylabel(f"{quantity}[{species_names[i]}]")
+            if quantity in {"Gamma", "Gamma_neo"}:
+                plot_values = jnp.log10(jnp.maximum(jnp.abs(arr[i]), 1.0e-300))
+            else:
+                plot_values = arr[i]
+            ax.plot(rho, plot_values, linestyle=linestyle, linewidth=linewidth, label=case["label"])
+        if quantity in {"Gamma", "Gamma_neo"}:
+            ax.set_ylabel(f"log10(|{quantity}|)[{species_names[i]}]")
+        else:
+            ax.set_ylabel(f"{quantity}[{species_names[i]}]")
         ax.grid(True, alpha=0.3)
         ax.legend()
     axes[-1].set_xlabel("rho")

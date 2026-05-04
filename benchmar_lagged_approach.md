@@ -337,3 +337,78 @@ Prepare a small table or note with:
    - divergence heuristic
    - or convergence scaling?
 4. After the axis regularization, are there any remaining exact-runtime physics mismatches at `t0`, or is the problem now entirely solver-side?
+
+## Update: Monoenergetic Database vs Exact NTX Audit
+
+The newer NTX/NEOPAX diagnostics changed the picture substantially.
+
+### What is now ruled out
+
+The following comparisons were checked and were consistent:
+
+1. raw NTX scan vs raw NTX prepared/direct solve
+2. raw NTX HDF5 file nodes vs raw exact prepared NTX at the same stored `rho`, `nu_v`, and field node
+3. NEOPAX database load/bridge at an exact stored node
+
+So the remaining mismatch is **not**:
+
+- an NTX solver bug
+- an NTX prepared-geometry bug
+- a raw HDF5 export bug
+- or a simple file-load/bridge bug at stored nodes
+
+### New key result
+
+A multi-node comparison of:
+
+- database-queried `D11/D13/D33`
+- vs exact prepared NTX `D11/D13/D33`
+
+at exact stored nodes of:
+
+- `rho`
+- `nu_v`
+- `Er`
+
+still showed clear mismatches.
+
+That means the earlier “this is only an off-node interpolation error” hypothesis was wrong.
+
+### Most likely root cause
+
+The strongest current suspect is the database field-axis construction itself.
+
+Both the NEOPAX loader and the NTX bridge currently construct the stored field axis using the first-radius `Er` row for all radii:
+
+- `Er[0, k]`
+
+instead of the radius-local values:
+
+- `Er[j, k]`
+
+This appears in:
+
+1. `NEOPAX/_database.py`
+2. `NTX/src/ntx/_neopax_bridge.py`
+
+So the database field coordinate used at query time is not actually the same per-radius field-node set present in the raw NTX scan file.
+
+### Practical consequence
+
+This explains why:
+
+1. raw file node vs exact NTX can match
+2. but database query vs exact NTX can still disagree even at nominal “same-node” comparisons
+
+### Recommended next fix
+
+Patch the field-axis construction so it uses the radius-local field values:
+
+- use `Er[j, k]`, not `Er[0, k]`
+
+in:
+
+1. `NEOPAX/_database.py`
+2. `NTX/src/ntx/_neopax_bridge.py`
+
+Then rerun the node-level database-vs-exact `Dij` audit before changing any more solver logic.
