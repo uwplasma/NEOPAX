@@ -1,0 +1,170 @@
+"""Compare one raw HDF5 scan node against an exact prepared NTX solve at that same node.
+
+This isolates whether the remaining mismatch is:
+- already present between the stored scan node and the exact prepared solve, or
+- introduced later by NEOPAX exact-runtime bridge/assembly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import sys
+from pathlib import Path
+
+import h5py
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import NEOPAX
+from NEOPAX._orchestrator import build_runtime_context
+from NEOPAX._transport_flux_models import NTXExactLijRuntimeTransportModel, _import_ntx
+
+DEFAULT_DATABASE_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_database_benchmark.toml")
+DEFAULT_EXACT_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_exact_lij_runtime_benchmark.toml")
+
+
+def _prepare_config(
+    config_path: Path,
+    *,
+    device: str,
+    er_init_mode: str,
+    force_exact: bool = False,
+    resolution: tuple[int, int, int] | None = None,
+):
+    config = NEOPAX.prepare_config(config_path, device=device)
+    config = copy.deepcopy(config)
+    config.setdefault("profiles", {})["er_initialization_mode"] = str(er_init_mode)
+    if force_exact:
+        neo = config.setdefault("neoclassical", {})
+        neo["flux_model"] = "ntx_exact_lij_runtime"
+        neo["entropy_model"] = "ntx_exact_lij_runtime"
+    if resolution is not None:
+        n_theta, n_zeta, n_xi = resolution
+        neo = config.setdefault("neoclassical", {})
+        neo["ntx_exact_n_theta"] = int(n_theta)
+        neo["ntx_exact_n_zeta"] = int(n_zeta)
+        neo["ntx_exact_n_xi"] = int(n_xi)
+    return config
+
+
+def _parse_resolution(spec: str) -> tuple[int, int, int]:
+    parts = [piece.strip() for piece in str(spec).split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"Resolution '{spec}' must be in 'n_theta,n_zeta,n_xi' format.")
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _extract_neoclassical_model(model):
+    return getattr(model, "neoclassical_model", model)
+
+
+def _find_database_path(config: dict) -> Path:
+    return Path(config["neoclassical"]["neoclassical_file"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
+    parser.add_argument("--database-config", default=str(DEFAULT_DATABASE_CONFIG))
+    parser.add_argument("--exact-config", default=str(DEFAULT_EXACT_CONFIG))
+    parser.add_argument(
+        "--er-init-mode",
+        default="analytical",
+        choices=["keep", "analytical", "ambipolar_min_entropy"],
+    )
+    parser.add_argument("--rho-index", type=int, default=1)
+    parser.add_argument("--nu-index", type=int, default=5)
+    parser.add_argument("--er-index", type=int, default=5)
+    parser.add_argument("--resolution", default="25,25,63")
+    args = parser.parse_args()
+
+    resolution = _parse_resolution(args.resolution)
+    db_cfg = _prepare_config(Path(args.database_config), device=args.device, er_init_mode=args.er_init_mode)
+    db_runtime, _ = build_runtime_context(db_cfg)
+    db_path = _find_database_path(db_cfg)
+    db_abs = (ROOT / db_path).resolve() if not db_path.is_absolute() else db_path.resolve()
+
+    with h5py.File(db_abs, "r") as handle:
+        rho = np.asarray(handle["rho"][()], dtype=float)
+        nu_v = np.asarray(handle["nu_v"][()], dtype=float)
+        Es = np.asarray(handle["Es"][()], dtype=float)
+        D11 = np.asarray(handle["D11"][()], dtype=float)
+        D13 = np.asarray(handle["D13"][()], dtype=float)
+        D31 = np.asarray(handle["D31"][()], dtype=float) if "D31" in handle else None
+        D33 = np.asarray(handle["D33"][()], dtype=float)
+
+    ir = int(args.rho_index)
+    inu = int(args.nu_index)
+    ier = int(args.er_index)
+    rho_value = float(rho[ir])
+    nu_hat_value = float(nu_v[inu])
+    epsi_hat_value = float(Es[ir, ier])
+
+    ex_cfg = _prepare_config(
+        Path(args.exact_config),
+        device=args.device,
+        er_init_mode=args.er_init_mode,
+        force_exact=True,
+        resolution=resolution,
+    )
+    ex_runtime, _ = build_runtime_context(ex_cfg)
+    ex_model = _extract_neoclassical_model(ex_runtime.models.flux)
+    if not isinstance(ex_model, NTXExactLijRuntimeTransportModel):
+        raise TypeError("Expected ntx_exact_lij_runtime neoclassical model.")
+    ex_model = ex_model.with_static_support()
+    ntx = _import_ntx()
+
+    radius_index = int(np.argmin(np.abs(np.asarray(ex_runtime.geometry.r_grid) - rho_value)))
+    support = ex_model._static_support()
+    prepared = jax.tree_util.tree_map(
+        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+        support.center_prepared,
+    )
+
+    exact_raw = ntx.solve_prepared_coefficient_vector(
+        prepared,
+        ntx.MonoenergeticCase(
+            nu_hat=jnp.asarray(nu_hat_value, dtype=jnp.float64),
+            epsi_hat=jnp.asarray(epsi_hat_value, dtype=jnp.float64),
+        ),
+    )
+    exact_raw = np.asarray(jax.device_get(exact_raw), dtype=float)
+
+    print(f"[file-vs-exact] database_file={db_abs}")
+    print(f"[file-vs-exact] requested_node=(rho_idx={ir}, nu_idx={inu}, er_idx={ier})")
+    print(f"[file-vs-exact] rho_file={rho_value:.12e}")
+    print(f"[file-vs-exact] radius_index_exact={radius_index}")
+    print(f"[file-vs-exact] rho_exact={float(ex_runtime.geometry.r_grid[radius_index]):.12e}")
+    print(f"[file-vs-exact] nu_hat={nu_hat_value:.12e}")
+    print(f"[file-vs-exact] epsi_hat_from_file_Es={epsi_hat_value:.12e}")
+    print()
+    print("raw file node")
+    print(f"  D11_file = {D11[ir, inu, ier]:.12e}")
+    if D31 is not None:
+        print(f"  D31_file = {D31[ir, inu, ier]:.12e}")
+    print(f"  D13_file = {D13[ir, inu, ier]:.12e}")
+    print(f"  D33_file = {D33[ir, inu, ier]:.12e}")
+    print()
+    print("exact prepared raw")
+    print(f"  D11_exact = {exact_raw[0]:.12e}")
+    print(f"  D31_exact = {exact_raw[1]:.12e}")
+    print(f"  D13_exact = {exact_raw[2]:.12e}")
+    print(f"  D33_exact = {exact_raw[3]:.12e}")
+    print(f"  D33_spitzer_exact = {exact_raw[4]:.12e}")
+    print()
+    print("absolute deltas")
+    print(f"  D11 = {abs(exact_raw[0] - D11[ir, inu, ier]):.12e}")
+    if D31 is not None:
+        print(f"  D31 = {abs(exact_raw[1] - D31[ir, inu, ier]):.12e}")
+    print(f"  D13 = {abs(exact_raw[2] - D13[ir, inu, ier]):.12e}")
+    print(f"  D33 = {abs(exact_raw[3] - D33[ir, inu, ier]):.12e}")
+
+
+if __name__ == "__main__":
+    main()
