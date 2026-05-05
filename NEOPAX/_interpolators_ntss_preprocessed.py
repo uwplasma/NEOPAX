@@ -263,8 +263,9 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
         return jax.lax.cond(x <= xs[0], left, lambda: jax.lax.cond(x <= xs[2], middle, right))
 
     def case_ngt3():
-        n_eff = jnp.minimum(n, SEGMENT_WIDTH)
-        valid_mask = jnp.arange(SEGMENT_WIDTH) < n_eff
+        width = xs.shape[0]
+        n_eff = jnp.minimum(n, width)
+        valid_mask = jnp.arange(width) < n_eff
         xs_mask = jnp.where(valid_mask, xs, jnp.inf)
         pos = jnp.searchsorted(xs_mask, x, side="left")
 
@@ -383,7 +384,7 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
 
 def _inpold_segment(x, xs_full, ys_full, start, count, icl, fcl, icu, fcu, fmix):
     xs, ys = _segment_arrays(xs_full, ys_full, start)
-    local_count = jnp.minimum(count, SEGMENT_WIDTH)
+    local_count = jnp.minimum(count, xs.shape[0])
     return _inpold_fixed(x, xs, ys, local_count, icl, fcl, icu, fcu, fmix)
 
 
@@ -820,4 +821,3 @@ def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
             lambda: jax.lax.cond((xri >= arr[nr - 2]) | (noi == 3), edge3, interior4),
         ),
     )
-

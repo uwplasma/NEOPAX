@@ -71,7 +71,8 @@ def _add_ntss1d_padding(data: dict) -> dict:
     d13 = data["D13"]
     d33 = data["D33"]
     n_er = int(er_grid.shape[1])
-    pad = max(0, NTSS1D_WIDTH - n_er)
+    width = max(NTSS1D_WIDTH, n_er)
+    pad = max(0, width - n_er)
     data = dict(data)
     data["er_count_ntss1d"] = jnp.array(n_er, dtype=jnp.int32)
     data["gmix_er_ntss1d"] = jnp.array(0.1)
