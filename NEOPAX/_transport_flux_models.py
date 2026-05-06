@@ -2192,22 +2192,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density,
+            density,
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature,
+            temperature,
+        )
         dndr_all = jax.vmap(
-            lambda density_a: get_gradient_density(
+            lambda density_a, right_value, right_grad: get_gradient_density(
                 density_a,
                 self.geometry.r_grid,
                 self.geometry.r_grid_half,
                 self.geometry.dr,
+                right_face_constraint=right_value,
+                right_face_grad_constraint=right_grad,
             )
-        )(density)
+        )(density, density_right_constraint, density_right_grad_constraint)
         dTdr_all = jax.vmap(
-            lambda temperature_a: get_gradient_temperature(
+            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
                 temperature_a,
                 self.geometry.r_grid,
                 self.geometry.r_grid_half,
                 self.geometry.dr,
+                right_face_constraint=right_value,
+                right_face_grad_constraint=right_grad,
             )
-        )(temperature)
+        )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
 
         def evaluator(radius_index, er_value):
             radius_index = jnp.asarray(radius_index, dtype=jnp.int32)
