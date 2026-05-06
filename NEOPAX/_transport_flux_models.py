@@ -1478,11 +1478,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         vth_a = vthermal_local[species_index]
         v_new_a = self.energy_grid.v_norm * vth_a
-        # Match the NEOPAX database runtime convention:
-        # the monoenergetic database is queried with Er / v_new. When an
-        # explicit floor is requested, apply the same minimum magnitude before
-        # feeding the exact NTX runtime solve.
-        epsi_hat_a = er_value * 1.0e3 / v_new_a
+        # Feed the exact NTX runtime with the same field convention used by the
+        # file/database benchmarks: epsi_hat = Es / v_new, with Es = Er * dr/ds.
+        epsi_hat_a = er_value * drds_value * 1.0e3 / v_new_a
         if self.er_v_floor is not None:
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
             sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)

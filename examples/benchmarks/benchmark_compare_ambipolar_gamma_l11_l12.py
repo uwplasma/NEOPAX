@@ -278,6 +278,13 @@ def _relative_max(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.max(np.abs(a - b) / denom))
 
 
+def _relative_max_with_location(a: np.ndarray, b: np.ndarray, x: np.ndarray) -> tuple[float, float, float, float]:
+    denom = np.maximum(np.abs(b), 1.0e-30)
+    rel = np.abs(a - b) / denom
+    idx = int(np.argmax(rel))
+    return float(rel[idx]), float(x[idx]), float(a[idx]), float(b[idx])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
@@ -329,17 +336,42 @@ def main():
             f"A3_db_max={np.max(np.abs(db_eval['a3'])):.6e} "
             f"A3_exact_max={np.max(np.abs(ex_eval['a3'])):.6e}"
         )
+        charged_rel, charged_er_at_max, charged_db_at_max, charged_exact_at_max = _relative_max_with_location(
+            db_eval["charged_gamma"],
+            ex_eval["charged_gamma"],
+            er_values,
+        )
         print(
             "  charged_gamma: "
             f"abs_max={np.max(np.abs(db_eval['charged_gamma'] - ex_eval['charged_gamma'])):.6e} "
-            f"rel_max={_relative_max(db_eval['charged_gamma'], ex_eval['charged_gamma']):.6e}"
+            f"rel_max={charged_rel:.6e} "
+            f"at Er={charged_er_at_max:.6e} "
+            f"(db={charged_db_at_max:.6e}, exact={charged_exact_at_max:.6e})"
         )
         for s_idx, s_name in enumerate(species_names):
+            l11_rel, l11_er_at_max, l11_db_at_max, l11_exact_at_max = _relative_max_with_location(
+                db_eval['l11'][:, s_idx],
+                ex_eval['l11'][:, s_idx],
+                er_values,
+            )
+            l12_rel, l12_er_at_max, l12_db_at_max, l12_exact_at_max = _relative_max_with_location(
+                db_eval['l12'][:, s_idx],
+                ex_eval['l12'][:, s_idx],
+                er_values,
+            )
+            gamma_rel, gamma_er_at_max, gamma_db_at_max, gamma_exact_at_max = _relative_max_with_location(
+                db_eval['gamma_species'][:, s_idx],
+                ex_eval['gamma_species'][:, s_idx],
+                er_values,
+            )
             print(
                 f"  {s_name}: "
-                f"L11_rel_max={_relative_max(db_eval['l11'][:, s_idx], ex_eval['l11'][:, s_idx]):.6e} "
-                f"L12_rel_max={_relative_max(db_eval['l12'][:, s_idx], ex_eval['l12'][:, s_idx]):.6e} "
-                f"Gamma_rel_max={_relative_max(db_eval['gamma_species'][:, s_idx], ex_eval['gamma_species'][:, s_idx]):.6e}"
+                f"L11_rel_max={l11_rel:.6e} at Er={l11_er_at_max:.6e} "
+                f"(db={l11_db_at_max:.6e}, exact={l11_exact_at_max:.6e}) "
+                f"L12_rel_max={l12_rel:.6e} at Er={l12_er_at_max:.6e} "
+                f"(db={l12_db_at_max:.6e}, exact={l12_exact_at_max:.6e}) "
+                f"Gamma_rel_max={gamma_rel:.6e} at Er={gamma_er_at_max:.6e} "
+                f"(db={gamma_db_at_max:.6e}, exact={gamma_exact_at_max:.6e})"
             )
 
         fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
