@@ -84,9 +84,9 @@ def _species_label(runtime, species_index: int) -> str:
 def _db_channels_to_physical(db_coeffs_raw: jax.Array, nu_hat_a: jax.Array) -> jax.Array:
     return jnp.stack(
         (
-            -10.0 ** jnp.asarray(db_coeffs_raw[:, 0], dtype=jnp.float64),
-            -jnp.asarray(db_coeffs_raw[:, 1], dtype=jnp.float64),
-            -jnp.asarray(db_coeffs_raw[:, 2], dtype=jnp.float64) / jnp.maximum(jnp.asarray(nu_hat_a, dtype=jnp.float64), 1.0e-30),
+            10.0 ** jnp.asarray(db_coeffs_raw[:, 0], dtype=jnp.float64),
+            jnp.asarray(db_coeffs_raw[:, 1], dtype=jnp.float64),
+            jnp.asarray(db_coeffs_raw[:, 2], dtype=jnp.float64) / jnp.maximum(jnp.asarray(nu_hat_a, dtype=jnp.float64), 1.0e-30),
         ),
         axis=1,
     )
@@ -95,9 +95,9 @@ def _db_channels_to_physical(db_coeffs_raw: jax.Array, nu_hat_a: jax.Array) -> j
 def _exact_raw_to_physical(exact_coeffs: jax.Array, drds_value: jax.Array) -> jax.Array:
     return jnp.stack(
         (
-            -jnp.asarray(exact_coeffs[:, 0], dtype=jnp.float64) * drds_value**2,
-            -jnp.asarray(exact_coeffs[:, 2], dtype=jnp.float64) * drds_value,
-            -jnp.asarray(exact_coeffs[:, 3], dtype=jnp.float64),
+            jnp.asarray(exact_coeffs[:, 0], dtype=jnp.float64) * drds_value**2,
+            jnp.asarray(exact_coeffs[:, 2], dtype=jnp.float64) * drds_value,
+            jnp.asarray(exact_coeffs[:, 3], dtype=jnp.float64),
         ),
         axis=1,
     )
