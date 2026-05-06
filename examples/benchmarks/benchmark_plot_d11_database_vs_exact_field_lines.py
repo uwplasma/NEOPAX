@@ -176,7 +176,7 @@ def main():
     print(f"[d11-field-lines] radii={radius_indices}")
     print(f"[d11-field-lines] fields={field_indices}")
 
-    colors = plt.cm.viridis(np.linspace(0.05, 0.95, max(len(field_indices), 2)))
+    colors = plt.cm.nipy_spectral(np.linspace(0.03, 0.97, max(len(field_indices), 2)))
 
     for ir in radius_indices:
         if ir not in prepared_by_radius:
@@ -187,7 +187,7 @@ def main():
         drds_value = float(Es[ir, 1] / Er[ir, 1]) if abs(Er[ir, 1]) > 0.0 else float(Es[ir, 2] / Er[ir, 2])
         r_value = float(runtime.geometry.a_b * rho[ir])
 
-        fig, ax = plt.subplots(figsize=(10, 7), constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(12, 7))
 
         for color, ier in zip(colors, field_indices):
             db_vals: list[float] = []
@@ -216,15 +216,23 @@ def main():
             db_ln = np.log(np.maximum(np.asarray(db_vals, dtype=float), 1.0e-300))
             exact_ln = np.log(np.maximum(np.asarray(exact_vals, dtype=float), 1.0e-300))
             label_base = f"field {ier} | Er/v={er_value:.3e}"
-            ax.plot(x_ln_nu, exact_ln, color=color, linewidth=2.0, label=f"{label_base} exact")
+            ax.plot(
+                x_ln_nu,
+                exact_ln,
+                color=color,
+                linewidth=1.8,
+                marker="o",
+                markersize=4.0,
+                label=f"{label_base} exact",
+            )
             ax.plot(
                 x_ln_nu,
                 db_ln,
                 color=color,
                 linewidth=1.8,
                 linestyle="--",
-                marker="o",
-                markersize=3.5,
+                marker="s",
+                markersize=4.0,
                 label=f"{label_base} db",
             )
 
@@ -232,8 +240,16 @@ def main():
         ax.set_xlabel("ln(nu/v)")
         ax.set_ylabel("ln(D11)")
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8, ncol=2)
+        ax.legend(
+            fontsize=8,
+            ncol=2,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            frameon=True,
+        )
 
+        fig.tight_layout(rect=(0.0, 0.0, 0.78, 1.0))
         out_path = output_dir / f"d11_field_lines_radius_{ir:03d}.png"
         fig.savefig(out_path, dpi=180)
         plt.close(fig)
