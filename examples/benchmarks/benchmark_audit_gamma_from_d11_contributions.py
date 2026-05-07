@@ -42,6 +42,7 @@ from NEOPAX._transport_flux_models import (
     NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
     _extract_right_constraints,
+    _import_ntx,
 )
 
 DEFAULT_DATABASE_CONFIG = Path("examples/Solve_Ambipolarity/ambiplarity_benchmark_Er_r_Large.toml")
@@ -206,6 +207,80 @@ def _exact_d11_physical(
     )
 
 
+def _exact_d11_physical_direct(
+    *,
+    model,
+    exact_config,
+    radius_index: int,
+    species_index: int,
+    er_value: float,
+    density,
+    temperature,
+    v_thermal,
+    field_input: str,
+):
+    ntx = _import_ntx()
+    support = model._static_support()
+    neo = exact_config["neoclassical"]
+    vmec_path = Path(exact_config["geometry"]["vmec_file"])
+    vmec_abs = (ROOT / vmec_path).resolve() if not vmec_path.is_absolute() else vmec_path.resolve()
+
+    rho_value = float(np.asarray(model.geometry.rho_grid[radius_index], dtype=float))
+    surface = ntx.surface_from_vmec_jax_vmec_wout_file(str(vmec_abs), s=float(rho_value**2))
+    grid_spec = ntx.GridSpec(
+        n_theta=int(neo["ntx_exact_n_theta"]),
+        n_zeta=int(neo["ntx_exact_n_zeta"]),
+        n_xi=int(neo["ntx_exact_n_xi"]),
+    )
+    prepared = ntx.prepare_monoenergetic_system(surface, grid_spec)
+    drds_value = float(np.asarray(support.center_channels.drds[radius_index], dtype=float))
+
+    collisionality_kind = _collisionality_kind(model.collisionality_model)
+    density_local = density[:, radius_index]
+    temperature_local = temperature[:, radius_index]
+    vthermal_local = v_thermal[:, radius_index]
+    vth_a = jnp.asarray(vthermal_local[species_index], dtype=jnp.float64)
+    v_new_a = jnp.asarray(model.energy_grid.v_norm, dtype=jnp.float64) * vth_a
+    nu_over_v = _nu_over_vnew_local(
+        model.species,
+        species_index,
+        v_new_a,
+        density_local,
+        temperature_local,
+        vthermal_local,
+        collisionality_kind,
+    )
+    er_over_v = jnp.asarray(er_value, dtype=jnp.float64) * 1.0e3 / v_new_a
+    if str(field_input).strip().lower() == "er":
+        epsi_hat_a = er_over_v
+    elif str(field_input).strip().lower() == "es":
+        epsi_hat_a = er_over_v * jnp.asarray(drds_value, dtype=jnp.float64)
+    else:
+        raise ValueError(f"field_input must be 'er' or 'es', got {field_input!r}")
+
+    coeffs = []
+    for nu_value, epsi_value in zip(np.asarray(nu_over_v, dtype=float), np.asarray(epsi_hat_a, dtype=float)):
+        coeff = ntx.solve_prepared_coefficient_vector(
+            prepared,
+            ntx.MonoenergeticCase(
+                nu_hat=jnp.asarray(float(nu_value), dtype=jnp.float64),
+                epsi_hat=jnp.asarray(float(epsi_value), dtype=jnp.float64),
+            ),
+        )
+        coeffs.append(np.asarray(jax.device_get(coeff), dtype=float))
+    coeffs = np.asarray(coeffs, dtype=float)
+
+    d11_physical = jnp.asarray(coeffs[:, 0], dtype=jnp.float64) * jnp.asarray(drds_value, dtype=jnp.float64) ** 2
+    d11_physical = jnp.maximum(d11_physical, jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64))
+    return (
+        np.asarray(d11_physical, dtype=float),
+        np.asarray(nu_over_v, dtype=float),
+        np.asarray(er_over_v, dtype=float),
+        np.asarray(epsi_hat_a, dtype=float),
+        float(np.asarray(vth_a, dtype=float)),
+    )
+
+
 def _contribution_table(energy_grid, species, species_index: int, vth_a: float, d11_physical: np.ndarray, a1: float, a2: float):
     charge = float(np.asarray(species.charge[species_index], dtype=float))
     mass = float(np.asarray(species.mass[species_index], dtype=float))
@@ -239,10 +314,13 @@ def main():
     parser.add_argument("--species-index", type=int, default=0)
     parser.add_argument("--er-value", type=float, default=None)
     parser.add_argument("--exact-field-input", choices=["es", "er"], default="es")
+    parser.add_argument("--exact-evaluator", choices=["runtime", "direct"], default="runtime")
     args = parser.parse_args()
 
-    db_runtime, db_state = build_runtime_context(_prepare_config(Path(args.database_config), device=args.device))
-    ex_runtime, ex_state = build_runtime_context(_prepare_config(Path(args.exact_config), device=args.device))
+    db_config = _prepare_config(Path(args.database_config), device=args.device)
+    ex_config = _prepare_config(Path(args.exact_config), device=args.device)
+    db_runtime, db_state = build_runtime_context(db_config)
+    ex_runtime, ex_state = build_runtime_context(ex_config)
     if db_state is None or ex_state is None:
         raise RuntimeError("Both configs must build a transport state.")
 
@@ -302,16 +380,29 @@ def main():
         temperature=temperature_db,
         v_thermal=v_thermal_db,
     )
-    d11_ex, nu_ex, er_over_v_ex, active_field_ex, vth_ex = _exact_d11_physical(
-        ex_model,
-        radius_index=radius_index,
-        species_index=species_index,
-        er_value=er_value,
-        density=density_ex,
-        temperature=temperature_ex,
-        v_thermal=v_thermal_ex,
-        field_input=args.exact_field_input,
-    )
+    if args.exact_evaluator == "runtime":
+        d11_ex, nu_ex, er_over_v_ex, active_field_ex, vth_ex = _exact_d11_physical(
+            ex_model,
+            radius_index=radius_index,
+            species_index=species_index,
+            er_value=er_value,
+            density=density_ex,
+            temperature=temperature_ex,
+            v_thermal=v_thermal_ex,
+            field_input=args.exact_field_input,
+        )
+    else:
+        d11_ex, nu_ex, er_over_v_ex, active_field_ex, vth_ex = _exact_d11_physical_direct(
+            model=ex_model,
+            exact_config=ex_config,
+            radius_index=radius_index,
+            species_index=species_index,
+            er_value=er_value,
+            density=density_ex,
+            temperature=temperature_ex,
+            v_thermal=v_thermal_ex,
+            field_input=args.exact_field_input,
+        )
 
     contrib_db = _contribution_table(db_runtime.energy_grid, db_runtime.species, species_index, vth_db, d11_db, a1_db, a2_db)
     contrib_ex = _contribution_table(ex_runtime.energy_grid, ex_runtime.species, species_index, vth_ex, d11_ex, a1_ex, a2_ex)
@@ -321,6 +412,7 @@ def main():
     print(f"[gamma-d11-audit] species_index={species_index} species={species_name}")
     print(f"[gamma-d11-audit] Er={er_value:.6e}")
     print(f"[gamma-d11-audit] exact_field_input={args.exact_field_input}")
+    print(f"[gamma-d11-audit] exact_evaluator={args.exact_evaluator}")
     print(f"[gamma-d11-audit] A1_db={a1_db:.6e} A2_db={a2_db:.6e}")
     print(f"[gamma-d11-audit] A1_exact={a1_ex:.6e} A2_exact={a2_ex:.6e}")
     print()
