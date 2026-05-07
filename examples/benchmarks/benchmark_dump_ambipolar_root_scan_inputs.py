@@ -154,7 +154,12 @@ def main():
     parser.add_argument(
         "--stdout",
         action="store_true",
-        help="Also print all rows to stdout.",
+        help="Also print all CSV rows to stdout.",
+    )
+    parser.add_argument(
+        "--print-summary",
+        action="store_true",
+        help="Print a grouped terminal summary per radius and Er with the 4 energy points for each species.",
     )
     args = parser.parse_args()
 
@@ -219,11 +224,9 @@ def main():
         writer = csv.writer(handle)
         writer.writerow(header)
 
-        if args.stdout:
-            print(",".join(header))
-
         for radius_index in radius_indices:
             for er_value in er_values:
+                summary_blocks: list[tuple[str, list[tuple[int, float, float, float, float]]]] = []
                 for species_index, species_name in enumerate(species_names):
                     scan = _active_scan_inputs(
                         model,
@@ -236,6 +239,7 @@ def main():
                         v_thermal=v_thermal,
                     )
                     ln_nu_over_v = np.log(np.maximum(scan["nu_over_v"], 1.0e-300))
+                    species_rows: list[tuple[int, float, float, float, float]] = []
                     for x_index, (x_value, v_norm_value) in enumerate(zip(x_values, v_norm, strict=True)):
                         row = [
                             int(radius_index),
@@ -259,7 +263,34 @@ def main():
                         ]
                         writer.writerow(row)
                         if args.stdout:
+                            if radius_index == radius_indices[0] and er_value == er_values[0] and species_index == 0 and x_index == 0:
+                                print(",".join(header))
                             print(",".join(str(value) for value in row))
+                        species_rows.append(
+                            (
+                                int(x_index),
+                                float(x_value),
+                                float(scan["active_field_over_v"][x_index]),
+                                float(scan["nu_over_v"][x_index]),
+                                float(ln_nu_over_v[x_index]),
+                            )
+                        )
+                    summary_blocks.append((species_name, species_rows))
+
+                if args.print_summary:
+                    print(
+                        f"[radius] idx={int(radius_index)} rho={float(scan['rho']):.6e} "
+                        f"r={float(scan['r']):.6e} drds={float(scan['drds']):.6e} "
+                        f"Er={float(er_value):.6e} field={scan['active_field_kind']}"
+                    )
+                    for species_name, species_rows in summary_blocks:
+                        print(f"  [{species_name}]")
+                        for x_index, x_value, active_field_over_v, nu_over_v, ln_nu_over_v_value in species_rows:
+                            print(
+                                f"    x[{x_index}]={x_value:.6e} "
+                                f"{scan['active_field_kind']}={active_field_over_v:.6e} "
+                                f"nu_over_v={nu_over_v:.6e} ln_nu_over_v={ln_nu_over_v_value:.6e}"
+                            )
 
     print(f"[ambipolar-root-inputs] wrote={output_path}")
 
