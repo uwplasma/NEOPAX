@@ -1611,10 +1611,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
             return ntx.solve_prepared_coefficient_vector(prepared, case)
+
+        def _solve_scan(nu_values, epsi_values):
+            return jax.lax.map(lambda case_values: _solve_one(case_values[0], case_values[1]), (nu_values, epsi_values))
+
         batch_size = self.scan_batch_size
         case_count = int(nu_hat_a.shape[0])
         if batch_size is None or int(batch_size) <= 0 or int(batch_size) >= case_count:
-            return jax.vmap(_solve_one)(nu_hat_a, epsi_hat_a)
+            return _solve_scan(nu_hat_a, epsi_hat_a)
 
         batch_size = int(batch_size)
         n_full = case_count // batch_size
@@ -1625,18 +1629,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             nu_full = nu_hat_a[: n_full * batch_size].reshape((n_full, batch_size))
             epsi_full = epsi_hat_a[: n_full * batch_size].reshape((n_full, batch_size))
             full = jax.lax.map(
-                lambda chunk: jax.vmap(_solve_one)(chunk[0], chunk[1]),
+                lambda chunk: _solve_scan(chunk[0], chunk[1]),
                 (nu_full, epsi_full),
             )
             outputs.append(full.reshape((n_full * batch_size, -1)))
 
         if remainder > 0:
-            outputs.append(
-                jax.vmap(_solve_one)(
-                    nu_hat_a[n_full * batch_size :],
-                    epsi_hat_a[n_full * batch_size :],
-                )
-            )
+            outputs.append(_solve_scan(nu_hat_a[n_full * batch_size :], epsi_hat_a[n_full * batch_size :]))
 
         if len(outputs) == 1:
             return outputs[0]
