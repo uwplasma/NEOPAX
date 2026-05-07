@@ -223,6 +223,9 @@ def _evaluate_radius(model, state, radius_index: int, er_values: np.ndarray):
     a1_species = []
     a2_species = []
     a3_scalar = []
+    gamma_l11_piece = []
+    gamma_l12_piece = []
+    gamma_l13_piece = []
 
     for er_value in er_values:
         er_profile = np.asarray(state.Er, dtype=float).copy()
@@ -246,6 +249,9 @@ def _evaluate_radius(model, state, radius_index: int, er_values: np.ndarray):
             + lij_np[:, 0, 1] * a2_local
             + lij_np[:, 0, 2] * a3_local
         )
+        gamma_l11_local = -per_species_density_phys * (lij_np[:, 0, 0] * a1_local)
+        gamma_l12_local = -per_species_density_phys * (lij_np[:, 0, 1] * a2_local)
+        gamma_l13_local = -per_species_density_phys * (lij_np[:, 0, 2] * a3_local)
 
         gamma_species.append(gamma_local)
         l11_species.append(lij_np[:, 0, 0])
@@ -253,6 +259,9 @@ def _evaluate_radius(model, state, radius_index: int, er_values: np.ndarray):
         a1_species.append(a1_local)
         a2_species.append(a2_local)
         a3_scalar.append(a3_local)
+        gamma_l11_piece.append(gamma_l11_local)
+        gamma_l12_piece.append(gamma_l12_local)
+        gamma_l13_piece.append(gamma_l13_local)
 
     gamma_species_np = np.asarray(gamma_species, dtype=float)
     l11_np = np.asarray(l11_species, dtype=float)
@@ -260,6 +269,9 @@ def _evaluate_radius(model, state, radius_index: int, er_values: np.ndarray):
     a1_np = np.asarray(a1_species, dtype=float)
     a2_np = np.asarray(a2_species, dtype=float)
     a3_np = np.asarray(a3_scalar, dtype=float)
+    gamma_l11_np = np.asarray(gamma_l11_piece, dtype=float)
+    gamma_l12_np = np.asarray(gamma_l12_piece, dtype=float)
+    gamma_l13_np = np.asarray(gamma_l13_piece, dtype=float)
     charged_gamma = np.sum(species_charge_qp[None, :] * gamma_species_np, axis=1)
 
     return {
@@ -270,6 +282,9 @@ def _evaluate_radius(model, state, radius_index: int, er_values: np.ndarray):
         "a1": a1_np,
         "a2": a2_np,
         "a3": a3_np,
+        "gamma_l11_piece": gamma_l11_np,
+        "gamma_l12_piece": gamma_l12_np,
+        "gamma_l13_piece": gamma_l13_np,
     }
 
 
@@ -283,6 +298,10 @@ def _relative_max_with_location(a: np.ndarray, b: np.ndarray, x: np.ndarray) -> 
     rel = np.abs(a - b) / denom
     idx = int(np.argmax(rel))
     return float(rel[idx]), float(x[idx]), float(a[idx]), float(b[idx])
+
+
+def _location_index_for_value(x: np.ndarray, value: float) -> int:
+    return int(np.argmin(np.abs(np.asarray(x, dtype=float) - float(value))))
 
 
 def main():
@@ -372,6 +391,32 @@ def main():
                 f"(db={l12_db_at_max:.6e}, exact={l12_exact_at_max:.6e}) "
                 f"Gamma_rel_max={gamma_rel:.6e} at Er={gamma_er_at_max:.6e} "
                 f"(db={gamma_db_at_max:.6e}, exact={gamma_exact_at_max:.6e})"
+            )
+            gamma_idx = _location_index_for_value(er_values, gamma_er_at_max)
+            print(
+                "    "
+                f"At Gamma-max Er: "
+                f"A1(db/exact)=({db_eval['a1'][gamma_idx, s_idx]:.6e}, {ex_eval['a1'][gamma_idx, s_idx]:.6e}) "
+                f"A2(db/exact)=({db_eval['a2'][gamma_idx, s_idx]:.6e}, {ex_eval['a2'][gamma_idx, s_idx]:.6e})"
+            )
+            print(
+                "    "
+                f"L11(db/exact)=({db_eval['l11'][gamma_idx, s_idx]:.6e}, {ex_eval['l11'][gamma_idx, s_idx]:.6e}) "
+                f"L12(db/exact)=({db_eval['l12'][gamma_idx, s_idx]:.6e}, {ex_eval['l12'][gamma_idx, s_idx]:.6e})"
+            )
+            print(
+                "    "
+                f"Gamma pieces db: "
+                f"G11={db_eval['gamma_l11_piece'][gamma_idx, s_idx]:.6e} "
+                f"G12={db_eval['gamma_l12_piece'][gamma_idx, s_idx]:.6e} "
+                f"G13={db_eval['gamma_l13_piece'][gamma_idx, s_idx]:.6e}"
+            )
+            print(
+                "    "
+                f"Gamma pieces exact: "
+                f"G11={ex_eval['gamma_l11_piece'][gamma_idx, s_idx]:.6e} "
+                f"G12={ex_eval['gamma_l12_piece'][gamma_idx, s_idx]:.6e} "
+                f"G13={ex_eval['gamma_l13_piece'][gamma_idx, s_idx]:.6e}"
             )
 
         fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
