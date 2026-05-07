@@ -177,9 +177,12 @@ def _exact_d11_physical(model, *, radius_index: int, species_index: int, er_valu
     coeffs = model._solve_coefficient_scan_prepared(prepared, nu_over_v, epsi_hat_a)
     d11_physical = jnp.asarray(coeffs[:, 0], dtype=jnp.float64) * drds_value**2
     d11_physical = jnp.maximum(d11_physical, jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64))
+    v_new_a = jnp.asarray(model.energy_grid.v_norm, dtype=jnp.float64) * vth_a
+    er_over_v = jnp.asarray(er_value, dtype=jnp.float64) * 1.0e3 / v_new_a
     return (
         np.asarray(d11_physical, dtype=float),
         np.asarray(nu_over_v, dtype=float),
+        np.asarray(er_over_v, dtype=float),
         np.asarray(epsi_hat_a, dtype=float),
         float(np.asarray(vth_a, dtype=float)),
     )
@@ -280,7 +283,7 @@ def main():
         temperature=temperature_db,
         v_thermal=v_thermal_db,
     )
-    d11_ex, nu_ex, field_ex, vth_ex = _exact_d11_physical(
+    d11_ex, nu_ex, er_over_v_ex, active_field_ex, vth_ex = _exact_d11_physical(
         ex_model,
         radius_index=radius_index,
         species_index=species_index,
@@ -303,7 +306,7 @@ def main():
     print("x-wise contributions")
     print(
         "x_idx x"
-        "         db_field/v    ex_field/v    db_ln_nu     ex_ln_nu"
+        "         db_Er/v       ex_Er/v       ex_active/v   db_ln_nu     ex_ln_nu"
         "      db_D11        ex_D11"
         "      db_L11_term   ex_L11_term"
         "      db_L12_term   ex_L12_term"
@@ -313,7 +316,7 @@ def main():
     for i, x_value in enumerate(x_values):
         print(
             f"{i:>3d} {x_value:>10.6e}"
-            f" {field_db[i]:>12.6e} {field_ex[i]:>12.6e}"
+            f" {field_db[i]:>12.6e} {er_over_v_ex[i]:>12.6e} {active_field_ex[i]:>12.6e}"
             f" {np.log(max(nu_db[i], 1.0e-300)):>12.6e} {np.log(max(nu_ex[i], 1.0e-300)):>12.6e}"
             f" {d11_db[i]:>12.6e} {d11_ex[i]:>12.6e}"
             f" {contrib_db['l11_terms'][i]:>12.6e} {contrib_ex['l11_terms'][i]:>12.6e}"
