@@ -154,7 +154,17 @@ def _database_d11_physical(model, state, *, radius_index: int, species_index: in
     )
 
 
-def _exact_d11_physical(model, *, radius_index: int, species_index: int, er_value: float, density, temperature, v_thermal):
+def _exact_d11_physical(
+    model,
+    *,
+    radius_index: int,
+    species_index: int,
+    er_value: float,
+    density,
+    temperature,
+    v_thermal,
+    field_input: str,
+):
     support = model._static_support()
     prepared = jax.tree_util.tree_map(
         lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
@@ -165,20 +175,28 @@ def _exact_d11_physical(model, *, radius_index: int, species_index: int, er_valu
     density_local = density[:, radius_index]
     vthermal_local = v_thermal[:, radius_index]
 
-    nu_over_v, epsi_hat_a, vth_a = model._local_scan_inputs(
-        drds_value=drds_value,
-        species_index=species_index,
-        er_value=jnp.asarray(er_value, dtype=jnp.float64),
-        temperature_local=temperature_local,
-        density_local=density_local,
-        vthermal_local=vthermal_local,
-        collisionality_kind=_collisionality_kind(model.collisionality_model),
+    collisionality_kind = _collisionality_kind(model.collisionality_model)
+    vth_a = jnp.asarray(vthermal_local[species_index], dtype=jnp.float64)
+    v_new_a = jnp.asarray(model.energy_grid.v_norm, dtype=jnp.float64) * vth_a
+    nu_over_v = _nu_over_vnew_local(
+        model.species,
+        species_index,
+        v_new_a,
+        density_local,
+        temperature_local,
+        vthermal_local,
+        collisionality_kind,
     )
+    er_over_v = jnp.asarray(er_value, dtype=jnp.float64) * 1.0e3 / v_new_a
+    if str(field_input).strip().lower() == "er":
+        epsi_hat_a = er_over_v
+    elif str(field_input).strip().lower() == "es":
+        epsi_hat_a = er_over_v * drds_value
+    else:
+        raise ValueError(f"field_input must be 'er' or 'es', got {field_input!r}")
     coeffs = model._solve_coefficient_scan_prepared(prepared, nu_over_v, epsi_hat_a)
     d11_physical = jnp.asarray(coeffs[:, 0], dtype=jnp.float64) * drds_value**2
     d11_physical = jnp.maximum(d11_physical, jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64))
-    v_new_a = jnp.asarray(model.energy_grid.v_norm, dtype=jnp.float64) * vth_a
-    er_over_v = jnp.asarray(er_value, dtype=jnp.float64) * 1.0e3 / v_new_a
     return (
         np.asarray(d11_physical, dtype=float),
         np.asarray(nu_over_v, dtype=float),
@@ -220,6 +238,7 @@ def main():
     parser.add_argument("--radius-index", type=int, default=38)
     parser.add_argument("--species-index", type=int, default=0)
     parser.add_argument("--er-value", type=float, default=None)
+    parser.add_argument("--exact-field-input", choices=["es", "er"], default="es")
     args = parser.parse_args()
 
     db_runtime, db_state = build_runtime_context(_prepare_config(Path(args.database_config), device=args.device))
@@ -291,6 +310,7 @@ def main():
         density=density_ex,
         temperature=temperature_ex,
         v_thermal=v_thermal_ex,
+        field_input=args.exact_field_input,
     )
 
     contrib_db = _contribution_table(db_runtime.energy_grid, db_runtime.species, species_index, vth_db, d11_db, a1_db, a2_db)
@@ -300,6 +320,7 @@ def main():
     print(f"[gamma-d11-audit] radius_index={radius_index} rho={float(np.asarray(db_runtime.geometry.rho_grid[radius_index], dtype=float)):.6e}")
     print(f"[gamma-d11-audit] species_index={species_index} species={species_name}")
     print(f"[gamma-d11-audit] Er={er_value:.6e}")
+    print(f"[gamma-d11-audit] exact_field_input={args.exact_field_input}")
     print(f"[gamma-d11-audit] A1_db={a1_db:.6e} A2_db={a2_db:.6e}")
     print(f"[gamma-d11-audit] A1_exact={a1_ex:.6e} A2_exact={a2_ex:.6e}")
     print()
