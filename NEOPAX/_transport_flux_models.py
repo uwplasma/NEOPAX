@@ -1048,7 +1048,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     n_theta: int = 25
     n_zeta: int = 25
     n_xi: int = 64
-    surface_backend: str = "auto"
+    surface_backend: str = "vmec"
     source_name: str = "ntx_scan_runtime"
     collisionality_model: str = "default"
     bc_density: Any = None
@@ -1257,7 +1257,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     n_theta: int = 25
     n_zeta: int = 25
     n_xi: int = 64
-    surface_backend: str = "auto"
+    surface_backend: str = "vmec"
     face_response_mode: str = "face_local_response"
     radial_batch_size: int | None = None
     radial_batch_mode: str = "simple"
@@ -1611,14 +1611,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
             return ntx.solve_prepared_coefficient_vector(prepared, case)
-
-        def _solve_scan(nu_values, epsi_values):
-            return jax.lax.map(lambda case_values: _solve_one(case_values[0], case_values[1]), (nu_values, epsi_values))
-
         batch_size = self.scan_batch_size
         case_count = int(nu_hat_a.shape[0])
         if batch_size is None or int(batch_size) <= 0 or int(batch_size) >= case_count:
-            return _solve_scan(nu_hat_a, epsi_hat_a)
+            return jax.vmap(_solve_one)(nu_hat_a, epsi_hat_a)
 
         batch_size = int(batch_size)
         n_full = case_count // batch_size
@@ -1629,13 +1625,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             nu_full = nu_hat_a[: n_full * batch_size].reshape((n_full, batch_size))
             epsi_full = epsi_hat_a[: n_full * batch_size].reshape((n_full, batch_size))
             full = jax.lax.map(
-                lambda chunk: _solve_scan(chunk[0], chunk[1]),
+                lambda chunk: jax.vmap(_solve_one)(chunk[0], chunk[1]),
                 (nu_full, epsi_full),
             )
             outputs.append(full.reshape((n_full * batch_size, -1)))
 
         if remainder > 0:
-            outputs.append(_solve_scan(nu_hat_a[n_full * batch_size :], epsi_hat_a[n_full * batch_size :]))
+            outputs.append(
+                jax.vmap(_solve_one)(
+                    nu_hat_a[n_full * batch_size :],
+                    epsi_hat_a[n_full * batch_size :],
+                )
+            )
 
         if len(outputs) == 1:
             return outputs[0]
@@ -2345,7 +2346,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_n_theta=25,
     ntx_exact_n_zeta=25,
     ntx_exact_n_xi=64,
-    ntx_exact_surface_backend="auto",
+    ntx_exact_surface_backend="vmec",
     ntx_exact_face_response_mode="face_local_response",
     ntx_exact_radial_batch_size=None,
     ntx_exact_radial_batch_mode="simple",
