@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX
+from NEOPAX._database import D11_POSITIVE_FLOOR
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from NEOPAX._orchestrator import build_runtime_context
 from NEOPAX._transport_flux_models import _import_ntx
@@ -101,7 +102,8 @@ def _database_d11_positive(db_coeffs: jax.Array) -> float:
 
 
 def _exact_d11_positive(exact_coeffs: np.ndarray, drds_value: float) -> float:
-    return float(np.asarray(exact_coeffs[0], dtype=float) * drds_value**2)
+    d11 = float(np.asarray(exact_coeffs[0], dtype=float) * drds_value**2)
+    return max(d11, float(D11_POSITIVE_FLOOR))
 
 
 def main():
