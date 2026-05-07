@@ -40,6 +40,7 @@ from ._state import (
     safe_density,
     safe_temperature,
 )
+from ._database import D11_POSITIVE_FLOOR
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
     ModelCapabilities,
@@ -1520,7 +1521,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         *,
         drds_value,
     ):
-        d11_a = -(jnp.asarray(coeff_scan[:, 0], dtype=jnp.float64) * drds_value**2)
+        # Match the database convention, which floors physical D11 before taking log10.
+        d11_physical = jnp.asarray(coeff_scan[:, 0], dtype=jnp.float64) * drds_value**2
+        d11_physical = jnp.maximum(d11_physical, jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64))
+        d11_a = -d11_physical
         d13_a = -(jnp.asarray(coeff_scan[:, 2], dtype=jnp.float64) * drds_value)
         d33_a = -jnp.asarray(coeff_scan[:, 3], dtype=jnp.float64)
         weighted_l11 = self.energy_grid.L11_weight * self.energy_grid.xWeights
