@@ -1317,10 +1317,10 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
     def root_finder_for_radius(i):
         if model_name in ("two_stage", "adaptive"):
             max_roots_local = int(amb_cfg.get("er_ambipolar_max_roots", 3))
-            zero_roots = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64)
-            zero_entropies = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64)
+            zero_roots = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64).at[0].set(0.0)
+            zero_entropies = jnp.zeros((max_roots_local,), dtype=jnp.float64)
             zero_best = jnp.asarray(0.0, dtype=jnp.float64)
-            zero_n_roots = jnp.asarray(0, dtype=jnp.int32)
+            zero_n_roots = jnp.asarray(1, dtype=jnp.int32)
 
             def _skip_center(_):
                 return zero_roots, zero_entropies, zero_best, zero_n_roots
