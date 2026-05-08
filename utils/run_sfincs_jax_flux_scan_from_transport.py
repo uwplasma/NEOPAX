@@ -831,7 +831,20 @@ def _run_tasks_in_parallel(
         while pending or active:
             while pending and len(active) < max_parallel:
                 payload_path = pending.pop(0)
-                active.append(_spawn(payload_path, slot))
+                worker = _spawn(payload_path, slot)
+                active.append(worker)
+                rho_value = None
+                try:
+                    payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+                    rho_value = float(payload.get("rho"))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    rho_value = None
+                rho_note = f" rho={rho_value:.4f}" if rho_value is not None else ""
+                gpu_note = f" gpu={worker['gpu_id']}" if worker["gpu_id"] is not None else ""
+                print(
+                    f"[sfincs-scan] launched {completed + len(active)}/{total}:{rho_note}{gpu_note}",
+                    flush=True,
+                )
                 slot += 1
             time.sleep(0.1)
             finished: list[dict[str, Any]] = []
