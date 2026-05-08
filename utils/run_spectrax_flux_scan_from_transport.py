@@ -163,8 +163,15 @@ def cmd_all(args: argparse.Namespace) -> int:
         verbose_workers=args.verbose_workers,
     )
     rc = bridge.cmd_run(run_args)
-    if rc != 0:
+    run_failed = rc != 0
+    if run_failed and not bool(args.collect_even_if_failures):
         return rc
+    if run_failed:
+        print(
+            "warning: one or more SPECTRAX runs failed; continuing to collect "
+            "available outputs and zero-filling missing runs.",
+            file=sys.stderr,
+        )
 
     collect_args = argparse.Namespace(
         manifest=str(manifest_path),
@@ -175,7 +182,10 @@ def cmd_all(args: argparse.Namespace) -> int:
         plot=args.plot,
         plot_run_heat_traces=args.plot_run_heat_traces,
     )
-    return bridge.cmd_collect(collect_args)
+    collect_rc = bridge.cmd_collect(collect_args)
+    if run_failed and collect_rc == 0:
+        return rc
+    return collect_rc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -259,6 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads-per-run", type=int, default=1)
     p.add_argument("--poll-interval", type=float, default=2.0)
     p.add_argument("--verbose-workers", action="store_true", help="Show the stdout/stderr from each SPECTRAX worker run")
+    p.add_argument(
+        "--collect-even-if-failures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Continue to the collect stage after partial run failures, zero-filling missing runs.",
+    )
     p.set_defaults(func=cmd_all)
     return p
 

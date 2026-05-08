@@ -1513,14 +1513,24 @@ def cmd_collect(args: argparse.Namespace) -> int:
         er[i] = float(run["Er"])
         diag_csv = Path(f"{run['output_prefix']}.diagnostics.csv")
         if not diag_csv.exists():
-            print(f"skipping missing diagnostics: {diag_csv}")
+            print(f"missing diagnostics; zero-filling run fluxes: {diag_csv}")
+            heat_flux[i] = 0.0
+            particle_flux[i] = 0.0
+            average_window_used[i] = float(args.average_window)
             continue
-        columns = _read_diagnostics_csv(diag_csv)
-        row, t_start_used, t_end_used = _time_average_columns(
-            columns,
-            average_window=float(args.average_window),
-            t_final_override=requested_t_final,
-        )
+        try:
+            columns = _read_diagnostics_csv(diag_csv)
+            row, t_start_used, t_end_used = _time_average_columns(
+                columns,
+                average_window=float(args.average_window),
+                t_final_override=requested_t_final,
+            )
+        except Exception as exc:
+            print(f"failed to read diagnostics; zero-filling run fluxes: {diag_csv} ({exc})")
+            heat_flux[i] = 0.0
+            particle_flux[i] = 0.0
+            average_window_used[i] = float(args.average_window)
+            continue
         average_window_used[i] = float(args.average_window)
         average_t_start[i] = t_start_used
         average_t_end[i] = t_end_used
