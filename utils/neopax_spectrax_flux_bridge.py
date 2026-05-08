@@ -132,6 +132,7 @@ def _runtime_toml_text(manifest: dict[str, Any], run_spec: dict[str, Any]) -> st
             f"use_diffrax = {_toml_scalar(time_cfg['use_diffrax'])}",
             f"sample_stride = {_toml_scalar(time_cfg['sample_stride'])}",
             f"diagnostics_stride = {_toml_scalar(time_cfg['diagnostics_stride'])}",
+            f"chunk_steps = {_toml_scalar(time_cfg['chunk_steps'])}" if time_cfg["chunk_steps"] is not None else "",
             f"fixed_dt = {_toml_scalar(time_cfg['fixed_dt'])}",
             f"cfl = {_toml_scalar(time_cfg['cfl'])}",
             f"state_sharding = {_toml_scalar(time_cfg['state_sharding'])}" if time_cfg["state_sharding"] is not None else "",
@@ -747,6 +748,9 @@ def _build_manifest(
             "use_diffrax": bool(_coalesce(args.use_diffrax, template_time.get("use_diffrax"), False)),
             "sample_stride": int(_coalesce(args.sample_stride, template_time.get("sample_stride"), 50)),
             "diagnostics_stride": int(_coalesce(args.diagnostics_stride, template_time.get("diagnostics_stride"), 50)),
+            "chunk_steps": None
+            if _coalesce(args.chunk_steps, template_time.get("chunk_steps"), None) is None
+            else int(_coalesce(args.chunk_steps, template_time.get("chunk_steps"), None)),
             "fixed_dt": bool(_coalesce(args.fixed_dt, template_time.get("fixed_dt"), False)),
             "cfl": float(_coalesce(args.cfl, template_time.get("cfl"), 1.0)),
             "state_sharding": None
@@ -1328,7 +1332,7 @@ def _write_run_heat_flux_trace_plots(
     *,
     manifest: dict[str, Any],
     species_names: list[str],
-) -> None:
+) -> tuple[list[Path], list[str]]:
     try:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError as exc:  # pragma: no cover
@@ -1337,13 +1341,21 @@ def _write_run_heat_flux_trace_plots(
         ) from exc
 
     runtime_species_names = list(manifest.get("runtime_species_names", []))
+    written: list[Path] = []
+    skipped: list[str] = []
     for run in manifest["runs"]:
         diag_csv = Path(f"{run['output_prefix']}.diagnostics.csv")
         if not diag_csv.exists():
+            skipped.append(f"rho={float(run['rho']):.4f}: missing diagnostics CSV {diag_csv}")
             continue
-        columns = _read_diagnostics_csv(diag_csv)
+        try:
+            columns = _read_diagnostics_csv(diag_csv)
+        except Exception as exc:
+            skipped.append(f"rho={float(run['rho']):.4f}: failed to read {diag_csv} ({exc})")
+            continue
         times = np.asarray(columns.get("t", []), dtype=float)
         if times.size == 0:
+            skipped.append(f"rho={float(run['rho']):.4f}: diagnostics CSV {diag_csv} has no time samples")
             continue
 
         fig, ax = plt.subplots(figsize=(7.0, 4.5), constrained_layout=True)
@@ -1367,6 +1379,8 @@ def _write_run_heat_flux_trace_plots(
         out_path = Path(run["run_dir"]).resolve() / "heat_flux_trace.png"
         fig.savefig(out_path, dpi=180)
         plt.close(fig)
+        written.append(out_path)
+    return written, skipped
 
 
 def _thermal_speed_ms(temperature_keV: float, mass_mp: float) -> float:
@@ -1634,10 +1648,22 @@ def cmd_collect(args: argparse.Namespace) -> int:
             q=q_sorted,
         )
     if bool(getattr(args, "plot_run_heat_traces", False)):
-        _write_run_heat_flux_trace_plots(
+        written, skipped = _write_run_heat_flux_trace_plots(
             manifest=manifest,
             species_names=species_names,
         )
+        if written:
+            print(f"Wrote {len(written)} per-run heat-flux trace plot(s)")
+            for path in written[:5]:
+                print(f"  {path}")
+            if len(written) > 5:
+                print(f"  ... and {len(written) - 5} more")
+        else:
+            print("No per-run heat-flux trace plots were written")
+        for message in skipped[:10]:
+            print(f"skipped heat-trace plot: {message}")
+        if len(skipped) > 10:
+            print(f"... and {len(skipped) - 10} more skipped heat-trace plot(s)")
 
     print(f"Wrote collected flux summary: {out_h5}")
     print(f"Wrote NEOPAX flux profile: {neopax_flux_out}")
@@ -1691,6 +1717,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--fixed-dt", action=argparse.BooleanOptionalAction, default=None)
     prep.add_argument("--sample-stride", type=int, default=None)
     prep.add_argument("--diagnostics-stride", type=int, default=None)
+    prep.add_argument("--chunk-steps", type=int, default=None, help="Adaptive nonlinear chunk size in steps for each SPECTRAX run")
     prep.add_argument("--cfl", type=float, default=None)
     prep.add_argument("--state-sharding", default=None, help="none, auto, ky, ...; used inside a single SPECTRAX run")
     prep.add_argument("--ky", type=float, default=None, help="Default nonlinear reference ky retained unless overridden")

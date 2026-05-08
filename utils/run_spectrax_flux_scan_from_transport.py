@@ -123,6 +123,7 @@ def cmd_all(args: argparse.Namespace) -> int:
         fixed_dt=args.fixed_dt,
         sample_stride=args.sample_stride,
         diagnostics_stride=args.diagnostics_stride,
+        chunk_steps=args.chunk_steps,
         cfl=args.cfl,
         state_sharding=args.state_sharding,
         ky=args.ky,
@@ -225,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fixed-dt", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--sample-stride", type=int, default=None)
     p.add_argument("--diagnostics-stride", type=int, default=None)
+    p.add_argument("--chunk-steps", type=int, default=None, help="Adaptive nonlinear chunk size in steps for each SPECTRAX run")
     p.add_argument("--cfl", type=float, default=None)
     p.add_argument("--state-sharding", default=None)
     p.add_argument("--ky", type=float, default=None, help="Default nonlinear reference ky retained unless overridden")

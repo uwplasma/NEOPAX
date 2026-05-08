@@ -561,14 +561,20 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
         env["VECLIB_MAXIMUM_THREADS"] = str(threads)
         env["NUMEXPR_NUM_THREADS"] = str(threads)
         env.pop("SFINCS_JAX_XLA_THREADS", None)
-        if cores > 1:
-            # Let sfincs_jax expose multiple host CPU devices and keep its
-            # built-in auto-sharding path enabled for larger RHSMode=1 solves.
+        worker_sharding = str(getattr(args, "worker_sharding", "off")).strip().lower()
+        if worker_sharding != "off" and cores > 1:
             env["SFINCS_JAX_CPU_DEVICES"] = str(cores)
-            env.pop("SFINCS_JAX_SHARD", None)
-            env.pop("SFINCS_JAX_AUTO_SHARD", None)
-            env.pop("SFINCS_JAX_MATVEC_SHARD_AXIS", None)
+            env["SFINCS_JAX_SHARD"] = "1"
+            if worker_sharding == "auto":
+                env["SFINCS_JAX_AUTO_SHARD"] = "1"
+                env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = "auto"
+            else:
+                env["SFINCS_JAX_AUTO_SHARD"] = "0"
+                env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = worker_sharding
         else:
+            # Default to process-level parallelism across radii rather than
+            # per-worker multi-device sharding.
+            env.pop("SFINCS_JAX_CPU_DEVICES", None)
             env["SFINCS_JAX_SHARD"] = "0"
             env["SFINCS_JAX_AUTO_SHARD"] = "0"
             env["SFINCS_JAX_MATVEC_SHARD_AXIS"] = "off"
@@ -1014,7 +1020,10 @@ def cmd_main(args: argparse.Namespace) -> int:
     if backend == "gpu":
         placement_note = f"gpu_ids={','.join(gpu_ids)}"
     else:
-        placement_note = f"cores_per_run={int(args.cores_per_run)}"
+        placement_note = (
+            f"cores_per_run={int(args.cores_per_run)} "
+            f"worker_sharding={str(args.worker_sharding).lower()}"
+        )
     print(
         "[sfincs-scan] "
         f"selected {len(radius_indices)} radii over rho in [{rho_min_val:.4f}, {rho_max_val:.4f}] "
@@ -1095,6 +1104,7 @@ def cmd_main(args: argparse.Namespace) -> int:
         f.attrs["time_value"] = np.nan if snapshot.time_value is None else float(snapshot.time_value)
         f.attrs["backend"] = backend
         f.attrs["max_parallel"] = int(args.max_parallel)
+        f.attrs["worker_sharding"] = str(args.worker_sharding).lower()
         f.attrs["include_phi1"] = bool(args.include_phi1) if args.include_phi1 is not None else -1
         f.attrs["axis_zero_padded"] = bool(axis_padded)
         for key, value in raw_meta.items():
@@ -1214,6 +1224,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids for backend=gpu.")
     p.add_argument("--max-parallel", type=int, default=1, help="Maximum concurrent sfincs_jax runs.")
     p.add_argument("--cores-per-run", type=int, default=1, help="CPU cores per run for backend=cpu.")
+    p.add_argument(
+        "--worker-sharding",
+        choices=("off", "auto", "theta", "zeta", "x", "flat"),
+        default="off",
+        help=(
+            "Per-worker sfincs_jax sharding mode for backend=cpu when cores-per-run > 1. "
+            "Default: off."
+        ),
+    )
     p.add_argument(
         "--benchmark-repeats",
         type=int,
