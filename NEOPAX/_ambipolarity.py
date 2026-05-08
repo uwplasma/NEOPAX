@@ -1261,6 +1261,14 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
             er_ambipolar_scan_batch_size = None
 
     charge_qp = jnp.asarray(params["species"].charge_qp)
+    geometry = getattr(flux_model, "geometry", None)
+    r_grid = getattr(geometry, "r_grid", None)
+    skip_axis_root = False
+    if r_grid is not None:
+        try:
+            skip_axis_root = bool(abs(float(np.asarray(r_grid)[0])) <= 1.0e-14)
+        except Exception:
+            skip_axis_root = False
     t_flux_build = __import__("time").perf_counter() if debug_stage_markers else None
     local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
     if debug_stage_markers and model_name == "two_stage":
@@ -1307,6 +1315,51 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         raise ValueError(f"Unknown ambipolarity model: {model_name}")
 
     def root_finder_for_radius(i):
+        if model_name in ("two_stage", "adaptive"):
+            max_roots_local = int(amb_cfg.get("er_ambipolar_max_roots", 3))
+            zero_roots = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64)
+            zero_entropies = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64)
+            zero_best = jnp.asarray(0.0, dtype=jnp.float64)
+            zero_n_roots = jnp.asarray(0, dtype=jnp.int32)
+
+            def _skip_center(_):
+                return zero_roots, zero_entropies, zero_best, zero_n_roots
+
+            def _run_root_finder(_):
+                args = {
+                    'Er_range': (
+                        float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                        float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                    ),
+                    'n_coarse': int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+                    'n_refine': int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+                    'max_roots': max_roots_local,
+                    'tol': float(amb_cfg.get("er_ambipolar_tol", 1e-6)),
+                    'x_tol': float(amb_cfg.get("er_ambipolar_x_tol", 1e-6)),
+                    'maxiter': int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                    'er_scan_batch_mode': er_ambipolar_scan_batch_mode,
+                    'er_scan_batch_size': er_ambipolar_scan_batch_size,
+                }
+                if model_name == "adaptive":
+                    args.update({
+                        'n_init': int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+                        'n_subdiv': int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+                        'n_rounds': int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+                        'max_brackets': int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+                    })
+                    args.pop('n_coarse', None)
+                args['Gamma_func'] = gamma_func_factory(i)
+                args['entropy_func'] = entropy_func_factory(i)
+                return root_finder(**args)
+
+            if skip_axis_root:
+                return jax.lax.cond(
+                    jnp.asarray(i, dtype=jnp.int32) == 0,
+                    _skip_center,
+                    _run_root_finder,
+                    operand=None,
+                )
+
         args = {}
         if model_name == "two_stage":
             args.update({

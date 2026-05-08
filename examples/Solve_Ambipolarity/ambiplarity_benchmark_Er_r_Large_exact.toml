@@ -36,6 +36,8 @@ er_ambipolar_output_dir = "./Ambipolarity_Er_r_Large_exact"
 debug = false
 debug_prints = false
 
+
+
 [energy_grid]
 n_x = 4
 
