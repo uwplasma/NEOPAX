@@ -534,6 +534,21 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
         env["JAX_PLATFORMS"] = "cpu"
         env["JAX_PLATFORM_NAME"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
+        # Some recent JAX/XLA builds reject the legacy CPU-thread flags that older
+        # shells or sfincs_jax opt-in settings may add. Keep other XLA flags, but
+        # scrub the unsupported CPU-thread knobs for per-worker CPU launches.
+        xla_flags = env.get("XLA_FLAGS", "")
+        filtered_xla_flags = " ".join(
+            token
+            for token in xla_flags.split()
+            if not token.startswith("--xla_cpu_parallelism_threads=")
+            and not token.startswith("--xla_cpu_multi_thread_eigen_num_threads=")
+            and not token.startswith("--xla_cpu_multi_thread_eigen=")
+        ).strip()
+        if filtered_xla_flags:
+            env["XLA_FLAGS"] = filtered_xla_flags
+        else:
+            env.pop("XLA_FLAGS", None)
         cores = int(args.cores_per_run)
         threads = max(1, cores)
         if cores > 0:
@@ -545,7 +560,7 @@ def _build_worker_env(args: argparse.Namespace, *, gpu_id: str | None) -> dict[s
         env["MKL_NUM_THREADS"] = str(threads)
         env["VECLIB_MAXIMUM_THREADS"] = str(threads)
         env["NUMEXPR_NUM_THREADS"] = str(threads)
-        env["SFINCS_JAX_XLA_THREADS"] = "1"
+        env.pop("SFINCS_JAX_XLA_THREADS", None)
         if cores > 1:
             # Let sfincs_jax expose multiple host CPU devices and keep its
             # built-in auto-sharding path enabled for larger RHSMode=1 solves.
