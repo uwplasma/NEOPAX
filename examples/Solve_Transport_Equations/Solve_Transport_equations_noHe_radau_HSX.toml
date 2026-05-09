@@ -13,10 +13,14 @@ boozer_file = "./examples/inputs/boozmn_HSX_QHS_vacuum_ns201.nc"
 n_radial = 51
 
 [neoclassical]
-flux_model = "ntx_database"
-entropy_model = "ntx_database"
-neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
-interpolation_mode = "preprocessed_3d_radial_ntss1d"
+flux_model = "fluxes_r_file"
+entropy_model = "fluxes_r_file"
+neoclassical_file = "./examples/inputs/sfincs_flux_HSX.h5"
+
+[turbulence]
+flux_model = "fluxes_r_file"
+turbulence_file = "./examples/inputs/spectrax_fluxes_hsx_t500"
+
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -36,10 +40,6 @@ er_ambipolar_plot = true
 er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux"
 er_initialization_preprocess_boundary_state = false
 
-[turbulence]
-flux_model = "turbulent_power_analytical"
-chi_density = [6.5e-05, 6.5e-05, 6.5e-05]
-chi_temperature = [0.0065, 0.0065, 0.0065]
 
 [classical]
 flux_model = "none"
@@ -65,7 +65,7 @@ density_shape_power = 10.0
 temperature_shape_power = 2.0
 n_scale = [0.65, 0.65, 0.65]
 T_scale =  0.7
-er_initialization_mode = "ambipolar_min_entropy"
+er_initialization_mode = "analytical"
 er0_scale = 100.0
 er0_peak_rho = 0.8
 
@@ -119,6 +119,7 @@ delta_zeff = 0.0
 
 [transport_solver]
 density_floor = 1.0e-3
+temperature_floor = 1.0e-3
 transport_solver_backend = "radau"
 integrator = "radau"
 radau_num_stages = 7
@@ -126,7 +127,7 @@ radau_error_estimator = "embedded2"
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
 t0 = 0.0
-t_final = 20.0
+t_final = 2.4e-4
 dt = 1.0e-8
 rtol = 1.0e-6
 atol = 1.0e-8

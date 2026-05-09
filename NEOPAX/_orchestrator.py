@@ -218,9 +218,13 @@ def _build_geometry(config: dict):
 
 
 def _build_database(config: dict, geometry):
-    neoclassical_file = config.get("neoclassical", {}).get("neoclassical_file")
+    neoclassical_cfg = config.get("neoclassical", {})
+    neoclassical_name = str(neoclassical_cfg.get("flux_model", "ntx_database")).strip().lower()
+    if neoclassical_name == "fluxes_r_file":
+        return None
+    neoclassical_file = neoclassical_cfg.get("neoclassical_file")
     if neoclassical_file and geometry is not None:
-        interp_mode = config.get("neoclassical", {}).get("interpolation_mode", "generic")
+        interp_mode = neoclassical_cfg.get("interpolation_mode", "generic")
         return load_monoenergetic_database(geometry, neoclassical_file, interp_mode)
     return None
 
