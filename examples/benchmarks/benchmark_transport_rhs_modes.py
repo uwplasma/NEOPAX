@@ -606,6 +606,15 @@ def main():
                     _print_initial_finiteness_probe(config)
                 last_result, wall_seconds = _run_once(config)
                 timed_runs.append(wall_seconds)
+                if last_result is not None and not args.debug_initial_finiteness:
+                    raw = last_result.raw_result if hasattr(last_result, "raw_result") else None
+                    if isinstance(raw, dict):
+                        if bool(raw.get("last_attempt_nonfinite_stage_residual", False)):
+                            print(
+                                "[benchmark] detected nonfinite stage residual; "
+                                "printing initial RHS finiteness probe for diagnosis"
+                            )
+                            _print_initial_finiteness_probe(config)
 
             final_state_delta = None
             if args.compute_final_state_delta and last_result is not None:

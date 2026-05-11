@@ -1852,6 +1852,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )(species_indices)
 
         lij_by_radius = self._map_radius_axis(_per_radius, radius_indices)
+        lij_by_radius = self._regularize_axis_radius0(lij_by_radius, self.geometry.r_grid_half)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
