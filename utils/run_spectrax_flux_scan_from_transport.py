@@ -80,13 +80,16 @@ def cmd_all(args: argparse.Namespace) -> int:
             else _default_transport_solution_path(config_path, cfg)
         )
     output_dir = Path(args.output_dir).resolve()
+    spectrax_template = (
+        str(Path(args.spectrax_template).resolve()) if args.spectrax_template else None
+    )
 
     prepare_args = argparse.Namespace(
         profiles_source=args.profiles_source,
         neopax_result=None if result_path is None else str(result_path),
         neopax_config=str(config_path),
         spectrax_root=args.spectrax_root,
-        spectrax_template=args.spectrax_template,
+        spectrax_template=spectrax_template,
         output_dir=str(output_dir),
         time_index=args.time_index,
         analytical_n_radii=args.analytical_n_radii,
