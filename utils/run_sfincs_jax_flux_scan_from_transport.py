@@ -378,6 +378,7 @@ def _prepare_input_text(
     species: list[SpeciesMeta],
     snapshot: TransportSnapshot,
     radius_index: int,
+    wout_path: Path | None,
     include_phi1: bool | None,
     resolution_overrides: dict[str, int | None],
     solver_tolerance: float | None,
@@ -393,6 +394,13 @@ def _prepare_input_text(
     text = template_text
     text = _patch_group_value(text=text, group="general", key="RHSMode", value=1)
     text = _patch_group_value(text=text, group="geometryParameters", key="inputRadialCoordinate", value=3)
+    if wout_path is not None:
+        text = _patch_group_value(
+            text=text,
+            group="geometryParameters",
+            key="equilibriumFile",
+            value=str(wout_path),
+        )
     # Let sfincs_jax infer gradient coordinates separately:
     # species from dNHatdrNs/dTHatdrNs -> mode 3, Phi from Er -> mode 4.
     text = _drop_group_key(text=text, group="geometryParameters", key="inputRadialCoordinateForGradients")
@@ -464,9 +472,7 @@ def _prepare_input_text(
     return text
 
 
-def _infer_wout_path(config_path: Path, cfg: dict[str, Any], explicit: str | None) -> Path | None:
-    if explicit:
-        return _resolve_preserving_config_path(config_path, explicit)
+def _infer_wout_path(config_path: Path, cfg: dict[str, Any]) -> Path | None:
     geometry_cfg = cfg.get("geometry", {})
     return _resolve_preserving_config_path(config_path, geometry_cfg.get("vmec_file"))
 
@@ -618,7 +624,6 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
     input_path = Path(payload["input_path"])
     output_path = Path(payload["output_path"])
     result_json = Path(payload["result_json"])
-    wout_path = payload.get("wout_path")
     n_species = int(payload["n_species"])
     benchmark_repeats = max(0, int(payload.get("benchmark_repeats", 0)))
     benchmark_warmup = max(0, int(payload.get("benchmark_warmup", 0)))
@@ -635,7 +640,6 @@ def _run_single_worker_from_payload(payload_path: Path) -> int:
         write_sfincs_jax_output_h5(
             input_namelist=input_path,
             output_path=output_path,
-            wout_path=None if wout_path in (None, "") else Path(wout_path),
             compute_transport_matrix=False,
             compute_solution=True,
             overwrite=True,
@@ -974,7 +978,7 @@ def cmd_main(args: argparse.Namespace) -> int:
     run_dir = output_dir / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    wout_path = _infer_wout_path(config_path, cfg, args.wout_path)
+    wout_path = _infer_wout_path(config_path, cfg)
     resolution_overrides = {
         "Ntheta": args.ntheta,
         "Nzeta": args.nzeta,
@@ -997,6 +1001,7 @@ def cmd_main(args: argparse.Namespace) -> int:
             species=species,
             snapshot=snapshot,
             radius_index=radius_index,
+            wout_path=wout_path,
             include_phi1=args.include_phi1,
             resolution_overrides=resolution_overrides,
             solver_tolerance=args.solver_tolerance,
@@ -1024,7 +1029,6 @@ def cmd_main(args: argparse.Namespace) -> int:
             "input_path": str(input_path),
             "output_path": str(surface_dir / "sfincsOutput.h5"),
             "result_json": str(result_json),
-            "wout_path": None if wout_path is None else str(wout_path),
             "n_species": len(species),
             "verbose": bool(args.verbose_workers),
             "benchmark_repeats": int(args.benchmark_repeats),
@@ -1238,7 +1242,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rho-min", type=float, default=None, help="Minimum rho to include.")
     p.add_argument("--rho-max", type=float, default=None, help="Maximum rho to include.")
     p.add_argument("--num-radii", type=int, default=None, help="Number of radii to sample inside the rho filter.")
-    p.add_argument("--wout-path", default=None, help="Optional VMEC equilibrium override for sfincs_jax.")
     p.add_argument("--include-phi1", dest="include_phi1", action="store_true", help="Force includePhi1 = true.")
     p.add_argument("--no-include-phi1", dest="include_phi1", action="store_false", help="Force includePhi1 = false.")
     p.set_defaults(include_phi1=None)
