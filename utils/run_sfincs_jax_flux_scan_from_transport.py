@@ -322,6 +322,9 @@ def _format_scalar(value: Any) -> str:
         return _bool_literal(value)
     if isinstance(value, (int, np.integer)):
         return str(int(value))
+    if isinstance(value, (str, os.PathLike)):
+        text = str(value).replace("'", "''")
+        return f"'{text}'"
     return f"{float(value):.16g}"
 
 
