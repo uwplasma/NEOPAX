@@ -201,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spectrax-template", default=None, help="Base SPECTRAX runtime TOML used as the model template")
     p.add_argument("--profiles-source", choices=("transport_h5", "analytical"), default="transport_h5")
     p.add_argument("--time-index", type=int, default=-1)
-    p.add_argument("--analytical-n-radii", type=int, default=51)
+    p.add_argument("--analytical-n-radii", type=int, default=None, help="Number of analytical rho points; defaults to [geometry].n_radial from the NEOPAX config")
     p.add_argument("--electron-model", choices=("adiabatic", "kinetic"), default=None)
     p.add_argument("--reference-ion", default=None)
     p.add_argument("--rho-indices", default=None)

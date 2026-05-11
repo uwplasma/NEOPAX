@@ -111,6 +111,25 @@ def _resolve_relative(base: Path, value: str | None) -> Path | None:
     return (base / path).resolve()
 
 
+def _resolve_preserving_config_path(config_path: Path, value: str | None) -> Path | None:
+    """Resolve a geometry path while preserving a working config-relative string when possible.
+
+    NEOPAX configs commonly store geometry files like ``./examples/inputs/wout.nc``.
+    When the radial-scan launcher is started from the NEOPAX repo root, that path is
+    already valid as written, so prefer keeping it unchanged instead of re-anchoring
+    it through an inferred project root. If it does not exist from the current working
+    directory, fall back to the NEOPAX-root-relative resolution.
+    """
+    if value is None:
+        return None
+    expanded = Path(os.path.expandvars(os.path.expanduser(value)))
+    if expanded.is_absolute():
+        return expanded.resolve()
+    if expanded.exists():
+        return expanded
+    return (_infer_neopax_root(config_path) / expanded).resolve()
+
+
 def _default_transport_solution_path(config_path: Path, cfg: dict[str, Any]) -> Path:
     output_cfg = cfg.get("transport_output", {})
     output_dir = _resolve_relative(_infer_neopax_root(config_path), output_cfg.get("transport_output_dir"))
@@ -233,6 +252,17 @@ def _build_standard_analytical_snapshot(
         er=np.asarray(er, dtype=np.float64),
         time_value=None,
     )
+
+
+def _analytical_n_radii_from_config(cfg: dict[str, Any], override: int | None) -> int:
+    if override is not None:
+        return max(2, int(override))
+    geometry_cfg = cfg.get("geometry", {})
+    n_radial_cfg = geometry_cfg.get("n_radial", 51)
+    try:
+        return max(2, int(n_radial_cfg))
+    except (TypeError, ValueError):
+        return 51
 
 
 def _parse_index_list(text: str | None) -> list[int] | None:
@@ -436,9 +466,9 @@ def _prepare_input_text(
 
 def _infer_wout_path(config_path: Path, cfg: dict[str, Any], explicit: str | None) -> Path | None:
     if explicit:
-        return _resolve_relative(_infer_neopax_root(config_path), explicit)
+        return _resolve_preserving_config_path(config_path, explicit)
     geometry_cfg = cfg.get("geometry", {})
-    return _resolve_relative(_infer_neopax_root(config_path), geometry_cfg.get("vmec_file"))
+    return _resolve_preserving_config_path(config_path, geometry_cfg.get("vmec_file"))
 
 
 def _last_species_vector(arr: np.ndarray, n_species: int) -> np.ndarray:
@@ -910,10 +940,11 @@ def cmd_main(args: argparse.Namespace) -> int:
     species = _parse_species_from_config(cfg)
     if str(args.profiles_source).lower() == "analytical":
         transport_solution = None
+        analytical_n_radii = _analytical_n_radii_from_config(cfg, args.analytical_n_radii)
         snapshot = _build_standard_analytical_snapshot(
             cfg,
             n_species=len(species),
-            n_radial=int(args.analytical_n_radii),
+            n_radial=analytical_n_radii,
         )
     else:
         transport_solution = (
@@ -1194,8 +1225,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--analytical-n-radii",
         type=int,
-        default=51,
-        help="Number of rho grid points to reconstruct for profiles-source=analytical.",
+        default=None,
+        help=(
+            "Number of rho grid points to reconstruct for profiles-source=analytical. "
+            "Default: use [geometry].n_radial from the NEOPAX config, falling back to 51."
+        ),
     )
     p.add_argument("--sfincs-template", required=False, default=None, help="Template sfincs_jax input.namelist.")
     p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory for runs and collected fluxes.")

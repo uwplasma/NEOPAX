@@ -28,6 +28,7 @@ import csv
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
@@ -223,6 +224,8 @@ def _resolve_relative(base: Path, value: str | None) -> str | None:
     if value is None:
         return None
     expanded = os.path.expandvars(os.path.expanduser(value))
+    if re.match(r"^[A-Za-z]:[\\/]", expanded):
+        return expanded
     path = Path(expanded)
     if path.is_absolute():
         return str(path.resolve())
@@ -946,12 +949,16 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     cfg = _load_toml(neopax_config)
     species = _parse_species_from_neopax_config(cfg)
+    geometry_cfg = cfg.get("geometry", {})
     profiles_source = str(args.profiles_source).strip().lower()
     if profiles_source == "analytical":
+        analytical_n_radii = args.analytical_n_radii
+        if analytical_n_radii is None or int(analytical_n_radii) <= 0:
+            analytical_n_radii = int(geometry_cfg.get("n_radial", 51))
         snapshot = _build_standard_analytical_snapshot(
             cfg,
             n_species=len(species),
-            n_radial=int(args.analytical_n_radii),
+            n_radial=int(analytical_n_radii),
         )
         neopax_result: Path | None = None
     elif profiles_source == "transport_h5":
@@ -1692,7 +1699,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--spectrax-template", default=None, help="Optional base SPECTRAX runtime TOML used as the model template")
     prep.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for the manifest and SPECTRAX outputs")
     prep.add_argument("--time-index", type=int, default=-1, help="Time slice for transport_solution.h5 inputs; default: final")
-    prep.add_argument("--analytical-n-radii", type=int, default=51, help="Number of rho points to reconstruct when --profiles-source=analytical")
+    prep.add_argument("--analytical-n-radii", type=int, default=None, help="Number of rho points to reconstruct when --profiles-source=analytical; defaults to [geometry].n_radial")
     prep.add_argument("--electron-model", choices=("adiabatic", "kinetic"), default=None)
     prep.add_argument("--reference-ion", default=None, help="Species name used as the normalization reference ion")
     prep.add_argument("--rho-indices", default=None, help="Explicit comma-separated rho indices, e.g. 5,10,20")
