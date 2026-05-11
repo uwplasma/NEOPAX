@@ -318,11 +318,13 @@ def _bool_literal(value: bool) -> str:
 
 
 def _format_scalar(value: Any) -> str:
+    if isinstance(value, np.generic):
+        return _format_scalar(value.item())
     if isinstance(value, bool):
         return _bool_literal(value)
     if isinstance(value, (int, np.integer)):
         return str(int(value))
-    if isinstance(value, (str, os.PathLike)):
+    if isinstance(value, (str, bytes, os.PathLike)):
         text = str(value).replace("'", "''")
         return f"'{text}'"
     return f"{float(value):.16g}"

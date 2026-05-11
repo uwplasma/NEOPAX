@@ -1,0 +1,95 @@
+! Input file for SFINCS version 3.
+! See the user manual for documentation of the parameters in this file.
+!----------------------------------------------------------------------
+
+!ss scanType = 28
+
+!   Settings specific to scanType = 28:
+!ss runSpecFile = runspec_mixed_electrons.dat
+
+&general
+  RHSMode = 1 ! 2x2 ion transport matrix
+/
+
+&geometryParameters
+  geometryScheme = 5 ! VMEC
+
+  inputRadialCoordinate = 3   ! rN
+  rN_wish = 0.12247
+
+  VMECRadialOption = 0
+  equilibriumFile = "../../stage1-equilibrium/output/wout_HSX_QHS_vacuum_ns201.nc"
+  min_Bmn_to_load = 0
+
+/
+
+&speciesParameters
+  Zs = 1
+  mHats = 1.0d+0
+  nHats = 1.0d+0!2.72d+0!1.0d+0
+  THats = 1.0d+0!10.0d+0!1.0d+0
+  dnHatdrHats = 1.0d+0
+  dTHatdrHats = 1.0d+0
+/
+
+&physicsParameters
+
+
+  ! We change Delta, alpha, nu_n, or Er because changing T_a is not workign at the moment.
+  Delta = 4.5694e-3  !Defines the temperature and mass, B_bar=1, R_bar=1 for VMEC inputs
+  alpha = 1.0     !Defines units of Electric field, related with temperature
+  nu_n= 8.330e-3     !Defnes units of species parameters
+  Er = 0.0        !in fraction of given temperature in ev
+
+
+  ! For THat=1, mHat=1, nHat=1,
+  ! then nu_n = nuPrime * B0OverBBar / (GHat + iota * IHat)
+  ! For LHD, then, nu_n = nuPrime * 0.2668018
+  collisionOperator =  0
+  includeXDotTerm = .true.
+  includeElectricFieldTermInXiDot = .true.
+  useDKESExBDrift = .false.
+  includePhi1 = .false.
+  !magneticDriftScheme=0
+/
+
+
+&resolutionParameters
+  Ntheta = 25
+!ss NthetaMinFactor = 1.1
+!ss NthetaMaxFactor = 1.5
+!ss NthetaNumRuns = 3
+
+  Nzeta =51
+!ss NzetaMinFactor = 1.1
+!ss NzetaMaxFactor = 1.5
+!ss NzetaNumRuns = 4
+
+Nxi= 100
+!ss NxiMinFactor = 1.1
+!ss NxiMaxFactor = 1.5
+!ss NxiNumRuns = 4
+
+
+  Nx = 8
+!ss NxMinFactor = 0.8
+!ss NxMaxFactor = 2
+!ss NxNumRuns = 0
+ ! NL=8
+
+ solverTolerance = 1d-6
+!ss solverToleranceMinFactor = 0.1
+!ss solverToleranceMaxFactor = 10
+!ss solverToleranceNumRuns = 0
+/
+
+&otherNumericalParameters
+/
+
+&preconditionerOptions
+/
+
+&export_f
+/
+                                  
+
