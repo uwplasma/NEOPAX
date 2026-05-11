@@ -127,7 +127,20 @@ def _resolve_preserving_config_path(config_path: Path, value: str | None) -> Pat
         return expanded.resolve()
     if expanded.exists():
         return expanded
-    return (_infer_neopax_root(config_path) / expanded).resolve()
+    neopax_candidate = (_infer_neopax_root(config_path) / expanded).resolve()
+    if neopax_candidate.exists():
+        return neopax_candidate
+    # Walk up from the config file: handles layouts where the relative path is
+    # anchored to a project root that sits above the inferred NEOPAX root.
+    current = config_path.resolve().parent
+    while True:
+        attempt = (current / expanded).resolve()
+        if attempt.exists():
+            return attempt
+        if current == current.parent:
+            break
+        current = current.parent
+    return neopax_candidate
 
 
 def _default_transport_solution_path(config_path: Path, cfg: dict[str, Any]) -> Path:
