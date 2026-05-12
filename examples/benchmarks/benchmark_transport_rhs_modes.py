@@ -399,6 +399,73 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 _print_array_finiteness(f"initial_probe.radau.stage_state_projected[{i}]", projected_stage_i)
                 _print_array_finiteness(f"initial_probe.radau.stage_rhs[{i}]", stage_rhs_i)
                 _print_array_finiteness(f"initial_probe.radau.stage_residual[{i}]", stage_residual_i)
+
+            jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t0, y))(flat_state0)
+            _print_array_finiteness("initial_probe.radau.jacobian_ref", jacobian_ref)
+
+            h_jacobian = h_value * jacobian_ref
+            identity_n = jnp.eye(flat_state0.shape[0], dtype=dtype)
+            radau_real_eig = jnp.asarray(stage_cfg.real_eig, dtype=dtype)
+            radau_complex_blocks = jnp.asarray(stage_cfg.complex_blocks, dtype=dtype)
+            real_matrix = identity_n - radau_real_eig * h_jacobian
+            _print_array_finiteness("initial_probe.radau.real_matrix", real_matrix)
+            real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+            _print_array_finiteness("initial_probe.radau.real_lu", real_lu)
+            _print_array_finiteness("initial_probe.radau.real_piv", real_piv)
+
+            if int(stage_cfg.complex_blocks.shape[0]) > 0:
+                identity_2 = jnp.eye(2, dtype=dtype)
+                complex_dim = 2 * flat_state0.shape[0]
+                complex_dense_all = jnp.transpose(
+                    identity_2[None, :, :, None, None] * identity_n[None, None, None, :, :]
+                    - radau_complex_blocks[:, :, :, None, None] * h_jacobian[None, None, None, :, :],
+                    (0, 1, 3, 2, 4),
+                ).reshape((int(stage_cfg.complex_blocks.shape[0]), complex_dim, complex_dim))
+                for i in range(int(stage_cfg.complex_blocks.shape[0])):
+                    _print_array_finiteness(f"initial_probe.radau.complex_matrix[{i}]", complex_dense_all[i])
+                    complex_lu_i, complex_piv_i = jax.scipy.linalg.lu_factor(complex_dense_all[i])
+                    _print_array_finiteness(f"initial_probe.radau.complex_lu[{i}]", complex_lu_i)
+                    _print_array_finiteness(f"initial_probe.radau.complex_piv[{i}]", complex_piv_i)
+
+            radau_transform = jnp.asarray(stage_cfg.transform, dtype=dtype)
+            radau_inv_transform = jnp.asarray(stage_cfg.inv_transform, dtype=dtype)
+            residual0 = (stages0 - jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)).reshape((-1,))
+            _print_array_finiteness("initial_probe.radau.residual0", residual0)
+            rhs_stages0 = (-residual0).reshape((num_stages, flat_state0.shape[0]))
+            rhs_transformed0 = radau_inv_transform @ rhs_stages0
+            _print_array_finiteness("initial_probe.radau.rhs_transformed0", rhs_transformed0)
+            rhs_real0 = rhs_transformed0[0]
+            delta_real0 = jax.scipy.linalg.lu_solve((real_lu, real_piv), rhs_real0)
+            _print_array_finiteness("initial_probe.radau.delta_real0", delta_real0)
+
+            delta_complex_rows = []
+            for i in range(int(stage_cfg.complex_blocks.shape[0])):
+                rhs_complex_i = rhs_transformed0[1:].reshape((int(stage_cfg.complex_blocks.shape[0]), 2, flat_state0.shape[0]))[i]
+                delta_complex_i = jax.scipy.linalg.lu_solve(
+                    jax.scipy.linalg.lu_factor(complex_dense_all[i]),
+                    rhs_complex_i.reshape((-1,)),
+                ).reshape((2, flat_state0.shape[0]))
+                _print_array_finiteness(f"initial_probe.radau.delta_complex[{i}]", delta_complex_i)
+                delta_complex_rows.append(delta_complex_i)
+
+            if delta_complex_rows:
+                delta_transformed0 = jnp.concatenate(
+                    [delta_real0[None, :], jnp.asarray(delta_complex_rows).reshape((2 * int(stage_cfg.complex_blocks.shape[0]), flat_state0.shape[0]))],
+                    axis=0,
+                )
+            else:
+                delta_transformed0 = delta_real0[None, :]
+            _print_array_finiteness("initial_probe.radau.delta_transformed0", delta_transformed0)
+            delta0 = (radau_transform @ delta_transformed0).reshape((-1,))
+            _print_array_finiteness("initial_probe.radau.delta0", delta0)
+            z1 = z0 + delta0
+            _print_array_finiteness("initial_probe.radau.z1", z1)
+            stages1 = z1.reshape((num_stages, flat_state0.shape[0]))
+            stage_states1 = flat_state0[None, :] + h_value * (a @ stages1)
+            stage_rhs1 = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states1)
+            residual1 = (stages1 - stage_rhs1).reshape((-1,))
+            _print_array_finiteness("initial_probe.radau.stage_rhs1", stage_rhs1)
+            _print_array_finiteness("initial_probe.radau.residual1", residual1)
     print("[benchmark] initial_probe: end")
 
 
