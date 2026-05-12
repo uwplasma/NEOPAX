@@ -33,6 +33,16 @@ import NEOPAX
 from NEOPAX._orchestrator import build_runtime_context, _normalized_boundary_cfg_for_transport
 from NEOPAX._boundary_conditions import build_boundary_condition_model
 from NEOPAX._transport_equations import ComposedEquationSystem, build_equation_system
+from NEOPAX._transport_solvers import (
+    _RADAU_STAGE_CONFIGS,
+    _extract_fixed_temperature_projection,
+    _extract_state_regularization,
+    _flat_rhs_factory,
+    _make_radau_stage_predictor,
+    _make_solver_state_transform,
+    _project_flat_state_if_needed,
+    _project_state_to_quasi_neutrality,
+)
 
 
 DEFAULT_CONFIG = Path("examples/benchmarks/Solve_Transport_equations_noHe_radau_benchmark.toml")
@@ -319,6 +329,76 @@ def _print_initial_finiteness_probe(config: dict) -> None:
     _print_array_finiteness("initial_probe.rhs0.density", rhs0.density)
     _print_array_finiteness("initial_probe.rhs0.pressure", rhs0.pressure)
     _print_array_finiteness("initial_probe.rhs0.Er", rhs0.Er)
+
+    solver_cfg = config.get("transport_solver", {})
+    backend = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
+    if backend == "radau":
+        num_stages = int(solver_cfg.get("radau_num_stages", 3))
+        stage_cfg = _RADAU_STAGE_CONFIGS.get(num_stages)
+        if stage_cfg is not None:
+            temperature_active_mask_solver, fixed_temperature_profile_solver = _extract_fixed_temperature_projection(
+                equation_system.vector_field
+            )
+            density_floor, temperature_floor = _extract_state_regularization(equation_system.vector_field)
+            solver_state0 = _project_state_to_quasi_neutrality(
+                state,
+                runtime.species,
+                temperature_active_mask=temperature_active_mask_solver,
+                fixed_temperature_profile=fixed_temperature_profile_solver,
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+            flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+                solver_state0,
+                runtime.species,
+                temperature_active_mask=temperature_active_mask_solver,
+                fixed_temperature_profile=fixed_temperature_profile_solver,
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+            flat_rhs = _flat_rhs_factory(
+                unpack_flat,
+                equation_system.vector_field,
+                (runtime.species,),
+                {},
+                project_flat=project_flat,
+            )
+            dtype = flat_state0.dtype
+            c = jnp.asarray(stage_cfg.c, dtype=dtype)
+            a = jnp.asarray(stage_cfg.a, dtype=dtype)
+            t0 = jnp.asarray(solver_cfg.get("t0", 0.0), dtype=dtype)
+            t_final = jnp.asarray(solver_cfg.get("t_final", solver_cfg.get("t1", 0.0)), dtype=dtype)
+            dt_min = jnp.asarray(solver_cfg.get("min_step", 1.0e-14), dtype=dtype)
+            dt_max = jnp.asarray(solver_cfg.get("max_step", solver_cfg.get("dt", 1.0)), dtype=dtype)
+            base_dt = jnp.clip(jnp.asarray(solver_cfg.get("dt", 0.0), dtype=dtype), dt_min, dt_max)
+            h_value = jnp.minimum(base_dt, t_final - t0)
+            f0_flat = flat_rhs(t0, flat_state0)
+            prev_stages = jnp.tile(f0_flat, num_stages)
+            z0 = _make_radau_stage_predictor(
+                f0_flat,
+                prev_stages,
+                jnp.asarray(0.0, dtype=dtype),
+                h_value,
+                c,
+                dtype,
+            )
+            _print_array_finiteness("initial_probe.radau.flat_state0", flat_state0)
+            _print_array_finiteness("initial_probe.radau.f0_flat", f0_flat)
+            _print_array_finiteness("initial_probe.radau.z0", z0)
+            stages0 = z0.reshape((num_stages, flat_state0.shape[0]))
+            stage_states = flat_state0[None, :] + h_value * (a @ stages0)
+            stage_times = t0 + c * h_value
+            _print_array_finiteness("initial_probe.radau.stage_times", stage_times)
+            for i in range(num_stages):
+                stage_time_i = stage_times[i]
+                stage_state_i = stage_states[i]
+                projected_stage_i = _project_flat_state_if_needed(stage_state_i, project_flat)
+                stage_rhs_i = flat_rhs(stage_time_i, stage_state_i)
+                stage_residual_i = stages0[i] - stage_rhs_i
+                _print_array_finiteness(f"initial_probe.radau.stage_state[{i}]", stage_state_i)
+                _print_array_finiteness(f"initial_probe.radau.stage_state_projected[{i}]", projected_stage_i)
+                _print_array_finiteness(f"initial_probe.radau.stage_rhs[{i}]", stage_rhs_i)
+                _print_array_finiteness(f"initial_probe.radau.stage_residual[{i}]", stage_residual_i)
     print("[benchmark] initial_probe: end")
 
 
