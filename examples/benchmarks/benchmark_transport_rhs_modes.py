@@ -166,6 +166,7 @@ def _build_config(
     solver["rhs_mode"] = str(rhs_mode)
     solver["debug_stage_markers"] = bool(debug_initial_finiteness)
     if str(backend).strip().lower() == "radau":
+        solver["radau_rhs_mode"] = str(rhs_mode)
         solver["radau_newton_divergence_mode"] = str(radau_newton_divergence_mode)
         solver["radau_newton_residual_norm"] = str(radau_newton_residual_norm)
     if single_attempt:
