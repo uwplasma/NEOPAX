@@ -1403,7 +1403,12 @@ class RADAUSolver(_RadauSolverConfig):
         conservative_divergence = divergence_mode in {"conservative", "hairer_like", "hairer"}
         use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
         theta_diverge_threshold = jnp.asarray(0.98 if conservative_divergence else 0.95, dtype=dtype)
-        slow_contraction_required = jnp.asarray(2 if conservative_divergence else 1, dtype=jnp.int32)
+        # A single late Newton ratio blip can happen even when the transformed
+        # Radau solve is otherwise converging cleanly. Requiring at least two
+        # consecutive slow-contraction events avoids spuriously rejecting
+        # nearly-converged steps while preserving the existing residual-blowup
+        # and nonfinite guards.
+        slow_contraction_required = jnp.asarray(2, dtype=jnp.int32)
         residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
         theta_clip_min = jnp.asarray(0.1, dtype=dtype)
         theta_clip_max = jnp.asarray(1.5, dtype=dtype)
