@@ -1402,13 +1402,14 @@ class RADAUSolver(_RadauSolverConfig):
         residual_norm_mode = str(getattr(self, "newton_residual_norm", "raw")).strip().lower()
         conservative_divergence = divergence_mode in {"conservative", "hairer_like", "hairer"}
         use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
-        theta_diverge_threshold = jnp.asarray(0.98 if conservative_divergence else 0.95, dtype=dtype)
-        # A single late Newton ratio blip can happen even when the transformed
-        # Radau solve is otherwise converging cleanly. Requiring at least two
-        # consecutive slow-contraction events avoids spuriously rejecting
-        # nearly-converged steps while preserving the existing residual-blowup
-        # and nonfinite guards.
-        slow_contraction_required = jnp.asarray(2, dtype=jnp.int32)
+        # Follow the Hairer/NTSS pattern more closely: use the Newton-correction
+        # contraction estimate to predict the remaining defect, and turn that
+        # into a controlled step rejection rather than an immediate "nonfinite"
+        # style divergence classification.
+        theta_diverge_threshold = jnp.asarray(0.99 if conservative_divergence else 0.99, dtype=dtype)
+        predictor_defect_floor = jnp.asarray(1.0e-4, dtype=dtype)
+        predictor_defect_cap = jnp.asarray(20.0, dtype=dtype)
+        predictor_fnewt = jnp.asarray(3.0e-2, dtype=dtype)
         residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
         theta_clip_min = jnp.asarray(0.1, dtype=dtype)
         theta_clip_max = jnp.asarray(1.5, dtype=dtype)
@@ -1570,10 +1571,11 @@ class RADAUSolver(_RadauSolverConfig):
                     z_cur,
                     delta_norm,
                     residual_norm,
-                    prev_residual_norm,
+                    prev_delta_norm,
+                    prev_theta_ratio,
                     theta_est,
                     diverged,
-                    slow_count,
+                    shrink_suggest,
                     slow_contraction_any,
                     residual_blowup_any,
                     newton_nonfinite_any,
@@ -1583,32 +1585,67 @@ class RADAUSolver(_RadauSolverConfig):
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
                 z_next = z_cur + delta
                 current_residual_norm = _residual_norm_fn(residual_cur)
-                safe_prev_residual = jnp.maximum(prev_residual_norm, tiny_scalar)
-                theta_raw = current_residual_norm / safe_prev_residual
-                theta_candidate = jnp.where(iter_idx > 0, theta_raw, zero_scalar)
-                theta_next = jnp.where(iter_idx > 0, jnp.maximum(theta_est, theta_candidate), theta_est)
-                slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > theta_diverge_threshold)
-                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * residual_blowup_factor)
-                nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)))
-                slow_count_next = jnp.where(slow_contraction, slow_count + 1, jnp.asarray(0, dtype=jnp.int32))
-                diverged_by_slow = slow_count_next >= slow_contraction_required
-                diverged_next = jnp.logical_or(diverged, jnp.logical_or(diverged_by_slow, jnp.logical_or(residual_blowup, nonfinite_state)))
+                current_delta_norm = jnp.linalg.norm(delta)
+                safe_prev_delta = jnp.maximum(prev_delta_norm, tiny_scalar)
+                theta_raw = current_delta_norm / safe_prev_delta
+                newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
+                theta_candidate = jnp.where(
+                    newton_iter_num == 2,
+                    theta_raw,
+                    jnp.sqrt(jnp.maximum(theta_raw * prev_theta_ratio, tiny_scalar)),
+                )
+                theta_valid = newton_iter_num > 1
+                theta_candidate = jnp.where(theta_valid, theta_candidate, zero_scalar)
+                theta_next = jnp.where(theta_valid, theta_candidate, theta_est)
+                theta_ratio_next = jnp.where(theta_valid, theta_raw, prev_theta_ratio)
+                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > residual_norm * residual_blowup_factor)
+                nonfinite_state = jnp.logical_not(
+                    jnp.logical_and(
+                        jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
+                        jnp.isfinite(current_delta_norm),
+                    )
+                )
+                predictor_active = jnp.logical_and(theta_valid, newton_iter_num < self.maxiter)
+                remaining_iters = jnp.maximum(self.maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
+                faccon = theta_candidate / jnp.maximum(jnp.asarray(1.0, dtype=dtype) - theta_candidate, tiny_scalar)
+                predicted_defect = faccon * current_delta_norm * (theta_candidate ** remaining_iters) / predictor_fnewt
+                qnewt = jnp.clip(predicted_defect, predictor_defect_floor, predictor_defect_cap)
+                predictor_exponent = -jnp.asarray(1.0, dtype=dtype) / (
+                    jnp.asarray(self.maxiter + 3, dtype=dtype) - newton_iter_num.astype(dtype)
+                )
+                predictor_shrink = jnp.clip(
+                    newton_shrink_num * (qnewt ** predictor_exponent),
+                    newton_shrink_min,
+                    newton_shrink_max,
+                )
+                slow_contraction = jnp.logical_and(
+                    predictor_active,
+                    jnp.where(
+                        theta_candidate < theta_diverge_threshold,
+                        predicted_defect >= jnp.asarray(1.0, dtype=dtype),
+                        jnp.asarray(True),
+                    ),
+                )
+                predictor_shrink = jnp.where(theta_candidate < theta_diverge_threshold, predictor_shrink, jnp.asarray(0.5, dtype=dtype))
+                shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
+                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_contraction, jnp.logical_or(residual_blowup, nonfinite_state)))
                 return (
                     iter_idx + 1,
                     z_next,
-                    jnp.linalg.norm(delta),
+                    current_delta_norm,
                     current_residual_norm,
-                    current_residual_norm,
+                    current_delta_norm,
+                    theta_ratio_next,
                     theta_next,
                     diverged_next,
-                    slow_count_next,
+                    shrink_suggest_next,
                     jnp.logical_or(slow_contraction_any, slow_contraction),
                     jnp.logical_or(residual_blowup_any, residual_blowup),
                     jnp.logical_or(newton_nonfinite_any, nonfinite_state),
                 )
 
             def cond_fn(newton_state):
-                iter_idx, _, delta_norm, residual_norm, _, _, diverged, _, _, _, _ = newton_state
+                iter_idx, _, delta_norm, residual_norm, _, _, _, diverged, _, _, _, _ = newton_state
                 active = jnp.logical_or(residual_norm > self.tol, delta_norm > self.tol)
                 return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
@@ -1619,8 +1656,9 @@ class RADAUSolver(_RadauSolverConfig):
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
                 zero_scalar,
+                zero_scalar,
                 jnp.asarray(False),
-                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(1.0, dtype=dtype),
                 jnp.asarray(False),
                 jnp.asarray(False),
                 jnp.asarray(False),
@@ -1632,10 +1670,11 @@ class RADAUSolver(_RadauSolverConfig):
                 z_final,
                 delta_norm_final,
                 _residual_norm_loop_final,
-                _prev_residual_final,
+                _prev_delta_final,
+                _prev_theta_ratio_final,
                 theta_final,
                 diverged_final,
-                _slow_count_final,
+                shrink_suggest_final,
                 slow_contraction_final,
                 residual_blowup_final,
                 newton_nonfinite_final,
@@ -1653,10 +1692,11 @@ class RADAUSolver(_RadauSolverConfig):
             err_vec = h_value * (embedded_f0_weight * f0 + (b_error @ stages_final))
             err_norm = _solver_error_norm(err_vec, flat_y, flat_next, self.atol, self.rtol)
             theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
+            fallback_newton_shrink = jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max)
             newton_shrink = jnp.where(
                 converged,
                 jnp.asarray(1.0, dtype=dtype),
-                jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max),
+                jnp.where(slow_contraction_final, shrink_suggest_final, fallback_newton_shrink),
             )
             jacobian_out = jacobian_ref
             cache_valid_out = jnp.asarray(True)

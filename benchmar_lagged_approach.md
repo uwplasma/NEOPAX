@@ -197,6 +197,44 @@ The likely remaining issue is inside the actual custom Radau solver path itself,
 2. per-iteration bookkeeping of `finite_initial_residual`, `nonfinite_stage_residual`, or `newton_nonfinite` is stale or inconsistent
 3. a later in-loop state mutation is occurring that the explicit replicated Newton probe does not yet capture
 
+## Refactor Plan: NTSS-Style Newton Rejection
+
+The next Radau update should make the nonlinear-step rejection logic look more like NTSS/Hairer Radau and less like a generic "slow contraction means divergence" heuristic.
+
+### Target behavior
+
+1. Base the contraction estimate on the **Newton correction norm** instead of the residual norm.
+   - NTSS uses the update-size sequence (`dyno`, `dynold`) for `theta`
+   - our old logic used a residual-ratio heuristic, which was too sensitive near convergence
+
+2. Replace the hard `slow_contraction -> diverged` trigger with an NTSS-style predicted-defect estimate.
+   - compute `theta`
+   - if `theta < 0.99`, estimate the remaining Newton defect
+   - reject the step and shrink `dt` only when that predicted defect is too large
+   - if `theta >= 0.99`, treat that as a controlled nonlinear rejection, not a "nonfinite physics" event
+
+3. Keep real failure classes separate.
+   - nonfinite state / residual
+   - residual blowup
+   - predicted slow-Newton rejection
+   - max-iteration exhaustion
+
+4. Keep the benchmark-side Newton probe in sync with the solver logic.
+   - the explicit probe and the actual solver must use the same `theta` and rejection formulas
+   - otherwise debugging output becomes misleading
+
+### Expected outcome
+
+After this refactor, exact-runtime Radau runs that are finite and nearly converged should no longer be mislabeled as nonfinite/diverged just because of a late bad contraction ratio.
+
+The most likely remaining outcomes should become:
+
+- accepted step
+- controlled timestep rejection with a sensible shrink factor
+- or a genuine nonfinite / blowup classification
+
+instead of the current mixed diagnostic state.
+
 ## Benchmark Set A: One Step Attempt Only
 
 Run timing benchmarks for exactly one Radau step attempt, without mixing in repeated retries.
