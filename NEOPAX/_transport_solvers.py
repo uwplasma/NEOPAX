@@ -1184,7 +1184,7 @@ def _apply_radau_lean_timestep_controller(
             dt=jnp.asarray(0.0, dtype=dtype),
             accepted=jnp.asarray(False),
             failed=fail_now,
-            fail_code=code,
+            fail_code=fail_code_next,
             converged=converged,
             err_norm=err_norm,
             diverged=diverged_final,

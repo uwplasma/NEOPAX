@@ -510,6 +510,132 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             z2 = _explicit_newton_update(z1, "1")
             z3 = _explicit_newton_update(z2, "2")
             _print_array_finiteness("initial_probe.radau.z3", z3)
+
+            tol = jnp.asarray(solver_cfg.get("nonlinear_solver_tol", solver_cfg.get("tol", 1.0e-8)), dtype=dtype)
+            maxiter = int(solver_cfg.get("nonlinear_solver_maxiter", solver_cfg.get("maxiter", 20)))
+            tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
+            zero_scalar = jnp.asarray(0.0, dtype=dtype)
+            theta_diverge_threshold = jnp.asarray(0.95, dtype=dtype)
+            slow_contraction_required = jnp.asarray(1, dtype=jnp.int32)
+            residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
+
+            def _residual_flat(z_flat):
+                stages = z_flat.reshape((num_stages, flat_state0.shape[0]))
+                stage_states = flat_state0[None, :] + h_value * (a @ stages)
+                evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+                return (stages - evals).reshape((-1,))
+
+            def _stage_solver(rhs):
+                rhs_stages = rhs.reshape((num_stages, flat_state0.shape[0]))
+                rhs_transformed = radau_inv_transform @ rhs_stages
+                rhs_real = rhs_transformed[0]
+                delta_real = jax.scipy.linalg.lu_solve((real_lu, real_piv), rhs_real)
+                rhs_complex_pairs = rhs_transformed[1:].reshape(
+                    (int(stage_cfg.complex_blocks.shape[0]), 2, flat_state0.shape[0])
+                )
+                delta_complex_pairs = []
+                for j in range(int(stage_cfg.complex_blocks.shape[0])):
+                    delta_complex_pair = jax.scipy.linalg.lu_solve(
+                        jax.scipy.linalg.lu_factor(complex_dense_all[j]),
+                        rhs_complex_pairs[j].reshape((-1,)),
+                    ).reshape((2, flat_state0.shape[0]))
+                    delta_complex_pairs.append(delta_complex_pair)
+                if delta_complex_pairs:
+                    delta_transformed = jnp.concatenate(
+                        [
+                            delta_real[None, :],
+                            jnp.asarray(delta_complex_pairs).reshape(
+                                (2 * int(stage_cfg.complex_blocks.shape[0]), flat_state0.shape[0])
+                            ),
+                        ],
+                        axis=0,
+                    )
+                else:
+                    delta_transformed = delta_real[None, :]
+                return (radau_transform @ delta_transformed).reshape((-1,))
+
+            def _probe_body(newton_state):
+                (
+                    iter_idx,
+                    z_cur,
+                    delta_norm,
+                    residual_norm,
+                    prev_residual_norm,
+                    theta_est,
+                    diverged,
+                    slow_count,
+                    slow_contraction_any,
+                    residual_blowup_any,
+                    newton_nonfinite_any,
+                ) = newton_state
+                residual_cur = _residual_flat(z_cur)
+                delta = _stage_solver(-residual_cur)
+                delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
+                z_next = z_cur + delta
+                current_residual_norm = jnp.linalg.norm(residual_cur)
+                safe_prev_residual = jnp.maximum(prev_residual_norm, tiny_scalar)
+                theta_raw = current_residual_norm / safe_prev_residual
+                theta_candidate = jnp.where(iter_idx > 0, theta_raw, zero_scalar)
+                theta_next = jnp.where(iter_idx > 0, jnp.maximum(theta_est, theta_candidate), theta_est)
+                slow_contraction = jnp.logical_and(iter_idx >= 1, theta_candidate > theta_diverge_threshold)
+                residual_blowup = jnp.logical_and(iter_idx >= 1, current_residual_norm > prev_residual_norm * residual_blowup_factor)
+                nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)))
+                slow_count_next = jnp.where(slow_contraction, slow_count + 1, jnp.asarray(0, dtype=jnp.int32))
+                diverged_next = jnp.logical_or(
+                    diverged,
+                    jnp.logical_or(
+                        slow_count_next >= slow_contraction_required,
+                        jnp.logical_or(residual_blowup, nonfinite_state),
+                    ),
+                )
+                return (
+                    iter_idx + 1,
+                    z_next,
+                    jnp.linalg.norm(delta),
+                    current_residual_norm,
+                    current_residual_norm,
+                    theta_next,
+                    diverged_next,
+                    slow_count_next,
+                    jnp.logical_or(slow_contraction_any, slow_contraction),
+                    jnp.logical_or(residual_blowup_any, residual_blowup),
+                    jnp.logical_or(newton_nonfinite_any, nonfinite_state),
+                )
+
+            def _probe_cond(newton_state):
+                iter_idx, _, delta_norm, residual_norm, _, _, diverged, _, _, _, _ = newton_state
+                active = jnp.logical_or(residual_norm > tol, delta_norm > tol)
+                return jnp.logical_and(jnp.logical_and(iter_idx < maxiter, active), jnp.logical_not(diverged))
+
+            probe_init = (
+                jnp.asarray(0, dtype=jnp.int32),
+                z0,
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(jnp.inf, dtype=dtype),
+                zero_scalar,
+                jnp.asarray(False),
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(False),
+            )
+            probe_final = jax.lax.while_loop(_probe_cond, _probe_body, probe_init)
+            probe_iter, probe_z, probe_delta_norm, probe_residual_norm, _probe_prev_residual, probe_theta, probe_diverged, _probe_slow_count, probe_slow_any, probe_blowup_any, probe_nonfinite_any = probe_final
+            probe_final_residual = _residual_flat(probe_z)
+            _print_array_finiteness("initial_probe.radau.while_loop_z", probe_z)
+            _print_array_finiteness("initial_probe.radau.while_loop_final_residual", probe_final_residual)
+            print(
+                "[benchmark] initial_probe.radau.while_loop:",
+                f"iter={int(probe_iter)}",
+                f"delta_norm={float(probe_delta_norm):.6e}",
+                f"residual_norm={float(probe_residual_norm):.6e}",
+                f"theta={float(probe_theta):.6e}",
+                f"diverged={bool(probe_diverged)}",
+                f"slow_any={bool(probe_slow_any)}",
+                f"blowup_any={bool(probe_blowup_any)}",
+                f"nonfinite_any={bool(probe_nonfinite_any)}",
+            )
     print("[benchmark] initial_probe: end")
 
 

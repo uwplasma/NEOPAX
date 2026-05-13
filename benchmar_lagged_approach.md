@@ -146,6 +146,57 @@ The current problem is now split into two solver-focused questions:
 
 2. Why does exact-runtime `lagged_response` still differ from exact-runtime `black_box` in the stage-residual failure signature?
 
+## Updated Status: Explicit Newton Replication
+
+The newer exact-runtime `black_box` debugging now shows a much stronger result than the older notes above.
+
+For exact-runtime `black_box` with `interpolate_center_response`:
+
+- initial transport probe is finite
+- `rhs0` is finite
+- Radau predictor `z0` is finite
+- all stage states at `z0` are finite
+- all stage RHS evaluations at `z0` are finite
+- all stage residuals at `z0` are finite
+- the benchmark-side explicit Newton replication remains finite through multiple updates:
+  - Jacobian finite
+  - transformed Radau real/complex block matrices finite
+  - LU factors finite
+  - `delta0`, `z1`, `residual1` finite
+  - `delta1`, `z2`, `residual2` finite
+
+Yet the custom Radau step still reports:
+
+- `accepted = False`
+- `converged = False`
+- `nonfinite_stage_residual = True`
+- `finite_initial_residual = False`
+- `newton_nonfinite = True`
+
+So the remaining blocker is now best understood as:
+
+- a **custom Radau solver bookkeeping / control-flow bug**
+- not a transport physics nonfinite
+- not an NTX runtime-model failure
+- and not evidence against the lagged-response approximation itself
+
+### Confirmed bookkeeping bug already fixed
+
+One concrete issue was identified in `_apply_radau_lean_timestep_controller(...)._reject(...)`:
+
+- rejected-but-not-terminal attempts were still returning `step_info.fail_code = 1` or `2`
+- even when the persistent step-state correctly had `fail_code = 0`
+
+That misleading `step_info.fail_code` behavior has now been corrected.
+
+### Current hypothesis
+
+The likely remaining issue is inside the actual custom Radau solver path itself, for example:
+
+1. the `while_loop` path diverges from the explicit benchmark-side Newton reconstruction
+2. per-iteration bookkeeping of `finite_initial_residual`, `nonfinite_stage_residual`, or `newton_nonfinite` is stale or inconsistent
+3. a later in-loop state mutation is occurring that the explicit replicated Newton probe does not yet capture
+
 ## Benchmark Set A: One Step Attempt Only
 
 Run timing benchmarks for exactly one Radau step attempt, without mixing in repeated retries.
