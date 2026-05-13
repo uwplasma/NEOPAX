@@ -114,6 +114,7 @@ def _build_config(
     ntx_use_remat: bool,
     radau_newton_divergence_mode: str,
     radau_newton_residual_norm: str,
+    debug_initial_finiteness: bool = False,
     single_attempt: bool = False,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
@@ -163,7 +164,7 @@ def _build_config(
     solver = config.setdefault("transport_solver", {})
     solver["transport_solver_backend"] = str(backend)
     solver["rhs_mode"] = str(rhs_mode)
-    solver["debug_stage_markers"] = False
+    solver["debug_stage_markers"] = bool(debug_initial_finiteness)
     if str(backend).strip().lower() == "radau":
         solver["radau_newton_divergence_mode"] = str(radau_newton_divergence_mode)
         solver["radau_newton_residual_norm"] = str(radau_newton_residual_norm)
@@ -915,6 +916,7 @@ def main():
                 ntx_use_remat=args.ntx_use_remat,
                 radau_newton_divergence_mode=args.radau_newton_divergence_mode,
                 radau_newton_residual_norm=args.radau_newton_residual_norm,
+                debug_initial_finiteness=args.debug_initial_finiteness,
                 single_attempt=args.single_attempt,
             )
 
