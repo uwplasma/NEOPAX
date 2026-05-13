@@ -134,11 +134,11 @@ def _build_config(
 
     if active_flux_model == "ntx_exact_lij_runtime":
         if n_theta is None:
-            n_theta = DEFAULT_NTX_EXACT_N_THETA
+            n_theta = neoclassical.get("ntx_exact_n_theta", DEFAULT_NTX_EXACT_N_THETA)
         if n_zeta is None:
-            n_zeta = DEFAULT_NTX_EXACT_N_ZETA
+            n_zeta = neoclassical.get("ntx_exact_n_zeta", DEFAULT_NTX_EXACT_N_ZETA)
         if n_xi is None:
-            n_xi = DEFAULT_NTX_EXACT_N_XI
+            n_xi = neoclassical.get("ntx_exact_n_xi", DEFAULT_NTX_EXACT_N_XI)
         if n_theta is not None:
             neoclassical["ntx_exact_n_theta"] = int(n_theta)
         if n_zeta is not None:
@@ -923,11 +923,9 @@ def main():
 
             if rhs_mode == args.rhs_modes[0]:
                 print(f"[benchmark] active_flux_model={active_flux_model}")
-                if active_flux_model == "ntx_exact_lij_runtime" and (
-                    args.ntx_n_theta is not None or args.ntx_n_zeta is not None or args.ntx_n_xi is not None
-                ):
+                if active_flux_model == "ntx_exact_lij_runtime":
                     print(
-                        "[benchmark] ntx exact runtime resolution overrides:",
+                        "[benchmark] ntx exact runtime resolution:",
                         f"n_theta={config['neoclassical'].get('ntx_exact_n_theta')}",
                         f"n_zeta={config['neoclassical'].get('ntx_exact_n_zeta')}",
                         f"n_xi={config['neoclassical'].get('ntx_exact_n_xi')}",

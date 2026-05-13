@@ -235,6 +235,90 @@ The most likely remaining outcomes should become:
 
 instead of the current mixed diagnostic state.
 
+## Updated Status: Correct `black_box` Branch
+
+One important benchmark bug was found after the earlier notes:
+
+- the benchmark wrapper was not actually overriding `radau_rhs_mode`
+- so some earlier "black_box" runs were still executing `lagged_response`
+
+This has now been fixed, and the true exact-runtime `black_box` one-step benchmark is now trustworthy.
+
+### Current trusted `black_box` result
+
+For exact-runtime `black_box` with `interpolate_center_response`, the real in-solver Newton trace now shows:
+
+- finite initial residual
+- finite stage states
+- finite stage residuals
+- finite Newton updates
+- no residual blowup
+- no nonfinite state
+- final residual still small (`~1e-6`)
+
+The step is currently rejected only because the final NTSS-style contraction estimate reaches:
+
+- `theta > 1`
+
+so the rejection is now a **controlled nonlinear rejection**, not a nonfinite physics failure and not stale solver bookkeeping.
+
+That is a much better state than before:
+
+- the old fake nonfinite classification is gone
+- the actual branch (`black_box`) is being exercised
+- the remaining question is now solver policy, not solver corruption
+
+## Next Step
+
+The next development step should be a focused acceptance-policy experiment on top of the now-correct NTSS-style Newton rejection logic.
+
+### Goal
+
+Decide whether transport should:
+
+1. remain **strictly NTSS-like**
+   - reject whenever the final contraction predictor says Newton is no longer reliable
+
+2. or allow a **relaxed near-converged acceptance**
+   - if the step is finite
+   - no residual blowup
+   - no nonfinite state
+   - and final nonlinear residual is already below a configurable relaxed tolerance
+
+### Recommended implementation experiment
+
+Add a configurable relaxed acceptance gate for Radau, for example:
+
+- keep NTSS-style predictor logic unchanged
+- but after Newton, if:
+  - `converged == False`
+  - `diverged == True` only because of slow contraction
+  - `nonfinite_stage_state == False`
+  - `nonfinite_stage_residual == False`
+  - `residual_blowup == False`
+  - `newton_nonfinite == False`
+  - `final_residual_norm <= relaxed_accept_tol`
+
+then classify the step as accepted anyway.
+
+This should be treated as a policy toggle rather than a replacement of the NTSS logic.
+
+### Why this is the right next step
+
+At this point the main uncertainty is no longer:
+
+- batching
+- exact-runtime NTX correctness
+- axis regularization
+- lagged-response corruption
+- or fake solver nonfinite bookkeeping
+
+The remaining uncertainty is:
+
+- whether strict NTSS-style rejection is too conservative for the transport problem when the nonlinear residual is already very small
+
+So the next benchmark should answer a policy question, not a debugging question.
+
 ## Benchmark Set A: One Step Attempt Only
 
 Run timing benchmarks for exactly one Radau step attempt, without mixing in repeated retries.
