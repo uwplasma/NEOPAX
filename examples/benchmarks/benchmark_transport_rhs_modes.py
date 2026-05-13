@@ -456,16 +456,60 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             else:
                 delta_transformed0 = delta_real0[None, :]
             _print_array_finiteness("initial_probe.radau.delta_transformed0", delta_transformed0)
+            def _explicit_newton_update(z_cur, label: str):
+                stages_cur = z_cur.reshape((num_stages, flat_state0.shape[0]))
+                stage_states_cur = flat_state0[None, :] + h_value * (a @ stages_cur)
+                stage_rhs_cur = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states_cur)
+                residual_cur = (stages_cur - stage_rhs_cur).reshape((-1,))
+                _print_array_finiteness(f"initial_probe.radau.stage_rhs{label}", stage_rhs_cur)
+                _print_array_finiteness(f"initial_probe.radau.residual{label}", residual_cur)
+
+                rhs_stages_cur = (-residual_cur).reshape((num_stages, flat_state0.shape[0]))
+                rhs_transformed_cur = radau_inv_transform @ rhs_stages_cur
+                _print_array_finiteness(f"initial_probe.radau.rhs_transformed{label}", rhs_transformed_cur)
+
+                rhs_real_cur = rhs_transformed_cur[0]
+                delta_real_cur = jax.scipy.linalg.lu_solve((real_lu, real_piv), rhs_real_cur)
+                _print_array_finiteness(f"initial_probe.radau.delta_real{label}", delta_real_cur)
+
+                delta_complex_rows_cur = []
+                rhs_complex_blocks_cur = rhs_transformed_cur[1:].reshape(
+                    (int(stage_cfg.complex_blocks.shape[0]), 2, flat_state0.shape[0])
+                )
+                for j in range(int(stage_cfg.complex_blocks.shape[0])):
+                    delta_complex_cur = jax.scipy.linalg.lu_solve(
+                        jax.scipy.linalg.lu_factor(complex_dense_all[j]),
+                        rhs_complex_blocks_cur[j].reshape((-1,)),
+                    ).reshape((2, flat_state0.shape[0]))
+                    _print_array_finiteness(f"initial_probe.radau.delta_complex{label}[{j}]", delta_complex_cur)
+                    delta_complex_rows_cur.append(delta_complex_cur)
+
+                if delta_complex_rows_cur:
+                    delta_transformed_cur = jnp.concatenate(
+                        [
+                            delta_real_cur[None, :],
+                            jnp.asarray(delta_complex_rows_cur).reshape(
+                                (2 * int(stage_cfg.complex_blocks.shape[0]), flat_state0.shape[0])
+                            ),
+                        ],
+                        axis=0,
+                    )
+                else:
+                    delta_transformed_cur = delta_real_cur[None, :]
+                _print_array_finiteness(f"initial_probe.radau.delta_transformed{label}", delta_transformed_cur)
+                delta_cur = (radau_transform @ delta_transformed_cur).reshape((-1,))
+                _print_array_finiteness(f"initial_probe.radau.delta{label}", delta_cur)
+                z_next = z_cur + delta_cur
+                _print_array_finiteness(f"initial_probe.radau.z_next{label}", z_next)
+                return z_next
+
             delta0 = (radau_transform @ delta_transformed0).reshape((-1,))
             _print_array_finiteness("initial_probe.radau.delta0", delta0)
             z1 = z0 + delta0
             _print_array_finiteness("initial_probe.radau.z1", z1)
-            stages1 = z1.reshape((num_stages, flat_state0.shape[0]))
-            stage_states1 = flat_state0[None, :] + h_value * (a @ stages1)
-            stage_rhs1 = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states1)
-            residual1 = (stages1 - stage_rhs1).reshape((-1,))
-            _print_array_finiteness("initial_probe.radau.stage_rhs1", stage_rhs1)
-            _print_array_finiteness("initial_probe.radau.residual1", residual1)
+            z2 = _explicit_newton_update(z1, "1")
+            z3 = _explicit_newton_update(z2, "2")
+            _print_array_finiteness("initial_probe.radau.z3", z3)
     print("[benchmark] initial_probe: end")
 
 
