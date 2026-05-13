@@ -116,6 +116,8 @@ def _build_config(
     radau_newton_residual_norm: str,
     debug_initial_finiteness: bool = False,
     single_attempt: bool = False,
+    max_steps: int | None = None,
+    stop_after_accepted_steps: int | None = None,
 ):
     config = NEOPAX.prepare_config(config_path, backend=backend, device=device)
     config = copy.deepcopy(config)
@@ -172,6 +174,11 @@ def _build_config(
     if single_attempt:
         solver["max_steps"] = 1
         solver.pop("stop_after_accepted_steps", None)
+    else:
+        if max_steps is not None:
+            solver["max_steps"] = int(max_steps)
+        if stop_after_accepted_steps is not None:
+            solver["stop_after_accepted_steps"] = int(stop_after_accepted_steps)
 
     transport_output = config.setdefault("transport_output", {})
     transport_output["transport_plot"] = False
@@ -843,6 +850,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override transport_solver.max_steps for the benchmark run. "
+            "Ignored when --single-attempt is used."
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-accepted-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override transport_solver.stop_after_accepted_steps for the benchmark run. "
+            "Useful to allow retries and stop after the first accepted step. "
+            "Ignored when --single-attempt is used."
+        ),
+    )
+    parser.add_argument(
         "--debug-initial-finiteness",
         action="store_true",
         help=(
@@ -893,6 +919,8 @@ def main():
     print(f"[benchmark] compute_final_state_delta={args.compute_final_state_delta}")
     print(f"[benchmark] debug_lagged_timing={args.debug_lagged_timing}")
     print(f"[benchmark] single_attempt={args.single_attempt}")
+    print(f"[benchmark] max_steps_override={args.max_steps}")
+    print(f"[benchmark] stop_after_accepted_steps_override={args.stop_after_accepted_steps}")
     print(f"[benchmark] debug_initial_finiteness={args.debug_initial_finiteness}")
     print(f"[benchmark] rhs_modes={args.rhs_modes}")
 
@@ -919,6 +947,8 @@ def main():
                 radau_newton_residual_norm=args.radau_newton_residual_norm,
                 debug_initial_finiteness=args.debug_initial_finiteness,
                 single_attempt=args.single_attempt,
+                max_steps=args.max_steps,
+                stop_after_accepted_steps=args.stop_after_accepted_steps,
             )
 
             if rhs_mode == args.rhs_modes[0]:
