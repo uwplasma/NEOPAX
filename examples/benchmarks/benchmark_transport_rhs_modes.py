@@ -292,6 +292,18 @@ def _print_tree_finiteness(prefix: str, tree) -> None:
         _print_array_finiteness(f"{prefix}.{_path_to_suffix(path)}", leaf)
 
 
+def _print_axis_window(label: str, arr, n_cols: int = 4) -> None:
+    arr_np = np.asarray(jax.device_get(arr))
+    if arr_np.ndim == 0:
+        print(f"[benchmark] {label}: value={arr_np.item()}")
+        return
+    if arr_np.ndim == 1:
+        print(f"[benchmark] {label}: first={arr_np[:n_cols].tolist()}")
+        return
+    window = arr_np[..., :n_cols]
+    print(f"[benchmark] {label}: first_cols={window.tolist()}")
+
+
 def _decode_packed_flat_index(flat_idx: int, packed_density_shape, packed_pressure_shape, packed_er_shape):
     density_size = int(np.prod(packed_density_shape))
     pressure_size = int(np.prod(packed_pressure_shape))
@@ -447,6 +459,39 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             )
             if lagged_response0 is not None:
                 _print_tree_finiteness("initial_probe.radau.lagged_response0", lagged_response0)
+                if shared_flux_model is not None and hasattr(shared_flux_model, "evaluate_with_lagged_response"):
+                    lagged_center_fluxes = shared_flux_model.evaluate_with_lagged_response(
+                        working_state,
+                        lagged_response0.flux_response,
+                    )
+                    _print_tree_finiteness("initial_probe.lagged_center_flux", lagged_center_fluxes)
+                    if temperature_eq is not None:
+                        lagged_temp_debug = temperature_eq.debug_components(working_state, fluxes=lagged_center_fluxes)
+                        _print_tree_finiteness("initial_probe.lagged_temperature", lagged_temp_debug)
+                        for key in (
+                            "Q_faces",
+                            "Gamma_neo_faces",
+                            "Gamma_turb_faces",
+                            "convective_neo_faces",
+                            "convective_turb_faces",
+                            "thermal_flux_rhs",
+                            "pressure_rhs",
+                        ):
+                            if key in lagged_temp_debug:
+                                _print_axis_window(f"initial_probe.lagged_temperature.{key}", lagged_temp_debug[key])
+                        if center_fluxes is not None:
+                            direct_temp_debug = temperature_eq.debug_components(working_state, fluxes=center_fluxes)
+                            for key in (
+                                "Q_faces",
+                                "Gamma_neo_faces",
+                                "Gamma_turb_faces",
+                                "convective_neo_faces",
+                                "convective_turb_faces",
+                                "thermal_flux_rhs",
+                                "pressure_rhs",
+                            ):
+                                if key in direct_temp_debug:
+                                    _print_axis_window(f"initial_probe.direct_temperature.{key}", direct_temp_debug[key])
 
             def _stage_eval_flat(t_value, flat_y):
                 if lagged_response0 is not None:
