@@ -529,6 +529,30 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             newton_shrink_num = jnp.asarray(0.8, dtype=dtype)
             newton_shrink_min = jnp.asarray(0.1, dtype=dtype)
             newton_shrink_max = jnp.asarray(0.5, dtype=dtype)
+            residual_norm_mode = str(solver_cfg.get("radau_newton_residual_norm", "raw")).strip().lower()
+            newton_tol_mode = str(solver_cfg.get("radau_newton_tol_mode", "residual")).strip().lower()
+            fnewt_mode = str(solver_cfg.get("radau_newton_fnewt_mode", "tol")).strip().lower()
+            use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
+            use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss"}
+            use_hairer_scaled_correction = use_hairer_newton_tol or fnewt_mode in {"hairer", "hairer_like", "ntss"}
+            residual_size_sqrt = jnp.sqrt(jnp.asarray(num_stages * flat_state0.shape[0], dtype=dtype))
+            state_scale_base = jnp.asarray(solver_cfg.get("atol", 1.0e-8), dtype=dtype) + jnp.asarray(
+                solver_cfg.get("rtol", 1.0e-6), dtype=dtype
+            ) * jnp.abs(flat_state0)
+            stage_scale = jnp.broadcast_to(jnp.maximum(state_scale_base, tiny_scalar)[None, :], (num_stages, flat_state0.shape[0])).reshape((-1,))
+
+            def _residual_norm_value(residual_vec):
+                raw_norm = jnp.linalg.norm(residual_vec)
+                return jnp.where(
+                    use_rms_residual_norm,
+                    raw_norm / jnp.maximum(residual_size_sqrt, jnp.asarray(1.0, dtype=dtype)),
+                    raw_norm,
+                )
+
+            def _correction_norm_value(delta_vec):
+                raw_norm = jnp.linalg.norm(delta_vec)
+                scaled_norm = jnp.sqrt(jnp.mean((delta_vec / stage_scale) * (delta_vec / stage_scale)) + tiny_scalar)
+                return jnp.where(use_hairer_scaled_correction, scaled_norm, raw_norm)
 
             def _residual_flat(z_flat):
                 stages = z_flat.reshape((num_stages, flat_state0.shape[0]))
@@ -567,7 +591,21 @@ def _print_initial_finiteness_probe(config: dict) -> None:
 
             predictor_defect_floor = jnp.asarray(1.0e-4, dtype=dtype)
             predictor_defect_cap = jnp.asarray(20.0, dtype=dtype)
-            predictor_fnewt = jnp.asarray(3.0e-2, dtype=dtype)
+            if fnewt_mode in {"hairer", "hairer_like", "ntss"}:
+                uround = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+                expmns = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+                safe_rtol = jnp.maximum(jnp.asarray(solver_cfg.get("rtol", 1.0e-6), dtype=dtype), uround * 10.0)
+                rtol1 = jnp.asarray(0.1, dtype=dtype) * (safe_rtol ** expmns)
+                expmi = jnp.asarray(1.0, dtype=dtype) / expmns
+                predictor_fnewt = jnp.maximum(
+                    jnp.asarray(10.0, dtype=dtype) * uround / rtol1,
+                    jnp.minimum(
+                        jnp.asarray(3.0e-2, dtype=dtype),
+                        rtol1 ** (expmi - jnp.asarray(1.0, dtype=dtype)),
+                    ),
+                )
+            else:
+                predictor_fnewt = jnp.maximum(tol, tiny_scalar)
 
             def _probe_body(newton_state):
                 (
@@ -575,7 +613,8 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                     z_cur,
                     delta_norm,
                     residual_norm,
-                    prev_delta_norm,
+                    prev_newton_norm,
+                    newton_metric,
                     prev_theta_ratio,
                     theta_est,
                     diverged,
@@ -588,10 +627,11 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 delta = _stage_solver(-residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
                 z_next = z_cur + delta
-                current_residual_norm = jnp.linalg.norm(residual_cur)
+                current_residual_norm = _residual_norm_value(residual_cur)
                 current_delta_norm = jnp.linalg.norm(delta)
-                safe_prev_delta = jnp.maximum(prev_delta_norm, tiny_scalar)
-                theta_raw = current_delta_norm / safe_prev_delta
+                current_newton_norm = _correction_norm_value(delta)
+                safe_prev_delta = jnp.maximum(prev_newton_norm, tiny_scalar)
+                theta_raw = current_newton_norm / safe_prev_delta
                 newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
                 theta_candidate = jnp.where(
                     newton_iter_num == 2,
@@ -606,13 +646,13 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 nonfinite_state = jnp.logical_not(
                     jnp.logical_and(
                         jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
-                        jnp.isfinite(current_delta_norm),
+                        jnp.logical_and(jnp.isfinite(current_delta_norm), jnp.isfinite(current_newton_norm)),
                     )
                 )
                 predictor_active = jnp.logical_and(theta_valid, newton_iter_num < maxiter)
                 remaining_iters = jnp.maximum(maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
                 faccon = theta_candidate / jnp.maximum(jnp.asarray(1.0, dtype=dtype) - theta_candidate, tiny_scalar)
-                predicted_defect = faccon * current_delta_norm * (theta_candidate ** remaining_iters) / predictor_fnewt
+                predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / predictor_fnewt
                 qnewt = jnp.clip(predicted_defect, predictor_defect_floor, predictor_defect_cap)
                 predictor_exponent = -jnp.asarray(1.0, dtype=dtype) / (jnp.asarray(maxiter + 3, dtype=dtype) - newton_iter_num.astype(dtype))
                 predictor_shrink = jnp.clip(
@@ -628,6 +668,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                         jnp.asarray(True),
                     ),
                 )
+                convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
                 predictor_shrink = jnp.where(theta_candidate < theta_diverge_threshold, predictor_shrink, jnp.asarray(0.5, dtype=dtype))
                 shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
                 diverged_next = jnp.logical_or(
@@ -642,7 +683,8 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                     z_next,
                     current_delta_norm,
                     current_residual_norm,
-                    current_delta_norm,
+                    current_newton_norm,
+                    convergence_metric,
                     theta_ratio_next,
                     theta_next,
                     diverged_next,
@@ -653,13 +695,18 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 )
 
             def _probe_cond(newton_state):
-                iter_idx, _, delta_norm, residual_norm, _, _, _, diverged, _, _, _, _ = newton_state
-                active = jnp.logical_or(residual_norm > tol, delta_norm > tol)
+                iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+                active = jnp.where(
+                    use_hairer_newton_tol,
+                    newton_metric > predictor_fnewt,
+                    jnp.logical_or(residual_norm > tol, delta_norm > tol),
+                )
                 return jnp.logical_and(jnp.logical_and(iter_idx < maxiter, active), jnp.logical_not(diverged))
 
             probe_init = (
                 jnp.asarray(0, dtype=jnp.int32),
                 z0,
+                jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(jnp.inf, dtype=dtype),
@@ -672,7 +719,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 jnp.asarray(False),
             )
             probe_final = jax.lax.while_loop(_probe_cond, _probe_body, probe_init)
-            probe_iter, probe_z, probe_delta_norm, probe_residual_norm, _probe_prev_delta, _probe_prev_theta_ratio, probe_theta, probe_diverged, _probe_shrink_suggest, probe_slow_any, probe_blowup_any, probe_nonfinite_any = probe_final
+            probe_iter, probe_z, probe_delta_norm, probe_residual_norm, _probe_prev_newton, probe_newton_metric, _probe_prev_theta_ratio, probe_theta, probe_diverged, _probe_shrink_suggest, probe_slow_any, probe_blowup_any, probe_nonfinite_any = probe_final
             probe_final_residual = _residual_flat(probe_z)
             _print_array_finiteness("initial_probe.radau.while_loop_z", probe_z)
             _print_array_finiteness("initial_probe.radau.while_loop_final_residual", probe_final_residual)
@@ -681,6 +728,9 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 f"iter={int(probe_iter)}",
                 f"delta_norm={float(probe_delta_norm):.6e}",
                 f"residual_norm={float(probe_residual_norm):.6e}",
+                f"newton_metric={float(probe_newton_metric):.6e}",
+                f"newton_tol_mode={newton_tol_mode}",
+                f"predictor_fnewt={float(predictor_fnewt):.6e}",
                 f"theta={float(probe_theta):.6e}",
                 f"diverged={bool(probe_diverged)}",
                 f"slow_any={bool(probe_slow_any)}",

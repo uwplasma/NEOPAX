@@ -848,6 +848,123 @@ Now we can test three distinct policies more cleanly:
 2. Hairer-like predictor scaling from `rtol`
 3. later, if desired, a relaxed near-converged acceptance override
 
+## Current State: Newton Tolerance Modes
+
+The previous `radau_newton_fnewt_mode` change by itself was **not** enough to make the custom solver match Hairer/NTSS Newton stopping behavior.
+
+The reason is:
+
+- `radau_newton_fnewt_mode` only changed how `predictor_fnewt` was computed
+- it did **not** initially change the actual Newton stopping rule
+- the true Newton stop condition in NEOPAX was still:
+  - residual norm compared against `nonlinear_solver_tol`
+
+This has now been corrected.
+
+### New solver toggle
+
+The solver now has a second explicit control:
+
+- `radau_newton_tol_mode = "residual" | "hairer"`
+
+Accepted aliases for the Hairer-style mode also include:
+
+- `"hairer_like"`
+- `"ntss"`
+
+### Mode meanings
+
+1. `radau_newton_tol_mode = "residual"`
+   - keep the NEOPAX-style Newton stop condition
+   - Newton continues while:
+     - residual norm is above `nonlinear_solver_tol`
+     - or update norm is above `nonlinear_solver_tol`
+
+2. `radau_newton_tol_mode = "hairer"`
+   - use a Hairer/NTSS-style Newton stop condition
+   - Newton stops based on a **scaled Newton correction metric**
+   - this metric is compared against `predictor_fnewt`
+   - it does **not** use the raw residual norm as the primary Newton stopping test
+
+### Important conceptual correction
+
+In Hairer/NTSS Radau, the Newton solver is not controlled by:
+
+- a raw nonlinear residual norm threshold
+
+Instead it is controlled by:
+
+- a tolerance-like quantity `fnewt`
+- compared against a scaled correction/update metric
+
+So the current NEOPAX Hairer mode is intended to mirror that structure, not to reinterpret `fnewt` as a residual tolerance.
+
+## Current State: First Hairer-Mode Result
+
+The first retry-enabled exact realtime NTX benchmark using:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+
+showed a large behavioral change.
+
+### Observed behavior
+
+For the same low-resolution exact-runtime case:
+
+- `n_theta = 5`
+- `n_zeta = 21`
+- `n_xi = 33`
+
+the step was accepted immediately on the first attempt, with:
+
+- `accepted = True`
+- `converged = True`
+- `newton_iter_count = 2`
+- `final_time = 1.0e-8`
+- `final_residual_norm ~ 2.8e-6`
+- `final_delta_norm ~ 7.6e-5`
+- `predictor_fnewt ~ 4.77e-4`
+
+### Interpretation
+
+This is **not** a contradiction.
+
+It means:
+
+- the raw residual was still larger than the old direct tolerance `1e-7`
+- but the Hairer-style scaled correction metric was already small enough to satisfy the Newton stop rule
+
+So the new Hairer-mode acceptance is substantially less strict than the old direct residual-based Newton stopping rule.
+
+### Practical consequence
+
+For this exact realtime NTX case, the solver now appears able to:
+
+1. keep the original trial step size
+2. avoid the long retry cascade
+3. accept the first step under a more NTSS-like Newton stopping rule
+
+This is currently the strongest evidence that the previous retry-heavy behavior was at least partly caused by using a NEOPAX-specific residual stopping criterion rather than a Hairer-style correction stopping criterion.
+
+## Important Diagnostic Caveat
+
+The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.
+
+In the first Hairer-mode run:
+
+- the real solver trace showed:
+  - converged in 2 Newton iterations
+  - accepted first attempt
+- but the benchmark-side explicit Newton probe still reported the old longer rejection-style trace
+
+So at the moment:
+
+- the real `[radau-solver] ...` trace is the trustworthy source for actual solver behavior
+- the benchmark-side explicit Newton replication needs to be updated to use the same Newton stop rule and tolerance mode as the real solver
+
+Until that probe is synchronized, it should not be used as the authoritative source when `radau_newton_tol_mode = "hairer"`.
+
 ## Current State: Memory Limits
 
 The higher-resolution exact realtime NTX tests revealed two distinct memory pressure points.
@@ -917,6 +1034,20 @@ Goal:
 
 This is the cleanest next apples-to-apples solver-policy comparison.
 
+### Path 2b: Compare Newton tolerance modes directly
+
+Now that the solver also supports a true Hairer-style Newton stop rule, the more decisive comparison is:
+
+1. `radau_newton_tol_mode = "residual"`
+2. `radau_newton_tol_mode = "hairer"`
+
+with `radau_newton_fnewt_mode` chosen consistently in each case.
+
+Goal:
+
+- determine whether the retry cascade is mainly caused by the old residual-based Newton stopping rule
+- or whether additional acceptance-policy changes are still needed even after switching to Hairer-style correction-based stopping
+
 ### Path 3: Add relaxed near-converged acceptance
 
 Keep the predictor logic, but allow acceptance when:
@@ -952,12 +1083,17 @@ The most useful order for the next session is:
 2. compare:
    - `radau_newton_fnewt_mode = "tol"`
    - `radau_newton_fnewt_mode = "hairer"`
-3. measure:
+3. compare:
+   - `radau_newton_tol_mode = "residual"`
+   - `radau_newton_tol_mode = "hairer"`
+4. measure:
    - number of rejected attempts
    - accepted-step wall time
    - accepted `dt`
    - final accepted Newton iteration count
-4. only then decide whether a relaxed near-converged acceptance gate is still needed
+   - final accepted raw residual norm
+5. synchronize the benchmark-side explicit Newton probe with the real solver logic
+6. only then decide whether a relaxed near-converged acceptance gate is still needed
 
 This keeps the next comparisons interpretable and avoids mixing:
 
