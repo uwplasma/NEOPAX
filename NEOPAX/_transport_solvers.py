@@ -1912,7 +1912,19 @@ class RADAUSolver(_RadauSolverConfig):
             def _run(_):
                 return _attempt_step_lean(step_state)
 
-            return jax.lax.cond(failed, _skip, _run, operand=None)
+            step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
+            if debug_newton_trace:
+                jax.debug.print(
+                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged}",
+                    t_start=step_state.t,
+                    dt_try=step_state.dt,
+                    accepted=step_info.accepted,
+                    failed=step_info.failed,
+                    fail_code=step_info.fail_code,
+                    converged=step_info.converged,
+                    ordered=True,
+                )
+            return step_state_out, step_info
 
         step_state0 = _make_radau_initial_step_state(
             t0,
