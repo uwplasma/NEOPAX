@@ -266,7 +266,28 @@ def _print_tree_finiteness(prefix: str, tree) -> None:
         for key, value in tree.items():
             _print_array_finiteness(f"{prefix}.{key}", value)
         return
-    _print_array_finiteness(prefix, tree)
+    try:
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
+    except Exception:
+        _print_array_finiteness(prefix, tree)
+        return
+    if len(path_leaves) <= 1:
+        _print_array_finiteness(prefix, tree)
+        return
+
+    def _path_to_suffix(path) -> str:
+        parts = []
+        for entry in path:
+            key = getattr(entry, "key", None)
+            if key is None:
+                key = getattr(entry, "idx", None)
+            if key is None:
+                key = str(entry)
+            parts.append(str(key))
+        return ".".join(parts) if parts else "leaf"
+
+    for path, leaf in path_leaves:
+        _print_array_finiteness(f"{prefix}.{_path_to_suffix(path)}", leaf)
 
 
 def _print_initial_finiteness_probe(config: dict) -> None:
@@ -320,6 +341,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
 
     working_state, _ = equation_system._prepare_working_state(state)
     print("[benchmark] initial_probe: start")
+    print(f"[benchmark] initial_probe.radau_rhs_mode={config.get('transport_solver', {}).get('radau_rhs_mode', 'unset')}")
     _print_array_finiteness("initial_probe.state.Er", state.Er)
     _print_array_finiteness("initial_probe.working_state.Er", working_state.Er)
 
@@ -400,6 +422,8 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 if (use_transport_lagged_response and build_lagged_response is not None)
                 else None
             )
+            if lagged_response0 is not None:
+                _print_tree_finiteness("initial_probe.radau.lagged_response0", lagged_response0)
 
             def _stage_eval_flat(t_value, flat_y):
                 if lagged_response0 is not None:
@@ -421,6 +445,16 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             stage_states = flat_state0[None, :] + h_value * (a @ stages0)
             stage_times = t0 + c * h_value
             _print_array_finiteness("initial_probe.radau.stage_times", stage_times)
+            if lagged_response0 is not None:
+                direct_stage_rhs0 = flat_rhs(stage_times[0], stage_states[0])
+                lagged_stage_rhs0 = flat_rhs_with_lagged_response(stage_times[0], stage_states[0], lagged_response0)
+                direct_minus_lagged_stage_rhs0 = direct_stage_rhs0 - lagged_stage_rhs0
+                _print_array_finiteness("initial_probe.radau.direct_stage_rhs[0]", direct_stage_rhs0)
+                _print_array_finiteness("initial_probe.radau.lagged_stage_rhs[0]", lagged_stage_rhs0)
+                _print_array_finiteness(
+                    "initial_probe.radau.direct_minus_lagged_stage_rhs[0]",
+                    direct_minus_lagged_stage_rhs0,
+                )
             for i in range(num_stages):
                 stage_time_i = stage_times[i]
                 stage_state_i = stage_states[i]
