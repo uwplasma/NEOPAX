@@ -746,3 +746,221 @@ For each case, compare:
 4. exact NTX reconstructed `D13`
 
 Do the same for `D33` if needed, but `D13` is now the highest-priority residual discrepancy.
+
+## Current State: Exact Runtime Radau Retry Behavior
+
+The most important new result is that exact realtime NTX `black_box` transport is now confirmed to be **advanceable by Radau**, even under the old `nonlinear_solver_tol = 1e-7` acceptance setting.
+
+### What was shown
+
+Using:
+
+- exact realtime NTX
+- `rhs_mode = black_box`
+- retry-enabled benchmark run
+- `max_steps = 20`
+- `stop_after_accepted_steps = 1`
+
+the solver did the following:
+
+1. first attempted step was rejected
+2. several subsequent retries were also rejected
+3. after timestep reduction, a later retry converged and the step was accepted
+
+So the previous single-attempt rejection result should be interpreted as:
+
+- "the original trial step was too large for clean Newton convergence"
+
+not:
+
+- "the solver cannot advance the exact realtime NTX problem"
+
+### Concrete accepted-step result
+
+For the successful retry sequence at low exact-runtime resolution (`n_theta = 5`, `n_zeta = 21`, `n_xi = 33`):
+
+- multiple rejected attempts occurred first
+- the accepted step finally converged with:
+  - `accepted = True`
+  - `converged = True`
+  - `err_norm ~ 9.4e-13`
+  - `final_delta_norm ~ 7.1e-15`
+  - `final_residual_norm = 0`
+  - `theta_final ~ 8.4e-05`
+- the accepted time advance was:
+  - `final_time = 3.125e-10`
+
+This means the current Radau logic is conservative but not fundamentally broken for exact realtime NTX.
+
+### Updated interpretation
+
+The main remaining issue is now best framed as:
+
+1. **efficiency / conservatism**
+   - too many rejected attempts before acceptance
+2. **policy**
+   - whether the first few nearly-converged attempts should be accepted earlier
+3. **memory**
+   - higher exact-runtime resolutions can hit GPU OOM before or during the solver step
+
+It is no longer accurate to describe the exact realtime `black_box` case as simply "failing to converge."
+
+## Current State: `fnewt` Logic
+
+The custom Radau solver has now been extended so that the NTSS/Hairer-style `fnewt` predictor scale is no longer hardcoded.
+
+### New solver toggle
+
+The following TOML control now exists:
+
+- `radau_newton_fnewt_mode = "tol" | "hairer"`
+
+Accepted aliases for the Hairer-style mode also include:
+
+- `"hairer_like"`
+- `"ntss"`
+
+### Mode meanings
+
+1. `radau_newton_fnewt_mode = "tol"`
+   - uses `nonlinear_solver_tol` directly as the predictor scale
+   - this matches the previous simplified NEOPAX behavior
+
+2. `radau_newton_fnewt_mode = "hairer"`
+   - computes `fnewt` from the classic Hairer/NTSS formula using:
+     - `rtol`
+     - machine precision
+     - Radau stage count
+
+### Why this matters
+
+Before this change:
+
+- NEOPAX used:
+  - a very strict direct Newton acceptance tolerance (`nonlinear_solver_tol`)
+  - but a separate hardcoded predictor scale (`predictor_fnewt = 3e-2`)
+
+That mismatch was awkward.
+
+Now we can test three distinct policies more cleanly:
+
+1. strict direct tolerance with `fnewt` tied to `tol`
+2. Hairer-like predictor scaling from `rtol`
+3. later, if desired, a relaxed near-converged acceptance override
+
+## Current State: Memory Limits
+
+The higher-resolution exact realtime NTX tests revealed two distinct memory pressure points.
+
+### 1. Ambipolar post-init debug diagnostic
+
+With `debug_initial_finiteness = true`, the code performs an extra ambipolar scan diagnostic **after** successful root finding.
+
+This can OOM independently of the actual ambipolar solve.
+
+So:
+
+- successful `best_roots` computation does **not** guarantee the debug scan will fit
+
+### 2. Actual Radau transport solve
+
+At higher exact-runtime resolutions, the solver can also OOM during:
+
+- `solver.solve(...)`
+- inside the custom Radau saved loop
+
+This is a real transport-step memory issue, separate from ambipolarity.
+
+### Practical consequence
+
+For exact realtime NTX there are now two partially separate resource questions:
+
+1. can ambipolar initialization fit?
+2. can the actual Radau Newton step fit?
+
+This is why low-resolution exact-runtime runs are currently the safest place to compare acceptance-policy changes.
+
+## Possible Paths
+
+The next development work can proceed along several reasonable paths.
+
+### Path 1: Stay strict, accept retries
+
+Keep:
+
+- strict `nonlinear_solver_tol`
+- current slow-contraction rejection behavior
+- no relaxed acceptance override
+
+Interpretation:
+
+- exact realtime NTX is valid
+- the solver is just conservative and may need several retries
+
+Cost:
+
+- expensive wall time
+- many rejected attempts
+- poor practicality at higher resolution
+
+### Path 2: Compare `fnewt` policies directly
+
+Run the same exact-runtime retry-enabled benchmark with:
+
+1. `radau_newton_fnewt_mode = "tol"`
+2. `radau_newton_fnewt_mode = "hairer"`
+
+Goal:
+
+- determine whether Hairer-style predictor scaling reduces unnecessary retries
+- without changing the actual Newton convergence tolerance
+
+This is the cleanest next apples-to-apples solver-policy comparison.
+
+### Path 3: Add relaxed near-converged acceptance
+
+Keep the predictor logic, but allow acceptance when:
+
+- all states are finite
+- no blowup occurred
+- no nonfinite stage residual occurred
+- final residual is already sufficiently small
+
+Interpretation:
+
+- more pragmatic transport policy
+- less faithful to strict Hairer/NTSS rejection semantics
+
+This path should only be evaluated after Path 2, otherwise the source of improvement becomes ambiguous.
+
+### Path 4: Focus on memory rather than acceptance policy
+
+Use lower exact-runtime resolution and/or memory-saving settings to stabilize experimentation:
+
+- reduce `ntx_exact_n_theta/n_zeta/n_xi`
+- use ambipolar scan batching
+- consider rematerialization / batch-mode settings
+- avoid heavy debug diagnostics during high-resolution runs
+
+This path is required if the main goal becomes realistic production-resolution transport rather than solver-policy diagnosis.
+
+## Recommended Near-Term Order
+
+The most useful order for the next session is:
+
+1. keep a low-resolution exact realtime NTX case that is known to fit
+2. compare:
+   - `radau_newton_fnewt_mode = "tol"`
+   - `radau_newton_fnewt_mode = "hairer"`
+3. measure:
+   - number of rejected attempts
+   - accepted-step wall time
+   - accepted `dt`
+   - final accepted Newton iteration count
+4. only then decide whether a relaxed near-converged acceptance gate is still needed
+
+This keeps the next comparisons interpretable and avoids mixing:
+
+- acceptance-policy changes
+- predictor-scale changes
+- and memory-driven resolution changes

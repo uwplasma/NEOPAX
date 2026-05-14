@@ -1226,6 +1226,7 @@ class _RadauSolverConfig(TransportSolver):
     rhs_mode: str = "black_box"
     newton_divergence_mode: str = "legacy"
     newton_residual_norm: str = "raw"
+    newton_fnewt_mode: str = "tol"
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -1252,6 +1253,7 @@ class _RadauSolverConfig(TransportSolver):
         rhs_mode: str = "black_box",
         newton_divergence_mode: str = "legacy",
         newton_residual_norm: str = "raw",
+        newton_fnewt_mode: str = "tol",
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
@@ -1277,6 +1279,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
         object.__setattr__(self, "newton_divergence_mode", str(newton_divergence_mode).strip().lower())
         object.__setattr__(self, "newton_residual_norm", str(newton_residual_norm).strip().lower())
+        object.__setattr__(self, "newton_fnewt_mode", str(newton_fnewt_mode).strip().lower())
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -1406,6 +1409,7 @@ class RADAUSolver(_RadauSolverConfig):
         debug_newton_trace = bool(getattr(self, "debug_stage_markers", False))
         conservative_divergence = divergence_mode in {"conservative", "hairer_like", "hairer"}
         use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
+        fnewt_mode = str(getattr(self, "newton_fnewt_mode", "tol")).strip().lower()
         # Follow the Hairer/NTSS pattern more closely: use the Newton-correction
         # contraction estimate to predict the remaining defect, and turn that
         # into a controlled step rejection rather than an immediate "nonfinite"
@@ -1413,13 +1417,27 @@ class RADAUSolver(_RadauSolverConfig):
         theta_diverge_threshold = jnp.asarray(0.99 if conservative_divergence else 0.99, dtype=dtype)
         predictor_defect_floor = jnp.asarray(1.0e-4, dtype=dtype)
         predictor_defect_cap = jnp.asarray(20.0, dtype=dtype)
-        predictor_fnewt = jnp.asarray(3.0e-2, dtype=dtype)
         residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
         theta_clip_min = jnp.asarray(0.1, dtype=dtype)
         theta_clip_max = jnp.asarray(1.5, dtype=dtype)
         newton_shrink_num = jnp.asarray(0.8, dtype=dtype)
         newton_shrink_min = jnp.asarray(0.1, dtype=dtype)
         newton_shrink_max = jnp.asarray(0.5, dtype=dtype)
+        if fnewt_mode in {"hairer", "hairer_like", "ntss"}:
+            uround = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+            expmns = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+            safe_rtol = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround * 10.0)
+            rtol1 = jnp.asarray(0.1, dtype=dtype) * (safe_rtol ** expmns)
+            expmi = jnp.asarray(1.0, dtype=dtype) / expmns
+            predictor_fnewt = jnp.maximum(
+                jnp.asarray(10.0, dtype=dtype) * uround / rtol1,
+                jnp.minimum(
+                    jnp.asarray(3.0e-2, dtype=dtype),
+                    rtol1 ** (expmi - jnp.asarray(1.0, dtype=dtype)),
+                ),
+            )
+        else:
+            predictor_fnewt = jnp.maximum(jnp.asarray(self.tol, dtype=dtype), tiny_scalar)
         radau_transform = jnp.asarray(stage_cfg.transform, dtype=dtype)
         radau_inv_transform = jnp.asarray(stage_cfg.inv_transform, dtype=dtype)
         radau_real_eig = jnp.asarray(stage_cfg.real_eig, dtype=dtype)
@@ -1433,6 +1451,13 @@ class RADAUSolver(_RadauSolverConfig):
         complex_lu0 = jnp.broadcast_to(jnp.eye(complex_dim, dtype=dtype), (num_complex_pairs, complex_dim, complex_dim))
         complex_piv0 = jnp.broadcast_to(jnp.arange(complex_dim, dtype=jnp.int32), (num_complex_pairs, complex_dim))
         residual_size_sqrt = jnp.sqrt(jnp.asarray(num_stages * state_dim, dtype=dtype))
+
+        if debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] newton_fnewt_mode={mode} predictor_fnewt={fnewt:.6e}",
+                mode=fnewt_mode,
+                fnewt=predictor_fnewt,
+            )
 
         def _residual_norm_fn(residual_vec):
             raw_norm = jnp.linalg.norm(residual_vec)
@@ -2803,6 +2828,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             rhs_mode=str(_cfg_get("radau_rhs_mode", generic_rhs_mode)),
             newton_divergence_mode=str(_cfg_get("radau_newton_divergence_mode", "legacy")),
             newton_residual_norm=str(_cfg_get("radau_newton_residual_norm", "raw")),
+            newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
