@@ -1467,20 +1467,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if n_radius == 0:
             return map_fn(fn, radius_indices)
 
-        has_axis0 = (
-            n_radius >= 4
-            and int(radius_indices[0]) == 0
-            and bool(jnp.isclose(radius_coordinates[0], 0.0))
-        )
-        if not has_axis0:
+        if n_radius < 4:
             return map_fn(fn, radius_indices)
 
-        mapped_non_axis = map_fn(fn, radius_indices[1:])
-        mapped_with_placeholder = jax.tree_util.tree_map(
-            lambda arr: jnp.concatenate([arr[:1], arr], axis=0),
-            mapped_non_axis,
+        def _regularized_skip_axis(_):
+            mapped_non_axis = map_fn(fn, radius_indices[1:])
+            mapped_with_placeholder = jax.tree_util.tree_map(
+                lambda arr: jnp.concatenate([arr[:1], arr], axis=0),
+                mapped_non_axis,
+            )
+            return self._regularize_axis_radius0(mapped_with_placeholder, radius_coordinates)
+
+        def _direct_map(_):
+            return map_fn(fn, radius_indices)
+
+        return jax.lax.cond(
+            jnp.isclose(radius_coordinates[0], 0.0),
+            _regularized_skip_axis,
+            _direct_map,
+            operand=None,
         )
-        return self._regularize_axis_radius0(mapped_with_placeholder, radius_coordinates)
 
     def _regularize_center_fluxes_axis0(self, gamma, q, upar):
         regularized_fluxes = tuple(
