@@ -35,6 +35,7 @@ from NEOPAX._boundary_conditions import build_boundary_condition_model
 from NEOPAX._transport_equations import ComposedEquationSystem, build_equation_system
 from NEOPAX._transport_solvers import (
     _RADAU_STAGE_CONFIGS,
+    _electron_density_index,
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
     _flat_rhs_factory,
@@ -42,6 +43,7 @@ from NEOPAX._transport_solvers import (
     _lagged_response_hooks,
     _make_radau_stage_predictor,
     _make_solver_state_transform,
+    _pack_transport_state_arrays,
     _project_flat_state_if_needed,
     _project_state_to_quasi_neutrality,
 )
@@ -290,6 +292,25 @@ def _print_tree_finiteness(prefix: str, tree) -> None:
         _print_array_finiteness(f"{prefix}.{_path_to_suffix(path)}", leaf)
 
 
+def _decode_packed_flat_index(flat_idx: int, packed_density_shape, packed_pressure_shape, packed_er_shape):
+    density_size = int(np.prod(packed_density_shape))
+    pressure_size = int(np.prod(packed_pressure_shape))
+    er_size = int(np.prod(packed_er_shape))
+
+    if flat_idx < density_size:
+        local = np.unravel_index(flat_idx, packed_density_shape)
+        return "density", local
+    if flat_idx < density_size + pressure_size:
+        local_idx = flat_idx - density_size
+        local = np.unravel_index(local_idx, packed_pressure_shape)
+        return "pressure", local
+    if flat_idx < density_size + pressure_size + er_size:
+        local_idx = flat_idx - density_size - pressure_size
+        local = np.unravel_index(local_idx, packed_er_shape)
+        return "Er", local
+    return "unknown", (flat_idx,)
+
+
 def _print_initial_finiteness_probe(config: dict) -> None:
     runtime, state = build_runtime_context(config)
     if runtime.geometry is None or state is None:
@@ -396,6 +417,8 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 {},
                 project_flat=project_flat,
             )
+            packed_state0 = _pack_transport_state_arrays(solver_state0, runtime.species)
+            packed_density0, packed_pressure0, packed_er0 = packed_state0
             build_lagged_response, _ = _lagged_response_hooks(equation_system.vector_field)
             flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
                 unpack_flat,
@@ -455,6 +478,49 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                     "initial_probe.radau.direct_minus_lagged_stage_rhs[0]",
                     direct_minus_lagged_stage_rhs0,
                 )
+                nonfinite_stage0 = np.argwhere(~np.isfinite(np.asarray(jax.device_get(lagged_stage_rhs0)))).reshape((-1,))
+                if nonfinite_stage0.size > 0:
+                    eidx = _electron_density_index(runtime.species)
+                    packed_density_species_to_full = [
+                        full_idx
+                        for full_idx in range(int(solver_state0.density.shape[0]))
+                        if eidx is None or full_idx != int(eidx)
+                    ]
+                    for flat_idx in nonfinite_stage0[:12].tolist():
+                        component, local = _decode_packed_flat_index(
+                            int(flat_idx),
+                            packed_density0.shape,
+                            packed_pressure0.shape,
+                            packed_er0.shape,
+                        )
+                        extra = ""
+                        if component == "density":
+                            packed_species_idx = int(local[0])
+                            radial_idx = int(local[1])
+                            full_species_idx = packed_density_species_to_full[packed_species_idx]
+                            extra = (
+                                f" packed_species={packed_species_idx}"
+                                f" full_species={full_species_idx}"
+                                f" radial_idx={radial_idx}"
+                            )
+                        elif component == "pressure":
+                            species_idx = int(local[0])
+                            radial_idx = int(local[1])
+                            extra = f" species={species_idx} radial_idx={radial_idx}"
+                        elif component == "Er":
+                            radial_idx = int(local[0])
+                            extra = f" radial_idx={radial_idx}"
+                        direct_val = np.asarray(jax.device_get(direct_stage_rhs0))[flat_idx]
+                        lagged_val = np.asarray(jax.device_get(lagged_stage_rhs0))[flat_idx]
+                        print(
+                            "[benchmark] initial_probe.radau.lagged_nonfinite_index:",
+                            f"flat_idx={flat_idx}",
+                            f"component={component}",
+                            f"local_index={tuple(int(x) for x in local)}",
+                            extra,
+                            f"direct_value={direct_val}",
+                            f"lagged_value={lagged_val}",
+                        )
             for i in range(num_stages):
                 stage_time_i = stage_times[i]
                 stage_state_i = stage_states[i]
