@@ -38,6 +38,8 @@ from NEOPAX._transport_solvers import (
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
     _flat_rhs_factory,
+    _flat_rhs_with_lagged_response_factory,
+    _lagged_response_hooks,
     _make_radau_stage_predictor,
     _make_solver_state_transform,
     _project_flat_state_if_needed,
@@ -372,6 +374,16 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 {},
                 project_flat=project_flat,
             )
+            build_lagged_response, _ = _lagged_response_hooks(equation_system.vector_field)
+            flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+                unpack_flat,
+                equation_system.vector_field,
+                (runtime.species,),
+                {},
+                project_flat=project_flat,
+            )
+            rhs_mode_norm = str(solver_cfg.get("radau_rhs_mode", "black_box")).strip().lower()
+            use_transport_lagged_response = rhs_mode_norm in {"lagged_transport_response", "lagged_response"}
             dtype = flat_state0.dtype
             c = jnp.asarray(stage_cfg.c, dtype=dtype)
             a = jnp.asarray(stage_cfg.a, dtype=dtype)
@@ -383,6 +395,17 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             h_value = jnp.minimum(base_dt, t_final - t0)
             f0_flat = flat_rhs(t0, flat_state0)
             prev_stages = jnp.tile(f0_flat, num_stages)
+            lagged_response0 = (
+                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
+                if (use_transport_lagged_response and build_lagged_response is not None)
+                else None
+            )
+
+            def _stage_eval_flat(t_value, flat_y):
+                if lagged_response0 is not None:
+                    return flat_rhs_with_lagged_response(t_value, flat_y, lagged_response0)
+                return flat_rhs(t_value, flat_y)
+
             z0 = _make_radau_stage_predictor(
                 f0_flat,
                 prev_stages,
@@ -402,14 +425,14 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 stage_time_i = stage_times[i]
                 stage_state_i = stage_states[i]
                 projected_stage_i = _project_flat_state_if_needed(stage_state_i, project_flat)
-                stage_rhs_i = flat_rhs(stage_time_i, stage_state_i)
+                stage_rhs_i = _stage_eval_flat(stage_time_i, stage_state_i)
                 stage_residual_i = stages0[i] - stage_rhs_i
                 _print_array_finiteness(f"initial_probe.radau.stage_state[{i}]", stage_state_i)
                 _print_array_finiteness(f"initial_probe.radau.stage_state_projected[{i}]", projected_stage_i)
                 _print_array_finiteness(f"initial_probe.radau.stage_rhs[{i}]", stage_rhs_i)
                 _print_array_finiteness(f"initial_probe.radau.stage_residual[{i}]", stage_residual_i)
 
-            jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t0, y))(flat_state0)
+            jacobian_ref = jax.jacfwd(lambda y: _stage_eval_flat(t0, y))(flat_state0)
             _print_array_finiteness("initial_probe.radau.jacobian_ref", jacobian_ref)
 
             h_jacobian = h_value * jacobian_ref
@@ -438,7 +461,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
 
             radau_transform = jnp.asarray(stage_cfg.transform, dtype=dtype)
             radau_inv_transform = jnp.asarray(stage_cfg.inv_transform, dtype=dtype)
-            residual0 = (stages0 - jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)).reshape((-1,))
+            residual0 = (stages0 - jax.vmap(_stage_eval_flat, in_axes=(0, 0))(stage_times, stage_states)).reshape((-1,))
             _print_array_finiteness("initial_probe.radau.residual0", residual0)
             rhs_stages0 = (-residual0).reshape((num_stages, flat_state0.shape[0]))
             rhs_transformed0 = radau_inv_transform @ rhs_stages0
@@ -468,7 +491,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             def _explicit_newton_update(z_cur, label: str):
                 stages_cur = z_cur.reshape((num_stages, flat_state0.shape[0]))
                 stage_states_cur = flat_state0[None, :] + h_value * (a @ stages_cur)
-                stage_rhs_cur = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states_cur)
+                stage_rhs_cur = jax.vmap(_stage_eval_flat, in_axes=(0, 0))(stage_times, stage_states_cur)
                 residual_cur = (stages_cur - stage_rhs_cur).reshape((-1,))
                 _print_array_finiteness(f"initial_probe.radau.stage_rhs{label}", stage_rhs_cur)
                 _print_array_finiteness(f"initial_probe.radau.residual{label}", residual_cur)
@@ -557,7 +580,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
             def _residual_flat(z_flat):
                 stages = z_flat.reshape((num_stages, flat_state0.shape[0]))
                 stage_states = flat_state0[None, :] + h_value * (a @ stages)
-                evals = jax.vmap(flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+                evals = jax.vmap(_stage_eval_flat, in_axes=(0, 0))(stage_times, stage_states)
                 return (stages - evals).reshape((-1,))
 
             def _stage_solver(rhs):
