@@ -859,6 +859,9 @@ def _make_radau_initial_step_state(
         prev_error=jnp.asarray(1.0, dtype=dtype),
         prev_stages=jnp.tile(flat_rhs(t0, flat_state0), num_stages),
         prev_dt=jnp.asarray(0.0, dtype=dtype),
+        recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+        regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+        easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
         jacobian=jnp.zeros((state_dim, state_dim), dtype=dtype),
         cache_valid=jnp.asarray(False),
         cache_dt=jnp.asarray(0.0, dtype=dtype),
@@ -1098,8 +1101,60 @@ def _apply_radau_lean_timestep_controller(
 ):
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
     safe_error = jnp.maximum(err_norm, 1.0e-12)
-    growth = safety_factor * safe_error ** (-controller_alpha)
+    prev_error = jnp.maximum(step_state.prev_error, 1.0e-12)
+    controller_beta = jnp.asarray(0.08, dtype=dtype)
+    mild_growth = jnp.asarray(1.25, dtype=dtype)
+    moderate_growth = jnp.asarray(1.5, dtype=dtype)
+    cautious_regrowth = jnp.asarray(1.15, dtype=dtype)
+    strong_retry_shrink = jnp.asarray(0.6, dtype=dtype)
+    moderate_retry_shrink = jnp.asarray(0.8, dtype=dtype)
+    difficult_theta = jnp.asarray(0.03, dtype=dtype)
+    very_difficult_theta = jnp.asarray(0.10, dtype=dtype)
+    easy_theta = jnp.asarray(0.01, dtype=dtype)
+    easy_error = jnp.asarray(0.05, dtype=dtype)
+    growth = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta
     growth = jnp.clip(growth, min_step_factor, max_step_factor)
+    difficult_accept = jnp.logical_or(
+        slow_contraction,
+        jnp.logical_or(
+            theta_final >= difficult_theta,
+            newton_iter_count >= jnp.asarray(6, dtype=jnp.int32),
+        ),
+    )
+    very_difficult_accept = jnp.logical_or(
+        theta_final >= very_difficult_theta,
+        newton_iter_count >= jnp.asarray(8, dtype=jnp.int32),
+    )
+    easy_accept = jnp.logical_and(
+        jnp.logical_and(err_norm <= easy_error, theta_final <= easy_theta),
+        jnp.logical_and(newton_iter_count <= jnp.asarray(4, dtype=jnp.int32), jnp.logical_not(slow_contraction)),
+    )
+    difficulty_growth_cap = jnp.where(
+        very_difficult_accept,
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.where(
+            difficult_accept,
+            mild_growth,
+            moderate_growth,
+        ),
+    )
+    post_reject_growth_cap = jnp.where(
+        step_state.regrowth_cooldown > 0,
+        cautious_regrowth,
+        max_step_factor,
+    )
+    streak_growth_cap = jnp.where(
+        step_state.easy_growth_streak >= jnp.asarray(2, dtype=jnp.int32),
+        max_step_factor,
+        moderate_growth,
+    )
+    growth_cap = jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap))
+    growth = jnp.clip(growth, min_step_factor, growth_cap)
+    growth = jnp.where(
+        jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype)),
+        jnp.asarray(1.0, dtype=dtype),
+        growth,
+    )
     next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
     def _accept(_):
@@ -1107,6 +1162,12 @@ def _apply_radau_lean_timestep_controller(
         accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
+        regrowth_cooldown_next = jnp.maximum(step_state.regrowth_cooldown - jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+        easy_growth_streak_next = jnp.where(
+            easy_accept,
+            jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
         return _RadauStepState(
             t=t_new,
             y=accepted_y,
@@ -1115,6 +1176,9 @@ def _apply_radau_lean_timestep_controller(
             prev_error=safe_error,
             prev_stages=stage_history,
             prev_dt=trial_dt,
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=regrowth_cooldown_next,
+            easy_growth_streak=easy_growth_streak_next,
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1153,10 +1217,21 @@ def _apply_radau_lean_timestep_controller(
             jnp.asarray(2, dtype=jnp.int32),
             jnp.asarray(1, dtype=jnp.int32),
         )
-        reduced_dt = jnp.maximum(
+        retry_count_next = jnp.minimum(step_state.recent_reject_count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32))
+        retry_shrink = jnp.where(
+            retry_count_next >= jnp.asarray(3, dtype=jnp.int32),
+            strong_retry_shrink,
+            jnp.where(
+                retry_count_next >= jnp.asarray(2, dtype=jnp.int32),
+                moderate_retry_shrink,
+                jnp.asarray(1.0, dtype=dtype),
+            ),
+        )
+        reduced_dt_base = jnp.maximum(
             jnp.minimum(jnp.where(converged, next_dt, trial_dt * newton_shrink), trial_dt * jnp.asarray(0.5, dtype=dtype)),
             dt_min,
         )
+        reduced_dt = jnp.maximum(reduced_dt_base * retry_shrink, dt_min)
         status_next = jnp.asarray([0, 0, n_accepted], dtype=jnp.int32)
         fail_now = jnp.logical_and(reduced_dt <= dt_min * (1.0 + 1.0e-12), jnp.logical_not(accepted))
         fail_code_next = jnp.where(fail_now, code, jnp.asarray(0, dtype=jnp.int32))
@@ -1170,6 +1245,9 @@ def _apply_radau_lean_timestep_controller(
             prev_error=step_state.prev_error,
             prev_stages=step_state.prev_stages,
             prev_dt=step_state.prev_dt,
+            recent_reject_count=retry_count_next,
+            regrowth_cooldown=jnp.asarray(3, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1301,6 +1379,9 @@ class _RadauStepState:
     prev_error: Any
     prev_stages: Any
     prev_dt: Any
+    recent_reject_count: Any
+    regrowth_cooldown: Any
+    easy_growth_streak: Any
     jacobian: Any
     cache_valid: Any
     cache_dt: Any

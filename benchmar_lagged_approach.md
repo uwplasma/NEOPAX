@@ -982,6 +982,24 @@ So the Radau logic is now being updated so that:
 
 This should make the behavior more faithful to the intended Hairer/NTSS acceptance semantics and should reduce spurious rejected attempts near convergence.
 
+## Update: Low-Overhead NTSS-Like Controller Hysteresis
+
+The accepted-step controller was still using a very lean one-step error-growth rule, which made it prone to:
+
+- regrowing `dt` too aggressively immediately after difficult regions
+- repeated grow-fail-shrink oscillation
+- spending too long near zones that require sustained small timesteps
+
+To move this closer to the previously discussed NTSS/Hairer direction without adding JAX-unfriendly complexity, the controller has now been extended with scalar-history logic only:
+
+- mild PI-style history using the previous accepted-step error
+- post-rejection regrowth cooldown
+- stronger shrinkage after repeated rejected retries
+- accepted-step growth caps based on Newton difficulty (`theta`, iteration count, slow contraction)
+- an easy-step streak that only allows aggressive growth after several clearly comfortable accepted steps
+
+This keeps the implementation efficient for JAX because it adds only a few scalar fields to the Radau step state and uses `jnp.where(...)`-style controller algebra rather than dynamic branching or large history buffers.
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.
