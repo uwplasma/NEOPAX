@@ -1102,7 +1102,8 @@ def _apply_radau_lean_timestep_controller(
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
     safe_error = jnp.maximum(err_norm, 1.0e-12)
     prev_error = jnp.maximum(step_state.prev_error, 1.0e-12)
-    controller_beta = jnp.asarray(0.08, dtype=dtype)
+    controller_beta = jnp.asarray(0.4, dtype=dtype) * controller_alpha
+    controller_gamma = jnp.asarray(0.2, dtype=dtype) * controller_alpha
     mild_growth = jnp.asarray(1.25, dtype=dtype)
     moderate_growth = jnp.asarray(1.5, dtype=dtype)
     cautious_regrowth = jnp.asarray(1.15, dtype=dtype)
@@ -1112,7 +1113,28 @@ def _apply_radau_lean_timestep_controller(
     very_difficult_theta = jnp.asarray(0.10, dtype=dtype)
     easy_theta = jnp.asarray(0.01, dtype=dtype)
     easy_error = jnp.asarray(0.05, dtype=dtype)
-    growth = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta
+    prev_dt_safe = jnp.maximum(step_state.prev_dt, dt_min)
+    prev_dt_available = step_state.prev_dt > jnp.asarray(0.0, dtype=dtype)
+    step_ratio_prev = jnp.where(prev_dt_available, trial_dt / prev_dt_safe, jnp.asarray(1.0, dtype=dtype))
+    gustafsson_damping = jnp.where(
+        prev_dt_available,
+        jnp.clip(
+            jnp.where(
+                step_ratio_prev > jnp.asarray(1.0, dtype=dtype),
+                step_ratio_prev ** (-controller_gamma),
+                jnp.asarray(1.0, dtype=dtype),
+            ),
+            jnp.asarray(0.85, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        ),
+        jnp.asarray(1.0, dtype=dtype),
+    )
+    growth = (
+        safety_factor
+        * safe_error ** (-controller_alpha)
+        * prev_error ** controller_beta
+        * gustafsson_damping
+    )
     growth = jnp.clip(growth, min_step_factor, max_step_factor)
     difficult_accept = jnp.logical_or(
         slow_contraction,

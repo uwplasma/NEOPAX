@@ -1000,6 +1000,14 @@ To move this closer to the previously discussed NTSS/Hairer direction without ad
 
 This keeps the implementation efficient for JAX because it adds only a few scalar fields to the Radau step state and uses `jnp.where(...)`-style controller algebra rather than dynamic branching or large history buffers.
 
+The controller has now been pushed one step closer to the missing Hairer/NTSS ingredient by making the accepted-step growth formula itself more explicitly PI-like:
+
+- current accepted error
+- previous accepted error
+- and a light step-ratio damping term that suppresses immediate further growth after a recent accepted-step expansion
+
+This is still not a full classic Gustafsson controller, but it is closer in spirit than the earlier pure one-step error rule and remains cheap to trace/JIT in JAX.
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.
