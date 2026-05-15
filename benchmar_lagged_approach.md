@@ -947,6 +947,41 @@ For this exact realtime NTX case, the solver now appears able to:
 
 This is currently the strongest evidence that the previous retry-heavy behavior was at least partly caused by using a NEOPAX-specific residual stopping criterion rather than a Hairer-style correction stopping criterion.
 
+## Update: Slow-Theta Must Not Override Satisfied Hairer Convergence
+
+While reviewing the custom Radau Hairer-mode logic, an additional acceptance-policy bug became clear.
+
+The solver already computes the intended Hairer/NTSS-style Newton stop metric:
+
+- a scaled correction metric (`newton_metric`)
+- compared against `predictor_fnewt`
+
+However, the previous implementation still allowed:
+
+- `slow_contraction = True`
+
+to force:
+
+- `diverged = True`
+
+even on an iteration where:
+
+- `newton_metric <= predictor_fnewt`
+
+This is stricter than the intended Hairer/NTSS behavior.
+
+The correct interpretation is:
+
+- `theta` / slow contraction is a predictor of whether continuing Newton is worthwhile
+- but it should not overrule an iterate that has already satisfied the Newton correction criterion
+
+So the Radau logic is now being updated so that:
+
+- `slow_contraction` remains a diagnostic / retry predictor
+- but it only forces rejection when `newton_metric > predictor_fnewt`
+
+This should make the behavior more faithful to the intended Hairer/NTSS acceptance semantics and should reduce spurious rejected attempts near convergence.
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.

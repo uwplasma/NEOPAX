@@ -1674,15 +1674,19 @@ class RADAUSolver(_RadauSolverConfig):
                     ),
                 )
                 convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
+                meets_newton_tol = convergence_metric <= predictor_fnewt
                 predictor_shrink = jnp.where(theta_candidate < theta_diverge_threshold, predictor_shrink, jnp.asarray(0.5, dtype=dtype))
                 shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
-                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_contraction, jnp.logical_or(residual_blowup, nonfinite_state)))
+                slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
+                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
                 if debug_newton_trace:
                     jax.debug.print(
-                        "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
+                        "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
                         iter=iter_idx + 1,
                         delta_norm=current_delta_norm,
                         residual_norm=current_residual_norm,
+                        newton_metric=convergence_metric,
+                        fnewt=predictor_fnewt,
                         theta=theta_next,
                         slow=slow_contraction,
                         blowup=residual_blowup,
@@ -1764,7 +1768,7 @@ class RADAUSolver(_RadauSolverConfig):
             )
             if debug_newton_trace:
                 jax.debug.print(
-                    "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
+                    "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
                     iter=iter_final,
                     converged=converged,
                     diverged=diverged_final,
@@ -1773,6 +1777,8 @@ class RADAUSolver(_RadauSolverConfig):
                     nonfinite_stage_residual=nonfinite_stage_residual,
                     residual_norm=final_residual_norm,
                     delta_norm=delta_norm_final,
+                    newton_metric=newton_metric_final,
+                    fnewt=predictor_fnewt,
                     theta=theta_final,
                     slow=slow_contraction_final,
                     blowup=residual_blowup_final,
