@@ -1045,6 +1045,7 @@ def _make_radau_stage_predictor(
     h_value,
     c,
     dtype,
+    predictor_mode="current",
 ):
     base_guess = c[:, None] * f0[None, :]
     use_predictor = jnp.logical_and(
@@ -1054,8 +1055,22 @@ def _make_radau_stage_predictor(
     prev_stage_guess = prev_stages.reshape(base_guess.shape) * (
         h_value / jnp.maximum(prev_dt, jnp.asarray(1.0e-14, dtype=dtype))
     )
+    predictor_mode_norm = str(predictor_mode).strip().lower()
+    if predictor_mode_norm in {"default", "legacy"}:
+        predictor_mode_norm = "current"
+    if predictor_mode_norm not in {"current", "collocation"}:
+        raise ValueError(
+            "radau_predictor_mode must be one of: current, collocation"
+        )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
-    return jnp.where(use_predictor, blended_guess, base_guess).reshape((-1,))
+    prev_stage0 = prev_stages.reshape(base_guess.shape)[0]
+    collocation_guess = prev_stage_guess + c[:, None] * (f0 - prev_stage0)[None, :]
+    collocation_guess = (
+        jnp.asarray(0.9, dtype=dtype) * collocation_guess
+        + jnp.asarray(0.1, dtype=dtype) * base_guess
+    )
+    predictor_guess = collocation_guess if predictor_mode_norm == "collocation" else blended_guess
+    return jnp.where(use_predictor, predictor_guess, base_guess).reshape((-1,))
 
 
 def _apply_radau_lean_timestep_controller(
@@ -1389,6 +1404,7 @@ class _RadauSolverConfig(TransportSolver):
     newton_tol_mode: str = "residual"
     newton_fnewt_mode: str = "tol"
     controller_mode: str = "current"
+    predictor_mode: str = "current"
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -1418,6 +1434,7 @@ class _RadauSolverConfig(TransportSolver):
         newton_tol_mode: str = "residual",
         newton_fnewt_mode: str = "tol",
         controller_mode: str = "current",
+        predictor_mode: str = "current",
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
@@ -1461,6 +1478,21 @@ class _RadauSolverConfig(TransportSolver):
                 "radau_controller_mode must be one of: current, gustafsson"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
+        predictor_mode_norm = str(predictor_mode).strip().lower()
+        predictor_aliases = {
+            "default": "current",
+            "legacy": "current",
+            "stage_history": "current",
+            "extrapolated": "collocation",
+            "hairer": "collocation",
+            "ntss": "collocation",
+        }
+        predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
+        if predictor_mode_norm not in {"current", "collocation"}:
+            raise ValueError(
+                "radau_predictor_mode must be one of: current, collocation"
+            )
+        object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -1584,6 +1616,7 @@ class RADAUSolver(_RadauSolverConfig):
                 "Radau lagged transport response mode requires a vector field with "
                 "build_lagged_response(...) and evaluate_with_lagged_response(...)."
             )
+        predictor_mode = str(getattr(self, "predictor_mode", "current")).strip().lower()
         error_order = float(stage_cfg.embedded_order if stage_cfg.has_embedded_estimator else stage_cfg.order)
         controller_alpha = 0.7 / (error_order + 1.0)
         zero_scalar = jnp.asarray(0.0, dtype=dtype)
@@ -1698,6 +1731,7 @@ class RADAUSolver(_RadauSolverConfig):
                 h_value,
                 c,
                 dtype,
+                predictor_mode=predictor_mode,
             )
             finite_f0 = jnp.all(jnp.isfinite(f0))
             finite_z0 = jnp.all(jnp.isfinite(z0))
@@ -3064,6 +3098,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_tol_mode=str(_cfg_get("radau_newton_tol_mode", "residual")),
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
             controller_mode=str(_cfg_get("radau_controller_mode", "current")),
+            predictor_mode=str(_cfg_get("radau_predictor_mode", "current")),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),

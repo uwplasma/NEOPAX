@@ -1037,6 +1037,19 @@ This keeps the current path available for direct comparison and makes future ben
 - current controller behavior remains available unchanged
 - the more modern predictive controller can now be tested independently
 
+## Update: Preserve Current Predictor And Add Stronger Collocation Option
+
+The Radau stage predictor is also now being split into explicit modes so that predictor experiments can be benchmarked independently of controller changes:
+
+- `radau_predictor_mode = "current"`
+  - preserves the existing stage-history blend
+
+- `radau_predictor_mode = "collocation"`
+  - uses the previous accepted-step stage history more aggressively
+  - applies a collocation-style correction so the predicted stages are shifted to match the current step's fresh base slope `f(t_n, y_n)`
+
+This is intended as the next low-risk step toward a more mature Hairer/NTSS-like predictor while keeping the current predictor available as a stable comparison baseline.
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.
