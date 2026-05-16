@@ -849,6 +849,8 @@ def _make_radau_initial_step_state(
     real_piv0,
     complex_lu0,
     complex_piv0,
+    lagged_response_cache,
+    lagged_response_valid,
 ):
     state_dim = flat_state0.shape[0]
     return _RadauStepState(
@@ -862,6 +864,8 @@ def _make_radau_initial_step_state(
         recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
         regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
         easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+        lagged_response_cache=lagged_response_cache,
+        lagged_response_valid=lagged_response_valid,
         jacobian=jnp.zeros((state_dim, state_dim), dtype=dtype),
         cache_valid=jnp.asarray(False),
         cache_dt=jnp.asarray(0.0, dtype=dtype),
@@ -1272,6 +1276,8 @@ def _apply_radau_lean_timestep_controller(
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=regrowth_cooldown_next,
             easy_growth_streak=easy_growth_streak_next,
+            lagged_response_cache=step_state.lagged_response_cache,
+            lagged_response_valid=jnp.asarray(False),
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1284,6 +1290,8 @@ def _apply_radau_lean_timestep_controller(
             y=accepted_y,
             t=t_new,
             dt=trial_dt,
+            next_dt=next_dt_accept,
+            growth=growth,
             accepted=jnp.asarray(True),
             failed=jnp.asarray(False),
             fail_code=fail_code,
@@ -1345,6 +1353,8 @@ def _apply_radau_lean_timestep_controller(
                 jnp.asarray(2, dtype=jnp.int32),
             ),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_cache=step_state.lagged_response_cache,
+            lagged_response_valid=step_state.lagged_response_valid,
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1356,7 +1366,9 @@ def _apply_radau_lean_timestep_controller(
         ), _RadauStepInfo(
             y=step_state.y,
             t=step_state.t,
-            dt=jnp.asarray(0.0, dtype=dtype),
+            dt=trial_dt,
+            next_dt=reduced_dt,
+            growth=jnp.where(trial_dt > 0, reduced_dt / trial_dt, jnp.asarray(1.0, dtype=dtype)),
             accepted=jnp.asarray(False),
             failed=fail_now,
             fail_code=fail_code_next,
@@ -1514,6 +1526,8 @@ class _RadauStepState:
     recent_reject_count: Any
     regrowth_cooldown: Any
     easy_growth_streak: Any
+    lagged_response_cache: Any
+    lagged_response_valid: Any
     jacobian: Any
     cache_valid: Any
     cache_dt: Any
@@ -1530,9 +1544,11 @@ class _RadauStepInfo:
     y: Any
     t: Any
     dt: Any
-    accepted: Any
-    failed: Any
-    fail_code: Any
+    next_dt: Any = None
+    growth: Any = None
+    accepted: Any = None
+    failed: Any = None
+    fail_code: Any = None
     converged: Any = None
     err_norm: Any = None
     diverged: Any = None
@@ -1616,6 +1632,11 @@ class RADAUSolver(_RadauSolverConfig):
                 "Radau lagged transport response mode requires a vector field with "
                 "build_lagged_response(...) and evaluate_with_lagged_response(...)."
             )
+        initial_lagged_response = (
+            build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
+            if (use_transport_lagged_response and build_lagged_response is not None)
+            else None
+        )
         predictor_mode = str(getattr(self, "predictor_mode", "current")).strip().lower()
         error_order = float(stage_cfg.embedded_order if stage_cfg.has_embedded_estimator else stage_cfg.order)
         controller_alpha = 0.7 / (error_order + 1.0)
@@ -1717,10 +1738,14 @@ class RADAUSolver(_RadauSolverConfig):
             real_piv_cache,
             complex_lu_cache,
             complex_piv_cache,
+            lagged_response_cache,
+            lagged_response_valid,
         ):
             f0 = flat_rhs(t_value, flat_y)
             lagged_response = (
-                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
+                lagged_response_cache
+                if (use_transport_lagged_response and lagged_response_valid)
+                else build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
                 if (use_transport_lagged_response and build_lagged_response is not None)
                 else None
             )
@@ -2040,6 +2065,7 @@ class RADAUSolver(_RadauSolverConfig):
                 finite_f0,
                 finite_z0,
                 finite_initial_residual,
+                lagged_response,
             )
 
         def _attempt_step_lean(step_state: _RadauStepState):
@@ -2054,11 +2080,17 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
-                finite_f0, finite_z0, finite_initial_residual,
+                finite_f0, finite_z0, finite_initial_residual, lagged_response_out,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
                 step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv,
+                step_state.lagged_response_cache, step_state.lagged_response_valid,
+            )
+            step_state = dataclasses.replace(
+                step_state,
+                lagged_response_cache=lagged_response_out,
+                lagged_response_valid=jnp.asarray(use_transport_lagged_response),
             )
             return _apply_radau_lean_timestep_controller(
                 step_state=step_state,
@@ -2111,6 +2143,8 @@ class RADAUSolver(_RadauSolverConfig):
                     y=step_state.y,
                     t=step_state.t,
                     dt=jnp.asarray(0.0, dtype=dtype),
+                    next_dt=step_state.dt,
+                    growth=jnp.asarray(1.0, dtype=dtype),
                     accepted=jnp.asarray(False),
                     failed=failed,
                     fail_code=fail_code,
@@ -2137,13 +2171,16 @@ class RADAUSolver(_RadauSolverConfig):
             step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
             if debug_newton_trace:
                 jax.debug.print(
-                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged}",
+                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e}",
                     t_start=step_state.t,
                     dt_try=step_state.dt,
                     accepted=step_info.accepted,
                     failed=step_info.failed,
                     fail_code=step_info.fail_code,
                     converged=step_info.converged,
+                    err_norm=jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype),
+                    growth=jnp.asarray(1.0, dtype=dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=dtype),
+                    next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=dtype),
                     ordered=True,
                 )
             return step_state_out, step_info
@@ -2159,6 +2196,8 @@ class RADAUSolver(_RadauSolverConfig):
             real_piv0,
             complex_lu0,
             complex_piv0,
+            initial_lagged_response,
+            jnp.asarray(use_transport_lagged_response),
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1

@@ -1037,6 +1037,21 @@ This keeps the current path available for direct comparison and makes future ben
 - current controller behavior remains available unchanged
 - the more modern predictive controller can now be tested independently
 
+## Update: Reuse Lagged NTX Response Across Rejected Retries
+
+Another inefficiency was identified in the lagged-response Radau path:
+
+- the lagged NTX response is built from the base state at the start of an attempted timestep
+- if that timestep attempt is rejected, the retry starts from the same base state
+- so rebuilding the lagged response on every rejected retry is unnecessary
+
+The Radau step state now caches exactly one lagged-response object for the current base state:
+
+- reused across rejected retries from the same `t_n, y_n`
+- invalidated after an accepted step advances the base state
+
+This keeps the memory footprint bounded while removing repeated lagged-response rebuild cost in retry-heavy regions.
+
 ## Update: Preserve Current Predictor And Add Stronger Collocation Option
 
 The Radau stage predictor is also now being split into explicit modes so that predictor experiments can be benchmarked independently of controller changes:
@@ -1049,6 +1064,122 @@ The Radau stage predictor is also now being split into explicit modes so that pr
   - applies a collocation-style correction so the predicted stages are shifted to match the current step's fresh base slope `f(t_n, y_n)`
 
 This is intended as the next low-risk step toward a more mature Hairer/NTSS-like predictor while keeping the current predictor available as a stable comparison baseline.
+
+## Current Implemented Timestep / Retry Upgrades
+
+At this point the custom Radau path includes the following timestep-control and retry-related changes:
+
+1. Hairer/NTSS-style Newton stop rule
+
+- `radau_newton_tol_mode = "hairer"`
+- Newton convergence is controlled by a scaled correction metric (`newton_metric`)
+- this metric is compared against `predictor_fnewt`
+- the raw nonlinear residual is no longer the primary Newton stop criterion in Hairer mode
+
+2. Slow-theta rejection fix
+
+- `slow_contraction` no longer overrides an already-satisfied Hairer Newton convergence test
+- a step is not rejected just because the contraction predictor is pessimistic when `newton_metric <= predictor_fnewt`
+
+3. Improved attempt diagnostics
+
+- the per-attempt Radau debug line now prints:
+  - `t_start`
+  - `dt_try`
+  - `accepted`
+  - `failed`
+  - `fail_code`
+  - `converged`
+  - `err_norm`
+- this makes it much clearer when a retry happened because:
+  - Newton failed
+  - versus Newton converged but the embedded timestep error estimate rejected the step
+
+4. Current-controller scalar-history hysteresis
+
+- mild PI-like accepted-step growth update
+- post-rejection regrowth moderation
+- stronger shrinkage after repeated rejected retries
+- Newton-quality growth caps
+- easy-step streak logic for regrowth release
+
+This remains available as:
+
+- `radau_controller_mode = "current"`
+
+5. Optional predictive controller path
+
+- a separate more modern controller option now exists:
+  - `radau_controller_mode = "gustafsson"`
+- this uses:
+  - PI-style history
+  - a light predictive / Gustafsson-style proposal
+  - lighter post-rejection moderation
+  - Newton-quality growth caps as safety only
+
+6. Optional stronger stage predictor
+
+- `radau_predictor_mode = "current"`
+  - preserves the existing stage-history blend
+
+- `radau_predictor_mode = "collocation"`
+  - uses previous accepted-stage history more aggressively
+  - shifts that predictor using the fresh base slope at the current step start
+
+7. Reuse of lagged NTX response across rejected retries
+
+- the lagged-response Radau path now caches exactly one lagged NTX response for the current base state
+- if a timestep attempt is rejected and retried from the same `t_n, y_n`, that cached lagged response is reused
+- after an accepted step advances the state, the cached lagged response is invalidated
+
+This removes unnecessary lagged-response rebuild cost in retry-heavy regions while keeping memory bounded to one cached lagged response.
+
+## Remaining State-Of-The-Art Controller / Predictor Upgrades
+
+The current implementation is meaningfully closer to a mature adaptive Radau solver, but it is still not the final state-of-the-art controller path.
+
+The most relevant remaining upgrades are:
+
+1. A cleaner, more faithful Gustafsson accepted-step controller
+
+- reduce reliance on handcrafted cooldown/streak heuristics
+- let accepted-step growth be driven more directly by a polished history-aware formula
+
+2. Stronger collocation / extrapolated stage prediction
+
+- use previous accepted-stage history more faithfully
+- target fewer Newton iterations and larger accepted `dt`
+
+3. Better reuse across retries
+
+- especially reuse of transformed-block factorizations / decompositions when:
+  - the Jacobian is still valid
+  - `dt` changes only moderately
+
+4. Smoother Newton-quality weighting in timestep growth
+
+- replace some current hard caps / thresholds with more continuous quality weighting based on:
+  - `theta_final`
+  - `newton_iter_count`
+  - recent contraction difficulty
+
+5. Possible future comparison against another stiff family
+
+- especially variable-order BDF
+- not because Radau is wrong, but to learn whether the remaining step-count limit is mostly:
+  - controller/predictor quality
+  - or a deeper method-family issue for this transport problem
+
+Current practical recommendation:
+
+- keep the stiff transient solvability of Radau
+- benchmark:
+  - `radau_controller_mode = "current"` vs `radau_controller_mode = "gustafsson"`
+  - `radau_predictor_mode = "current"` vs `radau_predictor_mode = "collocation"`
+- then decide whether the next gain should come from:
+  - controller refinement
+  - stronger predictor logic
+  - or retry-side factorization reuse
 
 ## Important Diagnostic Caveat
 
@@ -1203,3 +1334,74 @@ This keeps the next comparisons interpretable and avoids mixing:
 - acceptance-policy changes
 - predictor-scale changes
 - and memory-driven resolution changes
+
+## Possible Future Lagged-Response Updates
+
+### Reuse cached lagged response across accepted steps
+
+Possible next optimization:
+
+- keep the cached lagged NTX response even after an accepted step
+- rebuild it only when the accepted state has drifted enough that the frozen lagged model is no longer trustworthy
+
+Why this may help:
+
+- `build_lagged_response(state)` depends on the transport state, not on `dt`
+- if successive accepted states are close, rebuilding the full lagged NTX response every step may be unnecessary
+- this is the natural extension of the already-implemented reuse across rejected retries
+
+Suggested control approach:
+
+- use a dedicated lagged-response reuse tolerance, separate from the ODE timestep `rtol`
+- monitor relative drift in important quantities such as:
+  - `Er`
+  - pressure / temperature
+  - possibly density
+  - ideally collisionality-related inputs such as `log_nu_star`
+- force rebuild if solver quality degrades, e.g.:
+  - more rejected attempts
+  - larger `theta`
+  - larger Newton iteration count
+
+This is conceptually similar to:
+
+- frozen-Jacobian / chord-method reuse
+- quasi-Newton refresh logic
+- trust-region style model-validity checks
+
+### Whole-response reuse is the safest next step
+
+With the current NTX call structure, the most practical next update is:
+
+- cache one lagged response for the current reference state
+- reuse it across accepted steps while a drift criterion is satisfied
+- rebuild the whole response once that criterion fails
+
+Why this is attractive:
+
+- it fits the current `build_lagged_response(state)` and `evaluate_with_lagged_response(state, lagged_response)` API well
+- it keeps implementation and memory overhead bounded
+- it is much lower risk than partially rebuilding only selected radii
+
+### Per-radius or per-anchor selective refresh
+
+Possible later refinement:
+
+- refresh only the radii or anchors whose local state drift exceeds a threshold
+- keep the rest of the cached lagged response unchanged
+
+Why this is harder:
+
+- the current lagged-response API builds a coherent full response object for all radii / anchors
+- there is no existing public interface for "rebuild only this subset of radii"
+- selective refresh would require masked replacement logic and more careful cache bookkeeping
+
+Still, it appears feasible because:
+
+- the full-radius branch is already built radius-by-radius internally
+- the coarse/interpolated branch is already built anchor-by-anchor internally
+
+Best implementation order:
+
+1. whole-response reuse across accepted steps
+2. optional per-radius / per-anchor masked refresh only if benchmarks justify the extra complexity
