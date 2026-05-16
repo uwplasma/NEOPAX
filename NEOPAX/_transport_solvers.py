@@ -1838,8 +1838,8 @@ class RADAUSolver(_RadauSolverConfig):
         max_total_steps = int(max(1, self.max_steps))
         state_dim = flat_state0.shape[0]
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
-        build_lagged_response, _ = _lagged_response_hooks(vector_field)
-        flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+        build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+        flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
             args=args,
@@ -1854,11 +1854,18 @@ class RADAUSolver(_RadauSolverConfig):
             )
         use_lagged_linear_response = rhs_mode == "lagged_linear_state"
         use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
-        if use_transport_lagged_response and build_lagged_response is None:
+        if use_transport_lagged_response and build_lagged_response_raw is None:
             raise ValueError(
                 "Radau lagged transport response mode requires a vector field with "
                 "build_lagged_response(...) and evaluate_with_lagged_response(...)."
             )
+        build_lagged_response = build_lagged_response_raw
+        flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
+        if use_transport_lagged_response:
+            # Compile the lagged NTX builder/evaluator as standalone executables once,
+            # rather than only as inlined Python call paths inside the Radau step.
+            build_lagged_response = jax.jit(build_lagged_response_raw)
+            flat_rhs_with_lagged_response = jax.jit(flat_rhs_with_lagged_response_raw)
         initial_lagged_response = (
             build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
             if (use_transport_lagged_response and build_lagged_response is not None)
