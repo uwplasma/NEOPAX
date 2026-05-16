@@ -1063,6 +1063,7 @@ def _run_saved_loop_debug_walltime(
     stop_after_accepted_steps=None,
     walltime_label="solver.attempt",
 ):
+    compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
     save_times = jnp.linspace(t0, t_final, save_n)
     ys_saved = jnp.zeros((save_n, state_dim), dtype=dtype)
     ts_saved = jnp.zeros((save_n,), dtype=dtype)
@@ -1106,7 +1107,7 @@ def _run_saved_loop_debug_walltime(
 
         attempt_idx = step_idx + 1
         start = time.perf_counter()
-        step_state, step_info = step_fn(step_state, None)
+        step_state, step_info = compiled_step_fn(step_state)
         step_state = jax.block_until_ready(step_state)
         step_info = jax.block_until_ready(step_info)
         elapsed = time.perf_counter() - start
