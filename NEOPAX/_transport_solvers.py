@@ -1114,6 +1114,7 @@ def _apply_radau_lean_timestep_controller(
     slow_contraction,
     residual_blowup,
     newton_nonfinite,
+    lagged_reused,
     fail_code,
     n_accepted,
     dtype,
@@ -1181,13 +1182,24 @@ def _apply_radau_lean_timestep_controller(
     )
     growth_predictive = jnp.clip(growth_predictive, min_step_factor, max_step_factor)
     use_gustafsson_controller = controller_mode == "gustafsson"
+    use_current_legacy_controller = controller_mode == "current_legacy"
     use_hairer_lean_controller = controller_mode == "hairer_lean"
     growth_lean = safety_factor * safe_error ** (-controller_alpha)
     growth_lean = jnp.clip(growth_lean, min_step_factor, max_step_factor)
+    growth_current_legacy = (
+        safety_factor
+        * safe_error ** (-controller_alpha)
+        * prev_error ** controller_beta
+    )
+    growth_current_legacy = jnp.clip(growth_current_legacy, min_step_factor, max_step_factor)
     growth = jnp.where(
         use_gustafsson_controller,
         jnp.minimum(growth_pi, growth_predictive),
-        jnp.where(use_hairer_lean_controller, growth_lean, growth_current),
+        jnp.where(
+            use_hairer_lean_controller,
+            growth_lean,
+            jnp.where(use_current_legacy_controller, growth_current_legacy, growth_current),
+        ),
     )
     difficult_accept = jnp.logical_or(
         slow_contraction,
@@ -1341,6 +1353,7 @@ def _apply_radau_lean_timestep_controller(
             dt=trial_dt,
             next_dt=next_dt_accept,
             growth=growth,
+            lagged_reused=lagged_reused,
             accepted=jnp.asarray(True),
             failed=jnp.asarray(False),
             fail_code=fail_code,
@@ -1419,6 +1432,7 @@ def _apply_radau_lean_timestep_controller(
             dt=trial_dt,
             next_dt=reduced_dt,
             growth=jnp.where(trial_dt > 0, reduced_dt / trial_dt, jnp.asarray(1.0, dtype=dtype)),
+            lagged_reused=lagged_reused,
             accepted=jnp.asarray(False),
             failed=fail_now,
             fail_code=fail_code_next,
@@ -1536,6 +1550,9 @@ class _RadauSolverConfig(TransportSolver):
             "legacy": "current",
             "heuristic": "current",
             "lean": "current",
+            "old_current": "current_legacy",
+            "pre_tuned": "current_legacy",
+            "ntss_quality": "current_legacy",
             "original": "hairer_lean",
             "simple": "hairer_lean",
             "pi": "gustafsson",
@@ -1543,9 +1560,9 @@ class _RadauSolverConfig(TransportSolver):
             "standard": "gustafsson",
         }
         controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
-        if controller_mode_norm not in {"current", "gustafsson", "hairer_lean"}:
+        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean"}:
             raise ValueError(
-                "radau_controller_mode must be one of: current, gustafsson, hairer_lean"
+                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
         predictor_mode_norm = str(predictor_mode).strip().lower()
@@ -1621,6 +1638,7 @@ class _RadauStepInfo:
     dt: Any
     next_dt: Any = None
     growth: Any = None
+    lagged_reused: Any = None
     accepted: Any = None
     failed: Any = None
     fail_code: Any = None
@@ -1818,8 +1836,10 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_reference_y_cache,
         ):
             f0 = flat_rhs(t_value, flat_y)
+            lagged_response_reused = jnp.asarray(False)
             if use_transport_lagged_response:
                 candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
+                lagged_response_reused = jnp.asarray(lagged_response_valid)
 
                 def _reuse_cached(_):
                     return lagged_response_cache
@@ -2160,6 +2180,7 @@ class RADAUSolver(_RadauSolverConfig):
                 finite_initial_residual,
                 lagged_response,
                 lagged_reference_y,
+                lagged_response_reused,
             )
 
         def _attempt_step_lean(step_state: _RadauStepState):
@@ -2174,7 +2195,7 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
-                finite_f0, finite_z0, finite_initial_residual, lagged_response_out, lagged_reference_y_out,
+                finite_f0, finite_z0, finite_initial_residual, lagged_response_out, lagged_reference_y_out, lagged_response_reused,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
@@ -2216,6 +2237,7 @@ class RADAUSolver(_RadauSolverConfig):
                 slow_contraction=slow_contraction_final,
                 residual_blowup=residual_blowup_final,
                 newton_nonfinite=newton_nonfinite_final,
+                lagged_reused=lagged_response_reused,
                 fail_code=fail_code,
                 n_accepted=n_accepted,
                 dtype=dtype,
@@ -2244,6 +2266,7 @@ class RADAUSolver(_RadauSolverConfig):
                     dt=jnp.asarray(0.0, dtype=dtype),
                     next_dt=step_state.dt,
                     growth=jnp.asarray(1.0, dtype=dtype),
+                    lagged_reused=jnp.asarray(False),
                     accepted=jnp.asarray(False),
                     failed=failed,
                     fail_code=fail_code,
@@ -2270,7 +2293,7 @@ class RADAUSolver(_RadauSolverConfig):
             step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
             if debug_newton_trace:
                 jax.debug.print(
-                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e}",
+                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused}",
                     t_start=step_state.t,
                     dt_try=step_state.dt,
                     accepted=step_info.accepted,
@@ -2280,6 +2303,7 @@ class RADAUSolver(_RadauSolverConfig):
                     err_norm=jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype),
                     growth=jnp.asarray(1.0, dtype=dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=dtype),
                     next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=dtype),
+                    lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
                     ordered=True,
                 )
             return step_state_out, step_info

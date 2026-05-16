@@ -1027,6 +1027,15 @@ To keep the recent solver behavior reproducible while still moving toward a more
   - preserves the existing NEOPAX controller logic
   - includes the current scalar-history hysteresis, Newton-quality growth caps, and recent-retry safeguards
 
+- `radau_controller_mode = "current_legacy"`
+  - preserves the earlier Newton-quality-aware timestep policy from before the later accepted-step tuning
+  - keeps:
+    - Newton-quality influence from `theta`, `slow_contraction`, and iteration count
+    - post-rejection cooldown
+    - easy-step streak / release logic
+  - but drops the later extra accepted-step damping around recent accepted-step expansions
+  - intended as the closest comparison point to the earlier behavior where easy Newton solves influenced `dt` more directly
+
 - `radau_controller_mode = "gustafsson"`
   - uses a cleaner predictive accepted-step update
   - combines a PI-style term with a light Gustafsson-like predictive proposal based on previous accepted-step history
@@ -1136,6 +1145,15 @@ This remains available as:
 - this is useful when:
   - the Newton-side Hairer changes are clearly helping
   - but the newer accepted-step controller heuristics are making `dt` recover too slowly or shrink after easy accepted steps
+
+5c. Optional earlier Newton-quality-aware controller path
+
+- a separate intermediate controller option now exists:
+  - `radau_controller_mode = "current_legacy"`
+- this is meant to approximate the earlier phase where:
+  - Hairer-style Newton acceptance was already in place
+  - slow/theta was being used as a timestep-quality signal
+  - but the later accepted-step tuning had not yet shifted the balance as much
 
 6. Optional stronger stage predictor
 
