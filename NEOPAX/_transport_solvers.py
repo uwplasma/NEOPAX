@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.special import roots_jacobi
 
+from ._transport_debug import debug_timing_start, debug_timing_end
+
 
 TIME_SOLVER_REGISTRY: dict[str, Callable[..., "TransportSolver"]] = {}
 
@@ -2188,6 +2190,8 @@ class RADAUSolver(_RadauSolverConfig):
             fail_code = status[STATUS_FAIL_CODE]
             n_accepted = status[STATUS_N_ACCEPTED]
             trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
+            if debug_newton_trace:
+                jax.debug.callback(lambda: debug_timing_start("radau.attempt"), ordered=True)
             (
                 trial_y, err_norm, converged, stage_history, theta_final,
                 newton_iter_count, final_residual_norm, final_delta_norm,
@@ -2208,7 +2212,7 @@ class RADAUSolver(_RadauSolverConfig):
                 lagged_response_valid=jnp.asarray(use_transport_lagged_response),
                 lagged_reference_y=lagged_reference_y_out,
             )
-            return _apply_radau_lean_timestep_controller(
+            step_state_next, step_info_next = _apply_radau_lean_timestep_controller(
                 step_state=step_state,
                 trial_dt=trial_dt,
                 trial_y=trial_y,
@@ -2254,6 +2258,9 @@ class RADAUSolver(_RadauSolverConfig):
                 lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                 project_flat=project_flat,
             )
+            if debug_newton_trace:
+                jax.debug.callback(lambda: debug_timing_end("radau.attempt"), ordered=True)
+            return step_state_next, step_info_next
 
         def step_fn(step_state: _RadauStepState, _):
             failed = step_state.status[STATUS_FAILED] != 0

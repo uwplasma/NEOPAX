@@ -38,3 +38,24 @@ def lagged_timing_end(label: str) -> None:
         count, start = stack.pop()
     elapsed = time.perf_counter() - start
     print(f"[lagged-timing] {label} end   #{count} elapsed_s={elapsed:.6f}", flush=True)
+
+
+def debug_timing_start(label: str) -> None:
+    now = time.perf_counter()
+    with _TIMER_LOCK:
+        count = _TIMER_COUNTS.get(label, 0) + 1
+        _TIMER_COUNTS[label] = count
+        stack = _TIMER_STACKS.setdefault(label, [])
+        stack.append((count, now))
+    print(f"[debug-timing] {label} start #{count}", flush=True)
+
+
+def debug_timing_end(label: str) -> None:
+    with _TIMER_LOCK:
+        stack = _TIMER_STACKS.get(label, [])
+        if not stack:
+            print(f"[debug-timing] {label} end #? (no-start)", flush=True)
+            return
+        count, start = stack.pop()
+    elapsed = time.perf_counter() - start
+    print(f"[debug-timing] {label} end   #{count} elapsed_s={elapsed:.6f}", flush=True)
