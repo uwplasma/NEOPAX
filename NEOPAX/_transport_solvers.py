@@ -9,12 +9,11 @@ Inspired by torax (https://github.com/google-deepmind/torax).
 from typing import Callable, Any
 import dataclasses
 import inspect
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.special import roots_jacobi
-
-from ._transport_debug import debug_timing_start, debug_timing_end
 
 
 TIME_SOLVER_REGISTRY: dict[str, Callable[..., "TransportSolver"]] = {}
@@ -1051,6 +1050,135 @@ def _run_saved_loop(
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
 
+def _run_saved_loop_debug_walltime(
+    *,
+    step_state0,
+    step_fn,
+    save_n,
+    t0,
+    t_final,
+    state_dim,
+    dtype,
+    max_total_steps,
+    stop_after_accepted_steps=None,
+    walltime_label="solver.attempt",
+):
+    save_times = jnp.linspace(t0, t_final, save_n)
+    ys_saved = jnp.zeros((save_n, state_dim), dtype=dtype)
+    ts_saved = jnp.zeros((save_n,), dtype=dtype)
+    dts_saved = jnp.zeros((save_n,), dtype=dtype)
+    accepted_mask_saved = jnp.zeros((save_n,), dtype=bool)
+    failed_mask_saved = jnp.zeros((save_n,), dtype=bool)
+    fail_codes_saved = jnp.zeros((save_n,), dtype=jnp.int32)
+    ys_saved = ys_saved.at[0].set(step_state0.y)
+    ts_saved = ts_saved.at[0].set(t0)
+    accepted_mask_saved = accepted_mask_saved.at[0].set(True)
+
+    step_state = step_state0
+    step_idx = 0
+    save_idx = jnp.asarray(1, dtype=jnp.int32)
+
+    last_attempt_accepted = jnp.asarray(False)
+    last_attempt_converged = jnp.asarray(False)
+    last_attempt_err_norm = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_fail_code = jnp.asarray(0, dtype=jnp.int32)
+    last_attempt_diverged = jnp.asarray(False)
+    last_attempt_nonfinite_stage_state = jnp.asarray(False)
+    last_attempt_nonfinite_stage_residual = jnp.asarray(False)
+    last_attempt_finite_f0 = jnp.asarray(True)
+    last_attempt_finite_z0 = jnp.asarray(True)
+    last_attempt_finite_initial_residual = jnp.asarray(True)
+    last_attempt_newton_iter_count = jnp.asarray(0, dtype=jnp.int32)
+    last_attempt_final_residual_norm = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_final_delta_norm = jnp.asarray(jnp.inf, dtype=dtype)
+    last_attempt_theta_final = jnp.asarray(0.0, dtype=dtype)
+    last_attempt_slow_contraction = jnp.asarray(False)
+    last_attempt_residual_blowup = jnp.asarray(False)
+    last_attempt_newton_nonfinite = jnp.asarray(False)
+
+    while True:
+        active = bool(jax.device_get(_custom_loop_active(step_state, t_final, jnp.asarray(step_idx, dtype=jnp.int32), max_total_steps)))
+        if stop_after_accepted_steps is not None:
+            limit_hit = bool(jax.device_get(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)))
+            active = active and (not limit_hit)
+        if not active:
+            break
+
+        attempt_idx = step_idx + 1
+        start = time.perf_counter()
+        step_state, step_info = step_fn(step_state, None)
+        step_state = jax.block_until_ready(step_state)
+        step_info = jax.block_until_ready(step_info)
+        elapsed = time.perf_counter() - start
+        print(f"[debug-walltime] {walltime_label} #{attempt_idx} elapsed_s={elapsed:.6f}", flush=True)
+
+        save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_saved_slots(
+            save_idx,
+            save_times,
+            step_info.t,
+            step_info.y,
+            step_info.dt,
+            step_info.accepted,
+            step_info.failed,
+            step_info.fail_code,
+            ys_saved,
+            ts_saved,
+            dts_saved,
+            accepted_mask_saved,
+            failed_mask_saved,
+            fail_codes_saved,
+        )
+
+        last_attempt_accepted = jnp.asarray(step_info.accepted)
+        last_attempt_converged = jnp.asarray(False if getattr(step_info, "converged", None) is None else getattr(step_info, "converged"))
+        last_attempt_err_norm = jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype)
+        last_attempt_fail_code = jnp.asarray(step_info.fail_code, dtype=jnp.int32)
+        last_attempt_diverged = jnp.asarray(False if getattr(step_info, "diverged", None) is None else getattr(step_info, "diverged"))
+        last_attempt_nonfinite_stage_state = jnp.asarray(False if getattr(step_info, "nonfinite_stage_state", None) is None else getattr(step_info, "nonfinite_stage_state"))
+        last_attempt_nonfinite_stage_residual = jnp.asarray(False if getattr(step_info, "nonfinite_stage_residual", None) is None else getattr(step_info, "nonfinite_stage_residual"))
+        last_attempt_finite_f0 = jnp.asarray(True if getattr(step_info, "finite_f0", None) is None else getattr(step_info, "finite_f0"))
+        last_attempt_finite_z0 = jnp.asarray(True if getattr(step_info, "finite_z0", None) is None else getattr(step_info, "finite_z0"))
+        last_attempt_finite_initial_residual = jnp.asarray(True if getattr(step_info, "finite_initial_residual", None) is None else getattr(step_info, "finite_initial_residual"))
+        last_attempt_newton_iter_count = jnp.asarray(0 if getattr(step_info, "newton_iter_count", None) is None else getattr(step_info, "newton_iter_count"), dtype=jnp.int32)
+        last_attempt_final_residual_norm = jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "final_residual_norm", None) is None else jnp.asarray(getattr(step_info, "final_residual_norm"), dtype=dtype)
+        last_attempt_final_delta_norm = jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "final_delta_norm", None) is None else jnp.asarray(getattr(step_info, "final_delta_norm"), dtype=dtype)
+        last_attempt_theta_final = jnp.asarray(0.0, dtype=dtype) if getattr(step_info, "theta_final", None) is None else jnp.asarray(getattr(step_info, "theta_final"), dtype=dtype)
+        last_attempt_slow_contraction = jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction"))
+        last_attempt_residual_blowup = jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup"))
+        last_attempt_newton_nonfinite = jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite"))
+
+        step_idx += 1
+
+    return (
+        step_state,
+        jnp.asarray(step_idx, dtype=jnp.int32),
+        save_idx,
+        ys_saved,
+        ts_saved,
+        dts_saved,
+        accepted_mask_saved,
+        failed_mask_saved,
+        fail_codes_saved,
+        last_attempt_accepted,
+        last_attempt_converged,
+        last_attempt_err_norm,
+        last_attempt_fail_code,
+        last_attempt_diverged,
+        last_attempt_nonfinite_stage_state,
+        last_attempt_nonfinite_stage_residual,
+        last_attempt_finite_f0,
+        last_attempt_finite_z0,
+        last_attempt_finite_initial_residual,
+        last_attempt_newton_iter_count,
+        last_attempt_final_residual_norm,
+        last_attempt_final_delta_norm,
+        last_attempt_theta_final,
+        last_attempt_slow_contraction,
+        last_attempt_residual_blowup,
+        last_attempt_newton_nonfinite,
+    )
+
+
 def _make_radau_stage_predictor(
     f0,
     prev_stages,
@@ -1490,6 +1618,7 @@ class _RadauSolverConfig(TransportSolver):
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
     debug_stage_markers: bool = False
+    debug_walltime_attempts: bool = False
 
     def __init__(
         self,
@@ -1522,6 +1651,7 @@ class _RadauSolverConfig(TransportSolver):
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
+        debug_walltime_attempts: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -1604,6 +1734,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "stop_after_accepted_steps", stop_after_accepted_steps)
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "debug_stage_markers", bool(debug_stage_markers))
+        object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -2190,8 +2321,6 @@ class RADAUSolver(_RadauSolverConfig):
             fail_code = status[STATUS_FAIL_CODE]
             n_accepted = status[STATUS_N_ACCEPTED]
             trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
-            if debug_newton_trace:
-                jax.debug.callback(lambda: debug_timing_start("radau.attempt"), ordered=True)
             (
                 trial_y, err_norm, converged, stage_history, theta_final,
                 newton_iter_count, final_residual_norm, final_delta_norm,
@@ -2258,8 +2387,6 @@ class RADAUSolver(_RadauSolverConfig):
                 lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                 project_flat=project_flat,
             )
-            if debug_newton_trace:
-                jax.debug.callback(lambda: debug_timing_end("radau.attempt"), ordered=True)
             return step_state_next, step_info_next
 
         def step_fn(step_state: _RadauStepState, _):
@@ -2333,6 +2460,31 @@ class RADAUSolver(_RadauSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
+        if bool(getattr(self, "debug_walltime_attempts", False)):
+            loop_result = _run_saved_loop_debug_walltime(
+                step_state0=step_state0,
+                step_fn=step_fn,
+                save_n=save_n,
+                t0=t0,
+                t_final=t_final,
+                state_dim=state_dim,
+                dtype=dtype,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+                walltime_label="radau.attempt",
+            )
+        else:
+            loop_result = _run_saved_loop(
+                step_state0=step_state0,
+                step_fn=step_fn,
+                save_n=save_n,
+                t0=t0,
+                t_final=t_final,
+                state_dim=state_dim,
+                dtype=dtype,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
         (
             step_state_f,
             _,
@@ -2360,17 +2512,7 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
-        ) = _run_saved_loop(
-            step_state0=step_state0,
-            step_fn=step_fn,
-            save_n=save_n,
-            t0=t0,
-            t_final=t_final,
-            state_dim=state_dim,
-            dtype=dtype,
-            max_total_steps=max_total_steps,
-            stop_after_accepted_steps=stop_after_accepted_steps,
-        )
+        ) = loop_result
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
         n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
@@ -3275,6 +3417,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
+            debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)
