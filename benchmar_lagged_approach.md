@@ -1154,6 +1154,33 @@ This remains available as:
 
 This removes unnecessary lagged-response rebuild cost in retry-heavy regions while keeping memory bounded to one cached lagged response.
 
+8. Optional global lagged-response reuse across accepted steps
+
+- a new toggle now exists:
+  - `lagged_response_reuse_mode = "retry_only" | "global_state_drift"`
+- default remains:
+  - `retry_only`
+- the new optional mode:
+  - `global_state_drift`
+  keeps the cached lagged response after an accepted step when the accepted state is still close to the cached lagged-response reference state
+
+The current global reuse criterion is:
+
+- compute a normalized drift metric on the packed flat transport state:
+  - `|| y_new - y_ref || / (atol + rtol * scale(y_ref, y_new))`
+- reuse the cached lagged response if that global metric is `<= 1`
+
+Associated knobs:
+
+- `lagged_response_reuse_rtol`
+- `lagged_response_reuse_atol`
+
+This is intentionally simpler than a flux-based or per-radius policy:
+
+- it uses state drift, not flux drift
+- it reuses or rebuilds the whole lagged response as one object
+- it is the lowest-risk extension of the already-implemented retry-only cache
+
 ## Remaining State-Of-The-Art Controller / Predictor Upgrades
 
 The current implementation is meaningfully closer to a mature adaptive Radau solver, but it is still not the final state-of-the-art controller path.

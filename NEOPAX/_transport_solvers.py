@@ -838,6 +838,11 @@ def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: flo
     return jnp.sqrt(jnp.mean(normalized * normalized) + 1.0e-30)
 
 
+def _lagged_response_global_reuse_metric(current_flat, reference_flat, atol: float, rtol: float):
+    delta_flat = current_flat - reference_flat
+    return _solver_error_norm(delta_flat, reference_flat, current_flat, atol=atol, rtol=rtol)
+
+
 def _make_radau_initial_step_state(
     t0,
     flat_state0,
@@ -851,6 +856,7 @@ def _make_radau_initial_step_state(
     complex_piv0,
     lagged_response_cache,
     lagged_response_valid,
+    lagged_reference_y,
 ):
     state_dim = flat_state0.shape[0]
     return _RadauStepState(
@@ -866,6 +872,7 @@ def _make_radau_initial_step_state(
         easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
         lagged_response_cache=lagged_response_cache,
         lagged_response_valid=lagged_response_valid,
+        lagged_reference_y=lagged_reference_y,
         jacobian=jnp.zeros((state_dim, state_dim), dtype=dtype),
         cache_valid=jnp.asarray(False),
         cache_dt=jnp.asarray(0.0, dtype=dtype),
@@ -1117,6 +1124,10 @@ def _apply_radau_lean_timestep_controller(
     min_step_factor,
     max_step_factor,
     controller_mode,
+    use_transport_lagged_response,
+    lagged_response_reuse_mode,
+    lagged_response_reuse_rtol,
+    lagged_response_reuse_atol,
     project_flat,
 ):
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
@@ -1262,6 +1273,20 @@ def _apply_radau_lean_timestep_controller(
         t_new = step_state.t + trial_dt
         accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
+        lagged_reuse_global = lagged_response_reuse_mode == "global_state_drift"
+        lagged_reuse_metric = _lagged_response_global_reuse_metric(
+            accepted_y,
+            step_state.lagged_reference_y,
+            atol=lagged_response_reuse_atol,
+            rtol=lagged_response_reuse_rtol,
+        )
+        keep_lagged_response = jnp.logical_and(
+            jnp.asarray(use_transport_lagged_response),
+            jnp.logical_and(
+                lagged_reuse_global,
+                lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
+            ),
+        )
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
         regrowth_cooldown_next = jnp.where(
             use_hairer_lean_controller,
@@ -1300,7 +1325,8 @@ def _apply_radau_lean_timestep_controller(
             regrowth_cooldown=regrowth_cooldown_next,
             easy_growth_streak=easy_growth_streak_next,
             lagged_response_cache=step_state.lagged_response_cache,
-            lagged_response_valid=jnp.asarray(False),
+            lagged_response_valid=keep_lagged_response,
+            lagged_reference_y=step_state.lagged_reference_y,
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1378,6 +1404,7 @@ def _apply_radau_lean_timestep_controller(
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
             lagged_response_cache=step_state.lagged_response_cache,
             lagged_response_valid=step_state.lagged_response_valid,
+            lagged_reference_y=step_state.lagged_reference_y,
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
             cache_dt=cache_dt_out,
@@ -1440,6 +1467,9 @@ class _RadauSolverConfig(TransportSolver):
     newton_fnewt_mode: str = "tol"
     controller_mode: str = "current"
     predictor_mode: str = "current"
+    lagged_response_reuse_mode: str = "retry_only"
+    lagged_response_reuse_rtol: float = 5.0e-2
+    lagged_response_reuse_atol: float = 1.0e-8
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -1470,6 +1500,9 @@ class _RadauSolverConfig(TransportSolver):
         newton_fnewt_mode: str = "tol",
         controller_mode: str = "current",
         predictor_mode: str = "current",
+        lagged_response_reuse_mode: str = "retry_only",
+        lagged_response_reuse_rtol: float = 5.0e-2,
+        lagged_response_reuse_atol: float = 1.0e-8,
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
@@ -1530,6 +1563,22 @@ class _RadauSolverConfig(TransportSolver):
                 "radau_predictor_mode must be one of: current, collocation"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
+        lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
+        lagged_reuse_aliases = {
+            "default": "retry_only",
+            "retry": "retry_only",
+            "state": "global_state_drift",
+            "global": "global_state_drift",
+            "state_drift": "global_state_drift",
+        }
+        lagged_reuse_mode_norm = lagged_reuse_aliases.get(lagged_reuse_mode_norm, lagged_reuse_mode_norm)
+        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift"}:
+            raise ValueError(
+                "lagged_response_reuse_mode must be one of: retry_only, global_state_drift"
+            )
+        object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
+        object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
+        object.__setattr__(self, "lagged_response_reuse_atol", float(lagged_response_reuse_atol))
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -1553,6 +1602,7 @@ class _RadauStepState:
     easy_growth_streak: Any
     lagged_response_cache: Any
     lagged_response_valid: Any
+    lagged_reference_y: Any
     jacobian: Any
     cache_valid: Any
     cache_dt: Any
@@ -1765,6 +1815,7 @@ class RADAUSolver(_RadauSolverConfig):
             complex_piv_cache,
             lagged_response_cache,
             lagged_response_valid,
+            lagged_reference_y_cache,
         ):
             f0 = flat_rhs(t_value, flat_y)
             if use_transport_lagged_response:
@@ -1782,8 +1833,15 @@ class RADAUSolver(_RadauSolverConfig):
                     _rebuild_cached,
                     operand=None,
                 )
+                lagged_reference_y = jax.lax.cond(
+                    lagged_response_valid,
+                    lambda _: lagged_reference_y_cache,
+                    lambda _: flat_y,
+                    operand=None,
+                )
             else:
                 lagged_response = None
+                lagged_reference_y = flat_y
             z0 = _make_radau_stage_predictor(
                 f0,
                 prev_stages,
@@ -2101,6 +2159,7 @@ class RADAUSolver(_RadauSolverConfig):
                 finite_z0,
                 finite_initial_residual,
                 lagged_response,
+                lagged_reference_y,
             )
 
         def _attempt_step_lean(step_state: _RadauStepState):
@@ -2115,17 +2174,18 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
-                finite_f0, finite_z0, finite_initial_residual, lagged_response_out,
+                finite_f0, finite_z0, finite_initial_residual, lagged_response_out, lagged_reference_y_out,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
                 step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv,
-                step_state.lagged_response_cache, step_state.lagged_response_valid,
+                step_state.lagged_response_cache, step_state.lagged_response_valid, step_state.lagged_reference_y,
             )
             step_state = dataclasses.replace(
                 step_state,
                 lagged_response_cache=lagged_response_out,
                 lagged_response_valid=jnp.asarray(use_transport_lagged_response),
+                lagged_reference_y=lagged_reference_y_out,
             )
             return _apply_radau_lean_timestep_controller(
                 step_state=step_state,
@@ -2166,6 +2226,10 @@ class RADAUSolver(_RadauSolverConfig):
                 min_step_factor=self.min_step_factor,
                 max_step_factor=self.max_step_factor,
                 controller_mode=str(getattr(self, "controller_mode", "current")).strip().lower(),
+                use_transport_lagged_response=use_transport_lagged_response,
+                lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+                lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+                lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                 project_flat=project_flat,
             )
 
@@ -2233,6 +2297,7 @@ class RADAUSolver(_RadauSolverConfig):
             complex_piv0,
             initial_lagged_response,
             jnp.asarray(use_transport_lagged_response),
+            flat_state0,
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
@@ -3173,6 +3238,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
             controller_mode=str(_cfg_get("radau_controller_mode", "current")),
             predictor_mode=str(_cfg_get("radau_predictor_mode", "current")),
+            lagged_response_reuse_mode=str(_cfg_get("lagged_response_reuse_mode", "retry_only")),
+            lagged_response_reuse_rtol=float(_cfg_get("lagged_response_reuse_rtol", 5.0e-2)),
+            lagged_response_reuse_atol=float(_cfg_get("lagged_response_reuse_atol", 1.0e-8)),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
