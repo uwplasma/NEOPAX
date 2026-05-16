@@ -35,5 +35,6 @@ def lagged_timing_end(label: str) -> None:
         if not stack:
             print(f"[lagged-timing] {label} end #? (no-start)", flush=True)
             return
-        count, _start = stack.pop()
-    print(f"[lagged-timing] {label} end   #{count}", flush=True)
+        count, start = stack.pop()
+    elapsed = time.perf_counter() - start
+    print(f"[lagged-timing] {label} end   #{count} elapsed_s={elapsed:.6f}", flush=True)
