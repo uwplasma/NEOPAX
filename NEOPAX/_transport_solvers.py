@@ -1742,13 +1742,23 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_response_valid,
         ):
             f0 = flat_rhs(t_value, flat_y)
-            lagged_response = (
-                lagged_response_cache
-                if (use_transport_lagged_response and lagged_response_valid)
-                else build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
-                if (use_transport_lagged_response and build_lagged_response is not None)
-                else None
-            )
+            if use_transport_lagged_response:
+                candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
+
+                def _reuse_cached(_):
+                    return lagged_response_cache
+
+                def _rebuild_cached(_):
+                    return build_lagged_response(candidate_state)
+
+                lagged_response = jax.lax.cond(
+                    lagged_response_valid,
+                    _reuse_cached,
+                    _rebuild_cached,
+                    operand=None,
+                )
+            else:
+                lagged_response = None
             z0 = _make_radau_stage_predictor(
                 f0,
                 prev_stages,
