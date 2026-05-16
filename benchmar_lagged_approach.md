@@ -1019,6 +1019,24 @@ The post-rejection recovery is now less fixed and more responsive:
 
 So the controller still avoids the old overshoot/retry pattern, but it should now let `dt` recover more naturally once the stiff region has really passed.
 
+## Update: Preserve Current Controller And Add Explicit Gustafsson Option
+
+To keep the recent solver behavior reproducible while still moving toward a more state-of-the-art adaptive Radau controller, the timestep policy is now being split into explicit modes:
+
+- `radau_controller_mode = "current"`
+  - preserves the existing NEOPAX controller logic
+  - includes the current scalar-history hysteresis, Newton-quality growth caps, and recent-retry safeguards
+
+- `radau_controller_mode = "gustafsson"`
+  - uses a cleaner predictive accepted-step update
+  - combines a PI-style term with a light Gustafsson-like predictive proposal based on previous accepted-step history
+  - keeps only a light Newton-quality cap and a lighter post-rejection regrowth limiter
+
+This keeps the current path available for direct comparison and makes future benchmarking much easier:
+
+- current controller behavior remains available unchanged
+- the more modern predictive controller can now be tested independently
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.

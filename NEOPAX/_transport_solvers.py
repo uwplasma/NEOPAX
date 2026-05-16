@@ -1097,6 +1097,7 @@ def _apply_radau_lean_timestep_controller(
     controller_alpha,
     min_step_factor,
     max_step_factor,
+    controller_mode,
     project_flat,
 ):
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
@@ -1132,13 +1133,29 @@ def _apply_radau_lean_timestep_controller(
         ),
         jnp.asarray(1.0, dtype=dtype),
     )
-    growth = (
+    growth_current = (
         safety_factor
         * safe_error ** (-controller_alpha)
         * prev_error ** controller_beta
         * gustafsson_damping
     )
-    growth = jnp.clip(growth, min_step_factor, max_step_factor)
+    growth_current = jnp.clip(growth_current, min_step_factor, max_step_factor)
+    growth_pi = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta
+    growth_pi = jnp.clip(growth_pi, min_step_factor, max_step_factor)
+    growth_predictive = jnp.where(
+        prev_dt_available,
+        safety_factor
+        * (prev_dt_safe / jnp.maximum(trial_dt, dt_min))
+        * (prev_error / jnp.maximum(safe_error * safe_error, 1.0e-12)) ** controller_alpha,
+        growth_pi,
+    )
+    growth_predictive = jnp.clip(growth_predictive, min_step_factor, max_step_factor)
+    use_gustafsson_controller = controller_mode == "gustafsson"
+    growth = jnp.where(
+        use_gustafsson_controller,
+        jnp.minimum(growth_pi, growth_predictive),
+        growth_current,
+    )
     difficult_accept = jnp.logical_or(
         slow_contraction,
         jnp.logical_or(
@@ -1167,15 +1184,31 @@ def _apply_radau_lean_timestep_controller(
             moderate_growth,
         ),
     )
-    post_reject_growth_cap = jnp.where(
+    post_reject_growth_cap_current = jnp.where(
         step_state.regrowth_cooldown > 0,
         jnp.where(recovery_ready, recovery_regrowth, cautious_regrowth),
         max_step_factor,
     )
-    streak_growth_cap = jnp.where(
+    streak_growth_cap_current = jnp.where(
         step_state.easy_growth_streak >= jnp.asarray(1, dtype=jnp.int32),
         max_step_factor,
         jnp.asarray(1.75, dtype=dtype),
+    )
+    post_reject_growth_cap_gustafsson = jnp.where(
+        step_state.recent_reject_count > 0,
+        jnp.where(recovery_ready, jnp.asarray(1.45, dtype=dtype), cautious_regrowth),
+        max_step_factor,
+    )
+    streak_growth_cap_gustafsson = max_step_factor
+    post_reject_growth_cap = jnp.where(
+        use_gustafsson_controller,
+        post_reject_growth_cap_gustafsson,
+        post_reject_growth_cap_current,
+    )
+    streak_growth_cap = jnp.where(
+        use_gustafsson_controller,
+        streak_growth_cap_gustafsson,
+        streak_growth_cap_current,
     )
     growth_cap = jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap))
     growth = jnp.clip(growth, min_step_factor, growth_cap)
@@ -1185,7 +1218,7 @@ def _apply_radau_lean_timestep_controller(
         growth,
     )
     growth = jnp.where(
-        jnp.logical_and(step_state.regrowth_cooldown > 0, recovery_ready),
+        jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready),
         jnp.maximum(growth, jnp.asarray(1.2, dtype=dtype)),
         growth,
     )
@@ -1196,14 +1229,22 @@ def _apply_radau_lean_timestep_controller(
         accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
-        regrowth_cooldown_next = jnp.maximum(
-            step_state.regrowth_cooldown - jnp.where(easy_accept, jnp.asarray(2, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32)),
+        regrowth_cooldown_next = jnp.where(
+            use_gustafsson_controller,
             jnp.asarray(0, dtype=jnp.int32),
+            jnp.maximum(
+                step_state.regrowth_cooldown - jnp.where(easy_accept, jnp.asarray(2, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32)),
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
         )
         easy_growth_streak_next = jnp.where(
-            easy_accept,
-            jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
+            use_gustafsson_controller,
             jnp.asarray(0, dtype=jnp.int32),
+            jnp.where(
+                easy_accept,
+                jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
         )
         return _RadauStepState(
             t=t_new,
@@ -1283,7 +1324,11 @@ def _apply_radau_lean_timestep_controller(
             prev_stages=step_state.prev_stages,
             prev_dt=step_state.prev_dt,
             recent_reject_count=retry_count_next,
-            regrowth_cooldown=jnp.asarray(2, dtype=jnp.int32),
+            regrowth_cooldown=jnp.where(
+                use_gustafsson_controller,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(2, dtype=jnp.int32),
+            ),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
             jacobian=jacobian_out,
             cache_valid=cache_valid_out,
@@ -1343,6 +1388,7 @@ class _RadauSolverConfig(TransportSolver):
     newton_residual_norm: str = "raw"
     newton_tol_mode: str = "residual"
     newton_fnewt_mode: str = "tol"
+    controller_mode: str = "current"
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -1371,6 +1417,7 @@ class _RadauSolverConfig(TransportSolver):
         newton_residual_norm: str = "raw",
         newton_tol_mode: str = "residual",
         newton_fnewt_mode: str = "tol",
+        controller_mode: str = "current",
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
@@ -1398,6 +1445,22 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "newton_residual_norm", str(newton_residual_norm).strip().lower())
         object.__setattr__(self, "newton_tol_mode", str(newton_tol_mode).strip().lower())
         object.__setattr__(self, "newton_fnewt_mode", str(newton_fnewt_mode).strip().lower())
+        controller_mode_norm = str(controller_mode).strip().lower()
+        controller_aliases = {
+            "default": "current",
+            "legacy": "current",
+            "heuristic": "current",
+            "lean": "current",
+            "pi": "gustafsson",
+            "predictive": "gustafsson",
+            "standard": "gustafsson",
+        }
+        controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
+        if controller_mode_norm not in {"current", "gustafsson"}:
+            raise ValueError(
+                "radau_controller_mode must be one of: current, gustafsson"
+            )
+        object.__setattr__(self, "controller_mode", controller_mode_norm)
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -2001,6 +2064,7 @@ class RADAUSolver(_RadauSolverConfig):
                 controller_alpha=controller_alpha,
                 min_step_factor=self.min_step_factor,
                 max_step_factor=self.max_step_factor,
+                controller_mode=str(getattr(self, "controller_mode", "current")).strip().lower(),
                 project_flat=project_flat,
             )
 
@@ -2999,6 +3063,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_residual_norm=str(_cfg_get("radau_newton_residual_norm", "raw")),
             newton_tol_mode=str(_cfg_get("radau_newton_tol_mode", "residual")),
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
+            controller_mode=str(_cfg_get("radau_controller_mode", "current")),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
