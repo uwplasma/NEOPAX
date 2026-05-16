@@ -1008,6 +1008,17 @@ The controller has now been pushed one step closer to the missing Hairer/NTSS in
 
 This is still not a full classic Gustafsson controller, but it is closer in spirit than the earlier pure one-step error rule and remains cheap to trace/JIT in JAX.
 
+An additional refinement has now been applied because the first hysteresis pass made `dt` recovery too sticky after difficult regions.
+
+The post-rejection recovery is now less fixed and more responsive:
+
+- shorter regrowth cooldown
+- faster cooldown decay after genuinely easy accepted steps
+- a larger temporary recovery cap when the next accepted step is already clearly easy again
+- lighter growth damping after recent accepted-step expansion
+
+So the controller still avoids the old overshoot/retry pattern, but it should now let `dt` recover more naturally once the stiff region has really passed.
+
 ## Important Diagnostic Caveat
 
 The benchmark-side `initial_probe.radau.while_loop` block is now likely out of sync with the real solver after the Newton tolerance refactor.
