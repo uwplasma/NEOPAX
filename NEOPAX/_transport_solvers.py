@@ -1170,10 +1170,13 @@ def _apply_radau_lean_timestep_controller(
     )
     growth_predictive = jnp.clip(growth_predictive, min_step_factor, max_step_factor)
     use_gustafsson_controller = controller_mode == "gustafsson"
+    use_hairer_lean_controller = controller_mode == "hairer_lean"
+    growth_lean = safety_factor * safe_error ** (-controller_alpha)
+    growth_lean = jnp.clip(growth_lean, min_step_factor, max_step_factor)
     growth = jnp.where(
         use_gustafsson_controller,
         jnp.minimum(growth_pi, growth_predictive),
-        growth_current,
+        jnp.where(use_hairer_lean_controller, growth_lean, growth_current),
     )
     difficult_accept = jnp.logical_or(
         slow_contraction,
@@ -1220,24 +1223,36 @@ def _apply_radau_lean_timestep_controller(
     )
     streak_growth_cap_gustafsson = max_step_factor
     post_reject_growth_cap = jnp.where(
+        use_hairer_lean_controller,
+        max_step_factor,
+        jnp.where(
         use_gustafsson_controller,
         post_reject_growth_cap_gustafsson,
         post_reject_growth_cap_current,
+        ),
     )
     streak_growth_cap = jnp.where(
+        use_hairer_lean_controller,
+        max_step_factor,
+        jnp.where(
         use_gustafsson_controller,
         streak_growth_cap_gustafsson,
         streak_growth_cap_current,
+        ),
     )
-    growth_cap = jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap))
+    growth_cap = jnp.where(
+        use_hairer_lean_controller,
+        max_step_factor,
+        jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap)),
+    )
     growth = jnp.clip(growth, min_step_factor, growth_cap)
     growth = jnp.where(
-        jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype)),
+        jnp.logical_and(jnp.logical_not(use_hairer_lean_controller), jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype))),
         jnp.asarray(1.0, dtype=dtype),
         growth,
     )
     growth = jnp.where(
-        jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready),
+        jnp.logical_and(jnp.logical_not(use_hairer_lean_controller), jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready)),
         jnp.maximum(growth, jnp.asarray(1.2, dtype=dtype)),
         growth,
     )
@@ -1249,20 +1264,28 @@ def _apply_radau_lean_timestep_controller(
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
         regrowth_cooldown_next = jnp.where(
+            use_hairer_lean_controller,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.where(
             use_gustafsson_controller,
             jnp.asarray(0, dtype=jnp.int32),
             jnp.maximum(
                 step_state.regrowth_cooldown - jnp.where(easy_accept, jnp.asarray(2, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32)),
                 jnp.asarray(0, dtype=jnp.int32),
             ),
+            ),
         )
         easy_growth_streak_next = jnp.where(
+            use_hairer_lean_controller,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.where(
             use_gustafsson_controller,
             jnp.asarray(0, dtype=jnp.int32),
             jnp.where(
                 easy_accept,
                 jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
                 jnp.asarray(0, dtype=jnp.int32),
+            ),
             ),
         )
         return _RadauStepState(
@@ -1480,14 +1503,16 @@ class _RadauSolverConfig(TransportSolver):
             "legacy": "current",
             "heuristic": "current",
             "lean": "current",
+            "original": "hairer_lean",
+            "simple": "hairer_lean",
             "pi": "gustafsson",
             "predictive": "gustafsson",
             "standard": "gustafsson",
         }
         controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
-        if controller_mode_norm not in {"current", "gustafsson"}:
+        if controller_mode_norm not in {"current", "gustafsson", "hairer_lean"}:
             raise ValueError(
-                "radau_controller_mode must be one of: current, gustafsson"
+                "radau_controller_mode must be one of: current, gustafsson, hairer_lean"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
         predictor_mode_norm = str(predictor_mode).strip().lower()

@@ -1032,6 +1032,14 @@ To keep the recent solver behavior reproducible while still moving toward a more
   - combines a PI-style term with a light Gustafsson-like predictive proposal based on previous accepted-step history
   - keeps only a light Newton-quality cap and a lighter post-rejection regrowth limiter
 
+- `radau_controller_mode = "hairer_lean"`
+  - keeps the newer Hairer-side Newton convergence logic
+  - but uses a much simpler accepted-step update closer to the older/original NEOPAX behavior
+  - accepted-step growth is driven mainly by a one-step error controller:
+    - `growth ~ safety_factor * err_norm^(-alpha)`
+  - disables the newer cooldown / streak / Newton-quality regrowth heuristics
+  - intended for direct comparison when the more elaborate controller modes become too sticky
+
 This keeps the current path available for direct comparison and makes future benchmarking much easier:
 
 - current controller behavior remains available unchanged
@@ -1117,6 +1125,18 @@ This remains available as:
   - lighter post-rejection moderation
   - Newton-quality growth caps as safety only
 
+5b. Optional lean/original-style controller path
+
+- a separate simpler controller option now exists:
+  - `radau_controller_mode = "hairer_lean"`
+- this preserves:
+  - Hairer Newton stopping
+  - slow-theta non-override fix
+- while reverting the accepted-step timestep evolution closer to the earlier simple NEOPAX rule
+- this is useful when:
+  - the Newton-side Hairer changes are clearly helping
+  - but the newer accepted-step controller heuristics are making `dt` recover too slowly or shrink after easy accepted steps
+
 6. Optional stronger stage predictor
 
 - `radau_predictor_mode = "current"`
@@ -1174,6 +1194,7 @@ Current practical recommendation:
 
 - keep the stiff transient solvability of Radau
 - benchmark:
+  - `radau_controller_mode = "hairer_lean"` vs `radau_controller_mode = "current"`
   - `radau_controller_mode = "current"` vs `radau_controller_mode = "gustafsson"`
   - `radau_predictor_mode = "current"` vs `radau_predictor_mode = "collocation"`
 - then decide whether the next gain should come from:
