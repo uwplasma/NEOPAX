@@ -2336,6 +2336,7 @@ class RADAUSolver(_RadauSolverConfig):
                 lagged_response,
                 lagged_reference_y,
                 lagged_response_reused,
+                jacobian_reused,
             )
 
         def _attempt_step_lean(step_state: _RadauStepState):
@@ -2351,6 +2352,7 @@ class RADAUSolver(_RadauSolverConfig):
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
                 finite_f0, finite_z0, finite_initial_residual, lagged_response_out, lagged_reference_y_out, lagged_response_reused,
+                jacobian_reused,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
