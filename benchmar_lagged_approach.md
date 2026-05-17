@@ -1471,3 +1471,112 @@ Best implementation order:
 
 1. whole-response reuse across accepted steps
 2. optional per-radius / per-anchor masked refresh only if benchmarks justify the extra complexity
+
+## Update: Radau / Lagged-Response Design Contract
+
+The intended contract has now been clarified and should guide the next refactor steps:
+
+- the custom Radau solver machinery should behave the same for:
+  - database / normal transport RHS
+  - exact-runtime lagged-response transport RHS
+- the only default difference should be:
+  - how selected flux components are evaluated
+
+In practice this means:
+
+- same Newton / predictor / cache / LU / timestep-controller path
+- same Jacobian reuse policy
+- same retry behavior
+- only the selected flux model components should switch to their lagged-response evaluation path
+
+For the current NTX case this means:
+
+- neoclassical fluxes may be supplied by the NTX lagged response
+- turbulence and classical should remain on their normal paths unless they also provide lagged responses
+- the full transport RHS remains the full transport RHS, but built from the same component-wise flux selection logic
+
+This is important because the older implementation had drifted away from that contract:
+
+- lagged-response mode was not just changing flux evaluation
+- it was also changing the Newton linearization / reuse behavior
+
+## Update: Radau Refactor Started
+
+The first pass of the custom-Radau refactor has now started in `_transport_solvers.py`.
+
+Current changes already made:
+
+1. `rhs_mode = "lagged_response"` now uses the selected lagged flux/RHS path consistently for:
+   - `f0`
+   - stage residual evaluation
+   - Newton Jacobian construction at the current state
+
+2. the custom Radau step no longer automatically disables the standard Jacobian reuse path just because:
+   - `use_transport_lagged_response = True`
+
+3. the initial stage-history seed (`prev_stages`) is now initialized from the same selected RHS path, instead of always from the direct non-lagged RHS
+
+4. attempt diagnostics now include:
+   - `jacobian_reused=True|False`
+   - alongside the existing:
+     - `lagged_reused=True|False`
+
+The purpose of this first pass is to bring lagged-response Radau back toward:
+
+- same solver structure as the normal/database path
+- different flux source only
+
+## What Is Still Missing
+
+The refactor is not finished yet. The following items still need to be checked and/or completed:
+
+1. Confirm that the lagged-response path now really matches the normal/database Radau path structurally.
+
+What still needs verification from runs:
+
+- Jacobian reuse frequency
+- LU reuse behavior
+- accepted/rejected-step pattern
+- whether the lagged path is still paying a hidden solver-side cost not present in the normal path
+
+2. Verify whether the remaining large walltime is dominated by:
+
+- the NTX lagged-response build itself
+- the lagged-response stage evaluations
+- or some remaining solver-side mismatch
+
+This now needs to be measured after the Radau-path refactor, not before it.
+
+3. Decide whether the Newton Jacobian source in lagged mode should remain:
+
+- the full selected transport RHS Jacobian
+
+or whether a separate advanced option should later exist for:
+
+- a lagged Jacobian
+- a frozen Jacobian
+- or a more aggressive reuse policy
+
+Important:
+
+- this should be a separate future option
+- it should not be implicitly bundled into `rhs_mode = "lagged_response"`
+
+4. Check whether any other solver backends still have the old lagged/non-lagged structural mismatch.
+
+The current work has focused on the custom Radau path only.
+
+5. Update benchmark interpretation after reruns.
+
+The next benchmark reruns should explicitly record:
+
+- `lagged_reused`
+- `jacobian_reused`
+- walltime per attempt / per accepted step
+- whether accepted-step lagged-response reuse is active
+
+Only after that should we decide whether the dominant remaining issue is:
+
+- lagged-response build cost
+- solver-side Jacobian cost
+- or insufficient lagged-response reuse across accepted steps

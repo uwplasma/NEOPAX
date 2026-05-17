@@ -849,7 +849,7 @@ def _make_radau_initial_step_state(
     flat_state0,
     base_dt,
     dtype,
-    flat_rhs,
+    initial_rhs,
     num_stages,
     real_lu0,
     real_piv0,
@@ -866,7 +866,7 @@ def _make_radau_initial_step_state(
         dt=base_dt,
         status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
         prev_error=jnp.asarray(1.0, dtype=dtype),
-        prev_stages=jnp.tile(flat_rhs(t0, flat_state0), num_stages),
+        prev_stages=jnp.tile(initial_rhs, num_stages),
         prev_dt=jnp.asarray(0.0, dtype=dtype),
         recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
         regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
@@ -1246,6 +1246,7 @@ def _apply_radau_lean_timestep_controller(
     residual_blowup,
     newton_nonfinite,
     lagged_reused,
+    jacobian_reused,
     fail_code,
     n_accepted,
     dtype,
@@ -1485,6 +1486,7 @@ def _apply_radau_lean_timestep_controller(
             next_dt=next_dt_accept,
             growth=growth,
             lagged_reused=lagged_reused,
+            jacobian_reused=jacobian_reused,
             accepted=jnp.asarray(True),
             failed=jnp.asarray(False),
             fail_code=fail_code,
@@ -1564,6 +1566,7 @@ def _apply_radau_lean_timestep_controller(
             next_dt=reduced_dt,
             growth=jnp.where(trial_dt > 0, reduced_dt / trial_dt, jnp.asarray(1.0, dtype=dtype)),
             lagged_reused=lagged_reused,
+            jacobian_reused=jacobian_reused,
             accepted=jnp.asarray(False),
             failed=fail_now,
             fail_code=fail_code_next,
@@ -1773,6 +1776,7 @@ class _RadauStepInfo:
     next_dt: Any = None
     growth: Any = None
     lagged_reused: Any = None
+    jacobian_reused: Any = None
     accepted: Any = None
     failed: Any = None
     fail_code: Any = None
@@ -1861,15 +1865,15 @@ class RADAUSolver(_RadauSolverConfig):
             )
         build_lagged_response = build_lagged_response_raw
         flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
-        if use_transport_lagged_response:
-            # Compile the lagged NTX builder/evaluator as standalone executables once,
-            # rather than only as inlined Python call paths inside the Radau step.
-            build_lagged_response = jax.jit(build_lagged_response_raw)
-            flat_rhs_with_lagged_response = jax.jit(flat_rhs_with_lagged_response_raw)
         initial_lagged_response = (
             build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
             if (use_transport_lagged_response and build_lagged_response is not None)
             else None
+        )
+        initial_rhs = (
+            flat_rhs_with_lagged_response(t0, flat_state0, initial_lagged_response)
+            if initial_lagged_response is not None
+            else flat_rhs(t0, flat_state0)
         )
         predictor_mode = str(getattr(self, "predictor_mode", "current")).strip().lower()
         error_order = float(stage_cfg.embedded_order if stage_cfg.has_embedded_estimator else stage_cfg.order)
@@ -1976,7 +1980,6 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_response_valid,
             lagged_reference_y_cache,
         ):
-            f0 = flat_rhs(t_value, flat_y)
             lagged_response_reused = jnp.asarray(False)
             if use_transport_lagged_response:
                 candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
@@ -2003,6 +2006,16 @@ class RADAUSolver(_RadauSolverConfig):
             else:
                 lagged_response = None
                 lagged_reference_y = flat_y
+
+            def _rhs_eval(t_eval, y_eval):
+                if lagged_response is not None:
+                    return flat_rhs_with_lagged_response(t_eval, y_eval, lagged_response)
+                return flat_rhs(t_eval, y_eval)
+
+            def _rhs_eval_at_current_time(y_eval):
+                return _rhs_eval(t_value, y_eval)
+
+            f0 = _rhs_eval(t_value, flat_y)
             z0 = _make_radau_stage_predictor(
                 f0,
                 prev_stages,
@@ -2019,14 +2032,14 @@ class RADAUSolver(_RadauSolverConfig):
             dt_close = jnp.abs(h_value - cache_dt) <= self.jacobian_reuse_rtol * jacobian_dt_scale
             reuse_linearization = jnp.logical_and(
                 jnp.logical_and(cache_valid, dt_close),
-                jnp.logical_not(jnp.asarray(jnp.logical_or(use_lagged_linear_response, use_transport_lagged_response))),
+                jnp.logical_not(jnp.asarray(use_lagged_linear_response)),
             )
 
             def _reuse_linearization(_):
                 return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
 
             def _recompute_linearization(_):
-                jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_value, y))(flat_y)
+                jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
                 h_jacobian = h_value * jacobian_ref
                 real_matrix = identity_n - radau_real_eig * h_jacobian
                 real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
@@ -2057,13 +2070,14 @@ class RADAUSolver(_RadauSolverConfig):
                 _recompute_linearization,
                 operand=None,
             )
+            jacobian_reused = reuse_linearization
 
             def _evaluate_stage_model(z_flat):
                 stages = z_flat.reshape((num_stages, state_dim))
                 stage_states = flat_y[None, :] + h_value * (a @ stages)
                 if lagged_response is not None:
                     stage_times = t_value + c * h_value
-                    evals = jax.vmap(lambda ti, yi: flat_rhs_with_lagged_response(ti, yi, lagged_response), in_axes=(0, 0))(stage_times, stage_states)
+                    evals = jax.vmap(_rhs_eval, in_axes=(0, 0))(stage_times, stage_states)
                 elif use_lagged_linear_response:
                     # Freeze a step-local affine response around (t_n, y_n):
                     # f(y) ~= f_ref + J_ref (y - y_ref)
@@ -2379,6 +2393,7 @@ class RADAUSolver(_RadauSolverConfig):
                 residual_blowup=residual_blowup_final,
                 newton_nonfinite=newton_nonfinite_final,
                 lagged_reused=lagged_response_reused,
+                jacobian_reused=jacobian_reused,
                 fail_code=fail_code,
                 n_accepted=n_accepted,
                 dtype=dtype,
@@ -2409,6 +2424,7 @@ class RADAUSolver(_RadauSolverConfig):
                     next_dt=step_state.dt,
                     growth=jnp.asarray(1.0, dtype=dtype),
                     lagged_reused=jnp.asarray(False),
+                    jacobian_reused=jnp.asarray(False),
                     accepted=jnp.asarray(False),
                     failed=failed,
                     fail_code=fail_code,
@@ -2435,7 +2451,7 @@ class RADAUSolver(_RadauSolverConfig):
             step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
             if debug_newton_trace:
                 jax.debug.print(
-                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused}",
+                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
                     t_start=step_state.t,
                     dt_try=step_state.dt,
                     accepted=step_info.accepted,
@@ -2446,6 +2462,7 @@ class RADAUSolver(_RadauSolverConfig):
                     growth=jnp.asarray(1.0, dtype=dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=dtype),
                     next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=dtype),
                     lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
+                    jacobian_reused=jnp.asarray(False) if getattr(step_info, "jacobian_reused", None) is None else jnp.asarray(getattr(step_info, "jacobian_reused")),
                     ordered=True,
                 )
             return step_state_out, step_info
@@ -2455,7 +2472,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_state0,
             base_dt,
             dtype,
-            flat_rhs,
+            initial_rhs,
             num_stages,
             real_lu0,
             real_piv0,
