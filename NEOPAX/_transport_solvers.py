@@ -1187,31 +1187,87 @@ def _make_radau_stage_predictor(
     h_value,
     c,
     dtype,
+    a=None,
+    jacobian_guess=None,
+    jacobian_guess_valid=False,
     predictor_mode="current",
 ):
+    if a is None:
+        a = c[:, None]
     base_guess = c[:, None] * f0[None, :]
     use_predictor = jnp.logical_and(
         prev_dt > 0.0,
         jnp.all(jnp.isfinite(prev_stages)),
     )
-    prev_stage_guess = prev_stages.reshape(base_guess.shape) * (
-        h_value / jnp.maximum(prev_dt, jnp.asarray(1.0e-14, dtype=dtype))
-    )
+    step_ratio = h_value / jnp.maximum(prev_dt, jnp.asarray(1.0e-14, dtype=dtype))
+    bounded_step_ratio = jnp.clip(step_ratio, jnp.asarray(0.25, dtype=dtype), jnp.asarray(4.0, dtype=dtype))
+    prev_stage_stack = prev_stages.reshape(base_guess.shape)
+    prev_stage_guess = prev_stage_stack * bounded_step_ratio
     predictor_mode_norm = str(predictor_mode).strip().lower()
     if predictor_mode_norm in {"default", "legacy"}:
         predictor_mode_norm = "current"
-    if predictor_mode_norm not in {"current", "collocation"}:
+    predictor_aliases = {
+        "extrapolated": "extrapolated_collocation",
+        "extrapolated-collocation": "extrapolated_collocation",
+        "jacobian": "jacobian_linearized",
+        "linearized": "jacobian_linearized",
+        "linearized_collocation": "jacobian_linearized",
+    }
+    predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
+    if predictor_mode_norm not in {"current", "collocation", "extrapolated_collocation", "jacobian_linearized"}:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation"
+            "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, jacobian_linearized"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
-    prev_stage0 = prev_stages.reshape(base_guess.shape)[0]
+    prev_stage0 = prev_stage_stack[0]
     collocation_guess = prev_stage_guess + c[:, None] * (f0 - prev_stage0)[None, :]
     collocation_guess = (
         jnp.asarray(0.9, dtype=dtype) * collocation_guess
         + jnp.asarray(0.1, dtype=dtype) * base_guess
     )
-    predictor_guess = collocation_guess if predictor_mode_norm == "collocation" else blended_guess
+    extrapolated_collocation_guess = (
+        collocation_guess
+        + (bounded_step_ratio - jnp.asarray(1.0, dtype=dtype)) * (prev_stage_guess - base_guess)
+    )
+    extrapolated_collocation_guess = (
+        jnp.asarray(0.95, dtype=dtype) * extrapolated_collocation_guess
+        + jnp.asarray(0.05, dtype=dtype) * base_guess
+    )
+
+    jacobian_usable = jnp.logical_and(
+        jnp.asarray(jacobian_guess_valid),
+        jnp.logical_and(jnp.all(jnp.isfinite(jacobian_guess)), a is not None),
+    )
+
+    def _jacobian_predictor():
+        seed_guess = extrapolated_collocation_guess
+        stage_states_guess = h_value * (a @ seed_guess)
+        linearized_evals = f0[None, :] + stage_states_guess @ jacobian_guess.T
+        return (
+            jnp.asarray(0.9, dtype=dtype) * linearized_evals
+            + jnp.asarray(0.1, dtype=dtype) * seed_guess
+        )
+
+    jacobian_linearized_guess = jax.lax.cond(
+        jacobian_usable,
+        lambda _: _jacobian_predictor(),
+        lambda _: extrapolated_collocation_guess,
+        operand=None,
+    )
+
+    predictor_guess = jnp.where(
+        predictor_mode_norm == "current",
+        blended_guess,
+        jnp.where(
+            predictor_mode_norm == "collocation",
+            collocation_guess,
+            jnp.where(
+                predictor_mode_norm == "extrapolated_collocation",
+                extrapolated_collocation_guess,
+                jacobian_linearized_guess,
+            ),
+        ),
+    )
     return jnp.where(use_predictor, predictor_guess, base_guess).reshape((-1,))
 
 
@@ -1706,14 +1762,23 @@ class _RadauSolverConfig(TransportSolver):
             "default": "current",
             "legacy": "current",
             "stage_history": "current",
-            "extrapolated": "collocation",
             "hairer": "collocation",
             "ntss": "collocation",
+            "extrapolated": "extrapolated_collocation",
+            "extrapolated-collocation": "extrapolated_collocation",
+            "jacobian": "jacobian_linearized",
+            "linearized": "jacobian_linearized",
+            "linearized_collocation": "jacobian_linearized",
         }
         predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
-        if predictor_mode_norm not in {"current", "collocation"}:
+        if predictor_mode_norm not in {
+            "current",
+            "collocation",
+            "extrapolated_collocation",
+            "jacobian_linearized",
+        }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation"
+                "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, jacobian_linearized"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
@@ -2023,6 +2088,9 @@ class RADAUSolver(_RadauSolverConfig):
                 h_value,
                 c,
                 dtype,
+                a=a,
+                jacobian_guess=jacobian_cache,
+                jacobian_guess_valid=cache_valid,
                 predictor_mode=predictor_mode,
             )
             finite_f0 = jnp.all(jnp.isfinite(f0))

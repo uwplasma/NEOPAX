@@ -1580,3 +1580,367 @@ Only after that should we decide whether the dominant remaining issue is:
 - lagged-response build cost
 - solver-side Jacobian cost
 - or insufficient lagged-response reuse across accepted steps
+
+## Update: Radau / Lagged-Response Structural Fix Appears To Help
+
+The latest rerun of the exact-runtime NTX lagged-response Radau transport case now looks much healthier.
+
+Observed behavior:
+
+- steps are accepted immediately
+- retry behavior is no longer pathological
+- walltime per attempt dropped substantially after the first attempt
+- the run now completes in a reasonable total time
+
+Representative pattern from the current run:
+
+- first attempt still carries noticeable startup cost
+- subsequent accepted attempts are much cheaper
+- the custom Radau path no longer shows the previous catastrophic lagged-response slowdown
+
+This strongly suggests that the recent structural Radau-path refactor was important:
+
+- lagged-response mode now behaves much more like the normal/database Radau path
+- the lagged flux evaluation is no longer dragging along the old solver-side mismatch in the same way
+
+### Important interpretation
+
+This does **not** mean the exact-runtime NTX lagged path is using a database fallback.
+
+The current successful benchmark still uses:
+
+- `flux_model = "ntx_exact_lij_runtime"`
+
+with no database-backed neoclassical model selected.
+
+So the improved timing should be interpreted as:
+
+- the Radau/lagged-response structural mismatch was a real issue
+- fixing that mismatch improved the runtime substantially
+
+## Update: Main Remaining Issue Is Now Timestep Policy
+
+With retry behavior and lagged-response timing looking much better, the next main issue is no longer the lagged-response structural path itself.
+
+The current main concern is now:
+
+- the timestep policy appears to take too many accepted steps compared with earlier benchmarks
+
+In the latest successful runs:
+
+- steps are easy
+- Newton convergence is comfortable
+- but the accepted-step pattern still needs to be compared against earlier simpler-controller benchmarks
+
+## Specific Follow-Up Note: Reconstruct The Earlier Good Timestep Policy
+
+The next timestep-policy investigation should focus especially on identifying which earlier controller/policy combination was active in the benchmark phase where:
+
+- the solver avoided the false non-convergence / divergence classification
+- the problem was actually converged
+- `theta` was slow or pessimistic
+- and yet the overall step count was lower than in the current runs
+
+This needs special emphasis because the current situation is now:
+
+- retry behavior seems good
+- timing behavior seems much better
+- but the number of accepted steps is still too large compared with the earlier simpler-controller benchmarks
+
+### Recommended next policy question
+
+Reconstruct and compare the timestep policy that was active when:
+
+1. Hairer-style Newton acceptance had already prevented the old false non-convergence flagging
+2. `theta` was being treated as a caution signal rather than a hard rejection override
+3. the accepted-step controller was still simpler and apparently produced fewer total steps
+
+This should be treated as a concrete benchmark question, not just a code-history question.
+
+### Practical benchmark note
+
+The next comparison should explicitly record:
+
+- controller mode
+- predictor mode
+- accepted-step count
+- rejected-attempt count
+- average accepted `dt`
+- total runtime
+
+with special attention to which earlier controller/predictor combination best reproduces the lower-step behavior seen in the previous simpler benchmarks.
+
+## Update: Latest Benchmark Outcome
+
+The latest transport benchmarks changed the picture again in an important way.
+
+### 1. The Radau / lagged-response structural refactor helped substantially
+
+After the recent custom-Radau refactor, the exact-runtime NTX lagged-response case now behaves much better:
+
+- immediate accepted steps are possible
+- retry behavior is no longer pathological
+- walltime per attempt is dramatically lower than in the earlier broken lagged-response runs
+- the run no longer shows the previous catastrophic solver-side slowdown
+
+This is strong evidence that the earlier lagged-response slowdown was not just "raw NTX cost", but was strongly amplified by a solver-path mismatch in the custom Radau implementation.
+
+### 2. Exact-runtime NTX is still being used
+
+The improved timing should **not** be interpreted as a database fallback.
+
+The successful lagged-response runs still use:
+
+- `flux_model = "ntx_exact_lij_runtime"`
+
+with no database-backed neoclassical model selected.
+
+So the current interpretation is:
+
+- exact-runtime NTX lagged-response path is active
+- the Radau-path structural fix removed a large artificial penalty
+
+### 3. The main remaining issue is now timestep-policy stagnation
+
+The latest database benchmark reruns show that the current accepted-step controller can still stall the timestep badly even when:
+
+- Newton is converged
+- the step is accepted
+- `err_norm` is extremely small
+- there are no nonfinite states or residuals
+
+Representative pattern:
+
+- `converged = True`
+- `err_norm ~ 1e-13`
+- `newton_iter_count = 7`
+- `theta ~ 2.4e-02`
+- `accepted = True`
+- but:
+  - `growth = 1.0`
+  - `next_dt = dt_try`
+
+and this can persist for thousands of accepted steps, causing the timestep to freeze near:
+
+- `dt ~ 1.48e-08`
+
+### 4. Why the timestep is freezing
+
+The current controller logic still classifies an accepted step as "difficult" if:
+
+- `newton_iter_count >= 6`
+
+even when the step is clearly converged and the error estimate is tiny.
+
+Then, in the current non-lean controller modes, difficult accepted steps can be forced to:
+
+- `growth = 1.0`
+
+instead of being allowed to regrow.
+
+So the current bottleneck is no longer:
+
+- false non-convergence
+- lagged-response rebuild cost
+- or solver-path corruption
+
+It is now:
+
+- overly conservative accepted-step growth policy for difficult-but-converged Newton solves
+
+### 5. Important comparison result
+
+This behavior also explains why the older/original timestep/Newton policy seemed to use fewer steps:
+
+- the older policy was effectively more permissive
+- it did not penalize accepted 6-7 iteration Newton solves as strongly
+- so it allowed larger regrowth or at least avoided long flat `growth = 1.0` plateaus
+
+This is now the main reason to revisit the older simpler controller logic.
+
+## Updated Priority
+
+The current priority is now:
+
+1. keep the Radau / lagged-response structural fix
+2. keep the Hairer-side Newton convergence improvements
+3. revisit the accepted-step timestep policy
+
+with special focus on reconstructing which earlier controller behavior gave:
+
+- correct convergence classification
+- but fewer accepted steps
+
+## Immediate Recommended Comparison
+
+The next comparison should focus on:
+
+- `radau_controller_mode = "current_legacy"`
+- `radau_controller_mode = "hairer_lean"`
+- and the earlier simpler benchmark behavior
+
+while keeping:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+
+fixed
+
+The question is no longer whether the solver can converge safely.
+
+The question is now:
+
+- which accepted-step policy avoids freezing `dt` on difficult-but-converged steps while preserving the good convergence classification.
+
+## Update: Confirmed Controller / Predictor Comparison Results
+
+For the exact-runtime NTX lagged-response transport case with:
+
+- `radau_rhs_mode = "lagged_response"`
+- `lagged_response_reuse_mode = "global_state_drift"`
+- `lagged_response_reuse_rtol = 1.0e-2`
+- `lagged_response_reuse_atol = 1.0e-8`
+- `ntx_exact_face_response_mode = "interpolate_center_response"`
+- `ntx_exact_response_anchor_count = 48`
+- `t_final = 1.0e-2`
+
+the following controller / predictor combinations have now been explicitly observed:
+
+### Confirmed results
+
+1. `hairer_lean + collocation`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "collocation"`
+- result:
+  - `n_steps = 139`
+
+2. `hairer_lean + current`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "current"`
+- result:
+  - `n_steps = 147`
+
+3. `current_legacy + current`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "current_legacy"`
+- `radau_predictor_mode = "current"`
+- result:
+  - `n_steps = 253`
+
+4. `current_legacy + collocation`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "current_legacy"`
+- `radau_predictor_mode = "collocation"`
+- result:
+  - `n_steps = 226`
+
+5. `current + collocation`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "current"`
+- `radau_predictor_mode = "collocation"`
+- result:
+  - `n_steps = 238`
+
+6. `current + current`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "current"`
+- `radau_predictor_mode = "current"`
+- result:
+  - `n_steps = 240`
+
+7. `gustafsson + current`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "gustafsson"`
+- `radau_predictor_mode = "current"`
+- result:
+  - `n_steps = 271`
+
+8. `gustafsson + collocation`
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "gustafsson"`
+- `radau_predictor_mode = "collocation"`
+- result:
+  - `n_steps = 275`
+
+### Current ranking
+
+Best to worst so far, for minimizing accepted timesteps:
+
+1. `hairer_lean + collocation` -> `139`
+2. `hairer_lean + current` -> `147`
+3. `current_legacy + collocation` -> `226`
+4. `current + collocation` -> `238`
+5. `current + current` -> `240`
+6. `current_legacy + current` -> `253`
+7. `gustafsson + current` -> `271`
+8. `gustafsson + collocation` -> `275`
+
+### Current practical conclusion
+
+For this exact-runtime NTX lagged-response benchmark family:
+
+- the accepted-step controller is the dominant lever
+- `hairer_lean` is clearly better than `current_legacy` and `gustafsson` for minimizing accepted steps
+- within the better controller family, `collocation` gives a modest additional gain
+
+So the current best-known configuration is:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "collocation"`
+- `lagged_response_reuse_mode = "global_state_drift"`
+- `lagged_response_reuse_rtol = 1.0e-2`
+- `lagged_response_reuse_atol = 1.0e-8`
+
+## Update: Experimental Predictor Upgrades Added
+
+Two new experimental Radau predictor modes have now been added as isolated extensions to the stage-predictor path, without changing the controller structure, Newton termination logic, or lagged-response plumbing.
+
+### New predictor modes
+
+1. `radau_predictor_mode = "extrapolated_collocation"`
+
+- starts from the existing `collocation` predictor
+- adds a bounded step-ratio extrapolation based on the previous accepted stage pattern
+- is intended to be a higher-order warm start than plain `collocation`, while staying purely algebraic and cheap
+
+2. `radau_predictor_mode = "jacobian_linearized"`
+
+- starts from the `extrapolated_collocation` predictor
+- applies one linearized collocation-style correction using the cached Jacobian when available
+- falls back automatically to `extrapolated_collocation` when no reusable Jacobian cache is available
+
+### Implementation notes
+
+- the additions were kept local to `_make_radau_stage_predictor(...)`
+- the new modes only consume already-available inputs:
+  - previous accepted stages
+  - previous / current timestep
+  - Radau collocation matrix
+  - cached Jacobian when available
+- this keeps the change minimally invasive and friendly to JAX tracing and differentiability
+- no extra Python-side state or imperative bookkeeping was introduced
+- the Jacobian-informed mode is intentionally cache-aware rather than forcing a new Jacobian build just for prediction
+
+### Current intent
+
+These predictor modes are experimental next-step candidates for reducing Newton work and possibly accepted timestep count further, while preserving the current Radau / lagged-response solver structure that now behaves well.
