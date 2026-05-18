@@ -1399,6 +1399,9 @@ def _apply_radau_lean_timestep_controller(
     trial_dt,
     trial_y,
     err_norm,
+    density_err_norm,
+    pressure_err_norm,
+    er_err_norm,
     converged,
     stage_history,
     jacobian_out,
@@ -1502,7 +1505,12 @@ def _apply_radau_lean_timestep_controller(
     use_current_legacy_controller = controller_mode == "current_legacy"
     use_hairer_lean_controller = controller_mode == "hairer_lean"
     use_hairer_lean_aggressive_controller = controller_mode == "hairer_lean_aggressive"
+    use_hairer_lean_transport_controller = controller_mode == "hairer_lean_transport"
     use_hairer_ntss_controller = controller_mode == "hairer_ntss"
+    use_hairer_lean_family_controller = jnp.logical_or(
+        jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller),
+        use_hairer_lean_transport_controller,
+    )
     growth_lean = safety_factor * safe_error ** (-controller_alpha)
     growth_lean = jnp.clip(growth_lean, min_step_factor, max_step_factor)
     nit_ref = jnp.asarray(20.0, dtype=dtype)
@@ -1532,7 +1540,7 @@ def _apply_radau_lean_timestep_controller(
             use_hairer_ntss_controller,
             growth_ntss,
             jnp.where(
-            jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller),
+            use_hairer_lean_family_controller,
             growth_lean,
             jnp.where(use_current_legacy_controller, growth_current_legacy, growth_current),
             ),
@@ -1583,7 +1591,7 @@ def _apply_radau_lean_timestep_controller(
     )
     streak_growth_cap_gustafsson = max_step_factor
     post_reject_growth_cap = jnp.where(
-        jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller),
+        jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
         max_step_factor,
         jnp.where(
         use_gustafsson_controller,
@@ -1592,7 +1600,7 @@ def _apply_radau_lean_timestep_controller(
         ),
     )
     streak_growth_cap = jnp.where(
-        jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller),
+        jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
         max_step_factor,
         jnp.where(
         use_gustafsson_controller,
@@ -1601,18 +1609,18 @@ def _apply_radau_lean_timestep_controller(
         ),
     )
     growth_cap = jnp.where(
-        jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller),
+        jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
         max_step_factor,
         jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap)),
     )
     growth = jnp.clip(growth, min_step_factor, growth_cap)
     growth = jnp.where(
-        jnp.logical_and(jnp.logical_not(jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller)), jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype))),
+        jnp.logical_and(jnp.logical_not(jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller)), jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype))),
         jnp.asarray(1.0, dtype=dtype),
         growth,
     )
     growth = jnp.where(
-        jnp.logical_and(jnp.logical_not(jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller)), jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready)),
+        jnp.logical_and(jnp.logical_not(jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller)), jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready)),
         jnp.maximum(growth, jnp.asarray(1.2, dtype=dtype)),
         growth,
     )
@@ -1623,11 +1631,39 @@ def _apply_radau_lean_timestep_controller(
             jnp.logical_and(err_norm <= aggressive_healthy_err, jnp.logical_not(very_difficult_accept)),
         ),
     )
+    dominant_ref = jnp.maximum(density_err_norm, pressure_err_norm)
+    er_dominant = er_err_norm >= jnp.asarray(1.25, dtype=dtype) * dominant_ref
+    background_easy = jnp.logical_and(
+        density_err_norm <= jnp.asarray(0.15, dtype=dtype),
+        pressure_err_norm <= jnp.asarray(0.15, dtype=dtype),
+    )
+    transport_growth_ready = jnp.logical_and(
+        accepted,
+        jnp.logical_and(
+            er_dominant,
+            jnp.logical_and(
+                background_easy,
+                jnp.logical_and(theta_final <= jnp.asarray(0.06, dtype=dtype), newton_iter_count <= jnp.asarray(8, dtype=jnp.int32)),
+            ),
+        ),
+    )
     growth = jnp.where(
         jnp.logical_and(use_hairer_lean_aggressive_controller, aggressive_growth_ready),
         jnp.maximum(
             growth,
             jnp.where(easy_accept, aggressive_easy_growth_floor, aggressive_recovery_growth_floor),
+        ),
+        growth,
+    )
+    growth = jnp.where(
+        jnp.logical_and(use_hairer_lean_transport_controller, transport_growth_ready),
+        jnp.maximum(
+            growth,
+            jnp.where(
+                easy_accept,
+                jnp.asarray(1.75, dtype=dtype),
+                jnp.asarray(1.35, dtype=dtype),
+            ),
         ),
         growth,
     )
@@ -1664,7 +1700,7 @@ def _apply_radau_lean_timestep_controller(
         )
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
         regrowth_cooldown_next = jnp.where(
-            jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller),
+            jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
             jnp.asarray(0, dtype=jnp.int32),
             jnp.where(
             use_gustafsson_controller,
@@ -1676,7 +1712,7 @@ def _apply_radau_lean_timestep_controller(
             ),
         )
         easy_growth_streak_next = jnp.where(
-            jnp.logical_or(jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller), use_hairer_ntss_controller),
+            jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
             jnp.asarray(0, dtype=jnp.int32),
             jnp.where(
             use_gustafsson_controller,
@@ -1952,6 +1988,9 @@ class _RadauSolverConfig(TransportSolver):
             "aggressive": "hairer_lean_aggressive",
             "lean_aggressive": "hairer_lean_aggressive",
             "healthy_regrowth": "hairer_lean_aggressive",
+            "transport": "hairer_lean_transport",
+            "lean_transport": "hairer_lean_transport",
+            "transport_aware": "hairer_lean_transport",
             "ntss": "hairer_ntss",
             "hairer": "hairer_ntss",
             "hairer_default": "hairer_ntss",
@@ -1961,9 +2000,9 @@ class _RadauSolverConfig(TransportSolver):
             "standard": "gustafsson",
         }
         controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
-        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_ntss"}:
+        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_lean_transport", "hairer_ntss"}:
             raise ValueError(
-                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_ntss"
+                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_lean_transport, hairer_ntss"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
         predictor_mode_norm = str(predictor_mode).strip().lower()
@@ -2631,6 +2670,59 @@ class RADAUSolver(_RadauSolverConfig):
                 pressure_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(pressure_next)
                 er_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
                 scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
+            if scale_override is None:
+                ref_abs = jnp.abs(flat_y)
+                cand_abs = jnp.abs(flat_next)
+                max_scale = jnp.maximum(ref_abs, cand_abs)
+                mean_scale = jnp.asarray(0.5, dtype=dtype) * (ref_abs + cand_abs)
+                scale_base = jnp.where(
+                    error_scale_mode == "mean",
+                    mean_scale,
+                    jnp.where(
+                        error_scale_mode == "blend",
+                        jnp.asarray(0.75, dtype=dtype) * max_scale + jnp.asarray(0.25, dtype=dtype) * mean_scale,
+                        jnp.where(
+                            error_scale_mode == "ntss",
+                            cand_abs,
+                            jnp.where(
+                                error_scale_mode == "ntss_max",
+                                max_scale,
+                                jnp.where(
+                                    error_scale_mode == "ntss_blend",
+                                    jnp.asarray(0.5, dtype=dtype) * cand_abs + jnp.asarray(0.5, dtype=dtype) * max_scale,
+                                    max_scale,
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                local_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * scale_base
+            else:
+                local_scale = scale_override
+            normalized_err = err_vec / local_scale
+            if density_size + pressure_size + er_size == state_dim:
+                density_slice = normalized_err[:density_size]
+                pressure_slice = normalized_err[density_size:density_size + pressure_size]
+                er_slice = normalized_err[density_size + pressure_size:density_size + pressure_size + er_size]
+                density_err_norm = jnp.where(
+                    density_size > 0,
+                    jnp.sqrt(jnp.mean(density_slice * density_slice) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(0.0, dtype=dtype),
+                )
+                pressure_err_norm = jnp.where(
+                    pressure_size > 0,
+                    jnp.sqrt(jnp.mean(pressure_slice * pressure_slice) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(0.0, dtype=dtype),
+                )
+                er_err_norm = jnp.where(
+                    er_size > 0,
+                    jnp.sqrt(jnp.mean(er_slice * er_slice) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(0.0, dtype=dtype),
+                )
+            else:
+                density_err_norm = jnp.asarray(0.0, dtype=dtype)
+                pressure_err_norm = err_norm
+                er_err_norm = jnp.asarray(0.0, dtype=dtype)
             err_norm = _solver_error_norm(
                 err_vec,
                 flat_y,
@@ -2679,6 +2771,9 @@ class RADAUSolver(_RadauSolverConfig):
                 finite_f0,
                 finite_z0,
                 finite_initial_residual,
+                density_err_norm,
+                pressure_err_norm,
+                er_err_norm,
                 lagged_response,
                 lagged_reference_y,
                 lagged_response_reused,
@@ -2697,7 +2792,8 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
                 real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
                 newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
-                finite_f0, finite_z0, finite_initial_residual, lagged_response_out, lagged_reference_y_out, lagged_response_reused,
+                finite_f0, finite_z0, finite_initial_residual, density_err_norm, pressure_err_norm, er_err_norm,
+                lagged_response_out, lagged_reference_y_out, lagged_response_reused,
                 jacobian_reused,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
@@ -2717,6 +2813,9 @@ class RADAUSolver(_RadauSolverConfig):
                 trial_dt=trial_dt,
                 trial_y=trial_y,
                 err_norm=err_norm,
+                density_err_norm=density_err_norm,
+                pressure_err_norm=pressure_err_norm,
+                er_err_norm=er_err_norm,
                 converged=converged,
                 stage_history=stage_history,
                 jacobian_out=jacobian_out,

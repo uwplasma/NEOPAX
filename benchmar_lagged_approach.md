@@ -2808,3 +2808,156 @@ Guardrail:
 - this is a new mode only
 - `radau_predictor_mode = "collocation"` is unchanged
 - the implementation stays array-only, JAX-friendly, and differentiability-friendly
+
+### Result so far
+
+- `hairer_lean + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 64`
+  - `synchronized_elapsed_s = 211.281`
+
+Comparison against the previous best result:
+
+- `hairer_lean + collocation + embedded2_ntss_transport_scale`
+  - `n_steps = 68`
+  - `synchronized_elapsed_s = 234.904`
+
+Current interpretation:
+
+- the transport-weighted predictor appears to improve further on top of the transport-structured NTSS estimator
+- the predictor is allowing even fewer accepted steps than the already-strong `embedded2_ntss_transport_scale` baseline
+- Newton per-step effort can still be somewhat higher on these larger accepted timesteps
+- but both accepted-step count and total synchronized runtime improved further
+
+Current best-known configuration is now:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "collocation_transport_weighted"`
+- `radau_error_estimator = "embedded2_ntss_transport_scale"`
+
+with:
+
+- `n_steps = 64`
+
+### Most promising next predictor refinements
+
+Given the latest results, the remaining predictor-side improvements are likely to be incremental and should stay in the same transport-aware spirit.
+
+The most promising next predictor ideas are:
+
+1. A transport-weighted dense-output predictor
+
+- combine the NTSS-like dense predictor with the transport-weighted block-aware correction logic
+- this is the cleanest next untried predictor-side extension
+
+Motivation:
+
+- `ntss_dense_output` alone matched the old collocation baseline on step count
+- `collocation_transport_weighted` improved further once the transport-structured estimator was in place
+- combining the two is the most natural next predictor experiment
+
+2. An estimator-aware transport-weighted predictor
+
+- keep the transport-weighted collocation structure
+- make the `Er` correction trust depend more explicitly on the same small-scale sensitivity that motivated the transport-structured estimator
+
+Motivation:
+
+- the successful estimator result suggests that `Er` scaling is the most delicate blockwise ingredient
+- the predictor could use the same block sensitivity to decide how strongly to trust `Er` history
+
+3. A Newton-quality transport-weighted predictor
+
+- keep the transport-weighted predictor
+- additionally modulate block trust using previous Newton quality
+
+Motivation:
+
+- if the previous accepted step converged but required many iterations, some blocks may still have stale history
+- this could be most useful when a single block is driving extra Newton work
+
+Current recommendation:
+
+- do not return to broad global extrapolation or Jacobian-enriched predictor experiments first
+- the best next predictor-side work is now transport-aware and block-aware rather than generic
+
+## Update: First Transport-Aware `hairer_lean` Controller Mode
+
+A new opt-in controller mode has now been added:
+
+- `radau_controller_mode = "hairer_lean_transport"`
+
+Intent:
+
+- preserve the successful `hairer_lean` controller structure
+- keep the same base growth law
+- only add a transport-aware regrowth nudge when the normalized local error is clearly dominated by the `Er` block while density and pressure remain comparatively easy
+
+Current implementation characteristics:
+
+- computes lightweight blockwise normalized local error RMS values from the existing embedded error estimate
+- uses those only inside the new mode
+- if:
+  - the step is accepted
+  - `Er` clearly dominates the blockwise normalized local error
+  - density and pressure remain easy
+  - Newton behavior is still healthy enough
+- then:
+  - apply a modest regrowth floor on top of the usual `hairer_lean` growth
+
+Guardrail:
+
+- `radau_controller_mode = "hairer_lean"` is unchanged
+- this new behavior is opt-in only
+- no host-side logic or non-JAX control path is introduced
+
+### Most promising next estimator refinements
+
+Even after the strong success of `embedded2_ntss_transport_scale`, there is still some focused estimator-side work worth considering.
+
+The highest-signal next estimator refinements are:
+
+1. Tune the `Er` floor inside `embedded2_ntss_transport_scale`
+
+- current form:
+  - `Er_floor = max(0.1 * rms(Er_next), 1e-3)`
+
+Most useful follow-up variants:
+
+- weaker `Er` floor
+  - e.g. `0.05 * rms(Er_next)`
+- stronger `Er` floor
+  - e.g. `0.2 * rms(Er_next)`
+- different absolute floors
+  - e.g. `1e-4`, `1e-3`, `1e-2`
+
+2. Tie the `Er` floor to the transport physics scale `DEr`
+
+Possible forms:
+
+- `Er_floor = c * DEr`
+- or
+- `Er_floor = max(c1 * rms(Er_next), c2 * DEr)`
+
+Motivation:
+
+- `DEr` is already a meaningful scale in the transport setup
+- this would make the estimator more physically interpretable than a purely RMS-based heuristic
+
+3. Give `Er` its own effective tolerance strength if needed
+
+If floor tuning is not enough, the next refinement could be:
+
+- keep density and pressure candidate-only NTSS scaling unchanged
+- but give the `Er` block a separate effective tolerance strength
+
+For example:
+
+- different `atol_Er`
+- or different `rtol_eff_Er`
+
+Current recommendation:
+
+- do not return to generic max/mean/blend experiments
+- the highest-value remaining estimator work is now refining the transport-structured `Er` scaling specifically
