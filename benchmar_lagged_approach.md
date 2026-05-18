@@ -2690,3 +2690,121 @@ Guardrail:
 - `embedded2_ntss_scale` remains unchanged
 - this new behavior is opt-in only
 - the implementation stays array-only, JAX-friendly, and differentiability-friendly
+
+### Result so far
+
+- `hairer_lean + collocation + embedded2_ntss_transport_scale`
+  - `n_steps = 68`
+  - `synchronized_elapsed_s = 234.904`
+
+This is the strongest accepted-step reduction seen so far.
+
+Comparison against the previous best estimator result:
+
+- `hairer_lean + collocation + embedded2_ntss_scale`
+  - `n_steps = 112`
+  - `synchronized_elapsed_s = 258.703`
+
+Current interpretation:
+
+- the transport-structured NTSS estimator appears to be the current best mode for accepted-step reduction
+- Newton is often doing a bit more work per accepted step, because the larger accepted timesteps are harder nonlinear solves
+- however, the overall step count and runtime both improved significantly
+
+### Validation note
+
+So far, the visible differences in `Er` appear to be minimal and likely dominated by the fact that different solver modes save output at different accepted timesteps.
+
+That means the next required validation should be:
+
+- compare the solutions at fixed physical save times
+- either by forcing a common output-time grid
+- or by interpolating one run onto the other run's saved times
+
+This is the right next check before treating `embedded2_ntss_transport_scale` as the preferred default beyond benchmark step-count optimization.
+
+### Most promising next estimator refinements
+
+Given the current results, the remaining useful estimator-side work is now likely to be very focused rather than generic.
+
+The most promising next refinements are:
+
+1. Tune the `Er` floor formula inside `embedded2_ntss_transport_scale`
+
+- the current implementation uses:
+  - `Er_floor = max(0.1 * rms(Er_next), 1e-3)`
+- this is a reasonable first choice, but it is clearly tunable
+
+Most useful follow-up variants:
+
+- weaker `Er` floor
+  - e.g. `0.05 * rms(Er_next)`
+- stronger `Er` floor
+  - e.g. `0.2 * rms(Er_next)`
+- different absolute floors
+  - e.g. `1e-4`, `1e-3`, `1e-2`
+
+2. Tie the `Er` floor to the transport physics scale `DEr`
+
+Possible forms:
+
+- `Er_floor = c * DEr`
+- or
+- `Er_floor = max(c1 * rms(Er_next), c2 * DEr)`
+
+Why this is attractive:
+
+- `DEr` is already a meaningful scale in the transport setup
+- this would make the estimator tuning more physically interpretable than using only an RMS-based heuristic
+
+3. Separate tolerance strength by block if needed
+
+If simple `Er` floor tuning is not enough, a next refinement could be:
+
+- keep the current density / pressure candidate-only NTSS scaling
+- but give `Er` its own effective tolerance strength
+
+For example:
+
+- different `atol_Er`
+- or different `rtol_eff_Er`
+
+Current recommendation:
+
+- do not return to generic max/mean/blend estimator experiments first
+- the highest-signal next estimator work is now tuning the transport-structured `Er` scaling specifically
+
+## Update: First Transport-Weighted Predictor Mode
+
+A new opt-in predictor mode has now been added:
+
+- `radau_predictor_mode = "collocation_transport_weighted"`
+
+Intent:
+
+- preserve the successful `collocation` predictor structure
+- make the fresh collocation correction block-aware
+- let different transport blocks respond differently when their stage history looks stale
+
+Current implementation characteristics:
+
+- density block:
+  - blockwise correction gate with a high minimum trust level
+- pressure block:
+  - blockwise correction gate with near-full trust by default
+- `Er` block:
+  - blockwise correction gate with a lower minimum trust level
+  - intended to damp `Er` correction more strongly when the previous `Er` stage history looks stale
+
+This means the predictor still has the same overall form:
+
+- previous stage guess
+- plus a collocation-style fresh correction
+
+but the correction amplitude is now allowed to differ by block.
+
+Guardrail:
+
+- this is a new mode only
+- `radau_predictor_mode = "collocation"` is unchanged
+- the implementation stays array-only, JAX-friendly, and differentiability-friendly

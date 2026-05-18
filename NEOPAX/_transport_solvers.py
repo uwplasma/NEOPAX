@@ -1211,6 +1211,9 @@ def _make_radau_stage_predictor(
     h_value,
     c,
     dtype,
+    density_size=0,
+    pressure_size=0,
+    er_size=0,
     prev_theta_final=None,
     prev_newton_iter_count=None,
     predictor_mode="current",
@@ -1235,6 +1238,8 @@ def _make_radau_stage_predictor(
         "dense": "ntss_dense_output",
         "dense_output": "ntss_dense_output",
         "ntss_dense": "ntss_dense_output",
+        "transport": "collocation_transport_weighted",
+        "transport_weighted": "collocation_transport_weighted",
     }
     predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
     if predictor_mode_norm not in {
@@ -1244,9 +1249,10 @@ def _make_radau_stage_predictor(
         "dt_ratio_gated_collocation",
         "collocation_correction_gated",
         "newton_quality_gated_collocation",
+        "collocation_transport_weighted",
     }:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
+            "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation, collocation_transport_weighted"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
     prev_stage0 = prev_stage_stack[0]
@@ -1268,12 +1274,63 @@ def _make_radau_stage_predictor(
     dense_den = jnp.sum(dense_bary, axis=1, keepdims=True)
     dense_guess = dense_num / dense_den
     dense_guess = jnp.where(jnp.all(jnp.isfinite(dense_guess)), dense_guess, collocation_guess)
+    if density_size + pressure_size + er_size == base_guess.shape[1]:
+        density_end = density_size
+        pressure_end = density_size + pressure_size
+
+        def _block_gate(block_delta, block_prev, min_gate):
+            scale = jnp.maximum(jnp.maximum(jnp.abs(block_prev), jnp.abs(block_prev + block_delta)), jnp.asarray(1.0e-12, dtype=dtype))
+            mismatch = jnp.sqrt(jnp.mean((block_delta / scale) ** 2) + jnp.asarray(1.0e-12, dtype=dtype))
+            return min_gate + (
+                (jnp.asarray(1.0, dtype=dtype) - min_gate)
+                / (jnp.asarray(1.0, dtype=dtype) + (mismatch / jnp.asarray(0.5, dtype=dtype)) ** 2)
+            )
+
+        density_delta = f0[:density_end] - prev_stage0[:density_end]
+        density_prev = prev_stage0[:density_end]
+        pressure_delta = f0[density_end:pressure_end] - prev_stage0[density_end:pressure_end]
+        pressure_prev = prev_stage0[density_end:pressure_end]
+        er_delta = f0[pressure_end:pressure_end + er_size] - prev_stage0[pressure_end:pressure_end + er_size]
+        er_prev = prev_stage0[pressure_end:pressure_end + er_size]
+
+        density_gate = jnp.where(
+            density_size > 0,
+            _block_gate(density_delta, density_prev, jnp.asarray(0.75, dtype=dtype)),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        pressure_gate = jnp.where(
+            pressure_size > 0,
+            _block_gate(pressure_delta, pressure_prev, jnp.asarray(0.85, dtype=dtype)),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        er_gate = jnp.where(
+            er_size > 0,
+            _block_gate(er_delta, er_prev, jnp.asarray(0.35, dtype=dtype)),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        block_gate_vec = jnp.concatenate(
+            [
+                jnp.full((density_size,), density_gate, dtype=dtype),
+                jnp.full((pressure_size,), pressure_gate, dtype=dtype),
+                jnp.full((er_size,), er_gate, dtype=dtype),
+            ],
+            axis=0,
+        )
+        transport_weighted_guess = prev_stage_guess + block_gate_vec[None, :] * collocation_correction
+        transport_weighted_guess = (
+            jnp.asarray(0.9, dtype=dtype) * transport_weighted_guess
+            + jnp.asarray(0.1, dtype=dtype) * base_guess
+        )
+    else:
+        transport_weighted_guess = collocation_guess
     if predictor_mode_norm == "current":
         predictor_guess = blended_guess
     elif predictor_mode_norm == "collocation":
         predictor_guess = collocation_guess
     elif predictor_mode_norm == "ntss_dense_output":
         predictor_guess = dense_guess
+    elif predictor_mode_norm == "collocation_transport_weighted":
+        predictor_guess = transport_weighted_guess
     elif predictor_mode_norm == "collocation_correction_gated":
         mismatch_scale = jnp.maximum(jnp.maximum(jnp.abs(f0), jnp.abs(prev_stage0)), jnp.asarray(1.0e-12, dtype=dtype))
         mismatch_norm = jnp.sqrt(jnp.mean(((f0 - prev_stage0) / mismatch_scale) ** 2) + jnp.asarray(1.0e-12, dtype=dtype))
@@ -1919,6 +1976,8 @@ class _RadauSolverConfig(TransportSolver):
             "dense": "ntss_dense_output",
             "dense_output": "ntss_dense_output",
             "ntss_dense": "ntss_dense_output",
+            "transport": "collocation_transport_weighted",
+            "transport_weighted": "collocation_transport_weighted",
             "gated": "dt_ratio_gated_collocation",
             "dt_gated": "dt_ratio_gated_collocation",
             "correction_gated": "collocation_correction_gated",
@@ -1929,12 +1988,13 @@ class _RadauSolverConfig(TransportSolver):
             "current",
             "collocation",
             "ntss_dense_output",
+            "collocation_transport_weighted",
             "dt_ratio_gated_collocation",
             "collocation_correction_gated",
             "newton_quality_gated_collocation",
         }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
+                "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, collocation_transport_weighted, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
@@ -2279,6 +2339,9 @@ class RADAUSolver(_RadauSolverConfig):
                 h_value,
                 c,
                 dtype,
+                density_size=density_size,
+                pressure_size=pressure_size,
+                er_size=er_size,
                 prev_theta_final=prev_theta_final,
                 prev_newton_iter_count=prev_newton_iter_count,
                 predictor_mode=predictor_mode,
