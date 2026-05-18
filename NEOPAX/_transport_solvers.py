@@ -833,27 +833,30 @@ def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, 
     return _flat_rhs
 
 
-def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max", rtol_eff=None):
+def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max", rtol_eff=None, scale_override=None):
     ref_abs = jnp.abs(flat_ref)
     cand_abs = jnp.abs(flat_candidate)
     max_scale = jnp.maximum(ref_abs, cand_abs)
     mean_scale = 0.5 * (ref_abs + cand_abs)
     effective_rtol = rtol if rtol_eff is None else rtol_eff
-    if scale_mode == "max":
-        scale_base = max_scale
-    elif scale_mode == "mean":
-        scale_base = mean_scale
-    elif scale_mode == "blend":
-        scale_base = jnp.asarray(0.75, dtype=err_vec.dtype) * max_scale + jnp.asarray(0.25, dtype=err_vec.dtype) * mean_scale
-    elif scale_mode == "ntss":
-        scale_base = cand_abs
-    elif scale_mode == "ntss_max":
-        scale_base = max_scale
-    elif scale_mode == "ntss_blend":
-        scale_base = jnp.asarray(0.5, dtype=err_vec.dtype) * cand_abs + jnp.asarray(0.5, dtype=err_vec.dtype) * max_scale
+    if scale_override is None:
+        if scale_mode == "max":
+            scale_base = max_scale
+        elif scale_mode == "mean":
+            scale_base = mean_scale
+        elif scale_mode == "blend":
+            scale_base = jnp.asarray(0.75, dtype=err_vec.dtype) * max_scale + jnp.asarray(0.25, dtype=err_vec.dtype) * mean_scale
+        elif scale_mode == "ntss":
+            scale_base = cand_abs
+        elif scale_mode == "ntss_max":
+            scale_base = max_scale
+        elif scale_mode == "ntss_blend":
+            scale_base = jnp.asarray(0.5, dtype=err_vec.dtype) * cand_abs + jnp.asarray(0.5, dtype=err_vec.dtype) * max_scale
+        else:
+            raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
+        scale = atol + effective_rtol * scale_base
     else:
-        raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
-    scale = atol + effective_rtol * scale_base
+        scale = scale_override
     normalized = err_vec / scale
     return jnp.sqrt(jnp.mean(normalized * normalized) + 1.0e-30)
 
@@ -1850,6 +1853,8 @@ class _RadauSolverConfig(TransportSolver):
             "hairer": "embedded2_ntss_scale",
             "ntss_max": "embedded2_ntss_max_scale",
             "ntss_blend": "embedded2_ntss_blend_scale",
+            "transport": "embedded2_ntss_transport_scale",
+            "ntss_transport": "embedded2_ntss_transport_scale",
         }
         error_estimator_norm = error_estimator_aliases.get(error_estimator_norm, error_estimator_norm)
         if error_estimator_norm not in {
@@ -1859,9 +1864,10 @@ class _RadauSolverConfig(TransportSolver):
             "embedded2_ntss_scale",
             "embedded2_ntss_max_scale",
             "embedded2_ntss_blend_scale",
+            "embedded2_ntss_transport_scale",
         }:
             raise ValueError(
-                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale"
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale, embedded2_ntss_transport_scale"
             )
         object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
@@ -2038,6 +2044,16 @@ class RADAUSolver(_RadauSolverConfig):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
+        packed_state0 = _pack_transport_state_arrays(state, species)
+        if isinstance(packed_state0, tuple) and len(packed_state0) == 3:
+            density0, pressure0, er0 = packed_state0
+            density_size = int(np.prod(density0.shape))
+            pressure_size = int(np.prod(pressure0.shape))
+            er_size = int(np.prod(er0.shape))
+        else:
+            density_size = 0
+            pressure_size = 0
+            er_size = 0
         if self.num_stages not in _RADAU_STAGE_CONFIGS:
             raise ValueError(
                 f"Unsupported custom Radau stage count '{self.num_stages}'. "
@@ -2065,6 +2081,7 @@ class RADAUSolver(_RadauSolverConfig):
             else "ntss" if error_estimator_mode == "embedded2_ntss_scale"
             else "ntss_max" if error_estimator_mode == "embedded2_ntss_max_scale"
             else "ntss_blend" if error_estimator_mode == "embedded2_ntss_blend_scale"
+            else "ntss_transport" if error_estimator_mode == "embedded2_ntss_transport_scale"
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
@@ -2145,6 +2162,11 @@ class RADAUSolver(_RadauSolverConfig):
             predictor_fnewt = jnp.maximum(jnp.asarray(self.tol, dtype=dtype), tiny_scalar)
         estimator_rtol_eff = jnp.asarray(self.rtol, dtype=dtype)
         if error_estimator_mode == "embedded2_ntss_scale":
+            uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+            expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+            safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
+            estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
+        if error_estimator_mode in {"embedded2_ntss_max_scale", "embedded2_ntss_blend_scale", "embedded2_ntss_transport_scale"}:
             uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
             expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
             safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
@@ -2530,6 +2552,22 @@ class RADAUSolver(_RadauSolverConfig):
                 )
             flat_next = flat_y + h_value * (b @ stages_final)
             err_vec = h_value * (embedded_f0_weight * f0 + (b_error @ stages_final))
+            scale_override = None
+            if error_scale_mode == "ntss_transport" and (density_size + pressure_size + er_size == state_dim):
+                density_end = density_size
+                pressure_end = density_size + pressure_size
+                density_next = flat_next[:density_end]
+                pressure_next = flat_next[density_end:pressure_end]
+                er_next = flat_next[pressure_end:pressure_end + er_size]
+                er_rms = jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=dtype))
+                er_floor = jnp.maximum(
+                    jnp.asarray(0.1, dtype=dtype) * er_rms,
+                    jnp.asarray(1.0e-3, dtype=dtype),
+                )
+                density_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(density_next)
+                pressure_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(pressure_next)
+                er_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
+                scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
             err_norm = _solver_error_norm(
                 err_vec,
                 flat_y,
@@ -2538,6 +2576,7 @@ class RADAUSolver(_RadauSolverConfig):
                 self.rtol,
                 scale_mode=error_scale_mode,
                 rtol_eff=estimator_rtol_eff,
+                scale_override=scale_override,
             )
             theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
             fallback_newton_shrink = jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max)

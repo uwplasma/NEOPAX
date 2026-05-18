@@ -2632,3 +2632,61 @@ Guardrail:
 - `embedded2_ntss_scale` remains unchanged
 - these are follow-up variants only
 - the embedded error vector itself is still unchanged across all these modes
+
+### Results so far
+
+For the restored `hairer_lean + collocation` benchmark family:
+
+- `embedded2_ntss_scale`
+  - `n_steps = 112`
+  - `synchronized_elapsed_s = 258.703`
+- `embedded2_ntss_max_scale`
+  - `n_steps = 139`
+  - `synchronized_elapsed_s = 257.475`
+- `embedded2_ntss_blend_scale`
+  - `n_steps = 152`
+  - `synchronized_elapsed_s = 281.461`
+
+Current interpretation:
+
+- `embedded2_ntss_max_scale` collapses almost exactly back to the old baseline behavior
+- `embedded2_ntss_blend_scale` is worse than both `embedded2_ntss_scale` and the old baseline
+- this strongly suggests the main win comes specifically from the combination of:
+  - NTSS-style `rtol_eff`
+  - and candidate-only scaling
+- the NTSS-style effective relative tolerance alone is not enough
+
+## Update: First Transport-Structured NTSS Estimator
+
+A new opt-in transport-structured estimator mode has now been added:
+
+- `radau_error_estimator = "embedded2_ntss_transport_scale"`
+
+Intent:
+
+- preserve the successful NTSS-style candidate-only scaling for the full state
+- keep density and pressure fully active in the norm
+- only give the `Er` block a state-dependent floor-aware scale, since it is the most likely delicate block in this transport structure
+
+Current implementation characteristics:
+
+- density block:
+  - `scale_n = atol + rtol_eff * abs(n_next)`
+- pressure block:
+  - `scale_p = atol + rtol_eff * abs(p_next)`
+- `Er` block:
+  - `scale_Er = atol + rtol_eff * max(abs(Er_next), Er_floor)`
+- with:
+  - `Er_floor = max(0.1 * rms(Er_next), 1e-3)`
+
+Why this is structured but still general:
+
+- if density or temperature/pressure become important, they still fully contribute through their own candidate-state scales
+- the estimator is not `Er`-only
+- it simply prevents very small local `Er` values from collapsing the normalization scale too aggressively
+
+Guardrail:
+
+- `embedded2_ntss_scale` remains unchanged
+- this new behavior is opt-in only
+- the implementation stays array-only, JAX-friendly, and differentiability-friendly
