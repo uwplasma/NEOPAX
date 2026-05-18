@@ -2445,3 +2445,38 @@ Important guardrail:
 
 - this is a new mode only
 - the existing `hairer_lean + collocation + embedded2` baseline is unchanged
+
+### Result so far
+
+- `hairer_ntss + collocation + embedded2`
+  - `n_steps = 207`
+  - `synchronized_elapsed_s = 302.276`
+
+So this first NTSS-like controller attempt is clearly worse than the established baseline and should be treated as a negative result for accepted-step minimization.
+
+## Update: First NTSS-Like Dense Predictor Mode
+
+A new opt-in predictor mode has now been added:
+
+- `radau_predictor_mode = "ntss_dense_output"`
+
+Intent:
+
+- make a first pass at the most important still-untried NTSS-like predictor idea
+- keep the current `collocation` predictor unchanged
+- reuse only cheap local Radau history already available in the step state
+
+Current implementation characteristics:
+
+- builds a small dense-output-style extrapolation from:
+  - the previous accepted stage history
+  - the current start-of-step slope `f0`
+  - the step ratio `h / hold`
+- extrapolates the previous stage polynomial forward to the new collocation nodes
+- falls back to `collocation` if the dense extrapolated guess is not finite
+
+Important guardrail:
+
+- this is a new predictor mode only
+- `radau_predictor_mode = "collocation"` is unchanged
+- no extra predictor-side Jacobian machinery is introduced

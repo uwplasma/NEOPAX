@@ -1222,17 +1222,21 @@ def _make_radau_stage_predictor(
         "dt_gated": "dt_ratio_gated_collocation",
         "correction_gated": "collocation_correction_gated",
         "quality_gated": "newton_quality_gated_collocation",
+        "dense": "ntss_dense_output",
+        "dense_output": "ntss_dense_output",
+        "ntss_dense": "ntss_dense_output",
     }
     predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
     if predictor_mode_norm not in {
         "current",
         "collocation",
+        "ntss_dense_output",
         "dt_ratio_gated_collocation",
         "collocation_correction_gated",
         "newton_quality_gated_collocation",
     }:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
+            "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
     prev_stage0 = prev_stage_stack[0]
@@ -1242,10 +1246,24 @@ def _make_radau_stage_predictor(
         jnp.asarray(0.9, dtype=dtype) * collocation_guess
         + jnp.asarray(0.1, dtype=dtype) * base_guess
     )
+    dense_nodes = jnp.concatenate([c, jnp.asarray([jnp.asarray(1.0, dtype=dtype)], dtype=dtype)])
+    dense_values = jnp.concatenate([prev_stage_stack, f0[None, :]], axis=0)
+    dense_eval_nodes = jnp.asarray(1.0, dtype=dtype) + c * step_ratio
+    dense_node_diffs = dense_nodes[:, None] - dense_nodes[None, :]
+    dense_node_diffs_safe = dense_node_diffs + jnp.eye(dense_nodes.shape[0], dtype=dtype)
+    dense_weights = jnp.asarray(1.0, dtype=dtype) / jnp.prod(dense_node_diffs_safe, axis=1)
+    dense_eval_diffs = dense_eval_nodes[:, None] - dense_nodes[None, :]
+    dense_bary = dense_weights[None, :] / dense_eval_diffs
+    dense_num = dense_bary @ dense_values
+    dense_den = jnp.sum(dense_bary, axis=1, keepdims=True)
+    dense_guess = dense_num / dense_den
+    dense_guess = jnp.where(jnp.all(jnp.isfinite(dense_guess)), dense_guess, collocation_guess)
     if predictor_mode_norm == "current":
         predictor_guess = blended_guess
     elif predictor_mode_norm == "collocation":
         predictor_guess = collocation_guess
+    elif predictor_mode_norm == "ntss_dense_output":
+        predictor_guess = dense_guess
     elif predictor_mode_norm == "collocation_correction_gated":
         mismatch_scale = jnp.maximum(jnp.maximum(jnp.abs(f0), jnp.abs(prev_stage0)), jnp.asarray(1.0e-12, dtype=dtype))
         mismatch_norm = jnp.sqrt(jnp.mean(((f0 - prev_stage0) / mismatch_scale) ** 2) + jnp.asarray(1.0e-12, dtype=dtype))
@@ -1870,6 +1888,9 @@ class _RadauSolverConfig(TransportSolver):
             "stage_history": "current",
             "hairer": "collocation",
             "ntss": "collocation",
+            "dense": "ntss_dense_output",
+            "dense_output": "ntss_dense_output",
+            "ntss_dense": "ntss_dense_output",
             "gated": "dt_ratio_gated_collocation",
             "dt_gated": "dt_ratio_gated_collocation",
             "correction_gated": "collocation_correction_gated",
@@ -1879,12 +1900,13 @@ class _RadauSolverConfig(TransportSolver):
         if predictor_mode_norm not in {
             "current",
             "collocation",
+            "ntss_dense_output",
             "dt_ratio_gated_collocation",
             "collocation_correction_gated",
             "newton_quality_gated_collocation",
         }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
+                "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
