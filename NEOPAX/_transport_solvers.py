@@ -833,8 +833,20 @@ def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, 
     return _flat_rhs
 
 
-def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float):
-    scale = atol + rtol * jnp.maximum(jnp.abs(flat_ref), jnp.abs(flat_candidate))
+def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max"):
+    ref_abs = jnp.abs(flat_ref)
+    cand_abs = jnp.abs(flat_candidate)
+    max_scale = jnp.maximum(ref_abs, cand_abs)
+    mean_scale = 0.5 * (ref_abs + cand_abs)
+    if scale_mode == "max":
+        scale_base = max_scale
+    elif scale_mode == "mean":
+        scale_base = mean_scale
+    elif scale_mode == "blend":
+        scale_base = jnp.asarray(0.75, dtype=err_vec.dtype) * max_scale + jnp.asarray(0.25, dtype=err_vec.dtype) * mean_scale
+    else:
+        raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
+    scale = atol + rtol * scale_base
     normalized = err_vec / scale
     return jnp.sqrt(jnp.mean(normalized * normalized) + 1.0e-30)
 
@@ -1772,7 +1784,12 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "min_step", float(min_step))
         object.__setattr__(self, "tol", float(tol))
         object.__setattr__(self, "maxiter", int(max(1, maxiter)))
-        object.__setattr__(self, "error_estimator", str(error_estimator).strip().lower())
+        error_estimator_norm = str(error_estimator).strip().lower()
+        if error_estimator_norm not in {"embedded2", "embedded2_mean_scale", "embedded2_blend_scale"}:
+            raise ValueError(
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale"
+            )
+        object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
         object.__setattr__(self, "safety_factor", float(safety_factor))
         object.__setattr__(self, "min_step_factor", float(min_step_factor))
@@ -1959,6 +1976,12 @@ class RADAUSolver(_RadauSolverConfig):
         base_dt = jnp.clip(jnp.asarray(self.dt, dtype=dtype), dt_min, dt_max)
         max_total_steps = int(max(1, self.max_steps))
         state_dim = flat_state0.shape[0]
+        error_estimator_mode = str(getattr(self, "error_estimator", "embedded2")).strip().lower()
+        error_scale_mode = (
+            "mean" if error_estimator_mode == "embedded2_mean_scale"
+            else "blend" if error_estimator_mode == "embedded2_blend_scale"
+            else "max"
+        )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
@@ -2416,7 +2439,14 @@ class RADAUSolver(_RadauSolverConfig):
                 )
             flat_next = flat_y + h_value * (b @ stages_final)
             err_vec = h_value * (embedded_f0_weight * f0 + (b_error @ stages_final))
-            err_norm = _solver_error_norm(err_vec, flat_y, flat_next, self.atol, self.rtol)
+            err_norm = _solver_error_norm(
+                err_vec,
+                flat_y,
+                flat_next,
+                self.atol,
+                self.rtol,
+                scale_mode=error_scale_mode,
+            )
             theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
             fallback_newton_shrink = jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max)
             newton_shrink = jnp.where(

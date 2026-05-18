@@ -2215,3 +2215,51 @@ More specifically, the new mode can enforce a modest minimum regrowth floor when
 
 - plain `radau_controller_mode = "hairer_lean"` remains unchanged
 - this new behavior is only active when the new mode is explicitly selected
+
+### Result so far
+
+- `hairer_lean_aggressive` was tested with `collocation`
+- observed result:
+  - `n_steps = 160`
+
+So in its current form this controller variant is not promising for the accepted-step minimization objective.
+
+## Update: First Error-Estimator-Side Implementation
+
+The first estimator-side implementation has now been added as opt-in variants of the existing embedded Radau error estimator.
+
+### New modes
+
+1. `radau_error_estimator = "embedded2"`
+
+- existing baseline
+- unchanged behavior
+
+2. `radau_error_estimator = "embedded2_mean_scale"`
+
+- keeps the same embedded Radau error vector
+- changes only the normalization scale from:
+  - `max(|y_n|, |y_{n+1}|)`
+  - to
+  - `0.5 * (|y_n| + |y_{n+1}|)`
+
+Intent:
+
+- test whether the current endpoint-max scaling is slightly conservative for this benchmark family
+
+3. `radau_error_estimator = "embedded2_blend_scale"`
+
+- keeps the same embedded Radau error vector
+- uses a mild blended normalization scale:
+  - `0.75 * max + 0.25 * mean`
+
+Intent:
+
+- provide a softer estimator experiment that is closer to the baseline than the full mean-scale variant
+
+### Guardrail
+
+- the embedded error vector itself is unchanged
+- the current `embedded2` baseline path is unchanged
+- the new behavior is only active when the new estimator modes are explicitly selected
+- the implementation is array-only, JAX-friendly, and differentiability-friendly
