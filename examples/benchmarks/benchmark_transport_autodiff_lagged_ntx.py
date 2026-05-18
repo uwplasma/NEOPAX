@@ -60,6 +60,7 @@ OBJECTIVE_LABELS = [
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
 ]
+DEFAULT_FD_SWEEP_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
 
 
 def _prepare_benchmark_config(config_path: Path, *, device: str | None) -> dict[str, Any]:
@@ -286,6 +287,18 @@ def _sequence_allclose(seq_a, seq_b, *, rtol: float = 1.0e-10, atol: float = 1.0
     return bool(np.allclose(arr_a, arr_b, rtol=rtol, atol=atol))
 
 
+def _parse_float_csv(text: str | None) -> tuple[float, ...]:
+    if text is None:
+        return ()
+    values = []
+    for chunk in str(text).split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    return tuple(values)
+
+
 def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
     accepted_mask = result.get("accepted_mask")
     failed_mask = result.get("failed_mask")
@@ -463,6 +476,100 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"abs_err={float(abs_err):.6e} "
             f"rel_err={float(rel_err):.6e}"
         )
+    fd_sweep = report.get("fd_step_sweep")
+    if fd_sweep:
+        print("[autodiff-gate] fd step sweep:")
+        for entry in fd_sweep:
+            print(
+                f"  - scale={float(entry['scale']):.6e} "
+                f"fd_step={float(entry['fd_step']):.6e} "
+                f"max_rel_err={float(entry['max_relative_error']):.6e} "
+                f"n_steps_minus={entry['n_steps_minus']} "
+                f"n_steps_plus={entry['n_steps_plus']} "
+                f"saved_times_equal={entry['saved_times_equal_minus_plus']} "
+                f"saved_dts_equal={entry['saved_dts_equal_minus_plus']}"
+            )
+
+
+def _fd_step_sweep_report(
+    *,
+    runtime,
+    config: dict[str, Any],
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    baseline_value: float,
+    gradient_ad: jax.Array,
+    fd_step: float,
+    step_multipliers: tuple[float, ...],
+) -> list[dict[str, Any]]:
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    entries: list[dict[str, Any]] = []
+    seen_steps: set[float] = set()
+
+    for scale in step_multipliers:
+        step_value = float(fd_step * scale)
+        if step_value <= 0.0:
+            continue
+        rounded_key = round(step_value, 18)
+        if rounded_key in seen_steps:
+            continue
+        seen_steps.add(rounded_key)
+        minus_value = baseline_value - step_value
+        plus_value = baseline_value + step_value
+        minus_result = run_transport(
+            config,
+            runtime,
+            _parameterized_initial_state(
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                geometry=runtime.geometry,
+                n_species=runtime.species.number_species,
+                parameter_name=parameter_name,
+                parameter_value=jnp.asarray(minus_value),
+            ),
+        )
+        plus_result = run_transport(
+            config,
+            runtime,
+            _parameterized_initial_state(
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                geometry=runtime.geometry,
+                n_species=runtime.species.number_species,
+                parameter_name=parameter_name,
+                parameter_value=jnp.asarray(plus_value),
+            ),
+        )
+        objectives_minus = _objective_vector(minus_result["final_state"], runtime)
+        objectives_plus = _objective_vector(plus_result["final_state"], runtime)
+        gradient_fd = (objectives_plus - objectives_minus) / (2.0 * step_value)
+        grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+        abs_err = np.abs(grad_ad_np - grad_fd_np)
+        rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+        minus_diag = _result_diagnostics(minus_result)
+        plus_diag = _result_diagnostics(plus_result)
+        entries.append(
+            {
+                "scale": float(scale),
+                "fd_step": float(step_value),
+                "gradient_fd": grad_fd_np.tolist(),
+                "gradient_absolute_error": abs_err.tolist(),
+                "gradient_relative_error": rel_err.tolist(),
+                "max_relative_error": float(np.max(rel_err)),
+                "n_steps_minus": minus_diag["n_steps"],
+                "n_steps_plus": plus_diag["n_steps"],
+                "saved_times_equal_minus_plus": _sequence_allclose(
+                    minus_diag["saved_times"],
+                    plus_diag["saved_times"],
+                ),
+                "saved_dts_equal_minus_plus": _sequence_allclose(
+                    minus_diag["saved_step_sizes"],
+                    plus_diag["saved_step_sizes"],
+                ),
+            }
+        )
+    return entries
 
 
 def build_report(
@@ -475,6 +582,8 @@ def build_report(
     sweep_points: int,
     with_sweep: bool,
     one_step_diagnostic: bool,
+    with_fd_step_sweep: bool,
+    fd_step_sweep_multipliers: tuple[float, ...],
     device: str | None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
@@ -577,6 +686,20 @@ def build_report(
     minus_diag = _result_diagnostics(minus_result)
     plus_diag = _result_diagnostics(plus_result)
 
+    fd_step_sweep = None
+    if with_fd_step_sweep:
+        fd_step_sweep = _fd_step_sweep_report(
+            runtime=runtime,
+            config=config,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            baseline_value=baseline_value,
+            gradient_ad=gradient_ad,
+            fd_step=fd_step,
+            step_multipliers=fd_step_sweep_multipliers,
+        )
+
     report = {
         "config_path": str(config_path),
         "one_step_diagnostic": bool(one_step_diagnostic),
@@ -591,8 +714,10 @@ def build_report(
         "max_relative_error": float(np.max(rel_err)),
         "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
         "objective_labels": OBJECTIVE_LABELS,
+        "autodiff_reuses_baseline_value_only": True,
         "sweep_values": sweep_values.tolist(),
         "sweep_objectives": sweep_objectives.tolist(),
+        "fd_step_sweep": fd_step_sweep,
         "solver_path": {
             "baseline": baseline_diag,
             "fd_minus": minus_diag,
@@ -636,6 +761,16 @@ def main() -> None:
     parser.add_argument("--sweep-points", type=int, default=7)
     parser.add_argument("--with-sweep", action="store_true", help="Run extra sweep solves for objective curves.")
     parser.add_argument(
+        "--with-fd-step-sweep",
+        action="store_true",
+        help="Run extra full-solve FD checks at multiple FD step sizes.",
+    )
+    parser.add_argument(
+        "--fd-step-sweep-multipliers",
+        default="0.25,0.5,1.0,2.0,4.0",
+        help="Comma-separated multipliers applied to the base FD step when --with-fd-step-sweep is enabled.",
+    )
+    parser.add_argument(
         "--one-step-diagnostic",
         action="store_true",
         help="Stop after one accepted transport step to isolate local AD-vs-FD behavior.",
@@ -653,6 +788,8 @@ def main() -> None:
         sweep_points=args.sweep_points,
         with_sweep=args.with_sweep,
         one_step_diagnostic=args.one_step_diagnostic,
+        with_fd_step_sweep=args.with_fd_step_sweep,
+        fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
         device=args.device,
     )
 
