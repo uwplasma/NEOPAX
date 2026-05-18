@@ -2034,6 +2034,9 @@ class _RadauSolverConfig(TransportSolver):
             "ntss_blend": "embedded2_ntss_blend_scale",
             "transport": "embedded2_ntss_transport_scale",
             "ntss_transport": "embedded2_ntss_transport_scale",
+            "block_floor": "embedded2_ntss_block_floor_scale",
+            "floor_scale": "embedded2_ntss_block_floor_scale",
+            "ntss_block_floor": "embedded2_ntss_block_floor_scale",
         }
         error_estimator_norm = error_estimator_aliases.get(error_estimator_norm, error_estimator_norm)
         if error_estimator_norm not in {
@@ -2044,9 +2047,10 @@ class _RadauSolverConfig(TransportSolver):
             "embedded2_ntss_max_scale",
             "embedded2_ntss_blend_scale",
             "embedded2_ntss_transport_scale",
+            "embedded2_ntss_block_floor_scale",
         }:
             raise ValueError(
-                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale, embedded2_ntss_transport_scale"
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale, embedded2_ntss_transport_scale, embedded2_ntss_block_floor_scale"
             )
         object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
@@ -2277,6 +2281,7 @@ class RADAUSolver(_RadauSolverConfig):
             else "ntss_max" if error_estimator_mode == "embedded2_ntss_max_scale"
             else "ntss_blend" if error_estimator_mode == "embedded2_ntss_blend_scale"
             else "ntss_transport" if error_estimator_mode == "embedded2_ntss_transport_scale"
+            else "ntss_block_floor" if error_estimator_mode == "embedded2_ntss_block_floor_scale"
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
@@ -2361,7 +2366,7 @@ class RADAUSolver(_RadauSolverConfig):
             expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
             safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
             estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
-        if error_estimator_mode in {"embedded2_ntss_max_scale", "embedded2_ntss_blend_scale", "embedded2_ntss_transport_scale"}:
+        if error_estimator_mode in {"embedded2_ntss_max_scale", "embedded2_ntss_blend_scale", "embedded2_ntss_transport_scale", "embedded2_ntss_block_floor_scale"}:
             uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
             expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
             safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
@@ -2764,6 +2769,28 @@ class RADAUSolver(_RadauSolverConfig):
                 )
                 density_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(density_next)
                 pressure_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(pressure_next)
+                er_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
+                scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
+            if error_scale_mode == "ntss_block_floor" and (density_size + pressure_size + er_size == state_dim):
+                density_end = density_size
+                pressure_end = density_size + pressure_size
+                density_next = flat_next[:density_end]
+                pressure_next = flat_next[density_end:pressure_end]
+                er_next = flat_next[pressure_end:pressure_end + er_size]
+                density_floor = jnp.maximum(
+                    jnp.asarray(0.05, dtype=dtype) * jnp.sqrt(jnp.mean(density_next * density_next) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(1.0e-4, dtype=dtype),
+                )
+                pressure_floor = jnp.maximum(
+                    jnp.asarray(0.05, dtype=dtype) * jnp.sqrt(jnp.mean(pressure_next * pressure_next) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(1.0e-4, dtype=dtype),
+                )
+                er_floor = jnp.maximum(
+                    jnp.asarray(0.1, dtype=dtype) * jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=dtype)),
+                    jnp.asarray(1.0e-3, dtype=dtype),
+                )
+                density_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(density_next), density_floor)
+                pressure_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(pressure_next), pressure_floor)
                 er_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
                 scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
             if scale_override is None:

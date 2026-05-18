@@ -2993,6 +2993,140 @@ Guardrail:
 
 ### Result so far
 
+- `hairer_lean_transport_discounted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 62`
+  - `synchronized_elapsed_s = 211.968`
+
+Comparison against the previous strongest configurations:
+
+- `hairer_lean + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 64`
+  - `synchronized_elapsed_s = 211.281`
+- `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 63`
+  - `synchronized_elapsed_s = 222.810`
+
+Current interpretation:
+
+- the discounted transport-aware controller is the strongest controller result so far
+- it achieved the lowest accepted-step count seen so far
+- unlike the growth-encouraging transport-aware controllers, it did so without a major runtime penalty
+- this supports the working hypothesis that the remaining controller gain comes more from discounting false pessimism on localized difficulty than from forcing stronger accepted-step regrowth
+
+## Updated Best-Known Configuration
+
+The current best-known accepted-step result is now:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean_transport_discounted"`
+- `radau_predictor_mode = "collocation_transport_weighted"`
+- `radau_error_estimator = "embedded2_ntss_transport_scale"`
+
+with:
+
+- `n_steps = 62`
+- `synchronized_elapsed_s = 211.968`
+
+## Most Promising Remaining Experiments
+
+At this point the stack is already heavily transport-structured, so the remaining gains are likely to be incremental rather than dramatic.
+
+The most promising next experiments are:
+
+1. `transport_weighted_dense` with the discounted transport-aware controller
+
+- this predictor was previously worse than `collocation_transport_weighted` when paired with plain `hairer_lean`
+- but it has not yet been tested together with:
+  - `hairer_lean_transport_discounted`
+  - `embedded2_ntss_transport_scale`
+
+Recommended comparison:
+
+- `radau_controller_mode = "hairer_lean_transport_discounted"`
+- `radau_predictor_mode = "transport_weighted_dense"`
+- `radau_error_estimator = "embedded2_ntss_transport_scale"`
+
+Observed result:
+
+- `hairer_lean_transport_discounted + transport_weighted_dense + embedded2_ntss_transport_scale`
+  - `n_steps = 63`
+  - `synchronized_elapsed_s = 210.381`
+
+Comparison against the current best step-count configuration:
+
+- `hairer_lean_transport_discounted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 62`
+  - `synchronized_elapsed_s = 211.968`
+
+Current interpretation:
+
+- `transport_weighted_dense` is essentially tied on runtime and may even be slightly faster in this run
+- but `collocation_transport_weighted` still remains the best predictor for minimizing accepted steps
+
+2. Tune the `Er` floor inside `embedded2_ntss_transport_scale`
+
+This is still the most promising estimator-side refinement.
+
+Most useful variants:
+
+- weaker floor factor
+  - e.g. `0.05 * rms(Er_next)`
+- stronger floor factor
+  - e.g. `0.2 * rms(Er_next)`
+- `DEr`-based floor
+  - e.g. `max(c1 * rms(Er_next), c2 * DEr)`
+
+3. Refine the discounted controller using blockwise Newton difficulty
+
+The current discounted controller discounts pessimism based on localized blockwise error structure.
+
+A possible refinement would be:
+
+- only discount pessimism when the localized difficult block also looks Newton-benign
+
+This is lower priority than the two items above, but it is the most plausible next controller refinement if more controller work is attempted.
+
+## Current Recommendation
+
+If only one next test is run, the strongest next candidate is:
+
+- `hairer_lean_transport_discounted + transport_weighted_dense + embedded2_ntss_transport_scale`
+
+After that, the highest-value remaining refinement is still estimator-side tuning of the transport-structured `Er` floor.
+
+## Update: First General Block-Floor Estimator Mode
+
+A new opt-in estimator mode has now been added:
+
+- `radau_error_estimator = "embedded2_ntss_block_floor_scale"`
+
+Intent:
+
+- generalize the successful transport-structured scaling idea beyond only `Er`
+- allow density, pressure, and `Er` all to protect themselves if their candidate-state scale becomes too small
+
+Current implementation characteristics:
+
+- density block:
+  - `floor_n = max(0.05 * rms(n_next), 1e-4)`
+- pressure block:
+  - `floor_p = max(0.05 * rms(p_next), 1e-4)`
+- `Er` block:
+  - `floor_Er = max(0.1 * rms(Er_next), 1e-3)`
+
+Then each block uses:
+
+- `scale_block = atol + rtol_eff * max(abs(block_next), floor_block)`
+
+Guardrail:
+
+- this is a new estimator mode only
+- `embedded2_ntss_transport_scale` remains unchanged
+- this is the first general block-floor version, not yet the more physics-aware `DEr`-based refinement
+
+### Result so far
+
 - `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
   - `n_steps = 63`
   - `synchronized_elapsed_s = 222.810`
