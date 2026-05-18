@@ -2809,6 +2809,23 @@ Guardrail:
 - `radau_predictor_mode = "collocation"` is unchanged
 - the implementation stays array-only, JAX-friendly, and differentiability-friendly
 
+### Additional predictor variant now available
+
+A combined dense + transport-weighted predictor mode has also now been added:
+
+- `radau_predictor_mode = "transport_weighted_dense"`
+
+Intent:
+
+- keep the transport-weighted block-aware correction idea
+- blend it with the NTSS-like dense predictor enhancement
+- allow dense-history information to help more where the blockwise history looks trustworthy
+
+Guardrail:
+
+- this is a separate opt-in mode only
+- `collocation_transport_weighted` and `ntss_dense_output` remain unchanged
+
 ### Result so far
 
 - `hairer_lean + collocation_transport_weighted + embedded2_ntss_transport_scale`
@@ -2942,6 +2959,31 @@ Guardrail:
 - this is a new mode only
 - `radau_controller_mode = "hairer_lean"` remains unchanged
 - the change is still algebraic, array-only, JAX-friendly, and differentiability-friendly
+
+### Result so far
+
+- `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 63`
+  - `synchronized_elapsed_s = 222.810`
+
+Comparison against the previous best practical configuration:
+
+- `hairer_lean + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 64`
+  - `synchronized_elapsed_s = 211.281`
+
+Current interpretation:
+
+- the weighted transport-aware controller achieved the lowest accepted-step count seen so far
+- but only by a very small margin (`64 -> 63`)
+- and it did so with worse total synchronized runtime
+
+So the current split is:
+
+- best raw accepted-step count:
+  - `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+- best practical near-best configuration:
+  - `hairer_lean + collocation_transport_weighted + embedded2_ntss_transport_scale`
 
 ### Most promising next estimator refinements
 

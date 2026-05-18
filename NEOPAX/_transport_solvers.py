@@ -1240,6 +1240,9 @@ def _make_radau_stage_predictor(
         "ntss_dense": "ntss_dense_output",
         "transport": "collocation_transport_weighted",
         "transport_weighted": "collocation_transport_weighted",
+        "transport_dense": "transport_weighted_dense",
+        "weighted_dense": "transport_weighted_dense",
+        "dense_transport": "transport_weighted_dense",
     }
     predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
     if predictor_mode_norm not in {
@@ -1250,9 +1253,10 @@ def _make_radau_stage_predictor(
         "collocation_correction_gated",
         "newton_quality_gated_collocation",
         "collocation_transport_weighted",
+        "transport_weighted_dense",
     }:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation, collocation_transport_weighted"
+            "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation, collocation_transport_weighted, transport_weighted_dense"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
     prev_stage0 = prev_stage_stack[0]
@@ -1321,14 +1325,25 @@ def _make_radau_stage_predictor(
             jnp.asarray(0.9, dtype=dtype) * transport_weighted_guess
             + jnp.asarray(0.1, dtype=dtype) * base_guess
         )
+        transport_weighted_dense_guess = (
+            transport_weighted_guess
+            + block_gate_vec[None, :] * (dense_guess - transport_weighted_guess)
+        )
+        transport_weighted_dense_guess = (
+            jnp.asarray(0.95, dtype=dtype) * transport_weighted_dense_guess
+            + jnp.asarray(0.05, dtype=dtype) * base_guess
+        )
     else:
         transport_weighted_guess = collocation_guess
+        transport_weighted_dense_guess = dense_guess
     if predictor_mode_norm == "current":
         predictor_guess = blended_guess
     elif predictor_mode_norm == "collocation":
         predictor_guess = collocation_guess
     elif predictor_mode_norm == "ntss_dense_output":
         predictor_guess = dense_guess
+    elif predictor_mode_norm == "transport_weighted_dense":
+        predictor_guess = transport_weighted_dense_guess
     elif predictor_mode_norm == "collocation_transport_weighted":
         predictor_guess = transport_weighted_guess
     elif predictor_mode_norm == "collocation_correction_gated":
@@ -2069,6 +2084,9 @@ class _RadauSolverConfig(TransportSolver):
             "ntss_dense": "ntss_dense_output",
             "transport": "collocation_transport_weighted",
             "transport_weighted": "collocation_transport_weighted",
+            "transport_dense": "transport_weighted_dense",
+            "weighted_dense": "transport_weighted_dense",
+            "dense_transport": "transport_weighted_dense",
             "gated": "dt_ratio_gated_collocation",
             "dt_gated": "dt_ratio_gated_collocation",
             "correction_gated": "collocation_correction_gated",
@@ -2080,12 +2098,13 @@ class _RadauSolverConfig(TransportSolver):
             "collocation",
             "ntss_dense_output",
             "collocation_transport_weighted",
+            "transport_weighted_dense",
             "dt_ratio_gated_collocation",
             "collocation_correction_gated",
             "newton_quality_gated_collocation",
         }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, collocation_transport_weighted, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
+                "radau_predictor_mode must be one of: current, collocation, ntss_dense_output, collocation_transport_weighted, transport_weighted_dense, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
