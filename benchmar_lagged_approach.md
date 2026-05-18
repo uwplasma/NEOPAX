@@ -1944,3 +1944,49 @@ Two new experimental Radau predictor modes have now been added as isolated exten
 ### Current intent
 
 These predictor modes are experimental next-step candidates for reducing Newton work and possibly accepted timestep count further, while preserving the current Radau / lagged-response solver structure that now behaves well.
+
+## Update: Experimental Predictor Results
+
+The first two experimental predictor upgrades did not beat plain `collocation` in the current exact-runtime NTX lagged-response benchmark family.
+
+### Observed outcomes
+
+1. `hairer_lean + extrapolated_collocation`
+
+- `radau_predictor_mode = "extrapolated_collocation"`
+- result:
+  - `n_steps = 150`
+
+2. `hairer_lean + jacobian_linearized`
+
+- `radau_predictor_mode = "jacobian_linearized"`
+- result:
+  - `n_steps = 149`
+
+### Interpretation
+
+- both experimental modes were slightly worse than plain `collocation`
+- `extrapolated_collocation` likely overused stage-history extrapolation when the local collocation correction was already sufficient
+- `jacobian_linearized` did not reduce step count enough to compensate for its extra per-predictor work
+
+So the current practical conclusion remains:
+
+- `collocation` is still the best predictor seen so far for this benchmark family
+
+## Update: New Gated Predictor Option
+
+A new experimental predictor mode has been added:
+
+- `radau_predictor_mode = "dt_ratio_gated_collocation"`
+
+Intent:
+
+- start from the existing `collocation` predictor
+- only blend toward the more aggressive `extrapolated_collocation` predictor when `dt_new / dt_old` stays close to `1`
+- fall back smoothly toward plain `collocation` when the step-ratio change is larger
+
+Implementation notes:
+
+- the gate is smooth and algebraic, based on the bounded timestep ratio
+- this keeps the mode JAX-friendly and differentiability-friendly
+- the change remains local to the predictor path and does not modify controller or Newton logic

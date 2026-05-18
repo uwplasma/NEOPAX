@@ -1209,14 +1209,22 @@ def _make_radau_stage_predictor(
     predictor_aliases = {
         "extrapolated": "extrapolated_collocation",
         "extrapolated-collocation": "extrapolated_collocation",
+        "gated": "dt_ratio_gated_collocation",
+        "dt_gated": "dt_ratio_gated_collocation",
         "jacobian": "jacobian_linearized",
         "linearized": "jacobian_linearized",
         "linearized_collocation": "jacobian_linearized",
     }
     predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
-    if predictor_mode_norm not in {"current", "collocation", "extrapolated_collocation", "jacobian_linearized"}:
+    if predictor_mode_norm not in {
+        "current",
+        "collocation",
+        "extrapolated_collocation",
+        "dt_ratio_gated_collocation",
+        "jacobian_linearized",
+    }:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, jacobian_linearized"
+            "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, dt_ratio_gated_collocation, jacobian_linearized"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
     prev_stage0 = prev_stage_stack[0]
@@ -1232,6 +1240,19 @@ def _make_radau_stage_predictor(
     extrapolated_collocation_guess = (
         jnp.asarray(0.95, dtype=dtype) * extrapolated_collocation_guess
         + jnp.asarray(0.05, dtype=dtype) * base_guess
+    )
+    log_step_ratio = jnp.abs(jnp.log(bounded_step_ratio))
+    full_trust_ratio = jnp.asarray(jnp.log(1.1), dtype=dtype)
+    zero_trust_ratio = jnp.asarray(jnp.log(1.5), dtype=dtype)
+    gate_u = jnp.clip(
+        (zero_trust_ratio - log_step_ratio) / (zero_trust_ratio - full_trust_ratio),
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+    )
+    step_ratio_gate = gate_u * gate_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * gate_u)
+    dt_ratio_gated_collocation_guess = (
+        collocation_guess
+        + step_ratio_gate * (extrapolated_collocation_guess - collocation_guess)
     )
 
     jacobian_usable = jnp.logical_and(
@@ -1264,7 +1285,11 @@ def _make_radau_stage_predictor(
             jnp.where(
                 predictor_mode_norm == "extrapolated_collocation",
                 extrapolated_collocation_guess,
-                jacobian_linearized_guess,
+                jnp.where(
+                    predictor_mode_norm == "dt_ratio_gated_collocation",
+                    dt_ratio_gated_collocation_guess,
+                    jacobian_linearized_guess,
+                ),
             ),
         ),
     )
@@ -1766,6 +1791,8 @@ class _RadauSolverConfig(TransportSolver):
             "ntss": "collocation",
             "extrapolated": "extrapolated_collocation",
             "extrapolated-collocation": "extrapolated_collocation",
+            "gated": "dt_ratio_gated_collocation",
+            "dt_gated": "dt_ratio_gated_collocation",
             "jacobian": "jacobian_linearized",
             "linearized": "jacobian_linearized",
             "linearized_collocation": "jacobian_linearized",
@@ -1775,10 +1802,11 @@ class _RadauSolverConfig(TransportSolver):
             "current",
             "collocation",
             "extrapolated_collocation",
+            "dt_ratio_gated_collocation",
             "jacobian_linearized",
         }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, jacobian_linearized"
+                "radau_predictor_mode must be one of: current, collocation, extrapolated_collocation, dt_ratio_gated_collocation, jacobian_linearized"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
