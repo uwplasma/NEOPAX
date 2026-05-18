@@ -847,6 +847,10 @@ def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: flo
         scale_base = jnp.asarray(0.75, dtype=err_vec.dtype) * max_scale + jnp.asarray(0.25, dtype=err_vec.dtype) * mean_scale
     elif scale_mode == "ntss":
         scale_base = cand_abs
+    elif scale_mode == "ntss_max":
+        scale_base = max_scale
+    elif scale_mode == "ntss_blend":
+        scale_base = jnp.asarray(0.5, dtype=err_vec.dtype) * cand_abs + jnp.asarray(0.5, dtype=err_vec.dtype) * max_scale
     else:
         raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
     scale = atol + effective_rtol * scale_base
@@ -1844,11 +1848,20 @@ class _RadauSolverConfig(TransportSolver):
             "ntss": "embedded2_ntss_scale",
             "ntss_scale": "embedded2_ntss_scale",
             "hairer": "embedded2_ntss_scale",
+            "ntss_max": "embedded2_ntss_max_scale",
+            "ntss_blend": "embedded2_ntss_blend_scale",
         }
         error_estimator_norm = error_estimator_aliases.get(error_estimator_norm, error_estimator_norm)
-        if error_estimator_norm not in {"embedded2", "embedded2_mean_scale", "embedded2_blend_scale", "embedded2_ntss_scale"}:
+        if error_estimator_norm not in {
+            "embedded2",
+            "embedded2_mean_scale",
+            "embedded2_blend_scale",
+            "embedded2_ntss_scale",
+            "embedded2_ntss_max_scale",
+            "embedded2_ntss_blend_scale",
+        }:
             raise ValueError(
-                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale"
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale"
             )
         object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
@@ -2050,6 +2063,8 @@ class RADAUSolver(_RadauSolverConfig):
             "mean" if error_estimator_mode == "embedded2_mean_scale"
             else "blend" if error_estimator_mode == "embedded2_blend_scale"
             else "ntss" if error_estimator_mode == "embedded2_ntss_scale"
+            else "ntss_max" if error_estimator_mode == "embedded2_ntss_max_scale"
+            else "ntss_blend" if error_estimator_mode == "embedded2_ntss_blend_scale"
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)

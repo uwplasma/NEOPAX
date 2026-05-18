@@ -2516,3 +2516,119 @@ Important guardrail:
 - `radau_error_estimator = "embedded2"` remains unchanged
 - this is not yet a full reproduction of NTSS `estrad_` / `estrav_`
 - it is the first isolated scaling-side approximation only
+
+### Result so far
+
+- `hairer_lean + collocation + embedded2_ntss_scale`
+  - `n_steps = 112`
+  - `synchronized_elapsed_s = 258.703`
+
+This is the first NTSS-inspired modification that clearly beats the restored baseline on accepted-step count.
+
+Comparison against the previous best baseline:
+
+- `hairer_lean + collocation + embedded2`
+  - `n_steps = 139`
+  - `synchronized_elapsed_s = 256.126`
+
+So the current leading interpretation is:
+
+- the main missing gain did not come from the controller or predictor
+- it came from the error-estimator scaling
+- the earlier baseline error normalization was likely too conservative for this benchmark family
+
+## Updated Best-Known Configuration
+
+The current best-known accepted-step result is:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "collocation"`
+- `radau_error_estimator = "embedded2_ntss_scale"`
+
+with:
+
+- `n_steps = 112`
+
+## Recommended Follow-Up Matrix
+
+Since the new estimator mode appears to be the main breakthrough, the next most useful comparisons are:
+
+1. `hairer_lean + ntss_dense_output + embedded2_ntss_scale`
+
+- most interesting next test
+- checks whether the NTSS-like predictor adds anything on top of the new estimator scaling
+
+2. `hairer_ntss + collocation + embedded2_ntss_scale`
+
+- lower priority
+- mainly tests whether the controller still remains too conservative even after the estimator improvement
+
+3. `hairer_ntss + ntss_dense_output + embedded2_ntss_scale`
+
+- completeness test for the fuller NTSS-like bundle
+- currently less likely to beat the best `hairer_lean` path
+
+Current expectation:
+
+- `embedded2_ntss_scale` is probably the main win
+- `ntss_dense_output` is worth testing next
+- `hairer_ntss` is still more likely to hurt than help on accepted-step count
+
+## Update: Dense Predictor With NTSS-Style Error Scaling
+
+The most important follow-up comparison has now been run:
+
+- `hairer_lean + ntss_dense_output + embedded2_ntss_scale`
+  - `n_steps = 112`
+  - `synchronized_elapsed_s = 252.216`
+
+Comparison against the current best-known baseline with the same estimator:
+
+- `hairer_lean + collocation + embedded2_ntss_scale`
+  - `n_steps = 112`
+  - `synchronized_elapsed_s = 258.703`
+
+So at the moment:
+
+- `ntss_dense_output` does not further reduce accepted-step count beyond the current best `112`
+- however, it does appear slightly better on walltime in this run
+
+Current interpretation:
+
+- the NTSS-style estimator scaling remains the dominant improvement
+- the NTSS-like dense predictor is at least compatible with that improvement
+- but it has not yet shown an additional accepted-step reduction beyond the estimator gain itself
+
+## Update: NTSS-Style Error-Scaling Refinements
+
+To understand which part of the successful NTSS-style estimator scaling is doing the useful work, two additional opt-in variants have now been added:
+
+1. `radau_error_estimator = "embedded2_ntss_max_scale"`
+
+- keeps the NTSS-style effective relative tolerance:
+  - `rtol_eff = 0.1 * rtol^expmns`
+- but uses `max(|y_n|, |y_{n+1}|)` instead of candidate-only scaling
+
+Intent:
+
+- test whether the main win came from the NTSS-style `rtol_eff` alone
+- while restoring the more conservative max-based state scale
+
+2. `radau_error_estimator = "embedded2_ntss_blend_scale"`
+
+- keeps the same NTSS-style `rtol_eff`
+- uses a mild blend between:
+  - candidate-only scaling
+  - max-based scaling
+
+Intent:
+
+- test whether the best result can be retained while slightly regularizing the pure candidate-only scaling
+
+Guardrail:
+
+- `embedded2_ntss_scale` remains unchanged
+- these are follow-up variants only
+- the embedded error vector itself is still unchanged across all these modes
