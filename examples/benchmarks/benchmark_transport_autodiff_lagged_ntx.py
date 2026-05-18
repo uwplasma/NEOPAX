@@ -55,6 +55,9 @@ OBJECTIVE_LABELS = [
     "softmax_Er",
     "smooth_root_proxy",
     "Er2_volume_average",
+    "Er_volume_average",
+    "electron_temperature_volume_average_keV",
+    "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
 ]
 
@@ -167,16 +170,34 @@ def _alpha_power_volume_average(final_state, runtime) -> jax.Array:
     return _volume_average(alpha_mw_m3, runtime.geometry)
 
 
+def _electron_temperature_volume_average(final_state, runtime) -> jax.Array:
+    species_idx = getattr(runtime.species, "species_idx", {})
+    electron_idx = species_idx.get("e", 0)
+    temperature = jnp.asarray(final_state.temperature[electron_idx], dtype=final_state.pressure.dtype)
+    return _volume_average(temperature, runtime.geometry)
+
+
+def _total_pressure_volume_average(final_state, runtime) -> jax.Array:
+    total_pressure = jnp.sum(jnp.asarray(final_state.pressure, dtype=final_state.pressure.dtype), axis=0)
+    return _volume_average(total_pressure, runtime.geometry)
+
+
 def _objective_vector(final_state, runtime) -> jax.Array:
     er = jnp.asarray(final_state.Er)
     rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
     er2_vol = _volume_average(er * er, runtime.geometry)
+    er_vol = _volume_average(er, runtime.geometry)
+    te_vol = _electron_temperature_volume_average(final_state, runtime)
+    p_tot_vol = _total_pressure_volume_average(final_state, runtime)
     alpha_vol = _alpha_power_volume_average(final_state, runtime)
     return jnp.stack(
         [
             _softmax_objective(er),
             _smooth_root_proxy(er, rho),
             er2_vol,
+            er_vol,
+            te_vol,
+            p_tot_vol,
             alpha_vol,
         ]
     )
@@ -206,6 +227,27 @@ def _transport_objectives_for_parameter(
 
 def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> float:
     return max(abs_step, rel_step * max(abs(baseline_value), 1.0))
+
+
+def _accepted_count(mask) -> int | None:
+    if mask is None:
+        return None
+    arr = np.asarray(jax.device_get(mask))
+    return int(np.sum(arr))
+
+
+def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    accepted_mask = result.get("accepted_mask")
+    failed_mask = result.get("failed_mask")
+    fail_codes = result.get("fail_codes")
+    diag = {
+        "n_steps": None if result.get("n_steps") is None else int(np.asarray(jax.device_get(result["n_steps"]))),
+        "accepted_count": _accepted_count(accepted_mask),
+        "accepted_mask": None if accepted_mask is None else np.asarray(jax.device_get(accepted_mask), dtype=bool).tolist(),
+        "failed_any": False if failed_mask is None else bool(np.any(np.asarray(jax.device_get(failed_mask), dtype=bool))),
+        "fail_codes": None if fail_codes is None else np.asarray(jax.device_get(fail_codes)).tolist(),
+    }
+    return diag
 
 
 def _write_sweep_csv(
@@ -298,6 +340,42 @@ def _write_figure(report: dict[str, Any], out: Path) -> None:
     plt.close(fig)
 
 
+def _print_terminal_summary(report: dict[str, Any]) -> None:
+    print(
+        f"[autodiff-gate] parameter={report['parameter_name']} "
+        f"baseline_value={report['baseline_value']:.6e} "
+        f"fd_step={report['fd_step']:.6e}"
+    )
+    path = report.get("solver_path", {})
+    for key in ("baseline", "fd_minus", "fd_plus"):
+        diag = path.get(key, {})
+        print(
+            f"[autodiff-gate] path {key}: "
+            f"n_steps={diag.get('n_steps')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"failed_any={diag.get('failed_any')}"
+        )
+    print(
+        "[autodiff-gate] fd path parity:",
+        f"accepted_mask_equal_minus_plus={path.get('accepted_mask_equal_minus_plus')}",
+    )
+    print("[autodiff-gate] objective errors:")
+    for label, j_ad, j_fd, abs_err, rel_err in zip(
+        report["objective_labels"],
+        report["gradient_autodiff"],
+        report["gradient_fd"],
+        report["gradient_absolute_error"],
+        report["gradient_relative_error"],
+    ):
+        print(
+            f"  - {label}: "
+            f"ad={float(j_ad):.6e} "
+            f"fd={float(j_fd):.6e} "
+            f"abs_err={float(abs_err):.6e} "
+            f"rel_err={float(rel_err):.6e}"
+        )
+
+
 def build_report(
     *,
     config_path: Path,
@@ -306,6 +384,7 @@ def build_report(
     abs_fd_step: float,
     sweep_half_width_rel: float,
     sweep_points: int,
+    with_sweep: bool,
     device: str | None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
@@ -325,36 +404,23 @@ def build_report(
         parameter_name=parameter_name,
     )
 
-    baseline_objectives = objective_fn(jnp.asarray(baseline_value))
     gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
 
     fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
-    objectives_minus = objective_fn(jnp.asarray(minus_value))
-    objectives_plus = objective_fn(jnp.asarray(plus_value))
-    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
-
-    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    abs_err = np.abs(grad_ad_np - grad_fd_np)
-    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
-
-    sweep_half_width = sweep_half_width_rel * max(abs(baseline_value), 1.0)
-    sweep_values = np.linspace(
-        baseline_value - sweep_half_width,
-        baseline_value + sweep_half_width,
-        int(sweep_points),
-        dtype=float,
+    baseline_result = run_transport(
+        config,
+        runtime,
+        _parameterized_initial_state(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_name=parameter_name,
+            parameter_value=jnp.asarray(baseline_value),
+        ),
     )
-    sweep_objectives = np.stack(
-        [
-            np.asarray(jax.device_get(objective_fn(jnp.asarray(value))), dtype=float)
-            for value in sweep_values
-        ],
-        axis=0,
-    )
-
     minus_result = run_transport(
         config,
         runtime,
@@ -379,18 +445,46 @@ def build_report(
             parameter_value=jnp.asarray(plus_value),
         ),
     )
-    baseline_result = run_transport(
-        config,
-        runtime,
-        _parameterized_initial_state(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_name=parameter_name,
-            parameter_value=jnp.asarray(baseline_value),
-        ),
-    )
+
+    baseline_objectives = _objective_vector(baseline_result["final_state"], runtime)
+    objectives_minus = _objective_vector(minus_result["final_state"], runtime)
+    objectives_plus = _objective_vector(plus_result["final_state"], runtime)
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+
+    if with_sweep:
+        sweep_half_width = sweep_half_width_rel * max(abs(baseline_value), 1.0)
+        sweep_values = np.linspace(
+            baseline_value - sweep_half_width,
+            baseline_value + sweep_half_width,
+            int(sweep_points),
+            dtype=float,
+        )
+        sweep_objectives = np.stack(
+            [
+                np.asarray(jax.device_get(objective_fn(jnp.asarray(value))), dtype=float)
+                for value in sweep_values
+            ],
+            axis=0,
+        )
+    else:
+        sweep_values = np.asarray([minus_value, baseline_value, plus_value], dtype=float)
+        sweep_objectives = np.stack(
+            [
+                np.asarray(jax.device_get(objectives_minus), dtype=float),
+                np.asarray(jax.device_get(baseline_objectives), dtype=float),
+                np.asarray(jax.device_get(objectives_plus), dtype=float),
+            ],
+            axis=0,
+        )
+
+    baseline_diag = _result_diagnostics(baseline_result)
+    minus_diag = _result_diagnostics(minus_result)
+    plus_diag = _result_diagnostics(plus_result)
 
     report = {
         "config_path": str(config_path),
@@ -407,6 +501,17 @@ def build_report(
         "objective_labels": OBJECTIVE_LABELS,
         "sweep_values": sweep_values.tolist(),
         "sweep_objectives": sweep_objectives.tolist(),
+        "solver_path": {
+            "baseline": baseline_diag,
+            "fd_minus": minus_diag,
+            "fd_plus": plus_diag,
+            "accepted_mask_equal_minus_plus": (
+                baseline_diag["accepted_mask"] is not None
+                and minus_diag["accepted_mask"] is not None
+                and plus_diag["accepted_mask"] is not None
+                and minus_diag["accepted_mask"] == plus_diag["accepted_mask"]
+            ),
+        },
         "rho_grid": np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float).tolist(),
         "baseline_final_Er": np.asarray(jax.device_get(baseline_result["final_state"].Er), dtype=float).tolist(),
         "fd_minus_final_Er": np.asarray(jax.device_get(minus_result["final_state"].Er), dtype=float).tolist(),
@@ -429,6 +534,7 @@ def main() -> None:
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-4)
     parser.add_argument("--sweep-half-width-rel", type=float, default=5.0e-2)
     parser.add_argument("--sweep-points", type=int, default=7)
+    parser.add_argument("--with-sweep", action="store_true", help="Run extra sweep solves for objective curves.")
     parser.add_argument("--outdir", type=Path, default=Path("outputs/autodiff_transport_lagged_ntx"))
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
@@ -440,6 +546,7 @@ def main() -> None:
         abs_fd_step=args.fd_abs_step,
         sweep_half_width_rel=args.sweep_half_width_rel,
         sweep_points=args.sweep_points,
+        with_sweep=args.with_sweep,
         device=args.device,
     )
 
@@ -456,6 +563,7 @@ def main() -> None:
         sweep_values=np.asarray(report["sweep_values"], dtype=float),
         objective_values=np.asarray(report["sweep_objectives"], dtype=float),
     )
+    _print_terminal_summary(report)
     if not args.no_plot:
         _write_figure(report, fig_path)
         print(f"Wrote {fig_path}")
