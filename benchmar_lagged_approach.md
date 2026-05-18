@@ -1990,3 +1990,38 @@ Implementation notes:
 - the gate is smooth and algebraic, based on the bounded timestep ratio
 - this keeps the mode JAX-friendly and differentiability-friendly
 - the change remains local to the predictor path and does not modify controller or Newton logic
+
+## Update: Restored Predictor Baseline And New Low-Risk Experiments
+
+The temporary clipped shared stage-ratio scaling in the predictor core was the likely source of the distorted `current` / `collocation` reordering. After restoring the original raw stage-ratio scaling for the existing modes, the expected ordering came back:
+
+- `collocation` -> `139` steps
+- `current` -> `147` steps
+- `dt_ratio_gated_collocation` -> `151` steps
+
+This strongly suggests that future predictor experiments should preserve the existing `collocation` structure and only add small, local modifications.
+
+### Newly implemented experimental predictor modes
+
+1. `radau_predictor_mode = "collocation_correction_gated"`
+
+- keeps the restored raw stage-history scaling
+- keeps the same collocation structure
+- only gates the fresh correction term using the mismatch between:
+  - previous first-stage slope proxy
+  - current base slope `f0`
+
+2. `radau_predictor_mode = "newton_quality_gated_collocation"`
+
+- keeps the restored raw stage-history scaling
+- keeps the same collocation structure
+- gates the fresh correction term using previous-step Newton quality:
+  - previous `theta_final`
+  - previous `newton_iter_count`
+
+### Design intent
+
+- do not modify the live `current` or `collocation` behavior
+- do not reintroduce aggressive global extrapolation
+- keep the experiments cheap, JAX-friendly, and differentiability-friendly
+- only modulate the collocation correction when history looks less trustworthy

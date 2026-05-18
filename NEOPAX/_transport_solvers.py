@@ -882,6 +882,8 @@ def _make_radau_initial_step_state(
         real_piv=real_piv0,
         complex_lu=complex_lu0,
         complex_piv=complex_piv0,
+        prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+        prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
     )
 
 
@@ -1187,6 +1189,8 @@ def _make_radau_stage_predictor(
     h_value,
     c,
     dtype,
+    prev_theta_final=None,
+    prev_newton_iter_count=None,
     predictor_mode="current",
 ):
     base_guess = c[:, None] * f0[None, :]
@@ -1204,15 +1208,24 @@ def _make_radau_stage_predictor(
     predictor_aliases = {
         "gated": "dt_ratio_gated_collocation",
         "dt_gated": "dt_ratio_gated_collocation",
+        "correction_gated": "collocation_correction_gated",
+        "quality_gated": "newton_quality_gated_collocation",
     }
     predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
-    if predictor_mode_norm not in {"current", "collocation", "dt_ratio_gated_collocation"}:
+    if predictor_mode_norm not in {
+        "current",
+        "collocation",
+        "dt_ratio_gated_collocation",
+        "collocation_correction_gated",
+        "newton_quality_gated_collocation",
+    }:
         raise ValueError(
-            "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation"
+            "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
         )
     blended_guess = jnp.asarray(0.85, dtype=dtype) * prev_stage_guess + jnp.asarray(0.15, dtype=dtype) * base_guess
     prev_stage0 = prev_stage_stack[0]
-    collocation_guess = prev_stage_guess + c[:, None] * (f0 - prev_stage0)[None, :]
+    collocation_correction = c[:, None] * (f0 - prev_stage0)[None, :]
+    collocation_guess = prev_stage_guess + collocation_correction
     collocation_guess = (
         jnp.asarray(0.9, dtype=dtype) * collocation_guess
         + jnp.asarray(0.1, dtype=dtype) * base_guess
@@ -1221,6 +1234,42 @@ def _make_radau_stage_predictor(
         predictor_guess = blended_guess
     elif predictor_mode_norm == "collocation":
         predictor_guess = collocation_guess
+    elif predictor_mode_norm == "collocation_correction_gated":
+        mismatch_scale = jnp.maximum(jnp.maximum(jnp.abs(f0), jnp.abs(prev_stage0)), jnp.asarray(1.0e-12, dtype=dtype))
+        mismatch_norm = jnp.sqrt(jnp.mean(((f0 - prev_stage0) / mismatch_scale) ** 2) + jnp.asarray(1.0e-12, dtype=dtype))
+        correction_gate = jnp.asarray(0.25, dtype=dtype) + (
+            jnp.asarray(0.75, dtype=dtype)
+            / (jnp.asarray(1.0, dtype=dtype) + (mismatch_norm / jnp.asarray(0.5, dtype=dtype)) ** 2)
+        )
+        predictor_guess = prev_stage_guess + correction_gate * collocation_correction
+        predictor_guess = (
+            jnp.asarray(0.9, dtype=dtype) * predictor_guess
+            + jnp.asarray(0.1, dtype=dtype) * base_guess
+        )
+    elif predictor_mode_norm == "newton_quality_gated_collocation":
+        theta_value = jnp.asarray(0.0 if prev_theta_final is None else prev_theta_final, dtype=dtype)
+        iter_value = jnp.asarray(0 if prev_newton_iter_count is None else prev_newton_iter_count, dtype=jnp.int32)
+        theta_u = jnp.clip(
+            (jnp.asarray(0.08, dtype=dtype) - theta_value) / jnp.asarray(0.07, dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        theta_gate = theta_u * theta_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * theta_u)
+        iter_u = jnp.clip(
+            (jnp.asarray(7, dtype=jnp.int32) - iter_value).astype(dtype) / jnp.asarray(3.0, dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        iter_gate = iter_u * iter_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * iter_u)
+        quality_gate = jnp.maximum(
+            jnp.asarray(0.35, dtype=dtype),
+            theta_gate * iter_gate,
+        )
+        predictor_guess = prev_stage_guess + quality_gate * collocation_correction
+        predictor_guess = (
+            jnp.asarray(0.9, dtype=dtype) * predictor_guess
+            + jnp.asarray(0.1, dtype=dtype) * base_guess
+        )
     else:
         extrapolated_collocation_guess = (
             collocation_guess
@@ -1511,6 +1560,8 @@ def _apply_radau_lean_timestep_controller(
             real_piv=real_piv_out,
             complex_lu=complex_lu_out,
             complex_piv=complex_piv_out,
+            prev_theta_final=theta_final,
+            prev_newton_iter_count=newton_iter_count,
         ), _RadauStepInfo(
             y=accepted_y,
             t=t_new,
@@ -1591,6 +1642,8 @@ def _apply_radau_lean_timestep_controller(
             real_piv=real_piv_out,
             complex_lu=complex_lu_out,
             complex_piv=complex_piv_out,
+            prev_theta_final=theta_final,
+            prev_newton_iter_count=newton_iter_count,
         ), _RadauStepInfo(
             y=step_state.y,
             t=step_state.t,
@@ -1742,15 +1795,19 @@ class _RadauSolverConfig(TransportSolver):
             "ntss": "collocation",
             "gated": "dt_ratio_gated_collocation",
             "dt_gated": "dt_ratio_gated_collocation",
+            "correction_gated": "collocation_correction_gated",
+            "quality_gated": "newton_quality_gated_collocation",
         }
         predictor_mode_norm = predictor_aliases.get(predictor_mode_norm, predictor_mode_norm)
         if predictor_mode_norm not in {
             "current",
             "collocation",
             "dt_ratio_gated_collocation",
+            "collocation_correction_gated",
+            "newton_quality_gated_collocation",
         }:
             raise ValueError(
-                "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation"
+                "radau_predictor_mode must be one of: current, collocation, dt_ratio_gated_collocation, collocation_correction_gated, newton_quality_gated_collocation"
             )
         object.__setattr__(self, "predictor_mode", predictor_mode_norm)
         lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
@@ -1802,6 +1859,8 @@ class _RadauStepState:
     real_piv: Any
     complex_lu: Any
     complex_piv: Any
+    prev_theta_final: Any
+    prev_newton_iter_count: Any
 
 
 @jax.tree_util.register_dataclass
@@ -2005,6 +2064,8 @@ class RADAUSolver(_RadauSolverConfig):
             h_value,
             prev_stages,
             prev_dt,
+            prev_theta_final,
+            prev_newton_iter_count,
             jacobian_cache,
             cache_valid,
             cache_dt,
@@ -2060,6 +2121,8 @@ class RADAUSolver(_RadauSolverConfig):
                 h_value,
                 c,
                 dtype,
+                prev_theta_final=prev_theta_final,
+                prev_newton_iter_count=prev_newton_iter_count,
                 predictor_mode=predictor_mode,
             )
             finite_f0 = jnp.all(jnp.isfinite(f0))
@@ -2392,6 +2455,7 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_reused,
             ) = _single_step_custom(
                 step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
+                step_state.prev_theta_final, step_state.prev_newton_iter_count,
                 step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
                 step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv,
                 step_state.lagged_response_cache, step_state.lagged_response_valid, step_state.lagged_reference_y,
