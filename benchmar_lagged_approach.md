@@ -2912,6 +2912,37 @@ Guardrail:
 - this new behavior is opt-in only
 - no host-side logic or non-JAX control path is introduced
 
+## Update: First Symmetric Transport-Weighted `hairer_lean` Controller Mode
+
+A new opt-in controller mode has now been added:
+
+- `radau_controller_mode = "hairer_lean_transport_weighted"`
+
+Intent:
+
+- keep the same successful `hairer_lean` base growth law
+- use the same blockwise normalized local error decomposition already available from the embedded error estimate
+- respond symmetrically to whichever transport block is dominating, rather than only special-casing `Er`
+
+Current implementation characteristics:
+
+- computes smooth block weights from:
+  - density error contribution
+  - pressure error contribution
+  - `Er` error contribution
+- builds a smooth localization score from those block weights
+- only when:
+  - the step is accepted
+  - recovery-quality Newton behavior is still present
+  - the difficulty looks localized rather than global
+- applies a mild weighted regrowth floor on top of the usual `hairer_lean` growth
+
+Guardrail:
+
+- this is a new mode only
+- `radau_controller_mode = "hairer_lean"` remains unchanged
+- the change is still algebraic, array-only, JAX-friendly, and differentiability-friendly
+
 ### Most promising next estimator refinements
 
 Even after the strong success of `embedded2_ntss_transport_scale`, there is still some focused estimator-side work worth considering.

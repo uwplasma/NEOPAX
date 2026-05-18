@@ -1506,10 +1506,14 @@ def _apply_radau_lean_timestep_controller(
     use_hairer_lean_controller = controller_mode == "hairer_lean"
     use_hairer_lean_aggressive_controller = controller_mode == "hairer_lean_aggressive"
     use_hairer_lean_transport_controller = controller_mode == "hairer_lean_transport"
+    use_hairer_lean_transport_weighted_controller = controller_mode == "hairer_lean_transport_weighted"
     use_hairer_ntss_controller = controller_mode == "hairer_ntss"
     use_hairer_lean_family_controller = jnp.logical_or(
-        jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller),
-        use_hairer_lean_transport_controller,
+        jnp.logical_or(
+            jnp.logical_or(use_hairer_lean_controller, use_hairer_lean_aggressive_controller),
+            use_hairer_lean_transport_controller,
+        ),
+        use_hairer_lean_transport_weighted_controller,
     )
     growth_lean = safety_factor * safe_error ** (-controller_alpha)
     growth_lean = jnp.clip(growth_lean, min_step_factor, max_step_factor)
@@ -1647,12 +1651,57 @@ def _apply_radau_lean_timestep_controller(
             ),
         ),
     )
+    block_errs = jnp.stack(
+        [
+            jnp.maximum(density_err_norm, jnp.asarray(0.0, dtype=dtype)),
+            jnp.maximum(pressure_err_norm, jnp.asarray(0.0, dtype=dtype)),
+            jnp.maximum(er_err_norm, jnp.asarray(0.0, dtype=dtype)),
+        ],
+        axis=0,
+    )
+    block_err_total = jnp.maximum(jnp.sum(block_errs), jnp.asarray(1.0e-12, dtype=dtype))
+    block_weights = block_errs / block_err_total
+    block_concentration = jnp.sum(block_weights * block_weights)
+    localized_u = jnp.clip(
+        (block_concentration - jnp.asarray(0.5, dtype=dtype)) / jnp.asarray(0.5, dtype=dtype),
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+    )
+    localized_gate = localized_u * localized_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * localized_u)
+    weighted_background_easy = jnp.logical_and(
+        jnp.maximum(density_err_norm, pressure_err_norm) <= jnp.asarray(0.2, dtype=dtype),
+        er_err_norm <= jnp.asarray(1.0, dtype=dtype),
+    )
+    weighted_transport_growth_ready = jnp.logical_and(
+        accepted,
+        jnp.logical_and(
+            recovery_ready,
+            jnp.logical_and(
+                weighted_background_easy,
+                jnp.logical_and(jnp.logical_not(very_difficult_accept), localized_gate >= jnp.asarray(0.35, dtype=dtype)),
+            ),
+        ),
+    )
     growth = jnp.where(
         jnp.logical_and(use_hairer_lean_aggressive_controller, aggressive_growth_ready),
         jnp.maximum(
             growth,
             jnp.where(easy_accept, aggressive_easy_growth_floor, aggressive_recovery_growth_floor),
         ),
+        growth,
+    )
+    weighted_growth_floor = (
+        jnp.asarray(1.15, dtype=dtype)
+        + jnp.asarray(0.35, dtype=dtype) * localized_gate
+    )
+    weighted_growth_floor = jnp.where(
+        easy_accept,
+        weighted_growth_floor + jnp.asarray(0.1, dtype=dtype),
+        weighted_growth_floor,
+    )
+    growth = jnp.where(
+        jnp.logical_and(use_hairer_lean_transport_weighted_controller, weighted_transport_growth_ready),
+        jnp.maximum(growth, weighted_growth_floor),
         growth,
     )
     growth = jnp.where(
@@ -1991,6 +2040,9 @@ class _RadauSolverConfig(TransportSolver):
             "transport": "hairer_lean_transport",
             "lean_transport": "hairer_lean_transport",
             "transport_aware": "hairer_lean_transport",
+            "transport_weighted": "hairer_lean_transport_weighted",
+            "lean_transport_weighted": "hairer_lean_transport_weighted",
+            "transport_symmetric": "hairer_lean_transport_weighted",
             "ntss": "hairer_ntss",
             "hairer": "hairer_ntss",
             "hairer_default": "hairer_ntss",
@@ -2000,9 +2052,9 @@ class _RadauSolverConfig(TransportSolver):
             "standard": "gustafsson",
         }
         controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
-        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_lean_transport", "hairer_ntss"}:
+        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_lean_transport", "hairer_lean_transport_weighted", "hairer_ntss"}:
             raise ValueError(
-                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_lean_transport, hairer_ntss"
+                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_lean_transport, hairer_lean_transport_weighted, hairer_ntss"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
         predictor_mode_norm = str(predictor_mode).strip().lower()
