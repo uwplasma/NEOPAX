@@ -1217,37 +1217,32 @@ def _make_radau_stage_predictor(
         jnp.asarray(0.9, dtype=dtype) * collocation_guess
         + jnp.asarray(0.1, dtype=dtype) * base_guess
     )
-    extrapolated_collocation_guess = (
-        collocation_guess
-        + (bounded_step_ratio - jnp.asarray(1.0, dtype=dtype)) * (prev_stage_guess - base_guess)
-    )
-    extrapolated_collocation_guess = (
-        jnp.asarray(0.95, dtype=dtype) * extrapolated_collocation_guess
-        + jnp.asarray(0.05, dtype=dtype) * base_guess
-    )
-    log_step_ratio = jnp.abs(jnp.log(bounded_step_ratio))
-    full_trust_ratio = jnp.asarray(jnp.log(1.1), dtype=dtype)
-    zero_trust_ratio = jnp.asarray(jnp.log(1.5), dtype=dtype)
-    gate_u = jnp.clip(
-        (zero_trust_ratio - log_step_ratio) / (zero_trust_ratio - full_trust_ratio),
-        jnp.asarray(0.0, dtype=dtype),
-        jnp.asarray(1.0, dtype=dtype),
-    )
-    step_ratio_gate = gate_u * gate_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * gate_u)
-    dt_ratio_gated_collocation_guess = (
-        collocation_guess
-        + step_ratio_gate * (extrapolated_collocation_guess - collocation_guess)
-    )
-
-    predictor_guess = jnp.where(
-        predictor_mode_norm == "current",
-        blended_guess,
-        jnp.where(
-            predictor_mode_norm == "collocation",
-            collocation_guess,
-            dt_ratio_gated_collocation_guess,
-        ),
-    )
+    if predictor_mode_norm == "current":
+        predictor_guess = blended_guess
+    elif predictor_mode_norm == "collocation":
+        predictor_guess = collocation_guess
+    else:
+        extrapolated_collocation_guess = (
+            collocation_guess
+            + (bounded_step_ratio - jnp.asarray(1.0, dtype=dtype)) * (prev_stage_guess - base_guess)
+        )
+        extrapolated_collocation_guess = (
+            jnp.asarray(0.95, dtype=dtype) * extrapolated_collocation_guess
+            + jnp.asarray(0.05, dtype=dtype) * base_guess
+        )
+        log_step_ratio = jnp.abs(jnp.log(bounded_step_ratio))
+        full_trust_ratio = jnp.asarray(jnp.log(1.1), dtype=dtype)
+        zero_trust_ratio = jnp.asarray(jnp.log(1.5), dtype=dtype)
+        gate_u = jnp.clip(
+            (zero_trust_ratio - log_step_ratio) / (zero_trust_ratio - full_trust_ratio),
+            jnp.asarray(0.0, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        )
+        step_ratio_gate = gate_u * gate_u * (jnp.asarray(3.0, dtype=dtype) - jnp.asarray(2.0, dtype=dtype) * gate_u)
+        predictor_guess = (
+            collocation_guess
+            + step_ratio_gate * (extrapolated_collocation_guess - collocation_guess)
+        )
     return jnp.where(use_predictor, predictor_guess, base_guess).reshape((-1,))
 
 
