@@ -3125,6 +3125,33 @@ Guardrail:
 - `embedded2_ntss_transport_scale` remains unchanged
 - this is the first general block-floor version, not yet the more physics-aware `DEr`-based refinement
 
+## Update: First Blockwise-RMS Estimator Mode
+
+A new opt-in estimator mode has now been added:
+
+- `radau_error_estimator = "embedded2_ntss_block_rms"`
+
+Intent:
+
+- keep componentwise scaling and adaptive block floors
+- but change the final aggregation so that density, pressure, and `Er` contribute as balanced blocks rather than only through raw component count
+
+Current implementation characteristics:
+
+- reuses the same adaptive block floors as `embedded2_ntss_block_floor_scale`
+- computes:
+  - `err_n`
+  - `err_p`
+  - `err_Er`
+  as separate blockwise RMS values
+- then combines them as an equal-weight RMS over active blocks
+
+Guardrail:
+
+- this is a new estimator mode only
+- the current transport-structured estimator remains unchanged
+- this is the first blockwise aggregation experiment, not yet a tuned weighted-block variant
+
 ### Result so far
 
 - `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`

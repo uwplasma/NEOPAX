@@ -2037,6 +2037,8 @@ class _RadauSolverConfig(TransportSolver):
             "block_floor": "embedded2_ntss_block_floor_scale",
             "floor_scale": "embedded2_ntss_block_floor_scale",
             "ntss_block_floor": "embedded2_ntss_block_floor_scale",
+            "block_rms": "embedded2_ntss_block_rms",
+            "ntss_block_rms": "embedded2_ntss_block_rms",
         }
         error_estimator_norm = error_estimator_aliases.get(error_estimator_norm, error_estimator_norm)
         if error_estimator_norm not in {
@@ -2048,9 +2050,10 @@ class _RadauSolverConfig(TransportSolver):
             "embedded2_ntss_blend_scale",
             "embedded2_ntss_transport_scale",
             "embedded2_ntss_block_floor_scale",
+            "embedded2_ntss_block_rms",
         }:
             raise ValueError(
-                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale, embedded2_ntss_transport_scale, embedded2_ntss_block_floor_scale"
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale, embedded2_ntss_max_scale, embedded2_ntss_blend_scale, embedded2_ntss_transport_scale, embedded2_ntss_block_floor_scale, embedded2_ntss_block_rms"
             )
         object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
@@ -2282,6 +2285,7 @@ class RADAUSolver(_RadauSolverConfig):
             else "ntss_blend" if error_estimator_mode == "embedded2_ntss_blend_scale"
             else "ntss_transport" if error_estimator_mode == "embedded2_ntss_transport_scale"
             else "ntss_block_floor" if error_estimator_mode == "embedded2_ntss_block_floor_scale"
+            else "ntss_block_rms" if error_estimator_mode == "embedded2_ntss_block_rms"
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
@@ -2366,7 +2370,7 @@ class RADAUSolver(_RadauSolverConfig):
             expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
             safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
             estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
-        if error_estimator_mode in {"embedded2_ntss_max_scale", "embedded2_ntss_blend_scale", "embedded2_ntss_transport_scale", "embedded2_ntss_block_floor_scale"}:
+        if error_estimator_mode in {"embedded2_ntss_max_scale", "embedded2_ntss_blend_scale", "embedded2_ntss_transport_scale", "embedded2_ntss_block_floor_scale", "embedded2_ntss_block_rms"}:
             uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
             expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
             safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
@@ -2771,7 +2775,7 @@ class RADAUSolver(_RadauSolverConfig):
                 pressure_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.abs(pressure_next)
                 er_scale = jnp.asarray(self.atol, dtype=dtype) + estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
                 scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
-            if error_scale_mode == "ntss_block_floor" and (density_size + pressure_size + er_size == state_dim):
+            if error_scale_mode in {"ntss_block_floor", "ntss_block_rms"} and (density_size + pressure_size + er_size == state_dim):
                 density_end = density_size
                 pressure_end = density_size + pressure_size
                 density_next = flat_next[:density_end]
@@ -2856,6 +2860,24 @@ class RADAUSolver(_RadauSolverConfig):
                 rtol_eff=estimator_rtol_eff,
                 scale_override=scale_override,
             )
+            if error_scale_mode == "ntss_block_rms" and (density_size + pressure_size + er_size == state_dim):
+                active_block_squares = jnp.stack(
+                    [
+                        jnp.where(density_size > 0, density_err_norm * density_err_norm, jnp.asarray(0.0, dtype=dtype)),
+                        jnp.where(pressure_size > 0, pressure_err_norm * pressure_err_norm, jnp.asarray(0.0, dtype=dtype)),
+                        jnp.where(er_size > 0, er_err_norm * er_err_norm, jnp.asarray(0.0, dtype=dtype)),
+                    ],
+                    axis=0,
+                )
+                active_block_count = (
+                    jnp.where(density_size > 0, jnp.asarray(1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype))
+                    + jnp.where(pressure_size > 0, jnp.asarray(1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype))
+                    + jnp.where(er_size > 0, jnp.asarray(1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype))
+                )
+                err_norm = jnp.sqrt(
+                    jnp.sum(active_block_squares) / jnp.maximum(active_block_count, jnp.asarray(1.0, dtype=dtype))
+                    + jnp.asarray(1.0e-30, dtype=dtype)
+                )
             theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
             fallback_newton_shrink = jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max)
             newton_shrink = jnp.where(
