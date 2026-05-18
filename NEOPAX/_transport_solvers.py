@@ -1197,7 +1197,7 @@ def _make_radau_stage_predictor(
     step_ratio = h_value / jnp.maximum(prev_dt, jnp.asarray(1.0e-14, dtype=dtype))
     bounded_step_ratio = jnp.clip(step_ratio, jnp.asarray(0.25, dtype=dtype), jnp.asarray(4.0, dtype=dtype))
     prev_stage_stack = prev_stages.reshape(base_guess.shape)
-    prev_stage_guess = prev_stage_stack * bounded_step_ratio
+    prev_stage_guess = prev_stage_stack * step_ratio
     predictor_mode_norm = str(predictor_mode).strip().lower()
     if predictor_mode_norm in {"default", "legacy"}:
         predictor_mode_norm = "current"
@@ -1224,7 +1224,8 @@ def _make_radau_stage_predictor(
     else:
         extrapolated_collocation_guess = (
             collocation_guess
-            + (bounded_step_ratio - jnp.asarray(1.0, dtype=dtype)) * (prev_stage_guess - base_guess)
+            + (bounded_step_ratio - jnp.asarray(1.0, dtype=dtype))
+            * (prev_stage_stack * bounded_step_ratio - base_guess)
         )
         extrapolated_collocation_guess = (
             jnp.asarray(0.95, dtype=dtype) * extrapolated_collocation_guess
