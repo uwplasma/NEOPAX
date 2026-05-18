@@ -77,6 +77,15 @@ def _prepare_benchmark_config(config_path: Path, *, device: str | None) -> dict[
     return config
 
 
+def _apply_one_step_diagnostic_config(config: dict[str, Any]) -> dict[str, Any]:
+    tuned = copy.deepcopy(config)
+    solver_cfg = tuned.setdefault("transport_solver", {})
+    solver_cfg["stop_after_accepted_steps"] = 1
+    current_max_steps = int(solver_cfg.get("max_steps", 20000))
+    solver_cfg["max_steps"] = max(current_max_steps, 20)
+    return tuned
+
+
 def _baseline_profile_cfg(config: dict[str, Any]) -> dict[str, Any]:
     profiles = copy.deepcopy(config.get("profiles", {}))
     profiles.setdefault("model", "standard_analytical")
@@ -342,7 +351,8 @@ def _write_figure(report: dict[str, Any], out: Path) -> None:
 
 def _print_terminal_summary(report: dict[str, Any]) -> None:
     print(
-        f"[autodiff-gate] parameter={report['parameter_name']} "
+        f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
+        f"parameter={report['parameter_name']} "
         f"baseline_value={report['baseline_value']:.6e} "
         f"fd_step={report['fd_step']:.6e}"
     )
@@ -385,12 +395,15 @@ def build_report(
     sweep_half_width_rel: float,
     sweep_points: int,
     with_sweep: bool,
+    one_step_diagnostic: bool,
     device: str | None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
 
     config = _prepare_benchmark_config(config_path, device=device)
+    if one_step_diagnostic:
+        config = _apply_one_step_diagnostic_config(config)
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
@@ -403,8 +416,6 @@ def build_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
     )
-
-    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
 
     fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
     minus_value = baseline_value - fd_step
@@ -449,6 +460,7 @@ def build_report(
     baseline_objectives = _objective_vector(baseline_result["final_state"], runtime)
     objectives_minus = _objective_vector(minus_result["final_state"], runtime)
     objectives_plus = _objective_vector(plus_result["final_state"], runtime)
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
 
     grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
@@ -488,6 +500,7 @@ def build_report(
 
     report = {
         "config_path": str(config_path),
+        "one_step_diagnostic": bool(one_step_diagnostic),
         "parameter_name": parameter_name,
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
@@ -535,6 +548,11 @@ def main() -> None:
     parser.add_argument("--sweep-half-width-rel", type=float, default=5.0e-2)
     parser.add_argument("--sweep-points", type=int, default=7)
     parser.add_argument("--with-sweep", action="store_true", help="Run extra sweep solves for objective curves.")
+    parser.add_argument(
+        "--one-step-diagnostic",
+        action="store_true",
+        help="Stop after one accepted transport step to isolate local AD-vs-FD behavior.",
+    )
     parser.add_argument("--outdir", type=Path, default=Path("outputs/autodiff_transport_lagged_ntx"))
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
@@ -547,6 +565,7 @@ def main() -> None:
         sweep_half_width_rel=args.sweep_half_width_rel,
         sweep_points=args.sweep_points,
         with_sweep=args.with_sweep,
+        one_step_diagnostic=args.one_step_diagnostic,
         device=args.device,
     )
 
