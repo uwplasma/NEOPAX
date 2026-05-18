@@ -2263,3 +2263,185 @@ Intent:
 - the current `embedded2` baseline path is unchanged
 - the new behavior is only active when the new estimator modes are explicitly selected
 - the implementation is array-only, JAX-friendly, and differentiability-friendly
+
+### Results so far
+
+For the restored `hairer_lean + collocation` baseline:
+
+- `embedded2`
+  - `n_steps = 139`
+  - `synchronized_elapsed_s = 256.126`
+- `embedded2_blend_scale`
+  - `n_steps = 150`
+  - `synchronized_elapsed_s = 260.866`
+- `embedded2_mean_scale`
+  - `n_steps = 154`
+  - `synchronized_elapsed_s = 262.731`
+
+So far:
+
+- both estimator-side scaling variants are worse than plain `embedded2`
+- `embedded2_blend_scale` is less bad than `embedded2_mean_scale`
+- neither compensates with a better total runtime
+- plain `embedded2` remains the preferred baseline
+
+## Update: NTSS Source Comparison
+
+To understand what has and has not really been tried already, the local NTSS Radau source was inspected directly:
+
+- `NTSS/CRadau/radau.cpp`
+- `NTSS/CRadau/CRadau.cpp`
+- `NTSS/CRadau/CRadau.h`
+
+### 1. Controller: NTSS default is not the same as our `gustafsson`
+
+NTSS uses the classic Hairer/Wanner Radau step controller with:
+
+- a Newton-iteration-aware safety factor:
+  - `fac = min(safe, ((2*nit+1)*safe)/(newt+2*nit))`
+- a bounded error-based quotient:
+  - `quot = max(facr, min(facl, err^expo / fac))`
+- and then:
+  - `hnew = h / quot`
+
+There is also an optional Gustafsson predictive controller, but in the NTSS defaults:
+
+- `IWork[7] = 0`
+
+so that predictive controller is **off by default**.
+
+This means:
+
+- NTSS default is not equivalent to the NEOPAX `gustafsson` controller mode
+- `hairer_lean` is closer in spirit to the NTSS default than `gustafsson`
+- but `hairer_lean` is still simpler than NTSS because it does not currently reproduce:
+  - the Newton-iteration-aware `fac` formula
+  - the `facl/facr` bounded quotient logic exactly
+  - the accepted-step keep/freeze window based on `hnew / hold`
+
+### 2. Predictor: NTSS uses dense-output stage extrapolation
+
+The NTSS predictor is not the same as the current NEOPAX `collocation` predictor.
+
+NTSS behavior is:
+
+- if this is the first step, or a startup / reset condition is active:
+  - initialize stage increments from zero
+- otherwise:
+  - extrapolate the next stage increments from the previous successful step using:
+    - dense-output / continuation coefficients
+    - the previous accepted step size
+    - the new `h / hold` ratio
+
+So the most important genuinely untried NTSS-like predictor idea is:
+
+- a dense-output-based stage predictor built from the previous accepted Radau solution
+
+This is **not** the same as:
+
+- `collocation`
+- `dt_ratio_gated_collocation`
+- the earlier experimental extrapolated/Jacobian predictor variants
+
+### 3. Newton rejection logic is already much closer to NTSS/Hairer
+
+NTSS uses the familiar contraction machinery based on:
+
+- `theta`
+- `faccon = theta / (1 - theta)` when `theta < 0.99`
+- a predicted remaining defect estimate
+- rejection/shrink only when that predicted defect is too large
+
+This is the part of the solver where NEOPAX has already moved much closer to the NTSS/Hairer logic.
+
+So compared with controller/predictor/error-estimator work:
+
+- Newton stopping / rejection is no longer the biggest untried gap
+
+### 4. Embedded error: NTSS does not use our simple `embedded2` path
+
+NTSS does not appear to use the current NEOPAX-style direct embedded error vector:
+
+- `err_vec = h * (embedded_f0_weight * f0 + b_error @ stages)`
+
+Instead, the NTSS code calls dedicated embedded-estimator routines such as:
+
+- `estrad_`
+- `estrav_`
+
+and it also builds the scaling vector differently, in a more canonical componentwise form:
+
+- `scal[i] = atol1 + rtol1 * abs(y[i])`
+
+with `rtol1` itself modified internally in the Hairer/NTSS style.
+
+This means:
+
+- `embedded2_mean_scale` and `embedded2_blend_scale` were not NTSS-like experiments
+- a closer NTSS-inspired estimator path remains untried
+
+## What Has Really Been Tried vs. What Remains Open
+
+### Already tried in a meaningfully similar spirit
+
+- Hairer-like Newton stop metric and contraction-based nonlinear acceptance
+- simpler accepted-step controller behavior via `hairer_lean`
+- optional Gustafsson-like predictive controller behavior
+- several local stage-predictor enrichments around the existing `collocation` predictor
+- mild error-norm rescalings on top of the current `embedded2` estimator
+
+### Not yet really tried
+
+1. A closer NTSS default controller reproduction
+
+- keep predictive Gustafsson off by default
+- implement the iteration-aware `fac / quot / hnew` logic more faithfully
+- include the accepted-step keep/freeze window behavior
+
+2. A true NTSS-like dense-output predictor
+
+- use previous accepted-step dense-output / continuation coefficients
+- extrapolate the next stage increments from the previous successful Radau solution
+
+3. A closer NTSS-like embedded estimator / scaling path
+
+- not just rescaling the current `embedded2`
+- but using a more faithful componentwise `scal[i]` construction and, if practical, a closer analogue of the NTSS embedded-estimator logic
+
+## Updated Priority After The NTSS Inspection
+
+Given the benchmark results so far and the NTSS source comparison, the most promising remaining directions for step reduction now look like:
+
+1. A closer NTSS-style default controller, added as a new opt-in mode
+2. A true NTSS-like dense-output predictor, also opt-in
+3. A closer NTSS-style embedded estimator / scaling path
+
+All of these should remain subject to the same guardrail:
+
+- do not modify the established `hairer_lean + collocation + embedded2` baseline in place
+- only add new opt-in modes so that the current best benchmark path stays stable
+
+## Update: First NTSS-Like Controller Mode
+
+A new opt-in controller mode has now been added:
+
+- `radau_controller_mode = "hairer_ntss"`
+
+Intent:
+
+- move closer to the default non-predictive Hairer/NTSS controller behavior
+- keep the current `hairer_lean` path unchanged
+- test the controller before attempting a more NTSS-like predictor or estimator
+
+Current implementation characteristics:
+
+- uses a bounded Hairer-style `fac / quot / hnew` update
+- includes a Newton-iteration-aware safety factor
+- keeps predictive Gustafsson behavior off
+- includes an NTSS-like accepted-step keep window:
+  - if the proposed accepted-step growth stays in the mild range near the current step size, keep the same step size instead of changing it
+
+Important guardrail:
+
+- this is a new mode only
+- the existing `hairer_lean + collocation + embedded2` baseline is unchanged
