@@ -245,16 +245,73 @@ def _accepted_count(mask) -> int | None:
     return int(np.sum(arr))
 
 
+def _result_scalar(result: dict[str, Any], key: str, *, dtype=None):
+    value = result.get(key)
+    if value is None:
+        return None
+    arr = np.asarray(jax.device_get(value))
+    if arr.shape == ():
+        scalar = arr.item()
+        return dtype(scalar) if dtype is not None else scalar
+    return arr
+
+
+def _saved_rollout_signature(result: dict[str, Any]) -> dict[str, Any]:
+    accepted_mask = result.get("accepted_mask")
+    ts = result.get("ts")
+    dts = result.get("dts")
+    if accepted_mask is None or ts is None or dts is None:
+        return {
+            "saved_times": None,
+            "saved_step_sizes": None,
+        }
+
+    mask_arr = np.asarray(jax.device_get(accepted_mask), dtype=bool)
+    ts_arr = np.asarray(jax.device_get(ts), dtype=float)
+    dts_arr = np.asarray(jax.device_get(dts), dtype=float)
+    valid = mask_arr
+    return {
+        "saved_times": ts_arr[valid].tolist(),
+        "saved_step_sizes": dts_arr[valid].tolist(),
+    }
+
+
+def _sequence_allclose(seq_a, seq_b, *, rtol: float = 1.0e-10, atol: float = 1.0e-12) -> bool | None:
+    if seq_a is None or seq_b is None:
+        return None
+    arr_a = np.asarray(seq_a, dtype=float)
+    arr_b = np.asarray(seq_b, dtype=float)
+    if arr_a.shape != arr_b.shape:
+        return False
+    return bool(np.allclose(arr_a, arr_b, rtol=rtol, atol=atol))
+
+
 def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
     accepted_mask = result.get("accepted_mask")
     failed_mask = result.get("failed_mask")
     fail_codes = result.get("fail_codes")
+    rollout_signature = _saved_rollout_signature(result)
     diag = {
         "n_steps": None if result.get("n_steps") is None else int(np.asarray(jax.device_get(result["n_steps"]))),
         "accepted_count": _accepted_count(accepted_mask),
         "accepted_mask": None if accepted_mask is None else np.asarray(jax.device_get(accepted_mask), dtype=bool).tolist(),
         "failed_any": False if failed_mask is None else bool(np.any(np.asarray(jax.device_get(failed_mask), dtype=bool))),
         "fail_codes": None if fail_codes is None else np.asarray(jax.device_get(fail_codes)).tolist(),
+        "saved_times": rollout_signature["saved_times"],
+        "saved_step_sizes": rollout_signature["saved_step_sizes"],
+        "last_attempt": {
+            "accepted": _result_scalar(result, "last_attempt_accepted", dtype=bool),
+            "converged": _result_scalar(result, "last_attempt_converged", dtype=bool),
+            "fail_code": _result_scalar(result, "last_attempt_fail_code", dtype=int),
+            "newton_iter_count": _result_scalar(result, "last_attempt_newton_iter_count", dtype=int),
+            "theta_final": _result_scalar(result, "last_attempt_theta_final", dtype=float),
+            "err_norm": _result_scalar(result, "last_attempt_err_norm", dtype=float),
+            "final_residual_norm": _result_scalar(result, "last_attempt_final_residual_norm", dtype=float),
+            "final_delta_norm": _result_scalar(result, "last_attempt_final_delta_norm", dtype=float),
+            "slow_contraction": _result_scalar(result, "last_attempt_slow_contraction", dtype=bool),
+            "residual_blowup": _result_scalar(result, "last_attempt_residual_blowup", dtype=bool),
+            "newton_nonfinite": _result_scalar(result, "last_attempt_newton_nonfinite", dtype=bool),
+        },
     }
     return diag
 
@@ -350,6 +407,9 @@ def _write_figure(report: dict[str, Any], out: Path) -> None:
 
 
 def _print_terminal_summary(report: dict[str, Any]) -> None:
+    def _fmt_float(value) -> str:
+        return "na" if value is None else f"{float(value):.6e}"
+
     print(
         f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
         f"parameter={report['parameter_name']} "
@@ -359,15 +419,34 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
     path = report.get("solver_path", {})
     for key in ("baseline", "fd_minus", "fd_plus"):
         diag = path.get(key, {})
+        last_attempt = diag.get("last_attempt", {})
         print(
             f"[autodiff-gate] path {key}: "
             f"n_steps={diag.get('n_steps')} "
             f"accepted_count={diag.get('accepted_count')} "
             f"failed_any={diag.get('failed_any')}"
         )
+        print(
+            f"[autodiff-gate] path {key} last_attempt: "
+            f"accepted={last_attempt.get('accepted')} "
+            f"converged={last_attempt.get('converged')} "
+            f"fail_code={last_attempt.get('fail_code')} "
+            f"newton_iter_count={last_attempt.get('newton_iter_count')} "
+            f"theta_final={_fmt_float(last_attempt.get('theta_final'))} "
+            f"err_norm={_fmt_float(last_attempt.get('err_norm'))} "
+            f"final_residual_norm={_fmt_float(last_attempt.get('final_residual_norm'))} "
+            f"final_delta_norm={_fmt_float(last_attempt.get('final_delta_norm'))}"
+        )
+        print(
+            f"[autodiff-gate] path {key} saved_signature: "
+            f"times={diag.get('saved_times')} "
+            f"dts={diag.get('saved_step_sizes')}"
+        )
     print(
         "[autodiff-gate] fd path parity:",
-        f"accepted_mask_equal_minus_plus={path.get('accepted_mask_equal_minus_plus')}",
+        f"accepted_mask_equal_minus_plus={path.get('accepted_mask_equal_minus_plus')} "
+        f"saved_times_equal_minus_plus={path.get('saved_times_equal_minus_plus')} "
+        f"saved_dts_equal_minus_plus={path.get('saved_dts_equal_minus_plus')}",
     )
     print("[autodiff-gate] objective errors:")
     for label, j_ad, j_fd, abs_err, rel_err in zip(
@@ -523,6 +602,14 @@ def build_report(
                 and minus_diag["accepted_mask"] is not None
                 and plus_diag["accepted_mask"] is not None
                 and minus_diag["accepted_mask"] == plus_diag["accepted_mask"]
+            ),
+            "saved_times_equal_minus_plus": _sequence_allclose(
+                minus_diag["saved_times"],
+                plus_diag["saved_times"],
+            ),
+            "saved_dts_equal_minus_plus": _sequence_allclose(
+                minus_diag["saved_step_sizes"],
+                plus_diag["saved_step_sizes"],
             ),
         },
         "rho_grid": np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float).tolist(),

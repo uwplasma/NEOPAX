@@ -710,3 +710,247 @@ But the right plan is:
 - first validate AD through the lagged exact-runtime NTX transport path itself
 - then add a differentiable in-memory magnetic-input mode
 - then test VMEC-parameter sensitivities such as `RBC` against finite differences
+
+## Plan: Full-Rollout Gradients with Adaptive Solver Logic Preserved
+
+This section records the current planning direction after the one-step
+diagnostic succeeded but the full adaptive rollout failed AD-vs-FD parity.
+
+### Planning goal
+
+The goal is:
+
+- keep the normal full transport solve as the production forward path
+- obtain reliable derivatives for final-state objectives
+- keep memory and wall time as low as possible
+- avoid blindly inheriting a generic adjoint strategy if a more
+  physics-informed solver-aware strategy is available
+
+In particular, the target is:
+
+- full-rollout derivatives as trustworthy as the one-step derivatives
+- without giving up the current adaptive acceptance / retry logic in the
+  forward solve
+
+### What we know now
+
+From the current diagnostics:
+
+- local lagged NTX differentiation is good
+- one accepted transport step differentiates very well
+- the full adaptive rollout is where AD-vs-FD fails
+- the full-rollout mismatch is strongly correlated with adaptive path changes
+  across nearby parameter values
+
+So the main problem is not:
+
+- local NTX differentiability
+- or the accepted-step physics map itself
+
+The main problem is:
+
+- differentiating the full adaptive retry/accept/reject trace naively
+
+### Design principle
+
+We should distinguish two maps:
+
+1. the raw implemented solver trace
+   - includes every rejected trial and controller branch
+2. the accepted transport evolution map
+   - the physically relevant map that takes one accepted state to the next
+
+The planning direction is:
+
+- preserve the raw adaptive logic in the forward solve
+- but build differentiation around the accepted-step / accepted-rollout map
+
+This is the key way to keep the current forward behavior while avoiding the
+worst branch-sensitivity in gradients.
+
+### Efficiency principle
+
+The default assumption should be:
+
+- do not use a generic library adjoint blindly if it is more expensive than
+  necessary for this known physics system
+
+We should prefer:
+
+- reduced local responses
+- accepted-step replay rather than full trace storage
+- custom VJP/JVP rules at solver-relevant boundaries
+- small saved state
+- physics-informed structure whenever it lowers cost
+
+Diffrax-like ideas are useful as references, but the target is not “copy
+Diffrax”; the target is:
+
+- a NEOPAX-specific gradient path that is at least as reliable
+- and ideally more efficient for this transport problem
+
+### Staged plan
+
+#### Stage 0: Keep the current forward benchmark as the baseline
+
+The current lagged exact-runtime NTX transport benchmark remains the forward
+reference case.
+
+We continue to measure:
+
+- wall time
+- accepted-step count
+- rejected-step behavior
+- gradient parity diagnostics
+
+This ensures all later AD work is judged against the real production solve.
+
+#### Stage 1: Strengthen full-rollout diagnostics
+
+Before changing the differentiation design, improve the diagnosis of the full
+rollout mismatch.
+
+Add or keep:
+
+- FD step-size sweep for the full solve
+- accepted-step count comparison
+- accepted-step size sequence comparison
+- rejected-attempt count comparison
+- possibly Newton-iteration summaries
+
+Purpose:
+
+- determine how much of the mismatch is pure FD instability
+- determine how much is branch/path divergence
+
+#### Stage 2: Freeze accepted-step sequence as a diagnostic reference
+
+Add a diagnostic mode that:
+
+- runs the baseline full solve once
+- records the accepted timestep sequence
+- reruns nearby parameter values on that fixed accepted sequence
+
+Purpose:
+
+- remove controller/retry path drift from the FD comparison
+- test whether the accepted-rollout map itself has good parity
+
+Interpretation:
+
+- if parity becomes good, then the main issue is adaptive controller path
+  sensitivity
+- if parity is still bad, then the issue is deeper in the accepted rollout map
+
+This is a diagnostic tool, not necessarily the final production gradient path.
+
+#### Stage 3: Accepted-step custom differentiation
+
+Promote the accepted transport step to the main differentiated object:
+
+```text
+Y_{n+1} = Phi(Y_n, theta)
+```
+
+Forward:
+
+- keep the current adaptive nonlinear solve
+- accept the converged step as usual
+
+Backward:
+
+- differentiate the accepted-step map
+- do not explicitly backpropagate through every rejected trial
+
+This is the most important architectural shift.
+
+#### Stage 4: Accepted-rollout replay differentiation
+
+For the full run:
+
+- record the accepted-step sequence or enough information to replay it
+- define the backward pass on the accepted sequence
+
+This means:
+
+- rejected steps remain forward-only implementation details
+- gradients are built from the realized accepted rollout
+
+This is likely the closest efficient analogue to a Diffrax-style
+solver-aware differentiation strategy, while still staying custom to NEOPAX.
+
+#### Stage 5: Controller-gradient policy
+
+Make an explicit policy decision about the controller logic.
+
+Likely best choices are:
+
+- controller decisions remain active in the forward solve
+- controller branch logic is not treated as a primary smooth object in the
+  backward pass
+
+Possible implementations:
+
+- stop-gradient through retry/controller branch updates
+- or differentiate only the accepted-step replay map
+
+This is likely necessary to keep gradients stable without distorting the
+forward adaptive solver.
+
+#### Stage 6: Compare against a Diffrax reference solver only as a benchmark
+
+If needed, compare against a mature differentiable implicit solver such as
+Kvaerno5 in Diffrax.
+
+Use this comparison only to answer:
+
+- does a generic solver-aware AD path produce better full-rollout parity?
+- what are the memory and wall-time costs?
+
+Do not adopt it blindly.
+
+The decision criterion should be:
+
+- reliability
+- memory
+- speed
+- ability to exploit the known transport/NTX structure
+
+If NEOPAX-specific accepted-step differentiation is cheaper and equally
+reliable, that should be preferred.
+
+### Concrete benchmarking targets
+
+Each stage should be judged on:
+
+1. gradient parity
+   - AD vs FD for full-rollout objectives
+2. forward cost
+   - does the normal transport solve stay unchanged?
+3. gradient cost
+   - memory and time for derivative evaluation
+4. robustness
+   - does parity hold across `n0`, `T0`, `density_shape_power`,
+     `temperature_shape_power`?
+
+### Priority order
+
+The recommended order is:
+
+1. improve full-rollout diagnostics
+2. add fixed-accepted-sequence diagnostic mode
+3. design accepted-step custom differentiation
+4. design accepted-rollout replay differentiation
+5. only then compare against Diffrax/Kvaerno5 as a reference point
+
+### Short summary of the plan
+
+The plan is not to remove adaptive logic.
+
+The plan is:
+
+- keep the current adaptive forward solver
+- diagnose full-rollout path divergence carefully
+- move differentiation toward accepted-step / accepted-rollout replay rules
+- use Diffrax only as a benchmark reference, not as the default solution
+- aim for a NEOPAX-specific gradient path that is both reliable and efficient
