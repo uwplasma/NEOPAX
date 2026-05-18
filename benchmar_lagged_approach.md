@@ -2025,3 +2025,193 @@ This strongly suggests that future predictor experiments should preserve the exi
 - do not reintroduce aggressive global extrapolation
 - keep the experiments cheap, JAX-friendly, and differentiability-friendly
 - only modulate the collocation correction when history looks less trustworthy
+
+## Update: New Predictor Results After Restoring Raw Scaling
+
+With the shared raw stage-ratio scaling restored, the following additional predictor results were observed for the same exact-runtime NTX lagged-response benchmark family:
+
+1. `collocation_correction_gated`
+
+- `radau_predictor_mode = "collocation_correction_gated"`
+- result:
+  - `n_steps = 154`
+  - `synchronized_elapsed_s = 279.434`
+
+2. `newton_quality_gated_collocation`
+
+- `radau_predictor_mode = "newton_quality_gated_collocation"`
+- result:
+  - `n_steps = 140`
+  - `synchronized_elapsed_s = 245.212`
+
+### Interpretation
+
+- `collocation_correction_gated` is not promising so far
+- `newton_quality_gated_collocation` did not beat plain `collocation` on accepted-step count
+- however, `newton_quality_gated_collocation` is notable because it achieved:
+  - one extra accepted step compared with plain `collocation`
+  - but lower total synchronized solver time
+
+For reference, the restored plain `collocation` baseline is:
+
+- `n_steps = 139`
+- `synchronized_elapsed_s = 256.126`
+
+So at the moment:
+
+- `collocation` remains the best predictor for minimizing accepted steps
+- `newton_quality_gated_collocation` is the strongest experimental variant so far if walltime, not just step count, is considered
+
+## Next High-Leverage Directions For Large Step Reduction
+
+Given the latest results, the most promising next gains are now more likely to come from timestep-control and error-estimation policy than from further predictor micro-variants.
+
+### Guardrail
+
+Any future experiment in this area should preserve the current best-known baseline unchanged:
+
+- `radau_newton_tol_mode = "hairer"`
+- `radau_newton_fnewt_mode = "hairer"`
+- `radau_controller_mode = "hairer_lean"`
+- `radau_predictor_mode = "collocation"`
+
+Meaning:
+
+- do not modify the live behavior of `hairer_lean + collocation`
+- only add new logic under explicit new opt-in modes or flags
+- keep additions JAX-efficient, tracing-friendly, and differentiability-friendly
+
+### 1. More Aggressive Hairer-Lean Variant For Clearly Healthy Accepted Steps
+
+This is likely the strongest controller-side direction.
+
+Idea:
+
+- keep the basic `hairer_lean` structure
+- but introduce a new opt-in controller mode that allows stronger regrowth when a step is clearly healthy, for example when:
+  - accepted
+  - low `err_norm`
+  - low `theta_final`
+  - few Newton iterations
+  - no slow contraction
+
+Why this is promising:
+
+- controller choice already produced large step-count differences
+- a slightly more permissive healthy-step regrowth rule could reduce accepted steps much more than additional predictor tuning
+
+Implementation guidance:
+
+- add as a new controller mode rather than editing `hairer_lean`
+- keep it algebraic and branch-light
+- avoid nonlocal host-side bookkeeping
+
+### 2. Inspect Whether The Embedded Error Estimator Is Slightly Conservative
+
+This is one of the most plausible large-leverage directions.
+
+Idea:
+
+- check whether `embedded2` systematically reports error norms that are conservative for this transport problem
+- if so, add a new opt-in estimator or acceptance variant rather than changing the existing default
+
+Why this is promising:
+
+- if the embedded estimator is slightly conservative, the controller will never exploit larger stable timesteps regardless of predictor quality
+- this can cap performance much more strongly than nonlinear warm-start details
+
+Implementation guidance:
+
+- keep the existing `embedded2` path intact
+- only introduce new estimator behavior behind a new explicit mode
+- preserve array-only computations and avoid host-side postprocessing
+
+### 3. Inspect Whether The Error Norm Is Dominated By A Specific State Block
+
+This is probably the most physics-specific high-payoff diagnostic.
+
+Idea:
+
+- determine whether one subsystem, especially `Er`, dominates the timestep error norm
+- if so, consider adding a new opt-in error-scaling mode with better-balanced state weighting
+
+Why this is promising:
+
+- one stiff or sensitive component may be throttling the global timestep for the whole coupled transport solve
+- rebalancing the norm can reduce accepted steps much more than small predictor changes
+
+Implementation guidance:
+
+- do not change the existing error norm in place
+- add a new weighting / scaling mode only if diagnostics justify it
+- keep the scaling differentiable and JAX-friendly
+
+### 4. Add A Slightly Faster Recovery Path After One Conservative Accepted Step
+
+This is a narrower controller refinement.
+
+Idea:
+
+- when a step is accepted and the solver immediately shows healthy Newton behavior again, allow faster recovery of timestep growth instead of staying conservative for too long
+
+Why this is promising:
+
+- the current best controller may still spend too long regaining large `dt` after a cautious step
+- improving recovery can cut accepted steps without changing the base acceptance semantics
+
+Implementation guidance:
+
+- add as an opt-in controller variant
+- avoid long-history state or host-side logic
+- keep the state additions minimal if any are needed
+
+### 5. Lower-Priority Direction: Small Blend Retuning Inside The Existing Collocation Family
+
+This is now lower priority than controller / estimator work.
+
+Idea:
+
+- if future tuning returns to the predictor, only consider very small blend retuning around the successful `collocation` structure
+- do not revisit aggressive extrapolation as the first next step
+
+Why this is lower priority:
+
+- predictor variants so far only moved the results by a few steps
+- the main remaining gains likely live elsewhere
+
+### Recommended Priority Order
+
+1. Diagnose whether the error norm is dominated by a specific state block
+2. Check whether `embedded2` is conservative for this benchmark family
+3. Add a new opt-in aggressive-when-healthy `hairer_lean` variant
+4. Only afterward revisit additional predictor tuning if still needed
+
+## Update: First Controller-Side Implementation
+
+The first controller-side implementation from the next-step list has now been added as a new opt-in mode:
+
+- `radau_controller_mode = "hairer_lean_aggressive"`
+
+### Design
+
+- preserves the existing `hairer_lean` mode unchanged
+- reuses the same base Hairer-lean timestep-growth formula
+- only changes behavior on clearly healthy accepted steps
+
+More specifically, the new mode can enforce a modest minimum regrowth floor when all of the following are true:
+
+- the step is accepted
+- recovery-quality Newton behavior is present
+- `err_norm` is still comfortably small
+- the step is not classified as very difficult
+
+### Intent
+
+- test whether a slightly more assertive regrowth policy can reduce accepted steps
+- avoid changing the existing best-known `hairer_lean + collocation` baseline
+- keep the implementation algebraic, cheap, JAX-friendly, and differentiability-friendly
+
+### Important guardrail
+
+- plain `radau_controller_mode = "hairer_lean"` remains unchanged
+- this new behavior is only active when the new mode is explicitly selected
