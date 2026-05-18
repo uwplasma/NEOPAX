@@ -2480,3 +2480,39 @@ Important guardrail:
 - this is a new predictor mode only
 - `radau_predictor_mode = "collocation"` is unchanged
 - no extra predictor-side Jacobian machinery is introduced
+
+### Result so far
+
+- `hairer_lean + ntss_dense_output + embedded2`
+  - `n_steps = 139`
+  - `synchronized_elapsed_s = 267.904`
+
+So this first NTSS-like dense predictor matches the current best accepted-step count from plain `collocation`, but does not yet beat it.
+
+## Update: First NTSS-Like Embedded-Scaling Mode
+
+A new opt-in error-estimator mode has now been added:
+
+- `radau_error_estimator = "embedded2_ntss_scale"`
+
+Intent:
+
+- keep the current `embedded2` error vector unchanged for now
+- test the most accessible NTSS/Hairer-like difference first:
+  - a more canonical componentwise scaling style
+
+Current implementation characteristics:
+
+- keeps the same embedded Radau error vector as `embedded2`
+- switches the norm scaling to use the candidate state magnitude only:
+  - `scale_i = atol + rtol_eff * abs(y_{n+1,i})`
+- uses an NTSS/Hairer-style effective relative tolerance:
+  - `rtol_eff = 0.1 * rtol^expmns`
+  - with the same `expmns = (s + 1) / (2s)` stage-count-dependent exponent structure already used in the Newton `fnewt` logic
+
+Important guardrail:
+
+- this is a new estimator mode only
+- `radau_error_estimator = "embedded2"` remains unchanged
+- this is not yet a full reproduction of NTSS `estrad_` / `estrav_`
+- it is the first isolated scaling-side approximation only

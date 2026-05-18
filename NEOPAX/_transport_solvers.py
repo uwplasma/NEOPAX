@@ -833,20 +833,23 @@ def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, 
     return _flat_rhs
 
 
-def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max"):
+def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max", rtol_eff=None):
     ref_abs = jnp.abs(flat_ref)
     cand_abs = jnp.abs(flat_candidate)
     max_scale = jnp.maximum(ref_abs, cand_abs)
     mean_scale = 0.5 * (ref_abs + cand_abs)
+    effective_rtol = rtol if rtol_eff is None else rtol_eff
     if scale_mode == "max":
         scale_base = max_scale
     elif scale_mode == "mean":
         scale_base = mean_scale
     elif scale_mode == "blend":
         scale_base = jnp.asarray(0.75, dtype=err_vec.dtype) * max_scale + jnp.asarray(0.25, dtype=err_vec.dtype) * mean_scale
+    elif scale_mode == "ntss":
+        scale_base = cand_abs
     else:
         raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
-    scale = atol + rtol * scale_base
+    scale = atol + effective_rtol * scale_base
     normalized = err_vec / scale
     return jnp.sqrt(jnp.mean(normalized * normalized) + 1.0e-30)
 
@@ -1837,9 +1840,15 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "tol", float(tol))
         object.__setattr__(self, "maxiter", int(max(1, maxiter)))
         error_estimator_norm = str(error_estimator).strip().lower()
-        if error_estimator_norm not in {"embedded2", "embedded2_mean_scale", "embedded2_blend_scale"}:
+        error_estimator_aliases = {
+            "ntss": "embedded2_ntss_scale",
+            "ntss_scale": "embedded2_ntss_scale",
+            "hairer": "embedded2_ntss_scale",
+        }
+        error_estimator_norm = error_estimator_aliases.get(error_estimator_norm, error_estimator_norm)
+        if error_estimator_norm not in {"embedded2", "embedded2_mean_scale", "embedded2_blend_scale", "embedded2_ntss_scale"}:
             raise ValueError(
-                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale"
+                "radau_error_estimator must be one of: embedded2, embedded2_mean_scale, embedded2_blend_scale, embedded2_ntss_scale"
             )
         object.__setattr__(self, "error_estimator", error_estimator_norm)
         object.__setattr__(self, "num_stages", int(num_stages))
@@ -2040,6 +2049,7 @@ class RADAUSolver(_RadauSolverConfig):
         error_scale_mode = (
             "mean" if error_estimator_mode == "embedded2_mean_scale"
             else "blend" if error_estimator_mode == "embedded2_blend_scale"
+            else "ntss" if error_estimator_mode == "embedded2_ntss_scale"
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
@@ -2118,6 +2128,12 @@ class RADAUSolver(_RadauSolverConfig):
             )
         else:
             predictor_fnewt = jnp.maximum(jnp.asarray(self.tol, dtype=dtype), tiny_scalar)
+        estimator_rtol_eff = jnp.asarray(self.rtol, dtype=dtype)
+        if error_estimator_mode == "embedded2_ntss_scale":
+            uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+            expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+            safe_rtol_est = jnp.maximum(jnp.asarray(self.rtol, dtype=dtype), uround_est * 10.0)
+            estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
         radau_transform = jnp.asarray(stage_cfg.transform, dtype=dtype)
         radau_inv_transform = jnp.asarray(stage_cfg.inv_transform, dtype=dtype)
         radau_real_eig = jnp.asarray(stage_cfg.real_eig, dtype=dtype)
@@ -2506,6 +2522,7 @@ class RADAUSolver(_RadauSolverConfig):
                 self.atol,
                 self.rtol,
                 scale_mode=error_scale_mode,
+                rtol_eff=estimator_rtol_eff,
             )
             theta_safe = jnp.clip(theta_final, theta_clip_min, theta_clip_max)
             fallback_newton_shrink = jnp.clip(newton_shrink_num / theta_safe, newton_shrink_min, newton_shrink_max)
