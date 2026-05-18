@@ -419,3 +419,294 @@ This is the most promising route to simultaneously improve:
 - optimization gradient quality
 - scalability to expensive neoclassical and turbulent models
 
+## Magnetic-Configuration Differentiability Test Plan
+
+This section focuses on a more specific target than profile optimization:
+
+- differentiate a final transport-state diagnostic
+- with respect to magnetic-configuration parameters
+- starting from the lagged exact-runtime NTX response path currently being used
+
+The motivating example is a VMEC shape coefficient such as `RBC`.
+
+The intended comparison is:
+
+- automatic differentiation
+- finite differences
+
+for final-state diagnostics such as:
+
+- the maximum of `Er`
+- the radial position of an `Er` root / sign change
+
+### First important caveat: use smooth diagnostics first
+
+The first AD-vs-FD checks should use **smooth scalar objectives**.
+
+While the final goal may include:
+
+- `max(Er)`
+- root position of `Er`
+
+these are not ideal first diagnostics because they are not fully smooth:
+
+- `max(Er)` can switch active index
+- root location can jump if the profile flattens or multiple crossings compete
+
+So the recommended first objectives are:
+
+- soft maximum of final `Er`
+- integrated `Er^2`
+- smooth weighted radial center of positive `Er`
+- a smoothed zero-crossing locator
+- volume-averaged alpha power
+
+Only after these pass should we move to sharper diagnostics.
+
+### Feasibility
+
+This is feasible, but in stages.
+
+There are really two different questions:
+
+1. can we differentiate through the lagged exact-runtime NTX transport path?
+2. can we differentiate all the way back to a VMEC parameter like `RBC`?
+
+The answer is:
+
+- question 1: likely yes, and this should be tested first
+- question 2: probably feasible, but it will likely require a new magnetic-input mode
+
+The main reason is that the current setup is still largely file-driven:
+
+- transport geometry is built from `vmec_file` + `boozer_file`
+- exact-runtime NTX support is prebuilt from those files
+
+That is good for forward solves, but not the right interface for
+parameter-differentiable magnetic design.
+
+### Recommended staged plan
+
+#### Stage A: Local lagged NTX differentiability
+
+Before touching magnetic parameters directly, verify that the lagged
+exact-runtime NTX path is differentiable with respect to already-live local
+inputs.
+
+Suggested first parameters:
+
+- local `Er`
+- local density
+- local temperature
+
+Suggested outputs:
+
+- one transport moment
+- one `Lij` entry
+- one flux component
+
+Test:
+
+- compare JAX `grad` / `jvp` against finite differences
+- do this first for a single radius or reduced local problem
+
+This checks the local lagged-response differentiability in isolation.
+
+#### Stage B: Full transport differentiability with frozen geometry
+
+Keep the magnetic files fixed and test AD through the full transport solve.
+
+Suggested parameters:
+
+- `n0`
+- `T0`
+- `density_shape_power`
+- `temperature_shape_power`
+
+Suggested objectives:
+
+- softmax(final `Er`)
+- integrated final `Er^2`
+- smooth `Er` root-location proxy
+- volume-averaged alpha power
+
+Success criterion:
+
+- AD and FD agree for final-state diagnostics
+- lagged exact-runtime NTX remains stable under differentiation
+
+This validates the whole transport rollout before adding magnetic design
+variables.
+
+#### Stage C: Geometry-channel sensitivity bridge
+
+Before going all the way to `RBC`, test sensitivity to geometry quantities that
+the runtime support already depends on.
+
+Examples include:
+
+- `dr/ds`
+- `iota`
+- `B00`
+
+or other smooth geometry channels, if exposed conveniently.
+
+This acts as a bridge between:
+
+- transport-state differentiation
+- and magnetic-parameter differentiation
+
+If this stage is problematic, then going directly to `RBC` is premature.
+
+#### Stage D: New magnetic-input mode
+
+To differentiate with respect to `RBC` itself, add a new magnetic-input mode
+that is not centered on static files.
+
+Conceptually, the new path should look like:
+
+```text
+theta_mag -> vmec_jax equilibrium -> Boozer/surface representation -> NTX prepared support -> transport rollout
+```
+
+Instead of:
+
+```text
+vmec_file + boozer_file -> static support -> transport rollout
+```
+
+The new mode should accept an in-memory magnetic configuration or equilibrium
+object as the true differentiable input.
+
+#### Stage E: Magnetic-parameter AD-vs-FD test
+
+Once the new magnetic-input mode exists:
+
+- choose one small `RBC` perturbation direction
+- compute a transport objective from the final state
+- compare AD against finite differences
+
+Suggested initial objectives:
+
+- softmax(final `Er`)
+- smooth weighted center of positive `Er`
+- smooth `Er` root-location proxy
+- volume-averaged alpha power
+
+Only later:
+
+- `max(final Er)`
+- root-position diagnostics
+
+### Suggested smooth root-position proxy
+
+For a first differentiable proxy of the `Er` root location, avoid a hard
+sign-change detector and instead use a smooth weight that concentrates near
+small `|Er|`.
+
+One practical form is:
+
+```text
+w_i = exp(-beta * |Er_i|)
+r_root_proxy = sum(r_i * w_i) / sum(w_i)
+```
+
+where:
+
+- `r_i` are the radial coordinates
+- `beta` controls how tightly the weight concentrates near the zero-crossing
+
+This is not identical to a hard root finder, but it is a much better first
+diagnostic for AD-vs-FD agreement.
+
+If needed, this can later be refined so that it also prefers locations where
+the profile changes sign, but the simple near-zero weighted centroid is a good
+first test metric.
+
+### Suggested volume-averaged alpha-power objective
+
+To include a physics scalar depending on other transport-state components, add
+an objective based on volume-averaged alpha power.
+
+Conceptually:
+
+```text
+J_alpha = <P_alpha(state_final)>
+```
+
+This is useful because it brings in sensitivity to:
+
+- density
+- temperature
+- and any magnetic-configuration influence acting through the evolved final state
+
+So it complements the `Er`-focused diagnostics and helps test whether the AD
+path is behaving sensibly for broader state couplings as well.
+
+### Why a new magnetic-input mode is likely needed
+
+The current exact-runtime support build is centered on:
+
+- `vmec_file`
+- `boozer_file`
+- precomputed support from those files
+
+For real magnetic-parameter differentiation, the natural interface should be:
+
+- parameterized VMEC state
+- parameterized Boozer/surface representation
+
+not file paths.
+
+So yes, a new mode is likely needed if the target is genuine `RBC`
+differentiation.
+
+### Key technical uncertainty
+
+The largest uncertainty is not the lagged response itself.
+
+It is whether the full chain:
+
+- VMEC parameter update
+- equilibrium update
+- Boozer / surface conversion
+- NTX prepared support construction
+
+is available in a form that is both:
+
+- differentiable
+- practical enough for repeated AD-vs-FD comparisons
+
+That should be treated as a separate milestone.
+
+### Concrete testing ladder
+
+1. local lagged NTX AD vs FD
+2. full transport AD vs FD with frozen geometry
+3. geometry-channel AD vs FD
+4. add differentiable magnetic-input mode
+5. `RBC` AD vs FD on final-state transport diagnostics
+
+### Practical recommendation
+
+The first implementation should **not** start by differentiating with respect
+to `RBC` directly.
+
+The safer order is:
+
+1. prove the lagged NTX transport stack differentiates correctly with frozen geometry
+2. start with physically meaningful initial-profile parameters such as `n0`, `T0`, `density_shape_power`, and `temperature_shape_power`
+3. then introduce the new magnetic-input mode
+4. only then test `RBC`
+
+### Bottom line
+
+Yes, the idea makes sense.
+
+Yes, it is likely feasible.
+
+But the right plan is:
+
+- first validate AD through the lagged exact-runtime NTX transport path itself
+- then add a differentiable in-memory magnetic-input mode
+- then test VMEC-parameter sensitivities such as `RBC` against finite differences

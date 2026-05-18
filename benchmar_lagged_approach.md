@@ -3154,6 +3154,24 @@ Guardrail:
 
 ### Result so far
 
+- `hairer_lean_transport_discounted + collocation_transport_weighted + embedded2_ntss_block_rms`
+  - `n_steps = 66`
+  - `synchronized_elapsed_s = 223.623`
+
+Comparison against the current best estimator choice:
+
+- `hairer_lean_transport_discounted + collocation_transport_weighted + embedded2_ntss_transport_scale`
+  - `n_steps = 62`
+  - `synchronized_elapsed_s = 211.968`
+
+Current interpretation:
+
+- this first equal-weight blockwise RMS aggregation is worse than the simpler transport-structured estimator on this benchmark
+- the idea remains structurally interesting, but the untuned equal-weight block aggregation is not the right choice here
+- `embedded2_ntss_transport_scale` remains the best estimator so far for this case
+
+### Result so far
+
 - `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
   - `n_steps = 63`
   - `synchronized_elapsed_s = 222.810`
