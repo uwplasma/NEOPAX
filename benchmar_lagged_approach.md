@@ -2960,6 +2960,37 @@ Guardrail:
 - `radau_controller_mode = "hairer_lean"` remains unchanged
 - the change is still algebraic, array-only, JAX-friendly, and differentiability-friendly
 
+## Update: Discounted Transport-Aware `hairer_lean` Controller Mode
+
+A new opt-in controller mode has now been added:
+
+- `radau_controller_mode = "hairer_lean_transport_discounted"`
+
+Intent:
+
+- preserve the successful `hairer_lean` accepted-step growth law
+- do **not** add extra regrowth floors on accepted steps
+- only shrink less aggressively when the blockwise diagnostics indicate that the difficulty is localized rather than global
+
+Current implementation characteristics:
+
+- uses the same blockwise normalized local error decomposition already computed for the transport-aware controller experiments
+- identifies localized difficulty using a smooth block-concentration score
+- when localized difficulty is present:
+  - applies a milder retry shrink
+  - applies a less severe rejection cap on the replacement timestep
+
+This means the mode is:
+
+- discounting pessimism on localized difficulty
+- rather than encouraging extra growth on accepted steps
+
+Guardrail:
+
+- this is a new mode only
+- `radau_controller_mode = "hairer_lean"` remains unchanged
+- the implementation is still algebraic, array-only, JAX-friendly, and differentiability-friendly
+
 ### Result so far
 
 - `hairer_lean_transport_weighted + collocation_transport_weighted + embedded2_ntss_transport_scale`
