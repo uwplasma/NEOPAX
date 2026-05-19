@@ -1855,3 +1855,31 @@ The current code now includes that standalone validation entrypoint:
 This is intentionally different from the earlier failed attempts because it is
 not invoked from inside the present `solve -> jit(step_fn) -> lax.cond(...)`
 machinery.
+
+### Updated composition strategy
+
+The current evidence strongly suggests we should **not** replace the existing
+local one-step AD path:
+
+- the production one-step diagnostic is already excellent
+- the first standalone custom stage-subsolve tangent is currently less accurate
+
+So the next layer to redesign is not the local one-step derivative itself.
+It is the **multi-step composition boundary**.
+
+The corresponding code direction is now explicit:
+
+- keep the existing accepted-step primal logic
+- expose accepted-step composition as its own object
+- leave the production adaptive loop untouched
+
+The current code now contains that accepted-step composition boundary as:
+
+- `_RadauAcceptedStepMapResult`
+- `_radau_apply_accepted_step_map(...)`
+
+This is the right architectural seam for future AD-facing multi-step
+composition experiments:
+
+- preserve the good local one-step AD
+- redesign only the broken rollout/composition layer

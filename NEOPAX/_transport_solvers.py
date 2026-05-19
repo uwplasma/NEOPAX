@@ -2269,6 +2269,25 @@ class _RadauAcceptedRolloutResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepMapResult:
+    next_carry: Any
+    accepted_y: Any
+    accepted_t: Any
+    accepted_dt: Any
+    err_norm: Any
+    converged: Any
+    stage_history: Any
+    theta_final: Any
+    newton_iter_count: Any
+    final_residual_norm: Any
+    final_delta_norm: Any
+    density_err_norm: Any
+    pressure_err_norm: Any
+    er_err_norm: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _PreparedRadauAcceptedRollout:
     kernel_context: Any
     physics_context: Any
@@ -2757,6 +2776,64 @@ def _execute_radau_accepted_step_attempt(
         er_err_norm=er_err_norm,
         lagged_response_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
+    )
+
+
+def _radau_apply_accepted_step_map(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepMapResult:
+    """Apply one accepted-step composition map outside the adaptive loop.
+
+    This keeps the existing accepted-step primal math intact, but exposes the
+    accepted-step composition boundary as its own first-class object for future
+    AD-facing multi-step composition work.
+    """
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        attempt_context,
+    )
+    accepted_y = _project_flat_state_if_needed(
+        attempt_result.trial_y,
+        physics_context.project_flat,
+    )
+    next_carry = dataclasses.replace(
+        attempt_result.carry_after_attempt,
+        t=carry_in.t + attempt_result.trial_dt,
+        y=accepted_y,
+        dt=attempt_result.trial_dt,
+        prev_stages=attempt_result.stage_history,
+        prev_dt=attempt_result.trial_dt,
+        prev_theta_final=attempt_result.theta_final,
+        prev_newton_iter_count=attempt_result.newton_iter_count,
+        jacobian=attempt_result.jacobian_out,
+        cache_valid=attempt_result.cache_valid_out,
+        cache_dt=attempt_result.cache_dt_out,
+        cache_age=attempt_result.cache_age_out,
+        real_lu=attempt_result.real_lu_out,
+        real_piv=attempt_result.real_piv_out,
+        complex_lu=attempt_result.complex_lu_out,
+        complex_piv=attempt_result.complex_piv_out,
+    )
+    return _RadauAcceptedStepMapResult(
+        next_carry=next_carry,
+        accepted_y=accepted_y,
+        accepted_t=next_carry.t,
+        accepted_dt=attempt_result.trial_dt,
+        err_norm=attempt_result.err_norm,
+        converged=attempt_result.converged,
+        stage_history=attempt_result.stage_history,
+        theta_final=attempt_result.theta_final,
+        newton_iter_count=attempt_result.newton_iter_count,
+        final_residual_norm=attempt_result.final_residual_norm,
+        final_delta_norm=attempt_result.final_delta_norm,
+        density_err_norm=attempt_result.density_err_norm,
+        pressure_err_norm=attempt_result.pressure_err_norm,
+        er_err_norm=attempt_result.er_err_norm,
     )
 
 
@@ -4067,46 +4144,27 @@ def _radau_fixed_dt_accepted_rollout(
             t_final=carry.t + dt_value,
             use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
         )
-        attempt_result = _execute_radau_accepted_step_attempt(
+        step_map_result = _radau_apply_accepted_step_map(
             kernel_context,
             physics_context,
-            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            carry_for_step,
             attempt_context,
         )
-        accepted_y = _project_flat_state_if_needed(
-            attempt_result.trial_y,
-            physics_context.project_flat,
-        )
         next_carry = dataclasses.replace(
-            attempt_result.carry_after_attempt,
-            t=carry.t + attempt_result.trial_dt,
-            y=accepted_y,
-            dt=attempt_result.trial_dt,
+            step_map_result.next_carry,
             prev_error=jnp.maximum(
-                attempt_result.err_norm,
+                step_map_result.err_norm,
                 jnp.asarray(1.0e-12, dtype=kernel_context.dtype),
             ),
-            prev_stages=attempt_result.stage_history,
-            prev_dt=attempt_result.trial_dt,
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            jacobian=attempt_result.jacobian_out,
-            cache_valid=attempt_result.cache_valid_out,
-            cache_dt=attempt_result.cache_dt_out,
-            cache_age=attempt_result.cache_age_out,
-            real_lu=attempt_result.real_lu_out,
-            real_piv=attempt_result.real_piv_out,
-            complex_lu=attempt_result.complex_lu_out,
-            complex_piv=attempt_result.complex_piv_out,
-            prev_theta_final=attempt_result.theta_final,
-            prev_newton_iter_count=attempt_result.newton_iter_count,
         )
         scan_out = (
-            accepted_y,
-            attempt_result.err_norm,
-            attempt_result.converged,
-            attempt_result.trial_dt,
+            step_map_result.accepted_y,
+            step_map_result.err_norm,
+            step_map_result.converged,
+            step_map_result.accepted_dt,
         )
         return next_carry, scan_out
 
