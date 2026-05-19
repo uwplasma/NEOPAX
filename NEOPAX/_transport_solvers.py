@@ -2495,7 +2495,7 @@ def _execute_radau_accepted_step_attempt_impl(
     )
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 2))
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2))
 def _execute_radau_accepted_step_attempt(
     single_step_fun: Callable[..., tuple[Any, ...]],
     kernel_context: _RadauAcceptedStepKernelContext,
@@ -2515,17 +2515,18 @@ def _execute_radau_accepted_step_attempt(
 @_execute_radau_accepted_step_attempt.defjvp
 def _execute_radau_accepted_step_attempt_jvp(
     single_step_fun: Callable[..., tuple[Any, ...]],
+    kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     primals,
     tangents,
 ):
-    kernel_context, carry_in, context = primals
-    kernel_context_tangent, carry_tangent, context_tangent = tangents
+    carry_in, context = primals
+    carry_tangent, context_tangent = tangents
 
-    def _primal_fun(kernel_context_value, carry_value, context_value):
+    def _primal_fun(carry_value, context_value):
         return _execute_radau_accepted_step_attempt_impl(
             single_step_fun,
-            kernel_context_value,
+            kernel_context,
             physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_value),
             context_value,
@@ -2533,8 +2534,8 @@ def _execute_radau_accepted_step_attempt_jvp(
 
     primal_out, tangent_out = jax.jvp(
         _primal_fun,
-        (kernel_context, carry_in, context),
-        (kernel_context_tangent, carry_tangent, context_tangent),
+        (carry_in, context),
+        (carry_tangent, context_tangent),
     )
     return primal_out, tangent_out
 
