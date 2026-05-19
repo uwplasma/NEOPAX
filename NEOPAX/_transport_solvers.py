@@ -2277,6 +2277,28 @@ class _PreparedRadauAcceptedRollout:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauSolveExecutionContext:
+    kernel_context: Any
+    physics_context: Any
+    attempt_context: Any
+    dtype: Any
+    dt_min: Any
+    dt_max: Any
+    safety_factor: Any
+    controller_alpha: Any
+    min_step_factor: Any
+    max_step_factor: Any
+    controller_mode: Any
+    use_transport_lagged_response: Any
+    lagged_response_reuse_mode: Any
+    lagged_response_reuse_rtol: Any
+    lagged_response_reuse_atol: Any
+    project_flat: Any
+    debug_newton_trace: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepTangentInputs:
     dy: Any
     dh: Any
@@ -2645,14 +2667,13 @@ def _execute_radau_accepted_step_attempt_autodiff_jvp(
 ):
     (carry_in,) = primals
     (carry_tangent,) = tangents
-    primal_result, tangent_result = _execute_radau_accepted_step_attempt_with_approx_tangent(
+    return _execute_radau_accepted_step_attempt_with_approx_tangent(
         kernel_context,
         physics_context,
         carry_in,
         carry_tangent,
         context,
     )
-    return primal_result, tangent_result
 
 
 def _execute_radau_accepted_step_attempt(
@@ -2720,6 +2741,133 @@ def _execute_radau_accepted_step_attempt(
         lagged_response_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
     )
+
+
+def _radau_attempt_step_lean(
+    execution_context: _RadauSolveExecutionContext,
+    step_state: _RadauStepState,
+):
+    status = step_state.status
+    fail_code = status[1]
+    n_accepted = status[2]
+    carry_in = _radau_carry_from_step_state(step_state)
+    attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+        execution_context.kernel_context,
+        execution_context.physics_context,
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        execution_context.attempt_context,
+    )
+    step_state_attempt = _radau_step_state_from_carry(attempt_result.carry_after_attempt, status=status)
+    return _apply_radau_lean_timestep_controller(
+        step_state=step_state_attempt,
+        trial_dt=attempt_result.trial_dt,
+        trial_y=attempt_result.trial_y,
+        err_norm=attempt_result.err_norm,
+        density_err_norm=attempt_result.density_err_norm,
+        pressure_err_norm=attempt_result.pressure_err_norm,
+        er_err_norm=attempt_result.er_err_norm,
+        converged=attempt_result.converged,
+        stage_history=attempt_result.stage_history,
+        jacobian_out=attempt_result.jacobian_out,
+        cache_valid_out=attempt_result.cache_valid_out,
+        cache_dt_out=attempt_result.cache_dt_out,
+        cache_age_out=attempt_result.cache_age_out,
+        real_lu_out=attempt_result.real_lu_out,
+        real_piv_out=attempt_result.real_piv_out,
+        complex_lu_out=attempt_result.complex_lu_out,
+        complex_piv_out=attempt_result.complex_piv_out,
+        newton_shrink=attempt_result.newton_shrink,
+        diverged_final=attempt_result.diverged_final,
+        nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+        nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+        finite_f0=attempt_result.finite_f0,
+        finite_z0=attempt_result.finite_z0,
+        finite_initial_residual=attempt_result.finite_initial_residual,
+        newton_iter_count=attempt_result.newton_iter_count,
+        final_residual_norm=attempt_result.final_residual_norm,
+        final_delta_norm=attempt_result.final_delta_norm,
+        theta_final=attempt_result.theta_final,
+        slow_contraction=attempt_result.slow_contraction_final,
+        residual_blowup=attempt_result.residual_blowup_final,
+        newton_nonfinite=attempt_result.newton_nonfinite_final,
+        lagged_reused=attempt_result.lagged_response_reused,
+        jacobian_reused=attempt_result.jacobian_reused,
+        fail_code=fail_code,
+        n_accepted=n_accepted,
+        dtype=execution_context.dtype,
+        dt_min=execution_context.dt_min,
+        dt_max=execution_context.dt_max,
+        safety_factor=execution_context.safety_factor,
+        controller_alpha=execution_context.controller_alpha,
+        min_step_factor=execution_context.min_step_factor,
+        max_step_factor=execution_context.max_step_factor,
+        controller_mode=execution_context.controller_mode,
+        use_transport_lagged_response=execution_context.use_transport_lagged_response,
+        lagged_response_reuse_mode=execution_context.lagged_response_reuse_mode,
+        lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
+        lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
+        project_flat=execution_context.project_flat,
+    )
+
+
+def _radau_step_fn(
+    execution_context: _RadauSolveExecutionContext,
+    step_state: _RadauStepState,
+    _,
+):
+    failed = step_state.status[0] != 0
+    fail_code = step_state.status[1]
+
+    def _skip(_):
+        return step_state, _RadauStepInfo(
+            y=step_state.y,
+            t=step_state.t,
+            dt=jnp.asarray(0.0, dtype=execution_context.dtype),
+            next_dt=step_state.dt,
+            growth=jnp.asarray(1.0, dtype=execution_context.dtype),
+            lagged_reused=jnp.asarray(False),
+            jacobian_reused=jnp.asarray(False),
+            accepted=jnp.asarray(False),
+            failed=failed,
+            fail_code=fail_code,
+            converged=jnp.asarray(False),
+            err_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype),
+            diverged=jnp.asarray(False),
+            nonfinite_stage_state=jnp.asarray(False),
+            nonfinite_stage_residual=jnp.asarray(False),
+            finite_f0=jnp.asarray(True),
+            finite_z0=jnp.asarray(True),
+            finite_initial_residual=jnp.asarray(True),
+            newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            final_residual_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype),
+            final_delta_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype),
+            theta_final=jnp.asarray(0.0, dtype=execution_context.dtype),
+            slow_contraction=jnp.asarray(False),
+            residual_blowup=jnp.asarray(False),
+            newton_nonfinite=jnp.asarray(False),
+        )
+
+    def _run(_):
+        return _radau_attempt_step_lean(execution_context, step_state)
+
+    step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
+    if execution_context.debug_newton_trace:
+        jax.debug.print(
+            "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
+            t_start=step_state.t,
+            dt_try=step_state.dt,
+            accepted=step_info.accepted,
+            failed=step_info.failed,
+            fail_code=step_info.fail_code,
+            converged=step_info.converged,
+            err_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=execution_context.dtype),
+            growth=jnp.asarray(1.0, dtype=execution_context.dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=execution_context.dtype),
+            next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=execution_context.dtype),
+            lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
+            jacobian_reused=jnp.asarray(False) if getattr(step_info, "jacobian_reused", None) is None else jnp.asarray(getattr(step_info, "jacobian_reused")),
+            ordered=True,
+        )
+    return step_state_out, step_info
 
 
 def _radau_prepare_lagged_response(
@@ -4076,135 +4224,31 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         )
 
-        def _accepted_step_attempt_impl(carry_in: _RadauAcceptedStepCarry):
-            attempt_context = _RadauAcceptedStepAttemptContext(
-                t_final=t_final,
-                use_transport_lagged_response=jnp.asarray(use_transport_lagged_response),
-            )
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=t_final,
+            use_transport_lagged_response=jnp.asarray(use_transport_lagged_response),
+        )
+        execution_context = _RadauSolveExecutionContext(
+            kernel_context=kernel_context,
+            physics_context=physics_context,
+            attempt_context=attempt_context,
+            dtype=dtype,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            safety_factor=self.safety_factor,
+            controller_alpha=controller_alpha,
+            min_step_factor=self.min_step_factor,
+            max_step_factor=self.max_step_factor,
+            controller_mode=str(getattr(self, "controller_mode", "current")).strip().lower(),
+            use_transport_lagged_response=use_transport_lagged_response,
+            lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+            lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+            lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
+            project_flat=project_flat,
+            debug_newton_trace=bool(debug_newton_trace),
+        )
 
-            return _execute_radau_accepted_step_attempt_autodiff(
-                kernel_context,
-                physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_in),
-                attempt_context,
-            )
-
-        def _accepted_step_attempt(carry_in: _RadauAcceptedStepCarry):
-            return _accepted_step_attempt_impl(carry_in)
-
-        def _attempt_step_lean(step_state: _RadauStepState):
-            status = step_state.status
-            fail_code = status[STATUS_FAIL_CODE]
-            n_accepted = status[STATUS_N_ACCEPTED]
-            carry_in = _radau_carry_from_step_state(step_state)
-            attempt_result = _accepted_step_attempt(carry_in)
-            step_state = _radau_step_state_from_carry(attempt_result.carry_after_attempt, status=status)
-            step_state_next, step_info_next = _apply_radau_lean_timestep_controller(
-                step_state=step_state,
-                trial_dt=attempt_result.trial_dt,
-                trial_y=attempt_result.trial_y,
-                err_norm=attempt_result.err_norm,
-                density_err_norm=attempt_result.density_err_norm,
-                pressure_err_norm=attempt_result.pressure_err_norm,
-                er_err_norm=attempt_result.er_err_norm,
-                converged=attempt_result.converged,
-                stage_history=attempt_result.stage_history,
-                jacobian_out=attempt_result.jacobian_out,
-                cache_valid_out=attempt_result.cache_valid_out,
-                cache_dt_out=attempt_result.cache_dt_out,
-                cache_age_out=attempt_result.cache_age_out,
-                real_lu_out=attempt_result.real_lu_out,
-                real_piv_out=attempt_result.real_piv_out,
-                complex_lu_out=attempt_result.complex_lu_out,
-                complex_piv_out=attempt_result.complex_piv_out,
-                newton_shrink=attempt_result.newton_shrink,
-                diverged_final=attempt_result.diverged_final,
-                nonfinite_stage_state=attempt_result.nonfinite_stage_state,
-                nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
-                finite_f0=attempt_result.finite_f0,
-                finite_z0=attempt_result.finite_z0,
-                finite_initial_residual=attempt_result.finite_initial_residual,
-                newton_iter_count=attempt_result.newton_iter_count,
-                final_residual_norm=attempt_result.final_residual_norm,
-                final_delta_norm=attempt_result.final_delta_norm,
-                theta_final=attempt_result.theta_final,
-                slow_contraction=attempt_result.slow_contraction_final,
-                residual_blowup=attempt_result.residual_blowup_final,
-                newton_nonfinite=attempt_result.newton_nonfinite_final,
-                lagged_reused=attempt_result.lagged_response_reused,
-                jacobian_reused=attempt_result.jacobian_reused,
-                fail_code=fail_code,
-                n_accepted=n_accepted,
-                dtype=dtype,
-                dt_min=dt_min,
-                dt_max=dt_max,
-                safety_factor=self.safety_factor,
-                controller_alpha=controller_alpha,
-                min_step_factor=self.min_step_factor,
-                max_step_factor=self.max_step_factor,
-                controller_mode=str(getattr(self, "controller_mode", "current")).strip().lower(),
-                use_transport_lagged_response=use_transport_lagged_response,
-                lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
-                lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
-                lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
-                project_flat=project_flat,
-            )
-            return step_state_next, step_info_next
-
-        def step_fn(step_state: _RadauStepState, _):
-            failed = step_state.status[STATUS_FAILED] != 0
-            fail_code = step_state.status[STATUS_FAIL_CODE]
-
-            def _skip(_):
-                return step_state, _RadauStepInfo(
-                    y=step_state.y,
-                    t=step_state.t,
-                    dt=jnp.asarray(0.0, dtype=dtype),
-                    next_dt=step_state.dt,
-                    growth=jnp.asarray(1.0, dtype=dtype),
-                    lagged_reused=jnp.asarray(False),
-                    jacobian_reused=jnp.asarray(False),
-                    accepted=jnp.asarray(False),
-                    failed=failed,
-                    fail_code=fail_code,
-                    converged=jnp.asarray(False),
-                    err_norm=jnp.asarray(jnp.inf, dtype=dtype),
-                    diverged=jnp.asarray(False),
-                    nonfinite_stage_state=jnp.asarray(False),
-                    nonfinite_stage_residual=jnp.asarray(False),
-                    finite_f0=jnp.asarray(True),
-                    finite_z0=jnp.asarray(True),
-                    finite_initial_residual=jnp.asarray(True),
-                    newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
-                    final_residual_norm=jnp.asarray(jnp.inf, dtype=dtype),
-                    final_delta_norm=jnp.asarray(jnp.inf, dtype=dtype),
-                    theta_final=jnp.asarray(0.0, dtype=dtype),
-                    slow_contraction=jnp.asarray(False),
-                    residual_blowup=jnp.asarray(False),
-                    newton_nonfinite=jnp.asarray(False),
-                )
-
-            def _run(_):
-                return _attempt_step_lean(step_state)
-
-            step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
-            if debug_newton_trace:
-                jax.debug.print(
-                    "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
-                    t_start=step_state.t,
-                    dt_try=step_state.dt,
-                    accepted=step_info.accepted,
-                    failed=step_info.failed,
-                    fail_code=step_info.fail_code,
-                    converged=step_info.converged,
-                    err_norm=jnp.asarray(jnp.inf, dtype=dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=dtype),
-                    growth=jnp.asarray(1.0, dtype=dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=dtype),
-                    next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=dtype),
-                    lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
-                    jacobian_reused=jnp.asarray(False) if getattr(step_info, "jacobian_reused", None) is None else jnp.asarray(getattr(step_info, "jacobian_reused")),
-                    ordered=True,
-                )
-            return step_state_out, step_info
+        step_fn = partial(_radau_step_fn, execution_context)
 
         step_state0 = _make_radau_initial_step_state(
             t0,

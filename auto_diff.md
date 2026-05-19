@@ -1660,3 +1660,13 @@ via:
 
 That helper should be treated as the code-level target contract for the first
 accepted-step JVP implementation.
+
+In addition, the actual Radau attempt/control wrapper has now been pulled much
+closer to module scope:
+
+- `_radau_attempt_step_lean(...)`
+- `_radau_step_fn(...)`
+- `_RadauSolveExecutionContext`
+
+So the next AD boundary should target these module-scope step objects rather
+than the older deeply nested `solve`-local wrappers.
