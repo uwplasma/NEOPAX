@@ -2316,6 +2316,57 @@ class _RadauAcceptedStepApproximateTangentResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauStageSubsolveResult:
+    iter_final: Any
+    z_final: Any
+    delta_norm_final: Any
+    newton_metric_final: Any
+    theta_final: Any
+    diverged_final: Any
+    shrink_suggest_final: Any
+    slow_contraction_final: Any
+    residual_blowup_final: Any
+    newton_nonfinite_final: Any
+    finite_initial_residual: Any
+    nonfinite_stage_state: Any
+    nonfinite_stage_residual: Any
+    final_residual: Any
+    final_residual_norm: Any
+    converged: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauStageSubsolveInputs:
+    flat_y: Any
+    t_value: Any
+    h_value: Any
+    z0: Any
+    f0: Any
+    jacobian_ref: Any
+    lagged_response: Any
+    real_lu_out: Any
+    real_piv_out: Any
+    complex_lu_out: Any
+    complex_piv_out: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauStageSubsolveTangentInputs:
+    dy: Any
+    dh: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauStageSubsolveApproximateTangentResult:
+    dz_stages: Any
+    dz_flat: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepKernelContext:
     radau_transform: Any
     radau_inv_transform: Any
@@ -2642,40 +2693,6 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
     return primal_result, tangent_attempt
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
-def _execute_radau_accepted_step_attempt_autodiff(
-    kernel_context: _RadauAcceptedStepKernelContext,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-    carry_in: _RadauAcceptedStepCarry,
-    context: _RadauAcceptedStepAttemptContext,
-) -> _RadauAcceptedStepAttemptResult:
-    return _execute_radau_accepted_step_attempt(
-        kernel_context,
-        physics_context,
-        carry_in,
-        context,
-    )
-
-
-@_execute_radau_accepted_step_attempt_autodiff.defjvp
-def _execute_radau_accepted_step_attempt_autodiff_jvp(
-    kernel_context: _RadauAcceptedStepKernelContext,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-    context: _RadauAcceptedStepAttemptContext,
-    primals,
-    tangents,
-):
-    (carry_in,) = primals
-    (carry_tangent,) = tangents
-    return _execute_radau_accepted_step_attempt_with_approx_tangent(
-        kernel_context,
-        physics_context,
-        carry_in,
-        carry_tangent,
-        context,
-    )
-
-
 def _execute_radau_accepted_step_attempt(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -2751,7 +2768,7 @@ def _radau_attempt_step_lean(
     fail_code = status[1]
     n_accepted = status[2]
     carry_in = _radau_carry_from_step_state(step_state)
-    attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+    attempt_result = _execute_radau_accepted_step_attempt(
         execution_context.kernel_context,
         execution_context.physics_context,
         _radau_carry_with_forward_only_jvp_fields(carry_in),
@@ -3134,6 +3151,440 @@ def _radau_carry_with_forward_only_jvp_fields(
     )
 
 
+def _radau_stage_subsolve_residual(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    z_flat,
+):
+    """Evaluate the stage residual from explicit subsolve inputs."""
+    return _radau_stage_residual(
+        kernel_context,
+        physics_context,
+        flat_y=inputs.flat_y,
+        t_value=inputs.t_value,
+        h_value=inputs.h_value,
+        z_flat=z_flat,
+        f0=inputs.f0,
+        jacobian_ref=inputs.jacobian_ref,
+        lagged_response=inputs.lagged_response,
+    )
+
+
+def _radau_stage_subsolve_linear_solve(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    inputs: _RadauStageSubsolveInputs,
+    rhs,
+):
+    """Apply the current Newton linear solve from explicit subsolve inputs."""
+    return _radau_apply_stage_linear_solve(
+        kernel_context,
+        rhs=rhs,
+        real_lu_out=inputs.real_lu_out,
+        real_piv_out=inputs.real_piv_out,
+        complex_lu_out=inputs.complex_lu_out,
+        complex_piv_out=inputs.complex_piv_out,
+    )
+
+
+def _radau_build_stage_subsolve_inputs(
+    *,
+    flat_y,
+    t_value,
+    h_value,
+    z0,
+    f0,
+    jacobian_ref,
+    lagged_response,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+) -> _RadauStageSubsolveInputs:
+    """Package the explicit inputs for one Radau stage subsolve."""
+    return _RadauStageSubsolveInputs(
+        flat_y=flat_y,
+        t_value=t_value,
+        h_value=h_value,
+        z0=z0,
+        f0=f0,
+        jacobian_ref=jacobian_ref,
+        lagged_response=lagged_response,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+    )
+
+
+def _radau_extract_stage_subsolve_tangent_inputs(
+    inputs_tangent: _RadauStageSubsolveInputs,
+) -> _RadauStageSubsolveTangentInputs:
+    """Extract the first tangent-active Radau stage-subsolve inputs.
+
+    The first implicit-diff subsolve rule is only active with respect to:
+
+    - the incoming accepted state `y_n`
+    - the trial step size `h`
+
+    while Jacobian/LU factors and lagged-response objects remain forward data.
+    """
+    return _RadauStageSubsolveTangentInputs(
+        dy=inputs_tangent.flat_y,
+        dh=inputs_tangent.h_value,
+    )
+
+
+def _radau_compute_stage_subsolve_approximate_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    inputs: _RadauStageSubsolveInputs,
+    tangent_inputs: _RadauStageSubsolveTangentInputs,
+    subsolve_result: _RadauStageSubsolveResult,
+) -> _RadauStageSubsolveApproximateTangentResult:
+    """Compute the first approximate tangent for the explicit stage subsolve."""
+    stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    _, dz_stages = _radau_approximate_accepted_step_tangent(
+        kernel_context,
+        jacobian_ref=inputs.jacobian_ref,
+        h_value=inputs.h_value,
+        stages_final=stages_final,
+        dy_source=tangent_inputs.dy,
+        dh_source=tangent_inputs.dh,
+        real_lu_out=inputs.real_lu_out,
+        real_piv_out=inputs.real_piv_out,
+        complex_lu_out=inputs.complex_lu_out,
+        complex_piv_out=inputs.complex_piv_out,
+    )
+    return _RadauStageSubsolveApproximateTangentResult(
+        dz_stages=dz_stages,
+        dz_flat=dz_stages.reshape((-1,)),
+    )
+
+
+def _radau_build_stage_subsolve_tangent_result(
+    tangent_result: _RadauStageSubsolveApproximateTangentResult,
+    *,
+    primal_result: _RadauStageSubsolveResult,
+) -> _RadauStageSubsolveResult:
+    """Lift the approximate subsolve tangent back to subsolve-result shape."""
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    return _RadauStageSubsolveResult(
+        iter_final=_zero_tangent_like(primal_result.iter_final),
+        z_final=tangent_result.dz_flat,
+        delta_norm_final=_zero_tangent_like(primal_result.delta_norm_final),
+        newton_metric_final=_zero_tangent_like(primal_result.newton_metric_final),
+        theta_final=_zero_tangent_like(primal_result.theta_final),
+        diverged_final=_zero_tangent_like(primal_result.diverged_final),
+        shrink_suggest_final=_zero_tangent_like(primal_result.shrink_suggest_final),
+        slow_contraction_final=_zero_tangent_like(primal_result.slow_contraction_final),
+        residual_blowup_final=_zero_tangent_like(primal_result.residual_blowup_final),
+        newton_nonfinite_final=_zero_tangent_like(primal_result.newton_nonfinite_final),
+        finite_initial_residual=_zero_tangent_like(primal_result.finite_initial_residual),
+        nonfinite_stage_state=_zero_tangent_like(primal_result.nonfinite_stage_state),
+        nonfinite_stage_residual=_zero_tangent_like(primal_result.nonfinite_stage_residual),
+        final_residual=_zero_tangent_like(primal_result.final_residual),
+        final_residual_norm=_zero_tangent_like(primal_result.final_residual_norm),
+        converged=_zero_tangent_like(primal_result.converged),
+    )
+
+
+def _radau_run_stage_subsolve_with_approx_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    inputs_tangent: _RadauStageSubsolveInputs,
+) -> tuple[_RadauStageSubsolveResult, _RadauStageSubsolveApproximateTangentResult]:
+    """Return the stage-subsolve primal result plus its first approximate tangent."""
+    primal_result = _radau_run_stage_subsolve_from_inputs(
+        kernel_context,
+        physics_context,
+        inputs,
+    )
+    tangent_inputs = _radau_extract_stage_subsolve_tangent_inputs(inputs_tangent)
+    tangent_result = _radau_compute_stage_subsolve_approximate_tangent(
+        kernel_context,
+        inputs,
+        tangent_inputs,
+        primal_result,
+    )
+    return primal_result, tangent_result
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
+def _radau_run_stage_subsolve_autodiff(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+) -> _RadauStageSubsolveResult:
+    """Autodiff wrapper for the explicit Radau stage-subsolve primitive."""
+    return _radau_run_stage_subsolve(
+        kernel_context,
+        physics_context,
+        inputs,
+    )
+
+
+@_radau_run_stage_subsolve_autodiff.defjvp
+def _radau_run_stage_subsolve_autodiff_jvp(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    primals,
+    tangents,
+):
+    (inputs,) = primals
+    (inputs_tangent,) = tangents
+    primal_result, approx_tangent = _radau_run_stage_subsolve_with_approx_tangent(
+        kernel_context,
+        physics_context,
+        inputs,
+        inputs_tangent,
+    )
+    tangent_result = _radau_build_stage_subsolve_tangent_result(
+        approx_tangent,
+        primal_result=primal_result,
+    )
+    return primal_result, tangent_result
+
+
+def _radau_run_stage_subsolve_from_inputs(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+) -> _RadauStageSubsolveResult:
+    """Run the stage subsolve from an explicit input bundle.
+
+    This gives the future custom derivative rule a cleaner, closure-light
+    primitive target than the full accepted-step or adaptive-loop wrapper.
+    """
+    return _radau_run_stage_subsolve_autodiff(
+        kernel_context,
+        physics_context,
+        inputs,
+    )
+
+
+def _radau_run_stage_subsolve(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+) -> _RadauStageSubsolveResult:
+    """Run the implicit Radau stage Newton solve as a standalone subsolve.
+
+    This isolates the converged stage-system solve from the larger accepted-step
+    wrapper and adaptive controller logic. It is the closest NEOPAX analogue to
+    SPECTRAX-GK's "customize AD at a meaningful subsolve" pattern.
+    """
+
+    def body_fn(newton_state):
+        (
+            iter_idx,
+            z_cur,
+            delta_norm,
+            residual_norm,
+            prev_newton_norm,
+            newton_metric,
+            prev_theta_ratio,
+            theta_est,
+            diverged,
+            shrink_suggest,
+            slow_contraction_any,
+            residual_blowup_any,
+            newton_nonfinite_any,
+        ) = newton_state
+        residual_cur = _radau_stage_subsolve_residual(
+            kernel_context,
+            physics_context,
+            inputs,
+            z_cur,
+        )
+        delta = _radau_stage_subsolve_linear_solve(
+            kernel_context,
+            inputs,
+            -residual_cur,
+        )
+        delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
+        z_next = z_cur + delta
+        current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
+        current_delta_norm = jnp.linalg.norm(delta)
+        current_newton_norm = _radau_correction_norm(kernel_context, delta)
+        safe_prev_delta = jnp.maximum(prev_newton_norm, kernel_context.tiny_scalar)
+        theta_raw = current_newton_norm / safe_prev_delta
+        newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
+        theta_candidate = jnp.where(
+            newton_iter_num == 2,
+            theta_raw,
+            jnp.sqrt(jnp.maximum(theta_raw * prev_theta_ratio, kernel_context.tiny_scalar)),
+        )
+        theta_valid = newton_iter_num > 1
+        theta_candidate = jnp.where(theta_valid, theta_candidate, kernel_context.zero_scalar)
+        theta_next = jnp.where(theta_valid, theta_candidate, theta_est)
+        theta_ratio_next = jnp.where(theta_valid, theta_raw, prev_theta_ratio)
+        residual_blowup = jnp.logical_and(
+            iter_idx >= 1,
+            current_residual_norm > residual_norm * kernel_context.residual_blowup_factor,
+        )
+        nonfinite_state = jnp.logical_not(
+            jnp.logical_and(
+                jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
+                jnp.logical_and(jnp.isfinite(current_delta_norm), jnp.isfinite(current_newton_norm)),
+            )
+        )
+        predictor_active = jnp.logical_and(theta_valid, newton_iter_num < kernel_context.maxiter)
+        remaining_iters = jnp.maximum(kernel_context.maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
+        faccon = theta_candidate / jnp.maximum(
+            jnp.asarray(1.0, dtype=kernel_context.dtype) - theta_candidate,
+            kernel_context.tiny_scalar,
+        )
+        predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.predictor_fnewt
+        qnewt = jnp.clip(predicted_defect, kernel_context.predictor_defect_floor, kernel_context.predictor_defect_cap)
+        predictor_exponent = -jnp.asarray(1.0, dtype=kernel_context.dtype) / (
+            jnp.asarray(kernel_context.maxiter + 3, dtype=kernel_context.dtype) - newton_iter_num.astype(kernel_context.dtype)
+        )
+        predictor_shrink = jnp.clip(
+            kernel_context.newton_shrink_num * (qnewt ** predictor_exponent),
+            kernel_context.newton_shrink_min,
+            kernel_context.newton_shrink_max,
+        )
+        slow_contraction = jnp.logical_and(
+            predictor_active,
+            jnp.where(
+                theta_candidate < kernel_context.theta_diverge_threshold,
+                predicted_defect >= jnp.asarray(1.0, dtype=kernel_context.dtype),
+                jnp.asarray(True),
+            ),
+        )
+        convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
+        meets_newton_tol = convergence_metric <= kernel_context.predictor_fnewt
+        predictor_shrink = jnp.where(
+            theta_candidate < kernel_context.theta_diverge_threshold,
+            predictor_shrink,
+            jnp.asarray(0.5, dtype=kernel_context.dtype),
+        )
+        shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
+        slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
+        diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
+        if kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
+                iter=iter_idx + 1,
+                delta_norm=current_delta_norm,
+                residual_norm=current_residual_norm,
+                newton_metric=convergence_metric,
+                fnewt=kernel_context.predictor_fnewt,
+                theta=theta_next,
+                slow=slow_contraction,
+                blowup=residual_blowup,
+                nonfinite=nonfinite_state,
+                diverged=diverged_next,
+            )
+        return (
+            iter_idx + 1,
+            z_next,
+            current_delta_norm,
+            current_residual_norm,
+            current_newton_norm,
+            convergence_metric,
+            theta_ratio_next,
+            theta_next,
+            diverged_next,
+            shrink_suggest_next,
+            jnp.logical_or(slow_contraction_any, slow_contraction),
+            jnp.logical_or(residual_blowup_any, residual_blowup),
+            jnp.logical_or(newton_nonfinite_any, nonfinite_state),
+        )
+
+    def cond_fn(newton_state):
+        iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        active = jnp.where(
+            kernel_context.use_hairer_newton_tol,
+            newton_metric > kernel_context.predictor_fnewt,
+            jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
+        )
+        return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
+
+    init_newton = (
+        jnp.asarray(0, dtype=jnp.int32),
+        inputs.z0,
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        kernel_context.zero_scalar,
+        kernel_context.zero_scalar,
+        jnp.asarray(False),
+        jnp.asarray(1.0, dtype=kernel_context.dtype),
+        jnp.asarray(False),
+        jnp.asarray(False),
+        jnp.asarray(False),
+    )
+    initial_residual = _radau_stage_subsolve_residual(
+        kernel_context,
+        physics_context,
+        inputs,
+        inputs.z0,
+    )
+    finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
+    (
+        iter_final,
+        z_final,
+        delta_norm_final,
+        _residual_norm_loop_final,
+        _prev_newton_norm_final,
+        newton_metric_final,
+        _prev_theta_ratio_final,
+        theta_final,
+        diverged_final,
+        shrink_suggest_final,
+        slow_contraction_final,
+        residual_blowup_final,
+        newton_nonfinite_final,
+    ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
+    final_residual = _radau_stage_subsolve_residual(
+        kernel_context,
+        physics_context,
+        inputs,
+        z_final,
+    )
+    nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
+    nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
+    final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
+    converged = jnp.logical_and(
+        jnp.logical_and(
+            jnp.all(jnp.isfinite(z_final)),
+            jnp.where(
+                kernel_context.use_hairer_newton_tol,
+                newton_metric_final <= kernel_context.predictor_fnewt,
+                final_residual_norm <= kernel_context.tol,
+            ),
+        ),
+        jnp.logical_not(diverged_final),
+    )
+    return _RadauStageSubsolveResult(
+        iter_final=iter_final,
+        z_final=z_final,
+        delta_norm_final=delta_norm_final,
+        newton_metric_final=newton_metric_final,
+        theta_final=theta_final,
+        diverged_final=diverged_final,
+        shrink_suggest_final=shrink_suggest_final,
+        slow_contraction_final=slow_contraction_final,
+        residual_blowup_final=residual_blowup_final,
+        newton_nonfinite_final=newton_nonfinite_final,
+        finite_initial_residual=finite_initial_residual,
+        nonfinite_stage_state=nonfinite_stage_state,
+        nonfinite_stage_residual=nonfinite_stage_residual,
+        final_residual=final_residual,
+        final_residual_norm=final_residual_norm,
+        converged=converged,
+    )
+
+
 def _radau_single_step_primal(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3239,212 +3690,42 @@ def _radau_single_step_primal(
     )
     jacobian_reused = reuse_linearization
 
-    def residual(z_flat):
-        return _radau_stage_residual(
-            kernel_context,
-            physics_context,
-            flat_y=flat_y,
-            t_value=t_value,
-            h_value=h_value,
-            z_flat=z_flat,
-            f0=f0,
-            jacobian_ref=jacobian_ref,
-            lagged_response=lagged_response,
-        )
-
-    def stage_solver(rhs):
-        return _radau_apply_stage_linear_solve(
-            kernel_context,
-            rhs=rhs,
-            real_lu_out=real_lu_out,
-            real_piv_out=real_piv_out,
-            complex_lu_out=complex_lu_out,
-            complex_piv_out=complex_piv_out,
-        )
-
-    def body_fn(newton_state):
-        (
-            iter_idx,
-            z_cur,
-            delta_norm,
-            residual_norm,
-            prev_newton_norm,
-            newton_metric,
-            prev_theta_ratio,
-            theta_est,
-            diverged,
-            shrink_suggest,
-            slow_contraction_any,
-            residual_blowup_any,
-            newton_nonfinite_any,
-        ) = newton_state
-        residual_cur = residual(z_cur)
-        delta = stage_solver(-residual_cur)
-        delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
-        z_next = z_cur + delta
-        current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
-        current_delta_norm = jnp.linalg.norm(delta)
-        current_newton_norm = _radau_correction_norm(kernel_context, delta)
-        safe_prev_delta = jnp.maximum(prev_newton_norm, kernel_context.tiny_scalar)
-        theta_raw = current_newton_norm / safe_prev_delta
-        newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
-        theta_candidate = jnp.where(
-            newton_iter_num == 2,
-            theta_raw,
-            jnp.sqrt(jnp.maximum(theta_raw * prev_theta_ratio, kernel_context.tiny_scalar)),
-        )
-        theta_valid = newton_iter_num > 1
-        theta_candidate = jnp.where(theta_valid, theta_candidate, kernel_context.zero_scalar)
-        theta_next = jnp.where(theta_valid, theta_candidate, theta_est)
-        theta_ratio_next = jnp.where(theta_valid, theta_raw, prev_theta_ratio)
-        residual_blowup = jnp.logical_and(
-            iter_idx >= 1,
-            current_residual_norm > residual_norm * kernel_context.residual_blowup_factor,
-        )
-        nonfinite_state = jnp.logical_not(
-            jnp.logical_and(
-                jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
-                jnp.logical_and(jnp.isfinite(current_delta_norm), jnp.isfinite(current_newton_norm)),
-            )
-        )
-        predictor_active = jnp.logical_and(theta_valid, newton_iter_num < kernel_context.maxiter)
-        remaining_iters = jnp.maximum(kernel_context.maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
-        faccon = theta_candidate / jnp.maximum(
-            jnp.asarray(1.0, dtype=kernel_context.dtype) - theta_candidate,
-            kernel_context.tiny_scalar,
-        )
-        predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.predictor_fnewt
-        qnewt = jnp.clip(predicted_defect, kernel_context.predictor_defect_floor, kernel_context.predictor_defect_cap)
-        predictor_exponent = -jnp.asarray(1.0, dtype=kernel_context.dtype) / (
-            jnp.asarray(kernel_context.maxiter + 3, dtype=kernel_context.dtype) - newton_iter_num.astype(kernel_context.dtype)
-        )
-        predictor_shrink = jnp.clip(
-            kernel_context.newton_shrink_num * (qnewt ** predictor_exponent),
-            kernel_context.newton_shrink_min,
-            kernel_context.newton_shrink_max,
-        )
-        slow_contraction = jnp.logical_and(
-            predictor_active,
-            jnp.where(
-                theta_candidate < kernel_context.theta_diverge_threshold,
-                predicted_defect >= jnp.asarray(1.0, dtype=kernel_context.dtype),
-                jnp.asarray(True),
-            ),
-        )
-        convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
-        meets_newton_tol = convergence_metric <= kernel_context.predictor_fnewt
-        predictor_shrink = jnp.where(
-            theta_candidate < kernel_context.theta_diverge_threshold,
-            predictor_shrink,
-            jnp.asarray(0.5, dtype=kernel_context.dtype),
-        )
-        shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
-        slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
-        diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
-        if kernel_context.debug_newton_trace:
-            jax.debug.print(
-                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
-                iter=iter_idx + 1,
-                delta_norm=current_delta_norm,
-                residual_norm=current_residual_norm,
-                newton_metric=convergence_metric,
-                fnewt=kernel_context.predictor_fnewt,
-                theta=theta_next,
-                slow=slow_contraction,
-                blowup=residual_blowup,
-                nonfinite=nonfinite_state,
-                diverged=diverged_next,
-            )
-        return (
-            iter_idx + 1,
-            z_next,
-            current_delta_norm,
-            current_residual_norm,
-            current_newton_norm,
-            convergence_metric,
-            theta_ratio_next,
-            theta_next,
-            diverged_next,
-            shrink_suggest_next,
-            jnp.logical_or(slow_contraction_any, slow_contraction),
-            jnp.logical_or(residual_blowup_any, residual_blowup),
-            jnp.logical_or(newton_nonfinite_any, nonfinite_state),
-        )
-
-    def cond_fn(newton_state):
-        iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
-        active = jnp.where(
-            kernel_context.use_hairer_newton_tol,
-            newton_metric > kernel_context.predictor_fnewt,
-            jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
-        )
-        return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
-
-    init_newton = (
-        jnp.asarray(0, dtype=jnp.int32),
-        z0,
-        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-        kernel_context.zero_scalar,
-        kernel_context.zero_scalar,
-        jnp.asarray(False),
-        jnp.asarray(1.0, dtype=kernel_context.dtype),
-        jnp.asarray(False),
-        jnp.asarray(False),
-        jnp.asarray(False),
+    subsolve_inputs = _radau_build_stage_subsolve_inputs(
+        flat_y=flat_y,
+        t_value=t_value,
+        h_value=h_value,
+        z0=z0,
+        f0=f0,
+        jacobian_ref=jacobian_ref,
+        lagged_response=lagged_response,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
     )
-    initial_residual = residual(z0)
-    finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
-    (
-        iter_final,
-        z_final,
-        delta_norm_final,
-        _residual_norm_loop_final,
-        _prev_newton_norm_final,
-        newton_metric_final,
-        _prev_theta_ratio_final,
-        theta_final,
-        diverged_final,
-        shrink_suggest_final,
-        slow_contraction_final,
-        residual_blowup_final,
-        newton_nonfinite_final,
-    ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
-    stages_final = z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
-    final_residual = residual(z_final)
-    nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
-    nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
-    final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
-    converged = jnp.logical_and(
-        jnp.logical_and(
-            jnp.all(jnp.isfinite(z_final)),
-            jnp.where(
-                kernel_context.use_hairer_newton_tol,
-                newton_metric_final <= kernel_context.predictor_fnewt,
-                final_residual_norm <= kernel_context.tol,
-            ),
-        ),
-        jnp.logical_not(diverged_final),
+    subsolve_result = _radau_run_stage_subsolve_from_inputs(
+        kernel_context,
+        physics_context,
+        subsolve_inputs,
     )
+    stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     if kernel_context.debug_newton_trace:
         jax.debug.print(
             "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
-            iter=iter_final,
-            converged=converged,
-            diverged=diverged_final,
-            finite_initial_residual=finite_initial_residual,
-            nonfinite_stage_state=nonfinite_stage_state,
-            nonfinite_stage_residual=nonfinite_stage_residual,
-            residual_norm=final_residual_norm,
-            delta_norm=delta_norm_final,
-            newton_metric=newton_metric_final,
+            iter=subsolve_result.iter_final,
+            converged=subsolve_result.converged,
+            diverged=subsolve_result.diverged_final,
+            finite_initial_residual=subsolve_result.finite_initial_residual,
+            nonfinite_stage_state=subsolve_result.nonfinite_stage_state,
+            nonfinite_stage_residual=subsolve_result.nonfinite_stage_residual,
+            residual_norm=subsolve_result.final_residual_norm,
+            delta_norm=subsolve_result.delta_norm_final,
+            newton_metric=subsolve_result.newton_metric_final,
             fnewt=kernel_context.predictor_fnewt,
-            theta=theta_final,
-            slow=slow_contraction_final,
-            blowup=residual_blowup_final,
-            newton_nonfinite=newton_nonfinite_final,
+            theta=subsolve_result.theta_final,
+            slow=subsolve_result.slow_contraction_final,
+            blowup=subsolve_result.residual_blowup_final,
+            newton_nonfinite=subsolve_result.newton_nonfinite_final,
         )
     flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
     err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + (kernel_context.b_error @ stages_final))
@@ -3585,16 +3866,16 @@ def _radau_single_step_primal(
         )
     else:
         pressure_err_norm = err_norm
-    theta_safe = jnp.clip(theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
+    theta_safe = jnp.clip(subsolve_result.theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
     fallback_newton_shrink = jnp.clip(
         kernel_context.newton_shrink_num / theta_safe,
         kernel_context.newton_shrink_min,
         kernel_context.newton_shrink_max,
     )
     newton_shrink = jnp.where(
-        converged,
+        subsolve_result.converged,
         jnp.asarray(1.0, dtype=kernel_context.dtype),
-        jnp.where(slow_contraction_final, shrink_suggest_final, fallback_newton_shrink),
+        jnp.where(subsolve_result.slow_contraction_final, subsolve_result.shrink_suggest_final, fallback_newton_shrink),
     )
     jacobian_out = jacobian_ref
     cache_valid_out = jnp.asarray(True)
@@ -3603,15 +3884,15 @@ def _radau_single_step_primal(
     return (
         flat_next,
         err_norm,
-        converged,
-        z_final,
-        theta_final,
-        iter_final,
-        final_residual_norm,
-        delta_norm_final,
-        slow_contraction_final,
-        residual_blowup_final,
-        newton_nonfinite_final,
+        subsolve_result.converged,
+        subsolve_result.z_final,
+        subsolve_result.theta_final,
+        subsolve_result.iter_final,
+        subsolve_result.final_residual_norm,
+        subsolve_result.delta_norm_final,
+        subsolve_result.slow_contraction_final,
+        subsolve_result.residual_blowup_final,
+        subsolve_result.newton_nonfinite_final,
         jacobian_out,
         cache_valid_out,
         cache_dt_out,
@@ -3621,12 +3902,12 @@ def _radau_single_step_primal(
         complex_lu_out,
         complex_piv_out,
         newton_shrink,
-        diverged_final,
-        nonfinite_stage_state,
-        nonfinite_stage_residual,
+        subsolve_result.diverged_final,
+        subsolve_result.nonfinite_stage_state,
+        subsolve_result.nonfinite_stage_residual,
         finite_f0,
         finite_z0,
-        finite_initial_residual,
+        subsolve_result.finite_initial_residual,
         density_err_norm,
         pressure_err_norm,
         er_err_norm,

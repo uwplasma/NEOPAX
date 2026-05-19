@@ -1469,6 +1469,40 @@ This should guide the next design step. The next iteration should begin from
 the recorded failure mode instead of retrying the same boundary with minor
 variations.
 
+### SPECTRAX-GK comparison
+
+The local `SPECTRAX-GK` codebase suggests a more useful analogy than Diffrax
+for the current NEOPAX Radau work.
+
+What SPECTRAX-GK appears to do:
+
+- it keeps most time integration as ordinary JAX code (`jit`, `scan`,
+  checkpointing)
+- it does **not** appear to expose one big public "custom backward rule for the
+  whole solver" API for its native integrators
+- instead, it uses a `custom_vjp` on a mathematically meaningful **subsolve**
+  inside the RHS assembly:
+  - `spectraxgk/terms/fields.py: solve_fields`
+
+So the closest lesson is:
+
+- separate forward and backward rules at the level of the important solver
+  subproblem
+- not necessarily at the level of the entire time-integration loop
+
+For NEOPAX, the analogous subproblem is not the whole adaptive Radau loop.
+It is the **accepted implicit Radau stage solve**.
+
+This strengthens the current plan:
+
+- keep the adaptive production loop as ordinary forward solver logic
+- isolate the converged implicit Radau stage solve as its own mathematical
+  object
+- attach the custom derivative rule there
+
+This is more aligned with the SPECTRAX-GK pattern than trying to insert
+`custom_jvp` directly into the full adaptive loop machinery.
+
 ### Radau-native implicit differentiation plan
 
 The next iteration should be based on the **converged accepted Radau step as
@@ -1670,3 +1704,129 @@ closer to module scope:
 
 So the next AD boundary should target these module-scope step objects rather
 than the older deeply nested `solve`-local wrappers.
+
+#### What the latest failures clarified
+
+The repeated `custom_jvp` failures are now informative enough to count as a
+design result.
+
+What we tried:
+
+- attach `custom_jvp` around accepted-step attempt helpers
+- move those helpers to module scope
+- move the step/control wrapper to module scope
+- remove the old `solve`-local `step_fn` shim
+
+What still happened under `jax.jacfwd(...)`:
+
+- `DynamicJaxprTracer` constant-handler failures inside the compiled adaptive
+  step path
+
+So the current conclusion is:
+
+- the forward-neutral refactor was still worth doing
+- but the live custom derivative rule should **not** be attached from inside
+  the current `solve -> jit(step_fn) -> lax.cond(...)` machinery
+
+This does **not** invalidate the Radau-native implicit-diff plan.
+It narrows it:
+
+- the right mathematical object is still the converged implicit Radau stage
+  solve
+- but the future AD hook must sit at the **stage subsolve boundary**, not at
+  the surrounding adaptive loop wrapper
+
+#### Updated immediate implementation target
+
+Following the SPECTRAX-GK analogy more closely, the next concrete code target
+should be a first-class Radau stage subsolve object:
+
+- primal:
+  - run the Newton solve for the collocation stage system
+- derivative:
+  - use the implicit linearized stage solve
+
+This is now the clearest NEOPAX-native analogue to:
+
+- `solve_fields` in `SPECTRAX-GK`
+
+rather than trying to make the whole adaptive loop itself the first custom-AD
+boundary.
+
+The current code now exposes this direction more explicitly by isolating the
+Newton stage solve into a standalone helper:
+
+- `_radau_run_stage_subsolve(...)`
+
+That helper is still forward-only for now, but it is a much better future AD
+attachment point than the full adaptive step wrapper.
+
+The next useful structural refinement is now also in place:
+
+- `_RadauStageSubsolveInputs`
+- `_radau_build_stage_subsolve_inputs(...)`
+- `_radau_stage_subsolve_residual(...)`
+- `_radau_stage_subsolve_linear_solve(...)`
+- `_radau_run_stage_subsolve_from_inputs(...)`
+
+This matters because the future derivative rule should attach to a **primitive
+with explicit Radau data**, not to a large wrapper whose important solver
+inputs are still implicit in local variables.
+
+So the immediate AD target has now been narrowed further:
+
+- not the adaptive loop
+- not the whole accepted-step wrapper
+- but the explicit stage-subsolve primitive defined by:
+  - a bundled subsolve input object
+  - a residual map
+  - a stage linear solve
+
+The next solver-mathematical refinement is also now explicit in code:
+
+- `_RadauStageSubsolveTangentInputs`
+- `_RadauStageSubsolveApproximateTangentResult`
+- `_radau_extract_stage_subsolve_tangent_inputs(...)`
+- `_radau_compute_stage_subsolve_approximate_tangent(...)`
+- `_radau_run_stage_subsolve_with_approx_tangent(...)`
+
+This means the future AD hook no longer needs to invent the stage-subsolve
+contract on the fly. We now have a dedicated primitive-level pairing of:
+
+- primal:
+  - explicit stage-subsolve inputs
+  - explicit stage-subsolve result
+
+- tangent:
+  - explicit tangent-active subsolve inputs
+  - explicit approximate tangent result
+
+That is a much better starting point for a Radau-native custom derivative than
+the earlier attempts to attach `custom_jvp` around the adaptive loop wrappers.
+
+The stage-subsolve path has now also been cleaned up one more step:
+
+- `_radau_run_stage_subsolve(...)` now works directly from:
+  - `kernel_context`
+  - `physics_context`
+  - `_RadauStageSubsolveInputs`
+
+So the current primitive is no longer "explicit inputs plus lambda adapters".
+It is now an explicit module-scope stage-subsolve path end to end. That is the
+right shape for the next real AD experiment.
+
+The next live experiment is now attached exactly there:
+
+- `_radau_run_stage_subsolve_autodiff(...)`
+
+with its current first tangent lift via:
+
+- `_radau_build_stage_subsolve_tangent_result(...)`
+
+So the first active custom derivative is no longer aimed at:
+
+- the adaptive loop
+- the accepted-step wrapper
+- the step-control wrapper
+
+It is aimed at the explicit Radau stage-subsolve primitive itself.
