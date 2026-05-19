@@ -437,6 +437,23 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
     def _fmt_float(value) -> str:
         return "na" if value is None else f"{float(value):.6e}"
 
+    if report.get("small_step_only_check"):
+        print(
+            f"[autodiff-gate] mode=small_step_only "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        small_step = report.get("small_step_composition") or []
+        print("[autodiff-gate] small-step composition errors:")
+        for entry in small_step:
+            print(
+                f"  - step_count={int(entry['step_count'])} "
+                f"step_scale={float(entry['step_scale']):.6e} "
+                f"max_rel_err={float(entry['max_relative_error']):.6e}"
+            )
+        return
+
     print(
         f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
         f"parameter={report['parameter_name']} "
@@ -713,6 +730,104 @@ def _small_step_composition_objectives_for_parameter(
     return _objective_vector(final_state, runtime)
 
 
+def _small_step_composition_report(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    baseline_value: float,
+    fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+) -> list[dict[str, Any]]:
+    entries = []
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+    for raw_count in small_step_counts:
+        step_count = int(raw_count)
+        composition_objective_fn = lambda p: _small_step_composition_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            step_count=step_count,
+            step_scale=small_step_scale,
+        )
+        comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
+        comp_minus = np.asarray(
+            jax.device_get(composition_objective_fn(jnp.asarray(minus_value))),
+            dtype=float,
+        )
+        comp_plus = np.asarray(
+            jax.device_get(composition_objective_fn(jnp.asarray(plus_value))),
+            dtype=float,
+        )
+        comp_fd = (comp_plus - comp_minus) / (2.0 * fd_step)
+        comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
+        comp_abs_err = np.abs(comp_ad_np - comp_fd)
+        comp_rel_err = comp_abs_err / np.maximum(np.abs(comp_fd), 1.0e-10)
+        entries.append(
+            {
+                "step_count": int(step_count),
+                "step_scale": float(small_step_scale),
+                "gradient_autodiff": comp_ad_np.tolist(),
+                "gradient_fd": comp_fd.tolist(),
+                "gradient_absolute_error": comp_abs_err.tolist(),
+                "gradient_relative_error": comp_rel_err.tolist(),
+                "max_relative_error": float(np.max(comp_rel_err)),
+                "labels": OBJECTIVE_LABELS,
+            }
+        )
+    return entries
+
+
+def build_small_step_only_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    small_step_composition = _small_step_composition_report(
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_value=baseline_value,
+        fd_step=fd_step,
+        small_step_counts=small_step_counts,
+        small_step_scale=small_step_scale,
+    )
+    max_rel_error = max(float(entry["max_relative_error"]) for entry in small_step_composition)
+    return {
+        "config_path": str(config_path),
+        "small_step_only_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "small_step_composition": small_step_composition,
+        "passed": bool(np.isfinite(max_rel_error) and max_rel_error <= 5.0e-2),
+        "max_relative_error": float(max_rel_error),
+        "objective_labels": OBJECTIVE_LABELS,
+    }
+
+
 def build_report(
     *,
     config_path: Path,
@@ -879,44 +994,17 @@ def build_report(
 
     small_step_composition = None
     if with_small_step_composition_check:
-        small_step_composition = []
-        for raw_count in small_step_counts:
-            step_count = int(raw_count)
-            composition_objective_fn = lambda p: _small_step_composition_objectives_for_parameter(  # noqa: E731
-                p,
-                config=config,
-                runtime=runtime,
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                parameter_name=parameter_name,
-                step_count=step_count,
-                step_scale=small_step_scale,
-            )
-            comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
-            comp_minus = np.asarray(
-                jax.device_get(composition_objective_fn(jnp.asarray(minus_value))),
-                dtype=float,
-            )
-            comp_plus = np.asarray(
-                jax.device_get(composition_objective_fn(jnp.asarray(plus_value))),
-                dtype=float,
-            )
-            comp_fd = (comp_plus - comp_minus) / (2.0 * fd_step)
-            comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
-            comp_abs_err = np.abs(comp_ad_np - comp_fd)
-            comp_rel_err = comp_abs_err / np.maximum(np.abs(comp_fd), 1.0e-10)
-            small_step_composition.append(
-                {
-                    "step_count": int(step_count),
-                    "step_scale": float(small_step_scale),
-                    "gradient_autodiff": comp_ad_np.tolist(),
-                    "gradient_fd": comp_fd.tolist(),
-                    "gradient_absolute_error": comp_abs_err.tolist(),
-                    "gradient_relative_error": comp_rel_err.tolist(),
-                    "max_relative_error": float(np.max(comp_rel_err)),
-                    "labels": OBJECTIVE_LABELS,
-                }
-            )
+        small_step_composition = _small_step_composition_report(
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            baseline_value=baseline_value,
+            fd_step=fd_step,
+            small_step_counts=small_step_counts,
+            small_step_scale=small_step_scale,
+        )
 
     report = {
         "config_path": str(config_path),
@@ -1006,6 +1094,11 @@ def main() -> None:
         help="Run an additive AD-vs-FD check on a short accepted-step composition map.",
     )
     parser.add_argument(
+        "--small-step-only-check",
+        action="store_true",
+        help="Run only the short accepted-step composition check and skip the full transport benchmark solves.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by --with-small-step-composition-check.",
@@ -1020,23 +1113,34 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    report = build_report(
-        config_path=args.config,
-        parameter_name=args.parameter,
-        rel_fd_step=args.fd_rel_step,
-        abs_fd_step=args.fd_abs_step,
-        sweep_half_width_rel=args.sweep_half_width_rel,
-        sweep_points=args.sweep_points,
-        with_sweep=args.with_sweep,
-        one_step_diagnostic=args.one_step_diagnostic,
-        with_fd_step_sweep=args.with_fd_step_sweep,
-        fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
-        with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
-        with_small_step_composition_check=args.with_small_step_composition_check,
-        small_step_counts=_parse_float_csv(args.small_step_counts),
-        small_step_scale=args.small_step_scale,
-        device=args.device,
-    )
+    if args.small_step_only_check:
+        report = build_small_step_only_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
+    else:
+        report = build_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            sweep_half_width_rel=args.sweep_half_width_rel,
+            sweep_points=args.sweep_points,
+            with_sweep=args.with_sweep,
+            one_step_diagnostic=args.one_step_diagnostic,
+            with_fd_step_sweep=args.with_fd_step_sweep,
+            fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
+            with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
+            with_small_step_composition_check=args.with_small_step_composition_check,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
 
     outdir = args.outdir / args.parameter
     outdir.mkdir(parents=True, exist_ok=True)
