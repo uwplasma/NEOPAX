@@ -853,6 +853,11 @@ def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: flo
             scale_base = max_scale
         elif scale_mode == "ntss_blend":
             scale_base = jnp.asarray(0.5, dtype=err_vec.dtype) * cand_abs + jnp.asarray(0.5, dtype=err_vec.dtype) * max_scale
+        elif scale_mode in {"ntss_transport", "ntss_block_floor", "ntss_block_rms"}:
+            # These modes normally provide an explicit `scale_override` from the
+            # caller. If that is unavailable, fall back to the same max-based
+            # scaling used by the default embedded estimator path.
+            scale_base = max_scale
         else:
             raise ValueError(f"Unsupported solver error norm scale_mode '{scale_mode}'.")
         scale = atol + effective_rtol * scale_base
