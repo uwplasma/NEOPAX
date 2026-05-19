@@ -277,25 +277,6 @@ def _saved_rollout_signature(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _accepted_history_signature(result: dict[str, Any]) -> dict[str, Any]:
-    hist_mask = result.get("accepted_history_mask")
-    hist_ts = result.get("accepted_history_ts")
-    hist_dts = result.get("accepted_history_dts")
-    if hist_mask is None or hist_ts is None or hist_dts is None:
-        return {
-            "times": None,
-            "step_sizes": None,
-        }
-    mask_arr = np.asarray(jax.device_get(hist_mask), dtype=bool)
-    ts_arr = np.asarray(jax.device_get(hist_ts), dtype=float)
-    dts_arr = np.asarray(jax.device_get(hist_dts), dtype=float)
-    valid = mask_arr
-    return {
-        "times": ts_arr[valid].tolist(),
-        "step_sizes": dts_arr[valid].tolist(),
-    }
-
-
 def _sequence_allclose(seq_a, seq_b, *, rtol: float = 1.0e-10, atol: float = 1.0e-12) -> bool | None:
     if seq_a is None or seq_b is None:
         return None
@@ -331,8 +312,6 @@ def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
         "fail_codes": None if fail_codes is None else np.asarray(jax.device_get(fail_codes)).tolist(),
         "saved_times": rollout_signature["saved_times"],
         "saved_step_sizes": rollout_signature["saved_step_sizes"],
-        "accepted_history_times": _accepted_history_signature(result)["times"],
-        "accepted_history_step_sizes": _accepted_history_signature(result)["step_sizes"],
         "last_attempt": {
             "accepted": _result_scalar(result, "last_attempt_accepted", dtype=bool),
             "converged": _result_scalar(result, "last_attempt_converged", dtype=bool),
@@ -348,100 +327,6 @@ def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
         },
     }
     return diag
-
-
-def _attempt_accepted_history_replay(
-    *,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_name: str,
-    parameter_value: float,
-    accepted_history_times: list[float] | None,
-    accepted_history_step_sizes: list[float] | None,
-) -> dict[str, Any]:
-    if not accepted_history_times or not accepted_history_step_sizes:
-        return {"available": False, "feasible": False, "reason": "missing baseline accepted history", "steps": []}
-    if len(accepted_history_times) != len(accepted_history_step_sizes):
-        return {"available": False, "feasible": False, "reason": "inconsistent baseline accepted history lengths", "steps": []}
-    if len(accepted_history_times) < 2:
-        return {"available": False, "feasible": False, "reason": "accepted history too short", "steps": []}
-
-    replay_base = copy.deepcopy(config)
-    solver_cfg = replay_base.setdefault("transport_solver", {})
-    solver_cfg["record_accepted_history"] = True
-    solver_cfg["stop_after_accepted_steps"] = 1
-    solver_cfg["debug_walltime_attempts"] = False
-    solver_cfg["save_n"] = 2
-    solver_cfg["max_steps"] = max(int(solver_cfg.get("max_steps", 20000)), 20)
-
-    current_state = _parameterized_initial_state(
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        geometry=runtime.geometry,
-        n_species=runtime.species.number_species,
-        parameter_name=parameter_name,
-        parameter_value=jnp.asarray(parameter_value),
-    )
-    steps: list[dict[str, Any]] = []
-    feasible = True
-    reason = "ok"
-    time_tol = 1.0e-12
-    dt_tol = 1.0e-12
-
-    for step_idx in range(1, len(accepted_history_times)):
-        t_start = float(accepted_history_times[step_idx - 1])
-        t_stop = float(accepted_history_times[step_idx])
-        dt_target = float(accepted_history_step_sizes[step_idx])
-        step_cfg = copy.deepcopy(replay_base)
-        step_solver = step_cfg.setdefault("transport_solver", {})
-        step_solver["t0"] = t_start
-        step_solver["t_final"] = t_stop
-        step_solver["dt"] = dt_target
-        step_result = run_transport(step_cfg, runtime, current_state)
-        step_diag = _result_diagnostics(step_result)
-        actual_hist_times = step_diag.get("accepted_history_times")
-        actual_hist_dts = step_diag.get("accepted_history_step_sizes")
-        actual_final_time = float(np.asarray(jax.device_get(step_result["final_time"])))
-        actual_dt = None if not actual_hist_dts or len(actual_hist_dts) < 2 else float(actual_hist_dts[1])
-        actual_step_time = None if not actual_hist_times or len(actual_hist_times) < 2 else float(actual_hist_times[1])
-        time_match = actual_step_time is not None and abs(actual_step_time - t_stop) <= time_tol
-        dt_match = actual_dt is not None and abs(actual_dt - dt_target) <= dt_tol
-        step_ok = bool(time_match and dt_match and step_diag.get("n_steps") == 1 and not step_diag.get("failed_any"))
-        steps.append(
-            {
-                "step_index": int(step_idx),
-                "target_t0": t_start,
-                "target_t1": t_stop,
-                "target_dt": dt_target,
-                "actual_final_time": actual_final_time,
-                "actual_step_time": actual_step_time,
-                "actual_dt": actual_dt,
-                "n_steps": step_diag.get("n_steps"),
-                "failed_any": step_diag.get("failed_any"),
-                "time_match": bool(time_match),
-                "dt_match": bool(dt_match),
-                "step_ok": step_ok,
-            }
-        )
-        if not step_ok:
-            feasible = False
-            reason = f"mismatch at replay step {step_idx}"
-            break
-        current_state = step_result["final_state"]
-
-    final_objectives = None
-    if feasible:
-        final_objectives = np.asarray(jax.device_get(_objective_vector(current_state, runtime)), dtype=float).tolist()
-
-    return {
-        "available": True,
-        "feasible": bool(feasible),
-        "reason": reason,
-        "steps": steps,
-        "final_objectives": final_objectives,
-    }
 
 
 def _write_sweep_csv(
@@ -604,40 +489,6 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"saved_times_equal={entry['saved_times_equal_minus_plus']} "
                 f"saved_dts_equal={entry['saved_dts_equal_minus_plus']}"
             )
-    replay = report.get("accepted_history_replay")
-    if replay:
-        print(
-            "[autodiff-gate] accepted-history replay:",
-            f"available={replay.get('available')} "
-            f"feasible={replay.get('feasible')} "
-            f"reason={replay.get('reason')}",
-        )
-        for branch_name in ("baseline", "fd_minus", "fd_plus"):
-            branch = replay.get(branch_name)
-            if not branch:
-                continue
-            print(
-                f"  - {branch_name}: "
-                f"available={branch.get('available')} "
-                f"feasible={branch.get('feasible')} "
-                f"reason={branch.get('reason')}"
-            )
-            steps = branch.get("steps", [])
-            if steps:
-                first_bad = next((step for step in steps if not step.get("step_ok")), None)
-                if first_bad is None:
-                    print(f"    all {len(steps)} replay steps matched the baseline accepted history")
-                else:
-                    print(
-                        "    first mismatch:",
-                        f"step_index={first_bad.get('step_index')} "
-                        f"target_dt={first_bad.get('target_dt'):.6e} "
-                        f"actual_dt={first_bad.get('actual_dt')} "
-                        f"target_t1={first_bad.get('target_t1'):.6e} "
-                        f"actual_step_time={first_bad.get('actual_step_time')}"
-                    )
-
-
 def _fd_step_sweep_report(
     *,
     runtime,
@@ -731,15 +582,12 @@ def build_report(
     one_step_diagnostic: bool,
     with_fd_step_sweep: bool,
     fd_step_sweep_multipliers: tuple[float, ...],
-    with_accepted_history_replay: bool,
     device: str | None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
 
     config = _prepare_benchmark_config(config_path, device=device)
-    if with_accepted_history_replay:
-        config.setdefault("transport_solver", {})["record_accepted_history"] = True
     if one_step_diagnostic:
         config = _apply_one_step_diagnostic_config(config)
     runtime, baseline_state = build_runtime_context(config)
@@ -850,50 +698,6 @@ def build_report(
             step_multipliers=fd_step_sweep_multipliers,
         )
 
-    accepted_history_replay = None
-    if with_accepted_history_replay:
-        baseline_hist_times = baseline_diag.get("accepted_history_times")
-        baseline_hist_dts = baseline_diag.get("accepted_history_step_sizes")
-        accepted_history_replay = {
-            "baseline": _attempt_accepted_history_replay(
-                config=config,
-                runtime=runtime,
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                parameter_name=parameter_name,
-                parameter_value=baseline_value,
-                accepted_history_times=baseline_hist_times,
-                accepted_history_step_sizes=baseline_hist_dts,
-            ),
-            "fd_minus": _attempt_accepted_history_replay(
-                config=config,
-                runtime=runtime,
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                parameter_name=parameter_name,
-                parameter_value=minus_value,
-                accepted_history_times=baseline_hist_times,
-                accepted_history_step_sizes=baseline_hist_dts,
-            ),
-            "fd_plus": _attempt_accepted_history_replay(
-                config=config,
-                runtime=runtime,
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                parameter_name=parameter_name,
-                parameter_value=plus_value,
-                accepted_history_times=baseline_hist_times,
-                accepted_history_step_sizes=baseline_hist_dts,
-            ),
-        }
-        accepted_history_replay["available"] = True
-        accepted_history_replay["feasible"] = bool(
-            accepted_history_replay["baseline"].get("feasible")
-            and accepted_history_replay["fd_minus"].get("feasible")
-            and accepted_history_replay["fd_plus"].get("feasible")
-        )
-        accepted_history_replay["reason"] = "ok" if accepted_history_replay["feasible"] else "at least one branch could not replay the baseline accepted history"
-
     report = {
         "config_path": str(config_path),
         "one_step_diagnostic": bool(one_step_diagnostic),
@@ -912,7 +716,6 @@ def build_report(
         "sweep_values": sweep_values.tolist(),
         "sweep_objectives": sweep_objectives.tolist(),
         "fd_step_sweep": fd_step_sweep,
-        "accepted_history_replay": accepted_history_replay,
         "solver_path": {
             "baseline": baseline_diag,
             "fd_minus": minus_diag,
@@ -966,11 +769,6 @@ def main() -> None:
         help="Comma-separated multipliers applied to the base FD step when --with-fd-step-sweep is enabled.",
     )
     parser.add_argument(
-        "--with-accepted-history-replay",
-        action="store_true",
-        help="Attempt to replay the baseline accepted-step history for baseline, -h, and +h as a branch-stability diagnostic.",
-    )
-    parser.add_argument(
         "--one-step-diagnostic",
         action="store_true",
         help="Stop after one accepted transport step to isolate local AD-vs-FD behavior.",
@@ -990,7 +788,6 @@ def main() -> None:
         one_step_diagnostic=args.one_step_diagnostic,
         with_fd_step_sweep=args.with_fd_step_sweep,
         fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
-        with_accepted_history_replay=args.with_accepted_history_replay,
         device=args.device,
     )
 

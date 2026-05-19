@@ -690,9 +690,6 @@ def _finalize_custom_solver_output(
     fixed_temperature_profile=None,
     density_floor=None,
     temperature_floor=None,
-    accepted_history_ts=None,
-    accepted_history_dts=None,
-    accepted_history_mask=None,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
@@ -725,9 +722,6 @@ def _finalize_custom_solver_output(
         "accepted_mask": accepted_mask_saved,
         "failed_mask": failed_mask_saved,
         "fail_codes": fail_codes_saved,
-        "accepted_history_ts": accepted_history_ts,
-        "accepted_history_dts": accepted_history_dts,
-        "accepted_history_mask": accepted_history_mask,
         "n_steps": n_steps_f,
         "done": done_f,
         "failed": failed_f,
@@ -940,7 +934,6 @@ def _run_saved_loop(
     dtype,
     max_total_steps,
     stop_after_accepted_steps=None,
-    record_accepted_history=False,
 ):
     save_times = jnp.linspace(t0, t_final, save_n)
     ys_saved = jnp.zeros((save_n, state_dim), dtype=dtype)
@@ -949,16 +942,9 @@ def _run_saved_loop(
     accepted_mask_saved = jnp.zeros((save_n,), dtype=bool)
     failed_mask_saved = jnp.zeros((save_n,), dtype=bool)
     fail_codes_saved = jnp.zeros((save_n,), dtype=jnp.int32)
-    accepted_hist_n = int(max_total_steps) + 1 if record_accepted_history else 1
-    accepted_history_ts = jnp.zeros((accepted_hist_n,), dtype=dtype)
-    accepted_history_dts = jnp.zeros((accepted_hist_n,), dtype=dtype)
-    accepted_history_mask = jnp.zeros((accepted_hist_n,), dtype=bool)
     ys_saved = ys_saved.at[0].set(step_state0.y)
     ts_saved = ts_saved.at[0].set(t0)
     accepted_mask_saved = accepted_mask_saved.at[0].set(True)
-    if record_accepted_history:
-        accepted_history_ts = accepted_history_ts.at[0].set(t0)
-        accepted_history_mask = accepted_history_mask.at[0].set(True)
     last_attempt_accepted0 = jnp.asarray(False)
     last_attempt_converged0 = jnp.asarray(False)
     last_attempt_err_norm0 = jnp.asarray(jnp.inf, dtype=dtype)
@@ -1010,10 +996,6 @@ def _run_saved_loop(
             _last_slow_contraction,
             _last_residual_blowup,
             _last_newton_nonfinite,
-            accepted_hist_idx,
-            accepted_hist_ts,
-            accepted_hist_dts,
-            accepted_hist_mask,
         ) = loop_carry
         step_state, step_info = step_fn(step_state, None)
         save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
@@ -1032,29 +1014,6 @@ def _run_saved_loop(
             fails,
             codes,
         )
-        if record_accepted_history:
-            next_hist_idx = accepted_hist_idx + jnp.where(step_info.accepted, jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
-            write_idx = accepted_hist_idx
-            accepted_hist_ts = jax.lax.cond(
-                step_info.accepted,
-                lambda arr: arr.at[write_idx].set(step_info.t),
-                lambda arr: arr,
-                accepted_hist_ts,
-            )
-            accepted_hist_dts = jax.lax.cond(
-                step_info.accepted,
-                lambda arr: arr.at[write_idx].set(step_info.dt),
-                lambda arr: arr,
-                accepted_hist_dts,
-            )
-            accepted_hist_mask = jax.lax.cond(
-                step_info.accepted,
-                lambda arr: arr.at[write_idx].set(True),
-                lambda arr: arr,
-                accepted_hist_mask,
-            )
-        else:
-            next_hist_idx = accepted_hist_idx
         return (
             step_state,
             step_idx + 1,
@@ -1082,10 +1041,6 @@ def _run_saved_loop(
             jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction")),
             jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup")),
             jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite")),
-            next_hist_idx,
-            accepted_hist_ts,
-            accepted_hist_dts,
-            accepted_hist_mask,
         )
 
     loop_carry = (
@@ -1115,10 +1070,6 @@ def _run_saved_loop(
         last_attempt_slow_contraction0,
         last_attempt_residual_blowup0,
         last_attempt_newton_nonfinite0,
-        jnp.asarray(1 if record_accepted_history else 0, dtype=jnp.int32),
-        accepted_history_ts,
-        accepted_history_dts,
-        accepted_history_mask,
     )
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
@@ -1135,7 +1086,6 @@ def _run_saved_loop_debug_walltime(
     max_total_steps,
     stop_after_accepted_steps=None,
     walltime_label="solver.attempt",
-    record_accepted_history=False,
 ):
     compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
     save_times = jnp.linspace(t0, t_final, save_n)
@@ -1145,16 +1095,9 @@ def _run_saved_loop_debug_walltime(
     accepted_mask_saved = jnp.zeros((save_n,), dtype=bool)
     failed_mask_saved = jnp.zeros((save_n,), dtype=bool)
     fail_codes_saved = jnp.zeros((save_n,), dtype=jnp.int32)
-    accepted_hist_n = int(max_total_steps) + 1 if record_accepted_history else 1
-    accepted_history_ts = jnp.zeros((accepted_hist_n,), dtype=dtype)
-    accepted_history_dts = jnp.zeros((accepted_hist_n,), dtype=dtype)
-    accepted_history_mask = jnp.zeros((accepted_hist_n,), dtype=bool)
     ys_saved = ys_saved.at[0].set(step_state0.y)
     ts_saved = ts_saved.at[0].set(t0)
     accepted_mask_saved = accepted_mask_saved.at[0].set(True)
-    if record_accepted_history:
-        accepted_history_ts = accepted_history_ts.at[0].set(t0)
-        accepted_history_mask = accepted_history_mask.at[0].set(True)
 
     step_state = step_state0
     step_idx = 0
@@ -1177,7 +1120,6 @@ def _run_saved_loop_debug_walltime(
     last_attempt_slow_contraction = jnp.asarray(False)
     last_attempt_residual_blowup = jnp.asarray(False)
     last_attempt_newton_nonfinite = jnp.asarray(False)
-    accepted_hist_idx = jnp.asarray(1 if record_accepted_history else 0, dtype=jnp.int32)
 
     while True:
         active = bool(jax.device_get(_custom_loop_active(step_state, t_final, jnp.asarray(step_idx, dtype=jnp.int32), max_total_steps)))
@@ -1229,12 +1171,6 @@ def _run_saved_loop_debug_walltime(
         last_attempt_slow_contraction = jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction"))
         last_attempt_residual_blowup = jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup"))
         last_attempt_newton_nonfinite = jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite"))
-        if record_accepted_history and bool(jax.device_get(step_info.accepted)):
-            write_idx = int(jax.device_get(accepted_hist_idx))
-            accepted_history_ts = accepted_history_ts.at[write_idx].set(step_info.t)
-            accepted_history_dts = accepted_history_dts.at[write_idx].set(step_info.dt)
-            accepted_history_mask = accepted_history_mask.at[write_idx].set(True)
-            accepted_hist_idx = accepted_hist_idx + jnp.asarray(1, dtype=jnp.int32)
 
         step_idx += 1
 
@@ -1265,10 +1201,6 @@ def _run_saved_loop_debug_walltime(
         last_attempt_slow_contraction,
         last_attempt_residual_blowup,
         last_attempt_newton_nonfinite,
-        accepted_hist_idx,
-        accepted_history_ts,
-        accepted_history_dts,
-        accepted_history_mask,
     )
 
 
@@ -2048,7 +1980,6 @@ class _RadauSolverConfig(TransportSolver):
     n_steps: int = 0
     debug_stage_markers: bool = False
     debug_walltime_attempts: bool = False
-    record_accepted_history: bool = False
 
     def __init__(
         self,
@@ -2082,7 +2013,6 @@ class _RadauSolverConfig(TransportSolver):
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
         debug_walltime_attempts: bool = False,
-        record_accepted_history: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -2232,7 +2162,6 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "debug_stage_markers", bool(debug_stage_markers))
         object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
-        object.__setattr__(self, "record_accepted_history", bool(record_accepted_history))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -3149,7 +3078,6 @@ class RADAUSolver(_RadauSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
-        record_accepted_history = bool(getattr(self, "record_accepted_history", False))
         if bool(getattr(self, "debug_walltime_attempts", False)):
             loop_result = _run_saved_loop_debug_walltime(
                 step_state0=step_state0,
@@ -3162,7 +3090,6 @@ class RADAUSolver(_RadauSolverConfig):
                 max_total_steps=max_total_steps,
                 stop_after_accepted_steps=stop_after_accepted_steps,
                 walltime_label="radau.attempt",
-                record_accepted_history=record_accepted_history,
             )
         else:
             loop_result = _run_saved_loop(
@@ -3175,7 +3102,6 @@ class RADAUSolver(_RadauSolverConfig):
                 dtype=dtype,
                 max_total_steps=max_total_steps,
                 stop_after_accepted_steps=stop_after_accepted_steps,
-                record_accepted_history=record_accepted_history,
             )
         (
             step_state_f,
@@ -3204,10 +3130,6 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
-            _accepted_hist_idx,
-            accepted_history_ts,
-            accepted_history_dts,
-            accepted_history_mask,
         ) = loop_result
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
@@ -3245,9 +3167,6 @@ class RADAUSolver(_RadauSolverConfig):
             fixed_temperature_profile=fixed_temperature_profile,
             density_floor=density_floor,
             temperature_floor=temperature_floor,
-            accepted_history_ts=accepted_history_ts,
-            accepted_history_dts=accepted_history_dts,
-            accepted_history_mask=accepted_history_mask,
         )
 
 
@@ -3598,10 +3517,6 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
-            _accepted_hist_idx,
-            _accepted_history_ts,
-            _accepted_history_dts,
-            _accepted_history_mask,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -3970,10 +3885,6 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
-            _accepted_hist_idx,
-            _accepted_history_ts,
-            _accepted_history_dts,
-            _accepted_history_mask,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -4125,7 +4036,6 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
             debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
-            record_accepted_history=bool(_cfg_get("record_accepted_history", False)),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)
