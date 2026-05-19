@@ -3179,21 +3179,8 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_reused=jacobian_reused,
             )
 
-        @jax.custom_jvp
         def _accepted_step_attempt(carry_in: _RadauAcceptedStepCarry):
             return _accepted_step_attempt_impl(carry_in)
-
-        @_accepted_step_attempt.defjvp
-        def _accepted_step_attempt_jvp(primals, tangents):
-            """Selective JVP hook for the accepted-step boundary.
-
-            Keep the physically meaningful accepted-step inputs live, while
-            treating controller bookkeeping and recomputable Jacobian/LU caches
-            as forward-only state in the tangent path.
-            """
-            (carry_in,) = primals
-            carry_for_jvp = _radau_carry_with_forward_only_jvp_fields(carry_in)
-            return jax.jvp(_accepted_step_attempt_impl, (carry_for_jvp,), tangents)
 
         def _attempt_step_lean(step_state: _RadauStepState):
             status = step_state.status
