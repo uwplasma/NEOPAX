@@ -1268,3 +1268,143 @@ The next implementation step should be:
 
 That gives us a concrete object to optimize before we commit to a custom
 JVP/VJP rule.
+
+### Accepted-step JVP contract
+
+The next AD implementation should target the accepted-step map directly, and
+its contract should be written down explicitly before code is added.
+
+#### Proposed primal map
+
+For the current Radau path, define the primal accepted-step map as:
+
+- inputs:
+  - solver context
+  - physics context
+  - accepted-step carry at `n`
+  - proposed step size `dt_n`
+
+- outputs:
+  - accepted-step attempt result
+  - updated accepted-step carry after the attempt
+
+In symbols, the intended boundary is:
+
+- `(solver_ctx, physics_ctx, carry_n, dt_n) -> attempt_result_n`
+
+where `attempt_result_n` contains:
+
+- `y_trial`
+- acceptance error estimate
+- nonlinear convergence summary
+- updated lagged-response reuse state
+- updated linearization caches
+- accepted-step diagnostics
+
+The important point is that the custom derivative should attach to this map,
+not to the full outer adaptive loop.
+
+#### Tangent semantics
+
+The first custom rule should be a **JVP** for this accepted-step map, because:
+
+- the current benchmark uses `jax.jacfwd`
+- the one-step diagnostic is already the strongest validation target
+- JVP is the most direct first match to the current validation harness
+
+The intended tangent meaning is:
+
+- differentiate the numerical accepted-step update with respect to the
+  physically meaningful step inputs
+- do not differentiate with respect to the Python identity of solver/physics
+  callables
+- do not make controller bookkeeping or reuse caches primary tangent objects
+
+#### First tangent-active fields
+
+The first JVP should treat these carry fields as tangent-active:
+
+- `t`
+- `y`
+- `dt`
+- `prev_stages`
+- `prev_dt`
+- `prev_theta_final`
+- `prev_newton_iter_count`
+- `lagged_response_cache`
+- `lagged_response_valid`
+- `lagged_reference_y`
+
+These are the best first candidates because they influence:
+
+- predictor quality
+- local implicit solve behavior
+- lagged-response reconstruction
+- the realized accepted-step state update
+
+#### First forward-only fields
+
+The first JVP should treat these as forward-only by default:
+
+- `prev_error`
+- `recent_reject_count`
+- `regrowth_cooldown`
+- `easy_growth_streak`
+- `jacobian`
+- `cache_valid`
+- `cache_dt`
+- `cache_age`
+- `real_lu`
+- `real_piv`
+- `complex_lu`
+- `complex_piv`
+
+Rationale:
+
+- controller bookkeeping mostly affects future step proposals, not the local
+  accepted-step physics map
+- Jacobian/LU caches are acceleration state and can be recomputed
+
+This is a design choice, not an algebraic identity, and must be validated by
+the one-step benchmark first.
+
+#### Static context semantics
+
+The following should be passed as explicit **static context**, not as tangent
+data:
+
+- solver configuration / kernel context
+- physics callable bundle
+
+This does **not** mean the transport physics is excluded from
+differentiation. It only means:
+
+- differentiate the numerical map produced by those callables
+- do not differentiate with respect to the Python callable objects
+
+In other words:
+
+- `f(t, y, p)` remains differentiable
+- the Python object that implements `f` is treated as static
+
+#### First validation criterion
+
+The first custom JVP implementation should be considered acceptable only if:
+
+1. the one-step benchmark still matches FD at the current excellent level
+2. the forward production solve remains unchanged
+3. the new JVP boundary compiles reliably under the existing `jax.jacfwd`
+   benchmark path
+
+Only after that should rollout-level behavior be reassessed.
+
+#### Implementation consequence
+
+The next code change should therefore be:
+
+1. keep the current accepted-step primal boundary
+2. attach a top-level custom JVP to that boundary
+3. use static solver/physics context
+4. implement tangent flow only for the first tangent-active carry fields
+
+That is the cleanest next experimental AD step for NEOPAX.
