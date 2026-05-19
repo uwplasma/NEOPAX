@@ -8,9 +8,9 @@ Inspired by torax (https://github.com/google-deepmind/torax).
 
 from typing import Callable, Any
 import dataclasses
+from functools import partial
 import inspect
 import time
-from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -2258,6 +2258,42 @@ class _RadauAcceptedStepAttemptContext:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedRolloutResult:
+    final_carry: Any
+    final_y: Any
+    trial_ys: Any
+    err_norms: Any
+    converged_mask: Any
+    accepted_dts: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _PreparedRadauAcceptedRollout:
+    kernel_context: Any
+    physics_context: Any
+    initial_carry: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepTangentInputs:
+    dy: Any
+    dh: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepApproximateTangentResult:
+    dy_next: Any
+    dz_stages: Any
+    dtrial_dt: Any
+    dtrial_y: Any
+    dstage_history: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepKernelContext:
     radau_transform: Any
     radau_inv_transform: Any
@@ -2427,7 +2463,193 @@ def _radau_backward_payload_candidate(
     )
 
 
-def _execute_radau_accepted_step_attempt_impl(
+def _radau_extract_tangent_inputs_from_carry(
+    carry_tangent: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepTangentInputs:
+    """Extract the first tangent-active accepted-step inputs from a carry tangent.
+
+    The first implicit-diff JVP will treat the accepted-step map as primarily
+    active with respect to:
+
+    - `y_n`
+    - `h`
+
+    while most controller/caching state remains forward-only.
+    """
+    return _RadauAcceptedStepTangentInputs(
+        dy=carry_tangent.y,
+        dh=carry_tangent.dt,
+    )
+
+
+def _radau_build_approximate_tangent_result(
+    tangent_inputs: _RadauAcceptedStepTangentInputs,
+    tangent_result: _RadauAcceptedStepApproximateTangentResult,
+    *,
+    attempt_result: _RadauAcceptedStepAttemptResult,
+) -> _RadauAcceptedStepAttemptResult:
+    """Lift the approximate accepted-step tangent back to attempt-result shape.
+
+    This is a forward-neutral structural helper for the future JVP rule. Only
+    the fields controlled by the accepted-step implicit map are populated with
+    nonzero tangents here; diagnostic/controller outputs remain zero-like.
+    """
+    carry_after_attempt_tangent = dataclasses.replace(
+        jax.tree_util.tree_map(jnp.zeros_like, attempt_result.carry_after_attempt),
+        y=tangent_inputs.dy,
+        dt=tangent_inputs.dh,
+        lagged_reference_y=tangent_inputs.dy,
+    )
+    return _RadauAcceptedStepAttemptResult(
+        carry_after_attempt=carry_after_attempt_tangent,
+        trial_dt=tangent_result.dtrial_dt,
+        trial_y=tangent_result.dtrial_y,
+        err_norm=jnp.zeros_like(attempt_result.err_norm),
+        converged=jnp.zeros_like(attempt_result.converged),
+        stage_history=tangent_result.dstage_history,
+        jacobian_out=jnp.zeros_like(attempt_result.jacobian_out),
+        cache_valid_out=jnp.zeros_like(attempt_result.cache_valid_out),
+        cache_dt_out=jnp.zeros_like(attempt_result.cache_dt_out),
+        cache_age_out=jnp.zeros_like(attempt_result.cache_age_out),
+        real_lu_out=jnp.zeros_like(attempt_result.real_lu_out),
+        real_piv_out=jnp.zeros_like(attempt_result.real_piv_out),
+        complex_lu_out=jnp.zeros_like(attempt_result.complex_lu_out),
+        complex_piv_out=jnp.zeros_like(attempt_result.complex_piv_out),
+        newton_shrink=jnp.zeros_like(attempt_result.newton_shrink),
+        diverged_final=jnp.zeros_like(attempt_result.diverged_final),
+        nonfinite_stage_state=jnp.zeros_like(attempt_result.nonfinite_stage_state),
+        nonfinite_stage_residual=jnp.zeros_like(attempt_result.nonfinite_stage_residual),
+        finite_f0=jnp.zeros_like(attempt_result.finite_f0),
+        finite_z0=jnp.zeros_like(attempt_result.finite_z0),
+        finite_initial_residual=jnp.zeros_like(attempt_result.finite_initial_residual),
+        newton_iter_count=jnp.zeros_like(attempt_result.newton_iter_count),
+        final_residual_norm=jnp.zeros_like(attempt_result.final_residual_norm),
+        final_delta_norm=jnp.zeros_like(attempt_result.final_delta_norm),
+        theta_final=jnp.zeros_like(attempt_result.theta_final),
+        slow_contraction_final=jnp.zeros_like(attempt_result.slow_contraction_final),
+        residual_blowup_final=jnp.zeros_like(attempt_result.residual_blowup_final),
+        newton_nonfinite_final=jnp.zeros_like(attempt_result.newton_nonfinite_final),
+        density_err_norm=jnp.zeros_like(attempt_result.density_err_norm),
+        pressure_err_norm=jnp.zeros_like(attempt_result.pressure_err_norm),
+        er_err_norm=jnp.zeros_like(attempt_result.er_err_norm),
+        lagged_response_reused=jnp.zeros_like(attempt_result.lagged_response_reused),
+        jacobian_reused=jnp.zeros_like(attempt_result.jacobian_reused),
+    )
+
+
+def _radau_compute_approximate_attempt_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    tangent_inputs: _RadauAcceptedStepTangentInputs,
+    jacobian_ref,
+    trial_dt,
+    stage_history,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+) -> _RadauAcceptedStepApproximateTangentResult:
+    """Compute the first approximate implicit-diff tangent for one accepted step.
+
+    This helper packages the current solver-mathematical approximation into the
+    accepted-step output shape we expect a future JVP rule to produce.
+    """
+    dy_next, dz_stages = _radau_approximate_accepted_step_tangent(
+        kernel_context,
+        jacobian_ref=jacobian_ref,
+        h_value=trial_dt,
+        stages_final=stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim)),
+        dy_source=tangent_inputs.dy,
+        dh_source=tangent_inputs.dh,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+    )
+    return _RadauAcceptedStepApproximateTangentResult(
+        dy_next=dy_next,
+        dz_stages=dz_stages,
+        dtrial_dt=tangent_inputs.dh,
+        dtrial_y=dy_next,
+        dstage_history=dz_stages.reshape((-1,)),
+    )
+
+
+def _execute_radau_accepted_step_attempt_with_approx_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    carry_tangent: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> tuple[_RadauAcceptedStepAttemptResult, _RadauAcceptedStepAttemptResult]:
+    """Compute primal accepted-step result plus the first approximate tangent.
+
+    This is not yet wired into JAX as a custom derivative rule. It is a pure
+    solver-mathematical helper that defines what a future accepted-step JVP
+    should return.
+    """
+    primal_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    tangent_inputs = _radau_extract_tangent_inputs_from_carry(carry_tangent)
+    tangent_result = _radau_compute_approximate_attempt_tangent(
+        kernel_context,
+        tangent_inputs=tangent_inputs,
+        jacobian_ref=primal_result.jacobian_out,
+        trial_dt=primal_result.trial_dt,
+        stage_history=primal_result.stage_history,
+        real_lu_out=primal_result.real_lu_out,
+        real_piv_out=primal_result.real_piv_out,
+        complex_lu_out=primal_result.complex_lu_out,
+        complex_piv_out=primal_result.complex_piv_out,
+    )
+    tangent_attempt = _radau_build_approximate_tangent_result(
+        tangent_inputs,
+        tangent_result,
+        attempt_result=primal_result,
+    )
+    return primal_result, tangent_attempt
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
+def _execute_radau_accepted_step_attempt_autodiff(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepAttemptResult:
+    return _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+
+
+@_execute_radau_accepted_step_attempt_autodiff.defjvp
+def _execute_radau_accepted_step_attempt_autodiff_jvp(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    primals,
+    tangents,
+):
+    (carry_in,) = primals
+    (carry_tangent,) = tangents
+    primal_result, tangent_result = _execute_radau_accepted_step_attempt_with_approx_tangent(
+        kernel_context,
+        physics_context,
+        carry_in,
+        carry_tangent,
+        context,
+    )
+    return primal_result, tangent_result
+
+
+def _execute_radau_accepted_step_attempt(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
@@ -2492,47 +2714,6 @@ def _execute_radau_accepted_step_attempt_impl(
         lagged_response_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
     )
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
-def _execute_radau_accepted_step_attempt(
-    kernel_context: _RadauAcceptedStepKernelContext,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-    carry_in: _RadauAcceptedStepCarry,
-    context: _RadauAcceptedStepAttemptContext,
-) -> _RadauAcceptedStepAttemptResult:
-    return _execute_radau_accepted_step_attempt_impl(
-        kernel_context,
-        physics_context,
-        carry_in,
-        context,
-    )
-
-
-@_execute_radau_accepted_step_attempt.defjvp
-def _execute_radau_accepted_step_attempt_jvp(
-    kernel_context: _RadauAcceptedStepKernelContext,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-    primals,
-    tangents,
-):
-    carry_in, context = primals
-    carry_tangent, context_tangent = tangents
-
-    def _primal_fun(carry_value, context_value):
-        return _execute_radau_accepted_step_attempt_impl(
-            kernel_context,
-            physics_context,
-            _radau_carry_with_forward_only_jvp_fields(carry_value),
-            context_value,
-        )
-
-    primal_out, tangent_out = jax.jvp(
-        _primal_fun,
-        (carry_in, context),
-        (carry_tangent, context_tangent),
-    )
-    return primal_out, tangent_out
 
 
 def _radau_prepare_lagged_response(
@@ -2622,6 +2803,154 @@ def _radau_inverse_transform_stage_stack(
     stage_stack,
 ):
     return kernel_context.radau_transform @ stage_stack
+
+
+def _radau_evaluate_stage_model(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    *,
+    flat_y,
+    t_value,
+    h_value,
+    z_flat,
+    f0,
+    jacobian_ref,
+    lagged_response,
+):
+    stages = z_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
+    if lagged_response is not None:
+        stage_times = t_value + kernel_context.c * h_value
+        evals = jax.vmap(
+            lambda t_eval, y_eval: _radau_eval_rhs(
+                t_eval,
+                y_eval,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            ),
+            in_axes=(0, 0),
+        )(stage_times, stage_states)
+    elif kernel_context.use_lagged_linear_response:
+        state_delta = stage_states - flat_y[None, :]
+        evals = f0[None, :] + state_delta @ jacobian_ref.T
+    else:
+        stage_times = t_value + kernel_context.c * h_value
+        evals = jax.vmap(physics_context.flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+    return stages, evals
+
+
+def _radau_stage_residual(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    *,
+    flat_y,
+    t_value,
+    h_value,
+    z_flat,
+    f0,
+    jacobian_ref,
+    lagged_response,
+):
+    stages, evals = _radau_evaluate_stage_model(
+        kernel_context,
+        physics_context,
+        flat_y=flat_y,
+        t_value=t_value,
+        h_value=h_value,
+        z_flat=z_flat,
+        f0=f0,
+        jacobian_ref=jacobian_ref,
+        lagged_response=lagged_response,
+    )
+    return (stages - evals).reshape((-1,))
+
+
+def _radau_apply_stage_linear_solve(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    rhs,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+):
+    rhs_stages = rhs.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
+    rhs_real = rhs_transformed[0]
+    delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
+    rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
+
+    def _solve_pair(i, pair_solutions):
+        delta_pair = jax.scipy.linalg.lu_solve(
+            (complex_lu_out[i], complex_piv_out[i]),
+            rhs_complex_pairs[i].reshape((-1,)),
+        ).reshape((2, kernel_context.state_dim))
+        return pair_solutions.at[i].set(delta_pair)
+
+    delta_complex_pairs = jax.lax.fori_loop(
+        0,
+        kernel_context.num_complex_pairs,
+        _solve_pair,
+        jnp.zeros_like(rhs_complex_pairs),
+    )
+    delta_transformed = jnp.concatenate(
+        [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
+        axis=0,
+    )
+    return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+
+
+def _radau_approximate_accepted_step_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    jacobian_ref,
+    h_value,
+    stages_final,
+    dy_source,
+    dh_source,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+):
+    """Approximate accepted-step tangent via the current Newton linearization.
+
+    This helper uses the same stage-space linear operator already built for the
+    Newton solve. It is the first Radau-native tangent building block:
+
+    - it differentiates the converged accepted-step equations
+    - it does not differentiate through the raw Newton iteration history
+    - it currently uses the existing Jacobian linearization rather than the
+      exact collocation Jacobian at the converged stage point
+
+    The linearized stage system used here is:
+
+    (I - h A ⊗ J_ref) dZ = J_ref (dy + dh * A Z)
+
+    and the accepted-state tangent is:
+
+    dy_next = dy + dh * (b^T Z) + h * (b^T dZ)
+    """
+    dy_source = jnp.asarray(dy_source, dtype=kernel_context.dtype)
+    dh_source = jnp.asarray(dh_source, dtype=kernel_context.dtype)
+    stage_state_source = dy_source[None, :] + dh_source * (kernel_context.a @ stages_final)
+    stage_rhs = stage_state_source @ jacobian_ref.T
+    dz_flat = _radau_apply_stage_linear_solve(
+        kernel_context,
+        rhs=stage_rhs.reshape((-1,)),
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+    )
+    dz_stages = dz_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    dy_next = (
+        dy_source
+        + dh_source * (kernel_context.b @ stages_final)
+        + h_value * (kernel_context.b @ dz_stages)
+    )
+    return dy_next, dz_stages
 
 
 def _radau_carry_with_forward_only_jvp_fields(
@@ -2756,49 +3085,28 @@ def _radau_single_step_primal(
     )
     jacobian_reused = reuse_linearization
 
-    def _evaluate_stage_model(z_flat):
-        stages = z_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
-        if lagged_response is not None:
-            stage_times = t_value + kernel_context.c * h_value
-            evals = jax.vmap(_rhs_eval, in_axes=(0, 0))(stage_times, stage_states)
-        elif kernel_context.use_lagged_linear_response:
-            state_delta = stage_states - flat_y[None, :]
-            evals = f0[None, :] + state_delta @ jacobian_ref.T
-        else:
-            stage_times = t_value + kernel_context.c * h_value
-            evals = jax.vmap(physics_context.flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
-        return stages, evals
-
     def residual(z_flat):
-        stages, evals = _evaluate_stage_model(z_flat)
-        return (stages - evals).reshape((-1,))
+        return _radau_stage_residual(
+            kernel_context,
+            physics_context,
+            flat_y=flat_y,
+            t_value=t_value,
+            h_value=h_value,
+            z_flat=z_flat,
+            f0=f0,
+            jacobian_ref=jacobian_ref,
+            lagged_response=lagged_response,
+        )
 
     def stage_solver(rhs):
-        rhs_stages = rhs.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
-        rhs_real = rhs_transformed[0]
-        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
-        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
-
-        def _solve_pair(i, pair_solutions):
-            delta_pair = jax.scipy.linalg.lu_solve(
-                (complex_lu_out[i], complex_piv_out[i]),
-                rhs_complex_pairs[i].reshape((-1,)),
-            ).reshape((2, kernel_context.state_dim))
-            return pair_solutions.at[i].set(delta_pair)
-
-        delta_complex_pairs = jax.lax.fori_loop(
-            0,
-            kernel_context.num_complex_pairs,
-            _solve_pair,
-            jnp.zeros_like(rhs_complex_pairs),
+        return _radau_apply_stage_linear_solve(
+            kernel_context,
+            rhs=rhs,
+            real_lu_out=real_lu_out,
+            real_piv_out=real_piv_out,
+            complex_lu_out=complex_lu_out,
+            complex_piv_out=complex_piv_out,
         )
-        delta_transformed = jnp.concatenate(
-            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
-            axis=0,
-        )
-        return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
 
     def body_fn(newton_state):
         (
@@ -3175,6 +3483,327 @@ def _radau_single_step_primal(
     )
 
 
+def _radau_fixed_dt_accepted_rollout(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry0: _RadauAcceptedStepCarry,
+    dt_sequence,
+) -> _RadauAcceptedRolloutResult:
+    """AD-facing accepted-rollout helper over an explicit fixed `dt` sequence.
+
+    This helper is intentionally separate from the production adaptive loop.
+    It advances the accepted-step carry by replaying a caller-provided `dt`
+    sequence and updating the solver carry as if each step were accepted.
+
+    The purpose is to provide a cleaner differentiable map than the raw
+    adaptive production trace, without changing production forward behavior.
+    """
+
+    def _scan_body(carry, dt_value):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=carry.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
+        )
+        attempt_result = _execute_radau_accepted_step_attempt(
+            kernel_context,
+            physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            attempt_context,
+        )
+        accepted_y = _project_flat_state_if_needed(
+            attempt_result.trial_y,
+            physics_context.project_flat,
+        )
+        next_carry = dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry.t + attempt_result.trial_dt,
+            y=accepted_y,
+            dt=attempt_result.trial_dt,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=kernel_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=attempt_result.trial_dt,
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+        scan_out = (
+            accepted_y,
+            attempt_result.err_norm,
+            attempt_result.converged,
+            attempt_result.trial_dt,
+        )
+        return next_carry, scan_out
+
+    final_carry, scan_outputs = jax.lax.scan(_scan_body, carry0, dt_sequence)
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    return _RadauAcceptedRolloutResult(
+        final_carry=final_carry,
+        final_y=final_carry.y,
+        trial_ys=trial_ys,
+        err_norms=err_norms,
+        converged_mask=converged_mask,
+        accepted_dts=accepted_dts,
+    )
+
+
+def _build_prepared_radau_accepted_rollout(
+    *,
+    solver: "RADAUSolver",
+    state,
+    vector_field,
+    species,
+) -> _PreparedRadauAcceptedRollout:
+    """Build reusable Radau accepted-rollout contexts without running solve.
+
+    This is the setup boundary shared by the production Radau solve and the
+    separate AD-facing fixed-`dt` accepted-rollout helper.
+    """
+    args = (species,)
+    kwargs: dict[str, Any] = {}
+    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        state,
+        species,
+    )
+    dtype = flat_state0.dtype
+    density0 = getattr(state, "density", None)
+    pressure0 = getattr(state, "pressure", None)
+    er0 = getattr(state, "Er", None)
+    if density0 is not None and pressure0 is not None and er0 is not None:
+        density_size = int(np.prod(density0.shape))
+        pressure_size = int(np.prod(pressure0.shape))
+        er_size = int(np.prod(er0.shape))
+    else:
+        density_size = 0
+        pressure_size = 0
+        er_size = 0
+    if solver.num_stages not in _RADAU_STAGE_CONFIGS:
+        raise ValueError(
+            f"Unsupported custom Radau stage count '{solver.num_stages}'. "
+            f"Available options: {sorted(_RADAU_STAGE_CONFIGS)}"
+        )
+    stage_cfg = _RADAU_STAGE_CONFIGS[solver.num_stages]
+    c = jnp.asarray(stage_cfg.c, dtype=dtype)
+    a = jnp.asarray(stage_cfg.a, dtype=dtype)
+    b = jnp.asarray(stage_cfg.b, dtype=dtype)
+    b_error = jnp.asarray(stage_cfg.b_error, dtype=dtype)
+    embedded_f0_weight = jnp.asarray(stage_cfg.embedded_f0_weight, dtype=dtype)
+    num_stages = int(stage_cfg.num_stages)
+    t0 = jnp.asarray(solver.t0, dtype=dtype)
+    t_final = jnp.asarray(solver.t1, dtype=dtype)
+    dt_min = jnp.asarray(solver.min_step, dtype=dtype)
+    dt_max = jnp.asarray(solver.max_step, dtype=dtype)
+    base_dt = jnp.clip(jnp.asarray(solver.dt, dtype=dtype), dt_min, dt_max)
+    state_dim = flat_state0.shape[0]
+    rhs_mode = str(getattr(solver, "rhs_mode", "black_box")).strip().lower()
+    error_scale_mode = (
+        str(getattr(solver, "error_estimator", "embedded2")).strip().lower().removeprefix("embedded2_")
+    )
+    if error_scale_mode == "embedded2":
+        error_scale_mode = "max"
+    elif error_scale_mode in {"mean_scale", "mean"}:
+        error_scale_mode = "mean"
+    elif error_scale_mode in {"blend_scale", "blend"}:
+        error_scale_mode = "blend"
+    elif error_scale_mode == "ntss_scale":
+        error_scale_mode = "ntss"
+    elif error_scale_mode == "ntss_max_scale":
+        error_scale_mode = "ntss_max"
+    elif error_scale_mode == "ntss_blend_scale":
+        error_scale_mode = "ntss_blend"
+    elif error_scale_mode == "ntss_transport_scale":
+        error_scale_mode = "ntss_transport"
+    elif error_scale_mode == "ntss_block_floor_scale":
+        error_scale_mode = "ntss_block_floor"
+    elif error_scale_mode == "ntss_block_rms":
+        error_scale_mode = "ntss_block_rms"
+    else:
+        error_scale_mode = "max"
+
+    flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+    build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+    flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
+        unravel=unpack_flat,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
+    use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+    if use_transport_lagged_response and build_lagged_response_raw is None:
+        raise ValueError(
+            "Radau lagged transport response mode requires a vector field owner that defines "
+            "build_lagged_response(...) and evaluate_with_lagged_response(...)."
+        )
+    build_lagged_response = build_lagged_response_raw
+    flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
+    initial_lagged_response = (
+        build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
+        if (use_transport_lagged_response and build_lagged_response is not None)
+        else None
+    )
+    initial_rhs = (
+        flat_rhs_with_lagged_response(t0, flat_state0, initial_lagged_response)
+        if initial_lagged_response is not None
+        else flat_rhs(t0, flat_state0)
+    )
+
+    predictor_mode = str(getattr(solver, "predictor_mode", "current")).strip().lower()
+    divergence_mode = str(getattr(solver, "newton_divergence_mode", "legacy")).strip().lower()
+    residual_norm_mode = str(getattr(solver, "newton_residual_norm", "raw")).strip().lower()
+    debug_newton_trace = bool(getattr(solver, "debug_stage_markers", False))
+    use_rms_residual_norm = residual_norm_mode in {"rms", "scaled_rms"}
+    conservative_divergence = divergence_mode in {"ntss", "hairer", "conservative"}
+    newton_tol_mode = str(getattr(solver, "newton_tol_mode", "residual")).strip().lower()
+    fnewt_mode = str(getattr(solver, "newton_fnewt_mode", "tol")).strip().lower()
+    use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss"}
+    use_hairer_scaled_correction = use_hairer_newton_tol or fnewt_mode in {"hairer", "hairer_like", "ntss"}
+    tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
+    zero_scalar = jnp.asarray(0.0, dtype=dtype)
+    theta_diverge_threshold = jnp.asarray(0.99 if conservative_divergence else 0.99, dtype=dtype)
+    predictor_defect_floor = jnp.asarray(1.0e-4, dtype=dtype)
+    predictor_defect_cap = jnp.asarray(20.0, dtype=dtype)
+    residual_blowup_factor = jnp.asarray(2.0, dtype=dtype)
+    theta_clip_min = jnp.asarray(0.1, dtype=dtype)
+    theta_clip_max = jnp.asarray(1.5, dtype=dtype)
+    newton_shrink_num = jnp.asarray(0.8, dtype=dtype)
+    newton_shrink_min = jnp.asarray(0.1, dtype=dtype)
+    newton_shrink_max = jnp.asarray(0.5, dtype=dtype)
+    if fnewt_mode in {"hairer", "hairer_like", "ntss"}:
+        uround = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+        expmns = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+        safe_rtol = jnp.maximum(jnp.asarray(solver.rtol, dtype=dtype), uround * 10.0)
+        rtol1 = jnp.asarray(0.1, dtype=dtype) * (safe_rtol ** expmns)
+        expmi = jnp.asarray(1.0, dtype=dtype) / expmns
+        predictor_fnewt = jnp.maximum(
+            jnp.asarray(10.0, dtype=dtype) * uround / rtol1,
+            jnp.minimum(
+                jnp.asarray(3.0e-2, dtype=dtype),
+                rtol1 ** (expmi - jnp.asarray(1.0, dtype=dtype)),
+            ),
+        )
+    else:
+        predictor_fnewt = jnp.maximum(jnp.asarray(solver.tol, dtype=dtype), tiny_scalar)
+    estimator_rtol_eff = jnp.asarray(solver.rtol, dtype=dtype)
+    if error_scale_mode == "ntss":
+        uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+        expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+        safe_rtol_est = jnp.maximum(jnp.asarray(solver.rtol, dtype=dtype), uround_est * 10.0)
+        estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
+    if error_scale_mode in {"ntss_max", "ntss_blend", "ntss_transport", "ntss_block_floor", "ntss_block_rms"}:
+        uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+        expmns_est = jnp.asarray((num_stages + 1.0) / (2.0 * num_stages), dtype=dtype)
+        safe_rtol_est = jnp.maximum(jnp.asarray(solver.rtol, dtype=dtype), uround_est * 10.0)
+        estimator_rtol_eff = jnp.asarray(0.1, dtype=dtype) * (safe_rtol_est ** expmns_est)
+
+    radau_transform = jnp.asarray(stage_cfg.transform, dtype=dtype)
+    radau_inv_transform = jnp.asarray(stage_cfg.inv_transform, dtype=dtype)
+    radau_real_eig = jnp.asarray(stage_cfg.real_eig, dtype=dtype)
+    radau_complex_blocks = jnp.asarray(stage_cfg.complex_blocks, dtype=dtype)
+    num_complex_pairs = int(stage_cfg.complex_blocks.shape[0])
+    identity_2 = jnp.eye(2, dtype=dtype)
+    identity_n = jnp.eye(state_dim, dtype=dtype)
+    real_lu0 = jnp.eye(state_dim, dtype=dtype)
+    real_piv0 = jnp.arange(state_dim, dtype=jnp.int32)
+    complex_dim = 2 * state_dim
+    complex_lu0 = jnp.broadcast_to(jnp.eye(complex_dim, dtype=dtype), (num_complex_pairs, complex_dim, complex_dim))
+    complex_piv0 = jnp.broadcast_to(jnp.arange(complex_dim, dtype=jnp.int32), (num_complex_pairs, complex_dim))
+    residual_size_sqrt = jnp.sqrt(jnp.asarray(num_stages * state_dim, dtype=dtype))
+    state_scale_base = jnp.asarray(solver.atol, dtype=dtype) + jnp.asarray(solver.rtol, dtype=dtype) * jnp.abs(flat_state0)
+    stage_scale = jnp.broadcast_to(jnp.maximum(state_scale_base, tiny_scalar)[None, :], (num_stages, state_dim)).reshape((-1,))
+
+    kernel_context = _RadauAcceptedStepKernelContext(
+        radau_transform=radau_transform,
+        radau_inv_transform=radau_inv_transform,
+        c=c,
+        a=a,
+        b=b,
+        b_error=b_error,
+        embedded_f0_weight=embedded_f0_weight,
+        dtype=dtype,
+        density_size=int(density_size),
+        pressure_size=int(pressure_size),
+        er_size=int(er_size),
+        predictor_mode=predictor_mode,
+        jacobian_reuse_rtol=jnp.asarray(solver.jacobian_reuse_rtol, dtype=dtype),
+        use_lagged_linear_response=bool(rhs_mode == "lagged_linear_state"),
+        num_stages=int(num_stages),
+        state_dim=int(state_dim),
+        num_complex_pairs=int(num_complex_pairs),
+        complex_dim=int(complex_dim),
+        identity_2=identity_2,
+        identity_n=identity_n,
+        use_rms_residual_norm=bool(use_rms_residual_norm),
+        residual_size_sqrt=residual_size_sqrt,
+        stage_scale=stage_scale,
+        radau_real_eig=radau_real_eig,
+        radau_complex_blocks=radau_complex_blocks,
+        predictor_fnewt=predictor_fnewt,
+        maxiter=int(solver.maxiter),
+        tol=jnp.asarray(solver.tol, dtype=dtype),
+        error_scale_mode=error_scale_mode,
+        atol=jnp.asarray(solver.atol, dtype=dtype),
+        rtol=jnp.asarray(solver.rtol, dtype=dtype),
+        estimator_rtol_eff=estimator_rtol_eff,
+        use_hairer_newton_tol=bool(use_hairer_newton_tol),
+        use_hairer_scaled_correction=bool(use_hairer_scaled_correction),
+        theta_diverge_threshold=theta_diverge_threshold,
+        predictor_defect_floor=predictor_defect_floor,
+        predictor_defect_cap=predictor_defect_cap,
+        residual_blowup_factor=residual_blowup_factor,
+        theta_clip_min=theta_clip_min,
+        theta_clip_max=theta_clip_max,
+        newton_shrink_num=newton_shrink_num,
+        newton_shrink_min=newton_shrink_min,
+        newton_shrink_max=newton_shrink_max,
+        tiny_scalar=tiny_scalar,
+        zero_scalar=zero_scalar,
+        debug_newton_trace=bool(debug_newton_trace),
+        use_transport_lagged_response=bool(use_transport_lagged_response),
+    )
+    physics_context = _RadauAcceptedStepPhysicsContext(
+        unpack_flat=unpack_flat,
+        project_flat=project_flat,
+        build_lagged_response=build_lagged_response,
+        flat_rhs=flat_rhs,
+        flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+    )
+    step_state0 = _make_radau_initial_step_state(
+        t0,
+        flat_state0,
+        base_dt,
+        dtype,
+        initial_rhs,
+        num_stages,
+        real_lu0,
+        real_piv0,
+        complex_lu0,
+        complex_piv0,
+        initial_lagged_response,
+        jnp.asarray(use_transport_lagged_response),
+        flat_state0,
+    )
+    initial_carry = _radau_carry_from_step_state(step_state0)
+    return _PreparedRadauAcceptedRollout(
+        kernel_context=kernel_context,
+        physics_context=physics_context,
+        initial_carry=initial_carry,
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauStepInfo:
@@ -3447,7 +4076,7 @@ class RADAUSolver(_RadauSolverConfig):
                 use_transport_lagged_response=jnp.asarray(use_transport_lagged_response),
             )
 
-            return _execute_radau_accepted_step_attempt(
+            return _execute_radau_accepted_step_attempt_autodiff(
                 kernel_context,
                 physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_in),

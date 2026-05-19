@@ -1408,3 +1408,255 @@ The next code change should therefore be:
 4. implement tangent flow only for the first tangent-active carry fields
 
 That is the cleanest next experimental AD step for NEOPAX.
+
+### Current custom-JVP status
+
+The first two custom-JVP attempts at the accepted-step boundary both failed
+under the existing `jax.jacfwd` benchmark path, and those failures should now
+be treated as concrete design information rather than incidental bugs.
+
+#### Failure 1: closure-local custom JVP
+
+The first attempt attached `custom_jvp` while the accepted-step implementation
+still depended on solver-local closures. Under the one-step benchmark this
+failed with:
+
+- `TypeError: No constant handler for type: <class 'jax._src.interpreters.ad.JVPTracer'>`
+
+Interpretation:
+
+- the AD boundary was still too deep inside closure-captured traced state
+- this was not a valid JAX custom-derivative boundary
+
+#### Failure 2: module-scope wrapper around accepted-step attempt
+
+After hoisting the accepted-step primal logic and making solver/physics context
+explicit, a second module-scope `custom_jvp` attempt was tested. The one-step
+benchmark still failed, now with:
+
+- `TypeError: No constant handler for type: <class 'jax._src.interpreters.partial_eval.DynamicJaxprTracer'>`
+
+This happened even after:
+
+- hoisting the accepted-step primal function to module scope
+- making solver context explicit
+- making physics callable context explicit
+- removing the solver-local function-handle argument from the custom-JVP
+  boundary
+
+Interpretation:
+
+- the accepted-step attempt wrapper is still not a sufficiently clean custom
+  JVP boundary for the current `jacfwd` + `jit` + loop structure
+- the remaining issue is not just "too many hidden locals"
+- the current benchmark path is still forcing JAX to treat some traced value as
+  a static constant at the custom-JVP boundary
+
+#### Immediate conclusion
+
+At present, the accepted-step custom-JVP path should be considered:
+
+- structurally informative
+- but not yet a valid production AD implementation
+
+The important result is not just that the code failed. The important result is:
+
+- simply hoisting the primal step to module scope is **not sufficient by
+  itself** to make the current accepted-step custom-JVP valid under the
+  existing benchmark execution path
+
+This should guide the next design step. The next iteration should begin from
+the recorded failure mode instead of retrying the same boundary with minor
+variations.
+
+### Radau-native implicit differentiation plan
+
+The next iteration should be based on the **converged accepted Radau step as
+an implicit nonlinear solve**, not on:
+
+- tracing raw Newton iterations
+- tracing rejected-step controller history
+- fixed accepted-step replay as a final solution
+- more `custom_jvp` boundary experiments around the current loop structure
+
+#### Why this is the right Radau-native object
+
+For one accepted Radau step, the solver computes stage values `Z` by solving a
+nonlinear collocation system. In the current implementation this appears in
+`_radau_single_step_primal(...)` as:
+
+- stage predictor: `z0`
+- stage residual map: `residual(z_flat)`
+- Newton loop over `z`
+- converged stage stack: `stages_final = z_final.reshape((num_stages, state_dim))`
+- accepted state update:
+  - `flat_next = flat_y + h_value * (b @ stages_final)`
+
+So the mathematically meaningful accepted-step map is:
+
+- input:
+  - current state `y_n`
+  - step size `h`
+  - solver/physics context
+  - selected carry fields that actually affect the implicit equations
+- implicit stage solve:
+  - find `Z` such that `R(Z; y_n, h, p) = 0`
+- output:
+  - `y_{n+1} = y_n + h * (b^T Z)`
+
+This is the object to differentiate. The relevant derivative is therefore the
+derivative of the **solution of the stage equations**, not the derivative of
+the particular Newton history used to reach that solution.
+
+#### Accepted-step implicit system in the current code
+
+The current stage residual is implemented as:
+
+- `stages = z_flat.reshape((s, n))`
+- `stage_states = y_n + h * (A @ stages)`
+- `evals = f(t_n + c_i h, stage_states_i, ...)`
+- `R(Z) = Z - F(stage_states)`
+
+in flattened form:
+
+- `residual(z_flat) = (stages - evals).reshape((-1,))`
+
+where:
+
+- `s = num_stages`
+- `n = state_dim`
+- `Z in R^{s x n}`
+
+The accepted step then uses:
+
+- `y_{n+1} = y_n + h * (b^T Z)`
+
+This means the local tangent equation should come from:
+
+- `dR = R_Z dZ + R_y dy_n + R_h dh + R_p dp = 0`
+
+and therefore:
+
+- `dZ = - R_Z^{-1} (R_y dy_n + R_h dh + R_p dp)`
+
+followed by:
+
+- `dy_{n+1} = dy_n + d[h * (b^T Z)]`
+
+This is the core Radau-native JVP object.
+
+#### What the current solver already computes
+
+The current implementation already builds the linearization used by the stage
+Newton solver:
+
+- `jacobian_ref = jacfwd(_rhs_eval_at_current_time)(flat_y)`
+- transformed real block solve:
+  - `real_matrix = I - lambda_real * h * jacobian_ref`
+  - `real_lu_out`, `real_piv_out`
+- transformed complex block solves:
+  - `complex_lu_out`, `complex_piv_out`
+- transformed stage linear solver:
+  - `stage_solver(rhs)`
+
+This means we already have:
+
+- a stage-space linear solve mechanism
+- LU factorizations for the Radau eigenbasis blocks
+- the converged stage vector `z_final`
+- the accepted output state `flat_next`
+
+So the new path should reuse this solver mathematics rather than trying to
+differentiate through the explicit Newton loop.
+
+#### Important subtlety
+
+The current `stage_solver(...)` is the Newton linear solve built from
+`jacobian_ref = df/dy |_(t_n, y_n)` (or the lagged linear-response
+approximation), not yet the full exact Jacobian of the nonlinear collocation
+residual `R_Z` evaluated at the converged `Z`.
+
+So there are two Radau-native implementation levels:
+
+1. **Approximate implicit-diff JVP**
+- reuse the existing Newton linearization directly
+- cheapest path to a first Radau-native derivative rule
+- may already be much better than tracing Newton iterations
+
+2. **Full implicit-diff JVP**
+- build/apply the exact linearized collocation Jacobian `R_Z` at the converged
+  accepted step
+- solve the tangent system with that operator
+- this is the most principled final target
+
+The recommended order is:
+
+1. write the accepted-step implicit system explicitly
+2. implement the approximate implicit-diff JVP first
+3. validate one-step parity and full-rollout behavior
+4. then decide whether the exact `R_Z` linearization is necessary
+
+#### What should be reverted or ignored for this plan
+
+The following are not part of the long-term Radau-native AD solution:
+
+- fixed-step accepted-rollout replay as a final gradient method
+- `custom_jvp` boundary hacks around the current step loop
+- stop-gradient masking as a primary AD fix
+- differentiating through raw Newton iterate history
+
+The useful structural refactor that should remain is:
+
+- accepted-step carry/result/context dataclasses
+- module-scope helper math and accepted-step primal decomposition
+- clearer separation between accepted-step primal state and controller logic
+
+#### Immediate next coding step
+
+The next code change should be small and solver-mathematical:
+
+1. extract/document the accepted-step residual map `R(Z; y_n, h, p)`
+2. expose a module-scope helper that evaluates this residual at arbitrary
+   `z_flat`
+3. expose a module-scope helper that applies the current Newton
+   linearization-based inverse to a stage-space right-hand side
+4. use those two helpers to implement the **first implicit-diff accepted-step
+   JVP**
+
+That is the first step in the new plan that is genuinely on the Radau path and
+changes the derivative object for the right reason.
+
+#### Current implementation progress
+
+The following forward-neutral helpers now exist in `_transport_solvers.py`:
+
+- `_radau_stage_residual(...)`
+- `_radau_apply_stage_linear_solve(...)`
+- `_radau_approximate_accepted_step_tangent(...)`
+
+The new tangent helper currently uses the approximate linearized stage system:
+
+- `(I - h A ⊗ J_ref) dZ = J_ref (dy + dh * A Z)`
+
+followed by:
+
+- `dy_next = dy + dh * (b^T Z) + h * (b^T dZ)`
+
+This is **not yet** the full exact collocation implicit derivative, but it is
+the first solver-mathematical tangent object that is:
+
+- Radau-native
+- based on the converged accepted step
+- independent of raw Newton iteration tracing
+
+The current code now also contains a pure helper that returns:
+
+- the primal accepted-step attempt result
+- plus the approximate accepted-step tangent result in the same output shape
+
+via:
+
+- `_execute_radau_accepted_step_attempt_with_approx_tangent(...)`
+
+That helper should be treated as the code-level target contract for the first
+accepted-step JVP implementation.
