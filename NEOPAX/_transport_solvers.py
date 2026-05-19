@@ -10,6 +10,7 @@ from typing import Callable, Any
 import dataclasses
 import inspect
 import time
+from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -864,6 +865,18 @@ def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: flo
 def _lagged_response_global_reuse_metric(current_flat, reference_flat, atol: float, rtol: float):
     delta_flat = current_flat - reference_flat
     return _solver_error_norm(delta_flat, reference_flat, current_flat, atol=atol, rtol=rtol)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
+def _custom_jvp_single_arg(primal_fun: Callable[[Any], Any], jvp_prepare_fun: Callable[[Any], Any], arg):
+    """Module-scope custom-JVP boundary for single-argument solver maps."""
+    return primal_fun(arg)
+
+
+@_custom_jvp_single_arg.defjvp
+def _custom_jvp_single_arg_jvp(primal_fun, jvp_prepare_fun, primals, tangents):
+    prepared_primals = tuple(jvp_prepare_fun(primal) for primal in primals)
+    return jax.jvp(primal_fun, prepared_primals, tangents)
 
 
 def _make_radau_initial_step_state(
@@ -3180,7 +3193,11 @@ class RADAUSolver(_RadauSolverConfig):
             )
 
         def _accepted_step_attempt(carry_in: _RadauAcceptedStepCarry):
-            return _accepted_step_attempt_impl(carry_in)
+            return _custom_jvp_single_arg(
+                _accepted_step_attempt_impl,
+                _radau_carry_with_forward_only_jvp_fields,
+                carry_in,
+            )
 
         def _attempt_step_lean(step_state: _RadauStepState):
             status = step_state.status
