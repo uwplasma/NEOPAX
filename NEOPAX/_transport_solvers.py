@@ -2428,7 +2428,6 @@ def _radau_backward_payload_candidate(
 
 
 def _execute_radau_accepted_step_attempt_impl(
-    single_step_fun: Callable[..., tuple[Any, ...]],
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
@@ -2451,7 +2450,7 @@ def _execute_radau_accepted_step_attempt_impl(
         finite_f0, finite_z0, finite_initial_residual, density_err_norm, pressure_err_norm, er_err_norm,
         lagged_response_out, lagged_reference_y_out, lagged_response_reused,
         jacobian_reused,
-    ) = single_step_fun(kernel_context, physics_context, carry_in, trial_dt)
+    ) = _radau_single_step_primal(kernel_context, physics_context, carry_in, trial_dt)
     carry_after_attempt = dataclasses.replace(
         carry_in,
         lagged_response_cache=lagged_response_out,
@@ -2495,16 +2494,14 @@ def _execute_radau_accepted_step_attempt_impl(
     )
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2))
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
 def _execute_radau_accepted_step_attempt(
-    single_step_fun: Callable[..., tuple[Any, ...]],
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     context: _RadauAcceptedStepAttemptContext,
 ) -> _RadauAcceptedStepAttemptResult:
     return _execute_radau_accepted_step_attempt_impl(
-        single_step_fun,
         kernel_context,
         physics_context,
         carry_in,
@@ -2514,7 +2511,6 @@ def _execute_radau_accepted_step_attempt(
 
 @_execute_radau_accepted_step_attempt.defjvp
 def _execute_radau_accepted_step_attempt_jvp(
-    single_step_fun: Callable[..., tuple[Any, ...]],
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     primals,
@@ -2525,7 +2521,6 @@ def _execute_radau_accepted_step_attempt_jvp(
 
     def _primal_fun(carry_value, context_value):
         return _execute_radau_accepted_step_attempt_impl(
-            single_step_fun,
             kernel_context,
             physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_value),
@@ -2653,6 +2648,530 @@ def _radau_carry_with_forward_only_jvp_fields(
         real_piv=jax.lax.stop_gradient(carry.real_piv),
         complex_lu=jax.lax.stop_gradient(carry.complex_lu),
         complex_piv=jax.lax.stop_gradient(carry.complex_piv),
+    )
+
+
+def _radau_single_step_primal(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    h_value,
+):
+    flat_y = carry_in.y
+    t_value = carry_in.t
+    prev_stages = carry_in.prev_stages
+    prev_dt = carry_in.prev_dt
+    prev_theta_final = carry_in.prev_theta_final
+    prev_newton_iter_count = carry_in.prev_newton_iter_count
+    jacobian_cache = carry_in.jacobian
+    cache_valid = carry_in.cache_valid
+    cache_dt = carry_in.cache_dt
+    cache_age = carry_in.cache_age
+    real_lu_cache = carry_in.real_lu
+    real_piv_cache = carry_in.real_piv
+    complex_lu_cache = carry_in.complex_lu
+    complex_piv_cache = carry_in.complex_piv
+    lagged_response, lagged_reference_y, lagged_response_reused = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval(t_eval, y_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            y_eval,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    def _rhs_eval_at_current_time(y_eval):
+        return _rhs_eval(t_value, y_eval)
+
+    f0 = _rhs_eval(t_value, flat_y)
+    z0 = _make_radau_stage_predictor(
+        f0,
+        prev_stages,
+        prev_dt,
+        h_value,
+        kernel_context.c,
+        kernel_context.dtype,
+        density_size=kernel_context.density_size,
+        pressure_size=kernel_context.pressure_size,
+        er_size=kernel_context.er_size,
+        prev_theta_final=prev_theta_final,
+        prev_newton_iter_count=prev_newton_iter_count,
+        predictor_mode=kernel_context.predictor_mode,
+    )
+    finite_f0 = jnp.all(jnp.isfinite(f0))
+    finite_z0 = jnp.all(jnp.isfinite(z0))
+
+    jacobian_dt_scale = jnp.maximum(
+        jnp.abs(cache_dt),
+        jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
+    )
+    dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
+    reuse_linearization = jnp.logical_and(
+        jnp.logical_and(cache_valid, dt_close),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+
+    def _reuse_linearization(_):
+        return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+    def _recompute_linearization(_):
+        jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+        h_jacobian = h_value * jacobian_ref
+        real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
+        real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+        complex_dense_all = jnp.transpose(
+            kernel_context.identity_2[None, :, :, None, None] * kernel_context.identity_n[None, None, None, :, :]
+            - kernel_context.radau_complex_blocks[:, :, :, None, None] * h_jacobian[None, None, None, :, :],
+            (0, 1, 3, 2, 4),
+        ).reshape((kernel_context.num_complex_pairs, kernel_context.complex_dim, kernel_context.complex_dim))
+
+        def _factor_pair(i, carry):
+            lu_all, piv_all = carry
+            lu_i, piv_i = jax.scipy.linalg.lu_factor(complex_dense_all[i])
+            lu_all = lu_all.at[i].set(lu_i)
+            piv_all = piv_all.at[i].set(piv_i)
+            return lu_all, piv_all
+
+        complex_lu, complex_piv = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _factor_pair,
+            (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
+        )
+        return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
+
+    jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+        reuse_linearization,
+        _reuse_linearization,
+        _recompute_linearization,
+        operand=None,
+    )
+    jacobian_reused = reuse_linearization
+
+    def _evaluate_stage_model(z_flat):
+        stages = z_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
+        if lagged_response is not None:
+            stage_times = t_value + kernel_context.c * h_value
+            evals = jax.vmap(_rhs_eval, in_axes=(0, 0))(stage_times, stage_states)
+        elif kernel_context.use_lagged_linear_response:
+            state_delta = stage_states - flat_y[None, :]
+            evals = f0[None, :] + state_delta @ jacobian_ref.T
+        else:
+            stage_times = t_value + kernel_context.c * h_value
+            evals = jax.vmap(physics_context.flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+        return stages, evals
+
+    def residual(z_flat):
+        stages, evals = _evaluate_stage_model(z_flat)
+        return (stages - evals).reshape((-1,))
+
+    def stage_solver(rhs):
+        rhs_stages = rhs.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
+        rhs_real = rhs_transformed[0]
+        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
+        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
+
+        def _solve_pair(i, pair_solutions):
+            delta_pair = jax.scipy.linalg.lu_solve(
+                (complex_lu_out[i], complex_piv_out[i]),
+                rhs_complex_pairs[i].reshape((-1,)),
+            ).reshape((2, kernel_context.state_dim))
+            return pair_solutions.at[i].set(delta_pair)
+
+        delta_complex_pairs = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _solve_pair,
+            jnp.zeros_like(rhs_complex_pairs),
+        )
+        delta_transformed = jnp.concatenate(
+            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
+            axis=0,
+        )
+        return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+
+    def body_fn(newton_state):
+        (
+            iter_idx,
+            z_cur,
+            delta_norm,
+            residual_norm,
+            prev_newton_norm,
+            newton_metric,
+            prev_theta_ratio,
+            theta_est,
+            diverged,
+            shrink_suggest,
+            slow_contraction_any,
+            residual_blowup_any,
+            newton_nonfinite_any,
+        ) = newton_state
+        residual_cur = residual(z_cur)
+        delta = stage_solver(-residual_cur)
+        delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
+        z_next = z_cur + delta
+        current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
+        current_delta_norm = jnp.linalg.norm(delta)
+        current_newton_norm = _radau_correction_norm(kernel_context, delta)
+        safe_prev_delta = jnp.maximum(prev_newton_norm, kernel_context.tiny_scalar)
+        theta_raw = current_newton_norm / safe_prev_delta
+        newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
+        theta_candidate = jnp.where(
+            newton_iter_num == 2,
+            theta_raw,
+            jnp.sqrt(jnp.maximum(theta_raw * prev_theta_ratio, kernel_context.tiny_scalar)),
+        )
+        theta_valid = newton_iter_num > 1
+        theta_candidate = jnp.where(theta_valid, theta_candidate, kernel_context.zero_scalar)
+        theta_next = jnp.where(theta_valid, theta_candidate, theta_est)
+        theta_ratio_next = jnp.where(theta_valid, theta_raw, prev_theta_ratio)
+        residual_blowup = jnp.logical_and(
+            iter_idx >= 1,
+            current_residual_norm > residual_norm * kernel_context.residual_blowup_factor,
+        )
+        nonfinite_state = jnp.logical_not(
+            jnp.logical_and(
+                jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
+                jnp.logical_and(jnp.isfinite(current_delta_norm), jnp.isfinite(current_newton_norm)),
+            )
+        )
+        predictor_active = jnp.logical_and(theta_valid, newton_iter_num < kernel_context.maxiter)
+        remaining_iters = jnp.maximum(kernel_context.maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
+        faccon = theta_candidate / jnp.maximum(
+            jnp.asarray(1.0, dtype=kernel_context.dtype) - theta_candidate,
+            kernel_context.tiny_scalar,
+        )
+        predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.predictor_fnewt
+        qnewt = jnp.clip(predicted_defect, kernel_context.predictor_defect_floor, kernel_context.predictor_defect_cap)
+        predictor_exponent = -jnp.asarray(1.0, dtype=kernel_context.dtype) / (
+            jnp.asarray(kernel_context.maxiter + 3, dtype=kernel_context.dtype) - newton_iter_num.astype(kernel_context.dtype)
+        )
+        predictor_shrink = jnp.clip(
+            kernel_context.newton_shrink_num * (qnewt ** predictor_exponent),
+            kernel_context.newton_shrink_min,
+            kernel_context.newton_shrink_max,
+        )
+        slow_contraction = jnp.logical_and(
+            predictor_active,
+            jnp.where(
+                theta_candidate < kernel_context.theta_diverge_threshold,
+                predicted_defect >= jnp.asarray(1.0, dtype=kernel_context.dtype),
+                jnp.asarray(True),
+            ),
+        )
+        convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
+        meets_newton_tol = convergence_metric <= kernel_context.predictor_fnewt
+        predictor_shrink = jnp.where(
+            theta_candidate < kernel_context.theta_diverge_threshold,
+            predictor_shrink,
+            jnp.asarray(0.5, dtype=kernel_context.dtype),
+        )
+        shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
+        slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
+        diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
+        if kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
+                iter=iter_idx + 1,
+                delta_norm=current_delta_norm,
+                residual_norm=current_residual_norm,
+                newton_metric=convergence_metric,
+                fnewt=kernel_context.predictor_fnewt,
+                theta=theta_next,
+                slow=slow_contraction,
+                blowup=residual_blowup,
+                nonfinite=nonfinite_state,
+                diverged=diverged_next,
+            )
+        return (
+            iter_idx + 1,
+            z_next,
+            current_delta_norm,
+            current_residual_norm,
+            current_newton_norm,
+            convergence_metric,
+            theta_ratio_next,
+            theta_next,
+            diverged_next,
+            shrink_suggest_next,
+            jnp.logical_or(slow_contraction_any, slow_contraction),
+            jnp.logical_or(residual_blowup_any, residual_blowup),
+            jnp.logical_or(newton_nonfinite_any, nonfinite_state),
+        )
+
+    def cond_fn(newton_state):
+        iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        active = jnp.where(
+            kernel_context.use_hairer_newton_tol,
+            newton_metric > kernel_context.predictor_fnewt,
+            jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
+        )
+        return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
+
+    init_newton = (
+        jnp.asarray(0, dtype=jnp.int32),
+        z0,
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+        kernel_context.zero_scalar,
+        kernel_context.zero_scalar,
+        jnp.asarray(False),
+        jnp.asarray(1.0, dtype=kernel_context.dtype),
+        jnp.asarray(False),
+        jnp.asarray(False),
+        jnp.asarray(False),
+    )
+    initial_residual = residual(z0)
+    finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
+    (
+        iter_final,
+        z_final,
+        delta_norm_final,
+        _residual_norm_loop_final,
+        _prev_newton_norm_final,
+        newton_metric_final,
+        _prev_theta_ratio_final,
+        theta_final,
+        diverged_final,
+        shrink_suggest_final,
+        slow_contraction_final,
+        residual_blowup_final,
+        newton_nonfinite_final,
+    ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
+    stages_final = z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    final_residual = residual(z_final)
+    nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
+    nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
+    final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
+    converged = jnp.logical_and(
+        jnp.logical_and(
+            jnp.all(jnp.isfinite(z_final)),
+            jnp.where(
+                kernel_context.use_hairer_newton_tol,
+                newton_metric_final <= kernel_context.predictor_fnewt,
+                final_residual_norm <= kernel_context.tol,
+            ),
+        ),
+        jnp.logical_not(diverged_final),
+    )
+    if kernel_context.debug_newton_trace:
+        jax.debug.print(
+            "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
+            iter=iter_final,
+            converged=converged,
+            diverged=diverged_final,
+            finite_initial_residual=finite_initial_residual,
+            nonfinite_stage_state=nonfinite_stage_state,
+            nonfinite_stage_residual=nonfinite_stage_residual,
+            residual_norm=final_residual_norm,
+            delta_norm=delta_norm_final,
+            newton_metric=newton_metric_final,
+            fnewt=kernel_context.predictor_fnewt,
+            theta=theta_final,
+            slow=slow_contraction_final,
+            blowup=residual_blowup_final,
+            newton_nonfinite=newton_nonfinite_final,
+        )
+    flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
+    err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + (kernel_context.b_error @ stages_final))
+    scale_override = None
+    if kernel_context.error_scale_mode == "ntss_transport" and (
+        kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
+    ):
+        density_end = kernel_context.density_size
+        pressure_end = kernel_context.density_size + kernel_context.pressure_size
+        density_next = flat_next[:density_end]
+        pressure_next = flat_next[density_end:pressure_end]
+        er_next = flat_next[pressure_end:pressure_end + kernel_context.er_size]
+        er_rms = jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype))
+        er_floor = jnp.maximum(
+            jnp.asarray(0.1, dtype=kernel_context.dtype) * er_rms,
+            jnp.asarray(1.0e-3, dtype=kernel_context.dtype),
+        )
+        density_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(density_next)
+        pressure_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(pressure_next)
+        er_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
+        scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
+    if kernel_context.error_scale_mode in {"ntss_block_floor", "ntss_block_rms"} and (
+        kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
+    ):
+        density_end = kernel_context.density_size
+        pressure_end = kernel_context.density_size + kernel_context.pressure_size
+        density_next = flat_next[:density_end]
+        pressure_next = flat_next[density_end:pressure_end]
+        er_next = flat_next[pressure_end:pressure_end + kernel_context.er_size]
+        density_floor = jnp.maximum(
+            jnp.asarray(0.05, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(density_next * density_next) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(1.0e-4, dtype=kernel_context.dtype),
+        )
+        pressure_floor = jnp.maximum(
+            jnp.asarray(0.05, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(pressure_next * pressure_next) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(1.0e-4, dtype=kernel_context.dtype),
+        )
+        er_floor = jnp.maximum(
+            jnp.asarray(0.1, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(1.0e-3, dtype=kernel_context.dtype),
+        )
+        density_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(density_next), density_floor)
+        pressure_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(pressure_next), pressure_floor)
+        er_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
+        scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
+    if scale_override is None:
+        ref_abs = jnp.abs(flat_y)
+        cand_abs = jnp.abs(flat_next)
+        max_scale = jnp.maximum(ref_abs, cand_abs)
+        mean_scale = jnp.asarray(0.5, dtype=kernel_context.dtype) * (ref_abs + cand_abs)
+        scale_base = jnp.where(
+            kernel_context.error_scale_mode == "mean",
+            mean_scale,
+            jnp.where(
+                kernel_context.error_scale_mode == "blend",
+                jnp.asarray(0.75, dtype=kernel_context.dtype) * max_scale
+                + jnp.asarray(0.25, dtype=kernel_context.dtype) * mean_scale,
+                jnp.where(
+                    kernel_context.error_scale_mode == "ntss",
+                    cand_abs,
+                    jnp.where(
+                        kernel_context.error_scale_mode == "ntss_max",
+                        max_scale,
+                        jnp.where(
+                            kernel_context.error_scale_mode == "ntss_blend",
+                            jnp.asarray(0.5, dtype=kernel_context.dtype) * cand_abs
+                            + jnp.asarray(0.5, dtype=kernel_context.dtype) * max_scale,
+                            max_scale,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        local_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * scale_base
+    else:
+        local_scale = scale_override
+    normalized_err = err_vec / local_scale
+    if kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim:
+        density_slice = normalized_err[:kernel_context.density_size]
+        pressure_slice = normalized_err[
+            kernel_context.density_size:kernel_context.density_size + kernel_context.pressure_size
+        ]
+        er_slice = normalized_err[
+            kernel_context.density_size + kernel_context.pressure_size:
+            kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size
+        ]
+        density_err_norm = jnp.where(
+            kernel_context.density_size > 0,
+            jnp.sqrt(jnp.mean(density_slice * density_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+        pressure_err_norm = jnp.where(
+            kernel_context.pressure_size > 0,
+            jnp.sqrt(jnp.mean(pressure_slice * pressure_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+        er_err_norm = jnp.where(
+            kernel_context.er_size > 0,
+            jnp.sqrt(jnp.mean(er_slice * er_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    else:
+        density_err_norm = jnp.asarray(0.0, dtype=kernel_context.dtype)
+        pressure_err_norm = jnp.asarray(0.0, dtype=kernel_context.dtype)
+        er_err_norm = jnp.asarray(0.0, dtype=kernel_context.dtype)
+    err_norm = _solver_error_norm(
+        err_vec,
+        flat_y,
+        flat_next,
+        kernel_context.atol,
+        kernel_context.rtol,
+        scale_mode=kernel_context.error_scale_mode,
+        rtol_eff=kernel_context.estimator_rtol_eff,
+        scale_override=scale_override,
+    )
+    if kernel_context.error_scale_mode == "ntss_block_rms" and (
+        kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
+    ):
+        active_block_squares = jnp.stack(
+            [
+                jnp.where(kernel_context.density_size > 0, density_err_norm * density_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
+                jnp.where(kernel_context.pressure_size > 0, pressure_err_norm * pressure_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
+                jnp.where(kernel_context.er_size > 0, er_err_norm * er_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
+            ],
+            axis=0,
+        )
+        active_block_count = (
+            jnp.where(kernel_context.density_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
+            + jnp.where(kernel_context.pressure_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
+            + jnp.where(kernel_context.er_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
+        )
+        err_norm = jnp.sqrt(
+            jnp.sum(active_block_squares) / jnp.maximum(active_block_count, jnp.asarray(1.0, dtype=kernel_context.dtype))
+            + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)
+        )
+    else:
+        pressure_err_norm = err_norm
+    theta_safe = jnp.clip(theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
+    fallback_newton_shrink = jnp.clip(
+        kernel_context.newton_shrink_num / theta_safe,
+        kernel_context.newton_shrink_min,
+        kernel_context.newton_shrink_max,
+    )
+    newton_shrink = jnp.where(
+        converged,
+        jnp.asarray(1.0, dtype=kernel_context.dtype),
+        jnp.where(slow_contraction_final, shrink_suggest_final, fallback_newton_shrink),
+    )
+    jacobian_out = jacobian_ref
+    cache_valid_out = jnp.asarray(True)
+    cache_dt_out = h_value
+    cache_age_out = jnp.where(reuse_linearization, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
+    return (
+        flat_next,
+        err_norm,
+        converged,
+        z_final,
+        theta_final,
+        iter_final,
+        final_residual_norm,
+        delta_norm_final,
+        slow_contraction_final,
+        residual_blowup_final,
+        newton_nonfinite_final,
+        jacobian_out,
+        cache_valid_out,
+        cache_dt_out,
+        cache_age_out,
+        real_lu_out,
+        real_piv_out,
+        complex_lu_out,
+        complex_piv_out,
+        newton_shrink,
+        diverged_final,
+        nonfinite_stage_state,
+        nonfinite_stage_residual,
+        finite_f0,
+        finite_z0,
+        finite_initial_residual,
+        density_err_norm,
+        pressure_err_norm,
+        er_err_norm,
+        lagged_response,
+        lagged_reference_y,
+        lagged_response_reused,
+        jacobian_reused,
     )
 
 
@@ -2922,524 +3441,6 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         )
 
-        def _single_step_custom(
-            kernel_context: _RadauAcceptedStepKernelContext,
-            physics_context: _RadauAcceptedStepPhysicsContext,
-            carry_in: _RadauAcceptedStepCarry,
-            h_value,
-        ):
-            flat_y = carry_in.y
-            t_value = carry_in.t
-            prev_stages = carry_in.prev_stages
-            prev_dt = carry_in.prev_dt
-            prev_theta_final = carry_in.prev_theta_final
-            prev_newton_iter_count = carry_in.prev_newton_iter_count
-            jacobian_cache = carry_in.jacobian
-            cache_valid = carry_in.cache_valid
-            cache_dt = carry_in.cache_dt
-            cache_age = carry_in.cache_age
-            real_lu_cache = carry_in.real_lu
-            real_piv_cache = carry_in.real_piv
-            complex_lu_cache = carry_in.complex_lu
-            complex_piv_cache = carry_in.complex_piv
-            lagged_response, lagged_reference_y, lagged_response_reused = _radau_prepare_lagged_response(
-                kernel_context,
-                carry_in,
-                physics_context.unpack_flat,
-                physics_context.project_flat,
-                physics_context.build_lagged_response,
-            )
-
-            def _rhs_eval(t_eval, y_eval):
-                return _radau_eval_rhs(
-                    t_eval,
-                    y_eval,
-                    lagged_response,
-                    physics_context.flat_rhs,
-                    physics_context.flat_rhs_with_lagged_response,
-                )
-
-            def _rhs_eval_at_current_time(y_eval):
-                return _rhs_eval(t_value, y_eval)
-
-            f0 = _rhs_eval(t_value, flat_y)
-            z0 = _make_radau_stage_predictor(
-                f0,
-                prev_stages,
-                prev_dt,
-                h_value,
-                kernel_context.c,
-                kernel_context.dtype,
-                density_size=kernel_context.density_size,
-                pressure_size=kernel_context.pressure_size,
-                er_size=kernel_context.er_size,
-                prev_theta_final=prev_theta_final,
-                prev_newton_iter_count=prev_newton_iter_count,
-                predictor_mode=kernel_context.predictor_mode,
-            )
-            finite_f0 = jnp.all(jnp.isfinite(f0))
-            finite_z0 = jnp.all(jnp.isfinite(z0))
-
-            jacobian_dt_scale = jnp.maximum(
-                jnp.abs(cache_dt),
-                jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
-            )
-            dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
-            reuse_linearization = jnp.logical_and(
-                jnp.logical_and(cache_valid, dt_close),
-                jnp.logical_not(kernel_context.use_lagged_linear_response),
-            )
-
-            def _reuse_linearization(_):
-                return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
-
-            def _recompute_linearization(_):
-                jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
-                h_jacobian = h_value * jacobian_ref
-                real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
-                real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
-                complex_dense_all = jnp.transpose(
-                    kernel_context.identity_2[None, :, :, None, None] * kernel_context.identity_n[None, None, None, :, :]
-                    - kernel_context.radau_complex_blocks[:, :, :, None, None] * h_jacobian[None, None, None, :, :],
-                    (0, 1, 3, 2, 4),
-                ).reshape((kernel_context.num_complex_pairs, kernel_context.complex_dim, kernel_context.complex_dim))
-
-                def _factor_pair(i, carry):
-                    lu_all, piv_all = carry
-                    lu_i, piv_i = jax.scipy.linalg.lu_factor(complex_dense_all[i])
-                    lu_all = lu_all.at[i].set(lu_i)
-                    piv_all = piv_all.at[i].set(piv_i)
-                    return lu_all, piv_all
-
-                complex_lu, complex_piv = jax.lax.fori_loop(
-                    0,
-                    kernel_context.num_complex_pairs,
-                    _factor_pair,
-                    (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
-                )
-                return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
-
-            jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
-                reuse_linearization,
-                _reuse_linearization,
-                _recompute_linearization,
-                operand=None,
-            )
-            jacobian_reused = reuse_linearization
-
-            def _evaluate_stage_model(z_flat):
-                stages = z_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
-                stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
-                if lagged_response is not None:
-                    stage_times = t_value + kernel_context.c * h_value
-                    evals = jax.vmap(_rhs_eval, in_axes=(0, 0))(stage_times, stage_states)
-                elif kernel_context.use_lagged_linear_response:
-                    # Freeze a step-local affine response around (t_n, y_n):
-                    # f(y) ~= f_ref + J_ref (y - y_ref)
-                    state_delta = stage_states - flat_y[None, :]
-                    evals = f0[None, :] + state_delta @ jacobian_ref.T
-                else:
-                    stage_times = t_value + kernel_context.c * h_value
-                    evals = jax.vmap(physics_context.flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
-                return stages, evals
-
-            def residual(z_flat):
-                stages, evals = _evaluate_stage_model(z_flat)
-                return (stages - evals).reshape((-1,))
-
-            def stage_solver(rhs):
-                rhs_stages = rhs.reshape((kernel_context.num_stages, kernel_context.state_dim))
-                rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
-                rhs_real = rhs_transformed[0]
-                delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
-                rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
-
-                def _solve_pair(i, pair_solutions):
-                    delta_pair = jax.scipy.linalg.lu_solve(
-                        (complex_lu_out[i], complex_piv_out[i]),
-                        rhs_complex_pairs[i].reshape((-1,)),
-                    ).reshape((2, kernel_context.state_dim))
-                    return pair_solutions.at[i].set(delta_pair)
-
-                delta_complex_pairs = jax.lax.fori_loop(
-                    0,
-                    kernel_context.num_complex_pairs,
-                    _solve_pair,
-                    jnp.zeros_like(rhs_complex_pairs),
-                )
-                delta_transformed = jnp.concatenate(
-                    [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
-                    axis=0,
-                )
-                return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
-
-            def body_fn(newton_state):
-                (
-                    iter_idx,
-                    z_cur,
-                    delta_norm,
-                    residual_norm,
-                    prev_newton_norm,
-                    newton_metric,
-                    prev_theta_ratio,
-                    theta_est,
-                    diverged,
-                    shrink_suggest,
-                    slow_contraction_any,
-                    residual_blowup_any,
-                    newton_nonfinite_any,
-                ) = newton_state
-                residual_cur = residual(z_cur)
-                delta = stage_solver(-residual_cur)
-                delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
-                z_next = z_cur + delta
-                current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
-                current_delta_norm = jnp.linalg.norm(delta)
-                current_newton_norm = _radau_correction_norm(kernel_context, delta)
-                safe_prev_delta = jnp.maximum(prev_newton_norm, kernel_context.tiny_scalar)
-                theta_raw = current_newton_norm / safe_prev_delta
-                newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
-                theta_candidate = jnp.where(
-                    newton_iter_num == 2,
-                    theta_raw,
-                    jnp.sqrt(jnp.maximum(theta_raw * prev_theta_ratio, kernel_context.tiny_scalar)),
-                )
-                theta_valid = newton_iter_num > 1
-                theta_candidate = jnp.where(theta_valid, theta_candidate, kernel_context.zero_scalar)
-                theta_next = jnp.where(theta_valid, theta_candidate, theta_est)
-                theta_ratio_next = jnp.where(theta_valid, theta_raw, prev_theta_ratio)
-                residual_blowup = jnp.logical_and(
-                    iter_idx >= 1,
-                    current_residual_norm > residual_norm * kernel_context.residual_blowup_factor,
-                )
-                nonfinite_state = jnp.logical_not(
-                    jnp.logical_and(
-                        jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
-                        jnp.logical_and(jnp.isfinite(current_delta_norm), jnp.isfinite(current_newton_norm)),
-                    )
-                )
-                predictor_active = jnp.logical_and(theta_valid, newton_iter_num < kernel_context.maxiter)
-                remaining_iters = jnp.maximum(kernel_context.maxiter - 1 - newton_iter_num, jnp.asarray(0, dtype=jnp.int32))
-                faccon = theta_candidate / jnp.maximum(
-                    jnp.asarray(1.0, dtype=kernel_context.dtype) - theta_candidate,
-                    kernel_context.tiny_scalar,
-                )
-                predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.predictor_fnewt
-                qnewt = jnp.clip(predicted_defect, kernel_context.predictor_defect_floor, kernel_context.predictor_defect_cap)
-                predictor_exponent = -jnp.asarray(1.0, dtype=kernel_context.dtype) / (
-                    jnp.asarray(kernel_context.maxiter + 3, dtype=kernel_context.dtype) - newton_iter_num.astype(kernel_context.dtype)
-                )
-                predictor_shrink = jnp.clip(
-                    kernel_context.newton_shrink_num * (qnewt ** predictor_exponent),
-                    kernel_context.newton_shrink_min,
-                    kernel_context.newton_shrink_max,
-                )
-                slow_contraction = jnp.logical_and(
-                    predictor_active,
-                    jnp.where(
-                        theta_candidate < kernel_context.theta_diverge_threshold,
-                        predicted_defect >= jnp.asarray(1.0, dtype=kernel_context.dtype),
-                        jnp.asarray(True),
-                    ),
-                )
-                convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
-                meets_newton_tol = convergence_metric <= kernel_context.predictor_fnewt
-                predictor_shrink = jnp.where(
-                    theta_candidate < kernel_context.theta_diverge_threshold,
-                    predictor_shrink,
-                    jnp.asarray(0.5, dtype=kernel_context.dtype),
-                )
-                shrink_suggest_next = jnp.where(slow_contraction, predictor_shrink, shrink_suggest)
-                slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
-                diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
-                if kernel_context.debug_newton_trace:
-                    jax.debug.print(
-                        "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
-                        iter=iter_idx + 1,
-                        delta_norm=current_delta_norm,
-                        residual_norm=current_residual_norm,
-                        newton_metric=convergence_metric,
-                        fnewt=kernel_context.predictor_fnewt,
-                        theta=theta_next,
-                        slow=slow_contraction,
-                        blowup=residual_blowup,
-                        nonfinite=nonfinite_state,
-                        diverged=diverged_next,
-                    )
-                return (
-                    iter_idx + 1,
-                    z_next,
-                    current_delta_norm,
-                    current_residual_norm,
-                    current_newton_norm,
-                    convergence_metric,
-                    theta_ratio_next,
-                    theta_next,
-                    diverged_next,
-                    shrink_suggest_next,
-                    jnp.logical_or(slow_contraction_any, slow_contraction),
-                    jnp.logical_or(residual_blowup_any, residual_blowup),
-                    jnp.logical_or(newton_nonfinite_any, nonfinite_state),
-                )
-
-            def cond_fn(newton_state):
-                iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
-                active = jnp.where(
-                    kernel_context.use_hairer_newton_tol,
-                    newton_metric > kernel_context.predictor_fnewt,
-                    jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
-                )
-                return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
-
-            init_newton = (
-                jnp.asarray(0, dtype=jnp.int32),
-                z0,
-                jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-                jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-                jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-                jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
-                kernel_context.zero_scalar,
-                kernel_context.zero_scalar,
-                jnp.asarray(False),
-                jnp.asarray(1.0, dtype=kernel_context.dtype),
-                jnp.asarray(False),
-                jnp.asarray(False),
-                jnp.asarray(False),
-            )
-            initial_residual = residual(z0)
-            finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
-            (
-                iter_final,
-                z_final,
-                delta_norm_final,
-                _residual_norm_loop_final,
-                _prev_newton_norm_final,
-                newton_metric_final,
-                _prev_theta_ratio_final,
-                theta_final,
-                diverged_final,
-                shrink_suggest_final,
-                slow_contraction_final,
-                residual_blowup_final,
-                newton_nonfinite_final,
-            ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
-            stages_final = z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
-            final_residual = residual(z_final)
-            nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
-            nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
-            final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
-            converged = jnp.logical_and(
-                jnp.logical_and(
-                    jnp.all(jnp.isfinite(z_final)),
-                    jnp.where(
-                        kernel_context.use_hairer_newton_tol,
-                        newton_metric_final <= kernel_context.predictor_fnewt,
-                        final_residual_norm <= kernel_context.tol,
-                    ),
-                ),
-                jnp.logical_not(diverged_final),
-            )
-            if kernel_context.debug_newton_trace:
-                jax.debug.print(
-                    "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
-                    iter=iter_final,
-                    converged=converged,
-                    diverged=diverged_final,
-                    finite_initial_residual=finite_initial_residual,
-                    nonfinite_stage_state=nonfinite_stage_state,
-                    nonfinite_stage_residual=nonfinite_stage_residual,
-                    residual_norm=final_residual_norm,
-                    delta_norm=delta_norm_final,
-                    newton_metric=newton_metric_final,
-                    fnewt=kernel_context.predictor_fnewt,
-                    theta=theta_final,
-                    slow=slow_contraction_final,
-                    blowup=residual_blowup_final,
-                    newton_nonfinite=newton_nonfinite_final,
-                )
-            flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
-            err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + (kernel_context.b_error @ stages_final))
-            scale_override = None
-            if kernel_context.error_scale_mode == "ntss_transport" and (
-                kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
-            ):
-                density_end = kernel_context.density_size
-                pressure_end = kernel_context.density_size + kernel_context.pressure_size
-                density_next = flat_next[:density_end]
-                pressure_next = flat_next[density_end:pressure_end]
-                er_next = flat_next[pressure_end:pressure_end + kernel_context.er_size]
-                er_rms = jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=dtype))
-                er_floor = jnp.maximum(
-                    jnp.asarray(0.1, dtype=dtype) * er_rms,
-                    jnp.asarray(1.0e-3, dtype=dtype),
-                )
-                density_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(density_next)
-                pressure_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(pressure_next)
-                er_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
-                scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
-            if kernel_context.error_scale_mode in {"ntss_block_floor", "ntss_block_rms"} and (
-                kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
-            ):
-                density_end = kernel_context.density_size
-                pressure_end = kernel_context.density_size + kernel_context.pressure_size
-                density_next = flat_next[:density_end]
-                pressure_next = flat_next[density_end:pressure_end]
-                er_next = flat_next[pressure_end:pressure_end + kernel_context.er_size]
-                density_floor = jnp.maximum(
-                    jnp.asarray(0.05, dtype=dtype) * jnp.sqrt(jnp.mean(density_next * density_next) + jnp.asarray(1.0e-30, dtype=dtype)),
-                    jnp.asarray(1.0e-4, dtype=dtype),
-                )
-                pressure_floor = jnp.maximum(
-                    jnp.asarray(0.05, dtype=dtype) * jnp.sqrt(jnp.mean(pressure_next * pressure_next) + jnp.asarray(1.0e-30, dtype=dtype)),
-                    jnp.asarray(1.0e-4, dtype=dtype),
-                )
-                er_floor = jnp.maximum(
-                    jnp.asarray(0.1, dtype=dtype) * jnp.sqrt(jnp.mean(er_next * er_next) + jnp.asarray(1.0e-30, dtype=dtype)),
-                    jnp.asarray(1.0e-3, dtype=dtype),
-                )
-                density_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(density_next), density_floor)
-                pressure_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(pressure_next), pressure_floor)
-                er_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_next), er_floor)
-                scale_override = jnp.concatenate([density_scale, pressure_scale, er_scale], axis=0)
-            if scale_override is None:
-                ref_abs = jnp.abs(flat_y)
-                cand_abs = jnp.abs(flat_next)
-                max_scale = jnp.maximum(ref_abs, cand_abs)
-                mean_scale = jnp.asarray(0.5, dtype=dtype) * (ref_abs + cand_abs)
-                scale_base = jnp.where(
-                    kernel_context.error_scale_mode == "mean",
-                    mean_scale,
-                    jnp.where(
-                        kernel_context.error_scale_mode == "blend",
-                        jnp.asarray(0.75, dtype=dtype) * max_scale + jnp.asarray(0.25, dtype=dtype) * mean_scale,
-                        jnp.where(
-                            kernel_context.error_scale_mode == "ntss",
-                            cand_abs,
-                            jnp.where(
-                                kernel_context.error_scale_mode == "ntss_max",
-                                max_scale,
-                                jnp.where(
-                                    kernel_context.error_scale_mode == "ntss_blend",
-                                    jnp.asarray(0.5, dtype=dtype) * cand_abs + jnp.asarray(0.5, dtype=dtype) * max_scale,
-                                    max_scale,
-                                ),
-                            ),
-                        ),
-                    ),
-                )
-                local_scale = kernel_context.atol + kernel_context.estimator_rtol_eff * scale_base
-            else:
-                local_scale = scale_override
-            normalized_err = err_vec / local_scale
-            if kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim:
-                density_slice = normalized_err[:kernel_context.density_size]
-                pressure_slice = normalized_err[
-                    kernel_context.density_size:kernel_context.density_size + kernel_context.pressure_size
-                ]
-                er_slice = normalized_err[
-                    kernel_context.density_size + kernel_context.pressure_size:
-                    kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size
-                ]
-                density_err_norm = jnp.where(
-                    kernel_context.density_size > 0,
-                    jnp.sqrt(jnp.mean(density_slice * density_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
-                    jnp.asarray(0.0, dtype=kernel_context.dtype),
-                )
-                pressure_err_norm = jnp.where(
-                    kernel_context.pressure_size > 0,
-                    jnp.sqrt(jnp.mean(pressure_slice * pressure_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
-                    jnp.asarray(0.0, dtype=kernel_context.dtype),
-                )
-                er_err_norm = jnp.where(
-                    kernel_context.er_size > 0,
-                    jnp.sqrt(jnp.mean(er_slice * er_slice) + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)),
-                    jnp.asarray(0.0, dtype=kernel_context.dtype),
-                )
-            else:
-                density_err_norm = jnp.asarray(0.0, dtype=kernel_context.dtype)
-                pressure_err_norm = err_norm
-                er_err_norm = jnp.asarray(0.0, dtype=kernel_context.dtype)
-            err_norm = _solver_error_norm(
-                err_vec,
-                flat_y,
-                flat_next,
-                kernel_context.atol,
-                kernel_context.rtol,
-                scale_mode=kernel_context.error_scale_mode,
-                rtol_eff=kernel_context.estimator_rtol_eff,
-                scale_override=scale_override,
-            )
-            if kernel_context.error_scale_mode == "ntss_block_rms" and (
-                kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
-            ):
-                active_block_squares = jnp.stack(
-                    [
-                        jnp.where(kernel_context.density_size > 0, density_err_norm * density_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
-                        jnp.where(kernel_context.pressure_size > 0, pressure_err_norm * pressure_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
-                        jnp.where(kernel_context.er_size > 0, er_err_norm * er_err_norm, jnp.asarray(0.0, dtype=kernel_context.dtype)),
-                    ],
-                    axis=0,
-                )
-                active_block_count = (
-                    jnp.where(kernel_context.density_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
-                    + jnp.where(kernel_context.pressure_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
-                    + jnp.where(kernel_context.er_size > 0, jnp.asarray(1.0, dtype=kernel_context.dtype), jnp.asarray(0.0, dtype=kernel_context.dtype))
-                )
-                err_norm = jnp.sqrt(
-                    jnp.sum(active_block_squares) / jnp.maximum(active_block_count, jnp.asarray(1.0, dtype=kernel_context.dtype))
-                    + jnp.asarray(1.0e-30, dtype=kernel_context.dtype)
-                )
-            theta_safe = jnp.clip(theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
-            fallback_newton_shrink = jnp.clip(
-                kernel_context.newton_shrink_num / theta_safe,
-                kernel_context.newton_shrink_min,
-                kernel_context.newton_shrink_max,
-            )
-            newton_shrink = jnp.where(
-                converged,
-                jnp.asarray(1.0, dtype=dtype),
-                jnp.where(slow_contraction_final, shrink_suggest_final, fallback_newton_shrink),
-            )
-            jacobian_out = jacobian_ref
-            cache_valid_out = jnp.asarray(True)
-            cache_dt_out = h_value
-            cache_age_out = jnp.where(reuse_linearization, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
-            return (
-                flat_next,
-                err_norm,
-                converged,
-                z_final,
-                theta_final,
-                iter_final,
-                final_residual_norm,
-                delta_norm_final,
-                slow_contraction_final,
-                residual_blowup_final,
-                newton_nonfinite_final,
-                jacobian_out,
-                cache_valid_out,
-                cache_dt_out,
-                cache_age_out,
-                real_lu_out,
-                real_piv_out,
-                complex_lu_out,
-                complex_piv_out,
-                newton_shrink,
-                diverged_final,
-                nonfinite_stage_state,
-                nonfinite_stage_residual,
-                finite_f0,
-                finite_z0,
-                finite_initial_residual,
-                density_err_norm,
-                pressure_err_norm,
-                er_err_norm,
-                lagged_response,
-                lagged_reference_y,
-                lagged_response_reused,
-                jacobian_reused,
-            )
-
         def _accepted_step_attempt_impl(carry_in: _RadauAcceptedStepCarry):
             attempt_context = _RadauAcceptedStepAttemptContext(
                 t_final=t_final,
@@ -3447,7 +3448,6 @@ class RADAUSolver(_RadauSolverConfig):
             )
 
             return _execute_radau_accepted_step_attempt(
-                _single_step_custom,
                 kernel_context,
                 physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_in),
