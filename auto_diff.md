@@ -989,3 +989,282 @@ The plan is:
   rules
 - use Diffrax only as a benchmark reference, not as the default solution
 - aim for a NEOPAX-specific gradient path that is both reliable and efficient
+
+## Updated design decision after diagnostics
+
+This section supersedes the exploratory replay-diagnostic direction above.
+
+### What the benchmark established
+
+The current benchmark evidence is already sufficient to change direction:
+
+- the one-step lagged exact-runtime NTX transport map differentiates very well
+- the full adaptive rollout does not agree with naive AD-vs-FD checks
+- the full-rollout FD reference is unstable across FD step size
+- nearby parameter values drift onto different accepted-time / accepted-`dt`
+  histories
+
+So the main issue is not local differentiability. The main issue is that the
+full adaptive trace is not the right object to differentiate naively.
+
+### Revised implementation target
+
+The target should now be stated more precisely:
+
+- keep the current production forward solve and its adaptive retry/accept logic
+- build sensitivities around the accepted transport evolution
+- do not make rejected trial steps the primary differentiated object
+
+In other words, the design goal is not "identical accepted history only". The
+design goal is:
+
+- an accepted-step / accepted-rollout backward path for the production solve
+
+### Recommended NEOPAX implementation path
+
+The next implementation work should be:
+
+1. Define one accepted transport step as the principal differentiated object.
+   This step should include the solver-side carry that is genuinely needed by
+   the realized accepted update, rather than just the physical `TransportState`.
+
+2. Add a custom JVP or VJP for that accepted step map.
+   The backward rule should be expressed in terms of the accepted step map, not
+   in terms of every rejected nonlinear sub-attempt.
+
+3. Compose accepted-step rules into a rollout-level backward path.
+   This can use checkpointing or replay over accepted steps, but the replay
+   should be based on solver-relevant carry, not just saved physical state.
+
+4. Make controller policy explicit.
+   The adaptive controller remains active in the forward solve, but its
+   accept/reject branch logic should not be treated as the central smooth
+   object in the backward pass.
+
+### Diffrax / Kvaerno5 comparison
+
+Diffrax is a useful reference because it separates four concerns that NEOPAX
+should also separate:
+
+- solver step definition
+- nonlinear/root-finding method inside the implicit step
+- adaptive step-size controller
+- adjoint / autodiff strategy
+
+From the Diffrax documentation:
+
+- `RecursiveCheckpointAdjoint` is the default differentiation strategy and is
+  described as differentiating the numerical solution directly while using
+  online checkpointing to control memory
+- `ForwardMode` and `DirectAdjoint` are available when different AD behavior is
+  required
+- implicit solvers such as `Kvaerno5` take an explicit root finder
+- Diffrax provides `VeryChord` plus tolerance plumbing via
+  `with_stepsize_controller_tols(...)`
+- the abstract solver API has an explicit evolving solver state passed through
+  `init(...)` and `step(...)`
+
+This suggests a good comparison point:
+
+- Diffrax does not win by pretending rejected steps do not exist
+- Diffrax wins by making the solve, solver state, controller, and adjoint
+  policy explicit and solver-aware
+
+That is the useful lesson for NEOPAX.
+
+### What NEOPAX should copy from Diffrax
+
+NEOPAX should copy the separation of concepts:
+
+- accepted step map
+- solver carry/state
+- nonlinear solve policy
+- controller policy
+- sensitivity policy
+
+NEOPAX should not blindly copy the exact implementation, because our problem is
+more structured:
+
+- transport state has known physics structure
+- NTX already exposes solve-boundary derivative contracts
+- we can likely save less state than a general-purpose ODE framework
+- we can choose transport-specific linearizations instead of generic ones
+
+### Practical next step
+
+The next real engineering task should be:
+
+- identify the smallest solver-carry object needed to define a faithful
+  accepted transport step in NEOPAX
+- then design the custom accepted-step derivative rule around that object
+
+Only after that should we benchmark against Diffrax/Kvaerno5 to compare:
+
+- gradient quality
+- memory
+- wall time
+
+The purpose of the Diffrax comparison should be benchmarking and design
+calibration, not replacement-by-default.
+
+### Candidate minimal accepted-step carry for current Radau path
+
+Looking at the current custom Radau implementation, the accepted-step object is
+not just `(t_n, Y_n, dt_n)`. The current forward step also depends on a small
+amount of solver carry that influences:
+
+- predictor quality
+- Jacobian reuse
+- lagged-response reuse
+- adaptive controller evolution
+
+For the current implementation, the smallest *faithful* accepted-step carry
+appears to split into two groups.
+
+#### Group A: forward-essential carry
+
+These fields affect the realized accepted step or the next proposed step size,
+and so are the current best candidates for the accepted-step state that should
+be formalized:
+
+- physical step state:
+  - `t`
+  - `y`
+  - `dt`
+
+- controller memory:
+  - `prev_error`
+  - `recent_reject_count`
+  - `regrowth_cooldown`
+  - `easy_growth_streak`
+
+- predictor / Newton warm-start memory:
+  - `prev_stages`
+  - `prev_dt`
+  - `prev_theta_final`
+  - `prev_newton_iter_count`
+
+- lagged-response reuse state:
+  - `lagged_response_cache`
+  - `lagged_response_valid`
+  - `lagged_reference_y`
+
+- Jacobian / factorization reuse state:
+  - `jacobian`
+  - `cache_valid`
+  - `cache_dt`
+  - `cache_age`
+  - `real_lu`
+  - `real_piv`
+  - `complex_lu`
+  - `complex_piv`
+
+This is the current practical definition of the "accepted-step carry" in the
+production solver.
+
+#### Group B: diagnostic / reporting outputs
+
+These are useful for analysis and benchmarking, but they should not be treated
+as part of the core accepted-step state:
+
+- accepted / failed flags
+- fail code
+- error norm
+- Newton iteration count
+- final residual norm
+- final delta norm
+- `theta_final`
+- slow-contraction / blowup / nonfinite diagnostics
+
+They are valuable benchmark outputs, but not primary candidates for the state
+that needs to be carried through the differentiated rollout.
+
+### Immediate design implication
+
+The next design step should not be "wrap the whole solver trace in a custom
+VJP". It should be:
+
+1. formalize a first-class accepted-step carry object using Group A
+2. define the accepted step map on that carry object
+3. decide which parts of Group A are truly required by the backward rule, and
+   which can remain forward-only acceleration state
+
+That gives us a concrete path to reduce the problem further:
+
+- first define the faithful accepted-step boundary
+- then shrink the backward state from there, instead of guessing too early
+
+### First candidate backward payload
+
+A useful first cut is to distinguish between:
+
+- exact accepted-step replay state
+- recomputable linearization state
+- forward-only controller state
+
+For the current Radau implementation, the first conservative candidate for a
+one-step backward payload is:
+
+- `t_n`
+- `y_n`
+- accepted `dt_n`
+- `prev_stages`
+- `prev_dt`
+- `prev_theta_final`
+- `prev_newton_iter_count`
+- `lagged_response_cache`
+- `lagged_response_valid`
+- `lagged_reference_y`
+- accepted output state `y_{n+1}`
+
+Rationale:
+
+- this is enough to replay the accepted-step attempt with the same predictor
+  and lagged-response context
+- it avoids storing controller bookkeeping that mainly affects future step-size
+  proposals
+- it avoids storing Jacobian/factorization caches that can be recomputed
+
+#### Candidate recompute set
+
+The following fields should be treated as recomputable by default:
+
+- `jacobian`
+- `cache_valid`
+- `cache_dt`
+- `cache_age`
+- `real_lu`
+- `real_piv`
+- `complex_lu`
+- `complex_piv`
+- stage-level diagnostics
+- error norms
+- Newton residual summaries
+
+These are useful for speed in the forward solve, but they are poor first
+choices for minimal backward storage.
+
+#### Candidate forward-only controller state
+
+The following fields should initially be treated as forward-only, unless a
+later rollout-level backward design proves otherwise:
+
+- `prev_error`
+- `recent_reject_count`
+- `regrowth_cooldown`
+- `easy_growth_streak`
+
+These primarily control future timestep proposals and regrowth behavior. They
+matter for the production adaptive rollout, but they are not obvious
+requirements for the local accepted-step derivative.
+
+### Recommended next implementation move
+
+The next implementation step should be:
+
+1. introduce a candidate accepted-step backward payload object in code
+2. populate it from the current accepted-step carry/result boundary
+3. keep it unused by the solver for now
+
+That gives us a concrete object to optimize before we commit to a custom
+JVP/VJP rule.

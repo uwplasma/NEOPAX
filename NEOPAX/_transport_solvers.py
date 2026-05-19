@@ -882,11 +882,10 @@ def _make_radau_initial_step_state(
     lagged_reference_y,
 ):
     state_dim = flat_state0.shape[0]
-    return _RadauStepState(
+    carry0 = _RadauAcceptedStepCarry(
         t=t0,
         y=flat_state0,
         dt=base_dt,
-        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
         prev_error=jnp.asarray(1.0, dtype=dtype),
         prev_stages=jnp.tile(initial_rhs, num_stages),
         prev_dt=jnp.asarray(0.0, dtype=dtype),
@@ -906,6 +905,10 @@ def _make_radau_initial_step_state(
         complex_piv=complex_piv0,
         prev_theta_final=jnp.asarray(0.0, dtype=dtype),
         prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+    )
+    return _radau_step_state_from_carry(
+        carry0,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
     )
 
 
@@ -2166,6 +2169,87 @@ class _RadauSolverConfig(TransportSolver):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepCarry:
+    t: Any
+    y: Any
+    dt: Any
+    prev_error: Any
+    prev_stages: Any
+    prev_dt: Any
+    recent_reject_count: Any
+    regrowth_cooldown: Any
+    easy_growth_streak: Any
+    lagged_response_cache: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    real_lu: Any
+    real_piv: Any
+    complex_lu: Any
+    complex_piv: Any
+    prev_theta_final: Any
+    prev_newton_iter_count: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepAttemptResult:
+    carry_after_attempt: Any
+    trial_dt: Any
+    trial_y: Any
+    err_norm: Any
+    converged: Any
+    stage_history: Any
+    jacobian_out: Any
+    cache_valid_out: Any
+    cache_dt_out: Any
+    cache_age_out: Any
+    real_lu_out: Any
+    real_piv_out: Any
+    complex_lu_out: Any
+    complex_piv_out: Any
+    newton_shrink: Any
+    diverged_final: Any
+    nonfinite_stage_state: Any
+    nonfinite_stage_residual: Any
+    finite_f0: Any
+    finite_z0: Any
+    finite_initial_residual: Any
+    newton_iter_count: Any
+    final_residual_norm: Any
+    final_delta_norm: Any
+    theta_final: Any
+    slow_contraction_final: Any
+    residual_blowup_final: Any
+    newton_nonfinite_final: Any
+    density_err_norm: Any
+    pressure_err_norm: Any
+    er_err_norm: Any
+    lagged_response_reused: Any
+    jacobian_reused: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepBackwardPayloadCandidate:
+    t_start: Any
+    y_start: Any
+    dt: Any
+    prev_stages: Any
+    prev_dt: Any
+    prev_theta_final: Any
+    prev_newton_iter_count: Any
+    lagged_response_cache: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+    y_end: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauStepState:
     t: Any
     y: Any
@@ -2190,6 +2274,115 @@ class _RadauStepState:
     complex_piv: Any
     prev_theta_final: Any
     prev_newton_iter_count: Any
+
+
+def _radau_carry_from_step_state(step_state: "_RadauStepState") -> _RadauAcceptedStepCarry:
+    """Extract carry needed to describe the realized accepted Radau step."""
+    return _RadauAcceptedStepCarry(
+        t=step_state.t,
+        y=step_state.y,
+        dt=step_state.dt,
+        prev_error=step_state.prev_error,
+        prev_stages=step_state.prev_stages,
+        prev_dt=step_state.prev_dt,
+        recent_reject_count=step_state.recent_reject_count,
+        regrowth_cooldown=step_state.regrowth_cooldown,
+        easy_growth_streak=step_state.easy_growth_streak,
+        lagged_response_cache=step_state.lagged_response_cache,
+        lagged_response_valid=step_state.lagged_response_valid,
+        lagged_reference_y=step_state.lagged_reference_y,
+        jacobian=step_state.jacobian,
+        cache_valid=step_state.cache_valid,
+        cache_dt=step_state.cache_dt,
+        cache_age=step_state.cache_age,
+        real_lu=step_state.real_lu,
+        real_piv=step_state.real_piv,
+        complex_lu=step_state.complex_lu,
+        complex_piv=step_state.complex_piv,
+        prev_theta_final=step_state.prev_theta_final,
+        prev_newton_iter_count=step_state.prev_newton_iter_count,
+    )
+
+
+def _radau_step_state_from_carry(carry: _RadauAcceptedStepCarry, *, status) -> _RadauStepState:
+    """Rebuild full step state from carry plus controller status bookkeeping."""
+    return _RadauStepState(
+        t=carry.t,
+        y=carry.y,
+        dt=carry.dt,
+        status=status,
+        prev_error=carry.prev_error,
+        prev_stages=carry.prev_stages,
+        prev_dt=carry.prev_dt,
+        recent_reject_count=carry.recent_reject_count,
+        regrowth_cooldown=carry.regrowth_cooldown,
+        easy_growth_streak=carry.easy_growth_streak,
+        lagged_response_cache=carry.lagged_response_cache,
+        lagged_response_valid=carry.lagged_response_valid,
+        lagged_reference_y=carry.lagged_reference_y,
+        jacobian=carry.jacobian,
+        cache_valid=carry.cache_valid,
+        cache_dt=carry.cache_dt,
+        cache_age=carry.cache_age,
+        real_lu=carry.real_lu,
+        real_piv=carry.real_piv,
+        complex_lu=carry.complex_lu,
+        complex_piv=carry.complex_piv,
+        prev_theta_final=carry.prev_theta_final,
+        prev_newton_iter_count=carry.prev_newton_iter_count,
+    )
+
+
+def _radau_backward_payload_candidate(
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_result: _RadauAcceptedStepAttemptResult,
+) -> _RadauAcceptedStepBackwardPayloadCandidate:
+    """Candidate minimal payload for future accepted-step backward rules.
+
+    This is intentionally conservative: it keeps predictor and lagged-response
+    context, but excludes controller bookkeeping and recomputable Jacobian/LU
+    caches.
+    """
+    return _RadauAcceptedStepBackwardPayloadCandidate(
+        t_start=carry_in.t,
+        y_start=carry_in.y,
+        dt=attempt_result.trial_dt,
+        prev_stages=carry_in.prev_stages,
+        prev_dt=carry_in.prev_dt,
+        prev_theta_final=carry_in.prev_theta_final,
+        prev_newton_iter_count=carry_in.prev_newton_iter_count,
+        lagged_response_cache=carry_in.lagged_response_cache,
+        lagged_response_valid=carry_in.lagged_response_valid,
+        lagged_reference_y=carry_in.lagged_reference_y,
+        y_end=attempt_result.trial_y,
+    )
+
+
+def _radau_carry_with_forward_only_jvp_fields(
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepCarry:
+    """Mask clearly forward-only or recomputable carry fields in the JVP path.
+
+    This is the first conservative reduction of the differentiated object:
+    controller bookkeeping and Jacobian/LU reuse state remain active in the
+    forward solve, but do not contribute tangents through the accepted-step
+    JVP boundary.
+    """
+    return dataclasses.replace(
+        carry,
+        prev_error=jax.lax.stop_gradient(carry.prev_error),
+        recent_reject_count=jax.lax.stop_gradient(carry.recent_reject_count),
+        regrowth_cooldown=jax.lax.stop_gradient(carry.regrowth_cooldown),
+        easy_growth_streak=jax.lax.stop_gradient(carry.easy_growth_streak),
+        jacobian=jax.lax.stop_gradient(carry.jacobian),
+        cache_valid=jax.lax.stop_gradient(carry.cache_valid),
+        cache_dt=jax.lax.stop_gradient(carry.cache_dt),
+        cache_age=jax.lax.stop_gradient(carry.cache_age),
+        real_lu=jax.lax.stop_gradient(carry.real_lu),
+        real_piv=jax.lax.stop_gradient(carry.real_piv),
+        complex_lu=jax.lax.stop_gradient(carry.complex_lu),
+        complex_piv=jax.lax.stop_gradient(carry.complex_piv),
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -2925,11 +3118,8 @@ class RADAUSolver(_RadauSolverConfig):
                 jacobian_reused,
             )
 
-        def _attempt_step_lean(step_state: _RadauStepState):
-            status = step_state.status
-            fail_code = status[STATUS_FAIL_CODE]
-            n_accepted = status[STATUS_N_ACCEPTED]
-            trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
+        def _accepted_step_attempt_impl(carry_in: _RadauAcceptedStepCarry):
+            trial_dt = jnp.minimum(carry_in.dt, t_final - carry_in.t)
             (
                 trial_y, err_norm, converged, stage_history, theta_final,
                 newton_iter_count, final_residual_norm, final_delta_norm,
@@ -2941,26 +3131,23 @@ class RADAUSolver(_RadauSolverConfig):
                 lagged_response_out, lagged_reference_y_out, lagged_response_reused,
                 jacobian_reused,
             ) = _single_step_custom(
-                step_state.y, step_state.t, trial_dt, step_state.prev_stages, step_state.prev_dt,
-                step_state.prev_theta_final, step_state.prev_newton_iter_count,
-                step_state.jacobian, step_state.cache_valid, step_state.cache_dt, step_state.cache_age,
-                step_state.real_lu, step_state.real_piv, step_state.complex_lu, step_state.complex_piv,
-                step_state.lagged_response_cache, step_state.lagged_response_valid, step_state.lagged_reference_y,
+                carry_in.y, carry_in.t, trial_dt, carry_in.prev_stages, carry_in.prev_dt,
+                carry_in.prev_theta_final, carry_in.prev_newton_iter_count,
+                carry_in.jacobian, carry_in.cache_valid, carry_in.cache_dt, carry_in.cache_age,
+                carry_in.real_lu, carry_in.real_piv, carry_in.complex_lu, carry_in.complex_piv,
+                carry_in.lagged_response_cache, carry_in.lagged_response_valid, carry_in.lagged_reference_y,
             )
-            step_state = dataclasses.replace(
-                step_state,
+            carry_after_attempt = dataclasses.replace(
+                carry_in,
                 lagged_response_cache=lagged_response_out,
                 lagged_response_valid=jnp.asarray(use_transport_lagged_response),
                 lagged_reference_y=lagged_reference_y_out,
             )
-            step_state_next, step_info_next = _apply_radau_lean_timestep_controller(
-                step_state=step_state,
+            return _RadauAcceptedStepAttemptResult(
+                carry_after_attempt=carry_after_attempt,
                 trial_dt=trial_dt,
                 trial_y=trial_y,
                 err_norm=err_norm,
-                density_err_norm=density_err_norm,
-                pressure_err_norm=pressure_err_norm,
-                er_err_norm=er_err_norm,
                 converged=converged,
                 stage_history=stage_history,
                 jacobian_out=jacobian_out,
@@ -2982,11 +3169,73 @@ class RADAUSolver(_RadauSolverConfig):
                 final_residual_norm=final_residual_norm,
                 final_delta_norm=final_delta_norm,
                 theta_final=theta_final,
-                slow_contraction=slow_contraction_final,
-                residual_blowup=residual_blowup_final,
-                newton_nonfinite=newton_nonfinite_final,
-                lagged_reused=lagged_response_reused,
+                slow_contraction_final=slow_contraction_final,
+                residual_blowup_final=residual_blowup_final,
+                newton_nonfinite_final=newton_nonfinite_final,
+                density_err_norm=density_err_norm,
+                pressure_err_norm=pressure_err_norm,
+                er_err_norm=er_err_norm,
+                lagged_response_reused=lagged_response_reused,
                 jacobian_reused=jacobian_reused,
+            )
+
+        @jax.custom_jvp
+        def _accepted_step_attempt(carry_in: _RadauAcceptedStepCarry):
+            return _accepted_step_attempt_impl(carry_in)
+
+        @_accepted_step_attempt.defjvp
+        def _accepted_step_attempt_jvp(primals, tangents):
+            """Selective JVP hook for the accepted-step boundary.
+
+            Keep the physically meaningful accepted-step inputs live, while
+            treating controller bookkeeping and recomputable Jacobian/LU caches
+            as forward-only state in the tangent path.
+            """
+            (carry_in,) = primals
+            carry_for_jvp = _radau_carry_with_forward_only_jvp_fields(carry_in)
+            return jax.jvp(_accepted_step_attempt_impl, (carry_for_jvp,), tangents)
+
+        def _attempt_step_lean(step_state: _RadauStepState):
+            status = step_state.status
+            fail_code = status[STATUS_FAIL_CODE]
+            n_accepted = status[STATUS_N_ACCEPTED]
+            carry_in = _radau_carry_from_step_state(step_state)
+            attempt_result = _accepted_step_attempt(carry_in)
+            step_state = _radau_step_state_from_carry(attempt_result.carry_after_attempt, status=status)
+            step_state_next, step_info_next = _apply_radau_lean_timestep_controller(
+                step_state=step_state,
+                trial_dt=attempt_result.trial_dt,
+                trial_y=attempt_result.trial_y,
+                err_norm=attempt_result.err_norm,
+                density_err_norm=attempt_result.density_err_norm,
+                pressure_err_norm=attempt_result.pressure_err_norm,
+                er_err_norm=attempt_result.er_err_norm,
+                converged=attempt_result.converged,
+                stage_history=attempt_result.stage_history,
+                jacobian_out=attempt_result.jacobian_out,
+                cache_valid_out=attempt_result.cache_valid_out,
+                cache_dt_out=attempt_result.cache_dt_out,
+                cache_age_out=attempt_result.cache_age_out,
+                real_lu_out=attempt_result.real_lu_out,
+                real_piv_out=attempt_result.real_piv_out,
+                complex_lu_out=attempt_result.complex_lu_out,
+                complex_piv_out=attempt_result.complex_piv_out,
+                newton_shrink=attempt_result.newton_shrink,
+                diverged_final=attempt_result.diverged_final,
+                nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+                nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+                finite_f0=attempt_result.finite_f0,
+                finite_z0=attempt_result.finite_z0,
+                finite_initial_residual=attempt_result.finite_initial_residual,
+                newton_iter_count=attempt_result.newton_iter_count,
+                final_residual_norm=attempt_result.final_residual_norm,
+                final_delta_norm=attempt_result.final_delta_norm,
+                theta_final=attempt_result.theta_final,
+                slow_contraction=attempt_result.slow_contraction_final,
+                residual_blowup=attempt_result.residual_blowup_final,
+                newton_nonfinite=attempt_result.newton_nonfinite_final,
+                lagged_reused=attempt_result.lagged_response_reused,
+                jacobian_reused=attempt_result.jacobian_reused,
                 fail_code=fail_code,
                 n_accepted=n_accepted,
                 dtype=dtype,
