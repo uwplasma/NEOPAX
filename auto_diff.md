@@ -1815,18 +1815,43 @@ So the current primitive is no longer "explicit inputs plus lambda adapters".
 It is now an explicit module-scope stage-subsolve path end to end. That is the
 right shape for the next real AD experiment.
 
-The next live experiment is now attached exactly there:
+We also tested the next live custom-AD experiment exactly there:
 
 - `_radau_run_stage_subsolve_autodiff(...)`
 
-with its current first tangent lift via:
+with its first tangent lift via:
 
 - `_radau_build_stage_subsolve_tangent_result(...)`
 
-So the first active custom derivative is no longer aimed at:
+That experiment still failed under the real benchmark execution path with the
+same `DynamicJaxprTracer` constant-handler failure.
 
-- the adaptive loop
-- the accepted-step wrapper
-- the step-control wrapper
+So the updated conclusion is:
 
-It is aimed at the explicit Radau stage-subsolve primitive itself.
+- even the explicit stage-subsolve primitive is **not** currently a legal live
+  `custom_jvp` attachment when invoked from inside the present
+  `solve -> jit(step_fn) -> lax.cond(...)` machinery
+
+This is an important negative result. It means:
+
+- the stage-subsolve remains the right mathematical object
+- but the custom derivative still cannot be attached from *inside* the current
+  compiled adaptive solve path
+
+So the next Radau-native experiment should be split in two:
+
+1. **standalone AD-facing subsolve validation**
+- attach the custom derivative to the explicit stage-subsolve primitive
+- validate it outside the production adaptive loop
+
+2. **production-path reintegration**
+- only after the standalone subsolve derivative is validated
+- decide how to reintroduce it into the larger Radau solve architecture
+
+The current code now includes that standalone validation entrypoint:
+
+- `_radau_run_stage_subsolve_standalone_autodiff(...)`
+
+This is intentionally different from the earlier failed attempts because it is
+not invoked from inside the present `solve -> jit(step_fn) -> lax.cond(...)`
+machinery.

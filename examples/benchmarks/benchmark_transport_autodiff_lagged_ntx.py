@@ -42,9 +42,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX
-from NEOPAX._orchestrator import build_runtime_context, run_transport
+from NEOPAX._orchestrator import build_runtime_context, prepare_transport_solver_components, run_transport
 from NEOPAX._profiles import AnalyticalProfileModel
 from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
+from NEOPAX._transport_solvers import (
+    _build_prepared_radau_accepted_rollout,
+    _radau_prepare_stage_subsolve_inputs_from_carry,
+    _radau_run_stage_subsolve_standalone_autodiff,
+)
 
 
 DEFAULT_CONFIG = Path(
@@ -61,6 +66,12 @@ OBJECTIVE_LABELS = [
     "alpha_power_volume_average_mw_m3",
 ]
 DEFAULT_FD_SWEEP_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
+STANDALONE_SUBSOLVE_LABELS = [
+    "stage_sum",
+    "stage_l2_norm",
+    "final_residual_norm",
+    "theta_final",
+]
 
 
 def _prepare_benchmark_config(config_path: Path, *, device: str | None) -> dict[str, Any]:
@@ -489,6 +500,23 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"saved_times_equal={entry['saved_times_equal_minus_plus']} "
                 f"saved_dts_equal={entry['saved_dts_equal_minus_plus']}"
             )
+    standalone = report.get("standalone_stage_subsolve")
+    if standalone:
+        print("[autodiff-gate] standalone stage subsolve errors:")
+        for label, j_ad, j_fd, abs_err, rel_err in zip(
+            standalone["labels"],
+            standalone["gradient_autodiff"],
+            standalone["gradient_fd"],
+            standalone["gradient_absolute_error"],
+            standalone["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: "
+                f"ad={float(j_ad):.6e} "
+                f"fd={float(j_fd):.6e} "
+                f"abs_err={float(abs_err):.6e} "
+                f"rel_err={float(rel_err):.6e}"
+            )
 def _fd_step_sweep_report(
     *,
     runtime,
@@ -570,6 +598,53 @@ def _fd_step_sweep_report(
     return entries
 
 
+def _standalone_stage_subsolve_objectives_for_parameter(
+    p,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=p,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    subsolve_inputs = _radau_prepare_stage_subsolve_inputs_from_carry(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        prepared_rollout.initial_carry,
+        t_final=solver.t1,
+    )
+    subsolve_result = _radau_run_stage_subsolve_standalone_autodiff(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        subsolve_inputs,
+    )
+    return jnp.stack(
+        [
+            jnp.sum(subsolve_result.z_final),
+            jnp.linalg.norm(subsolve_result.z_final),
+            subsolve_result.final_residual_norm,
+            subsolve_result.theta_final,
+        ]
+    )
+
+
 def build_report(
     *,
     config_path: Path,
@@ -582,6 +657,7 @@ def build_report(
     one_step_diagnostic: bool,
     with_fd_step_sweep: bool,
     fd_step_sweep_multipliers: tuple[float, ...],
+    with_standalone_stage_subsolve_check: bool,
     device: str | None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
@@ -698,6 +774,38 @@ def build_report(
             step_multipliers=fd_step_sweep_multipliers,
         )
 
+    standalone_stage_subsolve = None
+    if with_standalone_stage_subsolve_check:
+        standalone_objective_fn = lambda p: _standalone_stage_subsolve_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        )
+        standalone_ad = jax.jacfwd(standalone_objective_fn)(jnp.asarray(baseline_value))
+        standalone_minus = np.asarray(
+            jax.device_get(standalone_objective_fn(jnp.asarray(minus_value))),
+            dtype=float,
+        )
+        standalone_plus = np.asarray(
+            jax.device_get(standalone_objective_fn(jnp.asarray(plus_value))),
+            dtype=float,
+        )
+        standalone_fd = (standalone_plus - standalone_minus) / (2.0 * fd_step)
+        standalone_ad_np = np.asarray(jax.device_get(standalone_ad), dtype=float)
+        standalone_abs_err = np.abs(standalone_ad_np - standalone_fd)
+        standalone_rel_err = standalone_abs_err / np.maximum(np.abs(standalone_fd), 1.0e-10)
+        standalone_stage_subsolve = {
+            "labels": STANDALONE_SUBSOLVE_LABELS,
+            "gradient_autodiff": standalone_ad_np.tolist(),
+            "gradient_fd": standalone_fd.tolist(),
+            "gradient_absolute_error": standalone_abs_err.tolist(),
+            "gradient_relative_error": standalone_rel_err.tolist(),
+            "max_relative_error": float(np.max(standalone_rel_err)),
+        }
+
     report = {
         "config_path": str(config_path),
         "one_step_diagnostic": bool(one_step_diagnostic),
@@ -716,6 +824,7 @@ def build_report(
         "sweep_values": sweep_values.tolist(),
         "sweep_objectives": sweep_objectives.tolist(),
         "fd_step_sweep": fd_step_sweep,
+        "standalone_stage_subsolve": standalone_stage_subsolve,
         "solver_path": {
             "baseline": baseline_diag,
             "fd_minus": minus_diag,
@@ -773,6 +882,11 @@ def main() -> None:
         action="store_true",
         help="Stop after one accepted transport step to isolate local AD-vs-FD behavior.",
     )
+    parser.add_argument(
+        "--with-standalone-stage-subsolve-check",
+        action="store_true",
+        help="Run an additive AD-vs-FD check on the standalone Radau stage-subsolve primitive.",
+    )
     parser.add_argument("--outdir", type=Path, default=Path("outputs/autodiff_transport_lagged_ntx"))
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
@@ -788,6 +902,7 @@ def main() -> None:
         one_step_diagnostic=args.one_step_diagnostic,
         with_fd_step_sweep=args.with_fd_step_sweep,
         fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
+        with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
         device=args.device,
     )
 

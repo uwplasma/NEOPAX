@@ -3187,6 +3187,127 @@ def _radau_stage_subsolve_linear_solve(
     )
 
 
+def _radau_prepare_stage_subsolve_inputs_from_carry(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    *,
+    t_final,
+) -> _RadauStageSubsolveInputs:
+    """Prepare explicit stage-subsolve inputs from a real Radau carry.
+
+    This is the standalone validation bridge between the production Radau setup
+    and the AD-facing stage-subsolve primitive.
+    """
+    flat_y = carry_in.y
+    t_value = carry_in.t
+    prev_stages = carry_in.prev_stages
+    prev_dt = carry_in.prev_dt
+    prev_theta_final = carry_in.prev_theta_final
+    prev_newton_iter_count = carry_in.prev_newton_iter_count
+    jacobian_cache = carry_in.jacobian
+    cache_valid = carry_in.cache_valid
+    cache_dt = carry_in.cache_dt
+    real_lu_cache = carry_in.real_lu
+    real_piv_cache = carry_in.real_piv
+    complex_lu_cache = carry_in.complex_lu
+    complex_piv_cache = carry_in.complex_piv
+    lagged_response, _lagged_reference_y, _lagged_response_reused = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+    trial_dt = jnp.minimum(carry_in.dt, jnp.asarray(t_final, dtype=kernel_context.dtype) - t_value)
+
+    def _rhs_eval(t_eval, y_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            y_eval,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    def _rhs_eval_at_current_time(y_eval):
+        return _rhs_eval(t_value, y_eval)
+
+    f0 = _rhs_eval(t_value, flat_y)
+    z0 = _make_radau_stage_predictor(
+        f0,
+        prev_stages,
+        prev_dt,
+        trial_dt,
+        kernel_context.c,
+        kernel_context.dtype,
+        density_size=kernel_context.density_size,
+        pressure_size=kernel_context.pressure_size,
+        er_size=kernel_context.er_size,
+        prev_theta_final=prev_theta_final,
+        prev_newton_iter_count=prev_newton_iter_count,
+        predictor_mode=kernel_context.predictor_mode,
+    )
+    jacobian_dt_scale = jnp.maximum(
+        jnp.abs(cache_dt),
+        jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
+    )
+    dt_close = jnp.abs(trial_dt - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
+    reuse_linearization = jnp.logical_and(
+        jnp.logical_and(cache_valid, dt_close),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+
+    def _reuse_linearization(_):
+        return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+    def _recompute_linearization(_):
+        jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+        h_jacobian = trial_dt * jacobian_ref
+        real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
+        real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+        complex_dense_all = jnp.transpose(
+            kernel_context.identity_2[None, :, :, None, None] * kernel_context.identity_n[None, None, None, :, :]
+            - kernel_context.radau_complex_blocks[:, :, :, None, None] * h_jacobian[None, None, None, :, :],
+            (0, 1, 3, 2, 4),
+        ).reshape((kernel_context.num_complex_pairs, kernel_context.complex_dim, kernel_context.complex_dim))
+
+        def _factor_pair(i, carry):
+            lu_all, piv_all = carry
+            lu_i, piv_i = jax.scipy.linalg.lu_factor(complex_dense_all[i])
+            lu_all = lu_all.at[i].set(lu_i)
+            piv_all = piv_all.at[i].set(piv_i)
+            return lu_all, piv_all
+
+        complex_lu, complex_piv = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _factor_pair,
+            (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
+        )
+        return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
+
+    jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+        reuse_linearization,
+        _reuse_linearization,
+        _recompute_linearization,
+        operand=None,
+    )
+    return _radau_build_stage_subsolve_inputs(
+        flat_y=flat_y,
+        t_value=t_value,
+        h_value=trial_dt,
+        z0=z0,
+        f0=f0,
+        jacobian_ref=jacobian_ref,
+        lagged_response=lagged_response,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+    )
+
+
 def _radau_build_stage_subsolve_inputs(
     *,
     flat_y,
@@ -3317,12 +3438,18 @@ def _radau_run_stage_subsolve_with_approx_tangent(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 1))
-def _radau_run_stage_subsolve_autodiff(
+def _radau_run_stage_subsolve_standalone_autodiff(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     inputs: _RadauStageSubsolveInputs,
 ) -> _RadauStageSubsolveResult:
-    """Autodiff wrapper for the explicit Radau stage-subsolve primitive."""
+    """Standalone AD-facing Radau stage-subsolve primitive.
+
+    This wrapper is intentionally *not* used by the production adaptive solve
+    path. It exists so we can validate the Radau-native custom derivative on
+    the mathematically meaningful stage subsolve outside the current
+    `solve -> jit(step_fn) -> lax.cond(...)` machinery.
+    """
     return _radau_run_stage_subsolve(
         kernel_context,
         physics_context,
@@ -3330,8 +3457,8 @@ def _radau_run_stage_subsolve_autodiff(
     )
 
 
-@_radau_run_stage_subsolve_autodiff.defjvp
-def _radau_run_stage_subsolve_autodiff_jvp(
+@_radau_run_stage_subsolve_standalone_autodiff.defjvp
+def _radau_run_stage_subsolve_standalone_autodiff_jvp(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     primals,
@@ -3362,7 +3489,7 @@ def _radau_run_stage_subsolve_from_inputs(
     This gives the future custom derivative rule a cleaner, closure-light
     primitive target than the full accepted-step or adaptive-loop wrapper.
     """
-    return _radau_run_stage_subsolve_autodiff(
+    return _radau_run_stage_subsolve(
         kernel_context,
         physics_context,
         inputs,

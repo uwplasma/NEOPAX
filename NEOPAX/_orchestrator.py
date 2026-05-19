@@ -669,7 +669,18 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     return runtime, state
 
 
-def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
+def prepare_transport_solver_components(
+    config: dict,
+    runtime: RuntimeContext,
+    state: TransportState,
+) -> dict[str, Any]:
+    """Build the reusable transport solve components without executing solve.
+
+    This is a forward-neutral extraction of the setup portion of
+    `run_transport(...)`. It is intended for tooling and diagnostics that need
+    access to the exact production solver, equation system, and vector field
+    without duplicating the orchestration logic.
+    """
     from ._boundary_conditions import build_boundary_condition_model
     from ._transport_equations import ComposedEquationSystem, build_equation_system
     from ._transport_solvers import build_time_solver
@@ -718,8 +729,6 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 right_value=jnp.asarray(er_edge),
                 right_gradient=None,
             )
-        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
-            print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={er_edge}")
 
     equations_to_evolve = build_equation_system(
         config=config,
@@ -767,9 +776,29 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         er_bc_model=bc.get("Er"),
     )
     solver = build_time_solver(solver_cfg)
+    return {
+        "bc": bc,
+        "equations_to_evolve": equations_to_evolve,
+        "solver_cfg": solver_cfg,
+        "equation_system": equation_system,
+        "solver": solver,
+        "solve_state": state,
+        "solve_vector_field": equation_system.vector_field,
+    }
+
+
+def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    bc = prepared["bc"]
+    equations_to_evolve = prepared["equations_to_evolve"]
+    solver_cfg = prepared["solver_cfg"]
+    equation_system = prepared["equation_system"]
+    solver = prepared["solver"]
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
     debug_markers = bool(solver_cfg.get("debug_stage_markers", False))
     debug_disable_jit = bool(solver_cfg.get("debug_disable_jit", False))
+    if debug_markers and _resolve_er_right_boundary_mode(config, runtime.solver_parameters) == "ambipolar_edge_root" and "Er" in bc:
+        print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={float(jnp.asarray(getattr(bc['Er'], 'right_value', 0.0))):.6e}")
     if debug_markers:
         rhs_mode = solver_cfg.get(
             "theta_rhs_mode" if backend_name in {"theta", "theta_newton"} else "radau_rhs_mode",
