@@ -741,6 +741,9 @@ From the current diagnostics:
 - the full adaptive rollout is where AD-vs-FD fails
 - the full-rollout mismatch is strongly correlated with adaptive path changes
   across nearby parameter values
+- naive full-rollout central FD is unstable across FD step size
+- full-rollout accepted times and accepted `dt` sequences drift even when the
+  saved accepted-mask pattern still looks the same
 
 So the main problem is not:
 
@@ -767,6 +770,14 @@ The planning direction is:
 
 This is the key way to keep the current forward behavior while avoiding the
 worst branch-sensitivity in gradients.
+
+Important clarification:
+
+- identical accepted history is **not** the final gradient goal
+- replaying or freezing accepted history is only a diagnostic and
+  construction tool
+- the final target is an accepted-trajectory-based backward pass for the full
+  adaptive solve
 
 ### Efficiency principle
 
@@ -805,25 +816,33 @@ We continue to measure:
 
 This ensures all later AD work is judged against the real production solve.
 
-#### Stage 1: Strengthen full-rollout diagnostics
+#### Stage 1: Finish the essential full-rollout diagnostics
 
-Before changing the differentiation design, improve the diagnosis of the full
-rollout mismatch.
+At this point the main architectural conclusion is already clear:
 
-Add or keep:
+- local/one-step differentiation is sound
+- naive full adaptive trace differentiation is not the right object
 
-- FD step-size sweep for the full solve
+So only the minimum remaining diagnostics should be kept.
+
+Keep:
+
 - accepted-step count comparison
 - accepted-step size sequence comparison
-- rejected-attempt count comparison
-- possibly Newton-iteration summaries
+- final accepted-step nonlinear summary
 
 Purpose:
 
-- determine how much of the mismatch is pure FD instability
-- determine how much is branch/path divergence
+- confirm where the accepted trajectory begins to diverge
+- avoid spending more time trying to rescue naive full-rollout FD as the main
+  truth reference
 
-#### Stage 2: Freeze accepted-step sequence as a diagnostic reference
+Current status:
+
+- this stage is effectively complete for `n0`
+- the evidence already supports changing the autodiff path
+
+#### Stage 2: Accepted-history replay as a diagnostic only
 
 Add a diagnostic mode that:
 
@@ -842,7 +861,13 @@ Interpretation:
   sensitivity
 - if parity is still bad, then the issue is deeper in the accepted rollout map
 
-This is a diagnostic tool, not necessarily the final production gradient path.
+This is **not** the final production gradient definition.
+
+It is only used to answer:
+
+- whether the accepted trajectory is the right object to build the backward
+  pass around
+- and whether controller/retry branching is the dominant source of parity loss
 
 #### Stage 3: Accepted-step custom differentiation
 
@@ -868,13 +893,20 @@ This is the most important architectural shift.
 
 For the full run:
 
-- record the accepted-step sequence or enough information to replay it
-- define the backward pass on the accepted sequence
+- record the accepted-step sequence or enough information to reconstruct the
+  realized accepted trajectory
+- define the backward pass on that realized accepted trajectory
 
 This means:
 
 - rejected steps remain forward-only implementation details
 - gradients are built from the realized accepted rollout
+
+This should be understood as:
+
+- a solver-aware backward pass for the adaptive solve
+- not as a requirement that nearby parameter values always share identical
+  accepted histories
 
 This is likely the closest efficient analogue to a Diffrax-style
 solver-aware differentiation strategy, while still staying custom to NEOPAX.
@@ -937,20 +969,23 @@ Each stage should be judged on:
 
 The recommended order is:
 
-1. improve full-rollout diagnostics
-2. add fixed-accepted-sequence diagnostic mode
-3. design accepted-step custom differentiation
-4. design accepted-rollout replay differentiation
+1. finish the minimum accepted-history diagnostic
+2. design accepted-step custom differentiation
+3. design accepted-rollout accepted-trajectory differentiation
+4. make the controller-gradient policy explicit
 5. only then compare against Diffrax/Kvaerno5 as a reference point
 
 ### Short summary of the plan
 
-The plan is not to remove adaptive logic.
+The plan is not to remove adaptive logic, and not to insist that gradients are
+only meaningful when the same accepted history repeats exactly.
 
 The plan is:
 
 - keep the current adaptive forward solver
-- diagnose full-rollout path divergence carefully
-- move differentiation toward accepted-step / accepted-rollout replay rules
+- use only the minimum diagnostics needed to confirm the accepted-trajectory
+  picture
+- move differentiation toward accepted-step / accepted-trajectory backward
+  rules
 - use Diffrax only as a benchmark reference, not as the default solution
 - aim for a NEOPAX-specific gradient path that is both reliable and efficient
