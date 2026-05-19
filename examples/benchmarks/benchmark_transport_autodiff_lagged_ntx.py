@@ -1094,14 +1094,9 @@ def main() -> None:
         help="Run an additive AD-vs-FD check on a short accepted-step composition map.",
     )
     parser.add_argument(
-        "--small-step-only-check",
-        action="store_true",
-        help="Run only the short accepted-step composition check and skip the full transport benchmark solves.",
-    )
-    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
-        help="Comma-separated accepted-step counts used by --with-small-step-composition-check.",
+        help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
     )
     parser.add_argument(
         "--small-step-scale",
@@ -1113,34 +1108,23 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    if args.small_step_only_check:
-        report = build_small_step_only_report(
-            config_path=args.config,
-            parameter_name=args.parameter,
-            rel_fd_step=args.fd_rel_step,
-            abs_fd_step=args.fd_abs_step,
-            small_step_counts=_parse_float_csv(args.small_step_counts),
-            small_step_scale=args.small_step_scale,
-            device=args.device,
-        )
-    else:
-        report = build_report(
-            config_path=args.config,
-            parameter_name=args.parameter,
-            rel_fd_step=args.fd_rel_step,
-            abs_fd_step=args.fd_abs_step,
-            sweep_half_width_rel=args.sweep_half_width_rel,
-            sweep_points=args.sweep_points,
-            with_sweep=args.with_sweep,
-            one_step_diagnostic=args.one_step_diagnostic,
-            with_fd_step_sweep=args.with_fd_step_sweep,
-            fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
-            with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
-            with_small_step_composition_check=args.with_small_step_composition_check,
-            small_step_counts=_parse_float_csv(args.small_step_counts),
-            small_step_scale=args.small_step_scale,
-            device=args.device,
-        )
+    report = build_report(
+        config_path=args.config,
+        parameter_name=args.parameter,
+        rel_fd_step=args.fd_rel_step,
+        abs_fd_step=args.fd_abs_step,
+        sweep_half_width_rel=args.sweep_half_width_rel,
+        sweep_points=args.sweep_points,
+        with_sweep=args.with_sweep,
+        one_step_diagnostic=args.one_step_diagnostic,
+        with_fd_step_sweep=args.with_fd_step_sweep,
+        fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
+        with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
+        with_small_step_composition_check=args.with_small_step_composition_check,
+        small_step_counts=_parse_float_csv(args.small_step_counts),
+        small_step_scale=args.small_step_scale,
+        device=args.device,
+    )
 
     outdir = args.outdir / args.parameter
     outdir.mkdir(parents=True, exist_ok=True)
