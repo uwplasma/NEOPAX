@@ -4136,9 +4136,15 @@ def _build_prepared_radau_accepted_rollout(
     """
     args = (species,)
     kwargs: dict[str, Any] = {}
+    temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+    density_floor, temperature_floor = _extract_state_regularization(vector_field)
     flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
         state,
         species,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
     )
     dtype = flat_state0.dtype
     density0 = getattr(state, "density", None)
