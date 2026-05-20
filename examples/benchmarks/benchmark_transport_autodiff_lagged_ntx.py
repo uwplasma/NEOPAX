@@ -47,6 +47,8 @@ from NEOPAX._profiles import AnalyticalProfileModel
 from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
+    _radau_adaptive_final_state_rollout,
+    _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
     _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
@@ -252,6 +254,117 @@ def _transport_objectives_for_parameter(
     return _objective_vector(final_state, runtime)
 
 
+def _adaptive_rollout_final_state_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    use_realized_schedule_jvp: bool = False,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    if use_realized_schedule_jvp:
+        state0_static = _parameterized_initial_state(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_name=parameter_name,
+            parameter_value=jax.lax.stop_gradient(parameter_value),
+        )
+        prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+        solver = prepared_components_static["solver"]
+        solve_vector_field_static = prepared_components_static["solve_vector_field"]
+        prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0_static,
+            vector_field=solve_vector_field_static,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout_static,
+        )
+        prepared_components = prepare_transport_solver_components(config, runtime, state0)
+        solve_vector_field = prepared_components["solve_vector_field"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0,
+            vector_field=solve_vector_field,
+            species=runtime.species,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+        final_y = _radau_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+        rollout = _radau_adaptive_final_state_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+    else:
+        prepared_components = prepare_transport_solver_components(config, runtime, state0)
+        solver = prepared_components["solver"]
+        solve_vector_field = prepared_components["solve_vector_field"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0,
+            vector_field=solve_vector_field,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+        rollout = _radau_adaptive_final_state_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return final_state, rollout
+
+
+def _adaptive_rollout_objectives_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    use_realized_schedule_jvp: bool = False,
+):
+    final_state, rollout = _adaptive_rollout_final_state_for_parameter(
+        parameter_value,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=use_realized_schedule_jvp,
+    )
+    return _objective_vector(final_state, runtime), rollout
+
+
 def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> float:
     return max(abs_step, rel_step * max(abs(baseline_value), 1.0))
 
@@ -344,6 +457,28 @@ def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
         },
     }
     return diag
+
+
+def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
+    trace = rollout.trace
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
+    next_dts = np.asarray(jax.device_get(trace.next_dts), dtype=float)
+    step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+    err_norms = np.asarray(jax.device_get(trace.err_norms), dtype=float)
+    return {
+        "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count))),
+        "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count))),
+        "completed": bool(np.asarray(jax.device_get(rollout.completed))),
+        "failed": bool(np.asarray(jax.device_get(rollout.failed))),
+        "fail_code": int(np.asarray(jax.device_get(rollout.fail_code))),
+        "accepted_mask": accepted_mask[active_mask].tolist(),
+        "attempted_dts": attempted_dts[active_mask].tolist(),
+        "next_dts": next_dts[active_mask].tolist(),
+        "step_ts": step_ts[active_mask].tolist(),
+        "err_norms": err_norms[active_mask].tolist(),
+    }
 
 
 def _write_sweep_csv(
@@ -508,6 +643,44 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"accepted_equal={paths.get('accepted_mask_equal_minus_plus')} "
                 f"attempted_dts_equal={paths.get('attempted_dts_equal_minus_plus')} "
                 f"next_dts_equal={paths.get('next_dts_equal_minus_plus')}"
+            )
+        return
+
+    if report.get("realized_schedule_rollout_check"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_rollout "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        path = report.get("rollout_path", {})
+        for key in ("baseline", "fd_minus", "fd_plus"):
+            diag = path.get(key, {})
+            print(
+                f"[autodiff-gate] rollout {key}: "
+                f"attempt_count={diag.get('attempt_count')} "
+                f"accepted_count={diag.get('accepted_count')} "
+                f"completed={diag.get('completed')} "
+                f"failed={diag.get('failed')} "
+                f"fail_code={diag.get('fail_code')}"
+            )
+            print(
+                f"[autodiff-gate] rollout {key} path: "
+                f"accepted_mask={diag.get('accepted_mask')} "
+                f"attempted_dts={diag.get('attempted_dts')} "
+                f"next_dts={diag.get('next_dts')}"
+            )
+        print("[autodiff-gate] objective errors:")
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_autodiff"],
+            report["gradient_fd"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
             )
         return
 
@@ -1198,6 +1371,106 @@ def build_forward_only_controller_report(
     }
 
 
+def build_realized_schedule_rollout_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    objectives_minus, minus_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    objectives_plus, plus_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    minus_diag = _adaptive_rollout_diagnostics(minus_rollout)
+    plus_diag = _adaptive_rollout_diagnostics(plus_rollout)
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_rollout_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_fd": grad_fd_np.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "rollout_path": {
+            "baseline": baseline_diag,
+            "fd_minus": minus_diag,
+            "fd_plus": plus_diag,
+            "accepted_mask_equal_minus_plus": minus_diag["accepted_mask"] == plus_diag["accepted_mask"],
+            "attempted_dts_equal_minus_plus": _sequence_allclose(
+                minus_diag["attempted_dts"],
+                plus_diag["attempted_dts"],
+            ),
+            "next_dts_equal_minus_plus": _sequence_allclose(
+                minus_diag["next_dts"],
+                plus_diag["next_dts"],
+            ),
+        },
+    }
+
+
 def build_small_step_only_report(
     *,
     config_path: Path,
@@ -1538,6 +1811,11 @@ def main() -> None:
         help="Run only the short rollout with controller dt evolution treated as forward-only between steps.",
     )
     parser.add_argument(
+        "--realized-schedule-rollout-check",
+        action="store_true",
+        help="Run a final-time-only adaptive-rollout check using the first solve-level custom JVP over the primal's realized accepted schedule.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -1552,7 +1830,15 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    if args.forward_only_controller_check:
+    if args.realized_schedule_rollout_check:
+        report = build_realized_schedule_rollout_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+        )
+    elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(
             config_path=args.config,
             parameter_name=args.parameter,
