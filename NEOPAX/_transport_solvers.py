@@ -2277,6 +2277,7 @@ class _RadauAcceptedRolloutResult:
 class _RadauControllerRolloutResult:
     final_step_state: Any
     final_carry: Any
+    step_ys: Any
     err_norms: Any
     accepted_mask: Any
     attempted_dts: Any
@@ -4253,6 +4254,7 @@ def _radau_controller_composed_rollout(
     def _scan_body(step_state, _):
         next_step_state, step_info = _radau_step_fn(execution_context, step_state, None)
         scan_out = (
+            next_step_state.y,
             step_info.err_norm,
             step_info.accepted,
             step_info.dt,
@@ -4265,11 +4267,12 @@ def _radau_controller_composed_rollout(
         step_state0,
         xs=jnp.arange(int(step_count), dtype=jnp.int32),
     )
-    err_norms, accepted_mask, attempted_dts, next_dts = scan_outputs
+    step_ys, err_norms, accepted_mask, attempted_dts, next_dts = scan_outputs
     final_carry = _radau_carry_from_step_state(final_step_state)
     return _RadauControllerRolloutResult(
         final_step_state=final_step_state,
         final_carry=final_carry,
+        step_ys=step_ys,
         err_norms=err_norms,
         accepted_mask=accepted_mask,
         attempted_dts=attempted_dts,

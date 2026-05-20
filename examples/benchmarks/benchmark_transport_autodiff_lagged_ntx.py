@@ -904,6 +904,37 @@ def _controller_rollout_summary(rollout) -> dict[str, Any]:
     }
 
 
+def _controller_multi_objectives_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    step_counts: tuple[int, ...],
+    step_scale: float,
+):
+    max_step_count = int(max(step_counts))
+    rollout, runtime, prepared_rollout = _controller_rollout_for_parameter(
+        parameter_value,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_count=max_step_count,
+        step_scale=step_scale,
+    )
+    unpack_flat = prepared_rollout.physics_context.unpack_flat
+    objectives = []
+    for step_count in step_counts:
+        flat_y = rollout.step_ys[int(step_count) - 1]
+        final_state = unpack_flat(flat_y)
+        objectives.append(_objective_vector(final_state, runtime))
+    return jnp.stack(objectives, axis=0), rollout
+
+
 def _controller_composition_report(
     *,
     config: dict[str, Any],
@@ -916,44 +947,101 @@ def _controller_composition_report(
     small_step_counts: tuple[float, ...],
     small_step_scale: float,
 ) -> list[dict[str, Any]]:
-    entries = []
+    step_counts = tuple(int(v) for v in small_step_counts)
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
-    for raw_count in small_step_counts:
-        step_count = int(raw_count)
-        composition_objective_fn = lambda p: _controller_composition_objectives_for_parameter(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            step_count=step_count,
-            step_scale=small_step_scale,
-        )
-        comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
-        comp_minus = np.asarray(
-            jax.device_get(composition_objective_fn(jnp.asarray(minus_value))),
-            dtype=float,
-        )
-        comp_plus = np.asarray(
-            jax.device_get(composition_objective_fn(jnp.asarray(plus_value))),
-            dtype=float,
-        )
-        comp_fd = (comp_plus - comp_minus) / (2.0 * fd_step)
-        comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
-        comp_abs_err = np.abs(comp_ad_np - comp_fd)
-        comp_rel_err = comp_abs_err / np.maximum(np.abs(comp_fd), 1.0e-10)
+    composition_objective_fn = lambda p: _controller_multi_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_counts=step_counts,
+        step_scale=small_step_scale,
+    )[0]
+    comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
+    comp_minus, minus_rollout = _controller_multi_objectives_for_parameter(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_counts=step_counts,
+        step_scale=small_step_scale,
+    )
+    comp_plus, plus_rollout = _controller_multi_objectives_for_parameter(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_counts=step_counts,
+        step_scale=small_step_scale,
+    )
+    baseline_objectives, baseline_rollout = _controller_multi_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_counts=step_counts,
+        step_scale=small_step_scale,
+    )
+    comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
+    comp_minus_np = np.asarray(jax.device_get(comp_minus), dtype=float)
+    comp_plus_np = np.asarray(jax.device_get(comp_plus), dtype=float)
+    comp_fd_np = (comp_plus_np - comp_minus_np) / (2.0 * fd_step)
+    entries = []
+    diag_baseline = _controller_rollout_summary(baseline_rollout)
+    diag_minus = _controller_rollout_summary(minus_rollout)
+    diag_plus = _controller_rollout_summary(plus_rollout)
+    for idx, step_count in enumerate(step_counts):
+        comp_abs_err = np.abs(comp_ad_np[idx] - comp_fd_np[idx])
+        comp_rel_err = comp_abs_err / np.maximum(np.abs(comp_fd_np[idx]), 1.0e-10)
         entries.append(
             {
                 "step_count": int(step_count),
                 "step_scale": float(small_step_scale),
-                "gradient_autodiff": comp_ad_np.tolist(),
-                "gradient_fd": comp_fd.tolist(),
+                "baseline_objectives": np.asarray(jax.device_get(baseline_objectives[idx]), dtype=float).tolist(),
+                "gradient_autodiff": comp_ad_np[idx].tolist(),
+                "gradient_fd": comp_fd_np[idx].tolist(),
                 "gradient_absolute_error": comp_abs_err.tolist(),
                 "gradient_relative_error": comp_rel_err.tolist(),
                 "max_relative_error": float(np.max(comp_rel_err)),
                 "labels": OBJECTIVE_LABELS,
+                "controller_paths": {
+                    "baseline": {
+                        "accepted_mask": diag_baseline["accepted_mask"][:step_count],
+                        "attempted_dts": diag_baseline["attempted_dts"][:step_count],
+                        "next_dts": diag_baseline["next_dts"][:step_count],
+                        "err_norms": diag_baseline["err_norms"][:step_count],
+                    },
+                    "fd_minus": {
+                        "accepted_mask": diag_minus["accepted_mask"][:step_count],
+                        "attempted_dts": diag_minus["attempted_dts"][:step_count],
+                        "next_dts": diag_minus["next_dts"][:step_count],
+                        "err_norms": diag_minus["err_norms"][:step_count],
+                    },
+                    "fd_plus": {
+                        "accepted_mask": diag_plus["accepted_mask"][:step_count],
+                        "attempted_dts": diag_plus["attempted_dts"][:step_count],
+                        "next_dts": diag_plus["next_dts"][:step_count],
+                        "err_norms": diag_plus["err_norms"][:step_count],
+                    },
+                    "accepted_mask_equal_minus_plus": diag_minus["accepted_mask"][:step_count] == diag_plus["accepted_mask"][:step_count],
+                    "attempted_dts_equal_minus_plus": _sequence_allclose(
+                        diag_minus["attempted_dts"][:step_count],
+                        diag_plus["attempted_dts"][:step_count],
+                    ),
+                    "next_dts_equal_minus_plus": _sequence_allclose(
+                        diag_minus["next_dts"][:step_count],
+                        diag_plus["next_dts"][:step_count],
+                    ),
+                },
             }
         )
     return entries
@@ -971,7 +1059,7 @@ def _controller_only_report(
     small_step_counts: tuple[float, ...],
     small_step_scale: float,
 ) -> list[dict[str, Any]]:
-    entries = _controller_composition_report(
+    return _controller_composition_report(
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
@@ -982,61 +1070,6 @@ def _controller_only_report(
         small_step_counts=small_step_counts,
         small_step_scale=small_step_scale,
     )
-    minus_value = baseline_value - fd_step
-    plus_value = baseline_value + fd_step
-    enriched_entries = []
-    for entry in entries:
-        step_count = int(entry["step_count"])
-        baseline_rollout, _, _ = _controller_rollout_for_parameter(
-            jnp.asarray(baseline_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            step_count=step_count,
-            step_scale=small_step_scale,
-        )
-        minus_rollout, _, _ = _controller_rollout_for_parameter(
-            jnp.asarray(minus_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            step_count=step_count,
-            step_scale=small_step_scale,
-        )
-        plus_rollout, _, _ = _controller_rollout_for_parameter(
-            jnp.asarray(plus_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            step_count=step_count,
-            step_scale=small_step_scale,
-        )
-        diag_baseline = _controller_rollout_summary(baseline_rollout)
-        diag_minus = _controller_rollout_summary(minus_rollout)
-        diag_plus = _controller_rollout_summary(plus_rollout)
-        enriched = dict(entry)
-        enriched["controller_paths"] = {
-            "baseline": diag_baseline,
-            "fd_minus": diag_minus,
-            "fd_plus": diag_plus,
-            "accepted_mask_equal_minus_plus": diag_minus["accepted_mask"] == diag_plus["accepted_mask"],
-            "attempted_dts_equal_minus_plus": _sequence_allclose(
-                diag_minus["attempted_dts"],
-                diag_plus["attempted_dts"],
-            ),
-            "next_dts_equal_minus_plus": _sequence_allclose(
-                diag_minus["next_dts"],
-                diag_plus["next_dts"],
-            ),
-        }
-        enriched_entries.append(enriched)
-    return enriched_entries
 
 
 def build_controller_only_report(
@@ -1468,18 +1501,19 @@ def main() -> None:
     fig_path = outdir / f"transport_autodiff_{args.parameter}.png"
 
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_sweep_csv(
-        csv_path,
-        parameter_name=report["parameter_name"],
-        sweep_values=np.asarray(report["sweep_values"], dtype=float),
-        objective_values=np.asarray(report["sweep_objectives"], dtype=float),
-    )
     _print_terminal_summary(report)
-    if not args.no_plot:
-        _write_figure(report, fig_path)
-        print(f"Wrote {fig_path}")
     print(f"Wrote {json_path}")
-    print(f"Wrote {csv_path}")
+    if "sweep_values" in report and "sweep_objectives" in report:
+        _write_sweep_csv(
+            csv_path,
+            parameter_name=report["parameter_name"],
+            sweep_values=np.asarray(report["sweep_values"], dtype=float),
+            objective_values=np.asarray(report["sweep_objectives"], dtype=float),
+        )
+        print(f"Wrote {csv_path}")
+        if not args.no_plot:
+            _write_figure(report, fig_path)
+            print(f"Wrote {fig_path}")
     print(
         f"parameter={report['parameter_name']} "
         f"passed={report['passed']} "
