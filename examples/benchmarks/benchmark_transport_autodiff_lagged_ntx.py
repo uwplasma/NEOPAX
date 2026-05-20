@@ -460,6 +460,17 @@ def _adaptive_rollout_nan_debug_for_parameter(
                     "newton_iter_count": int(newton_iter_counts[idx]),
                     "cache_valid_next": bool(cache_valid_next[idx]),
                     "tangent_finite": bool(debug.tangent_finite_mask[idx]),
+                    "dt_dot_abs": float(debug.dt_dot_abs[idx]),
+                    "prev_error_dot_abs": float(debug.prev_error_dot_abs[idx]),
+                    "density_dot_max_abs": float(debug.density_dot_max_abs[idx]),
+                    "pressure_dot_max_abs": float(debug.pressure_dot_max_abs[idx]),
+                    "er_dot_max_abs": float(debug.er_dot_max_abs[idx]),
+                    "y_dot_max_abs": float(debug.y_dot_max_abs[idx]),
+                    "prev_stages_dot_max_abs": float(debug.prev_stages_dot_max_abs[idx]),
+                    "lagged_response_cache_dot_max_abs": float(debug.lagged_response_cache_dot_max_abs[idx]),
+                    "jacobian_dot_max_abs": float(debug.jacobian_dot_max_abs[idx]),
+                    "real_lu_dot_max_abs": float(debug.real_lu_dot_max_abs[idx]),
+                    "complex_lu_dot_max_abs": float(debug.complex_lu_dot_max_abs[idx]),
                 }
             )
     return {
@@ -814,7 +825,18 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                         f"theta_final={_fmt_float(entry.get('theta_final'))} "
                         f"newton_iter_count={entry.get('newton_iter_count')} "
                         f"cache_valid_next={entry.get('cache_valid_next')} "
-                        f"tangent_finite={entry.get('tangent_finite')}"
+                        f"tangent_finite={entry.get('tangent_finite')} "
+                        f"dt_dot_abs={_fmt_float(entry.get('dt_dot_abs'))} "
+                        f"prev_error_dot_abs={_fmt_float(entry.get('prev_error_dot_abs'))} "
+                        f"density_dot_max_abs={_fmt_float(entry.get('density_dot_max_abs'))} "
+                        f"pressure_dot_max_abs={_fmt_float(entry.get('pressure_dot_max_abs'))} "
+                        f"er_dot_max_abs={_fmt_float(entry.get('er_dot_max_abs'))} "
+                        f"y_dot_max_abs={_fmt_float(entry.get('y_dot_max_abs'))} "
+                        f"prev_stages_dot_max_abs={_fmt_float(entry.get('prev_stages_dot_max_abs'))} "
+                        f"lagged_cache_dot_max_abs={_fmt_float(entry.get('lagged_response_cache_dot_max_abs'))} "
+                        f"jacobian_dot_max_abs={_fmt_float(entry.get('jacobian_dot_max_abs'))} "
+                        f"real_lu_dot_max_abs={_fmt_float(entry.get('real_lu_dot_max_abs'))} "
+                        f"complex_lu_dot_max_abs={_fmt_float(entry.get('complex_lu_dot_max_abs'))}"
                     )
         return
 

@@ -2334,6 +2334,17 @@ class _RadauReplayNanDiagnostic:
     first_bad_was_accepted: Any
     first_bad_dt: Any
     final_tangent_finite: Any
+    dt_dot_abs: Any
+    prev_error_dot_abs: Any
+    density_dot_max_abs: Any
+    pressure_dot_max_abs: Any
+    er_dot_max_abs: Any
+    y_dot_max_abs: Any
+    prev_stages_dot_max_abs: Any
+    lagged_response_cache_dot_max_abs: Any
+    jacobian_dot_max_abs: Any
+    real_lu_dot_max_abs: Any
+    complex_lu_dot_max_abs: Any
 
 
 @jax.tree_util.register_dataclass
@@ -4947,6 +4958,17 @@ def _radau_debug_realized_attempt_replay(
                 finite = jnp.logical_and(finite, jnp.all(jnp.isfinite(leaf_arr)))
         return finite
 
+    def _max_abs_scalar(value):
+        value_arr = jnp.asarray(value)
+        if not jnp.issubdtype(value_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=execution_context.dtype)
+        return jnp.max(jnp.abs(value_arr)).astype(execution_context.dtype)
+
+    def _state_component_max_abs(state_value, attr_name: str):
+        if hasattr(state_value, attr_name):
+            return _max_abs_scalar(getattr(state_value, attr_name))
+        return jnp.asarray(0.0, dtype=execution_context.dtype)
+
     def _accepted_attempt(
         carry_value,
         *,
@@ -5091,7 +5113,35 @@ def _radau_debug_realized_attempt_replay(
             operand=(carry, carry_dot),
         )
         is_finite = _tree_all_finite(carry_dot)
-        return (carry, carry_dot, jnp.logical_and(still_finite, is_finite)), is_finite
+        dt_dot_abs = _max_abs_scalar(carry_dot.dt)
+        prev_error_dot_abs = _max_abs_scalar(carry_dot.prev_error)
+        density_dot_max_abs = _state_component_max_abs(carry_dot.y, "density")
+        pressure_dot_max_abs = _state_component_max_abs(carry_dot.y, "pressure")
+        er_dot_max_abs = _state_component_max_abs(carry_dot.y, "Er")
+        y_dot_max_abs = _max_abs_scalar(carry_dot.y)
+        prev_stages_dot_max_abs = _max_abs_scalar(carry_dot.prev_stages)
+        lagged_response_cache_dot_max_abs = _max_abs_scalar(carry_dot.lagged_response_cache)
+        jacobian_dot_max_abs = _max_abs_scalar(carry_dot.jacobian)
+        real_lu_dot_max_abs = _max_abs_scalar(carry_dot.real_lu)
+        complex_lu_dot_max_abs = _max_abs_scalar(carry_dot.complex_lu)
+        return (
+            carry,
+            carry_dot,
+            jnp.logical_and(still_finite, is_finite),
+        ), (
+            is_finite,
+            dt_dot_abs,
+            prev_error_dot_abs,
+            density_dot_max_abs,
+            pressure_dot_max_abs,
+            er_dot_max_abs,
+            y_dot_max_abs,
+            prev_stages_dot_max_abs,
+            lagged_response_cache_dot_max_abs,
+            jacobian_dot_max_abs,
+            real_lu_dot_max_abs,
+            complex_lu_dot_max_abs,
+        )
 
     scan_inputs = (
         active_mask,
@@ -5103,11 +5153,25 @@ def _radau_debug_realized_attempt_replay(
         next_easy_growth_streak,
         next_lagged_response_valid,
     )
-    (_, _, _), tangent_finite_mask = jax.lax.scan(
+    (_, _, _), scan_outputs = jax.lax.scan(
         _scan_body,
         (carry0, carry0_dot, jnp.asarray(True)),
         scan_inputs,
     )
+    (
+        tangent_finite_mask,
+        dt_dot_abs,
+        prev_error_dot_abs,
+        density_dot_max_abs,
+        pressure_dot_max_abs,
+        er_dot_max_abs,
+        y_dot_max_abs,
+        prev_stages_dot_max_abs,
+        lagged_response_cache_dot_max_abs,
+        jacobian_dot_max_abs,
+        real_lu_dot_max_abs,
+        complex_lu_dot_max_abs,
+    ) = scan_outputs
 
     any_bad = jnp.any(jnp.logical_not(tangent_finite_mask))
     first_bad_index = jnp.where(
@@ -5128,6 +5192,17 @@ def _radau_debug_realized_attempt_replay(
         first_bad_was_accepted=first_bad_was_accepted,
         first_bad_dt=first_bad_dt,
         final_tangent_finite=tangent_finite_mask[-1] if tangent_finite_mask.shape[0] else jnp.asarray(True),
+        dt_dot_abs=dt_dot_abs,
+        prev_error_dot_abs=prev_error_dot_abs,
+        density_dot_max_abs=density_dot_max_abs,
+        pressure_dot_max_abs=pressure_dot_max_abs,
+        er_dot_max_abs=er_dot_max_abs,
+        y_dot_max_abs=y_dot_max_abs,
+        prev_stages_dot_max_abs=prev_stages_dot_max_abs,
+        lagged_response_cache_dot_max_abs=lagged_response_cache_dot_max_abs,
+        jacobian_dot_max_abs=jacobian_dot_max_abs,
+        real_lu_dot_max_abs=real_lu_dot_max_abs,
+        complex_lu_dot_max_abs=complex_lu_dot_max_abs,
     )
     diagnostic = jax.device_get(diagnostic)
     return _RadauReplayNanDiagnostic(
@@ -5136,6 +5211,17 @@ def _radau_debug_realized_attempt_replay(
         first_bad_was_accepted=bool(diagnostic.first_bad_was_accepted),
         first_bad_dt=float(diagnostic.first_bad_dt),
         final_tangent_finite=bool(diagnostic.final_tangent_finite),
+        dt_dot_abs=np.asarray(diagnostic.dt_dot_abs, dtype=float).tolist(),
+        prev_error_dot_abs=np.asarray(diagnostic.prev_error_dot_abs, dtype=float).tolist(),
+        density_dot_max_abs=np.asarray(diagnostic.density_dot_max_abs, dtype=float).tolist(),
+        pressure_dot_max_abs=np.asarray(diagnostic.pressure_dot_max_abs, dtype=float).tolist(),
+        er_dot_max_abs=np.asarray(diagnostic.er_dot_max_abs, dtype=float).tolist(),
+        y_dot_max_abs=np.asarray(diagnostic.y_dot_max_abs, dtype=float).tolist(),
+        prev_stages_dot_max_abs=np.asarray(diagnostic.prev_stages_dot_max_abs, dtype=float).tolist(),
+        lagged_response_cache_dot_max_abs=np.asarray(diagnostic.lagged_response_cache_dot_max_abs, dtype=float).tolist(),
+        jacobian_dot_max_abs=np.asarray(diagnostic.jacobian_dot_max_abs, dtype=float).tolist(),
+        real_lu_dot_max_abs=np.asarray(diagnostic.real_lu_dot_max_abs, dtype=float).tolist(),
+        complex_lu_dot_max_abs=np.asarray(diagnostic.complex_lu_dot_max_abs, dtype=float).tolist(),
     )
 
 
