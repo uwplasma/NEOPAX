@@ -2304,7 +2304,10 @@ class _RadauAdaptiveRolloutTrace:
     attempted_dts: Any
     next_dts: Any
     step_ts: Any
-    next_carry_template: Any
+    next_recent_reject_count: Any
+    next_regrowth_cooldown: Any
+    next_easy_growth_streak: Any
+    next_lagged_response_valid: Any
 
 
 @jax.tree_util.register_dataclass
@@ -4436,7 +4439,11 @@ def _radau_replay_realized_attempt_rollout(
     active_mask,
     accepted_mask,
     attempted_dts,
-    next_carry_template,
+    next_dts,
+    next_recent_reject_count,
+    next_regrowth_cooldown,
+    next_easy_growth_streak,
+    next_lagged_response_valid,
 ) -> _RadauAcceptedRolloutResult:
     """Replay the full realized attempt history using forward trace metadata.
 
@@ -4448,7 +4455,16 @@ def _radau_replay_realized_attempt_rollout(
     dtype = execution_context.dtype
 
     def _scan_body(carry, xs):
-        active, accepted, dt_value, carry_template = xs
+        (
+            active,
+            accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
 
         def _do_attempt(_):
             carry_for_step = dataclasses.replace(carry, dt=dt_value)
@@ -4465,21 +4481,50 @@ def _radau_replay_realized_attempt_rollout(
 
             def _accept(__):
                 return dataclasses.replace(
-                    carry_template,
+                    carry,
                     t=carry.t + dt_value,
                     y=accepted_y,
-                    dt=carry_template.dt,
+                    dt=next_dt_value,
+                    prev_error=jnp.maximum(
+                        attempt_result.err_norm,
+                        jnp.asarray(1.0e-12, dtype=dtype),
+                    ),
                     prev_stages=attempt_result.stage_history,
                     prev_dt=dt_value,
+                    recent_reject_count=recent_reject_count_value,
+                    regrowth_cooldown=regrowth_cooldown_value,
+                    easy_growth_streak=easy_growth_streak_value,
+                    lagged_response_valid=lagged_response_valid_value,
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    real_lu=attempt_result.real_lu_out,
+                    real_piv=attempt_result.real_piv_out,
+                    complex_lu=attempt_result.complex_lu_out,
+                    complex_piv=attempt_result.complex_piv_out,
                     prev_theta_final=attempt_result.theta_final,
                     prev_newton_iter_count=attempt_result.newton_iter_count,
                 )
 
             def _reject(__):
                 return dataclasses.replace(
-                    carry_template,
-                    t=carry.t,
-                    y=carry.y,
+                    carry,
+                    dt=next_dt_value,
+                    recent_reject_count=recent_reject_count_value,
+                    regrowth_cooldown=regrowth_cooldown_value,
+                    easy_growth_streak=easy_growth_streak_value,
+                    lagged_response_valid=lagged_response_valid_value,
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    real_lu=attempt_result.real_lu_out,
+                    real_piv=attempt_result.real_piv_out,
+                    complex_lu=attempt_result.complex_lu_out,
+                    complex_piv=attempt_result.complex_piv_out,
+                    prev_theta_final=attempt_result.theta_final,
+                    prev_newton_iter_count=attempt_result.newton_iter_count,
                 )
 
             next_carry = jax.lax.cond(accepted, _accept, _reject, operand=None)
@@ -4505,7 +4550,16 @@ def _radau_replay_realized_attempt_rollout(
     final_carry, scan_outputs = jax.lax.scan(
         _scan_body,
         carry0,
-        (active_mask, accepted_mask, attempted_dts, next_carry_template),
+        (
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ),
     )
     trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
     return _RadauAcceptedRolloutResult(
@@ -4707,7 +4761,10 @@ def _radau_adaptive_final_state_rollout(
             jnp.asarray(step_info.dt, dtype=dtype),
             jnp.asarray(step_info.next_dt, dtype=dtype),
             jnp.asarray(step_info.t, dtype=dtype),
-            _radau_carry_from_step_state(next_step_state),
+            next_step_state.recent_reject_count,
+            next_step_state.regrowth_cooldown,
+            next_step_state.easy_growth_streak,
+            next_step_state.lagged_response_valid,
         )
         return next_step_state, scan_out
 
@@ -4720,7 +4777,10 @@ def _radau_adaptive_final_state_rollout(
         attempted_dts,
         next_dts,
         step_ts,
-        next_carry_template,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
     ) = scan_outputs
     final_carry = _radau_carry_from_step_state(final_step_state)
     trace = _RadauAdaptiveRolloutTrace(
@@ -4741,7 +4801,10 @@ def _radau_adaptive_final_state_rollout(
         attempted_dts=attempted_dts,
         next_dts=next_dts,
         step_ts=step_ts,
-        next_carry_template=next_carry_template,
+        next_recent_reject_count=next_recent_reject_count,
+        next_regrowth_cooldown=next_regrowth_cooldown,
+        next_easy_growth_streak=next_easy_growth_streak,
+        next_lagged_response_valid=next_lagged_response_valid,
     )
     completed = jnp.logical_or(
         final_step_state.t >= (execution_context.attempt_context.t_final - 1.0e-15),
@@ -4798,7 +4861,11 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
     active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
     accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
     attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_carry_template = jax.lax.stop_gradient(rollout.trace.next_carry_template)
+    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
 
     def _replay(carry_value):
         replay = _radau_replay_realized_attempt_rollout(
@@ -4807,7 +4874,11 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
             active_mask,
             accepted_mask,
             attempted_dts,
-            next_carry_template,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
         )
         return replay.final_carry.y
 
