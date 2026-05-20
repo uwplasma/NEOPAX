@@ -2274,6 +2274,17 @@ class _RadauAcceptedRolloutResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauControllerRolloutResult:
+    final_step_state: Any
+    final_carry: Any
+    err_norms: Any
+    accepted_mask: Any
+    attempted_dts: Any
+    next_dts: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
     next_carry: Any
     accepted_y: Any
@@ -2319,6 +2330,44 @@ class _RadauSolveExecutionContext:
     lagged_response_reuse_atol: Any
     project_flat: Any
     debug_newton_trace: Any
+
+
+def _build_prepared_radau_execution_context(
+    *,
+    solver: "RADAUSolver",
+    prepared_rollout: _PreparedRadauAcceptedRollout,
+) -> _RadauSolveExecutionContext:
+    dtype = prepared_rollout.kernel_context.dtype
+    if solver.num_stages not in _RADAU_STAGE_CONFIGS:
+        raise ValueError(
+            f"Unsupported custom Radau stage count '{solver.num_stages}'. "
+            f"Available options: {sorted(_RADAU_STAGE_CONFIGS)}"
+        )
+    stage_cfg = _RADAU_STAGE_CONFIGS[solver.num_stages]
+    error_order = float(stage_cfg.embedded_order if stage_cfg.has_embedded_estimator else stage_cfg.order)
+    controller_alpha = 0.7 / (error_order + 1.0)
+    return _RadauSolveExecutionContext(
+        kernel_context=prepared_rollout.kernel_context,
+        physics_context=prepared_rollout.physics_context,
+        attempt_context=_RadauAcceptedStepAttemptContext(
+            t_final=jnp.asarray(solver.t1, dtype=dtype),
+            use_transport_lagged_response=jnp.asarray(prepared_rollout.kernel_context.use_transport_lagged_response),
+        ),
+        dtype=dtype,
+        dt_min=jnp.asarray(solver.min_step, dtype=dtype),
+        dt_max=jnp.asarray(solver.max_step, dtype=dtype),
+        safety_factor=solver.safety_factor,
+        controller_alpha=controller_alpha,
+        min_step_factor=solver.min_step_factor,
+        max_step_factor=solver.max_step_factor,
+        controller_mode=str(getattr(solver, "controller_mode", "current")).strip().lower(),
+        use_transport_lagged_response=prepared_rollout.kernel_context.use_transport_lagged_response,
+        lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+        lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+        lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
+        project_flat=prepared_rollout.physics_context.project_flat,
+        debug_newton_trace=bool(getattr(solver, "debug_stage_markers", False)),
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -4182,6 +4231,49 @@ def _radau_fixed_dt_accepted_rollout(
         err_norms=err_norms,
         converged_mask=converged_mask,
         accepted_dts=accepted_dts,
+    )
+
+
+def _radau_controller_composed_rollout(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    step_count: int,
+    dt_scale: float | Any = 1.0,
+) -> _RadauControllerRolloutResult:
+    """AD-facing rollout with real controller updates but without the outer saved loop."""
+
+    dtype = execution_context.dtype
+    scaled_dt = jnp.asarray(dt_scale, dtype=dtype) * carry0.dt
+    step_state0 = _radau_step_state_from_carry(
+        dataclasses.replace(carry0, dt=scaled_dt),
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+
+    def _scan_body(step_state, _):
+        next_step_state, step_info = _radau_step_fn(execution_context, step_state, None)
+        scan_out = (
+            step_info.err_norm,
+            step_info.accepted,
+            step_info.dt,
+            step_info.next_dt,
+        )
+        return next_step_state, scan_out
+
+    final_step_state, scan_outputs = jax.lax.scan(
+        _scan_body,
+        step_state0,
+        xs=jnp.arange(int(step_count), dtype=jnp.int32),
+    )
+    err_norms, accepted_mask, attempted_dts, next_dts = scan_outputs
+    final_carry = _radau_carry_from_step_state(final_step_state)
+    return _RadauControllerRolloutResult(
+        final_step_state=final_step_state,
+        final_carry=final_carry,
+        err_norms=err_norms,
+        accepted_mask=accepted_mask,
+        attempted_dts=attempted_dts,
+        next_dts=next_dts,
     )
 
 

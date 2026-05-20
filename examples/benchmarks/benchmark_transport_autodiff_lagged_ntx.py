@@ -48,7 +48,9 @@ from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
     _radau_apply_accepted_step_map,
+    _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
+    _radau_controller_composed_rollout,
     _radau_prepare_stage_subsolve_inputs_from_carry,
     _radau_run_stage_subsolve_standalone_autodiff,
 )
@@ -546,6 +548,15 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"step_scale={float(entry['step_scale']):.6e} "
                 f"max_rel_err={float(entry['max_relative_error']):.6e}"
             )
+    controller_step = report.get("controller_step_composition")
+    if controller_step:
+        print("[autodiff-gate] controller-step composition errors:")
+        for entry in controller_step:
+            print(
+                f"  - step_count={int(entry['step_count'])} "
+                f"step_scale={float(entry['step_scale']):.6e} "
+                f"max_rel_err={float(entry['max_relative_error']):.6e}"
+            )
 def _fd_step_sweep_report(
     *,
     runtime,
@@ -785,6 +796,103 @@ def _small_step_composition_report(
     return entries
 
 
+def _controller_composition_objectives_for_parameter(
+    p,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    step_count: int,
+    step_scale: float,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=p,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    rollout = _radau_controller_composed_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        step_count=step_count,
+        dt_scale=step_scale,
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return _objective_vector(final_state, runtime)
+
+
+def _controller_composition_report(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    baseline_value: float,
+    fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+) -> list[dict[str, Any]]:
+    entries = []
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+    for raw_count in small_step_counts:
+        step_count = int(raw_count)
+        composition_objective_fn = lambda p: _controller_composition_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            step_count=step_count,
+            step_scale=small_step_scale,
+        )
+        comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
+        comp_minus = np.asarray(
+            jax.device_get(composition_objective_fn(jnp.asarray(minus_value))),
+            dtype=float,
+        )
+        comp_plus = np.asarray(
+            jax.device_get(composition_objective_fn(jnp.asarray(plus_value))),
+            dtype=float,
+        )
+        comp_fd = (comp_plus - comp_minus) / (2.0 * fd_step)
+        comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
+        comp_abs_err = np.abs(comp_ad_np - comp_fd)
+        comp_rel_err = comp_abs_err / np.maximum(np.abs(comp_fd), 1.0e-10)
+        entries.append(
+            {
+                "step_count": int(step_count),
+                "step_scale": float(small_step_scale),
+                "gradient_autodiff": comp_ad_np.tolist(),
+                "gradient_fd": comp_fd.tolist(),
+                "gradient_absolute_error": comp_abs_err.tolist(),
+                "gradient_relative_error": comp_rel_err.tolist(),
+                "max_relative_error": float(np.max(comp_rel_err)),
+                "labels": OBJECTIVE_LABELS,
+            }
+        )
+    return entries
+
+
 def build_small_step_only_report(
     *,
     config_path: Path,
@@ -842,6 +950,7 @@ def build_report(
     fd_step_sweep_multipliers: tuple[float, ...],
     with_standalone_stage_subsolve_check: bool,
     with_small_step_composition_check: bool,
+    with_controller_composition_check: bool,
     small_step_counts: tuple[float, ...],
     small_step_scale: float,
     device: str | None,
@@ -1006,6 +1115,20 @@ def build_report(
             small_step_scale=small_step_scale,
         )
 
+    controller_step_composition = None
+    if with_controller_composition_check:
+        controller_step_composition = _controller_composition_report(
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            baseline_value=baseline_value,
+            fd_step=fd_step,
+            small_step_counts=small_step_counts,
+            small_step_scale=small_step_scale,
+        )
+
     report = {
         "config_path": str(config_path),
         "one_step_diagnostic": bool(one_step_diagnostic),
@@ -1026,6 +1149,7 @@ def build_report(
         "fd_step_sweep": fd_step_sweep,
         "standalone_stage_subsolve": standalone_stage_subsolve,
         "small_step_composition": small_step_composition,
+        "controller_step_composition": controller_step_composition,
         "solver_path": {
             "baseline": baseline_diag,
             "fd_minus": minus_diag,
@@ -1094,6 +1218,11 @@ def main() -> None:
         help="Run an additive AD-vs-FD check on a short accepted-step composition map.",
     )
     parser.add_argument(
+        "--with-controller-composition-check",
+        action="store_true",
+        help="Run an additive AD-vs-FD check on a short rollout with the real Radau controller dt updates.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -1121,6 +1250,7 @@ def main() -> None:
         fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
         with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
         with_small_step_composition_check=args.with_small_step_composition_check,
+        with_controller_composition_check=args.with_controller_composition_check,
         small_step_counts=_parse_float_csv(args.small_step_counts),
         small_step_scale=args.small_step_scale,
         device=args.device,
