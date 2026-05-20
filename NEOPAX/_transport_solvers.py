@@ -2301,6 +2301,9 @@ class _RadauAdaptiveRolloutTrace:
     lagged_reference_y: Any
     y_end: Any
     err_norms: Any
+    theta_finals: Any
+    newton_iter_counts: Any
+    cache_valid_next: Any
     attempted_dts: Any
     next_dts: Any
     step_ts: Any
@@ -4781,6 +4784,9 @@ def _radau_adaptive_final_state_rollout(
             jnp.asarray(step_info.accepted),
             payload,
             jnp.asarray(step_info.err_norm, dtype=dtype),
+            jnp.asarray(0.0 if getattr(step_info, "theta_final", None) is None else getattr(step_info, "theta_final"), dtype=dtype),
+            jnp.asarray(0 if getattr(step_info, "newton_iter_count", None) is None else getattr(step_info, "newton_iter_count"), dtype=jnp.int32),
+            jnp.asarray(next_step_state.cache_valid),
             jnp.asarray(step_info.dt, dtype=dtype),
             jnp.asarray(step_info.next_dt, dtype=dtype),
             jnp.asarray(step_info.t, dtype=dtype),
@@ -4797,6 +4803,9 @@ def _radau_adaptive_final_state_rollout(
         accepted_mask,
         payloads,
         err_norms,
+        theta_finals,
+        newton_iter_counts,
+        cache_valid_next,
         attempted_dts,
         next_dts,
         step_ts,
@@ -4821,6 +4830,9 @@ def _radau_adaptive_final_state_rollout(
         lagged_reference_y=payloads.lagged_reference_y,
         y_end=payloads.y_end,
         err_norms=err_norms,
+        theta_finals=theta_finals,
+        newton_iter_counts=newton_iter_counts,
+        cache_valid_next=cache_valid_next,
         attempted_dts=attempted_dts,
         next_dts=next_dts,
         step_ts=step_ts,

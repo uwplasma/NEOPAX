@@ -436,12 +436,39 @@ def _adaptive_rollout_nan_debug_for_parameter(
         carry0_dot,
         rollout.trace,
     )
+    attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
+    next_dts = np.asarray(jax.device_get(rollout.trace.next_dts), dtype=float)
+    accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
+    err_norms = np.asarray(jax.device_get(rollout.trace.err_norms), dtype=float)
+    theta_finals = np.asarray(jax.device_get(rollout.trace.theta_finals), dtype=float)
+    newton_iter_counts = np.asarray(jax.device_get(rollout.trace.newton_iter_counts), dtype=np.int32)
+    cache_valid_next = np.asarray(jax.device_get(rollout.trace.cache_valid_next), dtype=bool)
+    local_attempt_window: list[dict[str, Any]] = []
+    first_bad_index = int(debug.first_bad_index)
+    if first_bad_index >= 0:
+        start = max(0, first_bad_index - 2)
+        stop = min(len(attempted_dts), first_bad_index + 3)
+        for idx in range(start, stop):
+            local_attempt_window.append(
+                {
+                    "index": int(idx),
+                    "accepted": bool(accepted_mask[idx]),
+                    "attempted_dt": float(attempted_dts[idx]),
+                    "next_dt": float(next_dts[idx]),
+                    "err_norm": float(err_norms[idx]),
+                    "theta_final": float(theta_finals[idx]),
+                    "newton_iter_count": int(newton_iter_counts[idx]),
+                    "cache_valid_next": bool(cache_valid_next[idx]),
+                    "tangent_finite": bool(debug.tangent_finite_mask[idx]),
+                }
+            )
     return {
-        "first_bad_index": int(debug.first_bad_index),
+        "first_bad_index": first_bad_index,
         "first_bad_was_accepted": bool(debug.first_bad_was_accepted),
         "first_bad_dt": float(debug.first_bad_dt),
         "final_tangent_finite": bool(debug.final_tangent_finite),
         "tangent_finite_mask": list(debug.tangent_finite_mask),
+        "local_attempt_window": local_attempt_window,
         "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
         "accepted_mask": _adaptive_rollout_diagnostics(rollout)["accepted_mask"],
         "err_norms": _adaptive_rollout_diagnostics(rollout)["err_norms"],
@@ -774,6 +801,21 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"first_bad_dt={_fmt_float(nan_debug.get('first_bad_dt'))} "
                 f"final_tangent_finite={nan_debug.get('final_tangent_finite')}"
             )
+            local_attempt_window = nan_debug.get("local_attempt_window") or []
+            if local_attempt_window:
+                print("[autodiff-gate] replay NaN local window:")
+                for entry in local_attempt_window:
+                    print(
+                        f"  - index={entry.get('index')} "
+                        f"accepted={entry.get('accepted')} "
+                        f"attempted_dt={_fmt_float(entry.get('attempted_dt'))} "
+                        f"next_dt={_fmt_float(entry.get('next_dt'))} "
+                        f"err_norm={_fmt_float(entry.get('err_norm'))} "
+                        f"theta_final={_fmt_float(entry.get('theta_final'))} "
+                        f"newton_iter_count={entry.get('newton_iter_count')} "
+                        f"cache_valid_next={entry.get('cache_valid_next')} "
+                        f"tangent_finite={entry.get('tangent_finite')}"
+                    )
         return
 
     print(
