@@ -50,6 +50,7 @@ from NEOPAX._transport_solvers import (
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
+    _radau_debug_realized_attempt_replay,
     _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
     _radau_controller_composed_rollout,
@@ -363,6 +364,88 @@ def _adaptive_rollout_objectives_for_parameter(
         use_realized_schedule_jvp=use_realized_schedule_jvp,
     )
     return _objective_vector(final_state, runtime), rollout
+
+
+def _adaptive_rollout_nan_debug_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+
+    def _initial_carry_for_parameter(p):
+        state_p = _parameterized_initial_state(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_name=parameter_name,
+            parameter_value=p,
+        )
+        prepared_components_p = prepare_transport_solver_components(config, runtime, state_p)
+        solve_vector_field_p = prepared_components_p["solve_vector_field"]
+        prepared_rollout_p = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state_p,
+            vector_field=solve_vector_field_p,
+            species=runtime.species,
+        )
+        return prepared_rollout_p.initial_carry
+
+    baseline_value = jnp.asarray(parameter_value)
+    _, carry0_dot = jax.jvp(
+        _initial_carry_for_parameter,
+        (baseline_value,),
+        (jnp.asarray(1.0, dtype=baseline_value.dtype),),
+    )
+    debug = _radau_debug_realized_attempt_replay(
+        execution_context,
+        prepared_rollout.initial_carry,
+        carry0_dot,
+        rollout.trace,
+    )
+    return {
+        "first_bad_index": int(debug.first_bad_index),
+        "first_bad_was_accepted": bool(debug.first_bad_was_accepted),
+        "first_bad_dt": float(debug.first_bad_dt),
+        "final_tangent_finite": bool(debug.final_tangent_finite),
+        "tangent_finite_mask": list(debug.tangent_finite_mask),
+        "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
+        "accepted_mask": _adaptive_rollout_diagnostics(rollout)["accepted_mask"],
+        "err_norms": _adaptive_rollout_diagnostics(rollout)["err_norms"],
+    }
 
 
 def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> float:
@@ -681,6 +764,15 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             print(
                 f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
                 f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
+        nan_debug = report.get("nan_debug")
+        if nan_debug is not None:
+            print(
+                "[autodiff-gate] replay NaN debug: "
+                f"first_bad_index={nan_debug.get('first_bad_index')} "
+                f"first_bad_was_accepted={nan_debug.get('first_bad_was_accepted')} "
+                f"first_bad_dt={_fmt_float(nan_debug.get('first_bad_dt'))} "
+                f"final_tangent_finite={nan_debug.get('final_tangent_finite')}"
             )
         return
 
@@ -1439,6 +1531,16 @@ def build_realized_schedule_rollout_report(
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     minus_diag = _adaptive_rollout_diagnostics(minus_rollout)
     plus_diag = _adaptive_rollout_diagnostics(plus_rollout)
+    nan_debug = None
+    if not np.all(np.isfinite(grad_ad_np)):
+        nan_debug = _adaptive_rollout_nan_debug_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        )
 
     return {
         "config_path": str(config_path),
@@ -1468,6 +1570,7 @@ def build_realized_schedule_rollout_report(
                 plus_diag["next_dts"],
             ),
         },
+        "nan_debug": nan_debug,
     }
 
 
