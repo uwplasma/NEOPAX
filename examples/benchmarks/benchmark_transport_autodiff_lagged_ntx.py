@@ -456,6 +456,39 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             )
         return
 
+    if report.get("controller_only_check"):
+        print(
+            f"[autodiff-gate] mode=controller_only "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        controller_step = report.get("controller_step_composition") or []
+        print("[autodiff-gate] controller-step composition errors:")
+        for entry in controller_step:
+            paths = entry.get("controller_paths", {})
+            print(
+                f"  - step_count={int(entry['step_count'])} "
+                f"step_scale={float(entry['step_scale']):.6e} "
+                f"max_rel_err={float(entry['max_relative_error']):.6e} "
+                f"accepted_equal={paths.get('accepted_mask_equal_minus_plus')} "
+                f"attempted_dts_equal={paths.get('attempted_dts_equal_minus_plus')} "
+                f"next_dts_equal={paths.get('next_dts_equal_minus_plus')}"
+            )
+            print(
+                f"    baseline attempted_dts={paths.get('baseline', {}).get('attempted_dts')} "
+                f"next_dts={paths.get('baseline', {}).get('next_dts')}"
+            )
+            print(
+                f"    fd_minus attempted_dts={paths.get('fd_minus', {}).get('attempted_dts')} "
+                f"next_dts={paths.get('fd_minus', {}).get('next_dts')}"
+            )
+            print(
+                f"    fd_plus attempted_dts={paths.get('fd_plus', {}).get('attempted_dts')} "
+                f"next_dts={paths.get('fd_plus', {}).get('next_dts')}"
+            )
+        return
+
     print(
         f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
         f"parameter={report['parameter_name']} "
@@ -796,8 +829,8 @@ def _small_step_composition_report(
     return entries
 
 
-def _controller_composition_objectives_for_parameter(
-    p,
+def _controller_rollout_for_parameter(
+    parameter_value,
     *,
     config: dict[str, Any],
     runtime,
@@ -813,7 +846,7 @@ def _controller_composition_objectives_for_parameter(
         geometry=runtime.geometry,
         n_species=runtime.species.number_species,
         parameter_name=parameter_name,
-        parameter_value=p,
+        parameter_value=parameter_value,
     )
     prepared_components = prepare_transport_solver_components(config, runtime, state0)
     solver = prepared_components["solver"]
@@ -834,8 +867,41 @@ def _controller_composition_objectives_for_parameter(
         step_count=step_count,
         dt_scale=step_scale,
     )
+    return rollout, runtime, prepared_rollout
+
+
+def _controller_composition_objectives_for_parameter(
+    p,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    step_count: int,
+    step_scale: float,
+):
+    rollout, runtime, prepared_rollout = _controller_rollout_for_parameter(
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        step_count=step_count,
+        step_scale=step_scale,
+    )
     final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return _objective_vector(final_state, runtime)
+
+
+def _controller_rollout_summary(rollout) -> dict[str, Any]:
+    return {
+        "accepted_mask": np.asarray(jax.device_get(rollout.accepted_mask), dtype=bool).tolist(),
+        "attempted_dts": np.asarray(jax.device_get(rollout.attempted_dts), dtype=float).tolist(),
+        "next_dts": np.asarray(jax.device_get(rollout.next_dts), dtype=float).tolist(),
+        "err_norms": np.asarray(jax.device_get(rollout.err_norms), dtype=float).tolist(),
+    }
 
 
 def _controller_composition_report(
@@ -891,6 +957,129 @@ def _controller_composition_report(
             }
         )
     return entries
+
+
+def _controller_only_report(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    baseline_value: float,
+    fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+) -> list[dict[str, Any]]:
+    entries = _controller_composition_report(
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_value=baseline_value,
+        fd_step=fd_step,
+        small_step_counts=small_step_counts,
+        small_step_scale=small_step_scale,
+    )
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+    enriched_entries = []
+    for entry in entries:
+        step_count = int(entry["step_count"])
+        baseline_rollout, _, _ = _controller_rollout_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            step_count=step_count,
+            step_scale=small_step_scale,
+        )
+        minus_rollout, _, _ = _controller_rollout_for_parameter(
+            jnp.asarray(minus_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            step_count=step_count,
+            step_scale=small_step_scale,
+        )
+        plus_rollout, _, _ = _controller_rollout_for_parameter(
+            jnp.asarray(plus_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            step_count=step_count,
+            step_scale=small_step_scale,
+        )
+        diag_baseline = _controller_rollout_summary(baseline_rollout)
+        diag_minus = _controller_rollout_summary(minus_rollout)
+        diag_plus = _controller_rollout_summary(plus_rollout)
+        enriched = dict(entry)
+        enriched["controller_paths"] = {
+            "baseline": diag_baseline,
+            "fd_minus": diag_minus,
+            "fd_plus": diag_plus,
+            "accepted_mask_equal_minus_plus": diag_minus["accepted_mask"] == diag_plus["accepted_mask"],
+            "attempted_dts_equal_minus_plus": _sequence_allclose(
+                diag_minus["attempted_dts"],
+                diag_plus["attempted_dts"],
+            ),
+            "next_dts_equal_minus_plus": _sequence_allclose(
+                diag_minus["next_dts"],
+                diag_plus["next_dts"],
+            ),
+        }
+        enriched_entries.append(enriched)
+    return enriched_entries
+
+
+def build_controller_only_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    controller_step_composition = _controller_only_report(
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_value=baseline_value,
+        fd_step=fd_step,
+        small_step_counts=small_step_counts,
+        small_step_scale=small_step_scale,
+    )
+    max_rel_error = max(float(entry["max_relative_error"]) for entry in controller_step_composition)
+    return {
+        "config_path": str(config_path),
+        "controller_only_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "controller_step_composition": controller_step_composition,
+        "passed": bool(np.isfinite(max_rel_error) and max_rel_error <= 5.0e-2),
+        "max_relative_error": float(max_rel_error),
+        "objective_labels": OBJECTIVE_LABELS,
+    }
 
 
 def build_small_step_only_report(
@@ -1223,6 +1412,11 @@ def main() -> None:
         help="Run an additive AD-vs-FD check on a short rollout with the real Radau controller dt updates.",
     )
     parser.add_argument(
+        "--controller-only-check",
+        action="store_true",
+        help="Run only the short rollout with real Radau controller dt updates and print controller trajectory diagnostics.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -1237,24 +1431,35 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    report = build_report(
-        config_path=args.config,
-        parameter_name=args.parameter,
-        rel_fd_step=args.fd_rel_step,
-        abs_fd_step=args.fd_abs_step,
-        sweep_half_width_rel=args.sweep_half_width_rel,
-        sweep_points=args.sweep_points,
-        with_sweep=args.with_sweep,
-        one_step_diagnostic=args.one_step_diagnostic,
-        with_fd_step_sweep=args.with_fd_step_sweep,
-        fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
-        with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
-        with_small_step_composition_check=args.with_small_step_composition_check,
-        with_controller_composition_check=args.with_controller_composition_check,
-        small_step_counts=_parse_float_csv(args.small_step_counts),
-        small_step_scale=args.small_step_scale,
-        device=args.device,
-    )
+    if args.controller_only_check:
+        report = build_controller_only_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
+    else:
+        report = build_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            sweep_half_width_rel=args.sweep_half_width_rel,
+            sweep_points=args.sweep_points,
+            with_sweep=args.with_sweep,
+            one_step_diagnostic=args.one_step_diagnostic,
+            with_fd_step_sweep=args.with_fd_step_sweep,
+            fd_step_sweep_multipliers=_parse_float_csv(args.fd_step_sweep_multipliers),
+            with_standalone_stage_subsolve_check=args.with_standalone_stage_subsolve_check,
+            with_small_step_composition_check=args.with_small_step_composition_check,
+            with_controller_composition_check=args.with_controller_composition_check,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
 
     outdir = args.outdir / args.parameter
     outdir.mkdir(parents=True, exist_ok=True)
