@@ -51,6 +51,7 @@ from NEOPAX._transport_solvers import (
     _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
     _radau_controller_composed_rollout,
+    _radau_controller_forward_only_rollout,
     _radau_prepare_stage_subsolve_inputs_from_carry,
     _radau_run_stage_subsolve_standalone_autodiff,
 )
@@ -489,6 +490,27 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             )
         return
 
+    if report.get("forward_only_controller_check"):
+        print(
+            f"[autodiff-gate] mode=forward_only_controller "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        controller_step = report.get("controller_step_composition") or []
+        print("[autodiff-gate] controller-step composition errors:")
+        for entry in controller_step:
+            paths = entry.get("controller_paths", {})
+            print(
+                f"  - step_count={int(entry['step_count'])} "
+                f"step_scale={float(entry['step_scale']):.6e} "
+                f"max_rel_err={float(entry['max_relative_error']):.6e} "
+                f"accepted_equal={paths.get('accepted_mask_equal_minus_plus')} "
+                f"attempted_dts_equal={paths.get('attempted_dts_equal_minus_plus')} "
+                f"next_dts_equal={paths.get('next_dts_equal_minus_plus')}"
+            )
+        return
+
     print(
         f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
         f"parameter={report['parameter_name']} "
@@ -839,6 +861,7 @@ def _controller_rollout_for_parameter(
     parameter_name: str,
     step_count: int,
     step_scale: float,
+    forward_only_controller: bool = False,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -861,11 +884,20 @@ def _controller_rollout_for_parameter(
         solver=solver,
         prepared_rollout=prepared_rollout,
     )
-    rollout = _radau_controller_composed_rollout(
-        execution_context,
-        prepared_rollout.initial_carry,
-        step_count=step_count,
-        dt_scale=step_scale,
+    rollout = (
+        _radau_controller_forward_only_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            step_count=step_count,
+            dt_scale=step_scale,
+        )
+        if forward_only_controller
+        else _radau_controller_composed_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            step_count=step_count,
+            dt_scale=step_scale,
+        )
     )
     return rollout, runtime, prepared_rollout
 
@@ -914,6 +946,7 @@ def _controller_multi_objectives_for_parameter(
     parameter_name: str,
     step_counts: tuple[int, ...],
     step_scale: float,
+    forward_only_controller: bool = False,
 ):
     max_step_count = int(max(step_counts))
     rollout, runtime, prepared_rollout = _controller_rollout_for_parameter(
@@ -925,6 +958,7 @@ def _controller_multi_objectives_for_parameter(
         parameter_name=parameter_name,
         step_count=max_step_count,
         step_scale=step_scale,
+        forward_only_controller=forward_only_controller,
     )
     unpack_flat = prepared_rollout.physics_context.unpack_flat
     objectives = []
@@ -946,6 +980,7 @@ def _controller_composition_report(
     fd_step: float,
     small_step_counts: tuple[float, ...],
     small_step_scale: float,
+    forward_only_controller: bool = False,
 ) -> list[dict[str, Any]]:
     step_counts = tuple(int(v) for v in small_step_counts)
     minus_value = baseline_value - fd_step
@@ -959,6 +994,7 @@ def _controller_composition_report(
         parameter_name=parameter_name,
         step_counts=step_counts,
         step_scale=small_step_scale,
+        forward_only_controller=forward_only_controller,
     )[0]
     comp_ad = jax.jacfwd(composition_objective_fn)(jnp.asarray(baseline_value))
     comp_minus, minus_rollout = _controller_multi_objectives_for_parameter(
@@ -970,6 +1006,7 @@ def _controller_composition_report(
         parameter_name=parameter_name,
         step_counts=step_counts,
         step_scale=small_step_scale,
+        forward_only_controller=forward_only_controller,
     )
     comp_plus, plus_rollout = _controller_multi_objectives_for_parameter(
         jnp.asarray(plus_value),
@@ -980,6 +1017,7 @@ def _controller_composition_report(
         parameter_name=parameter_name,
         step_counts=step_counts,
         step_scale=small_step_scale,
+        forward_only_controller=forward_only_controller,
     )
     baseline_objectives, baseline_rollout = _controller_multi_objectives_for_parameter(
         jnp.asarray(baseline_value),
@@ -990,6 +1028,7 @@ def _controller_composition_report(
         parameter_name=parameter_name,
         step_counts=step_counts,
         step_scale=small_step_scale,
+        forward_only_controller=forward_only_controller,
     )
     comp_ad_np = np.asarray(jax.device_get(comp_ad), dtype=float)
     comp_minus_np = np.asarray(jax.device_get(comp_minus), dtype=float)
@@ -1105,6 +1144,50 @@ def build_controller_only_report(
     return {
         "config_path": str(config_path),
         "controller_only_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "controller_step_composition": controller_step_composition,
+        "passed": bool(np.isfinite(max_rel_error) and max_rel_error <= 5.0e-2),
+        "max_relative_error": float(max_rel_error),
+        "objective_labels": OBJECTIVE_LABELS,
+    }
+
+
+def build_forward_only_controller_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    small_step_counts: tuple[float, ...],
+    small_step_scale: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    controller_step_composition = _controller_composition_report(
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_value=baseline_value,
+        fd_step=fd_step,
+        small_step_counts=small_step_counts,
+        small_step_scale=small_step_scale,
+        forward_only_controller=True,
+    )
+    max_rel_error = max(float(entry["max_relative_error"]) for entry in controller_step_composition)
+    return {
+        "config_path": str(config_path),
+        "forward_only_controller_check": True,
         "parameter_name": parameter_name,
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
@@ -1450,6 +1533,11 @@ def main() -> None:
         help="Run only the short rollout with real Radau controller dt updates and print controller trajectory diagnostics.",
     )
     parser.add_argument(
+        "--forward-only-controller-check",
+        action="store_true",
+        help="Run only the short rollout with controller dt evolution treated as forward-only between steps.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -1464,7 +1552,17 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    if args.controller_only_check:
+    if args.forward_only_controller_check:
+        report = build_forward_only_controller_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
+    elif args.controller_only_check:
         report = build_controller_only_report(
             config_path=args.config,
             parameter_name=args.parameter,

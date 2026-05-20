@@ -1883,3 +1883,104 @@ composition experiments:
 
 - preserve the good local one-step AD
 - redesign only the broken rollout/composition layer
+
+### Main conclusion now
+
+The controller investigation is now the main result.
+
+What we tested:
+
+- accepted-step composition without controller `dt` updates
+- accepted-step composition with the real Radau controller `dt` updates
+
+What we found:
+
+- accepted-step composition alone stays excellent out to at least `40` steps
+- once the real controller updates `dt`, AD-vs-FD begins to drift
+- the first mismatch appears in `next_dt`, before any accepted/rejected path
+  split
+- later, the changed `next_dt` values become changed attempted `dt` values
+- only after that does the accepted-mask / path itself diverge
+
+So the first real AD failure is **controller-driven timestep drift**, not the
+implicit Radau step and not the accepted-step composition map by itself.
+
+The controller-only diagnostic showed the progression clearly:
+
+- `2` steps:
+  - accepted mask equal
+  - attempted `dt` equal
+  - next `dt` equal
+- `3` steps:
+  - accepted mask equal
+  - attempted `dt` equal
+  - next `dt` already slightly different
+- `5` to `20` steps:
+  - accepted mask still equal
+  - attempted `dt` and next `dt` now different
+  - AD-vs-FD error grows materially
+- `40` steps:
+  - accepted mask finally diverges too
+  - rollout AD-vs-FD can blow up completely
+
+This means:
+
+- rejection/path bifurcation is a **later consequence**
+- the controller update is the **first broken layer**
+
+So the main Radau-native solution effort should now target the adaptive
+controller handling, not the implicit step derivative:
+
+- either treat controller `dt` evolution as forward-only / nondifferentiated
+- or define a custom AD rule for the adaptive rollout that prevents controller
+  drift from dominating the derivative
+
+This is now the main approach and should be treated as the working diagnosis
+for full-solve AD failure in the current Radau path.
+
+### First concrete solution idea
+
+The first concrete solution idea is:
+
+- keep the current differentiated accepted-step map
+- keep the real Radau controller for forward execution
+- but treat the controller-driven `dt` update as **forward-only**
+
+In other words:
+
+1. run the accepted Radau step
+2. compute the next `dt` with the real controller
+3. use that `dt` for the next forward step
+4. block AD through the controller state update and `dt` evolution
+
+This means the differentiated object becomes:
+
+- the rollout of accepted Radau steps
+- **conditioned on the realized forward timestep schedule**
+
+not:
+
+- the full derivative of the adaptive controller itself
+
+Important interpretation:
+
+- the forward solve still decides the actual times / `dt`s
+- AD then differentiates the state evolution along that realized schedule
+- so the derivative answers:
+  - "how does the solution change along this forward-generated adaptive
+    schedule?"
+
+rather than:
+
+  - "how does the solution change including sensitivity of the controller's
+    timestep choices?"
+
+This is a deliberate approximation, but it is motivated by the evidence:
+
+- local step AD is good
+- accepted-step composition AD is good
+- controller `dt` sensitivity is the first thing that destabilizes the full
+  derivative
+
+So this should be treated as the **first implementation path** for obtaining a
+useful full-solve AD signal in the Radau solver.

@@ -3283,6 +3283,32 @@ def _radau_carry_with_forward_only_jvp_fields(
     )
 
 
+def _radau_step_state_with_forward_only_controller_fields(
+    step_state: _RadauStepState,
+) -> _RadauStepState:
+    """Mask controller-evolution fields while keeping state evolution active."""
+    return dataclasses.replace(
+        step_state,
+        dt=jax.lax.stop_gradient(step_state.dt),
+        status=jax.lax.stop_gradient(step_state.status),
+        prev_error=jax.lax.stop_gradient(step_state.prev_error),
+        prev_dt=jax.lax.stop_gradient(step_state.prev_dt),
+        recent_reject_count=jax.lax.stop_gradient(step_state.recent_reject_count),
+        regrowth_cooldown=jax.lax.stop_gradient(step_state.regrowth_cooldown),
+        easy_growth_streak=jax.lax.stop_gradient(step_state.easy_growth_streak),
+        jacobian=jax.lax.stop_gradient(step_state.jacobian),
+        cache_valid=jax.lax.stop_gradient(step_state.cache_valid),
+        cache_dt=jax.lax.stop_gradient(step_state.cache_dt),
+        cache_age=jax.lax.stop_gradient(step_state.cache_age),
+        real_lu=jax.lax.stop_gradient(step_state.real_lu),
+        real_piv=jax.lax.stop_gradient(step_state.real_piv),
+        complex_lu=jax.lax.stop_gradient(step_state.complex_lu),
+        complex_piv=jax.lax.stop_gradient(step_state.complex_piv),
+        prev_theta_final=jax.lax.stop_gradient(step_state.prev_theta_final),
+        prev_newton_iter_count=jax.lax.stop_gradient(step_state.prev_newton_iter_count),
+    )
+
+
 def _radau_stage_subsolve_residual(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -4255,6 +4281,54 @@ def _radau_controller_composed_rollout(
         next_step_state, step_info = _radau_step_fn(execution_context, step_state, None)
         scan_out = (
             next_step_state.y,
+            step_info.err_norm,
+            step_info.accepted,
+            step_info.dt,
+            step_info.next_dt,
+        )
+        return next_step_state, scan_out
+
+    final_step_state, scan_outputs = jax.lax.scan(
+        _scan_body,
+        step_state0,
+        xs=jnp.arange(int(step_count), dtype=jnp.int32),
+    )
+    step_ys, err_norms, accepted_mask, attempted_dts, next_dts = scan_outputs
+    final_carry = _radau_carry_from_step_state(final_step_state)
+    return _RadauControllerRolloutResult(
+        final_step_state=final_step_state,
+        final_carry=final_carry,
+        step_ys=step_ys,
+        err_norms=err_norms,
+        accepted_mask=accepted_mask,
+        attempted_dts=attempted_dts,
+        next_dts=next_dts,
+    )
+
+
+def _radau_controller_forward_only_rollout(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    step_count: int,
+    dt_scale: float | Any = 1.0,
+) -> _RadauControllerRolloutResult:
+    """Rollout with differentiated Radau steps but forward-only controller evolution."""
+
+    dtype = execution_context.dtype
+    scaled_dt = jnp.asarray(dt_scale, dtype=dtype) * carry0.dt
+    step_state0 = _radau_step_state_with_forward_only_controller_fields(
+        _radau_step_state_from_carry(
+            dataclasses.replace(carry0, dt=scaled_dt),
+            status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        )
+    )
+
+    def _scan_body(step_state, _):
+        next_step_state_raw, step_info = _radau_step_fn(execution_context, step_state, None)
+        next_step_state = _radau_step_state_with_forward_only_controller_fields(next_step_state_raw)
+        scan_out = (
+            next_step_state_raw.y,
             step_info.err_norm,
             step_info.accepted,
             step_info.dt,
