@@ -4959,12 +4959,16 @@ def _radau_debug_realized_attempt_replay(
         return finite
 
     def _max_abs_scalar(value):
+        if value is None:
+            return jnp.asarray(0.0, dtype=execution_context.dtype)
         value_arr = jnp.asarray(value)
         if not jnp.issubdtype(value_arr.dtype, jnp.inexact):
             return jnp.asarray(0.0, dtype=execution_context.dtype)
         return jnp.max(jnp.abs(value_arr)).astype(execution_context.dtype)
 
     def _state_component_max_abs(state_value, attr_name: str):
+        if state_value is None:
+            return jnp.asarray(0.0, dtype=execution_context.dtype)
         if hasattr(state_value, attr_name):
             return _max_abs_scalar(getattr(state_value, attr_name))
         return jnp.asarray(0.0, dtype=execution_context.dtype)
