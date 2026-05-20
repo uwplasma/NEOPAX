@@ -2304,6 +2304,7 @@ class _RadauAdaptiveRolloutTrace:
     attempted_dts: Any
     next_dts: Any
     step_ts: Any
+    next_carry_template: Any
 
 
 @jax.tree_util.register_dataclass
@@ -4429,6 +4430,94 @@ def _radau_replay_realized_accepted_rollout(
     )
 
 
+def _radau_replay_realized_attempt_rollout(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    active_mask,
+    accepted_mask,
+    attempted_dts,
+    next_carry_template,
+) -> _RadauAcceptedRolloutResult:
+    """Replay the full realized attempt history using forward trace metadata.
+
+    This keeps the discrete adaptive path fixed to the primal rollout while
+    still differentiating the accepted-step physical update on accepted
+    attempts.
+    """
+
+    dtype = execution_context.dtype
+
+    def _scan_body(carry, xs):
+        active, accepted, dt_value, carry_template = xs
+
+        def _do_attempt(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+            attempt_result = _execute_radau_accepted_step_attempt(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            accepted_y = _project_flat_state_if_needed(
+                attempt_result.trial_y,
+                execution_context.physics_context.project_flat,
+            )
+
+            def _accept(__):
+                return dataclasses.replace(
+                    carry_template,
+                    t=carry.t + dt_value,
+                    y=accepted_y,
+                    dt=carry_template.dt,
+                    prev_stages=attempt_result.stage_history,
+                    prev_dt=dt_value,
+                    prev_theta_final=attempt_result.theta_final,
+                    prev_newton_iter_count=attempt_result.newton_iter_count,
+                )
+
+            def _reject(__):
+                return dataclasses.replace(
+                    carry_template,
+                    t=carry.t,
+                    y=carry.y,
+                )
+
+            next_carry = jax.lax.cond(accepted, _accept, _reject, operand=None)
+            scan_out = (
+                next_carry.y,
+                attempt_result.err_norm,
+                attempt_result.converged,
+                dt_value,
+            )
+            return next_carry, scan_out
+
+        def _skip(_):
+            scan_out = (
+                carry.y,
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(False),
+                jnp.asarray(0.0, dtype=dtype),
+            )
+            return carry, scan_out
+
+        return jax.lax.cond(active, _do_attempt, _skip, operand=None)
+
+    final_carry, scan_outputs = jax.lax.scan(
+        _scan_body,
+        carry0,
+        (active_mask, accepted_mask, attempted_dts, next_carry_template),
+    )
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    return _RadauAcceptedRolloutResult(
+        final_carry=final_carry,
+        final_y=final_carry.y,
+        trial_ys=trial_ys,
+        err_norms=err_norms,
+        converged_mask=converged_mask,
+        accepted_dts=accepted_dts,
+    )
+
+
 def _radau_controller_composed_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
@@ -4618,6 +4707,7 @@ def _radau_adaptive_final_state_rollout(
             jnp.asarray(step_info.dt, dtype=dtype),
             jnp.asarray(step_info.next_dt, dtype=dtype),
             jnp.asarray(step_info.t, dtype=dtype),
+            _radau_carry_from_step_state(next_step_state),
         )
         return next_step_state, scan_out
 
@@ -4630,6 +4720,7 @@ def _radau_adaptive_final_state_rollout(
         attempted_dts,
         next_dts,
         step_ts,
+        next_carry_template,
     ) = scan_outputs
     final_carry = _radau_carry_from_step_state(final_step_state)
     trace = _RadauAdaptiveRolloutTrace(
@@ -4650,6 +4741,7 @@ def _radau_adaptive_final_state_rollout(
         attempted_dts=attempted_dts,
         next_dts=next_dts,
         step_ts=step_ts,
+        next_carry_template=next_carry_template,
     )
     completed = jnp.logical_or(
         final_step_state.t >= (execution_context.attempt_context.t_final - 1.0e-15),
@@ -4703,16 +4795,19 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
+    active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
     accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.dt)
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    next_carry_template = jax.lax.stop_gradient(rollout.trace.next_carry_template)
 
     def _replay(carry_value):
-        replay = _radau_replay_realized_accepted_rollout(
-            execution_context.kernel_context,
-            execution_context.physics_context,
+        replay = _radau_replay_realized_attempt_rollout(
+            execution_context,
             carry_value,
+            active_mask,
             accepted_mask,
             attempted_dts,
+            next_carry_template,
         )
         return replay.final_carry.y
 
