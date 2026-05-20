@@ -1076,6 +1076,12 @@ def _small_step_composition_report(
     entries = []
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
+
+    print(
+        f"[autodiff-gate] realized-schedule progress: preparing baseline rollout "
+        f"(parameter={parameter_name}, baseline_value={baseline_value:.6e}, fd_step={fd_step:.6e})",
+        flush=True,
+    )
     for raw_count in small_step_counts:
         step_count = int(raw_count)
         composition_objective_fn = lambda p: _small_step_composition_objectives_for_parameter(  # noqa: E731
@@ -1470,6 +1476,7 @@ def build_realized_schedule_rollout_report(
     rel_fd_step: float,
     abs_fd_step: float,
     device: str | None,
+    include_nan_debug: bool = False,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -1501,6 +1508,7 @@ def build_realized_schedule_rollout_report(
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
     )
+    print("[autodiff-gate] realized-schedule progress: baseline rollout complete; running fd_minus rollout", flush=True)
     objectives_minus, minus_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(minus_value),
         config=config,
@@ -1510,6 +1518,7 @@ def build_realized_schedule_rollout_report(
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
     )
+    print("[autodiff-gate] realized-schedule progress: fd_minus rollout complete; running fd_plus rollout", flush=True)
     objectives_plus, plus_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(plus_value),
         config=config,
@@ -1519,8 +1528,10 @@ def build_realized_schedule_rollout_report(
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
     )
+    print("[autodiff-gate] realized-schedule progress: fd_plus rollout complete; running AD gradient", flush=True)
 
     gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    print("[autodiff-gate] realized-schedule progress: AD gradient complete; forming FD gradient", flush=True)
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
 
     grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
@@ -1532,7 +1543,8 @@ def build_realized_schedule_rollout_report(
     minus_diag = _adaptive_rollout_diagnostics(minus_rollout)
     plus_diag = _adaptive_rollout_diagnostics(plus_rollout)
     nan_debug = None
-    if not np.all(np.isfinite(grad_ad_np)):
+    if include_nan_debug and not np.all(np.isfinite(grad_ad_np)):
+        print("[autodiff-gate] realized-schedule progress: AD produced nonfinite values; running NaN localization", flush=True)
         nan_debug = _adaptive_rollout_nan_debug_for_parameter(
             jnp.asarray(baseline_value),
             config=config,
@@ -1541,6 +1553,7 @@ def build_realized_schedule_rollout_report(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
         )
+        print("[autodiff-gate] realized-schedule progress: NaN localization complete", flush=True)
 
     return {
         "config_path": str(config_path),
@@ -1919,6 +1932,11 @@ def main() -> None:
         help="Run a final-time-only adaptive-rollout check using the first solve-level custom JVP over the primal's realized accepted schedule.",
     )
     parser.add_argument(
+        "--realized-schedule-nan-debug",
+        action="store_true",
+        help="When --realized-schedule-rollout-check is enabled, run the extra NaN-localization replay pass if AD returns nonfinite values.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -1940,6 +1958,7 @@ def main() -> None:
             rel_fd_step=args.fd_rel_step,
             abs_fd_step=args.fd_abs_step,
             device=args.device,
+            include_nan_debug=args.realized_schedule_nan_debug,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(

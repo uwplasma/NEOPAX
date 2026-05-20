@@ -4917,130 +4917,213 @@ def _radau_debug_realized_attempt_replay(
 ) -> _RadauReplayNanDiagnostic:
     """Locate the first nonfinite tangent in the realized-attempt replay."""
 
-    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
-    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
-    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
-    next_dts = np.asarray(jax.device_get(trace.next_dts), dtype=float)
-    next_recent_reject_count = np.asarray(jax.device_get(trace.next_recent_reject_count), dtype=np.int32)
-    next_regrowth_cooldown = np.asarray(jax.device_get(trace.next_regrowth_cooldown), dtype=np.int32)
-    next_easy_growth_streak = np.asarray(jax.device_get(trace.next_easy_growth_streak), dtype=np.int32)
-    next_lagged_response_valid = np.asarray(jax.device_get(trace.next_lagged_response_valid), dtype=bool)
+    active_mask = trace.active_mask
+    accepted_mask = trace.accepted_mask
+    attempted_dts = trace.attempted_dts
+    next_dts = trace.next_dts
+    next_recent_reject_count = trace.next_recent_reject_count
+    next_regrowth_cooldown = trace.next_regrowth_cooldown
+    next_easy_growth_streak = trace.next_easy_growth_streak
+    next_lagged_response_valid = trace.next_lagged_response_valid
 
-    def _tree_all_finite(tree) -> bool:
+    def _tree_all_finite(tree):
         leaves = jax.tree_util.tree_leaves(tree)
+        finite = jnp.asarray(True)
         for leaf in leaves:
-            arr = np.asarray(jax.device_get(leaf))
-            if np.issubdtype(arr.dtype, np.inexact) and not np.all(np.isfinite(arr)):
-                return False
-        return True
+            leaf_arr = jnp.asarray(leaf)
+            if jnp.issubdtype(leaf_arr.dtype, jnp.inexact):
+                finite = jnp.logical_and(finite, jnp.all(jnp.isfinite(leaf_arr)))
+        return finite
 
-    carry = carry0
-    carry_dot = carry0_dot
-    tangent_finite_mask: list[bool] = []
+    def _accepted_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        accepted_y = _project_flat_state_if_needed(
+            attempt_result.trial_y,
+            execution_context.physics_context.project_flat,
+        )
+        return dataclasses.replace(
+            carry_value,
+            t=carry_value.t + dt_value,
+            y=accepted_y,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
 
-    for idx in range(len(active_mask)):
-        if not active_mask[idx]:
-            tangent_finite_mask.append(_tree_all_finite(carry_dot))
-            continue
+    def _rejected_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        return dataclasses.replace(
+            carry_value,
+            dt=next_dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+            cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+            cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+            cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+            real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+            real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+            complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+            complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+            prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+            prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+        )
 
-        dt_value = jnp.asarray(attempted_dts[idx], dtype=execution_context.dtype)
-        next_dt_value = jnp.asarray(next_dts[idx], dtype=execution_context.dtype)
-        recent_reject_count_value = jnp.asarray(next_recent_reject_count[idx], dtype=jnp.int32)
-        regrowth_cooldown_value = jnp.asarray(next_regrowth_cooldown[idx], dtype=jnp.int32)
-        easy_growth_streak_value = jnp.asarray(next_easy_growth_streak[idx], dtype=jnp.int32)
-        lagged_response_valid_value = jnp.asarray(next_lagged_response_valid[idx])
+    def _scan_body(scan_state, inputs):
+        carry, carry_dot, still_finite = scan_state
+        (
+            active,
+            accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = inputs
 
-        if accepted_mask[idx]:
-            def _accepted_attempt(carry_value):
-                carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                )
-                accepted_y = _project_flat_state_if_needed(
-                    attempt_result.trial_y,
-                    execution_context.physics_context.project_flat,
-                )
-                return dataclasses.replace(
-                    carry_value,
-                    t=carry_value.t + dt_value,
-                    y=accepted_y,
-                    dt=next_dt_value,
-                    prev_error=jnp.maximum(
-                        attempt_result.err_norm,
-                        jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+        should_run = jnp.logical_and(active, still_finite)
+
+        def _run_step(step_operand):
+            carry_in, carry_dot_in = step_operand
+
+            def _run_accepted(_):
+                return jax.jvp(
+                    lambda c: _accepted_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
                     ),
-                    prev_stages=attempt_result.stage_history,
-                    prev_dt=dt_value,
-                    recent_reject_count=recent_reject_count_value,
-                    regrowth_cooldown=regrowth_cooldown_value,
-                    easy_growth_streak=easy_growth_streak_value,
-                    lagged_response_valid=lagged_response_valid_value,
-                    jacobian=attempt_result.jacobian_out,
-                    cache_valid=attempt_result.cache_valid_out,
-                    cache_dt=attempt_result.cache_dt_out,
-                    cache_age=attempt_result.cache_age_out,
-                    real_lu=attempt_result.real_lu_out,
-                    real_piv=attempt_result.real_piv_out,
-                    complex_lu=attempt_result.complex_lu_out,
-                    complex_piv=attempt_result.complex_piv_out,
-                    prev_theta_final=attempt_result.theta_final,
-                    prev_newton_iter_count=attempt_result.newton_iter_count,
+                    (carry_in,),
+                    (carry_dot_in,),
                 )
 
-            carry, carry_dot = jax.jvp(_accepted_attempt, (carry,), (carry_dot,))
-        else:
-            def _rejected_attempt(carry_value):
-                carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                )
-                return dataclasses.replace(
-                    carry_value,
-                    dt=next_dt_value,
-                    recent_reject_count=recent_reject_count_value,
-                    regrowth_cooldown=regrowth_cooldown_value,
-                    easy_growth_streak=easy_growth_streak_value,
-                    lagged_response_valid=lagged_response_valid_value,
-                    jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
-                    cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
-                    cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
-                    cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
-                    real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
-                    real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
-                    complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
-                    complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
-                    prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
-                    prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+            def _run_rejected(_):
+                return jax.jvp(
+                    lambda c: _rejected_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
+                    ),
+                    (carry_in,),
+                    (carry_dot_in,),
                 )
 
-            carry, carry_dot = jax.jvp(_rejected_attempt, (carry,), (carry_dot,))
+            return jax.lax.cond(accepted, _run_accepted, _run_rejected, operand=None)
 
-        tangent_finite_mask.append(_tree_all_finite(carry_dot))
-        if not tangent_finite_mask[-1]:
-            break
+        def _skip_step(step_operand):
+            return step_operand
 
-    tangent_finite_arr = np.asarray(tangent_finite_mask, dtype=bool)
-    bad_indices = np.flatnonzero(~tangent_finite_arr)
-    if bad_indices.size:
-        first_bad_index = int(bad_indices[0])
-        first_bad_was_accepted = bool(accepted_mask[first_bad_index])
-        first_bad_dt = float(attempted_dts[first_bad_index])
-    else:
-        first_bad_index = -1
-        first_bad_was_accepted = False
-        first_bad_dt = float("nan")
-    return _RadauReplayNanDiagnostic(
-        tangent_finite_mask=tangent_finite_arr.tolist(),
+        carry, carry_dot = jax.lax.cond(
+            should_run,
+            _run_step,
+            _skip_step,
+            operand=(carry, carry_dot),
+        )
+        is_finite = _tree_all_finite(carry_dot)
+        return (carry, carry_dot, jnp.logical_and(still_finite, is_finite)), is_finite
+
+    scan_inputs = (
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    (_, _, _), tangent_finite_mask = jax.lax.scan(
+        _scan_body,
+        (carry0, carry0_dot, jnp.asarray(True)),
+        scan_inputs,
+    )
+
+    any_bad = jnp.any(jnp.logical_not(tangent_finite_mask))
+    first_bad_index = jnp.where(
+        any_bad,
+        jnp.argmax(jnp.logical_not(tangent_finite_mask)).astype(jnp.int32),
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    safe_index = jnp.maximum(first_bad_index, 0)
+    first_bad_was_accepted = jnp.where(any_bad, accepted_mask[safe_index], jnp.asarray(False))
+    first_bad_dt = jnp.where(
+        any_bad,
+        attempted_dts[safe_index],
+        jnp.asarray(jnp.nan, dtype=attempted_dts.dtype),
+    )
+    diagnostic = _RadauReplayNanDiagnostic(
+        tangent_finite_mask=tangent_finite_mask,
         first_bad_index=first_bad_index,
         first_bad_was_accepted=first_bad_was_accepted,
         first_bad_dt=first_bad_dt,
-        final_tangent_finite=bool(tangent_finite_arr[-1]) if tangent_finite_arr.size else True,
+        final_tangent_finite=tangent_finite_mask[-1] if tangent_finite_mask.shape[0] else jnp.asarray(True),
+    )
+    diagnostic = jax.device_get(diagnostic)
+    return _RadauReplayNanDiagnostic(
+        tangent_finite_mask=np.asarray(diagnostic.tangent_finite_mask, dtype=bool).tolist(),
+        first_bad_index=int(diagnostic.first_bad_index),
+        first_bad_was_accepted=bool(diagnostic.first_bad_was_accepted),
+        first_bad_dt=float(diagnostic.first_bad_dt),
+        final_tangent_finite=bool(diagnostic.final_tangent_finite),
     )
 
 
