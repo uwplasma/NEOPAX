@@ -4959,12 +4959,19 @@ def _radau_debug_realized_attempt_replay(
         return finite
 
     def _max_abs_scalar(value):
+        zero = jnp.asarray(0.0, dtype=execution_context.dtype)
         if value is None:
-            return jnp.asarray(0.0, dtype=execution_context.dtype)
-        value_arr = jnp.asarray(value)
-        if not jnp.issubdtype(value_arr.dtype, jnp.inexact):
-            return jnp.asarray(0.0, dtype=execution_context.dtype)
-        return jnp.max(jnp.abs(value_arr)).astype(execution_context.dtype)
+            return zero
+        leaves = jax.tree_util.tree_leaves(value, is_leaf=lambda x: x is None)
+        max_abs = zero
+        for leaf in leaves:
+            if leaf is None:
+                continue
+            leaf_arr = jnp.asarray(leaf)
+            if not jnp.issubdtype(leaf_arr.dtype, jnp.inexact):
+                continue
+            max_abs = jnp.maximum(max_abs, jnp.max(jnp.abs(leaf_arr)).astype(execution_context.dtype))
+        return max_abs
 
     def _state_component_max_abs(state_value, attr_name: str):
         if state_value is None:
