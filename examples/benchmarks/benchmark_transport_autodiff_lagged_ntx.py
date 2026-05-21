@@ -50,6 +50,7 @@ from NEOPAX._transport_solvers import (
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
+    _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
     _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
@@ -546,6 +547,12 @@ def _adaptive_rollout_nan_debug_for_parameter(
                     "complex_lu_dot_max_abs": float(debug.complex_lu_dot_max_abs[idx]),
                 }
             )
+    zero_tangent_one_step = _radau_debug_compare_zero_tangent_one_step(
+        execution_context,
+        prepared_rollout.initial_carry,
+        rollout.trace,
+        target_attempt_index=first_bad_index,
+    )
     return {
         "first_bad_index": first_bad_index,
         "first_bad_was_accepted": bool(debug.first_bad_was_accepted),
@@ -593,6 +600,17 @@ def _adaptive_rollout_nan_debug_for_parameter(
             "first_bad_was_accepted": bool(all_tangents_zeroed_debug.first_bad_was_accepted),
             "first_bad_dt": float(all_tangents_zeroed_debug.first_bad_dt),
             "final_tangent_finite": bool(all_tangents_zeroed_debug.final_tangent_finite),
+        },
+        "zero_tangent_one_step": {
+            "target_attempt_index": int(zero_tangent_one_step.target_attempt_index),
+            "target_was_accepted": bool(zero_tangent_one_step.target_was_accepted),
+            "trial_dt": float(zero_tangent_one_step.trial_dt),
+            "custom_trial_y_max_abs": float(zero_tangent_one_step.custom_trial_y_max_abs),
+            "custom_stage_history_max_abs": float(zero_tangent_one_step.custom_stage_history_max_abs),
+            "custom_finite": bool(zero_tangent_one_step.custom_finite),
+            "direct_trial_y_max_abs": float(zero_tangent_one_step.direct_trial_y_max_abs),
+            "direct_stage_history_max_abs": float(zero_tangent_one_step.direct_stage_history_max_abs),
+            "direct_finite": bool(zero_tangent_one_step.direct_finite),
         },
         "local_attempt_window": local_attempt_window,
         "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
@@ -989,6 +1007,20 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"first_bad_was_accepted={all_tangents_zeroed_debug.get('first_bad_was_accepted')} "
                     f"first_bad_dt={_fmt_float(all_tangents_zeroed_debug.get('first_bad_dt'))} "
                     f"final_tangent_finite={all_tangents_zeroed_debug.get('final_tangent_finite')}"
+                )
+            zero_tangent_one_step = nan_debug.get("zero_tangent_one_step")
+            if zero_tangent_one_step is not None:
+                print(
+                    "[autodiff-gate] one-step zero-tangent compare: "
+                    f"target_attempt_index={zero_tangent_one_step.get('target_attempt_index')} "
+                    f"target_was_accepted={zero_tangent_one_step.get('target_was_accepted')} "
+                    f"trial_dt={_fmt_float(zero_tangent_one_step.get('trial_dt'))} "
+                    f"custom_trial_y_max_abs={_fmt_float(zero_tangent_one_step.get('custom_trial_y_max_abs'))} "
+                    f"custom_stage_history_max_abs={_fmt_float(zero_tangent_one_step.get('custom_stage_history_max_abs'))} "
+                    f"custom_finite={zero_tangent_one_step.get('custom_finite')} "
+                    f"direct_trial_y_max_abs={_fmt_float(zero_tangent_one_step.get('direct_trial_y_max_abs'))} "
+                    f"direct_stage_history_max_abs={_fmt_float(zero_tangent_one_step.get('direct_stage_history_max_abs'))} "
+                    f"direct_finite={zero_tangent_one_step.get('direct_finite')}"
                 )
             local_attempt_window = nan_debug.get("local_attempt_window") or []
             if local_attempt_window:

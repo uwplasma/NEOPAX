@@ -2349,6 +2349,20 @@ class _RadauReplayNanDiagnostic:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepZeroTangentComparison:
+    target_attempt_index: Any
+    target_was_accepted: Any
+    trial_dt: Any
+    custom_trial_y_max_abs: Any
+    custom_stage_history_max_abs: Any
+    custom_finite: Any
+    direct_trial_y_max_abs: Any
+    direct_stage_history_max_abs: Any
+    direct_finite: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
     next_carry: Any
     accepted_y: Any
@@ -5295,6 +5309,167 @@ def _radau_debug_realized_attempt_replay(
         jacobian_dot_max_abs=np.asarray(diagnostic.jacobian_dot_max_abs, dtype=float).tolist(),
         real_lu_dot_max_abs=np.asarray(diagnostic.real_lu_dot_max_abs, dtype=float).tolist(),
         complex_lu_dot_max_abs=np.asarray(diagnostic.complex_lu_dot_max_abs, dtype=float).tolist(),
+    )
+
+
+def _radau_debug_compare_zero_tangent_one_step(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    trace: _RadauAdaptiveRolloutTrace,
+    *,
+    target_attempt_index,
+) -> _RadauAcceptedStepZeroTangentComparison:
+    """Compare custom vs direct one-step JVP with zero tangent at one attempt."""
+
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts))
+    next_dts = np.asarray(jax.device_get(trace.next_dts))
+    next_recent_reject_count = np.asarray(jax.device_get(trace.next_recent_reject_count))
+    next_regrowth_cooldown = np.asarray(jax.device_get(trace.next_regrowth_cooldown))
+    next_easy_growth_streak = np.asarray(jax.device_get(trace.next_easy_growth_streak))
+    next_lagged_response_valid = np.asarray(jax.device_get(trace.next_lagged_response_valid))
+
+    zero = jnp.asarray(0.0, dtype=execution_context.dtype)
+
+    def _tree_all_finite(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        finite = jnp.asarray(True)
+        for leaf in leaves:
+            leaf_arr = jnp.asarray(leaf)
+            if jnp.issubdtype(leaf_arr.dtype, jnp.inexact):
+                finite = jnp.logical_and(finite, jnp.all(jnp.isfinite(leaf_arr)))
+        return finite
+
+    def _max_abs_scalar(value):
+        if value is None:
+            return zero
+        leaves = jax.tree_util.tree_leaves(value, is_leaf=lambda x: x is None)
+        max_abs = zero
+        for leaf in leaves:
+            if leaf is None:
+                continue
+            leaf_arr = jnp.asarray(leaf)
+            if not jnp.issubdtype(leaf_arr.dtype, jnp.inexact):
+                continue
+            max_abs = jnp.maximum(max_abs, jnp.max(jnp.abs(leaf_arr)).astype(execution_context.dtype))
+        return max_abs
+
+    target_index = int(target_attempt_index)
+    if target_index < 0 or target_index >= active_mask.shape[0] or not active_mask[target_index]:
+        return _RadauAcceptedStepZeroTangentComparison(
+            target_attempt_index=int(target_index),
+            target_was_accepted=False,
+            trial_dt=float(zero),
+            custom_trial_y_max_abs=float(zero),
+            custom_stage_history_max_abs=float(zero),
+            custom_finite=False,
+            direct_trial_y_max_abs=float(zero),
+            direct_stage_history_max_abs=float(zero),
+            direct_finite=False,
+        )
+
+    carry = carry0
+    for idx in range(target_index):
+        if not active_mask[idx]:
+            break
+        dt_value = jnp.asarray(attempted_dts[idx], dtype=execution_context.dtype)
+        next_dt_value = jnp.asarray(next_dts[idx], dtype=execution_context.dtype)
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_for_step,
+            execution_context.attempt_context,
+        )
+        if accepted_mask[idx]:
+            accepted_y = _project_flat_state_if_needed(
+                attempt_result.trial_y,
+                execution_context.physics_context.project_flat,
+            )
+            carry = dataclasses.replace(
+                carry,
+                t=carry.t + dt_value,
+                y=accepted_y,
+                dt=next_dt_value,
+                prev_error=jnp.maximum(
+                    attempt_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+                ),
+                prev_stages=attempt_result.stage_history,
+                prev_dt=dt_value,
+                recent_reject_count=jnp.asarray(next_recent_reject_count[idx]),
+                regrowth_cooldown=jnp.asarray(next_regrowth_cooldown[idx]),
+                easy_growth_streak=jnp.asarray(next_easy_growth_streak[idx]),
+                lagged_response_valid=jnp.asarray(next_lagged_response_valid[idx]),
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+        else:
+            carry = dataclasses.replace(
+                carry,
+                dt=next_dt_value,
+                recent_reject_count=jnp.asarray(next_recent_reject_count[idx]),
+                regrowth_cooldown=jnp.asarray(next_regrowth_cooldown[idx]),
+                easy_growth_streak=jnp.asarray(next_easy_growth_streak[idx]),
+                lagged_response_valid=jnp.asarray(next_lagged_response_valid[idx]),
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+
+    target_dt = jnp.asarray(attempted_dts[target_index], dtype=execution_context.dtype)
+    carry_for_target = dataclasses.replace(carry, dt=target_dt)
+    zero_tangent = jax.tree_util.tree_map(
+        lambda x: None if x is None else jnp.zeros_like(x),
+        carry_for_target,
+        is_leaf=lambda x: x is None,
+    )
+
+    def _custom_step(carry_value):
+        return _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_value),
+            execution_context.attempt_context,
+        )
+
+    def _direct_step(carry_value):
+        return _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_value),
+            execution_context.attempt_context,
+        )
+
+    _, custom_tangent = jax.jvp(_custom_step, (carry_for_target,), (zero_tangent,))
+    _, direct_tangent = jax.jvp(_direct_step, (carry_for_target,), (zero_tangent,))
+
+    return _RadauAcceptedStepZeroTangentComparison(
+        target_attempt_index=int(target_index),
+        target_was_accepted=bool(accepted_mask[target_index]),
+        trial_dt=float(target_dt),
+        custom_trial_y_max_abs=float(_max_abs_scalar(custom_tangent.trial_y)),
+        custom_stage_history_max_abs=float(_max_abs_scalar(custom_tangent.stage_history)),
+        custom_finite=bool(_tree_all_finite(custom_tangent)),
+        direct_trial_y_max_abs=float(_max_abs_scalar(direct_tangent.trial_y)),
+        direct_stage_history_max_abs=float(_max_abs_scalar(direct_tangent.stage_history)),
+        direct_finite=bool(_tree_all_finite(direct_tangent)),
     )
 
 
