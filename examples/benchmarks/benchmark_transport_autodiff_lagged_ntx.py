@@ -376,6 +376,7 @@ def _adaptive_rollout_nan_debug_for_parameter(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     debug_mode: str = "minimal",
+    include_one_step_compare: bool = False,
 ):
     def _zero_optional_pytree(tree):
         return jax.tree_util.tree_map(
@@ -519,29 +520,30 @@ def _adaptive_rollout_nan_debug_for_parameter(
             ),
             rollout.trace,
         )
-    attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
-    next_dts = np.asarray(jax.device_get(rollout.trace.next_dts), dtype=float)
-    accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
-    err_norms = np.asarray(jax.device_get(rollout.trace.err_norms), dtype=float)
-    theta_finals = np.asarray(jax.device_get(rollout.trace.theta_finals), dtype=float)
-    newton_iter_counts = np.asarray(jax.device_get(rollout.trace.newton_iter_counts), dtype=np.int32)
-    cache_valid_next = np.asarray(jax.device_get(rollout.trace.cache_valid_next), dtype=bool)
     local_attempt_window: list[dict[str, Any]] = []
     first_bad_index = int(debug.first_bad_index)
     if first_bad_index >= 0:
         start = max(0, first_bad_index - 2)
-        stop = min(len(attempted_dts), first_bad_index + 3)
+        stop = min(int(np.asarray(jax.device_get(rollout.attempt_count))), first_bad_index + 3)
+        attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts[start:stop]), dtype=float)
+        next_dts = np.asarray(jax.device_get(rollout.trace.next_dts[start:stop]), dtype=float)
+        accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask[start:stop]), dtype=bool)
+        err_norms = np.asarray(jax.device_get(rollout.trace.err_norms[start:stop]), dtype=float)
+        theta_finals = np.asarray(jax.device_get(rollout.trace.theta_finals[start:stop]), dtype=float)
+        newton_iter_counts = np.asarray(jax.device_get(rollout.trace.newton_iter_counts[start:stop]), dtype=np.int32)
+        cache_valid_next = np.asarray(jax.device_get(rollout.trace.cache_valid_next[start:stop]), dtype=bool)
         for idx in range(start, stop):
+            local_idx = idx - start
             local_attempt_window.append(
                 {
                     "index": int(idx),
-                    "accepted": bool(accepted_mask[idx]),
-                    "attempted_dt": float(attempted_dts[idx]),
-                    "next_dt": float(next_dts[idx]),
-                    "err_norm": float(err_norms[idx]),
-                    "theta_final": float(theta_finals[idx]),
-                    "newton_iter_count": int(newton_iter_counts[idx]),
-                    "cache_valid_next": bool(cache_valid_next[idx]),
+                    "accepted": bool(accepted_mask[local_idx]),
+                    "attempted_dt": float(attempted_dts[local_idx]),
+                    "next_dt": float(next_dts[local_idx]),
+                    "err_norm": float(err_norms[local_idx]),
+                    "theta_final": float(theta_finals[local_idx]),
+                    "newton_iter_count": int(newton_iter_counts[local_idx]),
+                    "cache_valid_next": bool(cache_valid_next[local_idx]),
                     "tangent_finite": bool(debug.tangent_finite_mask[idx]),
                     "dt_dot_abs": float(debug.dt_dot_abs[idx]),
                     "prev_error_dot_abs": float(debug.prev_error_dot_abs[idx]),
@@ -556,19 +558,23 @@ def _adaptive_rollout_nan_debug_for_parameter(
                     "complex_lu_dot_max_abs": float(debug.complex_lu_dot_max_abs[idx]),
                 }
             )
-    zero_tangent_one_step = _radau_debug_compare_zero_tangent_one_step(
-        execution_context,
-        prepared_rollout.initial_carry,
-        rollout.trace,
-        target_attempt_index=first_bad_index,
-    )
     result = {
         "first_bad_index": first_bad_index,
         "first_bad_was_accepted": bool(debug.first_bad_was_accepted),
         "first_bad_dt": float(debug.first_bad_dt),
         "final_tangent_finite": bool(debug.final_tangent_finite),
         "tangent_finite_mask": list(debug.tangent_finite_mask),
-        "zero_tangent_one_step": {
+        "local_attempt_window": local_attempt_window,
+        "debug_mode": debug_mode,
+    }
+    if include_one_step_compare:
+        zero_tangent_one_step = _radau_debug_compare_zero_tangent_one_step(
+            execution_context,
+            prepared_rollout.initial_carry,
+            rollout.trace,
+            target_attempt_index=first_bad_index,
+        )
+        result["zero_tangent_one_step"] = {
             "target_attempt_index": int(zero_tangent_one_step.target_attempt_index),
             "target_was_accepted": bool(zero_tangent_one_step.target_was_accepted),
             "trial_dt": float(zero_tangent_one_step.trial_dt),
@@ -578,13 +584,7 @@ def _adaptive_rollout_nan_debug_for_parameter(
             "direct_trial_y_max_abs": float(zero_tangent_one_step.direct_trial_y_max_abs),
             "direct_stage_history_max_abs": float(zero_tangent_one_step.direct_stage_history_max_abs),
             "direct_finite": bool(zero_tangent_one_step.direct_finite),
-        },
-        "local_attempt_window": local_attempt_window,
-        "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
-        "accepted_mask": _adaptive_rollout_diagnostics(rollout)["accepted_mask"],
-        "err_norms": _adaptive_rollout_diagnostics(rollout)["err_norms"],
-        "debug_mode": debug_mode,
-    }
+        }
     if all_tangents_zeroed_debug is not None:
         result["all_tangents_zeroed_debug"] = {
             "first_bad_index": int(all_tangents_zeroed_debug.first_bad_index),
@@ -750,6 +750,16 @@ def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
         "next_dts": next_dts[active_mask].tolist(),
         "step_ts": step_ts[active_mask].tolist(),
         "err_norms": err_norms[active_mask].tolist(),
+    }
+
+
+def _adaptive_rollout_summary(rollout) -> dict[str, Any]:
+    return {
+        "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count))),
+        "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count))),
+        "completed": bool(np.asarray(jax.device_get(rollout.completed))),
+        "failed": bool(np.asarray(jax.device_get(rollout.failed))),
+        "fail_code": int(np.asarray(jax.device_get(rollout.fail_code))),
     }
 
 
@@ -1833,6 +1843,7 @@ def build_realized_schedule_rollout_report(
     device: str | None,
     include_nan_debug: bool = False,
     nan_debug_mode: str = "minimal",
+    nan_debug_include_one_step_compare: bool = False,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -1909,6 +1920,7 @@ def build_realized_schedule_rollout_report(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             debug_mode=nan_debug_mode,
+            include_one_step_compare=nan_debug_include_one_step_compare,
         )
         print("[autodiff-gate] realized-schedule progress: NaN localization complete", flush=True)
 
@@ -1951,6 +1963,7 @@ def build_realized_schedule_ad_debug_fast_report(
     device: str | None,
     include_nan_debug: bool = True,
     nan_debug_mode: str = "minimal",
+    nan_debug_include_one_step_compare: bool = False,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -1984,7 +1997,7 @@ def build_realized_schedule_ad_debug_fast_report(
     print("[autodiff-gate] fast-ad-debug progress: AD gradient complete", flush=True)
 
     grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    baseline_diag = _adaptive_rollout_summary(baseline_rollout)
     nan_debug = None
     if include_nan_debug and not np.all(np.isfinite(grad_ad_np)):
         print("[autodiff-gate] fast-ad-debug progress: AD produced nonfinite values; running NaN localization", flush=True)
@@ -1996,6 +2009,7 @@ def build_realized_schedule_ad_debug_fast_report(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             debug_mode=nan_debug_mode,
+            include_one_step_compare=nan_debug_include_one_step_compare,
         )
         print("[autodiff-gate] fast-ad-debug progress: NaN localization complete", flush=True)
 
@@ -2375,6 +2389,11 @@ def main() -> None:
         help="Expand --realized-schedule-nan-debug to run the full replay sweep with all tangent-zeroing variants.",
     )
     parser.add_argument(
+        "--realized-schedule-nan-debug-one-step-compare",
+        action="store_true",
+        help="Add the expensive one-step custom-vs-direct zero-tangent comparison to NaN localization.",
+    )
+    parser.add_argument(
         "--small-step-counts",
         default="2,3,5",
         help="Comma-separated accepted-step counts used by the full-report short accepted-step composition check.",
@@ -2396,6 +2415,7 @@ def main() -> None:
             device=args.device,
             include_nan_debug=args.realized_schedule_nan_debug,
             nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
+            nan_debug_include_one_step_compare=args.realized_schedule_nan_debug_one_step_compare,
         )
     elif args.realized_schedule_rollout_check:
         report = build_realized_schedule_rollout_report(
@@ -2406,6 +2426,7 @@ def main() -> None:
             device=args.device,
             include_nan_debug=args.realized_schedule_nan_debug,
             nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
+            nan_debug_include_one_step_compare=args.realized_schedule_nan_debug_one_step_compare,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(

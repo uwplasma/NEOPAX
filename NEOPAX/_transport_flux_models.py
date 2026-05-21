@@ -49,6 +49,10 @@ from ._model_api import (
     validate_transport_flux_builder,
 )
 from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
+from ._spectrax_quasilinear_runtime import (
+    SpectraXQuasilinearRuntimeDiagnostics,
+    evaluate_spectrax_quasilinear_proxy,
+)
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
@@ -2998,6 +3002,83 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         )
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class SpectraXQuasilinearRuntimeTransportModel(TransportFluxModelBase):
+    species: Any
+    geometry: Any
+    backend_mode: str = "smooth_proxy"
+    b0: float = 0.0
+    b1: float = 1.0
+    b2: float = 0.0
+    particle_flux_scale: float = 0.0
+    adiabatic_electrons_only: bool = True
+    electrostatic_only: bool = True
+    spectrax_root: str | None = None
+    template: str | None = None
+
+    def _evaluate_runtime(self, state) -> tuple[dict[str, jax.Array], SpectraXQuasilinearRuntimeDiagnostics]:
+        backend_mode = str(self.backend_mode).strip().lower()
+        if backend_mode != "smooth_proxy":
+            raise NotImplementedError(
+                "SPECTRAX-GK external runtime backend is not implemented yet. "
+                "Use backend_mode='smooth_proxy' for the current in-repo scaffold."
+            )
+        return evaluate_spectrax_quasilinear_proxy(
+            state=state,
+            species=self.species,
+            geometry=self.geometry,
+            b0=self.b0,
+            b1=self.b1,
+            b2=self.b2,
+            adiabatic_electrons_only=bool(self.adiabatic_electrons_only),
+            particle_flux_scale=float(self.particle_flux_scale),
+        )
+
+    def __call__(self, state) -> dict:
+        fluxes, _diagnostics = self._evaluate_runtime(state)
+        return fluxes
+
+    def build_local_particle_flux_evaluator(self, state):
+        fluxes, _diagnostics = self._evaluate_runtime(state)
+        gamma_turb = fluxes["Gamma"]
+
+        def evaluator(radius_index, er_value):
+            del er_value
+            return gamma_turb[:, radius_index]
+
+        return evaluator
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        del state, kwargs
+        fluxes, _diagnostics = self._evaluate_runtime(face_state)
+        return fluxes
+
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        return JVPTransportFluxResponse(
+            reference_state=state,
+            reference_flux=self(state),
+        )
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del kwargs
+        delta_state = jax.tree_util.tree_map(
+            lambda current, reference: current - reference,
+            state,
+            lagged_response.reference_state,
+        )
+        tangent_flux = jax.jvp(
+            self.__call__,
+            (lagged_response.reference_state,),
+            (delta_state,),
+        )[1]
+        return jax.tree_util.tree_map(
+            lambda reference, tangent: reference + tangent,
+            lagged_response.reference_flux,
+            tangent_flux,
+        )
+
+
 # --- PATCH: Accept [neoclassical]/flux_model and [turbulence]/model as defaults ---
 
 # --- Refactored: Only the orchestrator builds models; this function is now a pure factory ---
@@ -3098,6 +3179,40 @@ register_transport_flux_model(
         chi_n=chi_n,
         pressure_source_model=pressure_source_model,
         total_power_mw=total_power_mw,
+    ),
+)
+
+register_transport_flux_model(
+    "spectrax_quasilinear_runtime",
+    lambda species, energy_grid, geometry, database=None, **kwargs: SpectraXQuasilinearRuntimeTransportModel(
+        species=species,
+        geometry=geometry,
+        backend_mode=str(kwargs.get("backend_mode", kwargs.get("mode", "smooth_proxy"))),
+        b0=float(kwargs.get("b0", 0.0)),
+        b1=float(kwargs.get("b1", 1.0)),
+        b2=float(kwargs.get("b2", 0.0)),
+        particle_flux_scale=float(kwargs.get("particle_flux_scale", 0.0)),
+        adiabatic_electrons_only=bool(kwargs.get("adiabatic_electrons_only", True)),
+        electrostatic_only=bool(kwargs.get("electrostatic_only", True)),
+        spectrax_root=kwargs.get("spectrax_root"),
+        template=kwargs.get("template"),
+    ),
+)
+
+register_transport_flux_model(
+    "spectrax_quasilinear_runtime_lagged",
+    lambda species, energy_grid, geometry, database=None, **kwargs: SpectraXQuasilinearRuntimeTransportModel(
+        species=species,
+        geometry=geometry,
+        backend_mode=str(kwargs.get("backend_mode", kwargs.get("mode", "smooth_proxy"))),
+        b0=float(kwargs.get("b0", 0.0)),
+        b1=float(kwargs.get("b1", 1.0)),
+        b2=float(kwargs.get("b2", 0.0)),
+        particle_flux_scale=float(kwargs.get("particle_flux_scale", 0.0)),
+        adiabatic_electrons_only=bool(kwargs.get("adiabatic_electrons_only", True)),
+        electrostatic_only=bool(kwargs.get("electrostatic_only", True)),
+        spectrax_root=kwargs.get("spectrax_root"),
+        template=kwargs.get("template"),
     ),
 )
 

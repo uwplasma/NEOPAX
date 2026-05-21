@@ -543,3 +543,48 @@ That is strong enough to be useful and honest enough to remain scientifically de
 4. Add AD-vs-FD tests against local profile perturbations.
 5. Integrate as a NEOPAX black-box turbulence model.
 6. Add lagged-response cache and refresh logic.
+
+## Current NEOPAX scaffold status
+
+The first in-repo scaffold is now started in NEOPAX with a deliberately safe scope:
+
+- new model keys:
+  - `spectrax_quasilinear_runtime`
+  - `spectrax_quasilinear_runtime_lagged`
+- new model-local runtime helper:
+  - `NEOPAX/_spectrax_quasilinear_runtime.py`
+- current backend:
+  - `backend_mode = "smooth_proxy"`
+
+This means the present implementation is:
+
+- flux-model-layer only,
+- fully local to the turbulence model interface,
+- differentiable and cheap enough for smoke tests,
+- not yet connected to an external SPECTRAX-GK runtime scan.
+
+The current scaffold already provides:
+
+- a smooth local feature map,
+- a fixed-coefficient closure
+
+```text
+log Q_total = b0 + b1 f1 + b2 f2
+```
+
+- simple channel reconstruction,
+- lagged-response-compatible `build_lagged_response(...)`,
+- lagged-response-compatible `evaluate_with_lagged_response(...)`,
+- orchestrator wiring for normal NEOPAX model selection.
+
+Two benchmark-style example configs now exist for smoke testing:
+
+- `examples/benchmarks/Calculate_Fluxes_noHe_spectrax_quasilinear_runtime_benchmark.toml`
+- `examples/benchmarks/Solve_Transport_equations_noHe_radau_spectrax_quasilinear_runtime_benchmark.toml`
+
+These are intentionally not the final scientific model. They are the first safe integration scaffold so that:
+
+- the configuration surface is exercised,
+- the flux-model hooks are validated,
+- lagged-response plumbing is tested at the model layer,
+- future replacement of the smooth proxy with a real SPECTRAX adapter can happen behind the same interface.

@@ -614,6 +614,14 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             pressure_source_model,
             total_power_mw,
         )
+    elif turbulence_name in {"spectrax_quasilinear_runtime", "spectrax_quasilinear_runtime_lagged"}:
+        turbulence_model = turbulence_factory(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            **dict(turbulence_cfg),
+        )
     else:
         turbulence_model = turbulence_factory(species, energy_grid, geometry, database)
     classical_model = (
