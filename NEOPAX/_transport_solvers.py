@@ -2830,6 +2830,47 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
     return primal_result, tangent_attempt
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
+def _execute_radau_accepted_step_attempt_autodiff(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepAttemptResult:
+    """AD-facing accepted-step attempt wrapper using the Radau-native JVP.
+
+    The forward pass remains exactly the current accepted-step primal. The JVP
+    avoids differentiating through the raw LU-factorisation / Newton-iteration
+    internals and instead uses the existing approximate implicit-diff tangent
+    defined at the accepted-step boundary.
+    """
+    return _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+
+
+@_execute_radau_accepted_step_attempt_autodiff.defjvp
+def _execute_radau_accepted_step_attempt_autodiff_jvp(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    primals,
+    tangents,
+):
+    (carry_in,) = primals
+    (carry_tangent,) = tangents
+    return _execute_radau_accepted_step_attempt_with_approx_tangent(
+        kernel_context,
+        physics_context,
+        carry_in,
+        carry_tangent,
+        context,
+    )
+
+
 def _execute_radau_accepted_step_attempt(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -4493,7 +4534,7 @@ def _radau_replay_realized_attempt_rollout(
         def _do_attempt(_):
             def _accepted_attempt(__):
                 carry_for_step = dataclasses.replace(carry, dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt(
+                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     _radau_carry_with_forward_only_jvp_fields(carry_for_step),
@@ -4539,7 +4580,7 @@ def _radau_replay_realized_attempt_rollout(
 
             def _rejected_attempt(__):
                 carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry), dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt(
+                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     _radau_carry_with_forward_only_jvp_fields(carry_for_step),
@@ -4991,7 +5032,7 @@ def _radau_debug_realized_attempt_replay(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-        attempt_result = _execute_radau_accepted_step_attempt(
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
             execution_context.kernel_context,
             execution_context.physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_for_step),
@@ -5039,7 +5080,7 @@ def _radau_debug_realized_attempt_replay(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
-        attempt_result = _execute_radau_accepted_step_attempt(
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
             execution_context.kernel_context,
             execution_context.physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_for_step),
