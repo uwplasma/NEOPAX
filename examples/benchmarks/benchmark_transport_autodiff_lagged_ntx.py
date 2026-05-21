@@ -1992,12 +1992,28 @@ def build_realized_schedule_ad_debug_fast_report(
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
     )
+    baseline_diag = _adaptive_rollout_summary(baseline_rollout)
+    print(
+        "[autodiff-gate] fast-ad-debug baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"completed={baseline_diag['completed']} "
+        f"failed={baseline_diag['failed']} "
+        f"fail_code={baseline_diag['fail_code']}",
+        flush=True,
+    )
     print("[autodiff-gate] fast-ad-debug progress: baseline rollout complete; running AD gradient", flush=True)
     gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
     print("[autodiff-gate] fast-ad-debug progress: AD gradient complete", flush=True)
 
     grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-    baseline_diag = _adaptive_rollout_summary(baseline_rollout)
+    print("[autodiff-gate] fast-ad-debug AD values:", flush=True)
+    for label, ad in zip(OBJECTIVE_LABELS, grad_ad_np):
+        finite_flag = bool(np.isfinite(ad))
+        print(
+            f"  - {label}: ad={float(ad):.6e} finite={finite_flag}",
+            flush=True,
+        )
     nan_debug = None
     if include_nan_debug and not np.all(np.isfinite(grad_ad_np)):
         print("[autodiff-gate] fast-ad-debug progress: AD produced nonfinite values; running NaN localization", flush=True)
@@ -2010,6 +2026,14 @@ def build_realized_schedule_ad_debug_fast_report(
             parameter_name=parameter_name,
             debug_mode=nan_debug_mode,
             include_one_step_compare=nan_debug_include_one_step_compare,
+        )
+        print(
+            "[autodiff-gate] fast-ad-debug NaN localization result: "
+            f"first_bad_index={nan_debug.get('first_bad_index')} "
+            f"first_bad_was_accepted={nan_debug.get('first_bad_was_accepted')} "
+            f"first_bad_dt={_fmt_float(nan_debug.get('first_bad_dt'))} "
+            f"final_tangent_finite={nan_debug.get('final_tangent_finite')}",
+            flush=True,
         )
         print("[autodiff-gate] fast-ad-debug progress: NaN localization complete", flush=True)
 
@@ -2356,6 +2380,11 @@ def main() -> None:
         help="Run an additive AD-vs-FD check on a short accepted-step composition map.",
     )
     parser.add_argument(
+        "--small-step-only-check",
+        action="store_true",
+        help="Run only the short accepted-step composition check, without the full baseline/fd solve report.",
+    )
+    parser.add_argument(
         "--with-controller-composition-check",
         action="store_true",
         help="Run an additive AD-vs-FD check on a short rollout with the real Radau controller dt updates.",
@@ -2442,6 +2471,16 @@ def main() -> None:
         )
     elif args.controller_only_check:
         report = build_controller_only_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            small_step_counts=_parse_float_csv(args.small_step_counts),
+            small_step_scale=args.small_step_scale,
+            device=args.device,
+        )
+    elif args.small_step_only_check:
+        report = build_small_step_only_report(
             config_path=args.config,
             parameter_name=args.parameter,
             rel_fd_step=args.fd_rel_step,

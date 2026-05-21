@@ -4618,7 +4618,7 @@ def _radau_replay_realized_attempt_rollout(
                     execution_context.physics_context.project_flat,
                 )
                 next_carry = dataclasses.replace(
-                    carry,
+                    attempt_result.carry_after_attempt,
                     t=carry.t + dt_value,
                     y=accepted_y,
                     dt=next_dt_value,
@@ -4665,7 +4665,9 @@ def _radau_replay_realized_attempt_rollout(
                     recent_reject_count=recent_reject_count_value,
                     regrowth_cooldown=regrowth_cooldown_value,
                     easy_growth_streak=easy_growth_streak_value,
+                    lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
                     lagged_response_valid=lagged_response_valid_value,
+                    lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
                     jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
                     cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
                     cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
@@ -5116,7 +5118,7 @@ def _radau_debug_realized_attempt_replay(
             execution_context.physics_context.project_flat,
         )
         return dataclasses.replace(
-            carry_value,
+            attempt_result.carry_after_attempt,
             t=carry_value.t + dt_value,
             y=accepted_y,
             dt=next_dt_value,
@@ -5165,7 +5167,9 @@ def _radau_debug_realized_attempt_replay(
             recent_reject_count=recent_reject_count_value,
             regrowth_cooldown=regrowth_cooldown_value,
             easy_growth_streak=easy_growth_streak_value,
+            lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
             lagged_response_valid=lagged_response_valid_value,
+            lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
             jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
             cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
             cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
