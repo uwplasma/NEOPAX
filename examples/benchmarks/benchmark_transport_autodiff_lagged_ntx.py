@@ -2021,6 +2021,8 @@ def build_realized_schedule_ad_debug_fast_report(
         "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
         "gradient_autodiff": grad_ad_np.tolist(),
         "ad_all_finite": bool(np.all(np.isfinite(grad_ad_np))),
+        "passed": bool(np.all(np.isfinite(grad_ad_np))),
+        "max_relative_error": float("nan"),
         "objective_labels": OBJECTIVE_LABELS,
         "rollout_path": {
             "baseline": baseline_diag,
@@ -2488,10 +2490,17 @@ def main() -> None:
         if not args.no_plot:
             _write_figure(report, fig_path)
             print(f"Wrote {fig_path}")
+    passed_value = report.get("passed")
+    max_rel_error_value = report.get("max_relative_error")
+    max_rel_error_text = (
+        f"{float(max_rel_error_value):.3e}"
+        if max_rel_error_value is not None
+        else "n/a"
+    )
     print(
         f"parameter={report['parameter_name']} "
-        f"passed={report['passed']} "
-        f"max_rel_error={report['max_relative_error']:.3e}"
+        f"passed={passed_value} "
+        f"max_rel_error={max_rel_error_text}"
     )
 
 

@@ -5896,7 +5896,6 @@ class RADAUSolver(_RadauSolverConfig):
         controller_alpha = 0.7 / (error_order + 1.0)
         zero_scalar = jnp.asarray(0.0, dtype=dtype)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
-        freeze_attempt_linearization = self.jacobian_reuse_mode == "freeze_attempt"
         divergence_mode = str(getattr(self, "newton_divergence_mode", "legacy")).strip().lower()
         residual_norm_mode = str(getattr(self, "newton_residual_norm", "raw")).strip().lower()
         debug_newton_trace = bool(getattr(self, "debug_stage_markers", False))
