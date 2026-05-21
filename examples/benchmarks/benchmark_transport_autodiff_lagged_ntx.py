@@ -499,6 +499,16 @@ def _adaptive_rollout_nan_debug_for_parameter(
         ),
         rollout.trace,
     )
+    all_tangents_zeroed_debug = _radau_debug_realized_attempt_replay(
+        execution_context,
+        prepared_rollout.initial_carry,
+        jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            carry0_dot,
+            is_leaf=lambda x: x is None,
+        ),
+        rollout.trace,
+    )
     attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
     next_dts = np.asarray(jax.device_get(rollout.trace.next_dts), dtype=float)
     accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
@@ -577,6 +587,12 @@ def _adaptive_rollout_nan_debug_for_parameter(
             "first_bad_was_accepted": bool(y_and_prev_error_zeroed_debug.first_bad_was_accepted),
             "first_bad_dt": float(y_and_prev_error_zeroed_debug.first_bad_dt),
             "final_tangent_finite": bool(y_and_prev_error_zeroed_debug.final_tangent_finite),
+        },
+        "all_tangents_zeroed_debug": {
+            "first_bad_index": int(all_tangents_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(all_tangents_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(all_tangents_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(all_tangents_zeroed_debug.final_tangent_finite),
         },
         "local_attempt_window": local_attempt_window,
         "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
@@ -964,6 +980,15 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"first_bad_was_accepted={y_and_prev_error_zeroed_debug.get('first_bad_was_accepted')} "
                     f"first_bad_dt={_fmt_float(y_and_prev_error_zeroed_debug.get('first_bad_dt'))} "
                     f"final_tangent_finite={y_and_prev_error_zeroed_debug.get('final_tangent_finite')}"
+                )
+            all_tangents_zeroed_debug = nan_debug.get("all_tangents_zeroed_debug")
+            if all_tangents_zeroed_debug is not None:
+                print(
+                    "[autodiff-gate] replay NaN debug with all tangents zeroed: "
+                    f"first_bad_index={all_tangents_zeroed_debug.get('first_bad_index')} "
+                    f"first_bad_was_accepted={all_tangents_zeroed_debug.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={_fmt_float(all_tangents_zeroed_debug.get('first_bad_dt'))} "
+                    f"final_tangent_finite={all_tangents_zeroed_debug.get('final_tangent_finite')}"
                 )
             local_attempt_window = nan_debug.get("local_attempt_window") or []
             if local_attempt_window:
