@@ -1979,6 +1979,148 @@ This is a deliberate approximation, but it is motivated by the evidence:
 
 - local step AD is good
 - accepted-step composition AD is good
+
+## Realized-schedule replay investigation update
+
+This section records the current status of the solve-level AD work around the
+realized adaptive Radau replay.
+
+### What was established before the latest replay fix attempt
+
+In the realized-schedule rollout check:
+
+- the first nonfinite tangent consistently appeared at accepted attempt
+  `index=144`
+- that step had benign primal diagnostics:
+  - accepted step
+  - `dt ~= 9.304070e-06`
+  - moderate `err_norm`
+  - small `theta_final`
+  - small Newton iteration count
+
+Several localized A/B tests were run by zeroing tangent channels in the replay
+carry:
+
+- `lagged_response_cache`
+- `prev_stages`
+- `lagged_response_cache + prev_stages`
+- `y`
+- `prev_error`
+- `y + prev_error`
+
+None of those moved the first bad step.
+
+The decisive diagnosis was:
+
+- even with **all incoming replay tangents zeroed**, the replay still produced
+  a first nonfinite tangent at accepted attempt `144`
+
+That means the failure was not just a large physical sensitivity or simple
+accumulation effect. It was structural: the replay JVP machinery itself was
+manufacturing bad tangents.
+
+### Structural replay fix attempt
+
+A real fix attempt was then made:
+
+- the realized-schedule replay was changed so that accepted attempts no longer
+  use raw `jax.jvp(...)` through the full primal accepted-step attempt
+- instead, the replay now calls an AD-facing accepted-step wrapper with a
+  `custom_jvp`
+- that custom JVP uses the existing Radau-native approximate implicit-diff
+  tangent, rather than differentiating through the raw Jacobian/LU/Newton
+  internals
+
+This was not just another diagnostic print. It changed the actual AD path used
+by the replay.
+
+### What changed after that fix attempt
+
+After switching the replay to the accepted-step custom JVP:
+
+- the replay still first failed at accepted attempt `144`
+- but several previously contaminated tangent channels were cleaned up:
+  - `prev_error_dot_abs` became `0`
+  - `jacobian_dot_max_abs` became `0`
+  - `real_lu_dot_max_abs` became `0`
+  - `complex_lu_dot_max_abs` became `0`
+
+So the structural replay fix partially worked:
+
+- it removed the bad AD path through raw Jacobian/LU/Newton internals
+- but it did **not** fully remove the `NaN`
+
+### Current remaining failure mode
+
+With the accepted-step custom JVP active, the first nonfinite quantities at
+accepted attempt `144` are now:
+
+- `y_dot_max_abs -> NaN`
+- `prev_stages_dot_max_abs -> NaN`
+
+while:
+
+- `prev_error_dot_abs = 0`
+- Jacobian/LU tangent summaries remain `0`
+
+This strongly suggests the remaining bug is now inside the **approximate
+accepted-step tangent formula itself**, especially the part that builds:
+
+- the accepted state tangent `dy_next`
+- the stage-history tangent `dz_stages`
+
+not in the raw replay-through-primal path anymore.
+
+### Practical conclusion
+
+The current state should be interpreted as:
+
+- the original realized-schedule replay JVP was structurally wrong
+- replacing it with the accepted-step custom JVP was a meaningful fix attempt
+  and improved the AD path
+- the remaining `NaN` is now localized much more narrowly to the current
+  approximate accepted-step tangent implementation
+
+So the next debugging/fix work should target:
+
+- `_radau_approximate_accepted_step_tangent(...)`
+- the stage linear solve used inside that tangent construction
+- any hidden dependence of `dz_stages` / `dy_next` on replay state that should
+  remain forward-only
+
+### Current solve plan
+
+At this point, the problem should be treated as an **accepted-step tangent
+construction bug**, not as a generic replay-AD or controller-history problem.
+
+The practical plan is:
+
+1. debug `_radau_approximate_accepted_step_tangent(...)` directly
+   - especially on the known problematic accepted attempt `144`
+
+2. inspect the tangent pipeline in order:
+   - stage RHS assembly
+   - transformed stage RHS
+   - real block linear solve
+   - complex block linear solve
+   - reconstructed `dz_stages`
+   - final `dy_next`
+
+3. enforce the basic correctness property:
+   - zero tangent input must give zero tangent output
+
+4. keep the first stable accepted-step custom JVP intentionally narrow:
+   - differentiate primarily with respect to accepted-step state `y_n`
+   - and trial step size `h`
+   - keep replay/controller/cache internals forward-only until the core tangent
+     path is stable
+
+The current leading hypothesis is:
+
+- the remaining `NaN` is produced inside the current approximate implicit-diff
+  accepted-step tangent formula itself
+- most likely in the `dZ` stage solve or in the subsequent reconstruction of
+  `dy_next`
 - controller `dt` sensitivity is the first thing that destabilizes the full
   derivative
 
