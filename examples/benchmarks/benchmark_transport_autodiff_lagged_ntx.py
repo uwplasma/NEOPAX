@@ -375,6 +375,13 @@ def _adaptive_rollout_nan_debug_for_parameter(
     profile_cfg: dict[str, Any],
     parameter_name: str,
 ):
+    def _zero_optional_pytree(tree):
+        return jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            tree,
+            is_leaf=lambda x: x is None,
+        )
+
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -436,6 +443,15 @@ def _adaptive_rollout_nan_debug_for_parameter(
         carry0_dot,
         rollout.trace,
     )
+    lagged_cache_zeroed_debug = _radau_debug_realized_attempt_replay(
+        execution_context,
+        prepared_rollout.initial_carry,
+        dataclasses.replace(
+            carry0_dot,
+            lagged_response_cache=_zero_optional_pytree(carry0_dot.lagged_response_cache),
+        ),
+        rollout.trace,
+    )
     attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
     next_dts = np.asarray(jax.device_get(rollout.trace.next_dts), dtype=float)
     accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
@@ -479,6 +495,12 @@ def _adaptive_rollout_nan_debug_for_parameter(
         "first_bad_dt": float(debug.first_bad_dt),
         "final_tangent_finite": bool(debug.final_tangent_finite),
         "tangent_finite_mask": list(debug.tangent_finite_mask),
+        "lagged_cache_zeroed_debug": {
+            "first_bad_index": int(lagged_cache_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(lagged_cache_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(lagged_cache_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(lagged_cache_zeroed_debug.final_tangent_finite),
+        },
         "local_attempt_window": local_attempt_window,
         "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
         "accepted_mask": _adaptive_rollout_diagnostics(rollout)["accepted_mask"],
@@ -812,6 +834,15 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"first_bad_dt={_fmt_float(nan_debug.get('first_bad_dt'))} "
                 f"final_tangent_finite={nan_debug.get('final_tangent_finite')}"
             )
+            lagged_cache_zeroed_debug = nan_debug.get("lagged_cache_zeroed_debug")
+            if lagged_cache_zeroed_debug is not None:
+                print(
+                    "[autodiff-gate] replay NaN debug with lagged-cache tangent zeroed: "
+                    f"first_bad_index={lagged_cache_zeroed_debug.get('first_bad_index')} "
+                    f"first_bad_was_accepted={lagged_cache_zeroed_debug.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={_fmt_float(lagged_cache_zeroed_debug.get('first_bad_dt'))} "
+                    f"final_tangent_finite={lagged_cache_zeroed_debug.get('final_tangent_finite')}"
+                )
             local_attempt_window = nan_debug.get("local_attempt_window") or []
             if local_attempt_window:
                 print("[autodiff-gate] replay NaN local window:")
