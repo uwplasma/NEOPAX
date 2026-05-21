@@ -375,6 +375,7 @@ def _adaptive_rollout_nan_debug_for_parameter(
     baseline_state,
     profile_cfg: dict[str, Any],
     parameter_name: str,
+    debug_mode: str = "minimal",
 ):
     def _zero_optional_pytree(tree):
         return jax.tree_util.tree_map(
@@ -444,62 +445,12 @@ def _adaptive_rollout_nan_debug_for_parameter(
         carry0_dot,
         rollout.trace,
     )
-    lagged_cache_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            lagged_response_cache=_zero_optional_pytree(carry0_dot.lagged_response_cache),
-        ),
-        rollout.trace,
-    )
-    prev_stages_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            prev_stages=jnp.zeros_like(carry0_dot.prev_stages),
-        ),
-        rollout.trace,
-    )
-    prev_stages_and_lagged_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            prev_stages=jnp.zeros_like(carry0_dot.prev_stages),
-            lagged_response_cache=_zero_optional_pytree(carry0_dot.lagged_response_cache),
-        ),
-        rollout.trace,
-    )
-    y_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            y=jax.tree_util.tree_map(jnp.zeros_like, carry0_dot.y),
-        ),
-        rollout.trace,
-    )
-    prev_error_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            prev_error=jnp.zeros_like(carry0_dot.prev_error),
-        ),
-        rollout.trace,
-    )
-    y_and_prev_error_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        dataclasses.replace(
-            carry0_dot,
-            y=jax.tree_util.tree_map(jnp.zeros_like, carry0_dot.y),
-            prev_error=jnp.zeros_like(carry0_dot.prev_error),
-        ),
-        rollout.trace,
-    )
+    lagged_cache_zeroed_debug = None
+    prev_stages_zeroed_debug = None
+    prev_stages_and_lagged_zeroed_debug = None
+    y_zeroed_debug = None
+    prev_error_zeroed_debug = None
+    y_and_prev_error_zeroed_debug = None
     all_tangents_zeroed_debug = _radau_debug_realized_attempt_replay(
         execution_context,
         prepared_rollout.initial_carry,
@@ -510,6 +461,63 @@ def _adaptive_rollout_nan_debug_for_parameter(
         ),
         rollout.trace,
     )
+    if debug_mode == "exhaustive":
+        lagged_cache_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                lagged_response_cache=_zero_optional_pytree(carry0_dot.lagged_response_cache),
+            ),
+            rollout.trace,
+        )
+        prev_stages_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                prev_stages=jnp.zeros_like(carry0_dot.prev_stages),
+            ),
+            rollout.trace,
+        )
+        prev_stages_and_lagged_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                prev_stages=jnp.zeros_like(carry0_dot.prev_stages),
+                lagged_response_cache=_zero_optional_pytree(carry0_dot.lagged_response_cache),
+            ),
+            rollout.trace,
+        )
+        y_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                y=jax.tree_util.tree_map(jnp.zeros_like, carry0_dot.y),
+            ),
+            rollout.trace,
+        )
+        prev_error_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                prev_error=jnp.zeros_like(carry0_dot.prev_error),
+            ),
+            rollout.trace,
+        )
+        y_and_prev_error_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dataclasses.replace(
+                carry0_dot,
+                y=jax.tree_util.tree_map(jnp.zeros_like, carry0_dot.y),
+                prev_error=jnp.zeros_like(carry0_dot.prev_error),
+            ),
+            rollout.trace,
+        )
     attempted_dts = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
     next_dts = np.asarray(jax.device_get(rollout.trace.next_dts), dtype=float)
     accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
@@ -553,48 +561,12 @@ def _adaptive_rollout_nan_debug_for_parameter(
         rollout.trace,
         target_attempt_index=first_bad_index,
     )
-    return {
+    result = {
         "first_bad_index": first_bad_index,
         "first_bad_was_accepted": bool(debug.first_bad_was_accepted),
         "first_bad_dt": float(debug.first_bad_dt),
         "final_tangent_finite": bool(debug.final_tangent_finite),
         "tangent_finite_mask": list(debug.tangent_finite_mask),
-        "lagged_cache_zeroed_debug": {
-            "first_bad_index": int(lagged_cache_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(lagged_cache_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(lagged_cache_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(lagged_cache_zeroed_debug.final_tangent_finite),
-        },
-        "prev_stages_zeroed_debug": {
-            "first_bad_index": int(prev_stages_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(prev_stages_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(prev_stages_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(prev_stages_zeroed_debug.final_tangent_finite),
-        },
-        "prev_stages_and_lagged_zeroed_debug": {
-            "first_bad_index": int(prev_stages_and_lagged_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(prev_stages_and_lagged_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(prev_stages_and_lagged_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(prev_stages_and_lagged_zeroed_debug.final_tangent_finite),
-        },
-        "y_zeroed_debug": {
-            "first_bad_index": int(y_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(y_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(y_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(y_zeroed_debug.final_tangent_finite),
-        },
-        "prev_error_zeroed_debug": {
-            "first_bad_index": int(prev_error_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(prev_error_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(prev_error_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(prev_error_zeroed_debug.final_tangent_finite),
-        },
-        "y_and_prev_error_zeroed_debug": {
-            "first_bad_index": int(y_and_prev_error_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(y_and_prev_error_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(y_and_prev_error_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(y_and_prev_error_zeroed_debug.final_tangent_finite),
-        },
         "all_tangents_zeroed_debug": {
             "first_bad_index": int(all_tangents_zeroed_debug.first_bad_index),
             "first_bad_was_accepted": bool(all_tangents_zeroed_debug.first_bad_was_accepted),
@@ -616,7 +588,51 @@ def _adaptive_rollout_nan_debug_for_parameter(
         "attempted_dts": _adaptive_rollout_diagnostics(rollout)["attempted_dts"],
         "accepted_mask": _adaptive_rollout_diagnostics(rollout)["accepted_mask"],
         "err_norms": _adaptive_rollout_diagnostics(rollout)["err_norms"],
+        "debug_mode": debug_mode,
     }
+    if lagged_cache_zeroed_debug is not None:
+        result["lagged_cache_zeroed_debug"] = {
+            "first_bad_index": int(lagged_cache_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(lagged_cache_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(lagged_cache_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(lagged_cache_zeroed_debug.final_tangent_finite),
+        }
+    if prev_stages_zeroed_debug is not None:
+        result["prev_stages_zeroed_debug"] = {
+            "first_bad_index": int(prev_stages_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(prev_stages_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(prev_stages_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(prev_stages_zeroed_debug.final_tangent_finite),
+        }
+    if prev_stages_and_lagged_zeroed_debug is not None:
+        result["prev_stages_and_lagged_zeroed_debug"] = {
+            "first_bad_index": int(prev_stages_and_lagged_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(prev_stages_and_lagged_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(prev_stages_and_lagged_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(prev_stages_and_lagged_zeroed_debug.final_tangent_finite),
+        }
+    if y_zeroed_debug is not None:
+        result["y_zeroed_debug"] = {
+            "first_bad_index": int(y_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(y_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(y_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(y_zeroed_debug.final_tangent_finite),
+        }
+    if prev_error_zeroed_debug is not None:
+        result["prev_error_zeroed_debug"] = {
+            "first_bad_index": int(prev_error_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(prev_error_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(prev_error_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(prev_error_zeroed_debug.final_tangent_finite),
+        }
+    if y_and_prev_error_zeroed_debug is not None:
+        result["y_and_prev_error_zeroed_debug"] = {
+            "first_bad_index": int(y_and_prev_error_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(y_and_prev_error_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(y_and_prev_error_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(y_and_prev_error_zeroed_debug.final_tangent_finite),
+        }
+    return result
 
 
 def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> float:
@@ -1751,6 +1767,7 @@ def build_realized_schedule_rollout_report(
     abs_fd_step: float,
     device: str | None,
     include_nan_debug: bool = False,
+    nan_debug_mode: str = "minimal",
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -1826,6 +1843,7 @@ def build_realized_schedule_rollout_report(
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
+            debug_mode=nan_debug_mode,
         )
         print("[autodiff-gate] realized-schedule progress: NaN localization complete", flush=True)
 
@@ -2208,7 +2226,12 @@ def main() -> None:
     parser.add_argument(
         "--realized-schedule-nan-debug",
         action="store_true",
-        help="When --realized-schedule-rollout-check is enabled, run the extra NaN-localization replay pass if AD returns nonfinite values.",
+        help="When --realized-schedule-rollout-check is enabled, run a minimal NaN-localization replay pass if AD returns nonfinite values.",
+    )
+    parser.add_argument(
+        "--realized-schedule-nan-debug-exhaustive",
+        action="store_true",
+        help="Expand --realized-schedule-nan-debug to run the full replay sweep with all tangent-zeroing variants.",
     )
     parser.add_argument(
         "--small-step-counts",
@@ -2233,6 +2256,7 @@ def main() -> None:
             abs_fd_step=args.fd_abs_step,
             device=args.device,
             include_nan_debug=args.realized_schedule_nan_debug,
+            nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(

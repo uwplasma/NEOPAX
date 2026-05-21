@@ -2126,3 +2126,92 @@ The current leading hypothesis is:
 
 So this should be treated as the **first implementation path** for obtaining a
 useful full-solve AD signal in the Radau solver.
+
+### Follow-up after zero-input safeguards
+
+The accepted-step approximate tangent was then tightened in two conservative
+ways:
+
+- `_radau_apply_stage_linear_solve(...)` now short-circuits an exactly zero RHS
+  to a zero solution instead of sending it through the LU solve
+- `_radau_approximate_accepted_step_tangent(...)` now explicitly enforces
+  zero-in -> zero-out for the narrow accepted-step tangent inputs
+  (`dy_source == 0` and `dh_source == 0`)
+
+These were real implementation changes aimed at the remaining tangent
+construction bug, not just more prints.
+
+### What the new run showed
+
+After those safeguards, the realized-schedule replay still failed at the same
+accepted attempt:
+
+- `first_bad_index = 144`
+- `first_bad_was_accepted = True`
+- `first_bad_dt ~= 9.304070e-06`
+
+But the local window became more informative:
+
+- at attempts `142` and `143`
+  - `prev_error_dot_abs = 0`
+  - `jacobian_dot_max_abs = 0`
+  - `real_lu_dot_max_abs = 0`
+  - `complex_lu_dot_max_abs = 0`
+  - `y_dot_max_abs` and `prev_stages_dot_max_abs` were still finite
+- at accepted attempt `144`
+  - `y_dot_max_abs -> NaN`
+  - `prev_stages_dot_max_abs -> NaN`
+  - while Jacobian/LU tangent summaries stayed `0`
+
+So the remaining failure is now even more clearly concentrated in the
+accepted-step tangent outputs themselves, especially:
+
+- accepted-state tangent assembly `dy_next`
+- stage-history tangent assembly `dz_stages`
+
+not in the raw Newton/LU differentiation path.
+
+### New local comparison hook
+
+To answer the key question "is the custom one-step tangent itself already
+wrong?", a new very local diagnostic hook was added.
+
+The benchmark NaN-debug path now also:
+
+1. replays the primal carry forward to the first bad attempt
+2. isolates that exact accepted-step input
+3. compares, on that single step with **zero tangent input**:
+   - the custom accepted-step JVP
+   - a direct one-step `jax.jvp` of the raw accepted-step primal
+
+This comparison is reported as:
+
+- `one-step zero-tangent compare: ...`
+
+and records:
+
+- target attempt index
+- whether that target was accepted
+- trial `dt`
+- custom one-step tangent finiteness and max norms
+- direct one-step tangent finiteness and max norms
+
+### Why this comparison matters
+
+This is the most direct test of the current hypothesis:
+
+- if the **custom one-step zero-tangent** output is already nonzero or
+  nonfinite while the **direct one-step zero-tangent** output is clean,
+  then the bug is inside the custom accepted-step tangent itself
+- if both are clean, then the remaining bug lies in how the one-step tangent is
+  composed or propagated through the realized-schedule replay
+
+This check was motivated by the earlier important observation that:
+
+- isolated one-step AD had behaved much better than solver-level replay AD
+
+So the current next-step diagnosis is no longer broad tangent-channel A/B
+testing. It is:
+
+- compare custom vs direct one-step tangent on the exact failing accepted step
+- then inspect whichever side first violates zero-in -> zero-out

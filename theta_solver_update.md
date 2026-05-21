@@ -4,14 +4,29 @@ This note describes a practical update path for the `theta` / `theta_newton`
 solver in NEOPAX based on a simple idea:
 
 - reuse the **well-behaved structural components** of the custom Radau solver
+- make the theta solver **look as much like Radau as possible at the solver-architecture level**
 - do **not** blindly copy Radau-specific stage machinery
 - keep `lagged_response` as a forward-solve acceleration mechanism
 - build a cleaner, more robust implicit theta solver around the same
   controller-quality and Newton-quality lessons
 
-The goal is not to turn theta into Radau. The goal is to transfer the parts of
-the Radau implementation that are conceptually solver-agnostic and have
-already shown themselves to be useful.
+The goal is not to turn theta into a fake collocation method. The goal is:
+
+- make theta and Radau use as similar a **solver boundary / controller /
+  diagnostics / reuse architecture** as possible
+- run the same kinds of NTX lagged-response cases through both solvers
+- and later let theta inherit a very similar AD strategy once the Radau AD path
+  is correct
+
+So the design target is:
+
+- **maximum architectural similarity**
+- **minimum mathematical distortion**
+
+In other words:
+
+- copy the Radau *solver logic shape* as far as it makes sense
+- only diverge where theta's one-stage implicit mathematics truly requires it
 
 ## Main idea
 
@@ -38,7 +53,44 @@ The parts that **are** Radau-specific are:
 So the right update strategy for theta is:
 
 - reuse the generic good ideas
-- replace the Radau-specific internals with theta-specific analogues
+- preserve the same high-level solver object boundaries
+- preserve the same controller and diagnostic language
+- preserve the same lagged-response and reuse concepts
+- replace only the Radau-specific mathematical internals with theta-specific
+  analogues
+
+## Compatibility goal
+
+The compatibility goal should be explicit:
+
+- we want theta and Radau to be testable on the same families of transport
+  problems
+- especially the same NTX lagged-response configurations
+- and we want later AD work on theta to follow the same overall pattern as the
+  final Radau AD path
+
+That means theta should try to match Radau in:
+
+- accepted-step attempt structure
+- accepted / rejected controller flow
+- Newton-quality summaries
+- reuse-state bookkeeping
+- lagged-response construction / reuse policy
+- saved diagnostics
+
+and should differ mainly in:
+
+- local implicit residual math
+- local linear solve structure
+- local error estimator
+
+This is important because it means future comparisons are easier:
+
+- same benchmark cases
+- same runtime diagnostics
+- same controller interpretation
+- same lagged-response modes
+- and later, ideally, the same AD boundary design
 
 ## What should be reused from Radau
 
@@ -256,6 +308,16 @@ That same accepted-step boundary later becomes the natural place for:
 - replay diagnostics
 - checkpointing
 
+This accepted-step boundary should be made as parallel as possible to the
+Radau accepted-step boundary:
+
+- carry in
+- one attempted implicit solve
+- accepted-step result object
+- updated carry out
+
+The internals will differ, but the outer shape should match closely.
+
 ## Role of lagged response in theta
 
 Yes, the same general `lagged_response` idea makes sense for theta.
@@ -343,6 +405,12 @@ Package one successful theta step as:
 This should be the theta equivalent of the accepted-step boundary that has been
 so useful in the Radau work.
 
+The stronger design requirement is:
+
+- the theta accepted-step boundary should be intentionally shaped to resemble
+  the Radau one, so that later replay / AD / diagnostics work can follow the
+  same pattern with minimal conceptual branching
+
 ### Layer 4: Controller wrapper
 
 Use a controller shell inspired by the better-behaved Radau controller logic:
@@ -407,6 +475,190 @@ is:
 - custom AD at the theta accepted-step boundary
 
 But this should come **after** the forward solver structure is cleaned up.
+
+## Current implementation progress
+
+The first theta-local implementation slice has now been started in code.
+
+Implemented so far:
+
+- `theta` / `theta_newton` step diagnostics now expose much more of the same
+  operational information style used by Radau:
+  - convergence flag
+  - residual-like error norm
+  - Newton iteration count
+  - final residual norm
+  - final correction norm
+  - `theta_final`-style contraction proxy
+  - slow-contraction / residual-blowup / nonfinite flags
+
+- `theta_newton` now reuses some expensive per-attempt data across retry
+  reductions:
+  - `f_old` is built once per attempted step
+  - transport `lagged_response` is built once per attempted step and reused
+    through reduced-`dt` retries
+
+- `theta_newton` now carries a more Radau-like controller memory state:
+  - `prev_error`
+  - `prev_dt`
+  - `recent_reject_count`
+  - `regrowth_cooldown`
+  - `easy_growth_streak`
+  - `prev_theta_final`
+  - `prev_newton_iter_count`
+
+- a theta-local controller helper was added that reuses the same **style** of
+  logic as the better-behaved Radau controller:
+  - current / Gustafsson / Hairer-lean / NTSS-like growth modes
+  - reject-history-aware shrink logic
+  - difficulty-aware growth caps using Newton quality and contraction
+
+- theta now has a first-class attempted-step result object,
+  `_ThetaAcceptedStepAttemptResult`, so both `theta` and `theta_newton`
+  organize one attempted implicit solve in a much more Radau-like way:
+  - attempt inputs
+  - one attempted solve
+  - structured attempt result
+  - step-info projection used for saved diagnostics
+
+- both theta backends now flow through a shared
+  `_theta_step_info_from_attempt(...)` helper instead of assembling saved
+  diagnostics ad hoc from loose tuples
+
+- theta now also has a first-class attempted-step input / reuse wrapper,
+  `_ThetaAttemptContext`, so the data needed for one attempted solve is
+  packaged explicitly rather than being reconstructed implicitly inside nested
+  local functions
+
+- both theta backends now build attempted steps through a shared
+  `_theta_make_attempt_context(...)` helper, and `theta_newton` reuses the
+  same attempt context across reduced-`dt` retries via
+  `_theta_attempt_context_with_dt(...)`
+
+- this makes theta more Radau-like not just at the result boundary, but also
+  at the attempt-input boundary:
+  - attempt context in
+  - one attempted implicit solve
+  - structured attempt result out
+
+- theta now also has a shared state-transition helper,
+  `_theta_step_transition_from_attempt(...)`, so both `theta` and
+  `theta_newton` apply accepted / rejected step outcomes through one common
+  carry-update path rather than each backend hand-assembling status and carry
+  updates locally
+
+- that means the forward theta architecture is now closer to the Radau shape
+  at three distinct boundaries:
+  - attempt context construction
+  - attempted-step result construction
+  - accepted / rejected carry transition
+
+- `theta_newton` now exposes an explicit `theta_controller_mode` setting
+  through solver parameters so it can be run with controller families that
+  intentionally mirror the Radau-side controller vocabulary
+
+- `theta_newton` now also exposes an explicit
+  `theta_jacobian_reuse_mode` setting so forward benchmarks can compare:
+  - `refresh_each_iteration`
+  - `freeze_attempt`
+
+- `theta_newton` now also exposes Radau-style reuse-control options directly:
+  - `theta_jacobian_reuse_rtol`
+  - `theta_max_jacobian_age`
+  - `theta_lagged_response_reuse_mode`
+  - `theta_lagged_response_reuse_rtol`
+  - `theta_lagged_response_reuse_atol`
+
+- this gives theta a first real, explicit Jacobian/LU reuse policy knob in the
+  same architectural spirit as Radau, while still keeping the local one-stage
+  Newton mathematics simple
+
+- the generic custom-solver saved output now also exposes
+  `last_attempt_jacobian_reused`, and theta populates it explicitly from the
+  chosen linearization-reuse behavior
+
+- the generic custom-solver saved output now also exposes
+  `last_attempt_lagged_reused`, and theta populates it explicitly when a
+  lagged transport response object was built and reused through the attempted
+  solve / retry path
+
+- that means forward benchmarks can now distinguish:
+  - whether theta converged
+  - how difficult Newton was
+  - whether the last attempt ran under reused-vs-refreshed linearization
+  - whether the last attempt used lagged transport-response reuse
+
+- theta now also carries a first-class `_ThetaReuseState` inside the step
+  state, and that reuse metadata is exposed at the end of a solve through
+  `final_reuse_state`
+
+- this is intentionally a lighter-weight forward-only analogue of the more
+  mature Radau reuse carry, but it has now become substantially closer:
+  - lagged-response cache object
+  - lagged-response validity flag
+  - lagged-response reference state
+  - Jacobian cache
+  - cache-validity flag
+  - cache `dt`
+  - cache age
+  - LU factorization cache
+  - pivot cache
+  - whether lagged response was actually reused on the last attempt
+  - whether the last attempt actually reused its Jacobian/LU linearization
+  - and the `dt` associated with that most recent linearization choice
+
+- `theta_newton` now also uses Radau-like reuse decision logic in the forward
+  path:
+  - lagged-response reuse can be controlled with `retry_only` or
+    `global_state_drift`
+  - global drift reuse uses the same normalized state-drift metric concept
+  - Jacobian/LU reuse now respects cache-validity, `dt` closeness, and cache
+    age limits in the same overall style as Radau
+
+- the current forward-path architecture is therefore much closer to the Radau
+  shape in the places that matter for future benchmarking:
+  - accepted-step attempt boundary
+  - controller memory
+  - Newton-quality summaries
+  - retry-aware lagged-response reuse
+  - explicit linearization reuse policy
+  - saved reuse diagnostics
+  - first-class reuse-state carry
+  - saved per-step diagnostics
+
+This is intentionally **not** a copy of the Radau stage method.
+It is reuse of:
+
+- controller shell ideas
+- Newton-quality heuristics
+- stateful retry / regrowth behavior
+
+while keeping the theta solver mathematically one-stage and much simpler.
+
+So the implementation direction is already aligned with the intended goal:
+
+- make theta operationally resemble Radau as much as possible
+- keep the only real differences at the local implicit-step mathematics level
+
+## Next practical step
+
+The next useful theta-local step is:
+
+- start using the richer theta reuse-state more actively in controller logic,
+  rather than only in reuse execution and final diagnostics
+
+- after that, the next strong forward-only target is to make Jacobian / LU
+  state itself more visible in saved diagnostics and controller decisions when
+  that proves helpful for benchmarking
+
+That would further align:
+
+- debugging
+- replayability
+- eventual future AD design
+- benchmark comparability against the same NTX lagged-response cases
+
+without coupling the theta work to the current Radau AD investigation.
 
 ## Does this make sense?
 

@@ -684,6 +684,9 @@ def _finalize_custom_solver_output(
     last_attempt_slow_contraction,
     last_attempt_residual_blowup,
     last_attempt_newton_nonfinite,
+    last_attempt_lagged_reused,
+    last_attempt_jacobian_reused,
+    final_reuse_state,
     unpack_flat,
     reference_state,
     species,
@@ -744,6 +747,9 @@ def _finalize_custom_solver_output(
         "last_attempt_slow_contraction": last_attempt_slow_contraction,
         "last_attempt_residual_blowup": last_attempt_residual_blowup,
         "last_attempt_newton_nonfinite": last_attempt_newton_nonfinite,
+        "last_attempt_lagged_reused": last_attempt_lagged_reused,
+        "last_attempt_jacobian_reused": last_attempt_jacobian_reused,
+        "final_reuse_state": final_reuse_state,
         "final_state": final_state,
         "final_time": t_final,
     }
@@ -971,6 +977,8 @@ def _run_saved_loop(
     last_attempt_slow_contraction0 = jnp.asarray(False)
     last_attempt_residual_blowup0 = jnp.asarray(False)
     last_attempt_newton_nonfinite0 = jnp.asarray(False)
+    last_attempt_lagged_reused0 = jnp.asarray(False)
+    last_attempt_jacobian_reused0 = jnp.asarray(False)
 
     def cond_fun(loop_carry):
         step_state, step_idx, *_ = loop_carry
@@ -1005,6 +1013,8 @@ def _run_saved_loop(
             _last_slow_contraction,
             _last_residual_blowup,
             _last_newton_nonfinite,
+            _last_lagged_reused,
+            _last_jacobian_reused,
         ) = loop_carry
         step_state, step_info = step_fn(step_state, None)
         save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
@@ -1050,6 +1060,8 @@ def _run_saved_loop(
             jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction")),
             jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup")),
             jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite")),
+            jnp.asarray(False if getattr(step_info, "lagged_reused", None) is None else getattr(step_info, "lagged_reused")),
+            jnp.asarray(False if getattr(step_info, "jacobian_reused", None) is None else getattr(step_info, "jacobian_reused")),
         )
 
     loop_carry = (
@@ -1079,6 +1091,8 @@ def _run_saved_loop(
         last_attempt_slow_contraction0,
         last_attempt_residual_blowup0,
         last_attempt_newton_nonfinite0,
+        last_attempt_lagged_reused0,
+        last_attempt_jacobian_reused0,
     )
     return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
 
@@ -1129,6 +1143,8 @@ def _run_saved_loop_debug_walltime(
     last_attempt_slow_contraction = jnp.asarray(False)
     last_attempt_residual_blowup = jnp.asarray(False)
     last_attempt_newton_nonfinite = jnp.asarray(False)
+    last_attempt_lagged_reused = jnp.asarray(False)
+    last_attempt_jacobian_reused = jnp.asarray(False)
 
     while True:
         active = bool(jax.device_get(_custom_loop_active(step_state, t_final, jnp.asarray(step_idx, dtype=jnp.int32), max_total_steps)))
@@ -1180,6 +1196,8 @@ def _run_saved_loop_debug_walltime(
         last_attempt_slow_contraction = jnp.asarray(False if getattr(step_info, "slow_contraction", None) is None else getattr(step_info, "slow_contraction"))
         last_attempt_residual_blowup = jnp.asarray(False if getattr(step_info, "residual_blowup", None) is None else getattr(step_info, "residual_blowup"))
         last_attempt_newton_nonfinite = jnp.asarray(False if getattr(step_info, "newton_nonfinite", None) is None else getattr(step_info, "newton_nonfinite"))
+        last_attempt_lagged_reused = jnp.asarray(False if getattr(step_info, "lagged_reused", None) is None else getattr(step_info, "lagged_reused"))
+        last_attempt_jacobian_reused = jnp.asarray(False if getattr(step_info, "jacobian_reused", None) is None else getattr(step_info, "jacobian_reused"))
 
         step_idx += 1
 
@@ -1210,6 +1228,8 @@ def _run_saved_loop_debug_walltime(
         last_attempt_slow_contraction,
         last_attempt_residual_blowup,
         last_attempt_newton_nonfinite,
+        last_attempt_lagged_reused,
+        last_attempt_jacobian_reused,
     )
 
 
@@ -5858,6 +5878,7 @@ class RADAUSolver(_RadauSolverConfig):
         controller_alpha = 0.7 / (error_order + 1.0)
         zero_scalar = jnp.asarray(0.0, dtype=dtype)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
+        freeze_attempt_linearization = self.jacobian_reuse_mode == "freeze_attempt"
         divergence_mode = str(getattr(self, "newton_divergence_mode", "legacy")).strip().lower()
         residual_norm_mode = str(getattr(self, "newton_residual_norm", "raw")).strip().lower()
         debug_newton_trace = bool(getattr(self, "debug_stage_markers", False))
@@ -6085,6 +6106,8 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
         ) = loop_result
         failed_f = step_state_f.status[STATUS_FAILED] != 0
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
@@ -6115,6 +6138,9 @@ class RADAUSolver(_RadauSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
+            getattr(step_state_f, "reuse_state", None),
             unpack_flat,
             state,
             species,
@@ -6197,6 +6223,13 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
     safety_factor: float = 0.9
     min_step_factor: float = 0.5
     max_step_factor: float = 2.0
+    controller_mode: str = "current"
+    jacobian_reuse_mode: str = "refresh_each_iteration"
+    jacobian_reuse_rtol: float = 0.1
+    max_jacobian_age: int = 8
+    lagged_response_reuse_mode: str = "retry_only"
+    lagged_response_reuse_rtol: float = 5.0e-2
+    lagged_response_reuse_atol: float = 1.0e-8
     target_nonlinear_iterations: int = 4
     delta_reduction_factor: float = 0.5
     tau_min: float = 0.01
@@ -6218,6 +6251,13 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         safety_factor: float = 0.9,
         min_step_factor: float = 0.5,
         max_step_factor: float = 2.0,
+        controller_mode: str = "current",
+        jacobian_reuse_mode: str = "refresh_each_iteration",
+        jacobian_reuse_rtol: float = 0.1,
+        max_jacobian_age: int = 8,
+        lagged_response_reuse_mode: str = "retry_only",
+        lagged_response_reuse_rtol: float = 5.0e-2,
+        lagged_response_reuse_atol: float = 1.0e-8,
         target_nonlinear_iterations: int = 4,
         delta_reduction_factor: float = 0.5,
         tau_min: float = 0.01,
@@ -6247,6 +6287,51 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
         object.__setattr__(self, "safety_factor", float(safety_factor))
         object.__setattr__(self, "min_step_factor", float(min_step_factor))
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
+        controller_mode_norm = str(controller_mode).strip().lower()
+        controller_aliases = {
+            "pi": "current",
+            "gustafson": "gustafsson",
+            "hairer": "hairer_lean",
+            "ntss": "hairer_ntss",
+        }
+        controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
+        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_ntss"}:
+            raise ValueError(
+                "theta_controller_mode must be one of: current, current_legacy, "
+                "gustafsson, hairer_lean, hairer_ntss"
+            )
+        object.__setattr__(self, "controller_mode", controller_mode_norm)
+        jacobian_reuse_mode_norm = str(jacobian_reuse_mode).strip().lower()
+        jacobian_reuse_aliases = {
+            "refresh": "refresh_each_iteration",
+            "every_iteration": "refresh_each_iteration",
+            "freeze": "freeze_attempt",
+            "frozen": "freeze_attempt",
+        }
+        jacobian_reuse_mode_norm = jacobian_reuse_aliases.get(jacobian_reuse_mode_norm, jacobian_reuse_mode_norm)
+        if jacobian_reuse_mode_norm not in {"refresh_each_iteration", "freeze_attempt"}:
+            raise ValueError(
+                "theta_jacobian_reuse_mode must be one of: "
+                "refresh_each_iteration, freeze_attempt"
+            )
+        object.__setattr__(self, "jacobian_reuse_mode", jacobian_reuse_mode_norm)
+        object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
+        object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
+        lagged_reuse_mode_norm = str(lagged_response_reuse_mode).strip().lower()
+        lagged_reuse_aliases = {
+            "retry": "retry_only",
+            "global": "global_state_drift",
+            "drift": "global_state_drift",
+        }
+        lagged_reuse_mode_norm = lagged_reuse_aliases.get(lagged_reuse_mode_norm, lagged_reuse_mode_norm)
+        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift"}:
+            raise ValueError(
+                "theta_lagged_response_reuse_mode must be one of: "
+                "retry_only, global_state_drift"
+            )
+        object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
+        object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
+        object.__setattr__(self, "lagged_response_reuse_atol", float(lagged_response_reuse_atol))
         object.__setattr__(self, "target_nonlinear_iterations", int(max(1, target_nonlinear_iterations)))
         object.__setattr__(self, "delta_reduction_factor", float(delta_reduction_factor))
         object.__setattr__(self, "tau_min", float(tau_min))
@@ -6259,6 +6344,14 @@ class _ThetaStepState:
     y: Any
     dt: Any
     status: Any
+    prev_error: Any = None
+    prev_dt: Any = None
+    recent_reject_count: Any = None
+    regrowth_cooldown: Any = None
+    easy_growth_streak: Any = None
+    prev_theta_final: Any = None
+    prev_newton_iter_count: Any = None
+    reuse_state: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -6270,6 +6363,522 @@ class _ThetaStepInfo:
     accepted: Any
     failed: Any
     fail_code: Any
+    converged: Any = None
+    err_norm: Any = None
+    diverged: Any = None
+    nonfinite_stage_state: Any = None
+    nonfinite_stage_residual: Any = None
+    finite_f0: Any = None
+    finite_z0: Any = None
+    finite_initial_residual: Any = None
+    newton_iter_count: Any = None
+    final_residual_norm: Any = None
+    final_delta_norm: Any = None
+    theta_final: Any = None
+    slow_contraction: Any = None
+    residual_blowup: Any = None
+    newton_nonfinite: Any = None
+    lagged_reused: Any = None
+    jacobian_reused: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaAcceptedStepAttemptResult:
+    trial_dt: Any
+    trial_y: Any
+    err_norm: Any
+    converged: Any
+    newton_iter_count: Any
+    final_residual_norm: Any
+    final_delta_norm: Any
+    theta_final: Any
+    slow_contraction: Any
+    residual_blowup: Any
+    newton_nonfinite: Any
+    lagged_reused: Any
+    jacobian_reused: Any
+    lagged_response_cache_out: Any
+    lagged_response_valid_out: Any
+    lagged_reference_y_out: Any
+    jacobian_out: Any
+    cache_valid_out: Any
+    cache_dt_out: Any
+    cache_age_out: Any
+    lu_out: Any
+    piv_out: Any
+    diverged_final: Any
+    nonfinite_stage_state: Any
+    nonfinite_stage_residual: Any
+    finite_f0: Any
+    finite_z0: Any
+    finite_initial_residual: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaAttemptContext:
+    t: Any
+    y: Any
+    trial_dt: Any
+    t_new: Any
+    f_old: Any
+    lagged_response: Any
+    lagged_reference_y: Any
+    lagged_response_reused: Any
+    reuse_state: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReuseState:
+    lagged_response_cache: Any
+    lagged_response_available: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    lu_factor: Any
+    pivots: Any
+    freeze_attempt_linearization: Any
+    last_lagged_reused: Any
+    last_jacobian_reused: Any
+    last_linearization_dt: Any
+
+
+def _theta_attempt_context_with_dt(
+    attempt_context: _ThetaAttemptContext,
+    trial_dt,
+) -> _ThetaAttemptContext:
+    return dataclasses.replace(
+        attempt_context,
+        trial_dt=trial_dt,
+        t_new=attempt_context.t + trial_dt,
+    )
+
+
+def _theta_initial_reuse_state(state_dim, dtype) -> _ThetaReuseState:
+    return _ThetaReuseState(
+        lagged_response_cache=None,
+        lagged_response_available=jnp.asarray(False),
+        lagged_response_valid=jnp.asarray(False),
+        lagged_reference_y=jnp.zeros((state_dim,), dtype=dtype),
+        jacobian=jnp.zeros((state_dim, state_dim), dtype=dtype),
+        cache_valid=jnp.asarray(False),
+        cache_dt=jnp.asarray(0.0, dtype=dtype),
+        cache_age=jnp.asarray(0, dtype=jnp.int32),
+        lu_factor=jnp.eye(state_dim, dtype=dtype),
+        pivots=jnp.arange(state_dim, dtype=jnp.int32),
+        freeze_attempt_linearization=jnp.asarray(False),
+        last_lagged_reused=jnp.asarray(False),
+        last_jacobian_reused=jnp.asarray(False),
+        last_linearization_dt=jnp.asarray(0.0, dtype=dtype),
+    )
+
+
+def _theta_make_reuse_state(
+    *,
+    lagged_response_cache,
+    lagged_response_available,
+    lagged_response_valid,
+    lagged_reference_y,
+    jacobian,
+    cache_valid,
+    cache_dt,
+    cache_age,
+    lu_factor,
+    pivots,
+    freeze_attempt_linearization,
+    last_lagged_reused,
+    last_jacobian_reused,
+    last_linearization_dt,
+):
+    return _ThetaReuseState(
+        lagged_response_cache=lagged_response_cache,
+        lagged_response_available=lagged_response_available,
+        lagged_response_valid=lagged_response_valid,
+        lagged_reference_y=lagged_reference_y,
+        jacobian=jacobian,
+        cache_valid=cache_valid,
+        cache_dt=cache_dt,
+        cache_age=cache_age,
+        lu_factor=lu_factor,
+        pivots=pivots,
+        freeze_attempt_linearization=freeze_attempt_linearization,
+        last_lagged_reused=last_lagged_reused,
+        last_jacobian_reused=last_jacobian_reused,
+        last_linearization_dt=last_linearization_dt,
+    )
+
+
+def _theta_make_attempt_context(
+    step_state: _ThetaStepState,
+    *,
+    t_final,
+    flat_rhs,
+    build_lagged_response,
+    unpack_flat,
+    project_flat,
+    use_transport_lagged_response,
+):
+    trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
+    y_proj = _project_flat_state_if_needed(step_state.y, project_flat)
+    lagged_response = (
+        build_lagged_response(unpack_flat(y_proj))
+        if (use_transport_lagged_response and build_lagged_response is not None)
+        else None
+    )
+    return _ThetaAttemptContext(
+        t=step_state.t,
+        y=step_state.y,
+        trial_dt=trial_dt,
+        t_new=step_state.t + trial_dt,
+        f_old=flat_rhs(step_state.t, step_state.y),
+        lagged_response=lagged_response,
+        lagged_reference_y=step_state.y,
+        lagged_response_reused=jnp.asarray(False),
+        reuse_state=step_state.reuse_state,
+    )
+
+
+def _theta_prepare_lagged_response(
+    step_state: _ThetaStepState,
+    *,
+    use_transport_lagged_response,
+    lagged_response_reuse_mode,
+    lagged_response_reuse_rtol,
+    lagged_response_reuse_atol,
+    unpack_flat,
+    project_flat,
+    build_lagged_response,
+):
+    if not use_transport_lagged_response:
+        return None, step_state.y, jnp.asarray(False)
+    candidate_flat = _project_flat_state_if_needed(step_state.y, project_flat)
+    candidate_state = unpack_flat(candidate_flat)
+    reuse_state = step_state.reuse_state
+    lagged_response_reused = jnp.asarray(False)
+    can_reuse = reuse_state.lagged_response_valid
+    if lagged_response_reuse_mode == "global_state_drift":
+        lagged_reuse_metric = _lagged_response_global_reuse_metric(
+            candidate_flat,
+            reuse_state.lagged_reference_y,
+            atol=lagged_response_reuse_atol,
+            rtol=lagged_response_reuse_rtol,
+        )
+        can_reuse = jnp.logical_and(can_reuse, lagged_reuse_metric <= jnp.asarray(1.0, dtype=candidate_flat.dtype))
+    if lagged_response_reuse_mode == "retry_only":
+        can_reuse = jnp.logical_and(can_reuse, step_state.recent_reject_count > jnp.asarray(0, dtype=jnp.int32))
+    lagged_response_reused = jnp.asarray(can_reuse)
+
+    def _reuse_cached(_):
+        return reuse_state.lagged_response_cache
+
+    def _rebuild_cached(_):
+        if build_lagged_response is None:
+            return None
+        return build_lagged_response(candidate_state)
+
+    lagged_response = jax.lax.cond(
+        can_reuse,
+        _reuse_cached,
+        _rebuild_cached,
+        operand=None,
+    )
+    lagged_reference_y = jax.lax.cond(
+        can_reuse,
+        lambda _: reuse_state.lagged_reference_y,
+        lambda _: candidate_flat,
+        operand=None,
+    )
+    return lagged_response, lagged_reference_y, lagged_response_reused
+
+
+def _theta_step_info_from_attempt(
+    step_state: _ThetaStepState,
+    *,
+    attempt_result: _ThetaAcceptedStepAttemptResult,
+    next_y,
+    next_t,
+    accepted,
+    fail_now,
+    fail_code,
+    dtype,
+) -> _ThetaStepInfo:
+    return _ThetaStepInfo(
+        y=jnp.where(accepted, next_y, step_state.y),
+        t=jnp.where(accepted, next_t, step_state.t),
+        dt=jnp.where(accepted, attempt_result.trial_dt, jnp.asarray(0.0, dtype=dtype)),
+        accepted=accepted,
+        failed=fail_now,
+        fail_code=fail_code,
+        converged=attempt_result.converged,
+        err_norm=attempt_result.err_norm,
+        diverged=attempt_result.diverged_final,
+        nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+        nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+        finite_f0=attempt_result.finite_f0,
+        finite_z0=attempt_result.finite_z0,
+        finite_initial_residual=attempt_result.finite_initial_residual,
+        newton_iter_count=attempt_result.newton_iter_count,
+        final_residual_norm=attempt_result.final_residual_norm,
+        final_delta_norm=attempt_result.final_delta_norm,
+        theta_final=attempt_result.theta_final,
+        slow_contraction=attempt_result.slow_contraction,
+        residual_blowup=attempt_result.residual_blowup,
+        newton_nonfinite=attempt_result.newton_nonfinite,
+        lagged_reused=attempt_result.lagged_reused,
+        jacobian_reused=attempt_result.jacobian_reused,
+    )
+
+
+def _theta_step_transition_from_attempt(
+    step_state: _ThetaStepState,
+    *,
+    attempt_result: _ThetaAcceptedStepAttemptResult,
+    n_accepted,
+    next_dt_if_accepted,
+    next_dt_if_rejected,
+    next_prev_error_if_accepted,
+    next_prev_dt_if_accepted,
+    next_recent_reject_count_if_accepted,
+    next_recent_reject_count_if_rejected,
+    next_regrowth_cooldown_if_accepted,
+    next_regrowth_cooldown_if_rejected,
+    next_easy_growth_streak_if_accepted,
+    next_easy_growth_streak_if_rejected,
+    next_reuse_state_if_accepted,
+    next_reuse_state_if_rejected,
+    project_flat,
+    dtype,
+):
+    accepted = attempt_result.converged
+    t_new = step_state.t + attempt_result.trial_dt
+    next_y = _project_flat_state_if_needed(attempt_result.trial_y, project_flat)
+    fail_now = jnp.logical_not(accepted)
+    fail_code = jnp.where(accepted, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32))
+    status_next = jnp.asarray(
+        [fail_now.astype(jnp.int32), fail_code, n_accepted + jnp.where(accepted, 1, 0)],
+        dtype=jnp.int32,
+    )
+    next_state = _ThetaStepState(
+        t=jnp.where(accepted, t_new, step_state.t),
+        y=jnp.where(accepted, next_y, step_state.y),
+        dt=jnp.where(accepted, next_dt_if_accepted, next_dt_if_rejected),
+        status=status_next,
+        prev_error=jnp.where(accepted, next_prev_error_if_accepted, step_state.prev_error),
+        prev_dt=jnp.where(accepted, next_prev_dt_if_accepted, step_state.prev_dt),
+        recent_reject_count=jnp.where(accepted, next_recent_reject_count_if_accepted, next_recent_reject_count_if_rejected),
+        regrowth_cooldown=jnp.where(accepted, next_regrowth_cooldown_if_accepted, next_regrowth_cooldown_if_rejected),
+        easy_growth_streak=jnp.where(accepted, next_easy_growth_streak_if_accepted, next_easy_growth_streak_if_rejected),
+        prev_theta_final=attempt_result.theta_final,
+        prev_newton_iter_count=attempt_result.newton_iter_count,
+        reuse_state=jax.lax.cond(
+            accepted,
+            lambda _: next_reuse_state_if_accepted,
+            lambda _: next_reuse_state_if_rejected,
+            operand=None,
+        ),
+    )
+    step_info = _theta_step_info_from_attempt(
+        step_state,
+        attempt_result=attempt_result,
+        next_y=next_y,
+        next_t=t_new,
+        accepted=accepted,
+        fail_now=fail_now,
+        fail_code=fail_code,
+        dtype=dtype,
+    )
+    return next_state, step_info
+
+
+def _theta_controller_update(
+    *,
+    step_state: _ThetaStepState,
+    trial_dt,
+    converged,
+    residual_norm,
+    newton_iter_count,
+    theta_final,
+    slow_contraction,
+    dt_min,
+    dt_max,
+    safety_factor,
+    min_step_factor,
+    max_step_factor,
+    controller_mode,
+    dtype,
+):
+    """Theta controller modeled after the well-behaved Radau controller shell."""
+    accepted = jnp.asarray(converged)
+    safe_error = jnp.maximum(residual_norm, jnp.asarray(1.0e-12, dtype=dtype))
+    prev_error = jnp.maximum(step_state.prev_error, jnp.asarray(1.0e-12, dtype=dtype))
+    controller_alpha = jnp.asarray(0.35, dtype=dtype)
+    controller_beta = jnp.asarray(0.3, dtype=dtype) * controller_alpha
+    controller_gamma = jnp.asarray(0.1, dtype=dtype) * controller_alpha
+    prev_dt_safe = jnp.maximum(step_state.prev_dt, dt_min)
+    prev_dt_available = step_state.prev_dt > jnp.asarray(0.0, dtype=dtype)
+    step_ratio_prev = jnp.where(prev_dt_available, trial_dt / prev_dt_safe, jnp.asarray(1.0, dtype=dtype))
+    gustafsson_damping = jnp.where(
+        prev_dt_available,
+        jnp.clip(
+            jnp.where(
+                step_ratio_prev > jnp.asarray(1.0, dtype=dtype),
+                step_ratio_prev ** (-controller_gamma),
+                jnp.asarray(1.0, dtype=dtype),
+            ),
+            jnp.asarray(0.85, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        ),
+        jnp.asarray(1.0, dtype=dtype),
+    )
+    growth_current = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta * gustafsson_damping
+    growth_current = jnp.clip(growth_current, min_step_factor, max_step_factor)
+    growth_pi = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta
+    growth_pi = jnp.clip(growth_pi, min_step_factor, max_step_factor)
+    growth_predictive = jnp.where(
+        prev_dt_available,
+        safety_factor
+        * (prev_dt_safe / jnp.maximum(trial_dt, dt_min))
+        * (prev_error / jnp.maximum(safe_error * safe_error, jnp.asarray(1.0e-12, dtype=dtype))) ** controller_alpha,
+        growth_pi,
+    )
+    growth_predictive = jnp.clip(growth_predictive, min_step_factor, max_step_factor)
+    nit_ref = jnp.asarray(20.0, dtype=dtype)
+    newton_iter_float = jnp.asarray(newton_iter_count, dtype=dtype)
+    fac_ntss = jnp.minimum(
+        safety_factor,
+        ((jnp.asarray(2.0, dtype=dtype) * nit_ref + jnp.asarray(1.0, dtype=dtype)) * safety_factor)
+        / jnp.maximum(newton_iter_float + jnp.asarray(2.0, dtype=dtype) * nit_ref, jnp.asarray(1.0, dtype=dtype)),
+    )
+    growth_ntss = jnp.asarray(1.0, dtype=dtype) / jnp.clip(
+        safe_error ** controller_alpha / jnp.maximum(fac_ntss, jnp.asarray(1.0e-12, dtype=dtype)),
+        jnp.asarray(1.0, dtype=dtype) / jnp.asarray(8.0, dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype) / jnp.asarray(0.75, dtype=dtype),
+    )
+    growth_current_legacy = safety_factor * safe_error ** (-controller_alpha) * prev_error ** controller_beta
+    growth_current_legacy = jnp.clip(growth_current_legacy, min_step_factor, max_step_factor)
+    use_gustafsson_controller = controller_mode == "gustafsson"
+    use_current_legacy_controller = controller_mode == "current_legacy"
+    use_hairer_lean_controller = controller_mode == "hairer_lean"
+    use_hairer_ntss_controller = controller_mode == "hairer_ntss"
+    growth = jnp.where(
+        use_gustafsson_controller,
+        jnp.minimum(growth_pi, growth_predictive),
+        jnp.where(
+            use_hairer_ntss_controller,
+            growth_ntss,
+            jnp.where(
+                use_hairer_lean_controller,
+                jnp.clip(safety_factor * safe_error ** (-controller_alpha), min_step_factor, max_step_factor),
+                jnp.where(use_current_legacy_controller, growth_current_legacy, growth_current),
+            ),
+        ),
+    )
+    difficult_theta = jnp.asarray(0.03, dtype=dtype)
+    very_difficult_theta = jnp.asarray(0.10, dtype=dtype)
+    easy_theta = jnp.asarray(0.01, dtype=dtype)
+    easy_error = jnp.asarray(0.05, dtype=dtype)
+    recovery_theta = jnp.asarray(0.02, dtype=dtype)
+    recovery_error = jnp.asarray(0.1, dtype=dtype)
+    difficult_accept = jnp.logical_or(
+        slow_contraction,
+        jnp.logical_or(theta_final >= difficult_theta, newton_iter_count >= jnp.asarray(6, dtype=jnp.int32)),
+    )
+    very_difficult_accept = jnp.logical_or(theta_final >= very_difficult_theta, newton_iter_count >= jnp.asarray(8, dtype=jnp.int32))
+    easy_accept = jnp.logical_and(
+        jnp.logical_and(safe_error <= easy_error, theta_final <= easy_theta),
+        jnp.logical_and(newton_iter_count <= jnp.asarray(4, dtype=jnp.int32), jnp.logical_not(slow_contraction)),
+    )
+    recovery_ready = jnp.logical_and(
+        jnp.logical_and(safe_error <= recovery_error, theta_final <= recovery_theta),
+        jnp.logical_and(newton_iter_count <= jnp.asarray(5, dtype=jnp.int32), jnp.logical_not(slow_contraction)),
+    )
+    difficulty_growth_cap = jnp.where(
+        very_difficult_accept,
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.where(difficult_accept, jnp.asarray(1.25, dtype=dtype), jnp.asarray(1.5, dtype=dtype)),
+    )
+    post_reject_growth_cap = jnp.where(
+        jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller),
+        max_step_factor,
+        jnp.where(
+            use_gustafsson_controller,
+            jnp.where(step_state.recent_reject_count > 0, jnp.where(recovery_ready, jnp.asarray(1.45, dtype=dtype), jnp.asarray(1.15, dtype=dtype)), max_step_factor),
+            jnp.where(step_state.regrowth_cooldown > 0, jnp.where(recovery_ready, jnp.asarray(1.35, dtype=dtype), jnp.asarray(1.15, dtype=dtype)), max_step_factor),
+        ),
+    )
+    streak_growth_cap = jnp.where(
+        jnp.logical_or(use_gustafsson_controller, use_hairer_lean_controller, use_hairer_ntss_controller),
+        max_step_factor,
+        jnp.where(step_state.easy_growth_streak >= jnp.asarray(1, dtype=jnp.int32), max_step_factor, jnp.asarray(1.75, dtype=dtype)),
+    )
+    growth_cap = jnp.where(
+        jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller),
+        max_step_factor,
+        jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap)),
+    )
+    growth = jnp.clip(growth, min_step_factor, growth_cap)
+    growth = jnp.where(
+        jnp.logical_and(
+            jnp.logical_not(jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller)),
+            jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype)),
+        ),
+        jnp.asarray(1.0, dtype=dtype),
+        growth,
+    )
+    growth = jnp.where(
+        jnp.logical_and(
+            jnp.logical_not(jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller)),
+            jnp.logical_and(step_state.regrowth_cooldown > 0, recovery_ready),
+        ),
+        jnp.maximum(growth, jnp.asarray(1.2, dtype=dtype)),
+        growth,
+    )
+    next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
+
+    retry_count_next = jnp.minimum(step_state.recent_reject_count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32))
+    retry_shrink = jnp.where(
+        retry_count_next >= jnp.asarray(3, dtype=jnp.int32),
+        jnp.asarray(0.6, dtype=dtype),
+        jnp.where(
+            retry_count_next >= jnp.asarray(2, dtype=jnp.int32),
+            jnp.asarray(0.8, dtype=dtype),
+            jnp.asarray(1.0, dtype=dtype),
+        ),
+    )
+    reduced_dt = jnp.maximum(jnp.minimum(trial_dt * retry_shrink, trial_dt * jnp.asarray(0.5, dtype=dtype)), dt_min)
+    regrowth_cooldown_next = jnp.where(
+        jnp.logical_or(use_gustafsson_controller, use_hairer_ntss_controller),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.maximum(
+            step_state.regrowth_cooldown - jnp.where(easy_accept, jnp.asarray(2, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32)),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+    )
+    easy_growth_streak_next = jnp.where(
+        jnp.logical_or(use_gustafsson_controller, use_hairer_lean_controller, use_hairer_ntss_controller),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.where(
+            easy_accept,
+            jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+    )
+    return {
+        "accepted": accepted,
+        "growth": growth,
+        "next_dt_accept": next_dt_accept,
+        "next_dt_reject": reduced_dt,
+        "safe_error": safe_error,
+        "easy_accept": easy_accept,
+        "regrowth_cooldown_next": regrowth_cooldown_next,
+        "easy_growth_streak_next": easy_growth_streak_next,
+        "retry_count_next": retry_count_next,
+    }
 
 
 class ThetaMethodSolver(_ThetaSolverConfig):
@@ -6325,15 +6934,14 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             )
         n_linearized_solves = 1 + (self.n_corrector_steps if self.use_predictor_corrector else 0)
 
-        def _single_theta_step(flat_y, t_value, h_value):
-            f_old = flat_rhs(t_value, flat_y)
-            t_new = t_value + h_value
+        def _single_theta_step(attempt_context: _ThetaAttemptContext):
+            flat_y = attempt_context.y
+            t_value = attempt_context.t
+            h_value = attempt_context.trial_dt
+            f_old = attempt_context.f_old
+            t_new = attempt_context.t_new
+            lagged_response = attempt_context.lagged_response
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
-            lagged_response = (
-                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
-                if (use_transport_lagged_response and build_lagged_response is not None)
-                else None
-            )
             f_ref_new = flat_rhs(t_new, flat_y)
             jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
 
@@ -6354,7 +6962,39 @@ class ThetaMethodSolver(_ThetaSolverConfig):
                 )
                 residual_norm = jnp.linalg.norm(residual)
                 converged = residual_norm <= self.tol
-                return y_new, converged
+                return _ThetaAcceptedStepAttemptResult(
+                    trial_dt=h_value,
+                    trial_y=y_new,
+                    err_norm=residual_norm,
+                    converged=converged,
+                    newton_iter_count=jnp.asarray(1, dtype=jnp.int32),
+                    final_residual_norm=residual_norm,
+                    final_delta_norm=jnp.linalg.norm(y_new - flat_y),
+                    theta_final=jnp.asarray(0.0, dtype=dtype),
+                    slow_contraction=jnp.asarray(False),
+                    residual_blowup=jnp.asarray(False),
+                    newton_nonfinite=jnp.logical_or(
+                        jnp.logical_not(jnp.all(jnp.isfinite(y_new))),
+                        jnp.logical_not(jnp.isfinite(residual_norm)),
+                    ),
+                    lagged_reused=jnp.asarray(lagged_response is not None),
+                    jacobian_reused=jnp.asarray(False),
+                    lagged_response_cache_out=lagged_response,
+                    lagged_response_valid_out=jnp.asarray(False),
+                    lagged_reference_y_out=flat_y,
+                    jacobian_out=jnp.zeros((state_dim, state_dim), dtype=dtype),
+                    cache_valid_out=jnp.asarray(False),
+                    cache_dt_out=h_value,
+                    cache_age_out=jnp.asarray(0, dtype=jnp.int32),
+                    lu_out=identity_n,
+                    piv_out=jnp.arange(state_dim, dtype=jnp.int32),
+                    diverged_final=jnp.logical_not(converged),
+                    nonfinite_stage_state=jnp.logical_not(jnp.all(jnp.isfinite(y_new))),
+                    nonfinite_stage_residual=jnp.logical_not(jnp.isfinite(residual_norm)),
+                    finite_f0=jnp.asarray(True),
+                    finite_z0=jnp.all(jnp.isfinite(flat_y)),
+                    finite_initial_residual=jnp.asarray(True),
+                )
 
             jacobian_guess0 = jnp.where(
                 use_lagged_linear_response,
@@ -6366,7 +7006,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             linearization_finite = jnp.logical_and(jnp.all(jnp.isfinite(system0)), jnp.all(jnp.isfinite(lu0)))
 
             def _corrector_body(_, carry):
-                guess, linear_ok = carry
+                guess, linear_ok, prev_delta_norm, theta_est, final_delta_norm = carry
                 guess_proj = _project_flat_state_if_needed(guess, project_flat)
                 f_guess = _eval_new_rhs(guess_proj)
                 affine_rhs = flat_y + h_value * (
@@ -6377,13 +7017,36 @@ class ThetaMethodSolver(_ThetaSolverConfig):
                 finite = jnp.logical_and(jnp.all(jnp.isfinite(next_guess)), linearization_finite)
                 next_guess = jnp.where(finite, next_guess, guess_proj)
                 next_guess = _project_flat_state_if_needed(next_guess, project_flat)
-                return next_guess, jnp.logical_and(linear_ok, finite)
+                delta_norm = jnp.linalg.norm(next_guess - guess_proj)
+                theta_candidate = jnp.where(
+                    prev_delta_norm > jnp.asarray(0.0, dtype=dtype),
+                    delta_norm / jnp.maximum(prev_delta_norm, jnp.asarray(1.0e-30, dtype=dtype)),
+                    theta_est,
+                )
+                theta_next = jnp.where(
+                    prev_delta_norm > jnp.asarray(0.0, dtype=dtype),
+                    theta_candidate,
+                    theta_est,
+                )
+                return (
+                    next_guess,
+                    jnp.logical_and(linear_ok, finite),
+                    delta_norm,
+                    theta_next,
+                    delta_norm,
+                )
 
-            y_new, linear_ok = jax.lax.fori_loop(
+            y_new, linear_ok, _prev_delta_norm, theta_final, final_delta_norm = jax.lax.fori_loop(
                 0,
                 n_linearized_solves,
                 _corrector_body,
-                (guess0, jnp.asarray(True)),
+                (
+                    guess0,
+                    jnp.asarray(True),
+                    jnp.asarray(0.0, dtype=dtype),
+                    jnp.asarray(0.0, dtype=dtype),
+                    jnp.asarray(0.0, dtype=dtype),
+                ),
             )
             f_new = _eval_new_rhs(y_new)
             residual = y_new - flat_y - h_value * (
@@ -6391,7 +7054,39 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             )
             residual_norm = jnp.linalg.norm(residual)
             converged = jnp.logical_and(linear_ok, residual_norm <= self.tol)
-            return y_new, converged
+            return _ThetaAcceptedStepAttemptResult(
+                trial_dt=h_value,
+                trial_y=y_new,
+                err_norm=residual_norm,
+                converged=converged,
+                newton_iter_count=jnp.asarray(n_linearized_solves, dtype=jnp.int32),
+                final_residual_norm=residual_norm,
+                final_delta_norm=final_delta_norm,
+                theta_final=theta_final,
+                slow_contraction=theta_final >= jnp.asarray(0.8, dtype=dtype),
+                residual_blowup=jnp.asarray(False),
+                newton_nonfinite=jnp.logical_or(
+                    jnp.logical_not(jnp.all(jnp.isfinite(y_new))),
+                    jnp.logical_not(jnp.isfinite(residual_norm)),
+                ),
+                lagged_reused=jnp.asarray(lagged_response is not None),
+                jacobian_reused=jnp.asarray(predictor_mode != "euler"),
+                lagged_response_cache_out=lagged_response,
+                lagged_response_valid_out=jnp.asarray(False),
+                lagged_reference_y_out=flat_y,
+                jacobian_out=jacobian_guess0,
+                cache_valid_out=jnp.asarray(True),
+                cache_dt_out=h_value,
+                cache_age_out=jnp.asarray(0, dtype=jnp.int32),
+                lu_out=lu0,
+                piv_out=piv0,
+                diverged_final=jnp.logical_not(converged),
+                nonfinite_stage_state=jnp.logical_not(jnp.all(jnp.isfinite(y_new))),
+                nonfinite_stage_residual=jnp.logical_not(jnp.isfinite(residual_norm)),
+                finite_f0=jnp.asarray(True),
+                finite_z0=jnp.all(jnp.isfinite(flat_y)),
+                finite_initial_residual=jnp.asarray(True),
+            )
 
         def step_fn(step_state: _ThetaStepState, _):
             failed = step_state.status[STATUS_FAILED] != 0
@@ -6409,29 +7104,50 @@ class ThetaMethodSolver(_ThetaSolverConfig):
                 )
 
             def _run(_):
-                trial_dt = jnp.minimum(step_state.dt, t_final - step_state.t)
-                trial_y, converged = _single_theta_step(step_state.y, step_state.t, trial_dt)
-                t_new = step_state.t + trial_dt
-                accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
-                fail_now = jnp.logical_not(converged)
-                code = jnp.where(converged, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32))
-                status_next = jnp.asarray(
-                    [fail_now.astype(jnp.int32), code, n_accepted + jnp.where(converged, 1, 0)],
-                    dtype=jnp.int32,
+                attempt_context = _theta_make_attempt_context(
+                    step_state,
+                    t_final=t_final,
+                    flat_rhs=flat_rhs,
+                    build_lagged_response=build_lagged_response,
+                    unpack_flat=unpack_flat,
+                    project_flat=project_flat,
+                    use_transport_lagged_response=use_transport_lagged_response,
                 )
-                next_state = _ThetaStepState(
-                    t=jnp.where(converged, t_new, step_state.t),
-                    y=jnp.where(converged, accepted_y, step_state.y),
-                    dt=step_state.dt,
-                    status=status_next,
+                attempt_result = _single_theta_step(attempt_context)
+                attempt_reuse_state = _theta_make_reuse_state(
+                    lagged_response_cache=attempt_result.lagged_response_cache_out,
+                    lagged_response_available=jnp.asarray(attempt_context.lagged_response is not None),
+                    lagged_response_valid=attempt_result.lagged_response_valid_out,
+                    lagged_reference_y=attempt_result.lagged_reference_y_out,
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    lu_factor=attempt_result.lu_out,
+                    pivots=attempt_result.piv_out,
+                    freeze_attempt_linearization=jnp.asarray(False),
+                    last_lagged_reused=attempt_result.lagged_reused,
+                    last_jacobian_reused=attempt_result.jacobian_reused,
+                    last_linearization_dt=attempt_result.trial_dt,
                 )
-                return next_state, _ThetaStepInfo(
-                    y=jnp.where(converged, accepted_y, step_state.y),
-                    t=jnp.where(converged, t_new, step_state.t),
-                    dt=jnp.where(converged, trial_dt, jnp.asarray(0.0, dtype=dtype)),
-                    accepted=converged,
-                    failed=fail_now,
-                    fail_code=code,
+                return _theta_step_transition_from_attempt(
+                    step_state,
+                    attempt_result=attempt_result,
+                    n_accepted=n_accepted,
+                    next_dt_if_accepted=step_state.dt,
+                    next_dt_if_rejected=step_state.dt,
+                    next_prev_error_if_accepted=jnp.maximum(attempt_result.err_norm, jnp.asarray(1.0e-12, dtype=dtype)),
+                    next_prev_dt_if_accepted=attempt_result.trial_dt,
+                    next_recent_reject_count_if_accepted=jnp.asarray(0, dtype=jnp.int32),
+                    next_recent_reject_count_if_rejected=step_state.recent_reject_count,
+                    next_regrowth_cooldown_if_accepted=step_state.regrowth_cooldown,
+                    next_regrowth_cooldown_if_rejected=step_state.regrowth_cooldown,
+                    next_easy_growth_streak_if_accepted=step_state.easy_growth_streak,
+                    next_easy_growth_streak_if_rejected=step_state.easy_growth_streak,
+                    next_reuse_state_if_accepted=attempt_reuse_state,
+                    next_reuse_state_if_rejected=attempt_reuse_state,
+                    project_flat=project_flat,
+                    dtype=dtype,
                 )
 
             return jax.lax.cond(failed, _skip, _run, operand=None)
@@ -6441,6 +7157,14 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             y=flat_state0,
             dt=base_dt,
             status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+            prev_error=jnp.asarray(1.0, dtype=dtype),
+            prev_dt=jnp.asarray(0.0, dtype=dtype),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+            prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            reuse_state=_theta_initial_reuse_state(state_dim, dtype),
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
@@ -6472,6 +7196,8 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -6517,6 +7243,9 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
+            step_state_f.reuse_state,
             unpack_flat,
             state,
             species,
@@ -6572,7 +7301,11 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             project_flat=project_flat,
         )
         predictor_mode = getattr(self, "predictor_mode", "linearized")
+        controller_mode = str(getattr(self, "controller_mode", "current")).strip().lower()
         rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
+        lagged_response_reuse_mode = str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower()
+        lagged_response_reuse_rtol = jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype)
+        lagged_response_reuse_atol = jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype)
         use_lagged_linear_response = rhs_mode == "lagged_linear_state"
         use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
         if use_transport_lagged_response and build_lagged_response is None:
@@ -6587,17 +7320,18 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         target_nonlinear_iterations = jnp.asarray(self.target_nonlinear_iterations, dtype=dtype)
         delta_reduction_factor = jnp.asarray(self.delta_reduction_factor, dtype=dtype)
         tau_min = jnp.asarray(self.tau_min, dtype=dtype)
+        jacobian_reuse_rtol = jnp.asarray(getattr(self, "jacobian_reuse_rtol", 0.1), dtype=dtype)
+        max_jacobian_age = jnp.asarray(getattr(self, "max_jacobian_age", 8), dtype=jnp.int32)
         tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
 
-        def _make_linearized_guess(flat_y, t_value, h_value):
-            f_old = flat_rhs(t_value, flat_y)
-            t_new = t_value + h_value
+        def _make_linearized_guess(attempt_context: _ThetaAttemptContext):
+            flat_y = attempt_context.y
+            t_value = attempt_context.t
+            h_value = attempt_context.trial_dt
+            f_old = attempt_context.f_old
+            lagged_response = attempt_context.lagged_response
+            t_new = attempt_context.t_new
             guess0 = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
-            lagged_response = (
-                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
-                if (use_transport_lagged_response and build_lagged_response is not None)
-                else None
-            )
             f_ref_new = flat_rhs(t_new, flat_y)
             jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
 
@@ -6644,18 +7378,19 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             guess_fallback = _project_flat_state_if_needed(flat_y + h_value * f_old, project_flat)
             return (
                 jnp.where(linear_ok_pc, guess_pc, guess_fallback),
-                jnp.asarray(True),
+                linear_ok_pc,
             )
 
-        def _single_theta_newton_step(flat_y, t_value, h_value):
-            f_old = flat_rhs(t_value, flat_y)
-            t_new = t_value + h_value
-            guess0, linear_ok0 = _make_linearized_guess(flat_y, t_value, h_value)
-            lagged_response = (
-                build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_y, project_flat)))
-                if (use_transport_lagged_response and build_lagged_response is not None)
-                else None
-            )
+        def _single_theta_newton_step(attempt_context: _ThetaAttemptContext):
+            flat_y = attempt_context.y
+            t_value = attempt_context.t
+            h_value = attempt_context.trial_dt
+            f_old = attempt_context.f_old
+            lagged_response = attempt_context.lagged_response
+            lagged_response_reused = attempt_context.lagged_response_reused
+            reuse_state = attempt_context.reuse_state
+            t_new = attempt_context.t_new
+            guess0, linear_ok0 = _make_linearized_guess(attempt_context)
             f_ref_new = flat_rhs(t_new, flat_y)
             jacobian_ref = jax.jacfwd(lambda y: flat_rhs(t_new, y))(flat_y)
 
@@ -6672,16 +7407,72 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 f_new = _eval_new_rhs(y_proj)
                 return y_proj - flat_y - h_value * ((one - theta) * f_old + theta * f_new)
 
+            jacobian_dt_scale = jnp.maximum(
+                jnp.abs(reuse_state.cache_dt),
+                jnp.asarray(1.0e-14, dtype=dtype),
+            )
+            dt_close = jnp.abs(h_value - reuse_state.cache_dt) <= jacobian_reuse_rtol * jacobian_dt_scale
+            can_reuse_linearization = jnp.logical_and(
+                jnp.logical_and(reuse_state.cache_valid, dt_close),
+                jnp.logical_and(
+                    reuse_state.cache_age < max_jacobian_age,
+                    jnp.logical_not(use_lagged_linear_response),
+                ),
+            )
+
+            def _reuse_linearization(_):
+                return reuse_state.jacobian, reuse_state.lu_factor, reuse_state.pivots
+
+            def _recompute_linearization(_):
+                residual_jacobian_guess0 = jax.jacfwd(residual)(guess0)
+                lu0, piv0 = jax.scipy.linalg.lu_factor(residual_jacobian_guess0)
+                return residual_jacobian_guess0, lu0, piv0
+
+            frozen_system, frozen_lu, frozen_piv = jax.lax.cond(
+                can_reuse_linearization,
+                _reuse_linearization,
+                _recompute_linearization,
+                operand=None,
+            )
+            frozen_linearization_finite = jnp.logical_and(
+                jnp.all(jnp.isfinite(frozen_system)),
+                jnp.all(jnp.isfinite(frozen_lu)),
+            )
+
             def body_fn(carry):
-                iter_idx, y_cur, residual_norm, diverged = carry
+                (
+                    iter_idx,
+                    y_cur,
+                    residual_norm,
+                    diverged,
+                    prev_delta_norm,
+                    theta_est,
+                    final_delta_norm,
+                    slow_contraction,
+                    residual_blowup,
+                    newton_nonfinite,
+                ) = carry
                 y_proj = _project_flat_state_if_needed(y_cur, project_flat)
                 residual_cur = residual(y_proj)
-                system = jax.jacfwd(residual)(y_proj)
-                lu, piv = jax.scipy.linalg.lu_factor(system)
+                if freeze_attempt_linearization:
+                    system = frozen_system
+                    lu = frozen_lu
+                    piv = frozen_piv
+                    finite_system = frozen_linearization_finite
+                else:
+                    system = jax.jacfwd(residual)(y_proj)
+                    lu, piv = jax.scipy.linalg.lu_factor(system)
+                    finite_system = jnp.logical_and(jnp.all(jnp.isfinite(system)), jnp.all(jnp.isfinite(lu)))
                 delta = jax.scipy.linalg.lu_solve((lu, piv), -residual_cur)
                 delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
-                finite_system = jnp.logical_and(jnp.all(jnp.isfinite(system)), jnp.all(jnp.isfinite(lu)))
                 delta = jnp.where(finite_system, delta, jnp.zeros_like(delta))
+                delta_norm = jnp.linalg.norm(delta)
+                theta_candidate = jnp.where(
+                    iter_idx > 0,
+                    delta_norm / jnp.maximum(prev_delta_norm, tiny_scalar),
+                    theta_est,
+                )
+                theta_next = jnp.where(iter_idx > 0, theta_candidate, theta_est)
                 base_norm = jnp.linalg.norm(residual_cur)
                 accept_factor = jnp.asarray(0.999, dtype=dtype)
 
@@ -6717,7 +7508,35 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 )
                 nonfinite_state = jnp.logical_not(jnp.logical_and(jnp.all(jnp.isfinite(y_next)), jnp.isfinite(residual_next)))
                 diverged_next = jnp.logical_or(diverged, jnp.logical_or(jnp.logical_not(accepted_final), nonfinite_state))
-                return iter_idx + 1, y_next, residual_next, diverged_next
+                residual_blowup_next = jnp.logical_or(
+                    residual_blowup,
+                    jnp.logical_and(jnp.isfinite(residual_next), residual_next > base_norm * jnp.asarray(1.5, dtype=dtype)),
+                )
+                newton_nonfinite_next = jnp.logical_or(
+                    newton_nonfinite,
+                    jnp.logical_not(
+                        jnp.logical_and(
+                            finite_system,
+                            jnp.logical_and(jnp.all(jnp.isfinite(y_next)), jnp.isfinite(residual_next)),
+                        )
+                    ),
+                )
+                slow_contraction_next = jnp.logical_or(
+                    slow_contraction,
+                    jnp.logical_and(iter_idx > 0, theta_next >= jnp.asarray(0.8, dtype=dtype)),
+                )
+                return (
+                    iter_idx + 1,
+                    y_next,
+                    residual_next,
+                    diverged_next,
+                    delta_norm,
+                    theta_next,
+                    delta_norm,
+                    slow_contraction_next,
+                    residual_blowup_next,
+                    newton_nonfinite_next,
+                )
 
             init_residual = residual(guess0)
             init_state = (
@@ -6725,19 +7544,68 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 guess0,
                 jnp.linalg.norm(init_residual),
                 jnp.logical_not(linear_ok0),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.logical_not(jnp.logical_and(linear_ok0, jnp.all(jnp.isfinite(init_residual)))),
             )
 
             def cond_fn(carry):
-                iter_idx, _y_cur, residual_norm, diverged = carry
+                iter_idx, _y_cur, residual_norm, diverged, *_rest = carry
                 active = residual_norm > self.tol
                 return jnp.logical_and(jnp.logical_and(iter_idx < self.maxiter, active), jnp.logical_not(diverged))
 
-            iter_final, y_final, residual_norm_final, diverged_final = jax.lax.while_loop(cond_fn, body_fn, init_state)
+            (
+                iter_final,
+                y_final,
+                residual_norm_final,
+                diverged_final,
+                _prev_delta_norm_final,
+                theta_final,
+                final_delta_norm,
+                slow_contraction_final,
+                residual_blowup_final,
+                newton_nonfinite_final,
+            ) = jax.lax.while_loop(cond_fn, body_fn, init_state)
             converged = jnp.logical_and(
                 jnp.logical_and(jnp.all(jnp.isfinite(y_final)), residual_norm_final <= self.tol),
                 jnp.logical_not(diverged_final),
             )
-            return _project_flat_state_if_needed(y_final, project_flat), converged, iter_final, residual_norm_final
+            trial_y = _project_flat_state_if_needed(y_final, project_flat)
+            return _ThetaAcceptedStepAttemptResult(
+                trial_dt=h_value,
+                trial_y=trial_y,
+                err_norm=residual_norm_final,
+                converged=converged,
+                newton_iter_count=iter_final,
+                final_residual_norm=residual_norm_final,
+                final_delta_norm=final_delta_norm,
+                theta_final=theta_final,
+                slow_contraction=slow_contraction_final,
+                residual_blowup=residual_blowup_final,
+                newton_nonfinite=newton_nonfinite_final,
+                lagged_reused=lagged_response_reused,
+                jacobian_reused=can_reuse_linearization,
+                lagged_response_cache_out=lagged_response,
+                lagged_response_valid_out=jnp.asarray(
+                    use_transport_lagged_response and (lagged_response_reuse_mode == "global_state_drift")
+                ),
+                lagged_reference_y_out=flat_y,
+                jacobian_out=frozen_system,
+                cache_valid_out=jnp.asarray(True),
+                cache_dt_out=h_value,
+                cache_age_out=jnp.where(can_reuse_linearization, reuse_state.cache_age + 1, jnp.asarray(0, dtype=jnp.int32)),
+                lu_out=frozen_lu,
+                piv_out=frozen_piv,
+                diverged_final=diverged_final,
+                nonfinite_stage_state=jnp.logical_not(jnp.all(jnp.isfinite(trial_y))),
+                nonfinite_stage_residual=jnp.logical_not(jnp.isfinite(residual_norm_final)),
+                finite_f0=jnp.all(jnp.isfinite(f_old)),
+                finite_z0=jnp.all(jnp.isfinite(flat_y)),
+                finite_initial_residual=jnp.all(jnp.isfinite(init_residual)),
+            )
 
         def step_fn(step_state: _ThetaStepState, _):
             failed = step_state.status[STATUS_FAILED] != 0
@@ -6755,51 +7623,205 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                 )
 
             def _run(_):
-                trial_dt0 = jnp.minimum(step_state.dt, t_final - step_state.t)
+                attempt_context0 = _theta_make_attempt_context(
+                    step_state,
+                    t_final=t_final,
+                    flat_rhs=flat_rhs,
+                    build_lagged_response=build_lagged_response,
+                    unpack_flat=unpack_flat,
+                    project_flat=project_flat,
+                    use_transport_lagged_response=use_transport_lagged_response,
+                )
+                lagged_response0, lagged_reference_y0, lagged_response_reused0 = _theta_prepare_lagged_response(
+                    step_state,
+                    use_transport_lagged_response=use_transport_lagged_response,
+                    lagged_response_reuse_mode=lagged_response_reuse_mode,
+                    lagged_response_reuse_rtol=lagged_response_reuse_rtol,
+                    lagged_response_reuse_atol=lagged_response_reuse_atol,
+                    unpack_flat=unpack_flat,
+                    project_flat=project_flat,
+                    build_lagged_response=build_lagged_response,
+                )
+                attempt_context0 = dataclasses.replace(
+                    attempt_context0,
+                    lagged_response=lagged_response0,
+                    lagged_reference_y=lagged_reference_y0,
+                    lagged_response_reused=lagged_response_reused0,
+                )
+                trial_dt0 = attempt_context0.trial_dt
 
                 def retry_cond(carry):
-                    trial_dt, _trial_y, converged, _iter_count, _residual_norm = carry
+                    trial_dt, _trial_y, converged, *_rest = carry
                     can_reduce = trial_dt > dt_min * (jnp.asarray(1.0, dtype=dtype) + jnp.asarray(1.0e-12, dtype=dtype))
                     return jnp.logical_and(jnp.logical_not(converged), can_reduce)
 
                 def retry_body(carry):
-                    trial_dt, _trial_y, _converged, _iter_count, _residual_norm = carry
+                    trial_dt, _trial_y, _converged, *_rest = carry
                     reduced_dt = jnp.maximum(trial_dt * delta_reduction_factor, dt_min)
-                    next_y, next_converged, next_iter_count, next_residual_norm = _single_theta_newton_step(step_state.y, step_state.t, reduced_dt)
-                    return reduced_dt, next_y, next_converged, next_iter_count, next_residual_norm
+                    retry_context = _theta_attempt_context_with_dt(attempt_context0, reduced_dt)
+                    next_attempt = _single_theta_newton_step(retry_context)
+                    return (
+                        reduced_dt,
+                        next_attempt.trial_y,
+                        next_attempt.converged,
+                        next_attempt.newton_iter_count,
+                        next_attempt.err_norm,
+                        next_attempt.final_delta_norm,
+                        next_attempt.theta_final,
+                        next_attempt.slow_contraction,
+                        next_attempt.residual_blowup,
+                        next_attempt.newton_nonfinite,
+                        next_attempt.finite_initial_residual,
+                        next_attempt.lagged_reused,
+                        next_attempt.jacobian_reused,
+                        next_attempt.lagged_response_cache_out,
+                        next_attempt.lagged_response_valid_out,
+                        next_attempt.lagged_reference_y_out,
+                        next_attempt.jacobian_out,
+                        next_attempt.cache_valid_out,
+                        next_attempt.cache_dt_out,
+                        next_attempt.cache_age_out,
+                        next_attempt.lu_out,
+                        next_attempt.piv_out,
+                    )
 
-                trial_y0, converged0, iter_count0, residual_norm0 = _single_theta_newton_step(step_state.y, step_state.t, trial_dt0)
-                trial_dt, trial_y, converged, iter_count, residual_norm = jax.lax.while_loop(
+                attempt0 = _single_theta_newton_step(attempt_context0)
+                (
+                    trial_dt,
+                    trial_y,
+                    converged,
+                    iter_count,
+                    residual_norm,
+                    final_delta_norm,
+                    theta_final,
+                    slow_contraction,
+                    residual_blowup,
+                    newton_nonfinite,
+                    finite_initial_residual,
+                    lagged_reused,
+                    jacobian_reused,
+                    lagged_response_cache_out,
+                    lagged_response_valid_out,
+                    lagged_reference_y_out,
+                    jacobian_out,
+                    cache_valid_out,
+                    cache_dt_out,
+                    cache_age_out,
+                    lu_out,
+                    piv_out,
+                ) = jax.lax.while_loop(
                     retry_cond,
                     retry_body,
-                    (trial_dt0, trial_y0, converged0, iter_count0, residual_norm0),
+                    (
+                        trial_dt0,
+                        attempt0.trial_y,
+                        attempt0.converged,
+                        attempt0.newton_iter_count,
+                        attempt0.err_norm,
+                        attempt0.final_delta_norm,
+                        attempt0.theta_final,
+                        attempt0.slow_contraction,
+                        attempt0.residual_blowup,
+                        attempt0.newton_nonfinite,
+                        attempt0.finite_initial_residual,
+                        attempt0.lagged_reused,
+                        attempt0.jacobian_reused,
+                        attempt0.lagged_response_cache_out,
+                        attempt0.lagged_response_valid_out,
+                        attempt0.lagged_reference_y_out,
+                        attempt0.jacobian_out,
+                        attempt0.cache_valid_out,
+                        attempt0.cache_dt_out,
+                        attempt0.cache_age_out,
+                        attempt0.lu_out,
+                        attempt0.piv_out,
+                    ),
                 )
-                t_new = step_state.t + trial_dt
-                effective_iters = jnp.maximum(jnp.asarray(1.0, dtype=dtype), iter_count.astype(dtype))
-                growth = safety_factor * (target_nonlinear_iterations / effective_iters) ** jnp.asarray(0.5, dtype=dtype)
-                growth = jnp.clip(growth, min_step_factor, max_step_factor)
-                retried = trial_dt < trial_dt0 * (jnp.asarray(1.0, dtype=dtype) - jnp.asarray(1.0e-12, dtype=dtype))
-                growth = jnp.where(retried, jnp.minimum(growth, one), growth)
-                next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
-                fail_now = jnp.logical_not(converged)
-                code = jnp.where(converged, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32))
-                status_next = jnp.asarray(
-                    [fail_now.astype(jnp.int32), code, n_accepted + jnp.where(converged, 1, 0)],
-                    dtype=jnp.int32,
+                attempt_result = _ThetaAcceptedStepAttemptResult(
+                    trial_dt=trial_dt,
+                    trial_y=trial_y,
+                    err_norm=residual_norm,
+                    converged=converged,
+                    newton_iter_count=iter_count,
+                    final_residual_norm=residual_norm,
+                    final_delta_norm=final_delta_norm,
+                    theta_final=theta_final,
+                    slow_contraction=slow_contraction,
+                    residual_blowup=residual_blowup,
+                    newton_nonfinite=newton_nonfinite,
+                    lagged_reused=lagged_reused,
+                    jacobian_reused=jacobian_reused,
+                    lagged_response_cache_out=lagged_response_cache_out,
+                    lagged_response_valid_out=lagged_response_valid_out,
+                    lagged_reference_y_out=lagged_reference_y_out,
+                    jacobian_out=jacobian_out,
+                    cache_valid_out=cache_valid_out,
+                    cache_dt_out=cache_dt_out,
+                    cache_age_out=cache_age_out,
+                    lu_out=lu_out,
+                    piv_out=piv_out,
+                    diverged_final=jnp.logical_not(converged),
+                    nonfinite_stage_state=jnp.logical_not(jnp.all(jnp.isfinite(trial_y))),
+                    nonfinite_stage_residual=jnp.logical_not(jnp.isfinite(residual_norm)),
+                    finite_f0=jnp.all(jnp.isfinite(attempt_context0.f_old)),
+                    finite_z0=jnp.all(jnp.isfinite(step_state.y)),
+                    finite_initial_residual=finite_initial_residual,
                 )
-                next_state = _ThetaStepState(
-                    t=jnp.where(converged, t_new, step_state.t),
-                    y=jnp.where(converged, trial_y, step_state.y),
-                    dt=jnp.where(converged, next_dt_accept, step_state.dt),
-                    status=status_next,
+                controller_update = _theta_controller_update(
+                    step_state=step_state,
+                    trial_dt=attempt_result.trial_dt,
+                    converged=attempt_result.converged,
+                    residual_norm=attempt_result.err_norm,
+                    newton_iter_count=attempt_result.newton_iter_count,
+                    theta_final=attempt_result.theta_final,
+                    slow_contraction=attempt_result.slow_contraction,
+                    dt_min=dt_min,
+                    dt_max=dt_max,
+                    safety_factor=safety_factor,
+                    min_step_factor=min_step_factor,
+                    max_step_factor=max_step_factor,
+                    controller_mode=controller_mode,
+                    dtype=dtype,
                 )
-                return next_state, _ThetaStepInfo(
-                    y=jnp.where(converged, trial_y, step_state.y),
-                    t=jnp.where(converged, t_new, step_state.t),
-                    dt=jnp.where(converged, trial_dt, jnp.asarray(0.0, dtype=dtype)),
-                    accepted=converged,
-                    failed=fail_now,
-                    fail_code=code,
+                attempt_reuse_state = _theta_make_reuse_state(
+                    lagged_response_cache=attempt_result.lagged_response_cache_out,
+                    lagged_response_available=jnp.asarray(attempt_context0.lagged_response is not None),
+                    lagged_response_valid=attempt_result.lagged_response_valid_out,
+                    lagged_reference_y=attempt_result.lagged_reference_y_out,
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    lu_factor=attempt_result.lu_out,
+                    pivots=attempt_result.piv_out,
+                    freeze_attempt_linearization=jnp.asarray(freeze_attempt_linearization),
+                    last_lagged_reused=attempt_result.lagged_reused,
+                    last_jacobian_reused=attempt_result.jacobian_reused,
+                    last_linearization_dt=attempt_result.trial_dt,
+                )
+                reject_regrowth_cooldown = jnp.where(
+                    jnp.logical_or(controller_mode == "gustafsson", controller_mode == "hairer_ntss"),
+                    jnp.asarray(0, dtype=jnp.int32),
+                    jnp.asarray(2, dtype=jnp.int32),
+                )
+                return _theta_step_transition_from_attempt(
+                    step_state,
+                    attempt_result=attempt_result,
+                    n_accepted=n_accepted,
+                    next_dt_if_accepted=controller_update["next_dt_accept"],
+                    next_dt_if_rejected=controller_update["next_dt_reject"],
+                    next_prev_error_if_accepted=controller_update["safe_error"],
+                    next_prev_dt_if_accepted=attempt_result.trial_dt,
+                    next_recent_reject_count_if_accepted=jnp.asarray(0, dtype=jnp.int32),
+                    next_recent_reject_count_if_rejected=controller_update["retry_count_next"],
+                    next_regrowth_cooldown_if_accepted=controller_update["regrowth_cooldown_next"],
+                    next_regrowth_cooldown_if_rejected=reject_regrowth_cooldown,
+                    next_easy_growth_streak_if_accepted=controller_update["easy_growth_streak_next"],
+                    next_easy_growth_streak_if_rejected=jnp.asarray(0, dtype=jnp.int32),
+                    next_reuse_state_if_accepted=attempt_reuse_state,
+                    next_reuse_state_if_rejected=attempt_reuse_state,
+                    project_flat=project_flat,
+                    dtype=dtype,
                 )
 
             return jax.lax.cond(failed, _skip, _run, operand=None)
@@ -6809,6 +7831,14 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             y=flat_state0,
             dt=base_dt,
             status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+            prev_error=jnp.asarray(1.0, dtype=dtype),
+            prev_dt=jnp.asarray(0.0, dtype=dtype),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+            prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            reuse_state=_theta_initial_reuse_state(state_dim, dtype),
         )
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
@@ -6840,6 +7870,8 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
         ) = _run_saved_loop(
             step_state0=step_state0,
             step_fn=step_fn,
@@ -6885,6 +7917,9 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             last_attempt_slow_contraction,
             last_attempt_residual_blowup,
             last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
+            step_state_f.reuse_state,
             unpack_flat,
             state,
             species,
@@ -6954,6 +7989,13 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             safety_factor=float(_cfg_get("safety_factor", 0.9)),
             min_step_factor=float(_cfg_get("min_step_factor", 0.5)),
             max_step_factor=float(_cfg_get("max_step_factor", 2.0)),
+            controller_mode=str(_cfg_get("theta_controller_mode", "current")),
+            jacobian_reuse_mode=str(_cfg_get("theta_jacobian_reuse_mode", "refresh_each_iteration")),
+            jacobian_reuse_rtol=float(_cfg_get("theta_jacobian_reuse_rtol", 0.1)),
+            max_jacobian_age=int(_cfg_get("theta_max_jacobian_age", 8)),
+            lagged_response_reuse_mode=str(_cfg_get("theta_lagged_response_reuse_mode", "retry_only")),
+            lagged_response_reuse_rtol=float(_cfg_get("theta_lagged_response_reuse_rtol", 5.0e-2)),
+            lagged_response_reuse_atol=float(_cfg_get("theta_lagged_response_reuse_atol", 1.0e-8)),
             target_nonlinear_iterations=int(_cfg_get("theta_target_nonlinear_iterations", 4)),
             delta_reduction_factor=float(_cfg_get("theta_delta_reduction_factor", 0.5)),
             tau_min=float(_cfg_get("theta_tau_min", 0.01)),
