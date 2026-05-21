@@ -451,17 +451,18 @@ def _adaptive_rollout_nan_debug_for_parameter(
     y_zeroed_debug = None
     prev_error_zeroed_debug = None
     y_and_prev_error_zeroed_debug = None
-    all_tangents_zeroed_debug = _radau_debug_realized_attempt_replay(
-        execution_context,
-        prepared_rollout.initial_carry,
-        jax.tree_util.tree_map(
-            lambda x: None if x is None else jnp.zeros_like(x),
-            carry0_dot,
-            is_leaf=lambda x: x is None,
-        ),
-        rollout.trace,
-    )
+    all_tangents_zeroed_debug = None
     if debug_mode == "exhaustive":
+        all_tangents_zeroed_debug = _radau_debug_realized_attempt_replay(
+            execution_context,
+            prepared_rollout.initial_carry,
+            jax.tree_util.tree_map(
+                lambda x: None if x is None else jnp.zeros_like(x),
+                carry0_dot,
+                is_leaf=lambda x: x is None,
+            ),
+            rollout.trace,
+        )
         lagged_cache_zeroed_debug = _radau_debug_realized_attempt_replay(
             execution_context,
             prepared_rollout.initial_carry,
@@ -567,12 +568,6 @@ def _adaptive_rollout_nan_debug_for_parameter(
         "first_bad_dt": float(debug.first_bad_dt),
         "final_tangent_finite": bool(debug.final_tangent_finite),
         "tangent_finite_mask": list(debug.tangent_finite_mask),
-        "all_tangents_zeroed_debug": {
-            "first_bad_index": int(all_tangents_zeroed_debug.first_bad_index),
-            "first_bad_was_accepted": bool(all_tangents_zeroed_debug.first_bad_was_accepted),
-            "first_bad_dt": float(all_tangents_zeroed_debug.first_bad_dt),
-            "final_tangent_finite": bool(all_tangents_zeroed_debug.final_tangent_finite),
-        },
         "zero_tangent_one_step": {
             "target_attempt_index": int(zero_tangent_one_step.target_attempt_index),
             "target_was_accepted": bool(zero_tangent_one_step.target_was_accepted),
@@ -590,6 +585,13 @@ def _adaptive_rollout_nan_debug_for_parameter(
         "err_norms": _adaptive_rollout_diagnostics(rollout)["err_norms"],
         "debug_mode": debug_mode,
     }
+    if all_tangents_zeroed_debug is not None:
+        result["all_tangents_zeroed_debug"] = {
+            "first_bad_index": int(all_tangents_zeroed_debug.first_bad_index),
+            "first_bad_was_accepted": bool(all_tangents_zeroed_debug.first_bad_was_accepted),
+            "first_bad_dt": float(all_tangents_zeroed_debug.first_bad_dt),
+            "final_tangent_finite": bool(all_tangents_zeroed_debug.final_tangent_finite),
+        }
     if lagged_cache_zeroed_debug is not None:
         result["lagged_cache_zeroed_debug"] = {
             "first_bad_index": int(lagged_cache_zeroed_debug.first_bad_index),
@@ -914,6 +916,69 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"attempted_dts_equal={paths.get('attempted_dts_equal_minus_plus')} "
                 f"next_dts_equal={paths.get('next_dts_equal_minus_plus')}"
             )
+        return
+
+    if report.get("realized_schedule_ad_debug_fast"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_ad_debug_fast "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] AD finiteness:")
+        for label, ad in zip(
+            report["objective_labels"],
+            report["gradient_autodiff"],
+        ):
+            print(f"  - {label}: ad={float(ad):.6e}")
+        nan_debug = report.get("nan_debug")
+        if nan_debug is not None:
+            print(
+                "[autodiff-gate] replay NaN debug: "
+                f"first_bad_index={nan_debug.get('first_bad_index')} "
+                f"first_bad_was_accepted={nan_debug.get('first_bad_was_accepted')} "
+                f"first_bad_dt={_fmt_float(nan_debug.get('first_bad_dt'))} "
+                f"final_tangent_finite={nan_debug.get('final_tangent_finite')}"
+            )
+            zero_tangent_one_step = nan_debug.get("zero_tangent_one_step")
+            if zero_tangent_one_step is not None:
+                print(
+                    "[autodiff-gate] one-step zero-tangent compare: "
+                    f"target_attempt_index={zero_tangent_one_step.get('target_attempt_index')} "
+                    f"target_was_accepted={zero_tangent_one_step.get('target_was_accepted')} "
+                    f"trial_dt={_fmt_float(zero_tangent_one_step.get('trial_dt'))} "
+                    f"custom_trial_y_max_abs={_fmt_float(zero_tangent_one_step.get('custom_trial_y_max_abs'))} "
+                    f"custom_stage_history_max_abs={_fmt_float(zero_tangent_one_step.get('custom_stage_history_max_abs'))} "
+                    f"custom_finite={zero_tangent_one_step.get('custom_finite')} "
+                    f"direct_trial_y_max_abs={_fmt_float(zero_tangent_one_step.get('direct_trial_y_max_abs'))} "
+                    f"direct_stage_history_max_abs={_fmt_float(zero_tangent_one_step.get('direct_stage_history_max_abs'))} "
+                    f"direct_finite={zero_tangent_one_step.get('direct_finite')}"
+                )
+            local_attempt_window = nan_debug.get("local_attempt_window") or []
+            if local_attempt_window:
+                print("[autodiff-gate] replay NaN local window:")
+                for entry in local_attempt_window:
+                    print(
+                        "  - "
+                        f"index={entry.get('index')} "
+                        f"accepted={entry.get('accepted')} "
+                        f"attempted_dt={_fmt_float(entry.get('attempted_dt'))} "
+                        f"next_dt={_fmt_float(entry.get('next_dt'))} "
+                        f"err_norm={_fmt_float(entry.get('err_norm'))} "
+                        f"theta_final={_fmt_float(entry.get('theta_final'))} "
+                        f"newton_iter_count={entry.get('newton_iter_count')} "
+                        f"cache_valid_next={entry.get('cache_valid_next')} "
+                        f"tangent_finite={entry.get('tangent_finite')}"
+                    )
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -1879,6 +1944,77 @@ def build_realized_schedule_rollout_report(
     }
 
 
+def build_realized_schedule_ad_debug_fast_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    include_nan_debug: bool = True,
+    nan_debug_mode: str = "minimal",
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    print("[autodiff-gate] fast-ad-debug progress: baseline rollout complete; running AD gradient", flush=True)
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    print("[autodiff-gate] fast-ad-debug progress: AD gradient complete", flush=True)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    nan_debug = None
+    if include_nan_debug and not np.all(np.isfinite(grad_ad_np)):
+        print("[autodiff-gate] fast-ad-debug progress: AD produced nonfinite values; running NaN localization", flush=True)
+        nan_debug = _adaptive_rollout_nan_debug_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            debug_mode=nan_debug_mode,
+        )
+        print("[autodiff-gate] fast-ad-debug progress: NaN localization complete", flush=True)
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_ad_debug_fast": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "gradient_autodiff": grad_ad_np.tolist(),
+        "ad_all_finite": bool(np.all(np.isfinite(grad_ad_np))),
+        "objective_labels": OBJECTIVE_LABELS,
+        "rollout_path": {
+            "baseline": baseline_diag,
+        },
+        "nan_debug": nan_debug,
+    }
+
+
 def build_small_step_only_report(
     *,
     config_path: Path,
@@ -2224,6 +2360,11 @@ def main() -> None:
         help="Run a final-time-only adaptive-rollout check using the first solve-level custom JVP over the primal's realized accepted schedule.",
     )
     parser.add_argument(
+        "--realized-schedule-ad-debug-fast",
+        action="store_true",
+        help="Run the cheapest realized-schedule AD failure-localization path: baseline rollout, AD gradient, and optional minimal NaN localization only.",
+    )
+    parser.add_argument(
         "--realized-schedule-nan-debug",
         action="store_true",
         help="When --realized-schedule-rollout-check is enabled, run a minimal NaN-localization replay pass if AD returns nonfinite values.",
@@ -2248,7 +2389,15 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
-    if args.realized_schedule_rollout_check:
+    if args.realized_schedule_ad_debug_fast:
+        report = build_realized_schedule_ad_debug_fast_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            include_nan_debug=args.realized_schedule_nan_debug,
+            nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
+        )
+    elif args.realized_schedule_rollout_check:
         report = build_realized_schedule_rollout_report(
             config_path=args.config,
             parameter_name=args.parameter,

@@ -719,6 +719,15 @@ def _finalize_custom_solver_output(
         density_floor=density_floor,
         temperature_floor=temperature_floor,
     )
+    reuse_lagged_available = None if final_reuse_state is None else getattr(final_reuse_state, "lagged_response_available", None)
+    reuse_lagged_valid = None if final_reuse_state is None else getattr(final_reuse_state, "lagged_response_valid", None)
+    reuse_cache_valid = None if final_reuse_state is None else getattr(final_reuse_state, "cache_valid", None)
+    reuse_cache_dt = None if final_reuse_state is None else getattr(final_reuse_state, "cache_dt", None)
+    reuse_cache_age = None if final_reuse_state is None else getattr(final_reuse_state, "cache_age", None)
+    reuse_freeze_attempt_linearization = None if final_reuse_state is None else getattr(final_reuse_state, "freeze_attempt_linearization", None)
+    reuse_last_lagged_reused = None if final_reuse_state is None else getattr(final_reuse_state, "last_lagged_reused", None)
+    reuse_last_jacobian_reused = None if final_reuse_state is None else getattr(final_reuse_state, "last_jacobian_reused", None)
+    reuse_last_linearization_dt = None if final_reuse_state is None else getattr(final_reuse_state, "last_linearization_dt", None)
     return {
         "ys": ys_saved,
         "ts": ts_saved,
@@ -750,6 +759,15 @@ def _finalize_custom_solver_output(
         "last_attempt_lagged_reused": last_attempt_lagged_reused,
         "last_attempt_jacobian_reused": last_attempt_jacobian_reused,
         "final_reuse_state": final_reuse_state,
+        "final_reuse_lagged_response_available": reuse_lagged_available,
+        "final_reuse_lagged_response_valid": reuse_lagged_valid,
+        "final_reuse_cache_valid": reuse_cache_valid,
+        "final_reuse_cache_dt": reuse_cache_dt,
+        "final_reuse_cache_age": reuse_cache_age,
+        "final_reuse_freeze_attempt_linearization": reuse_freeze_attempt_linearization,
+        "final_reuse_last_lagged_reused": reuse_last_lagged_reused,
+        "final_reuse_last_jacobian_reused": reuse_last_jacobian_reused,
+        "final_reuse_last_linearization_dt": reuse_last_linearization_dt,
         "final_state": final_state,
         "final_time": t_final,
     }
@@ -6704,6 +6722,8 @@ def _theta_controller_update(
     newton_iter_count,
     theta_final,
     slow_contraction,
+    lagged_reused,
+    jacobian_reused,
     dt_min,
     dt_max,
     safety_factor,
@@ -6784,6 +6804,8 @@ def _theta_controller_update(
     easy_error = jnp.asarray(0.05, dtype=dtype)
     recovery_theta = jnp.asarray(0.02, dtype=dtype)
     recovery_error = jnp.asarray(0.1, dtype=dtype)
+    reused_any = jnp.logical_or(lagged_reused, jacobian_reused)
+    reused_both = jnp.logical_and(lagged_reused, jacobian_reused)
     difficult_accept = jnp.logical_or(
         slow_contraction,
         jnp.logical_or(theta_final >= difficult_theta, newton_iter_count >= jnp.asarray(6, dtype=jnp.int32)),
@@ -6802,6 +6824,15 @@ def _theta_controller_update(
         jnp.asarray(1.0, dtype=dtype),
         jnp.where(difficult_accept, jnp.asarray(1.25, dtype=dtype), jnp.asarray(1.5, dtype=dtype)),
     )
+    reuse_growth_cap = jnp.where(
+        reused_both,
+        jnp.where(difficult_accept, jnp.asarray(1.0, dtype=dtype), jnp.asarray(1.15, dtype=dtype)),
+        jnp.where(
+            reused_any,
+            jnp.where(difficult_accept, jnp.asarray(1.0, dtype=dtype), jnp.asarray(1.25, dtype=dtype)),
+            max_step_factor,
+        ),
+    )
     post_reject_growth_cap = jnp.where(
         jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller),
         max_step_factor,
@@ -6819,7 +6850,10 @@ def _theta_controller_update(
     growth_cap = jnp.where(
         jnp.logical_or(use_hairer_lean_controller, use_hairer_ntss_controller),
         max_step_factor,
-        jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), jnp.minimum(post_reject_growth_cap, streak_growth_cap)),
+        jnp.minimum(
+            jnp.minimum(jnp.minimum(max_step_factor, difficulty_growth_cap), reuse_growth_cap),
+            jnp.minimum(post_reject_growth_cap, streak_growth_cap),
+        ),
     )
     growth = jnp.clip(growth, min_step_factor, growth_cap)
     growth = jnp.where(
@@ -6850,6 +6884,11 @@ def _theta_controller_update(
             jnp.asarray(1.0, dtype=dtype),
         ),
     )
+    retry_shrink = jnp.where(
+        reused_both,
+        retry_shrink * jnp.asarray(0.8, dtype=dtype),
+        jnp.where(reused_any, retry_shrink * jnp.asarray(0.9, dtype=dtype), retry_shrink),
+    )
     reduced_dt = jnp.maximum(jnp.minimum(trial_dt * retry_shrink, trial_dt * jnp.asarray(0.5, dtype=dtype)), dt_min)
     regrowth_cooldown_next = jnp.where(
         jnp.logical_or(use_gustafsson_controller, use_hairer_ntss_controller),
@@ -6859,11 +6898,20 @@ def _theta_controller_update(
             jnp.asarray(0, dtype=jnp.int32),
         ),
     )
+    reject_regrowth_cooldown_next = jnp.where(
+        jnp.logical_or(use_gustafsson_controller, use_hairer_ntss_controller),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.where(
+            reused_both,
+            jnp.asarray(3, dtype=jnp.int32),
+            jnp.where(reused_any, jnp.asarray(2, dtype=jnp.int32), jnp.asarray(1, dtype=jnp.int32)),
+        ),
+    )
     easy_growth_streak_next = jnp.where(
         jnp.logical_or(use_gustafsson_controller, use_hairer_lean_controller, use_hairer_ntss_controller),
         jnp.asarray(0, dtype=jnp.int32),
         jnp.where(
-            easy_accept,
+            jnp.logical_and(easy_accept, jnp.logical_not(reused_any)),
             jnp.minimum(step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(3, dtype=jnp.int32)),
             jnp.asarray(0, dtype=jnp.int32),
         ),
@@ -6876,6 +6924,7 @@ def _theta_controller_update(
         "safe_error": safe_error,
         "easy_accept": easy_accept,
         "regrowth_cooldown_next": regrowth_cooldown_next,
+        "reject_regrowth_cooldown_next": reject_regrowth_cooldown_next,
         "easy_growth_streak_next": easy_growth_streak_next,
         "retry_count_next": retry_count_next,
     }
@@ -7775,6 +7824,8 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                     newton_iter_count=attempt_result.newton_iter_count,
                     theta_final=attempt_result.theta_final,
                     slow_contraction=attempt_result.slow_contraction,
+                    lagged_reused=attempt_result.lagged_reused,
+                    jacobian_reused=attempt_result.jacobian_reused,
                     dt_min=dt_min,
                     dt_max=dt_max,
                     safety_factor=safety_factor,
@@ -7799,11 +7850,6 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                     last_jacobian_reused=attempt_result.jacobian_reused,
                     last_linearization_dt=attempt_result.trial_dt,
                 )
-                reject_regrowth_cooldown = jnp.where(
-                    jnp.logical_or(controller_mode == "gustafsson", controller_mode == "hairer_ntss"),
-                    jnp.asarray(0, dtype=jnp.int32),
-                    jnp.asarray(2, dtype=jnp.int32),
-                )
                 return _theta_step_transition_from_attempt(
                     step_state,
                     attempt_result=attempt_result,
@@ -7815,7 +7861,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
                     next_recent_reject_count_if_accepted=jnp.asarray(0, dtype=jnp.int32),
                     next_recent_reject_count_if_rejected=controller_update["retry_count_next"],
                     next_regrowth_cooldown_if_accepted=controller_update["regrowth_cooldown_next"],
-                    next_regrowth_cooldown_if_rejected=reject_regrowth_cooldown,
+                    next_regrowth_cooldown_if_rejected=controller_update["reject_regrowth_cooldown_next"],
                     next_easy_growth_streak_if_accepted=controller_update["easy_growth_streak_next"],
                     next_easy_growth_streak_if_rejected=jnp.asarray(0, dtype=jnp.int32),
                     next_reuse_state_if_accepted=attempt_reuse_state,

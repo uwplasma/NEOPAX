@@ -615,6 +615,26 @@ Implemented so far:
   - Jacobian/LU reuse now respects cache-validity, `dt` closeness, and cache
     age limits in the same overall style as Radau
 
+- the theta controller now also reacts to reuse-state quality instead of only
+  reporting it afterward:
+  - reused accepted attempts get tighter post-accept growth caps
+  - reused rejected attempts shrink more aggressively
+  - reused rejected attempts carry a longer regrowth cooldown
+  - easy-growth streaks are only advanced on genuinely easy non-reused accepts
+
+- the generic custom-solver output now also flattens key reuse-state summaries
+  into benchmark-facing fields, so theta reuse diagnostics are easier to compare
+  against Radau-style runs without manually unpacking the full reuse object:
+  - `final_reuse_lagged_response_available`
+  - `final_reuse_lagged_response_valid`
+  - `final_reuse_cache_valid`
+  - `final_reuse_cache_dt`
+  - `final_reuse_cache_age`
+  - `final_reuse_freeze_attempt_linearization`
+  - `final_reuse_last_lagged_reused`
+  - `final_reuse_last_jacobian_reused`
+  - `final_reuse_last_linearization_dt`
+
 - the current forward-path architecture is therefore much closer to the Radau
   shape in the places that matter for future benchmarking:
   - accepted-step attempt boundary
@@ -644,12 +664,10 @@ So the implementation direction is already aligned with the intended goal:
 
 The next useful theta-local step is:
 
-- start using the richer theta reuse-state more actively in controller logic,
-  rather than only in reuse execution and final diagnostics
-
-- after that, the next strong forward-only target is to make Jacobian / LU
-  state itself more visible in saved diagnostics and controller decisions when
-  that proves helpful for benchmarking
+- run benchmark-facing tests on the same NTX lagged-response cases and check
+  whether the new reuse-aware controller behavior is enough, or whether theta
+  still needs richer Jacobian / LU diagnostics and cache-quality decisions to
+  match Radau's practical forward behavior more closely
 
 That would further align:
 
