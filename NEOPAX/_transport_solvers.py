@@ -4785,14 +4785,16 @@ def _radau_run_prepared_on_realized_trace(
     trace: _RadauAdaptiveRolloutTrace,
     *,
     replay_mode: str = "attempt",
+    carry0: _RadauAcceptedStepCarry | None = None,
 ) -> dict[str, Any]:
     """Replay a prepared Radau rollout on a frozen forward trace from another solve."""
 
     replay_mode_normalized = str(replay_mode).strip().lower()
+    carry_start = prepared_rollout.initial_carry if carry0 is None else carry0
     if replay_mode_normalized == "attempt":
         rollout = _radau_replay_realized_attempt_rollout(
             execution_context,
-            prepared_rollout.initial_carry,
+            carry_start,
             jax.lax.stop_gradient(trace.active_mask),
             jax.lax.stop_gradient(trace.accepted_mask),
             jax.lax.stop_gradient(trace.attempted_dts),
@@ -4806,7 +4808,7 @@ def _radau_run_prepared_on_realized_trace(
         rollout = _radau_replay_realized_accepted_rollout(
             prepared_rollout.kernel_context,
             prepared_rollout.physics_context,
-            prepared_rollout.initial_carry,
+            carry_start,
             jax.lax.stop_gradient(trace.accepted_mask),
             jax.lax.stop_gradient(trace.attempted_dts),
         )

@@ -409,6 +409,85 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     return _objective_vector(replay["final_state"], runtime), replay
 
 
+def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    baseline_trace,
+    replay_mode: str = "attempt",
+    accepted_window_size: int = 10,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+
+    total_accepted = int(np.asarray(jax.device_get(jnp.sum(jnp.asarray(baseline_trace.accepted_mask, dtype=jnp.int32)))))
+    current_carry = prepared_rollout.initial_carry
+    window_summaries: list[dict[str, Any]] = []
+    last_replay = None
+    for accepted_start in range(0, total_accepted, int(accepted_window_size)):
+        window_trace = _slice_rollout_trace_by_accepted_window(
+            baseline_trace,
+            accepted_start=accepted_start,
+            accepted_count=min(int(accepted_window_size), total_accepted - accepted_start),
+        )
+        replay = _radau_run_prepared_on_realized_trace(
+            prepared_rollout,
+            execution_context,
+            window_trace,
+            replay_mode=replay_mode,
+            carry0=current_carry,
+        )
+        last_replay = replay
+        current_carry = replay["final_carry"]
+        window_summaries.append(
+            {
+                "accepted_start": int(accepted_start),
+                "accepted_count": int(np.sum(np.asarray(jax.device_get(window_trace.accepted_mask), dtype=bool))),
+                "attempt_count": int(np.sum(np.asarray(jax.device_get(window_trace.active_mask), dtype=bool))),
+                "state_finite": _tree_all_finite(replay["final_state"]),
+            }
+        )
+        if not _tree_all_finite(replay["final_state"]):
+            break
+
+    if last_replay is None:
+        final_state = prepared_rollout.physics_context.unpack_flat(current_carry.y)
+        replay_out = {
+            "final_state": final_state,
+            "final_carry": current_carry,
+            "replay_mode": str(replay_mode),
+            "window_summaries": window_summaries,
+        }
+    else:
+        replay_out = dict(last_replay)
+        replay_out["window_summaries"] = window_summaries
+
+    return _objective_vector(replay_out["final_state"], runtime), replay_out
+
+
 def _adaptive_rollout_nan_debug_for_parameter(
     parameter_value,
     *,
@@ -841,6 +920,33 @@ def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | 
     )
 
 
+def _slice_rollout_trace_by_accepted_window(
+    trace,
+    *,
+    accepted_start: int,
+    accepted_count: int,
+):
+    accepted_start = int(accepted_start)
+    accepted_count = int(accepted_count)
+    if accepted_start < 0 or accepted_count <= 0:
+        raise ValueError("accepted_start must be >= 0 and accepted_count must be > 0.")
+
+    accepted_mask = jnp.asarray(trace.accepted_mask, dtype=bool)
+    active_mask = jnp.asarray(trace.active_mask, dtype=bool)
+    accepted_prefix_count = jnp.cumsum(accepted_mask.astype(jnp.int32))
+    accepted_before = jnp.asarray(accepted_start, dtype=jnp.int32)
+    accepted_after = jnp.asarray(accepted_start + accepted_count, dtype=jnp.int32)
+    keep_mask = jnp.logical_and(
+        active_mask,
+        jnp.logical_and(accepted_prefix_count > accepted_before, accepted_prefix_count <= accepted_after),
+    )
+    return dataclasses.replace(
+        trace,
+        active_mask=keep_mask,
+        accepted_mask=jnp.logical_and(accepted_mask, keep_mask),
+    )
+
+
 def _frozen_replay_nonfinite_debug(
     replay_result: dict[str, Any],
     replay_trace,
@@ -1259,6 +1365,53 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"minus_all_finite={accepted_boundary.get('fd_minus', {}).get('all_finite')} "
                 f"plus_all_finite={accepted_boundary.get('fd_plus', {}).get('all_finite')} "
                 f"all_finite={accepted_boundary.get('all_finite')}"
+            )
+        return
+
+    if report.get("realized_schedule_windowed_frozen_fd_check"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_windowed_frozen_fd "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e} "
+            f"replay_mode={report.get('windowed_replay_mode')} "
+            f"accepted_window_size={report.get('accepted_window_size')}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        for key in ("windowed_fd_minus", "windowed_fd_plus"):
+            diag_windowed = path.get(key, {})
+            print(
+                f"[autodiff-gate] {key}: "
+                f"all_finite={diag_windowed.get('all_finite')}"
+            )
+            for entry in diag_windowed.get("window_summaries") or []:
+                print(
+                    "  - "
+                    f"accepted_start={entry.get('accepted_start')} "
+                    f"accepted_count={entry.get('accepted_count')} "
+                    f"attempt_count={entry.get('attempt_count')} "
+                    f"state_finite={entry.get('state_finite')}"
+                )
+        print("[autodiff-gate] objective errors:")
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_autodiff"],
+            report["gradient_fd"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
             )
         return
 
@@ -2773,6 +2926,152 @@ def build_realized_schedule_ad_debug_fast_report(
     }
 
 
+def build_realized_schedule_windowed_frozen_fd_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+    replay_mode: str = "attempt",
+    accepted_window_size: int = 10,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    print(
+        "[autodiff-gate] windowed-frozen-fd baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"completed={baseline_diag['completed']} "
+        f"failed={baseline_diag['failed']} "
+        f"fail_code={baseline_diag['fail_code']}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] windowed-frozen-fd progress: baseline rollout complete; "
+        f"running windowed fd_minus replay ({replay_mode}, window={accepted_window_size})",
+        flush=True,
+    )
+    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_trace=baseline_rollout.trace,
+        replay_mode=replay_mode,
+        accepted_window_size=accepted_window_size,
+    )
+    minus_objectives_np = np.asarray(jax.device_get(objectives_minus), dtype=float)
+    minus_replay_finite = _tree_all_finite(minus_replay["final_state"]) and bool(np.all(np.isfinite(minus_objectives_np)))
+    print(
+        "[autodiff-gate] windowed-frozen-fd fd_minus summary: "
+        f"state_finite={_tree_all_finite(minus_replay['final_state'])} "
+        f"objectives_finite={bool(np.all(np.isfinite(minus_objectives_np)))} "
+        f"all_finite={minus_replay_finite}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] windowed-frozen-fd progress: windowed fd_minus replay complete; "
+        f"running windowed fd_plus replay ({replay_mode}, window={accepted_window_size})",
+        flush=True,
+    )
+    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        baseline_trace=baseline_rollout.trace,
+        replay_mode=replay_mode,
+        accepted_window_size=accepted_window_size,
+    )
+    plus_objectives_np = np.asarray(jax.device_get(objectives_plus), dtype=float)
+    plus_replay_finite = _tree_all_finite(plus_replay["final_state"]) and bool(np.all(np.isfinite(plus_objectives_np)))
+    print(
+        "[autodiff-gate] windowed-frozen-fd fd_plus summary: "
+        f"state_finite={_tree_all_finite(plus_replay['final_state'])} "
+        f"objectives_finite={bool(np.all(np.isfinite(plus_objectives_np)))} "
+        f"all_finite={plus_replay_finite}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] windowed-frozen-fd progress: windowed fd_plus replay complete; running AD gradient",
+        flush=True,
+    )
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    print(
+        "[autodiff-gate] windowed-frozen-fd progress: AD gradient complete; forming windowed frozen FD gradient",
+        flush=True,
+    )
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_windowed_frozen_fd_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_fd": grad_fd_np.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "windowed_replay_mode": str(replay_mode),
+        "accepted_window_size": int(accepted_window_size),
+        "rollout_path": {
+            "baseline": baseline_diag,
+            "windowed_fd_minus": {
+                "all_finite": minus_replay_finite,
+                "window_summaries": minus_replay.get("window_summaries"),
+            },
+            "windowed_fd_plus": {
+                "all_finite": plus_replay_finite,
+                "window_summaries": plus_replay.get("window_summaries"),
+            },
+        },
+    }
+
+
 def build_small_step_only_report(
     *,
     config_path: Path,
@@ -3133,6 +3432,17 @@ def main() -> None:
         help="Run a fast one-command binary search that localizes the first failing frozen replay prefix and compares attempt vs accepted replay at the failure boundary.",
     )
     parser.add_argument(
+        "--realized-schedule-windowed-frozen-fd-check",
+        action="store_true",
+        help="Compare adaptive AD against FD built from short frozen baseline schedule windows with re-anchoring between windows.",
+    )
+    parser.add_argument(
+        "--realized-schedule-windowed-accepted-window-size",
+        type=int,
+        default=10,
+        help="Accepted-step window size used by --realized-schedule-windowed-frozen-fd-check.",
+    )
+    parser.add_argument(
         "--realized-schedule-frozen-replay-mode",
         default="attempt",
         choices=("attempt", "accepted"),
@@ -3216,6 +3526,16 @@ def main() -> None:
             rel_fd_step=args.fd_rel_step,
             abs_fd_step=args.fd_abs_step,
             device=args.device,
+        )
+    elif args.realized_schedule_windowed_frozen_fd_check:
+        report = build_realized_schedule_windowed_frozen_fd_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            replay_mode=args.realized_schedule_frozen_replay_mode,
+            accepted_window_size=args.realized_schedule_windowed_accepted_window_size,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(
