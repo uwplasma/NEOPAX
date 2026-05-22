@@ -1069,6 +1069,7 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"baseline_value={report['baseline_value']:.6e} "
             f"fd_step={report['fd_step']:.6e} "
             f"replay_mode={report.get('frozen_replay_mode')} "
+            f"ad_mode={report.get('ad_mode')} "
             f"accepted_step_limit={report.get('accepted_step_limit')}"
         )
         path = report.get("rollout_path", {})
@@ -2094,16 +2095,6 @@ def build_realized_schedule_frozen_fd_report(
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
 
-    objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=parameter_name,
-        use_realized_schedule_jvp=True,
-    )[0]
-
     baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
@@ -2181,6 +2172,30 @@ def build_realized_schedule_frozen_fd_report(
         "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
         flush=True,
     )
+    if accepted_step_limit is None:
+        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=True,
+        )[0]
+        ad_mode = "realized_schedule_jvp"
+    else:
+        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_frozen_trace(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            frozen_trace=replay_trace,
+            replay_mode=replay_mode,
+        )[0]
+        ad_mode = "frozen_trace_direct"
+
     gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
     print(
         "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
@@ -2213,6 +2228,7 @@ def build_realized_schedule_frozen_fd_report(
         "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
         "objective_labels": OBJECTIVE_LABELS,
         "frozen_replay_mode": str(replay_mode),
+        "ad_mode": ad_mode,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
         "accepted_time_list": accepted_time_list,
         "rollout_path": {

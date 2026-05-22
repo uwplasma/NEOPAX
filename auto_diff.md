@@ -2356,3 +2356,180 @@ python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --paramete
 
 If this passes, then the core Radau AD path is no longer blocked by the
 long-horizon NaN issue.
+
+---
+
+## 2026-05-22: Post-NaN status update
+
+### 1. Full adaptive FD is not a fair reference
+
+After the long-horizon NaN was fixed, the full realized-schedule rollout check
+was rerun:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-rollout-check
+```
+
+The result was:
+
+- AD stayed finite
+- but `fd_minus` and `fd_plus` followed very different adaptive paths
+
+Observed path counts:
+
+- baseline:
+  - `attempt_count = 184`
+  - `accepted_count = 115`
+- `fd_minus`:
+  - `attempt_count = 137`
+  - `accepted_count = 87`
+- `fd_plus`:
+  - `attempt_count = 179`
+  - `accepted_count = 113`
+
+Interpretation:
+
+- this is no longer a NaN problem in the AD path
+- the remaining AD-vs-FD mismatch is largely because the central FD reference
+  is comparing different discrete adaptive histories
+
+So the next benchmark target became:
+
+- compare AD against FD on a **frozen baseline realized schedule**
+
+### 2. Added reusable frozen-schedule helpers
+
+To support fairer FD checks and future tooling, reusable Radau replay helpers
+were added.
+
+Solver-level helpers in `_transport_solvers.py`:
+
+- `_radau_dt_sequence_from_time_list(...)`
+- `_radau_run_prepared_on_time_list(...)`
+- `_radau_run_prepared_on_realized_trace(...)`
+
+These provide:
+
+- replay on a caller-provided absolute time list
+- replay on a frozen realized adaptive trace
+
+Orchestrator-level helper in `_orchestrator.py`:
+
+- `run_transport_on_time_list(...)`
+
+Public export in `__init__.py`:
+
+- `NEOPAX.run_transport_on_time_list(...)`
+
+Important scope note:
+
+- `run_transport_on_time_list(...)` currently supports only the custom
+  `RADAUSolver`
+
+### 3. Added a benchmark mode for frozen-FD comparison
+
+The benchmark script now has:
+
+```bash
+--realized-schedule-frozen-fd-check
+--realized-schedule-frozen-replay-mode attempt|accepted
+--realized-schedule-frozen-accepted-steps N
+```
+
+Goal:
+
+- run one adaptive baseline rollout
+- compute AD
+- compute `fd_minus` / `fd_plus` by replaying the perturbed states on the
+  frozen baseline schedule
+
+This avoids paying for two extra adaptive FD solves and avoids comparing
+against unrelated adaptive paths.
+
+### 4. Important correction: frozen-FD failure is a frozen primal replay issue, not AD
+
+Running the first full frozen-FD attempt showed:
+
+- AD stayed finite
+- `fd_minus` / `fd_plus` frozen replay became nonfinite
+- therefore the printed frozen FD gradient became `nan`
+
+That means:
+
+- the old AD NaN bug appears fixed
+- the new problem is that the **forced frozen primal replay** can itself become
+  nonfinite when driven too far away from the baseline schedule
+
+So the next debugging target changed again:
+
+- not "why is AD nonfinite?"
+- but "how far can the frozen primal replay be pushed before it becomes
+  nonfinite?"
+
+### 5. Prefix frozen replay mode was added
+
+To localize that new failure efficiently, the frozen-FD benchmark now supports
+replaying only the first `N` accepted steps from the baseline realized
+schedule.
+
+Intended progression:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 1
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 2
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 3
+```
+
+The benchmark also prints:
+
+- `state_finite`
+- `objectives_finite`
+- `all_finite`
+
+for both:
+
+- `frozen_fd_minus`
+- `frozen_fd_plus`
+
+### 6. One-step frozen prefix result: finite replay, but initial comparison logic was wrong
+
+The first prefix test with `accepted_steps = 1` showed:
+
+- both frozen replays were finite
+- but the objective errors looked enormous
+
+That turned out to be a benchmark bug:
+
+- AD was still being computed for the full realized-schedule objective
+- while FD was being computed for the truncated 1-step frozen replay objective
+
+So those errors were not meaningful.
+
+This was patched so that:
+
+- when `--realized-schedule-frozen-accepted-steps N` is used
+- AD and FD are both computed for the **same truncated frozen objective**
+
+The benchmark now prints:
+
+- `ad_mode = realized_schedule_jvp`
+  when using the full realized-schedule AD boundary
+- `ad_mode = frozen_trace_direct`
+  when using a truncated frozen prefix comparison
+
+### Current best next step
+
+The correct immediate rerun is now:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 1
+```
+
+Then advance to:
+
+- `accepted_steps = 2`
+- `accepted_steps = 3`
+
+This should tell us whether the frozen replay comparison itself is sound
+step-by-step, and where the frozen primal replay first becomes unreliable if
+it still fails at larger prefixes.
