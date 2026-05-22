@@ -50,8 +50,10 @@ from NEOPAX._transport_solvers import (
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
+    _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
+    _execute_radau_accepted_step_attempt_autodiff,
     _build_prepared_radau_execution_context,
     _build_prepared_radau_accepted_rollout,
     _radau_controller_composed_rollout,
@@ -580,6 +582,303 @@ def _adaptive_rollout_objective_trajectory_on_realized_trace(
         unpack_flat=prepared_rollout.physics_context.unpack_flat,
     )
     return trajectory, replay
+
+
+def _adaptive_rollout_initial_carry_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    return prepared_rollout.initial_carry
+
+
+def _sample_accepted_step_indices(total_accepted: int, sample_every: int) -> tuple[int, ...]:
+    total_accepted = int(total_accepted)
+    sample_every = max(1, int(sample_every))
+    if total_accepted <= 0:
+        return ()
+    indices = list(range(0, total_accepted, sample_every))
+    if indices[-1] != total_accepted - 1:
+        indices.append(total_accepted - 1)
+    return tuple(indices)
+
+
+def _objective_tangent_from_flat_y(
+    flat_y,
+    flat_y_dot,
+    *,
+    runtime,
+    unpack_flat,
+):
+    def _obj_from_flat(y_flat):
+        return _objective_vector(unpack_flat(y_flat), runtime)
+
+    _, tangent = jax.jvp(_obj_from_flat, (flat_y,), (flat_y_dot,))
+    return tangent
+
+
+def _sampled_adaptive_objective_tangent_trajectory(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+    runtime,
+    unpack_flat,
+    sample_every: int,
+):
+    sample_indices = _sample_accepted_step_indices(
+        int(np.sum(np.asarray(jax.device_get(trace.accepted_mask), dtype=bool))),
+        sample_every,
+    )
+    sample_count = len(sample_indices)
+    if sample_count == 0:
+        return {
+            "sampled_times": jnp.zeros((0,), dtype=execution_context.dtype),
+            "sampled_tangents": jnp.zeros((0, len(OBJECTIVE_LABELS)), dtype=execution_context.dtype),
+            "sampled_indices": (),
+        }
+
+    sample_indices_arr = jnp.asarray(sample_indices, dtype=jnp.int32)
+    active_mask = jax.lax.stop_gradient(trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
+    step_ts = jax.lax.stop_gradient(trace.step_ts)
+
+    def _accepted_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        project_flat = execution_context.physics_context.project_flat
+        accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+        if accepted_y is None:
+            accepted_y = attempt_result.trial_y
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + dt_value,
+            y=accepted_y,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    def _rejected_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        return dataclasses.replace(
+            carry_value,
+            dt=next_dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+            lagged_response_valid=lagged_response_valid_value,
+            lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+            jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+            cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+            cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+            cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+            real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+            real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+            complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+            complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+            prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+            prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+        )
+
+    zero_tangents = jnp.zeros((sample_count, len(OBJECTIVE_LABELS)), dtype=execution_context.dtype)
+    zero_times = jnp.zeros((sample_count,), dtype=execution_context.dtype)
+
+    def _scan_body(scan_state, inputs):
+        carry, carry_dot, accepted_seen, sample_write_idx, sampled_times, sampled_tangents = scan_state
+        (
+            active,
+            accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+            time_value,
+        ) = inputs
+
+        def _run_step(step_operand):
+            carry_in, carry_dot_in = step_operand
+
+            def _run_accepted(_):
+                return jax.jvp(
+                    lambda c: _accepted_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
+                    ),
+                    (carry_in,),
+                    (carry_dot_in,),
+                )
+
+            def _run_rejected(_):
+                return jax.jvp(
+                    lambda c: _rejected_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
+                    ),
+                    (carry_in,),
+                    (carry_dot_in,),
+                )
+
+            return jax.lax.cond(accepted, _run_accepted, _run_rejected, operand=None)
+
+        def _skip_step(step_operand):
+            return step_operand
+
+        next_carry, next_carry_dot = jax.lax.cond(
+            active,
+            _run_step,
+            _skip_step,
+            operand=(carry, carry_dot),
+        )
+        accepted_seen_next = accepted_seen + jnp.where(jnp.logical_and(active, accepted), jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+        just_accepted_index = accepted_seen_next - 1
+        should_sample = jnp.logical_and(
+            jnp.logical_and(active, accepted),
+            jnp.logical_and(sample_write_idx < sample_count, just_accepted_index == sample_indices_arr[sample_write_idx]),
+        )
+
+        def _write_sample(_):
+            obj_tangent = _objective_tangent_from_flat_y(
+                next_carry.y,
+                next_carry_dot.y,
+                runtime=runtime,
+                unpack_flat=unpack_flat,
+            )
+            times_next = sampled_times.at[sample_write_idx].set(time_value)
+            tangents_next = sampled_tangents.at[sample_write_idx].set(obj_tangent)
+            return sample_write_idx + 1, times_next, tangents_next
+
+        sample_write_idx_next, sampled_times_next, sampled_tangents_next = jax.lax.cond(
+            should_sample,
+            _write_sample,
+            lambda _: (sample_write_idx, sampled_times, sampled_tangents),
+            operand=None,
+        )
+        return (
+            next_carry,
+            next_carry_dot,
+            accepted_seen_next,
+            sample_write_idx_next,
+            sampled_times_next,
+            sampled_tangents_next,
+        ), None
+
+    init_state = (
+        carry0,
+        carry0_dot,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        zero_times,
+        zero_tangents,
+    )
+    final_state, _ = jax.lax.scan(
+        _scan_body,
+        init_state,
+        (
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+            step_ts,
+        ),
+    )
+    return {
+        "sampled_times": final_state[4],
+        "sampled_tangents": final_state[5],
+        "sampled_indices": sample_indices,
+    }
 
 
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
@@ -1780,6 +2079,7 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"baseline_value={report['baseline_value']:.6e} "
             f"safe_attempt_index={report.get('safe_attempt_index')} "
             f"safe_accepted_count={report.get('safe_accepted_count')} "
+            f"sample_every={report.get('sample_every')} "
             f"safe_final_time={report.get('safe_final_time'):.6e}"
         )
         path = report.get("rollout_path", {})
@@ -3715,6 +4015,7 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
     device: str | None,
     known_first_bad_attempt_index: int,
     safe_attempt_margin: int,
+    sample_every: int,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -3755,17 +4056,42 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
         flush=True,
     )
 
-    adaptive_fn = lambda p: _adaptive_rollout_objective_trajectory_on_realized_trace(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
+    state0_static = _parameterized_initial_state(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
         parameter_name=parameter_name,
-        frozen_trace=safe_trace,
-        replay_mode="attempt",
-        accepted_count=safe_accepted_count,
-    )[0]
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    print("[autodiff-gate] baseline-dt-safe-trajectory progress: building adaptive initial carry tangent", flush=True)
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
     fixed_dt_fn = lambda p: _adaptive_rollout_objective_trajectory_on_time_list(  # noqa: E731
         p,
         config=config,
@@ -3777,26 +4103,37 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
     )[0]
 
     print("[autodiff-gate] baseline-dt-safe-trajectory progress: running realized-trace adaptive AD trajectory", flush=True)
-    adaptive_jac = jax.jacfwd(adaptive_fn)(jnp.asarray(baseline_value))
+    adaptive_result = _sampled_adaptive_objective_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=safe_trace,
+        runtime=runtime,
+        unpack_flat=prepared_rollout_static.physics_context.unpack_flat,
+        sample_every=sample_every,
+    )
     print("[autodiff-gate] baseline-dt-safe-trajectory progress: adaptive AD trajectory complete; running fixed-dt direct AD trajectory", flush=True)
-    fixed_dt_jac = jax.jacfwd(fixed_dt_fn)(jnp.asarray(baseline_value))
+    _, fixed_dt_tangent = jax.jvp(fixed_dt_fn, (jnp.asarray(baseline_value),), (jnp.asarray(1.0),))
 
-    adaptive_np = np.asarray(jax.device_get(adaptive_jac), dtype=float)
-    fixed_np = np.asarray(jax.device_get(fixed_dt_jac), dtype=float)
+    sample_indices = adaptive_result["sampled_indices"]
+    adaptive_np = np.asarray(jax.device_get(adaptive_result["sampled_tangents"]), dtype=float)
+    fixed_full_np = np.asarray(jax.device_get(fixed_dt_tangent), dtype=float)
+    fixed_np = fixed_full_np[np.asarray(sample_indices, dtype=int), :]
+    sampled_times_np = np.asarray(jax.device_get(adaptive_result["sampled_times"]), dtype=float)
     abs_err = np.abs(adaptive_np - fixed_np)
     rel_err = abs_err / np.maximum(np.abs(fixed_np), 1.0e-10)
 
     entries = []
     global_max_rel_error = 0.0
     label_to_index = {label: idx for idx, label in enumerate(OBJECTIVE_LABELS)}
-    for idx, t_value in enumerate(safe_time_list):
+    for idx, sample_idx in enumerate(sample_indices):
         step_rel = rel_err[idx]
         step_max = float(np.max(step_rel))
         global_max_rel_error = max(global_max_rel_error, step_max)
         entries.append(
             {
-                "accepted_index": int(idx + 1),
-                "time": float(t_value),
+                "accepted_index": int(sample_idx + 1),
+                "time": float(sampled_times_np[idx]),
                 "gradient_realized_trace_ad": adaptive_np[idx].tolist(),
                 "gradient_fixed_dt_direct_ad": fixed_np[idx].tolist(),
                 "gradient_absolute_error": abs_err[idx].tolist(),
@@ -3818,6 +4155,7 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
         "safe_attempt_index": int(safe_attempt_index),
         "safe_accepted_count": int(safe_accepted_count),
         "safe_final_time": float(safe_time_list[-1]),
+        "sample_every": int(max(1, sample_every)),
         "objective_labels": OBJECTIVE_LABELS,
         "entries": entries,
         "max_relative_error": float(global_max_rel_error),
@@ -4359,6 +4697,12 @@ def main() -> None:
         help="Dedicated opt-in mode: run one realized-trace adaptive AD trajectory and one fixed-dt direct AD trajectory, then compare per-accepted-step objective tangents along the safe baseline path.",
     )
     parser.add_argument(
+        "--baseline-dt-path-safe-trajectory-sample-every",
+        type=int,
+        default=5,
+        help="Accepted-step sampling stride used by --baseline-dt-path-safe-trajectory-compare-check to limit memory and output volume.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-safe-compose-scan-counts",
         default="1,2,5,10,20,30,40,45",
         help="Comma-separated accepted-step prefixes used by --baseline-dt-path-safe-compose-scan-check.",
@@ -4512,6 +4856,7 @@ def main() -> None:
             device=args.device,
             known_first_bad_attempt_index=args.known_first_bad_attempt_index,
             safe_attempt_margin=args.safe_attempt_margin,
+            sample_every=args.baseline_dt_path_safe_trajectory_sample_every,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(
