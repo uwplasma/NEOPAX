@@ -2533,3 +2533,120 @@ Then advance to:
 This should tell us whether the frozen replay comparison itself is sound
 step-by-step, and where the frozen primal replay first becomes unreliable if
 it still fails at larger prefixes.
+
+---
+
+## Next Session Checkpoint
+
+### What is currently true
+
+- the long-horizon AD NaN on the custom realized-schedule path appears fixed
+- the main remaining problem is **not** the adaptive AD itself
+- the current failure is that the **frozen primal replay used for FD**
+  becomes nonfinite on the full baseline realized schedule
+
+Most recent full frozen-FD run:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt
+```
+
+Observed result:
+
+- AD remained finite
+- `frozen_fd_minus`:
+  - `state_finite = False`
+  - `objectives_finite = False`
+  - `all_finite = False`
+- `frozen_fd_plus`:
+  - `state_finite = False`
+  - `objectives_finite = False`
+  - `all_finite = False`
+
+Interpretation:
+
+- the benchmark target is still correct:
+  - adaptive AD on the custom realized-schedule path
+  - FD computed from `fd_minus` / `fd_plus` on the **same frozen baseline path**
+- but the frozen primal replay itself is not yet robust enough over the full
+  schedule for those perturbed inputs
+
+### Important benchmark status
+
+The script currently distinguishes two different uses of the frozen-path mode:
+
+1. **Main benchmark**
+
+- no prefix truncation
+- compares:
+  - adaptive AD via the custom realized-schedule JVP
+  - against frozen-path FD
+
+2. **Prefix diagnostic**
+
+- uses `--realized-schedule-frozen-accepted-steps N`
+- this is now a **forward-only frozen replay stability diagnostic**
+- it does **not** try to push AD through the raw frozen replay helper
+
+Reason:
+
+- trying to run `jax.jacfwd` through the raw truncated frozen replay path hit a
+  tracer error:
+  - `TypeError: No constant handler for type: DynamicJaxprTracer`
+- that raw frozen replay helper is not intended to be the production AD
+  boundary anyway
+
+So:
+
+- AD should stay on the custom realized-schedule path
+- frozen replay is only for primal FD reference and replay-stability diagnosis
+
+### Exact next things to run
+
+The next session should localize where the frozen primal replay first stops
+being finite.
+
+Run in this order:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 1
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 2
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode attempt --realized-schedule-frozen-accepted-steps 3
+```
+
+Then, if still finite:
+
+- `accepted_steps = 5`
+- `accepted_steps = 10`
+
+### Additional discriminator
+
+If `attempt` mode fails early, compare against:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-frozen-fd-check --realized-schedule-frozen-replay-mode accepted --realized-schedule-frozen-accepted-steps 1
+```
+
+Then similarly for `2`, `3`, etc.
+
+Why:
+
+- if `accepted` mode stays finite while `attempt` mode fails
+- then the destabilizing piece is likely in the rejected-attempt replay path,
+  not the accepted-step map itself
+
+### What to focus on next
+
+Do **not** restart broad NaN debugging of the adaptive AD path.
+
+The focus is now:
+
+- frozen-path primal replay stability
+- especially the difference between:
+  - full-attempt replay
+  - accepted-step-only replay
+
+That is the cleanest way to isolate the remaining mismatch between:
+
+- adaptive AD on the custom realized-schedule boundary
+- and a valid frozen-path FD reference

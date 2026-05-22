@@ -816,6 +816,13 @@ def _tree_all_finite(tree) -> bool:
     return bool(finite)
 
 
+def _array_state_finite_mask(values: np.ndarray) -> np.ndarray:
+    if values.ndim <= 1:
+        return np.isfinite(values)
+    reduce_axes = tuple(range(1, values.ndim))
+    return np.all(np.isfinite(values), axis=reduce_axes)
+
+
 def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | None):
     if accepted_step_limit is None:
         return trace
@@ -832,6 +839,56 @@ def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | 
         active_mask=keep_mask,
         accepted_mask=jnp.logical_and(accepted_mask, keep_mask),
     )
+
+
+def _frozen_replay_nonfinite_debug(
+    replay_result: dict[str, Any],
+    replay_trace,
+    *,
+    objectives_np: np.ndarray,
+) -> dict[str, Any]:
+    rollout = replay_result["rollout"]
+    trial_ys = np.asarray(jax.device_get(rollout.trial_ys), dtype=float)
+    state_finite_mask = _array_state_finite_mask(trial_ys)
+    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
+    next_dts = np.asarray(jax.device_get(replay_trace.next_dts), dtype=float)
+    step_ts = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
+    baseline_err_norms = np.asarray(jax.device_get(replay_trace.err_norms), dtype=float)
+
+    active_indices = np.where(active_mask)[0]
+    active_state_finite = state_finite_mask[active_mask]
+    bad_positions = np.where(~active_state_finite)[0]
+    first_bad_index = int(active_indices[bad_positions[0]]) if bad_positions.size > 0 else -1
+
+    local_attempt_window: list[dict[str, Any]] = []
+    if first_bad_index >= 0:
+        start = max(0, first_bad_index - 2)
+        stop = min(len(active_mask), first_bad_index + 3)
+        for idx in range(start, stop):
+            if not active_mask[idx]:
+                continue
+            local_attempt_window.append(
+                {
+                    "index": int(idx),
+                    "accepted": bool(accepted_mask[idx]),
+                    "attempted_dt": float(attempted_dts[idx]),
+                    "next_dt": float(next_dts[idx]),
+                    "time": float(step_ts[idx]),
+                    "baseline_err_norm": float(baseline_err_norms[idx]),
+                    "replay_state_finite": bool(state_finite_mask[idx]),
+                }
+            )
+
+    return {
+        "final_state_finite": _tree_all_finite(replay_result["final_state"]),
+        "objectives_finite": bool(np.all(np.isfinite(objectives_np))),
+        "first_bad_index": first_bad_index,
+        "first_bad_was_accepted": None if first_bad_index < 0 else bool(accepted_mask[first_bad_index]),
+        "first_bad_dt": None if first_bad_index < 0 else float(attempted_dts[first_bad_index]),
+        "local_attempt_window": local_attempt_window,
+    }
 
 
 def _write_sweep_csv(
@@ -1095,6 +1152,40 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"objectives_finite={diag_frozen.get('objectives_finite')} "
                 f"all_finite={diag_frozen.get('all_finite')}"
             )
+            nonfinite_debug = diag_frozen.get("nonfinite_debug")
+            if nonfinite_debug is not None:
+                print(
+                    f"[autodiff-gate] {key} nonfinite debug: "
+                    f"first_bad_index={nonfinite_debug.get('first_bad_index')} "
+                    f"first_bad_was_accepted={nonfinite_debug.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={_fmt_float(nonfinite_debug.get('first_bad_dt'))} "
+                    f"final_state_finite={nonfinite_debug.get('final_state_finite')} "
+                    f"objectives_finite={nonfinite_debug.get('objectives_finite')}"
+                )
+                local_window = nonfinite_debug.get("local_attempt_window") or []
+                if local_window:
+                    print(f"[autodiff-gate] {key} local window:")
+                    for entry in local_window:
+                        print(
+                            "  - "
+                            f"index={entry.get('index')} "
+                            f"accepted={entry.get('accepted')} "
+                            f"time={_fmt_float(entry.get('time'))} "
+                            f"attempted_dt={_fmt_float(entry.get('attempted_dt'))} "
+                            f"next_dt={_fmt_float(entry.get('next_dt'))} "
+                            f"baseline_err_norm={_fmt_float(entry.get('baseline_err_norm'))} "
+                            f"replay_state_finite={entry.get('replay_state_finite')}"
+                        )
+            accepted_mode_debug = diag_frozen.get("accepted_mode_debug")
+            if accepted_mode_debug is not None:
+                print(
+                    f"[autodiff-gate] {key} accepted-only replay check: "
+                    f"first_bad_index={accepted_mode_debug.get('first_bad_index')} "
+                    f"first_bad_was_accepted={accepted_mode_debug.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={_fmt_float(accepted_mode_debug.get('first_bad_dt'))} "
+                    f"final_state_finite={accepted_mode_debug.get('final_state_finite')} "
+                    f"objectives_finite={accepted_mode_debug.get('objectives_finite')}"
+                )
         if report.get("ad_available", True):
             print("[autodiff-gate] objective errors:")
             for label, ad, fd, ae, re in zip(
@@ -1115,6 +1206,60 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 report["gradient_fd"],
             ):
                 print(f"  - {label}: frozen_fd={float(fd):.6e}")
+        return
+
+    if report.get("realized_schedule_frozen_replay_localize"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_frozen_replay_localize "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] attempt replay prefix checks:")
+        for entry in report.get("attempt_prefix_checks") or []:
+            print(
+                "  - "
+                f"accepted_steps={entry.get('accepted_step_limit')} "
+                f"attempt_count={entry.get('attempt_count')} "
+                f"accepted_count={entry.get('accepted_count')} "
+                f"minus_all_finite={entry.get('fd_minus', {}).get('all_finite')} "
+                f"plus_all_finite={entry.get('fd_plus', {}).get('all_finite')} "
+                f"all_finite={entry.get('all_finite')}"
+            )
+        last_passing = report.get("last_passing_attempt_case")
+        if last_passing is not None:
+            print(
+                "[autodiff-gate] last passing attempt prefix: "
+                f"accepted_steps={last_passing.get('accepted_step_limit')} "
+                f"attempt_count={last_passing.get('attempt_count')}"
+            )
+        first_failing = report.get("first_failing_attempt_case")
+        if first_failing is not None:
+            print(
+                "[autodiff-gate] first failing attempt prefix: "
+                f"accepted_steps={first_failing.get('accepted_step_limit')} "
+                f"attempt_count={first_failing.get('attempt_count')}"
+            )
+        accepted_boundary = report.get("accepted_mode_at_boundary")
+        if accepted_boundary is not None:
+            print(
+                "[autodiff-gate] accepted replay at boundary: "
+                f"accepted_steps={accepted_boundary.get('accepted_step_limit')} "
+                f"attempt_count={accepted_boundary.get('attempt_count')} "
+                f"minus_all_finite={accepted_boundary.get('fd_minus', {}).get('all_finite')} "
+                f"plus_all_finite={accepted_boundary.get('fd_plus', {}).get('all_finite')} "
+                f"all_finite={accepted_boundary.get('all_finite')}"
+            )
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -2145,6 +2290,8 @@ def build_realized_schedule_frozen_fd_report(
     )
     minus_objectives_np = np.asarray(jax.device_get(objectives_minus), dtype=float)
     minus_replay_finite = _tree_all_finite(minus_replay["final_state"]) and bool(np.all(np.isfinite(minus_objectives_np)))
+    minus_nonfinite_debug = None
+    minus_accepted_mode_debug = None
     print(
         "[autodiff-gate] realized-schedule frozen-fd fd_minus summary: "
         f"state_finite={_tree_all_finite(minus_replay['final_state'])} "
@@ -2169,6 +2316,8 @@ def build_realized_schedule_frozen_fd_report(
     )
     plus_objectives_np = np.asarray(jax.device_get(objectives_plus), dtype=float)
     plus_replay_finite = _tree_all_finite(plus_replay["final_state"]) and bool(np.all(np.isfinite(plus_objectives_np)))
+    plus_nonfinite_debug = None
+    plus_accepted_mode_debug = None
     print(
         "[autodiff-gate] realized-schedule frozen-fd fd_plus summary: "
         f"state_finite={_tree_all_finite(plus_replay['final_state'])} "
@@ -2176,6 +2325,60 @@ def build_realized_schedule_frozen_fd_report(
         f"all_finite={plus_replay_finite}",
         flush=True,
     )
+    if not minus_replay_finite:
+        minus_nonfinite_debug = _frozen_replay_nonfinite_debug(
+            minus_replay,
+            replay_trace,
+            objectives_np=minus_objectives_np,
+        )
+        if replay_mode == "attempt":
+            print(
+                "[autodiff-gate] realized-schedule frozen-fd progress: "
+                "fd_minus attempt replay failed; checking accepted-only replay on same frozen schedule",
+                flush=True,
+            )
+            minus_objectives_accepted, minus_replay_accepted = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+                jnp.asarray(minus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=parameter_name,
+                frozen_trace=replay_trace,
+                replay_mode="accepted",
+            )
+            minus_accepted_mode_debug = _frozen_replay_nonfinite_debug(
+                minus_replay_accepted,
+                replay_trace,
+                objectives_np=np.asarray(jax.device_get(minus_objectives_accepted), dtype=float),
+            )
+    if not plus_replay_finite:
+        plus_nonfinite_debug = _frozen_replay_nonfinite_debug(
+            plus_replay,
+            replay_trace,
+            objectives_np=plus_objectives_np,
+        )
+        if replay_mode == "attempt":
+            print(
+                "[autodiff-gate] realized-schedule frozen-fd progress: "
+                "fd_plus attempt replay failed; checking accepted-only replay on same frozen schedule",
+                flush=True,
+            )
+            plus_objectives_accepted, plus_replay_accepted = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+                jnp.asarray(plus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=parameter_name,
+                frozen_trace=replay_trace,
+                replay_mode="accepted",
+            )
+            plus_accepted_mode_debug = _frozen_replay_nonfinite_debug(
+                plus_replay_accepted,
+                replay_trace,
+                objectives_np=np.asarray(jax.device_get(plus_objectives_accepted), dtype=float),
+            )
     if accepted_step_limit is None:
         print(
             "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
@@ -2258,6 +2461,8 @@ def build_realized_schedule_frozen_fd_report(
                 "state_finite": _tree_all_finite(minus_replay["final_state"]),
                 "objectives_finite": bool(np.all(np.isfinite(minus_objectives_np))),
                 "all_finite": minus_replay_finite,
+                "nonfinite_debug": minus_nonfinite_debug,
+                "accepted_mode_debug": minus_accepted_mode_debug,
             },
             "frozen_fd_plus": {
                 "replay_mode": plus_replay["replay_mode"],
@@ -2266,8 +2471,206 @@ def build_realized_schedule_frozen_fd_report(
                 "state_finite": _tree_all_finite(plus_replay["final_state"]),
                 "objectives_finite": bool(np.all(np.isfinite(plus_objectives_np))),
                 "all_finite": plus_replay_finite,
+                "nonfinite_debug": plus_nonfinite_debug,
+                "accepted_mode_debug": plus_accepted_mode_debug,
             },
         },
+    }
+
+
+def _frozen_replay_prefix_case(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    minus_value: float,
+    plus_value: float,
+    baseline_trace,
+    replay_mode: str,
+    accepted_step_limit: int,
+) -> dict[str, Any]:
+    replay_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_trace,
+        accepted_step_limit,
+    )
+    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    accepted_times = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
+    accepted_time_list = accepted_times[np.logical_and(active_mask, accepted_mask)].tolist()
+
+    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        frozen_trace=replay_trace,
+        replay_mode=replay_mode,
+    )
+    minus_objectives_np = np.asarray(jax.device_get(objectives_minus), dtype=float)
+    minus_state_finite = _tree_all_finite(minus_replay["final_state"])
+    minus_objectives_finite = bool(np.all(np.isfinite(minus_objectives_np)))
+    minus_all_finite = bool(minus_state_finite and minus_objectives_finite)
+
+    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        frozen_trace=replay_trace,
+        replay_mode=replay_mode,
+    )
+    plus_objectives_np = np.asarray(jax.device_get(objectives_plus), dtype=float)
+    plus_state_finite = _tree_all_finite(plus_replay["final_state"])
+    plus_objectives_finite = bool(np.all(np.isfinite(plus_objectives_np)))
+    plus_all_finite = bool(plus_state_finite and plus_objectives_finite)
+
+    return {
+        "accepted_step_limit": int(accepted_step_limit),
+        "replay_mode": str(replay_mode),
+        "attempt_count": int(np.sum(active_mask)),
+        "accepted_count": int(np.sum(accepted_mask)),
+        "accepted_time_list": accepted_time_list,
+        "fd_minus": {
+            "state_finite": minus_state_finite,
+            "objectives_finite": minus_objectives_finite,
+            "all_finite": minus_all_finite,
+        },
+        "fd_plus": {
+            "state_finite": plus_state_finite,
+            "objectives_finite": plus_objectives_finite,
+            "all_finite": plus_all_finite,
+        },
+        "all_finite": bool(minus_all_finite and plus_all_finite),
+    }
+
+
+def build_realized_schedule_frozen_replay_localize_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    total_accepted = int(np.asarray(jax.device_get(baseline_rollout.accepted_count)))
+    print(
+        "[autodiff-gate] frozen-replay-localize baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"completed={baseline_diag['completed']} "
+        f"failed={baseline_diag['failed']} "
+        f"fail_code={baseline_diag['fail_code']}",
+        flush=True,
+    )
+
+    attempt_mode_cache: dict[int, dict[str, Any]] = {}
+
+    def _attempt_case(prefix: int) -> dict[str, Any]:
+        prefix = int(prefix)
+        if prefix not in attempt_mode_cache:
+            print(
+                "[autodiff-gate] frozen-replay-localize progress: "
+                f"checking attempt replay prefix accepted_steps={prefix}",
+                flush=True,
+            )
+            attempt_mode_cache[prefix] = _frozen_replay_prefix_case(
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=parameter_name,
+                minus_value=minus_value,
+                plus_value=plus_value,
+                baseline_trace=baseline_rollout.trace,
+                replay_mode="attempt",
+                accepted_step_limit=prefix,
+            )
+        return attempt_mode_cache[prefix]
+
+    low = 1
+    high = total_accepted
+    first_failing_attempt_case = _attempt_case(high)
+    if first_failing_attempt_case["all_finite"]:
+        last_passing_attempt_case = first_failing_attempt_case
+        first_failing_attempt_case = None
+    else:
+        last_passing_attempt_case = None
+        while low <= high:
+            mid = (low + high) // 2
+            case_mid = _attempt_case(mid)
+            if case_mid["all_finite"]:
+                last_passing_attempt_case = case_mid
+                low = mid + 1
+            else:
+                first_failing_attempt_case = case_mid
+                high = mid - 1
+
+    accepted_mode_at_boundary = None
+    boundary_case = first_failing_attempt_case or last_passing_attempt_case
+    if boundary_case is not None:
+        boundary_prefix = int(boundary_case["accepted_step_limit"])
+        print(
+            "[autodiff-gate] frozen-replay-localize progress: "
+            f"checking accepted replay at boundary accepted_steps={boundary_prefix}",
+            flush=True,
+        )
+        accepted_mode_at_boundary = _frozen_replay_prefix_case(
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            minus_value=minus_value,
+            plus_value=plus_value,
+            baseline_trace=baseline_rollout.trace,
+            replay_mode="accepted",
+            accepted_step_limit=boundary_prefix,
+        )
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_frozen_replay_localize": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "objective_labels": OBJECTIVE_LABELS,
+        "rollout_path": {
+            "baseline": baseline_diag,
+        },
+        "attempt_prefix_checks": [attempt_mode_cache[key] for key in sorted(attempt_mode_cache)],
+        "last_passing_attempt_case": last_passing_attempt_case,
+        "first_failing_attempt_case": first_failing_attempt_case,
+        "accepted_mode_at_boundary": accepted_mode_at_boundary,
+        "passed": bool(first_failing_attempt_case is None),
+        "max_relative_error": float("nan"),
     }
 
 
@@ -2725,6 +3128,11 @@ def main() -> None:
         help="Run a cheaper realized-schedule check that compares AD against FD on the baseline frozen Radau replay path instead of two fresh adaptive FD solves.",
     )
     parser.add_argument(
+        "--realized-schedule-frozen-replay-localize",
+        action="store_true",
+        help="Run a fast one-command binary search that localizes the first failing frozen replay prefix and compares attempt vs accepted replay at the failure boundary.",
+    )
+    parser.add_argument(
         "--realized-schedule-frozen-replay-mode",
         default="attempt",
         choices=("attempt", "accepted"),
@@ -2800,6 +3208,14 @@ def main() -> None:
             device=args.device,
             replay_mode=args.realized_schedule_frozen_replay_mode,
             accepted_step_limit=args.realized_schedule_frozen_accepted_steps,
+        )
+    elif args.realized_schedule_frozen_replay_localize:
+        report = build_realized_schedule_frozen_replay_localize_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(
