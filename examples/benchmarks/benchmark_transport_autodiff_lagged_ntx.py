@@ -1095,18 +1095,26 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"objectives_finite={diag_frozen.get('objectives_finite')} "
                 f"all_finite={diag_frozen.get('all_finite')}"
             )
-        print("[autodiff-gate] objective errors:")
-        for label, ad, fd, ae, re in zip(
-            report["objective_labels"],
-            report["gradient_autodiff"],
-            report["gradient_fd"],
-            report["gradient_absolute_error"],
-            report["gradient_relative_error"],
-        ):
-            print(
-                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
-                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
-            )
+        if report.get("ad_available", True):
+            print("[autodiff-gate] objective errors:")
+            for label, ad, fd, ae, re in zip(
+                report["objective_labels"],
+                report["gradient_autodiff"],
+                report["gradient_fd"],
+                report["gradient_absolute_error"],
+                report["gradient_relative_error"],
+            ):
+                print(
+                    f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                    f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+                )
+        else:
+            print("[autodiff-gate] prefix frozen replay diagnostic: AD skipped; reporting frozen FD only")
+            for label, fd in zip(
+                report["objective_labels"],
+                report["gradient_fd"],
+            ):
+                print(f"  - {label}: frozen_fd={float(fd):.6e}")
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -2168,11 +2176,11 @@ def build_realized_schedule_frozen_fd_report(
         f"all_finite={plus_replay_finite}",
         flush=True,
     )
-    print(
-        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
-        flush=True,
-    )
     if accepted_step_limit is None:
+        print(
+            "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
+            flush=True,
+        )
         objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
             p,
             config=config,
@@ -2195,18 +2203,23 @@ def build_realized_schedule_frozen_fd_report(
             replay_mode=replay_mode,
         )[0]
         ad_mode = "frozen_trace_direct"
-
-    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
-    print(
-        "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
-        flush=True,
-    )
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
-
-    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    abs_err = np.abs(grad_ad_np - grad_fd_np)
-    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    if accepted_step_limit is None:
+        gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+        print(
+            "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
+            flush=True,
+        )
+        grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+        abs_err = np.abs(grad_ad_np - grad_fd_np)
+        rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+        ad_available = True
+    else:
+        grad_ad_np = None
+        abs_err = None
+        rel_err = None
+        ad_available = False
 
     accepted_times = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
     accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
@@ -2220,15 +2233,20 @@ def build_realized_schedule_frozen_fd_report(
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
-        "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_autodiff": None if grad_ad_np is None else grad_ad_np.tolist(),
         "gradient_fd": grad_fd_np.tolist(),
-        "gradient_absolute_error": abs_err.tolist(),
-        "gradient_relative_error": rel_err.tolist(),
-        "max_relative_error": float(np.max(rel_err)),
-        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "gradient_absolute_error": None if abs_err is None else abs_err.tolist(),
+        "gradient_relative_error": None if rel_err is None else rel_err.tolist(),
+        "max_relative_error": float("nan") if rel_err is None else float(np.max(rel_err)),
+        "passed": (
+            bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2)
+            if rel_err is not None
+            else bool(minus_replay_finite and plus_replay_finite)
+        ),
         "objective_labels": OBJECTIVE_LABELS,
         "frozen_replay_mode": str(replay_mode),
         "ad_mode": ad_mode,
+        "ad_available": ad_available,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
         "accepted_time_list": accepted_time_list,
         "rollout_path": {
