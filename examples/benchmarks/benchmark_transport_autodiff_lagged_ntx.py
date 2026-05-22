@@ -444,6 +444,144 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     return _objective_vector(replay["final_state"], runtime), replay
 
 
+def _compress_accepted_trial_ys(
+    trial_ys: jax.Array,
+    accepted_mask: jax.Array,
+    accepted_count: int,
+) -> jax.Array:
+    accepted_count = int(accepted_count)
+    if accepted_count <= 0:
+        return jnp.zeros((0, trial_ys.shape[-1]), dtype=trial_ys.dtype)
+
+    def _scan_body(carry, xs):
+        write_idx, out = carry
+        accepted, flat_y = xs
+
+        def _write(_):
+            next_out = out.at[write_idx].set(flat_y)
+            return write_idx + 1, next_out
+
+        return jax.lax.cond(
+            jnp.logical_and(accepted, write_idx < accepted_count),
+            _write,
+            lambda _: (write_idx, out),
+            operand=None,
+        )
+
+    init = (
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.zeros((accepted_count, trial_ys.shape[-1]), dtype=trial_ys.dtype),
+    )
+    (_, packed) = jax.lax.scan(_scan_body, init, (accepted_mask, trial_ys))
+    return packed
+
+
+def _objective_trajectory_from_flat_ys(
+    flat_ys: jax.Array,
+    *,
+    runtime,
+    unpack_flat,
+) -> jax.Array:
+    def _single(flat_y):
+        return _objective_vector(unpack_flat(flat_y), runtime)
+
+    if flat_ys.shape[0] == 0:
+        return jnp.zeros((0, len(OBJECTIVE_LABELS)), dtype=jnp.asarray(runtime.geometry.rho_grid).dtype)
+    return jax.vmap(_single)(flat_ys)
+
+
+def _adaptive_rollout_objective_trajectory_on_time_list(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    time_list,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    replay = _radau_run_prepared_on_time_list(
+        prepared_rollout,
+        time_list,
+    )
+    flat_ys = replay["rollout"].trial_ys
+    trajectory = _objective_trajectory_from_flat_ys(
+        flat_ys,
+        runtime=runtime,
+        unpack_flat=prepared_rollout.physics_context.unpack_flat,
+    )
+    return trajectory, replay
+
+
+def _adaptive_rollout_objective_trajectory_on_realized_trace(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    frozen_trace,
+    replay_mode: str = "attempt",
+    accepted_count: int,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    replay = _radau_run_prepared_on_realized_trace(
+        prepared_rollout,
+        execution_context,
+        frozen_trace,
+        replay_mode=replay_mode,
+    )
+    accepted_flat_ys = _compress_accepted_trial_ys(
+        replay["rollout"].trial_ys,
+        jax.lax.stop_gradient(frozen_trace.accepted_mask),
+        accepted_count=accepted_count,
+    )
+    trajectory = _objective_trajectory_from_flat_ys(
+        accepted_flat_ys,
+        runtime=runtime,
+        unpack_flat=prepared_rollout.physics_context.unpack_flat,
+    )
+    return trajectory, replay
+
+
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     parameter_value,
     *,
@@ -889,6 +1027,10 @@ def _parse_float_csv(text: str | None) -> tuple[float, ...]:
             continue
         values.append(float(token))
     return tuple(values)
+
+
+def _parse_int_csv(text: str | None) -> tuple[int, ...]:
+    return tuple(int(round(v)) for v in _parse_float_csv(text))
 
 
 def _result_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
@@ -1592,6 +1734,74 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             print(
                 f"  - {label}: adaptive_ad={float(ad):.6e} fixed_dt_direct_ad={float(fd):.6e} "
                 f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
+        return
+
+    if report.get("baseline_dt_path_safe_compose_scan_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_safe_compose_scan "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_accepted_count={report.get('safe_accepted_count')}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] prefix compose errors:")
+        label_to_index = {label: idx for idx, label in enumerate(report["objective_labels"])}
+        er_idx = label_to_index["Er_volume_average"]
+        er2_idx = label_to_index["Er2_volume_average"]
+        pressure_idx = label_to_index["total_pressure_volume_average"]
+        for entry in report.get("entries") or []:
+            rel_err = np.asarray(entry["gradient_relative_error"], dtype=float)
+            print(
+                "  - "
+                f"accepted_count={entry.get('accepted_count')} "
+                f"final_time={float(entry.get('final_time')):.6e} "
+                f"max_rel_err={float(entry.get('max_relative_error')):.6e} "
+                f"Er_rel_err={float(rel_err[er_idx]):.6e} "
+                f"Er2_rel_err={float(rel_err[er2_idx]):.6e} "
+                f"pressure_rel_err={float(rel_err[pressure_idx]):.6e}"
+            )
+        return
+
+    if report.get("baseline_dt_path_safe_trajectory_compare_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_safe_trajectory_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_accepted_count={report.get('safe_accepted_count')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] accepted-step trajectory errors:")
+        for entry in report.get("entries") or []:
+            print(
+                "  - "
+                f"accepted_index={entry.get('accepted_index')} "
+                f"time={float(entry.get('time')):.6e} "
+                f"max_rel_err={float(entry.get('max_relative_error')):.6e} "
+                f"Er_rel_err={float(entry.get('Er_relative_error')):.6e} "
+                f"Er2_rel_err={float(entry.get('Er2_relative_error')):.6e} "
+                f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e}"
             )
         return
 
@@ -3355,6 +3565,267 @@ def build_baseline_dt_path_safe_compose_report(
     }
 
 
+def build_baseline_dt_path_safe_compose_scan_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+    accepted_step_counts: tuple[int, ...],
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_time_list_full = _accepted_time_list_until_attempt_index(
+        baseline_rollout.trace,
+        safe_attempt_index,
+    )
+    if not safe_time_list_full:
+        raise ValueError("Safe baseline dt path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+
+    safe_accepted_count = len(safe_time_list_full)
+    requested_counts = [int(v) for v in accepted_step_counts if int(v) > 0]
+    if not requested_counts:
+        requested_counts = [1, 2, 5, 10, safe_accepted_count]
+    prefix_counts = sorted({min(v, safe_accepted_count) for v in requested_counts})
+    print(
+        "[autodiff-gate] baseline-dt-safe-compose-scan baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"known_first_bad_attempt_index={known_first_bad_attempt_index} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_accepted_count={safe_accepted_count}",
+        flush=True,
+    )
+
+    entries: list[dict[str, Any]] = []
+    global_max_rel_error = 0.0
+    for accepted_count in prefix_counts:
+        prefix_time_list = safe_time_list_full[:accepted_count]
+        prefix_final_time = float(prefix_time_list[-1])
+        print(
+            "[autodiff-gate] baseline-dt-safe-compose-scan progress: "
+            f"accepted_count={accepted_count} "
+            f"final_time={prefix_final_time:.6e} "
+            "running adaptive AD",
+            flush=True,
+        )
+        config_prefix = _config_with_t_final(config, prefix_final_time)
+        runtime_prefix, baseline_state_prefix = build_runtime_context(config_prefix)
+        profile_cfg_prefix = _baseline_profile_cfg(config_prefix)
+
+        adaptive_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config_prefix,
+            runtime=runtime_prefix,
+            baseline_state=baseline_state_prefix,
+            profile_cfg=profile_cfg_prefix,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=True,
+        )[0]
+        fixed_dt_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_time_list(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            time_list=prefix_time_list,
+        )[0]
+
+        gradient_adaptive = jax.jacfwd(adaptive_objective_fn)(jnp.asarray(baseline_value))
+        print(
+            "[autodiff-gate] baseline-dt-safe-compose-scan progress: "
+            f"accepted_count={accepted_count} running fixed-dt direct AD",
+            flush=True,
+        )
+        gradient_fixed_dt_direct = jax.jacfwd(fixed_dt_objective_fn)(jnp.asarray(baseline_value))
+
+        grad_adaptive_np = np.asarray(jax.device_get(gradient_adaptive), dtype=float)
+        grad_direct_np = np.asarray(jax.device_get(gradient_fixed_dt_direct), dtype=float)
+        abs_err = np.abs(grad_adaptive_np - grad_direct_np)
+        rel_err = abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
+        max_rel_err = float(np.max(rel_err))
+        global_max_rel_error = max(global_max_rel_error, max_rel_err)
+
+        label_to_index = {label: idx for idx, label in enumerate(OBJECTIVE_LABELS)}
+        er_idx = label_to_index["Er_volume_average"]
+        er2_idx = label_to_index["Er2_volume_average"]
+        pressure_idx = label_to_index["total_pressure_volume_average"]
+        print(
+            "[autodiff-gate] baseline-dt-safe-compose-scan summary: "
+            f"accepted_count={accepted_count} "
+            f"max_rel_err={max_rel_err:.6e} "
+            f"Er_rel_err={float(rel_err[er_idx]):.6e} "
+            f"Er2_rel_err={float(rel_err[er2_idx]):.6e} "
+            f"pressure_rel_err={float(rel_err[pressure_idx]):.6e}",
+            flush=True,
+        )
+
+        entries.append(
+            {
+                "accepted_count": int(accepted_count),
+                "final_time": float(prefix_final_time),
+                "gradient_realized_schedule_autodiff": grad_adaptive_np.tolist(),
+                "gradient_fixed_dt_direct_autodiff": grad_direct_np.tolist(),
+                "gradient_absolute_error": abs_err.tolist(),
+                "gradient_relative_error": rel_err.tolist(),
+                "max_relative_error": max_rel_err,
+            }
+        )
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_safe_compose_scan_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "known_first_bad_attempt_index": int(known_first_bad_attempt_index),
+        "safe_attempt_margin": int(safe_attempt_margin),
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_accepted_count": int(safe_accepted_count),
+        "entries": entries,
+        "objective_labels": OBJECTIVE_LABELS,
+        "max_relative_error": float(global_max_rel_error),
+        "passed": bool(np.isfinite(global_max_rel_error) and global_max_rel_error <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
+def build_baseline_dt_path_safe_trajectory_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=len(_accepted_time_list_until_attempt_index(baseline_rollout.trace, safe_attempt_index)),
+    )
+    safe_time_list = _accepted_time_list_until_attempt_index(baseline_rollout.trace, safe_attempt_index)
+    safe_accepted_count = len(safe_time_list)
+    if safe_accepted_count <= 0:
+        raise ValueError("Safe baseline dt path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+
+    print(
+        "[autodiff-gate] baseline-dt-safe-trajectory baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"known_first_bad_attempt_index={known_first_bad_attempt_index} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_accepted_count={safe_accepted_count} "
+        f"safe_final_time={float(safe_time_list[-1]):.6e}",
+        flush=True,
+    )
+
+    adaptive_fn = lambda p: _adaptive_rollout_objective_trajectory_on_realized_trace(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        frozen_trace=safe_trace,
+        replay_mode="attempt",
+        accepted_count=safe_accepted_count,
+    )[0]
+    fixed_dt_fn = lambda p: _adaptive_rollout_objective_trajectory_on_time_list(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )[0]
+
+    print("[autodiff-gate] baseline-dt-safe-trajectory progress: running realized-trace adaptive AD trajectory", flush=True)
+    adaptive_jac = jax.jacfwd(adaptive_fn)(jnp.asarray(baseline_value))
+    print("[autodiff-gate] baseline-dt-safe-trajectory progress: adaptive AD trajectory complete; running fixed-dt direct AD trajectory", flush=True)
+    fixed_dt_jac = jax.jacfwd(fixed_dt_fn)(jnp.asarray(baseline_value))
+
+    adaptive_np = np.asarray(jax.device_get(adaptive_jac), dtype=float)
+    fixed_np = np.asarray(jax.device_get(fixed_dt_jac), dtype=float)
+    abs_err = np.abs(adaptive_np - fixed_np)
+    rel_err = abs_err / np.maximum(np.abs(fixed_np), 1.0e-10)
+
+    entries = []
+    global_max_rel_error = 0.0
+    label_to_index = {label: idx for idx, label in enumerate(OBJECTIVE_LABELS)}
+    for idx, t_value in enumerate(safe_time_list):
+        step_rel = rel_err[idx]
+        step_max = float(np.max(step_rel))
+        global_max_rel_error = max(global_max_rel_error, step_max)
+        entries.append(
+            {
+                "accepted_index": int(idx + 1),
+                "time": float(t_value),
+                "gradient_realized_trace_ad": adaptive_np[idx].tolist(),
+                "gradient_fixed_dt_direct_ad": fixed_np[idx].tolist(),
+                "gradient_absolute_error": abs_err[idx].tolist(),
+                "gradient_relative_error": step_rel.tolist(),
+                "max_relative_error": step_max,
+                "Er_relative_error": float(step_rel[label_to_index["Er_volume_average"]]),
+                "Er2_relative_error": float(step_rel[label_to_index["Er2_volume_average"]]),
+                "pressure_relative_error": float(step_rel[label_to_index["total_pressure_volume_average"]]),
+            }
+        )
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_safe_trajectory_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "known_first_bad_attempt_index": int(known_first_bad_attempt_index),
+        "safe_attempt_margin": int(safe_attempt_margin),
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_accepted_count": int(safe_accepted_count),
+        "safe_final_time": float(safe_time_list[-1]),
+        "objective_labels": OBJECTIVE_LABELS,
+        "entries": entries,
+        "max_relative_error": float(global_max_rel_error),
+        "passed": bool(np.isfinite(global_max_rel_error) and global_max_rel_error <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
 def build_realized_schedule_windowed_frozen_fd_report(
     *,
     config_path: Path,
@@ -3878,6 +4349,21 @@ def main() -> None:
         help="Compare adaptive realized-schedule AD against direct AD on the same safe baseline accepted dt path.",
     )
     parser.add_argument(
+        "--baseline-dt-path-safe-compose-scan-check",
+        action="store_true",
+        help="Compare adaptive realized-schedule AD against fixed-dt direct AD at multiple accepted-step prefixes of the same safe baseline path in one run.",
+    )
+    parser.add_argument(
+        "--baseline-dt-path-safe-trajectory-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: run one realized-trace adaptive AD trajectory and one fixed-dt direct AD trajectory, then compare per-accepted-step objective tangents along the safe baseline path.",
+    )
+    parser.add_argument(
+        "--baseline-dt-path-safe-compose-scan-counts",
+        default="1,2,5,10,20,30,40,45",
+        help="Comma-separated accepted-step prefixes used by --baseline-dt-path-safe-compose-scan-check.",
+    )
+    parser.add_argument(
         "--known-first-bad-attempt-index",
         type=int,
         default=76,
@@ -4006,6 +4492,23 @@ def main() -> None:
             parameter_name=args.parameter,
             rel_fd_step=args.fd_rel_step,
             abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+        )
+    elif args.baseline_dt_path_safe_compose_scan_check:
+        report = build_baseline_dt_path_safe_compose_scan_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+            accepted_step_counts=_parse_int_csv(args.baseline_dt_path_safe_compose_scan_counts),
+        )
+    elif args.baseline_dt_path_safe_trajectory_compare_check:
+        report = build_baseline_dt_path_safe_trajectory_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
             device=args.device,
             known_first_bad_attempt_index=args.known_first_bad_attempt_index,
             safe_attempt_margin=args.safe_attempt_margin,
