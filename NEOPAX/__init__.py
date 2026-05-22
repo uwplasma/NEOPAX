@@ -86,6 +86,12 @@ def run_config_path(*args, **kwargs):
     return _run_config_path(*args, **kwargs)
 
 
+def run_transport_on_time_list(*args, **kwargs):
+    from ._orchestrator import run_transport_on_time_list as _run_transport_on_time_list
+
+    return _run_transport_on_time_list(*args, **kwargs)
+
+
 __all__ = [
     "__version__",
     "__version_tuple__",
@@ -147,6 +153,7 @@ __all__ = [
     "run",
     "run_config",
     "run_config_path",
+    "run_transport_on_time_list",
     "source_model",
     "transport_flux_model",
 ]

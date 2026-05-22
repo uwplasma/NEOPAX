@@ -1325,6 +1325,36 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     return result
 
 
+def run_transport_on_time_list(
+    config: dict,
+    runtime: RuntimeContext,
+    state: TransportState,
+    time_list,
+):
+    """Run the custom Radau accepted-step map on a caller-provided absolute time list."""
+
+    from ._transport_solvers import (
+        RADAUSolver,
+        _build_prepared_radau_accepted_rollout,
+        _radau_run_prepared_on_time_list,
+    )
+
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    solver = prepared["solver"]
+    if not isinstance(solver, RADAUSolver):
+        raise TypeError(
+            "run_transport_on_time_list currently supports only the custom RADAUSolver."
+        )
+
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=prepared["solve_state"],
+        vector_field=prepared["solve_vector_field"],
+        species=runtime.species,
+    )
+    return _radau_run_prepared_on_time_list(prepared_rollout, time_list)
+
+
 def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState):
     result = solve_ambipolarity_roots_from_config(
         state=state,

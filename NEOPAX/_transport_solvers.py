@@ -4725,6 +4725,106 @@ def _radau_replay_realized_attempt_rollout(
     )
 
 
+def _radau_dt_sequence_from_time_list(
+    time_list,
+    *,
+    t0,
+    dtype,
+) -> jax.Array:
+    """Convert an absolute time list into accepted-step `dt` increments."""
+
+    times_np = np.asarray(time_list, dtype=float).reshape(-1)
+    if times_np.size == 0:
+        return jnp.asarray([], dtype=dtype)
+
+    t0_value = float(jnp.asarray(t0))
+    if np.isclose(times_np[0], t0_value, rtol=0.0, atol=1.0e-14):
+        times_np = times_np[1:]
+    if times_np.size == 0:
+        return jnp.asarray([], dtype=dtype)
+
+    full_times = np.concatenate(([t0_value], times_np), axis=0)
+    dt_sequence_np = np.diff(full_times)
+    if np.any(dt_sequence_np < -1.0e-14):
+        raise ValueError("time_list must be nondecreasing and not go backward in time.")
+    return jnp.asarray(dt_sequence_np, dtype=dtype)
+
+
+def _radau_run_prepared_on_time_list(
+    prepared_rollout: _PreparedRadauAcceptedRollout,
+    time_list,
+) -> dict[str, Any]:
+    """Replay the accepted-step Radau map on a caller-provided absolute time list."""
+
+    dt_sequence = _radau_dt_sequence_from_time_list(
+        time_list,
+        t0=prepared_rollout.kernel_context.t0,
+        dtype=prepared_rollout.kernel_context.dtype,
+    )
+    rollout = _radau_fixed_dt_accepted_rollout(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        prepared_rollout.initial_carry,
+        dt_sequence,
+    )
+    saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(rollout.trial_ys)
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return {
+        "time_list": jnp.asarray(time_list, dtype=prepared_rollout.kernel_context.dtype),
+        "dt_sequence": dt_sequence,
+        "saved_states": saved_states,
+        "final_state": final_state,
+        "final_carry": rollout.final_carry,
+        "rollout": rollout,
+    }
+
+
+def _radau_run_prepared_on_realized_trace(
+    prepared_rollout: _PreparedRadauAcceptedRollout,
+    execution_context: _RadauSolveExecutionContext,
+    trace: _RadauAdaptiveRolloutTrace,
+    *,
+    replay_mode: str = "attempt",
+) -> dict[str, Any]:
+    """Replay a prepared Radau rollout on a frozen forward trace from another solve."""
+
+    replay_mode_normalized = str(replay_mode).strip().lower()
+    if replay_mode_normalized == "attempt":
+        rollout = _radau_replay_realized_attempt_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            jax.lax.stop_gradient(trace.active_mask),
+            jax.lax.stop_gradient(trace.accepted_mask),
+            jax.lax.stop_gradient(trace.attempted_dts),
+            jax.lax.stop_gradient(trace.next_dts),
+            jax.lax.stop_gradient(trace.next_recent_reject_count),
+            jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+            jax.lax.stop_gradient(trace.next_easy_growth_streak),
+            jax.lax.stop_gradient(trace.next_lagged_response_valid),
+        )
+    elif replay_mode_normalized == "accepted":
+        rollout = _radau_replay_realized_accepted_rollout(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            prepared_rollout.initial_carry,
+            jax.lax.stop_gradient(trace.accepted_mask),
+            jax.lax.stop_gradient(trace.attempted_dts),
+        )
+    else:
+        raise ValueError(
+            "replay_mode must be one of {'attempt', 'accepted'} "
+            f"but got {replay_mode!r}."
+        )
+
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return {
+        "final_state": final_state,
+        "final_carry": rollout.final_carry,
+        "rollout": rollout,
+        "replay_mode": replay_mode_normalized,
+    }
+
+
 def _radau_controller_composed_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,

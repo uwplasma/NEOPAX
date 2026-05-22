@@ -57,6 +57,7 @@ from NEOPAX._transport_solvers import (
     _radau_controller_composed_rollout,
     _radau_controller_forward_only_rollout,
     _radau_prepare_stage_subsolve_inputs_from_carry,
+    _radau_run_prepared_on_realized_trace,
     _radau_run_stage_subsolve_standalone_autodiff,
 )
 
@@ -365,6 +366,47 @@ def _adaptive_rollout_objectives_for_parameter(
         use_realized_schedule_jvp=use_realized_schedule_jvp,
     )
     return _objective_vector(final_state, runtime), rollout
+
+
+def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    frozen_trace,
+    replay_mode: str = "attempt",
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    replay = _radau_run_prepared_on_realized_trace(
+        prepared_rollout,
+        execution_context,
+        frozen_trace,
+        replay_mode=replay_mode,
+    )
+    return _objective_vector(replay["final_state"], runtime), replay
 
 
 def _adaptive_rollout_nan_debug_for_parameter(
@@ -989,6 +1031,41 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                         f"cache_valid_next={entry.get('cache_valid_next')} "
                         f"tangent_finite={entry.get('tangent_finite')}"
                     )
+        return
+
+    if report.get("realized_schedule_frozen_fd_check"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_frozen_fd "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e} "
+            f"replay_mode={report.get('frozen_replay_mode')}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print(
+            f"[autodiff-gate] frozen accepted_time_list={report.get('accepted_time_list')}"
+        )
+        print("[autodiff-gate] objective errors:")
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_autodiff"],
+            report["gradient_fd"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -1956,6 +2033,138 @@ def build_realized_schedule_rollout_report(
     }
 
 
+def build_realized_schedule_frozen_fd_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+    replay_mode: str = "attempt",
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"completed={baseline_diag['completed']} "
+        f"failed={baseline_diag['failed']} "
+        f"fail_code={baseline_diag['fail_code']}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: baseline rollout complete; "
+        f"running frozen fd_minus replay ({replay_mode})",
+        flush=True,
+    )
+    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        frozen_trace=baseline_rollout.trace,
+        replay_mode=replay_mode,
+    )
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_minus replay complete; "
+        f"running frozen fd_plus replay ({replay_mode})",
+        flush=True,
+    )
+    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        frozen_trace=baseline_rollout.trace,
+        replay_mode=replay_mode,
+    )
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
+        flush=True,
+    )
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
+        flush=True,
+    )
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+
+    accepted_times = np.asarray(jax.device_get(baseline_rollout.trace.step_ts), dtype=float)
+    accepted_mask = np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(baseline_rollout.trace.active_mask), dtype=bool)
+    accepted_time_list = accepted_times[np.logical_and(active_mask, accepted_mask)].tolist()
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_frozen_fd_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_fd": grad_fd_np.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "frozen_replay_mode": str(replay_mode),
+        "accepted_time_list": accepted_time_list,
+        "rollout_path": {
+            "baseline": baseline_diag,
+            "frozen_fd_minus": {
+                "replay_mode": minus_replay["replay_mode"],
+                "accepted_count": int(np.sum(accepted_mask)),
+                "attempt_count": int(np.sum(active_mask)),
+            },
+            "frozen_fd_plus": {
+                "replay_mode": plus_replay["replay_mode"],
+                "accepted_count": int(np.sum(accepted_mask)),
+                "attempt_count": int(np.sum(active_mask)),
+            },
+        },
+    }
+
+
 def build_realized_schedule_ad_debug_fast_report(
     *,
     config_path: Path,
@@ -2405,6 +2614,17 @@ def main() -> None:
         help="Run a final-time-only adaptive-rollout check using the first solve-level custom JVP over the primal's realized accepted schedule.",
     )
     parser.add_argument(
+        "--realized-schedule-frozen-fd-check",
+        action="store_true",
+        help="Run a cheaper realized-schedule check that compares AD against FD on the baseline frozen Radau replay path instead of two fresh adaptive FD solves.",
+    )
+    parser.add_argument(
+        "--realized-schedule-frozen-replay-mode",
+        default="attempt",
+        choices=("attempt", "accepted"),
+        help="Frozen replay mode used by --realized-schedule-frozen-fd-check.",
+    )
+    parser.add_argument(
         "--realized-schedule-ad-debug-fast",
         action="store_true",
         help="Run the cheapest realized-schedule AD failure-localization path: baseline rollout, AD gradient, and optional minimal NaN localization only.",
@@ -2458,6 +2678,15 @@ def main() -> None:
             include_nan_debug=args.realized_schedule_nan_debug,
             nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
             nan_debug_include_one_step_compare=args.realized_schedule_nan_debug_one_step_compare,
+        )
+    elif args.realized_schedule_frozen_fd_check:
+        report = build_realized_schedule_frozen_fd_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            replay_mode=args.realized_schedule_frozen_replay_mode,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(

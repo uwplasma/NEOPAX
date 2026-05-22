@@ -2215,3 +2215,144 @@ testing. It is:
 
 - compare custom vs direct one-step tangent on the exact failing accepted step
 - then inspect whichever side first violates zero-in -> zero-out
+
+### Latest update: local derivatives are good, long-composition parity was the bug
+
+The subsequent focused tests changed the diagnosis materially.
+
+#### 1. One-step diagnostic passed very strongly
+
+Running the cheap one-step diagnostic for parameter `n0` showed excellent
+AD-vs-FD agreement for all tracked objectives.
+
+Representative result:
+
+- max relative error was on the order of `1e-6`
+
+Interpretation:
+
+- the local accepted Radau step derivative is good
+- the accepted-step custom/solver-local math is not the main remaining bug
+
+So the previously suspected "one-step tangent is wrong" hypothesis is no
+longer the leading one.
+
+#### 2. Short accepted-step composition also passed
+
+The short accepted-step composition check with:
+
+- `step_count = 2`
+- `step_count = 3`
+
+also passed with similarly tiny relative errors.
+
+Interpretation:
+
+- one accepted step is good
+- short composition of accepted steps is also good
+
+So the failure is not caused by immediate local composition of the accepted-step
+map.
+
+#### 3. The real bug was in long-horizon replay/carry parity
+
+Inspecting the production adaptive step path against the replay/debug
+composition path revealed an important implementation mismatch.
+
+Production path:
+
+- `_radau_attempt_step_lean(...)`
+- uses `attempt_result.carry_after_attempt`
+- then applies the timestep controller on top of that full post-attempt carry
+
+Replay/debug long-composition paths:
+
+- `_radau_replay_realized_attempt_rollout(...)`
+- `_radau_debug_realized_attempt_replay(...)`
+
+were manually reconstructing `next_carry` field-by-field instead of starting
+from `attempt_result.carry_after_attempt`.
+
+That is dangerous because it can silently drop or desynchronize post-attempt
+state that only matters after many attempts, especially:
+
+- `lagged_response_cache`
+- `lagged_reference_y`
+- lagged-response validity / reuse-related carry state
+
+This matches the observed symptom pattern exactly:
+
+- one-step good
+- 2-step / 3-step composition good
+- long realized schedule fails later (around attempt `144`)
+
+#### 4. Replay/carry parity fix
+
+The replay/composition path was patched so that:
+
+- accepted attempts now start from `attempt_result.carry_after_attempt`
+- rejected attempts explicitly carry forward the lagged-response cache and
+  lagged-reference state from the post-attempt result in forward-only form
+
+This brings the replay/debug long-composition path much closer to the actual
+production forward step logic.
+
+#### 5. Fast realized-schedule AD debug is now finite
+
+After that parity fix, the fast realized-schedule AD debug run became fully
+finite for `n0`.
+
+Observed result:
+
+- baseline realized schedule:
+  - `attempt_count = 184`
+  - `accepted_count = 115`
+  - `completed = True`
+  - `failed = False`
+- all reported AD objective derivatives were finite
+- NaN localization did not trigger at all
+
+Example finite AD values from the fast check:
+
+- `softmax_Er = -4.840568e+00`
+- `smooth_root_proxy = -7.633311e-05`
+- `Er2_volume_average = 6.354004e+00`
+- `Er_volume_average = -1.389743e+00`
+- `electron_temperature_volume_average_keV = 1.204892e-02`
+- `total_pressure_volume_average = 7.942981e+00`
+- `alpha_power_volume_average_mw_m3 = 2.703767e-01`
+
+Interpretation:
+
+- the old long-horizon NaN was not an unavoidable property of the accepted-step
+  tangent
+- it was strongly tied to replay/composition carry mismatch
+
+#### Updated leading conclusion
+
+The current best interpretation is now:
+
+- one-step derivative is good
+- short accepted-step composition is good
+- the major long-horizon failure was a replay/composition carry-parity bug
+- the carry-parity fix removed the nonfinite behavior in the fast
+  realized-schedule AD path
+
+So the work is no longer "find the first NaN".
+
+The next job is:
+
+- validate the now-finite long-horizon AD path against FD
+- confirm that the full realized-schedule rollout check gives acceptable
+  AD-vs-FD agreement
+
+#### Updated practical next step
+
+The next validation run should be:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-schedule-rollout-check
+```
+
+If this passes, then the core Radau AD path is no longer blocked by the
+long-horizon NaN issue.
