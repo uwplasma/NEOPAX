@@ -58,6 +58,7 @@ from NEOPAX._transport_solvers import (
     _radau_controller_forward_only_rollout,
     _radau_prepare_stage_subsolve_inputs_from_carry,
     _radau_run_prepared_on_realized_trace,
+    _radau_run_prepared_on_time_list,
     _radau_run_stage_subsolve_standalone_autodiff,
 )
 
@@ -409,6 +410,40 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     return _objective_vector(replay["final_state"], runtime), replay
 
 
+def _adaptive_rollout_objectives_for_parameter_on_time_list(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    time_list,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    replay = _radau_run_prepared_on_time_list(
+        prepared_rollout,
+        time_list,
+    )
+    return _objective_vector(replay["final_state"], runtime), replay
+
+
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     parameter_value,
     *,
@@ -447,7 +482,9 @@ def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     current_carry = prepared_rollout.initial_carry
     window_summaries: list[dict[str, Any]] = []
     last_replay = None
+    first_failing_window_debug = None
     for accepted_start in range(0, total_accepted, int(accepted_window_size)):
+        carry_before_window = current_carry
         window_trace = _slice_rollout_trace_by_accepted_window(
             baseline_trace,
             accepted_start=accepted_start,
@@ -462,15 +499,46 @@ def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
         )
         last_replay = replay
         current_carry = replay["final_carry"]
+        window_objectives = _objective_vector(replay["final_state"], runtime)
+        window_objectives_np = np.asarray(jax.device_get(window_objectives), dtype=float)
+        window_state_finite = _tree_all_finite(replay["final_state"])
         window_summaries.append(
             {
                 "accepted_start": int(accepted_start),
                 "accepted_count": int(np.sum(np.asarray(jax.device_get(window_trace.accepted_mask), dtype=bool))),
                 "attempt_count": int(np.sum(np.asarray(jax.device_get(window_trace.active_mask), dtype=bool))),
-                "state_finite": _tree_all_finite(replay["final_state"]),
+                "state_finite": window_state_finite,
             }
         )
-        if not _tree_all_finite(replay["final_state"]):
+        if not window_state_finite:
+            first_failing_window_debug = {
+                "accepted_start": int(accepted_start),
+                "accepted_count": int(np.sum(np.asarray(jax.device_get(window_trace.accepted_mask), dtype=bool))),
+                "attempt_count": int(np.sum(np.asarray(jax.device_get(window_trace.active_mask), dtype=bool))),
+                "replay_mode": str(replay_mode),
+                "nonfinite_debug": _frozen_replay_nonfinite_debug(
+                    replay,
+                    window_trace,
+                    objectives_np=window_objectives_np,
+                ),
+            }
+            if str(replay_mode).strip().lower() == "attempt":
+                accepted_replay = _radau_run_prepared_on_realized_trace(
+                    prepared_rollout,
+                    execution_context,
+                    window_trace,
+                    replay_mode="accepted",
+                    carry0=carry_before_window,
+                )
+                accepted_objectives_np = np.asarray(
+                    jax.device_get(_objective_vector(accepted_replay["final_state"], runtime)),
+                    dtype=float,
+                )
+                first_failing_window_debug["accepted_mode_debug"] = _frozen_replay_nonfinite_debug(
+                    accepted_replay,
+                    window_trace,
+                    objectives_np=accepted_objectives_np,
+                )
             break
 
     if last_replay is None:
@@ -484,6 +552,7 @@ def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     else:
         replay_out = dict(last_replay)
         replay_out["window_summaries"] = window_summaries
+        replay_out["first_failing_window_debug"] = first_failing_window_debug
 
     return _objective_vector(replay_out["final_state"], runtime), replay_out
 
@@ -918,6 +987,19 @@ def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | 
         active_mask=keep_mask,
         accepted_mask=jnp.logical_and(accepted_mask, keep_mask),
     )
+
+
+def _accepted_time_list_until_attempt_index(trace, inclusive_attempt_index: int) -> list[float]:
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+    upper = int(inclusive_attempt_index)
+    accepted_times = [
+        float(step_ts[idx])
+        for idx in range(min(len(active_mask), upper + 1))
+        if active_mask[idx] and accepted_mask[idx]
+    ]
+    return accepted_times
 
 
 def _slice_rollout_trace_by_accepted_window(
@@ -1401,6 +1483,42 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"attempt_count={entry.get('attempt_count')} "
                     f"state_finite={entry.get('state_finite')}"
                 )
+            failing_window = diag_windowed.get("first_failing_window_debug")
+            if failing_window is not None:
+                nf = failing_window.get("nonfinite_debug", {})
+                print(
+                    f"[autodiff-gate] {key} failing window: "
+                    f"accepted_start={failing_window.get('accepted_start')} "
+                    f"accepted_count={failing_window.get('accepted_count')} "
+                    f"attempt_count={failing_window.get('attempt_count')} "
+                    f"first_bad_index={nf.get('first_bad_index')} "
+                    f"first_bad_was_accepted={nf.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={_fmt_float(nf.get('first_bad_dt'))}"
+                )
+                local_window = nf.get("local_attempt_window") or []
+                if local_window:
+                    print(f"[autodiff-gate] {key} local window:")
+                    for entry in local_window:
+                        print(
+                            "  - "
+                            f"index={entry.get('index')} "
+                            f"accepted={entry.get('accepted')} "
+                            f"time={_fmt_float(entry.get('time'))} "
+                            f"attempted_dt={_fmt_float(entry.get('attempted_dt'))} "
+                            f"next_dt={_fmt_float(entry.get('next_dt'))} "
+                            f"baseline_err_norm={_fmt_float(entry.get('baseline_err_norm'))} "
+                            f"replay_state_finite={entry.get('replay_state_finite')}"
+                        )
+                accepted_debug = failing_window.get("accepted_mode_debug")
+                if accepted_debug is not None:
+                    print(
+                        f"[autodiff-gate] {key} accepted-only replay on failing window: "
+                        f"first_bad_index={accepted_debug.get('first_bad_index')} "
+                        f"first_bad_was_accepted={accepted_debug.get('first_bad_was_accepted')} "
+                        f"first_bad_dt={_fmt_float(accepted_debug.get('first_bad_dt'))} "
+                        f"final_state_finite={accepted_debug.get('final_state_finite')} "
+                        f"objectives_finite={accepted_debug.get('objectives_finite')}"
+                    )
         print("[autodiff-gate] objective errors:")
         for label, ad, fd, ae, re in zip(
             report["objective_labels"],
@@ -1411,6 +1529,68 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         ):
             print(
                 f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
+        return
+
+    if report.get("baseline_dt_path_safe_fd_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_safe_fd "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e} "
+            f"ad_mode={report.get('ad_mode')} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print(
+            "[autodiff-gate] fixed-dt replay finiteness: "
+            f"baseline={path.get('baseline_fixed_dt_state_finite')} "
+            f"fd_minus={path.get('fd_minus_fixed_dt_state_finite')} "
+            f"fd_plus={path.get('fd_plus_fixed_dt_state_finite')}"
+        )
+        print("[autodiff-gate] objective errors:")
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_autodiff"],
+            report["gradient_fd"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
+        return
+
+    if report.get("baseline_dt_path_safe_compose_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_safe_compose "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e}"
+        )
+        print("[autodiff-gate] objective errors:")
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_realized_schedule_autodiff"],
+            report["gradient_fixed_dt_direct_autodiff"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
+            print(
+                f"  - {label}: adaptive_ad={float(ad):.6e} fixed_dt_direct_ad={float(fd):.6e} "
                 f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
             )
         return
@@ -2926,6 +3106,255 @@ def build_realized_schedule_ad_debug_fast_report(
     }
 
 
+def _config_with_t_final(config: dict[str, Any], t_final: float) -> dict[str, Any]:
+    tuned = copy.deepcopy(config)
+    solver_cfg = tuned.setdefault("transport_solver", {})
+    solver_cfg["t_final"] = float(t_final)
+    return tuned
+
+
+def build_baseline_dt_path_safe_fd_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    baseline_objectives_full, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_time_list = _accepted_time_list_until_attempt_index(
+        baseline_rollout.trace,
+        safe_attempt_index,
+    )
+    if not safe_time_list:
+        raise ValueError("Safe baseline dt path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+    safe_final_time = float(safe_time_list[-1])
+    config_safe = _config_with_t_final(config, safe_final_time)
+    runtime_safe, baseline_state_safe = build_runtime_context(config_safe)
+    profile_cfg_safe = _baseline_profile_cfg(config_safe)
+    print(
+        "[autodiff-gate] baseline-dt-safe-fd baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"known_first_bad_attempt_index={known_first_bad_attempt_index} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_accepted_count={len(safe_time_list)} "
+        f"safe_final_time={safe_final_time:.6e}",
+        flush=True,
+    )
+
+    adaptive_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config_safe,
+        runtime=runtime_safe,
+        baseline_state=baseline_state_safe,
+        profile_cfg=profile_cfg_safe,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+    fixed_dt_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_time_list(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )[0]
+
+    baseline_objectives, baseline_replay = _adaptive_rollout_objectives_for_parameter_on_time_list(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )
+    baseline_fixed_dt_state_finite = _tree_all_finite(baseline_replay["final_state"])
+    print(
+        "[autodiff-gate] baseline-dt-safe-fd fixed replay summary: "
+        f"baseline_state_finite={baseline_fixed_dt_state_finite}",
+        flush=True,
+    )
+    print("[autodiff-gate] baseline-dt-safe-fd progress: baseline fixed-dt replay complete; running fd_minus replay", flush=True)
+    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_time_list(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )
+    minus_fixed_dt_state_finite = _tree_all_finite(minus_replay["final_state"])
+    print(
+        "[autodiff-gate] baseline-dt-safe-fd fd_minus summary: "
+        f"state_finite={minus_fixed_dt_state_finite}",
+        flush=True,
+    )
+    print("[autodiff-gate] baseline-dt-safe-fd progress: fd_minus replay complete; running fd_plus replay", flush=True)
+    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_time_list(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )
+    plus_fixed_dt_state_finite = _tree_all_finite(plus_replay["final_state"])
+    print(
+        "[autodiff-gate] baseline-dt-safe-fd fd_plus summary: "
+        f"state_finite={plus_fixed_dt_state_finite}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] baseline-dt-safe-fd progress: "
+        f"fd_plus replay complete; running realized-schedule AD to safe_final_time={safe_final_time:.6e}",
+        flush=True,
+    )
+    gradient_ad = jax.jacfwd(adaptive_objective_fn)(jnp.asarray(baseline_value))
+    print("[autodiff-gate] baseline-dt-safe-fd progress: AD gradient complete; forming FD gradient", flush=True)
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_safe_fd_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "known_first_bad_attempt_index": int(known_first_bad_attempt_index),
+        "safe_attempt_margin": int(safe_attempt_margin),
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_final_time": float(safe_final_time),
+        "safe_time_list": safe_time_list,
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "ad_mode": "realized_schedule_jvp",
+        "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_fd": grad_fd_np.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "rollout_path": {
+            "baseline": baseline_diag,
+            "baseline_fixed_dt_state_finite": baseline_fixed_dt_state_finite,
+            "fd_minus_fixed_dt_state_finite": minus_fixed_dt_state_finite,
+            "fd_plus_fixed_dt_state_finite": plus_fixed_dt_state_finite,
+        },
+    }
+
+
+def build_baseline_dt_path_safe_compose_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+) -> dict[str, Any]:
+    fd_report = build_baseline_dt_path_safe_fd_report(
+        config_path=config_path,
+        parameter_name=parameter_name,
+        rel_fd_step=rel_fd_step,
+        abs_fd_step=abs_fd_step,
+        device=device,
+        known_first_bad_attempt_index=known_first_bad_attempt_index,
+        safe_attempt_margin=safe_attempt_margin,
+    )
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    safe_final_time = float(fd_report["safe_final_time"])
+    config_safe = _config_with_t_final(config, safe_final_time)
+    runtime, baseline_state = build_runtime_context(config_safe)
+    profile_cfg = _baseline_profile_cfg(config_safe)
+    baseline_value = float(profile_cfg[parameter_name])
+    safe_time_list = list(fd_report["safe_time_list"])
+
+    adaptive_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config_safe,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+    fixed_dt_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_time_list(  # noqa: E731
+        p,
+        config=config,
+        runtime=_runtime,
+        baseline_state=_baseline_state,
+        profile_cfg=_profile_cfg,
+        parameter_name=parameter_name,
+        time_list=safe_time_list,
+    )[0]
+    _runtime, _baseline_state = build_runtime_context(config)
+    _profile_cfg = _baseline_profile_cfg(config)
+    print(
+        "[autodiff-gate] baseline-dt-safe-compose progress: "
+        f"running realized-schedule AD and fixed-dt direct AD to safe_final_time={safe_final_time:.6e}",
+        flush=True,
+    )
+    gradient_adaptive = jax.jacfwd(adaptive_objective_fn)(jnp.asarray(baseline_value))
+    print("[autodiff-gate] baseline-dt-safe-compose progress: realized-schedule AD complete; running fixed-dt direct AD", flush=True)
+    gradient_fixed_dt_direct = jax.jacfwd(fixed_dt_objective_fn)(jnp.asarray(baseline_value))
+    grad_adaptive_np = np.asarray(jax.device_get(gradient_adaptive), dtype=float)
+    grad_direct_np = np.asarray(jax.device_get(gradient_fixed_dt_direct), dtype=float)
+    abs_err = np.abs(grad_adaptive_np - grad_direct_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_safe_compose_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "safe_final_time": float(safe_final_time),
+        "safe_attempt_index": int(fd_report["safe_attempt_index"]),
+        "safe_time_list": fd_report["safe_time_list"],
+        "gradient_realized_schedule_autodiff": grad_adaptive_np.tolist(),
+        "gradient_fixed_dt_direct_autodiff": grad_direct_np.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "baseline_dt_safe_fd_report": fd_report,
+    }
+
+
 def build_realized_schedule_windowed_frozen_fd_report(
     *,
     config_path: Path,
@@ -3063,10 +3492,12 @@ def build_realized_schedule_windowed_frozen_fd_report(
             "windowed_fd_minus": {
                 "all_finite": minus_replay_finite,
                 "window_summaries": minus_replay.get("window_summaries"),
+                "first_failing_window_debug": minus_replay.get("first_failing_window_debug"),
             },
             "windowed_fd_plus": {
                 "all_finite": plus_replay_finite,
                 "window_summaries": plus_replay.get("window_summaries"),
+                "first_failing_window_debug": plus_replay.get("first_failing_window_debug"),
             },
         },
     }
@@ -3437,6 +3868,28 @@ def main() -> None:
         help="Compare adaptive AD against FD built from short frozen baseline schedule windows with re-anchoring between windows.",
     )
     parser.add_argument(
+        "--baseline-dt-path-safe-fd-check",
+        action="store_true",
+        help="Compare adaptive AD at a safe truncated final time against FD computed on the baseline accepted dt path up to two attempts before the known frozen-replay failure.",
+    )
+    parser.add_argument(
+        "--baseline-dt-path-safe-compose-check",
+        action="store_true",
+        help="Compare adaptive realized-schedule AD against direct AD on the same safe baseline accepted dt path.",
+    )
+    parser.add_argument(
+        "--known-first-bad-attempt-index",
+        type=int,
+        default=76,
+        help="Earliest known frozen-FD bad attempt index used to truncate the safe baseline dt path before fd_plus/fd_minus go nonfinite.",
+    )
+    parser.add_argument(
+        "--safe-attempt-margin",
+        type=int,
+        default=2,
+        help="How many attempts before the known bad attempt to stop the safe baseline dt path.",
+    )
+    parser.add_argument(
         "--realized-schedule-windowed-accepted-window-size",
         type=int,
         default=10,
@@ -3536,6 +3989,26 @@ def main() -> None:
             device=args.device,
             replay_mode=args.realized_schedule_frozen_replay_mode,
             accepted_window_size=args.realized_schedule_windowed_accepted_window_size,
+        )
+    elif args.baseline_dt_path_safe_fd_check:
+        report = build_baseline_dt_path_safe_fd_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+        )
+    elif args.baseline_dt_path_safe_compose_check:
+        report = build_baseline_dt_path_safe_compose_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
         )
     elif args.forward_only_controller_check:
         report = build_forward_only_controller_report(
