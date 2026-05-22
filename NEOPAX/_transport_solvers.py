@@ -4756,9 +4756,10 @@ def _radau_run_prepared_on_time_list(
 ) -> dict[str, Any]:
     """Replay the accepted-step Radau map on a caller-provided absolute time list."""
 
+    t0 = prepared_rollout.initial_carry.t
     dt_sequence = _radau_dt_sequence_from_time_list(
         time_list,
-        t0=prepared_rollout.kernel_context.t0,
+        t0=t0,
         dtype=prepared_rollout.kernel_context.dtype,
     )
     rollout = _radau_fixed_dt_accepted_rollout(
