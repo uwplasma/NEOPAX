@@ -2491,6 +2491,7 @@ def _build_prepared_radau_execution_context(
 class _RadauAcceptedStepTangentInputs:
     dy: Any
     dh: Any
+    dlagged_response_cache: Any
 
 
 @jax.tree_util.register_dataclass
@@ -2742,6 +2743,7 @@ def _radau_extract_tangent_inputs_from_carry(
     return _RadauAcceptedStepTangentInputs(
         dy=carry_tangent.y,
         dh=carry_tangent.dt,
+        dlagged_response_cache=carry_tangent.lagged_response_cache,
     )
 
 
@@ -2767,6 +2769,7 @@ def _radau_build_approximate_tangent_result(
         jax.tree_util.tree_map(_zero_tangent_like, attempt_result.carry_after_attempt),
         y=tangent_inputs.dy,
         dt=tangent_inputs.dh,
+        lagged_response_cache=tangent_inputs.dlagged_response_cache,
         lagged_reference_y=tangent_inputs.dy,
     )
     return _RadauAcceptedStepAttemptResult(
@@ -2811,6 +2814,7 @@ def _radau_compute_approximate_attempt_tangent(
     *,
     tangent_inputs: _RadauAcceptedStepTangentInputs,
     jacobian_ref,
+    lagged_eval_tangent,
     rhs_time_ref,
     trial_dt,
     stage_history,
@@ -2831,6 +2835,7 @@ def _radau_compute_approximate_attempt_tangent(
         stages_final=stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim)),
         dy_source=tangent_inputs.dy,
         dh_source=tangent_inputs.dh,
+        lagged_eval_tangent=lagged_eval_tangent,
         rhs_time_ref=rhs_time_ref,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
@@ -2885,10 +2890,43 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
 
     rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
     tangent_inputs = _radau_extract_tangent_inputs_from_carry(carry_tangent)
+
+    def _zero_stage_eval_tangent():
+        return jnp.zeros(
+            (kernel_context.num_stages, kernel_context.state_dim),
+            dtype=kernel_context.dtype,
+        )
+
+    if lagged_response is None or tangent_inputs.dlagged_response_cache is None:
+        lagged_eval_tangent = _zero_stage_eval_tangent()
+    else:
+        stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+        stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
+
+        _, lagged_eval_tangent = jax.jvp(
+            _stage_evals_from_lagged,
+            (lagged_response,),
+            (tangent_inputs.dlagged_response_cache,),
+        )
+
     tangent_result = _radau_compute_approximate_attempt_tangent(
         kernel_context,
         tangent_inputs=tangent_inputs,
         jacobian_ref=primal_result.jacobian_out,
+        lagged_eval_tangent=lagged_eval_tangent,
         rhs_time_ref=rhs_time_ref,
         trial_dt=primal_result.trial_dt,
         stage_history=primal_result.stage_history,
@@ -3466,6 +3504,7 @@ def _radau_approximate_accepted_step_tangent(
     stages_final,
     dy_source,
     dh_source,
+    lagged_eval_tangent,
     rhs_time_ref,
     real_lu_out,
     real_piv_out,
@@ -3492,9 +3531,11 @@ def _radau_approximate_accepted_step_tangent(
     """
     dy_source = jnp.asarray(dy_source, dtype=kernel_context.dtype)
     dh_source = jnp.asarray(dh_source, dtype=kernel_context.dtype)
+    lagged_eval_tangent = jnp.asarray(lagged_eval_tangent, dtype=kernel_context.dtype)
     zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
     zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
-    zero_input = jnp.logical_and(zero_dy, zero_dh)
+    zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
+    zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
 
     def _zero_tangent(_):
         dz_zero = jnp.zeros((kernel_context.num_stages, kernel_context.state_dim), dtype=kernel_context.dtype)
@@ -3507,6 +3548,7 @@ def _radau_approximate_accepted_step_tangent(
             stage_state_source @ jacobian_ref.T
             + (dh_source * kernel_context.c)[:, None]
             * jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)[None, :]
+            + lagged_eval_tangent
         )
         dz_flat = _radau_apply_stage_linear_solve(
             kernel_context,
