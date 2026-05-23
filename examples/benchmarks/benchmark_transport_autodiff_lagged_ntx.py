@@ -5253,6 +5253,20 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         (carry0_dot_restricted,),
     )
 
+    def _direct_tangent_with_ablation(**replacements):
+        ablated_dot = dataclasses.replace(carry0_dot, **replacements)
+        _, tangent = jax.jvp(
+            lambda carry: _execute_radau_accepted_step_attempt(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry,
+                execution_context.attempt_context,
+            ),
+            (carry0,),
+            (ablated_dot,),
+        )
+        return tangent
+
     lagged_response, _, _ = _radau_prepare_lagged_response(
         execution_context.kernel_context,
         carry0,
