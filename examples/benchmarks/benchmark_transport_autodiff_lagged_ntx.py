@@ -2717,6 +2717,18 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
                 f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
             )
+        helper_consistency = report.get("helper_consistency") or {}
+        if helper_consistency:
+            print("[autodiff-gate] third-step helper consistency:")
+            for label in ("custom_scan_vs_manual", "direct_scan_vs_manual"):
+                entry = helper_consistency.get(label, {}).get("trial_y", {})
+                print(
+                    "  - "
+                    f"{label}: "
+                    f"full_rel_err={float(entry.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+                )
         ablations = report.get("carry_field_ablations") or {}
         if ablations:
             print("[autodiff-gate] third-step carry-field ablations:")
@@ -6235,6 +6247,42 @@ def build_baseline_dt_path_third_step_carry_ablation_report(
         "trial_y": _flat_component_report(custom_carry2_dot.y, direct_carry2_dot.y),
     }
 
+    trace_prefix3 = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=3,
+    )
+    helper_custom = _sampled_adaptive_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=trace_prefix3,
+        sample_every=1,
+    )
+    helper_direct = _sampled_fixed_dt_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        dt_sequence=_radau_dt_sequence_from_time_list(
+            _accepted_time_list_until_attempt_index(baseline_rollout.trace, idx2),
+            t0=prepared_rollout_static.initial_carry.t,
+            dtype=prepared_rollout_static.kernel_context.dtype,
+        ),
+        sample_every=1,
+    )
+    helper_custom_np = np.asarray(jax.device_get(helper_custom["sampled_state_tangents"]), dtype=float)
+    helper_direct_np = np.asarray(jax.device_get(helper_direct["sampled_state_tangents"]), dtype=float)
+    helper_custom_step3 = helper_custom_np[2]
+    helper_direct_step3 = helper_direct_np[2]
+
+    helper_consistency = {
+        "custom_scan_vs_manual": {
+            "trial_y": _flat_component_report(helper_custom_step3, np.asarray(jax.device_get(custom_step3_result.y), dtype=float)),
+        },
+        "direct_scan_vs_manual": {
+            "trial_y": _flat_component_report(helper_direct_step3, np.asarray(jax.device_get(direct_step3_result.y), dtype=float)),
+        },
+    }
+
     ablation_specs = {
         "prev_stages_zeroed": {
             "prev_stages": jnp.zeros_like(direct_carry2_dot.prev_stages),
@@ -6300,6 +6348,7 @@ def build_baseline_dt_path_third_step_carry_ablation_report(
         "third_step_time": float(step_ts[idx2]),
         "custom_vs_direct": custom_vs_direct,
         "carry_after_step2_custom_vs_direct": carry_after_step2_custom_vs_direct,
+        "helper_consistency": helper_consistency,
         "carry_field_ablations": carry_field_ablations,
         "max_relative_error": float(custom_vs_direct["trial_y"]["Er_relative_error"]),
         "passed": bool(custom_vs_direct["trial_y"]["Er_relative_error"] <= 5.0e-2),
