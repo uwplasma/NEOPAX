@@ -2507,6 +2507,18 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
                     f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
                 )
+        ablations = report.get("carry_field_ablations") or {}
+        if ablations:
+            print("[autodiff-gate] carry-field ablations:")
+            for label, section in ablations.items():
+                direct_entry = section.get("ablated_direct_vs_direct", {}).get("trial_y", {})
+                custom_entry = section.get("custom_vs_ablated_direct", {}).get("trial_y", {})
+                print(
+                    "  - "
+                    f"{label}: "
+                    f"ablated_direct_Er_rel_err={float(direct_entry.get('Er_relative_error')):.6e} "
+                    f"custom_vs_ablated_Er_rel_err={float(custom_entry.get('Er_relative_error')):.6e}"
+                )
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -4996,6 +5008,27 @@ def build_baseline_dt_path_first_step_local_tangent_compare_report(
         (carry0_dot_restricted,),
     )
 
+    def _zero_optional_pytree(tree):
+        return jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            tree,
+            is_leaf=lambda x: x is None,
+        )
+
+    def _direct_tangent_with_ablation(**replacements):
+        ablated_dot = dataclasses.replace(carry0_dot, **replacements)
+        _, tangent = jax.jvp(
+            lambda carry: _execute_radau_accepted_step_attempt(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry,
+                execution_context.attempt_context,
+            ),
+            (carry0,),
+            (ablated_dot,),
+        )
+        return tangent
+
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
     num_stages = int(execution_context.kernel_context.num_stages)
     state_dim = int(execution_context.kernel_context.state_dim)
@@ -5378,6 +5411,48 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         "stage_history": _stage_history_report(custom_tangent.stage_history, restricted_direct_tangent.stage_history),
     }
 
+    ablation_specs = {
+        "prev_stages_zeroed": {
+            "prev_stages": jnp.zeros_like(carry0_dot.prev_stages),
+        },
+        "lagged_response_cache_zeroed": {
+            "lagged_response_cache": _zero_optional_pytree(carry0_dot.lagged_response_cache),
+        },
+        "lagged_reference_y_zeroed": {
+            "lagged_reference_y": jnp.zeros_like(carry0_dot.lagged_reference_y),
+        },
+        "linearization_cache_zeroed": {
+            "jacobian": jnp.zeros_like(carry0_dot.jacobian),
+            "cache_valid": jnp.zeros_like(carry0_dot.cache_valid),
+            "cache_dt": jnp.zeros_like(carry0_dot.cache_dt),
+            "cache_age": jnp.zeros_like(carry0_dot.cache_age),
+            "real_lu": jnp.zeros_like(carry0_dot.real_lu),
+            "real_piv": jnp.zeros(carry0_dot.real_piv.shape, dtype=carry0_dot.real_piv.dtype),
+            "complex_lu": jnp.zeros_like(carry0_dot.complex_lu),
+            "complex_piv": jnp.zeros(carry0_dot.complex_piv.shape, dtype=carry0_dot.complex_piv.dtype),
+        },
+        "step_history_meta_zeroed": {
+            "prev_error": jnp.zeros_like(carry0_dot.prev_error),
+            "prev_dt": jnp.zeros_like(carry0_dot.prev_dt),
+            "prev_theta_final": jnp.zeros_like(carry0_dot.prev_theta_final),
+            "prev_newton_iter_count": jnp.zeros(carry0_dot.prev_newton_iter_count.shape, dtype=carry0_dot.prev_newton_iter_count.dtype),
+        },
+    }
+
+    carry_field_ablations = {}
+    for label, replacements in ablation_specs.items():
+        ablated_direct_tangent = _direct_tangent_with_ablation(**replacements)
+        carry_field_ablations[label] = {
+            "ablated_direct_vs_direct": {
+                "trial_y": _flat_component_report(ablated_direct_tangent.trial_y, direct_tangent.trial_y),
+                "stage_history": _stage_history_report(ablated_direct_tangent.stage_history, direct_tangent.stage_history),
+            },
+            "custom_vs_ablated_direct": {
+                "trial_y": _flat_component_report(custom_tangent.trial_y, ablated_direct_tangent.trial_y),
+                "stage_history": _stage_history_report(custom_tangent.stage_history, ablated_direct_tangent.stage_history),
+            },
+        }
+
     return {
         "config_path": str(config_path),
         "baseline_dt_path_first_step_exact_local_tangent_compare_check": True,
@@ -5391,6 +5466,7 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         "custom_vs_exact": custom_vs_exact,
         "restricted_direct_vs_direct": restricted_direct_vs_direct,
         "custom_vs_restricted_direct": custom_vs_restricted_direct,
+        "carry_field_ablations": carry_field_ablations,
         "max_relative_error": float(
             max(
                 custom_vs_direct["trial_y"]["Er_relative_error"],
