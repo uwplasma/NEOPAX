@@ -4578,13 +4578,7 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
     fixed_full_np = np.asarray(jax.device_get(fixed_dt_tangent), dtype=float)
     fixed_np = fixed_full_np[np.asarray(sample_indices, dtype=int), :]
     sampled_times_np = np.asarray(jax.device_get(adaptive_result["sampled_times"]), dtype=float)
-
-    density_size = int(np.prod(np.asarray(baseline_state.density).shape))
-    pressure_size = int(np.prod(np.asarray(baseline_state.pressure).shape))
-    er_size = int(np.prod(np.asarray(baseline_state.Er).shape))
-    density_slice = slice(0, density_size)
-    pressure_slice = slice(density_size, density_size + pressure_size)
-    er_slice = slice(density_size + pressure_size, density_size + pressure_size + er_size)
+    unpack_flat = prepared_rollout_static.physics_context.unpack_flat
 
     def _rel_norm(a: np.ndarray, b: np.ndarray) -> float:
         num = float(np.linalg.norm(a - b))
@@ -4596,10 +4590,18 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
     for idx, sample_idx in enumerate(sample_indices):
         ad_step = adaptive_np[idx]
         direct_step = fixed_np[idx]
+        ad_state = unpack_flat(jnp.asarray(ad_step))
+        direct_state = unpack_flat(jnp.asarray(direct_step))
+        ad_density = np.asarray(jax.device_get(ad_state.density), dtype=float)
+        direct_density = np.asarray(jax.device_get(direct_state.density), dtype=float)
+        ad_pressure = np.asarray(jax.device_get(ad_state.pressure), dtype=float)
+        direct_pressure = np.asarray(jax.device_get(direct_state.pressure), dtype=float)
+        ad_er = np.asarray(jax.device_get(ad_state.Er), dtype=float)
+        direct_er = np.asarray(jax.device_get(direct_state.Er), dtype=float)
         full_rel = _rel_norm(ad_step, direct_step)
-        density_rel = _rel_norm(ad_step[density_slice], direct_step[density_slice])
-        pressure_rel = _rel_norm(ad_step[pressure_slice], direct_step[pressure_slice])
-        er_rel = _rel_norm(ad_step[er_slice], direct_step[er_slice])
+        density_rel = _rel_norm(ad_density, direct_density)
+        pressure_rel = _rel_norm(ad_pressure, direct_pressure)
+        er_rel = _rel_norm(ad_er, direct_er)
         global_max_rel_error = max(global_max_rel_error, full_rel, density_rel, pressure_rel, er_rel)
         entries.append(
             {
