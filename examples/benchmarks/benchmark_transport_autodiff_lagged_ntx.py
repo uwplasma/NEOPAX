@@ -53,6 +53,7 @@ from NEOPAX._transport_solvers import (
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
+    _radau_dt_sequence_from_time_list,
     _radau_eval_rhs,
     _radau_prepare_lagged_response,
     _radau_stage_residual,
