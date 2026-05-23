@@ -2910,3 +2910,111 @@ ignored carry-field tangents such as:
 - `lagged_reference_y`
 - `prev_stages`
 - other cached/controller carry fields
+
+### 2026-05-23 checkpoint
+
+Current progress:
+
+- the old long-horizon adaptive AD `NaN` issue is no longer the main blocker
+- the remaining blocker is a **correctness mismatch** in the custom adaptive AD
+- on the safe baseline-`dt` path:
+  - fixed-path FD and fixed-path direct AD agree well enough to trust the comparison setup
+  - adaptive/custom AD disagrees
+- so the bug is in the **custom adaptive derivative path**, not in the FD reference
+
+What is localized now:
+
+- the mismatch starts at the **first accepted step**
+- it accumulates over accepted steps
+- it is dominated by the **`Er` tangent**
+- density tangent is essentially exact in the short safe window
+- pressure tangent mismatch exists but is much smaller
+
+Key results already observed:
+
+1. First-step field compare:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-field-compare-check
+```
+
+Observed:
+
+- `density rel err ~ 2.36e-17`
+- `pressure rel err ~ 7.20e-07`
+- `Er rel err ~ 2.83e-03`
+
+Interpretation:
+
+- the custom tangent is already biased in `dEr` at the first accepted step
+
+2. First-step local tangent split:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-local-tangent-compare-check
+```
+
+Observed:
+
+- `trial_y Er_rel_err ~ 2.826e-03`
+- `stage_history Er_rel_err ~ 3.349e-03`
+- `carry_after_attempt_y` exactly matches
+
+Interpretation:
+
+- the bug is **not** primarily in later carry packaging
+- the first-step bias is already present in the local stage tangent `dZ`
+
+3. Exact residual-based one-step compare:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-exact-local-tangent-compare-check
+```
+
+Observed before the restricted-direct rerun:
+
+- `custom_vs_direct`
+  - `trial_y Er_rel_err ~ 2.826e-03`
+  - `stage_history Er_rel_err ~ 3.349e-03`
+- `exact_vs_direct`
+  - `trial_y Er_rel_err ~ 2.686e-03`
+  - `stage_history Er_rel_err ~ 3.252e-03`
+- `custom_vs_exact`
+  - `trial_y Er_rel_err ~ 1.054e-03`
+  - `stage_history Er_rel_err ~ 1.346e-03`
+
+Interpretation:
+
+- using the exact collocation residual Jacobian improves the first-step mismatch only slightly
+- so the bug is **not explained solely** by the current local stage-linearization approximation
+
+Current leading hypothesis:
+
+- the custom accepted-step JVP is likely dropping derivative dependence through carry fields that full direct JVP still sees
+- strongest suspects:
+  - `lagged_response_cache`
+  - `lagged_reference_y`
+  - `prev_stages`
+  - possibly other cached/controller carry fields
+
+Current problem:
+
+- the restricted-direct extension to the exact-local helper initially crashed because `restricted_direct_tangent` was not wired in
+- that wiring bug has now been fixed and syntax-checked
+- the **restricted-direct rerun has not yet been collected**
+
+Immediate next command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-exact-local-tangent-compare-check
+```
+
+New lines to inspect:
+
+- `restricted_direct_vs_direct`
+- `custom_vs_restricted_direct`
+
+Decision rule:
+
+- if `custom_vs_restricted_direct` is much smaller than `custom_vs_direct`, then the missing derivative route is in ignored carry-field tangents
+- if it is not much smaller, then the accepted-step custom tangent math itself is still the main bug site

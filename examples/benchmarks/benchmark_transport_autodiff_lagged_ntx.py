@@ -5199,6 +5199,26 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         (carry0,),
         (carry0_dot,),
     )
+    carry0_dot_restricted = jax.tree_util.tree_map(
+        lambda x: None if x is None else jnp.zeros_like(x),
+        carry0_dot,
+        is_leaf=lambda x: x is None,
+    )
+    carry0_dot_restricted = dataclasses.replace(
+        carry0_dot_restricted,
+        y=carry0_dot.y,
+        dt=carry0_dot.dt,
+    )
+    _, restricted_direct_tangent = jax.jvp(
+        lambda carry: _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry,
+            execution_context.attempt_context,
+        ),
+        (carry0,),
+        (carry0_dot_restricted,),
+    )
 
     lagged_response, _, _ = _radau_prepare_lagged_response(
         execution_context.kernel_context,
