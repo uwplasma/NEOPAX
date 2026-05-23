@@ -2785,3 +2785,50 @@ next debugging target should be the custom adaptive propagation of:
 
 - `dEr`
 - and any carry/history that feeds the `Er` update, especially `prev_stages`
+
+### 2026-05-23 update: state-slice trajectory result
+
+We ran the state-slice sampled compare at every accepted step:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-state-trajectory-compare-check --baseline-dt-path-safe-trajectory-sample-every 1
+```
+
+Key result:
+
+- `density_rel_err` stays essentially zero
+- `pressure_rel_err` stays very small
+- `Er_rel_err` is already nonzero at accepted step `1`
+- `Er_rel_err` then grows monotonically and strongly
+
+Representative values:
+
+- accepted step `1`: `Er_rel_err ~ 2.8e-03`
+- accepted step `5`: `Er_rel_err ~ 1.13e-01`
+- accepted step `10`: `Er_rel_err ~ 3.90e-01`
+- accepted step `36`: `Er_rel_err ~ 1.96e+00`
+- accepted step `45`: `Er_rel_err ~ 2.16e+01`
+
+This is strong evidence that:
+
+- the mismatch is not just a long-time accumulation from other channels
+- the custom adaptive tangent path is already wrong for `dEr` at the first
+  accepted step
+
+### New first-step localizer
+
+A dedicated first-step field compare mode was added:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-field-compare-check
+```
+
+This mode prints, for the first accepted step only:
+
+- `density`: adaptive/direct max abs, absolute error, relative error
+- `pressure`: adaptive/direct max abs, absolute error, relative error
+- `Er`: adaptive/direct max abs, absolute error, relative error
+
+This is the current best localizer for the next debugging step, because it
+removes long-horizon accumulation and focuses directly on the first accepted
+step where the `dEr` mismatch already exists.
