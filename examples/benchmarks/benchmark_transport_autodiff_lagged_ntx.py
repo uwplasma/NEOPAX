@@ -1154,6 +1154,130 @@ def _sampled_adaptive_state_tangent_trajectory(
     }
 
 
+def _sampled_fixed_dt_state_tangent_trajectory(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    dt_sequence,
+    sample_every: int,
+):
+    total_steps = int(np.asarray(jax.device_get(dt_sequence)).shape[0])
+    sample_indices = _sample_accepted_step_indices(total_steps, sample_every)
+    sample_count = len(sample_indices)
+    if sample_count == 0:
+        return {
+            "sampled_times": jnp.zeros((0,), dtype=execution_context.dtype),
+            "sampled_state_tangents": jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype),
+            "sampled_indices": (),
+        }
+
+    sample_indices_arr = jnp.asarray(sample_indices, dtype=jnp.int32)
+    dt_sequence = jnp.asarray(dt_sequence, dtype=execution_context.dtype)
+    cumulative_times = carry0.t + jnp.cumsum(dt_sequence)
+    zero_tangents = jnp.zeros((sample_count, carry0.y.shape[0]), dtype=execution_context.dtype)
+    zero_times = jnp.zeros((sample_count,), dtype=execution_context.dtype)
+
+    def _accepted_attempt(
+        carry_value,
+        *,
+        dt_value,
+    ):
+        carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            _RadauAcceptedStepAttemptContext(
+                t_final=carry_value.t + dt_value,
+                use_transport_lagged_response=jnp.asarray(execution_context.kernel_context.use_transport_lagged_response),
+            ),
+        )
+        project_flat = execution_context.physics_context.project_flat
+        accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+        if accepted_y is None:
+            accepted_y = attempt_result.trial_y
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + dt_value,
+            y=accepted_y,
+            dt=dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=dt_value,
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_valid=jnp.asarray(execution_context.kernel_context.use_transport_lagged_response),
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    def _scan_body(scan_state, inputs):
+        carry, carry_dot, step_index, sample_write_idx, sampled_times, sampled_tangents = scan_state
+        dt_value, time_value = inputs
+
+        next_carry, next_carry_dot = jax.jvp(
+            lambda c: _accepted_attempt(c, dt_value=dt_value),
+            (carry,),
+            (carry_dot,),
+        )
+        should_sample = jnp.logical_and(
+            sample_write_idx < sample_count,
+            step_index == sample_indices_arr[sample_write_idx],
+        )
+
+        def _write_sample(_):
+            times_next = sampled_times.at[sample_write_idx].set(time_value)
+            tangents_next = sampled_tangents.at[sample_write_idx].set(next_carry_dot.y)
+            return sample_write_idx + 1, times_next, tangents_next
+
+        sample_write_idx_next, sampled_times_next, sampled_tangents_next = jax.lax.cond(
+            should_sample,
+            _write_sample,
+            lambda _: (sample_write_idx, sampled_times, sampled_tangents),
+            operand=None,
+        )
+        return (
+            next_carry,
+            next_carry_dot,
+            step_index + jnp.asarray(1, dtype=jnp.int32),
+            sample_write_idx_next,
+            sampled_times_next,
+            sampled_tangents_next,
+        ), None
+
+    init_state = (
+        carry0,
+        carry0_dot,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        zero_times,
+        zero_tangents,
+    )
+    final_state, _ = jax.lax.scan(
+        _scan_body,
+        init_state,
+        (dt_sequence, cumulative_times),
+    )
+    return {
+        "sampled_times": final_state[4],
+        "sampled_state_tangents": final_state[5],
+        "sampled_indices": sample_indices,
+    }
+
+
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     parameter_value,
     *,
@@ -4758,24 +4882,21 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
         sample_every=sample_every,
     )
     print("[autodiff-gate] baseline-dt-safe-state-trajectory progress: adaptive trajectory complete; running fixed-dt direct state tangent trajectory", flush=True)
-    _, fixed_dt_tangent = jax.jvp(
-        lambda p: _adaptive_rollout_flat_state_trajectory_on_time_list(
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            time_list=safe_time_list,
-        )[0],
-        (jnp.asarray(baseline_value),),
-        (jnp.asarray(1.0),),
+    fixed_direct_result = _sampled_fixed_dt_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        dt_sequence=_radau_dt_sequence_from_time_list(
+            safe_time_list,
+            t0=prepared_rollout_static.initial_carry.t,
+            dtype=prepared_rollout_static.kernel_context.dtype,
+        ),
+        sample_every=sample_every,
     )
 
     sample_indices = adaptive_result["sampled_indices"]
     adaptive_np = np.asarray(jax.device_get(adaptive_result["sampled_state_tangents"]), dtype=float)
-    fixed_full_np = np.asarray(jax.device_get(fixed_dt_tangent), dtype=float)
-    fixed_np = fixed_full_np[np.asarray(sample_indices, dtype=int), :]
+    fixed_np = np.asarray(jax.device_get(fixed_direct_result["sampled_state_tangents"]), dtype=float)
     sampled_times_np = np.asarray(jax.device_get(adaptive_result["sampled_times"]), dtype=float)
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
 
