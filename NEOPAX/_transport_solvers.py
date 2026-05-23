@@ -2533,6 +2533,7 @@ class _RadauStageSubsolveInputs:
     z0: Any
     f0: Any
     jacobian_ref: Any
+    rhs_time_ref: Any
     lagged_response: Any
     real_lu_out: Any
     real_piv_out: Any
@@ -2810,6 +2811,7 @@ def _radau_compute_approximate_attempt_tangent(
     *,
     tangent_inputs: _RadauAcceptedStepTangentInputs,
     jacobian_ref,
+    rhs_time_ref,
     trial_dt,
     stage_history,
     real_lu_out,
@@ -2829,6 +2831,7 @@ def _radau_compute_approximate_attempt_tangent(
         stages_final=stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim)),
         dy_source=tangent_inputs.dy,
         dh_source=tangent_inputs.dh,
+        rhs_time_ref=rhs_time_ref,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
         complex_lu_out=complex_lu_out,
@@ -2862,11 +2865,31 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
         carry_in,
         context,
     )
+
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval_at_state(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_in.y,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
     tangent_inputs = _radau_extract_tangent_inputs_from_carry(carry_tangent)
     tangent_result = _radau_compute_approximate_attempt_tangent(
         kernel_context,
         tangent_inputs=tangent_inputs,
         jacobian_ref=primal_result.jacobian_out,
+        rhs_time_ref=rhs_time_ref,
         trial_dt=primal_result.trial_dt,
         stage_history=primal_result.stage_history,
         real_lu_out=primal_result.real_lu_out,
@@ -3443,6 +3466,7 @@ def _radau_approximate_accepted_step_tangent(
     stages_final,
     dy_source,
     dh_source,
+    rhs_time_ref,
     real_lu_out,
     real_piv_out,
     complex_lu_out,
@@ -3460,7 +3484,7 @@ def _radau_approximate_accepted_step_tangent(
 
     The linearized stage system used here is:
 
-    (I - h A ⊗ J_ref) dZ = J_ref (dy + dh * A Z)
+    (I - h A ⊗ J_ref) dZ = J_ref (dy + dh * A Z) + dh * c ⊗ f_t,ref
 
     and the accepted-state tangent is:
 
@@ -3479,7 +3503,11 @@ def _radau_approximate_accepted_step_tangent(
 
     def _compute_tangent(_):
         stage_state_source = dy_source[None, :] + dh_source * (kernel_context.a @ stages_final)
-        stage_rhs = stage_state_source @ jacobian_ref.T
+        stage_rhs = (
+            stage_state_source @ jacobian_ref.T
+            + (dh_source * kernel_context.c)[:, None]
+            * jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)[None, :]
+        )
         dz_flat = _radau_apply_stage_linear_solve(
             kernel_context,
             rhs=stage_rhs.reshape((-1,)),
@@ -3634,7 +3662,11 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
     def _rhs_eval_at_current_time(y_eval):
         return _rhs_eval(t_value, y_eval)
 
+    def _rhs_eval_at_state_time(t_eval):
+        return _rhs_eval(t_eval, flat_y)
+
     f0 = _rhs_eval(t_value, flat_y)
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_time)(t_value)
     z0 = _make_radau_stage_predictor(
         f0,
         prev_stages,
@@ -3701,6 +3733,7 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
         z0=z0,
         f0=f0,
         jacobian_ref=jacobian_ref,
+        rhs_time_ref=rhs_time_ref,
         lagged_response=lagged_response,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
@@ -3717,6 +3750,7 @@ def _radau_build_stage_subsolve_inputs(
     z0,
     f0,
     jacobian_ref,
+    rhs_time_ref,
     lagged_response,
     real_lu_out,
     real_piv_out,
@@ -3731,6 +3765,7 @@ def _radau_build_stage_subsolve_inputs(
         z0=z0,
         f0=f0,
         jacobian_ref=jacobian_ref,
+        rhs_time_ref=rhs_time_ref,
         lagged_response=lagged_response,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
@@ -3772,6 +3807,7 @@ def _radau_compute_stage_subsolve_approximate_tangent(
         stages_final=stages_final,
         dy_source=tangent_inputs.dy,
         dh_source=tangent_inputs.dh,
+        rhs_time_ref=inputs.rhs_time_ref,
         real_lu_out=inputs.real_lu_out,
         real_piv_out=inputs.real_piv_out,
         complex_lu_out=inputs.complex_lu_out,
@@ -4153,7 +4189,11 @@ def _radau_single_step_primal(
     def _rhs_eval_at_current_time(y_eval):
         return _rhs_eval(t_value, y_eval)
 
+    def _rhs_eval_at_state_time(t_eval):
+        return _rhs_eval(t_eval, flat_y)
+
     f0 = _rhs_eval(t_value, flat_y)
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_time)(t_value)
     z0 = _make_radau_stage_predictor(
         f0,
         prev_stages,
@@ -4225,6 +4265,7 @@ def _radau_single_step_primal(
         z0=z0,
         f0=f0,
         jacobian_ref=jacobian_ref,
+        rhs_time_ref=rhs_time_ref,
         lagged_response=lagged_response,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
