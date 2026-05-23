@@ -2752,6 +2752,8 @@ def _radau_build_approximate_tangent_result(
     tangent_result: _RadauAcceptedStepApproximateTangentResult,
     *,
     attempt_result: _RadauAcceptedStepAttemptResult,
+    dlagged_response_cache_out,
+    dlagged_reference_y_out,
 ) -> _RadauAcceptedStepAttemptResult:
     """Lift the approximate accepted-step tangent back to attempt-result shape.
 
@@ -2769,8 +2771,8 @@ def _radau_build_approximate_tangent_result(
         jax.tree_util.tree_map(_zero_tangent_like, attempt_result.carry_after_attempt),
         y=tangent_inputs.dy,
         dt=tangent_inputs.dh,
-        lagged_response_cache=tangent_inputs.dlagged_response_cache,
-        lagged_reference_y=tangent_inputs.dy,
+        lagged_response_cache=dlagged_response_cache_out,
+        lagged_reference_y=dlagged_reference_y_out,
     )
     return _RadauAcceptedStepAttemptResult(
         carry_after_attempt=carry_after_attempt_tangent,
@@ -2891,13 +2893,53 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
     rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
     tangent_inputs = _radau_extract_tangent_inputs_from_carry(carry_tangent)
 
+    def _lagged_output_tangent():
+        if not kernel_context.use_transport_lagged_response:
+            return None, tangent_inputs.dy
+
+        def _reuse_lagged_response(_):
+            return tangent_inputs.dlagged_response_cache
+
+        def _rebuild_lagged_response(_):
+            if physics_context.build_lagged_response is None:
+                return None
+
+            def _build_from_flat(flat_y):
+                candidate_state = physics_context.unpack_flat(
+                    _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+                )
+                return physics_context.build_lagged_response(candidate_state)
+
+            _, dlagged_response_out = jax.jvp(
+                _build_from_flat,
+                (carry_in.y,),
+                (tangent_inputs.dy,),
+            )
+            return dlagged_response_out
+
+        dlagged_response_cache_out = jax.lax.cond(
+            carry_in.lagged_response_valid,
+            _reuse_lagged_response,
+            _rebuild_lagged_response,
+            operand=None,
+        )
+        dlagged_reference_y_out = jax.lax.cond(
+            carry_in.lagged_response_valid,
+            lambda _: carry_tangent.lagged_reference_y,
+            lambda _: tangent_inputs.dy,
+            operand=None,
+        )
+        return dlagged_response_cache_out, dlagged_reference_y_out
+
+    dlagged_response_cache_out, dlagged_reference_y_out = _lagged_output_tangent()
+
     def _zero_stage_eval_tangent():
         return jnp.zeros(
             (kernel_context.num_stages, kernel_context.state_dim),
             dtype=kernel_context.dtype,
         )
 
-    if lagged_response is None or tangent_inputs.dlagged_response_cache is None:
+    if lagged_response is None or dlagged_response_cache_out is None:
         lagged_eval_tangent = _zero_stage_eval_tangent()
     else:
         stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
@@ -2919,26 +2961,111 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
         _, lagged_eval_tangent = jax.jvp(
             _stage_evals_from_lagged,
             (lagged_response,),
-            (tangent_inputs.dlagged_response_cache,),
+            (dlagged_response_cache_out,),
         )
 
-    tangent_result = _radau_compute_approximate_attempt_tangent(
-        kernel_context,
-        tangent_inputs=tangent_inputs,
-        jacobian_ref=primal_result.jacobian_out,
-        lagged_eval_tangent=lagged_eval_tangent,
-        rhs_time_ref=rhs_time_ref,
-        trial_dt=primal_result.trial_dt,
-        stage_history=primal_result.stage_history,
-        real_lu_out=primal_result.real_lu_out,
-        real_piv_out=primal_result.real_piv_out,
-        complex_lu_out=primal_result.complex_lu_out,
-        complex_piv_out=primal_result.complex_piv_out,
+    lagged_cache_tangent_active = jnp.asarray(False)
+    if dlagged_response_cache_out is not None:
+        lagged_cache_tangent_active = jnp.any(
+            jax.tree_util.tree_reduce(
+                lambda acc, x: jnp.logical_or(acc, jnp.any(jnp.asarray(x) != 0)),
+                dlagged_response_cache_out,
+                initializer=jnp.asarray(False),
+            )
+        )
+
+    def _approximate_tangent(_):
+        return _radau_compute_approximate_attempt_tangent(
+            kernel_context,
+            tangent_inputs=tangent_inputs,
+            jacobian_ref=primal_result.jacobian_out,
+            lagged_eval_tangent=lagged_eval_tangent,
+            rhs_time_ref=rhs_time_ref,
+            trial_dt=primal_result.trial_dt,
+            stage_history=primal_result.stage_history,
+            real_lu_out=primal_result.real_lu_out,
+            real_piv_out=primal_result.real_piv_out,
+            complex_lu_out=primal_result.complex_lu_out,
+            complex_piv_out=primal_result.complex_piv_out,
+        )
+
+    def _exact_lagged_cache_tangent(_):
+        z_final = primal_result.stage_history
+
+        def _residual_wrt_z(z_flat):
+            f0_local = _radau_eval_rhs(
+                carry_in.t,
+                carry_in.y,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+            return _radau_stage_residual(
+                kernel_context,
+                physics_context,
+                flat_y=carry_in.y,
+                t_value=carry_in.t,
+                h_value=primal_result.trial_dt,
+                z_flat=z_flat,
+                f0=f0_local,
+                jacobian_ref=primal_result.jacobian_out,
+                lagged_response=lagged_response,
+            )
+
+        def _residual_wrt_inputs(flat_y, h_scalar, lagged_response_value):
+            f0_local = _radau_eval_rhs(
+                carry_in.t,
+                flat_y,
+                lagged_response_value,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+            return _radau_stage_residual(
+                kernel_context,
+                physics_context,
+                flat_y=flat_y,
+                t_value=carry_in.t,
+                h_value=h_scalar,
+                z_flat=z_final,
+                f0=f0_local,
+                jacobian_ref=primal_result.jacobian_out,
+                lagged_response=lagged_response_value,
+            )
+
+        residual_z_jacobian = jax.jacfwd(_residual_wrt_z)(z_final)
+        _, residual_source = jax.jvp(
+            _residual_wrt_inputs,
+            (carry_in.y, primal_result.trial_dt, lagged_response),
+            (tangent_inputs.dy, tangent_inputs.dh, dlagged_response_cache_out),
+        )
+        dz_flat = -jnp.linalg.solve(residual_z_jacobian, residual_source)
+        dz_stages = dz_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        stages_final = z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        dy_next = (
+            tangent_inputs.dy
+            + tangent_inputs.dh * (kernel_context.b @ stages_final)
+            + primal_result.trial_dt * (kernel_context.b @ dz_stages)
+        )
+        return _RadauAcceptedStepApproximateTangentResult(
+            dy_next=dy_next,
+            dz_stages=dz_stages,
+            dtrial_dt=tangent_inputs.dh,
+            dtrial_y=dy_next,
+            dstage_history=dz_flat,
+        )
+
+    tangent_result = jax.lax.cond(
+        jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
+        _exact_lagged_cache_tangent,
+        _approximate_tangent,
+        operand=None,
     )
     tangent_attempt = _radau_build_approximate_tangent_result(
         tangent_inputs,
         tangent_result,
         attempt_result=primal_result,
+        dlagged_response_cache_out=dlagged_response_cache_out,
+        dlagged_reference_y_out=dlagged_reference_y_out,
     )
     return primal_result, tangent_attempt
 
