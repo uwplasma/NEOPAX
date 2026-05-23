@@ -5387,6 +5387,13 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
             ),
         }
 
+    def _zero_optional_pytree(tree):
+        return jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            tree,
+            is_leaf=lambda x: x is None,
+        )
+
     exact_trial_y = exact_dy_next
     exact_stage_history = exact_dz_flat
 
