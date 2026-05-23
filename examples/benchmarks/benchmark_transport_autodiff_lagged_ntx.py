@@ -638,6 +638,40 @@ def _objective_tangent_from_flat_y(
     return tangent
 
 
+def _adaptive_rollout_flat_state_trajectory_on_time_list(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    time_list,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    replay = _radau_run_prepared_on_time_list(
+        prepared_rollout,
+        time_list,
+    )
+    return replay["rollout"].trial_ys, replay
+
+
 def _sampled_adaptive_objective_tangent_trajectory(
     *,
     execution_context,
@@ -877,6 +911,241 @@ def _sampled_adaptive_objective_tangent_trajectory(
     return {
         "sampled_times": final_state[4],
         "sampled_tangents": final_state[5],
+        "sampled_indices": sample_indices,
+    }
+
+
+def _sampled_adaptive_state_tangent_trajectory(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+    sample_every: int,
+):
+    sample_indices = _sample_accepted_step_indices(
+        int(np.sum(np.asarray(jax.device_get(trace.accepted_mask), dtype=bool))),
+        sample_every,
+    )
+    sample_count = len(sample_indices)
+    if sample_count == 0:
+        return {
+            "sampled_times": jnp.zeros((0,), dtype=execution_context.dtype),
+            "sampled_state_tangents": jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype),
+            "sampled_indices": (),
+        }
+
+    sample_indices_arr = jnp.asarray(sample_indices, dtype=jnp.int32)
+    active_mask = jax.lax.stop_gradient(trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
+    step_ts = jax.lax.stop_gradient(trace.step_ts)
+
+    def _accepted_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        project_flat = execution_context.physics_context.project_flat
+        accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+        if accepted_y is None:
+            accepted_y = attempt_result.trial_y
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + dt_value,
+            y=accepted_y,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    def _rejected_attempt(
+        carry_value,
+        *,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        return dataclasses.replace(
+            carry_value,
+            dt=next_dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+            lagged_response_valid=lagged_response_valid_value,
+            lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+            jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+            cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+            cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+            cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+            real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+            real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+            complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+            complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+            prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+            prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+        )
+
+    zero_tangents = jnp.zeros((sample_count, carry0.y.shape[0]), dtype=execution_context.dtype)
+    zero_times = jnp.zeros((sample_count,), dtype=execution_context.dtype)
+
+    def _scan_body(scan_state, inputs):
+        carry, carry_dot, accepted_seen, sample_write_idx, sampled_times, sampled_tangents = scan_state
+        (
+            active,
+            accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+            time_value,
+        ) = inputs
+
+        def _run_step(step_operand):
+            carry_in, carry_dot_in = step_operand
+
+            def _run_accepted(_):
+                return jax.jvp(
+                    lambda c: _accepted_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
+                    ),
+                    (carry_in,),
+                    (carry_dot_in,),
+                )
+
+            def _run_rejected(_):
+                return jax.jvp(
+                    lambda c: _rejected_attempt(
+                        c,
+                        dt_value=dt_value,
+                        next_dt_value=next_dt_value,
+                        recent_reject_count_value=recent_reject_count_value,
+                        regrowth_cooldown_value=regrowth_cooldown_value,
+                        easy_growth_streak_value=easy_growth_streak_value,
+                        lagged_response_valid_value=lagged_response_valid_value,
+                    ),
+                    (carry_in,),
+                    (carry_dot_in,),
+                )
+
+            return jax.lax.cond(accepted, _run_accepted, _run_rejected, operand=None)
+
+        def _skip_step(step_operand):
+            return step_operand
+
+        next_carry, next_carry_dot = jax.lax.cond(
+            active,
+            _run_step,
+            _skip_step,
+            operand=(carry, carry_dot),
+        )
+        accepted_seen_next = accepted_seen + jnp.where(jnp.logical_and(active, accepted), jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+        just_accepted_index = accepted_seen_next - 1
+        should_sample = jnp.logical_and(
+            jnp.logical_and(active, accepted),
+            jnp.logical_and(sample_write_idx < sample_count, just_accepted_index == sample_indices_arr[sample_write_idx]),
+        )
+
+        def _write_sample(_):
+            times_next = sampled_times.at[sample_write_idx].set(time_value)
+            tangents_next = sampled_tangents.at[sample_write_idx].set(next_carry_dot.y)
+            return sample_write_idx + 1, times_next, tangents_next
+
+        sample_write_idx_next, sampled_times_next, sampled_tangents_next = jax.lax.cond(
+            should_sample,
+            _write_sample,
+            lambda _: (sample_write_idx, sampled_times, sampled_tangents),
+            operand=None,
+        )
+        return (
+            next_carry,
+            next_carry_dot,
+            accepted_seen_next,
+            sample_write_idx_next,
+            sampled_times_next,
+            sampled_tangents_next,
+        ), None
+
+    init_state = (
+        carry0,
+        carry0_dot,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        zero_times,
+        zero_tangents,
+    )
+    final_state, _ = jax.lax.scan(
+        _scan_body,
+        init_state,
+        (
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+            step_ts,
+        ),
+    )
+    return {
+        "sampled_times": final_state[4],
+        "sampled_state_tangents": final_state[5],
         "sampled_indices": sample_indices,
     }
 
@@ -2102,6 +2371,39 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"Er_rel_err={float(entry.get('Er_relative_error')):.6e} "
                 f"Er2_rel_err={float(entry.get('Er2_relative_error')):.6e} "
                 f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e}"
+            )
+        return
+
+    if report.get("baseline_dt_path_safe_state_trajectory_compare_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_safe_state_trajectory_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_accepted_count={report.get('safe_accepted_count')} "
+            f"sample_every={report.get('sample_every')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] accepted-step state-tangent errors:")
+        for entry in report.get("entries") or []:
+            print(
+                "  - "
+                f"accepted_index={entry.get('accepted_index')} "
+                f"time={float(entry.get('time')):.6e} "
+                f"full_state_rel_err={float(entry.get('full_state_relative_error')):.6e} "
+                f"density_rel_err={float(entry.get('density_relative_error')):.6e} "
+                f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
             )
         return
 
@@ -4164,6 +4466,170 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
     }
 
 
+def build_baseline_dt_path_safe_state_trajectory_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+    sample_every: int,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_time_list = _accepted_time_list_until_attempt_index(baseline_rollout.trace, safe_attempt_index)
+    safe_accepted_count = len(safe_time_list)
+    if safe_accepted_count <= 0:
+        raise ValueError("Safe baseline dt path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+    safe_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=safe_accepted_count,
+    )
+
+    print(
+        "[autodiff-gate] baseline-dt-safe-state-trajectory baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"known_first_bad_attempt_index={known_first_bad_attempt_index} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_accepted_count={safe_accepted_count} "
+        f"sample_every={int(max(1, sample_every))} "
+        f"safe_final_time={float(safe_time_list[-1]):.6e}",
+        flush=True,
+    )
+
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    print("[autodiff-gate] baseline-dt-safe-state-trajectory progress: running realized-trace adaptive state tangent trajectory", flush=True)
+    adaptive_result = _sampled_adaptive_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=safe_trace,
+        sample_every=sample_every,
+    )
+    print("[autodiff-gate] baseline-dt-safe-state-trajectory progress: adaptive trajectory complete; running fixed-dt direct state tangent trajectory", flush=True)
+    _, fixed_dt_tangent = jax.jvp(
+        lambda p: _adaptive_rollout_flat_state_trajectory_on_time_list(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            time_list=safe_time_list,
+        )[0],
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    sample_indices = adaptive_result["sampled_indices"]
+    adaptive_np = np.asarray(jax.device_get(adaptive_result["sampled_state_tangents"]), dtype=float)
+    fixed_full_np = np.asarray(jax.device_get(fixed_dt_tangent), dtype=float)
+    fixed_np = fixed_full_np[np.asarray(sample_indices, dtype=int), :]
+    sampled_times_np = np.asarray(jax.device_get(adaptive_result["sampled_times"]), dtype=float)
+
+    density_size = int(np.prod(np.asarray(baseline_state.density).shape))
+    pressure_size = int(np.prod(np.asarray(baseline_state.pressure).shape))
+    er_size = int(np.prod(np.asarray(baseline_state.Er).shape))
+    density_slice = slice(0, density_size)
+    pressure_slice = slice(density_size, density_size + pressure_size)
+    er_slice = slice(density_size + pressure_size, density_size + pressure_size + er_size)
+
+    def _rel_norm(a: np.ndarray, b: np.ndarray) -> float:
+        num = float(np.linalg.norm(a - b))
+        den = max(float(np.linalg.norm(b)), 1.0e-10)
+        return num / den
+
+    entries = []
+    global_max_rel_error = 0.0
+    for idx, sample_idx in enumerate(sample_indices):
+        ad_step = adaptive_np[idx]
+        direct_step = fixed_np[idx]
+        full_rel = _rel_norm(ad_step, direct_step)
+        density_rel = _rel_norm(ad_step[density_slice], direct_step[density_slice])
+        pressure_rel = _rel_norm(ad_step[pressure_slice], direct_step[pressure_slice])
+        er_rel = _rel_norm(ad_step[er_slice], direct_step[er_slice])
+        global_max_rel_error = max(global_max_rel_error, full_rel, density_rel, pressure_rel, er_rel)
+        entries.append(
+            {
+                "accepted_index": int(sample_idx + 1),
+                "time": float(sampled_times_np[idx]),
+                "full_state_relative_error": float(full_rel),
+                "density_relative_error": float(density_rel),
+                "pressure_relative_error": float(pressure_rel),
+                "Er_relative_error": float(er_rel),
+            }
+        )
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_safe_state_trajectory_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "known_first_bad_attempt_index": int(known_first_bad_attempt_index),
+        "safe_attempt_margin": int(safe_attempt_margin),
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_accepted_count": int(safe_accepted_count),
+        "safe_final_time": float(safe_time_list[-1]),
+        "sample_every": int(max(1, sample_every)),
+        "entries": entries,
+        "max_relative_error": float(global_max_rel_error),
+        "passed": bool(np.isfinite(global_max_rel_error) and global_max_rel_error <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
 def build_realized_schedule_windowed_frozen_fd_report(
     *,
     config_path: Path,
@@ -4697,6 +5163,11 @@ def main() -> None:
         help="Dedicated opt-in mode: run one realized-trace adaptive AD trajectory and one fixed-dt direct AD trajectory, then compare per-accepted-step objective tangents along the safe baseline path.",
     )
     parser.add_argument(
+        "--baseline-dt-path-safe-state-trajectory-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: run one realized-trace adaptive state-tangent trajectory and one fixed-dt direct state-tangent trajectory, then compare state-slice mismatches along the safe baseline path.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-safe-trajectory-sample-every",
         type=int,
         default=5,
@@ -4851,6 +5322,15 @@ def main() -> None:
         )
     elif args.baseline_dt_path_safe_trajectory_compare_check:
         report = build_baseline_dt_path_safe_trajectory_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+            sample_every=args.baseline_dt_path_safe_trajectory_sample_every,
+        )
+    elif args.baseline_dt_path_safe_state_trajectory_compare_check:
+        report = build_baseline_dt_path_safe_state_trajectory_compare_report(
             config_path=args.config,
             parameter_name=args.parameter,
             device=args.device,

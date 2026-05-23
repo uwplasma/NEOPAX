@@ -2650,3 +2650,138 @@ That is the cleanest way to isolate the remaining mismatch between:
 
 - adaptive AD on the custom realized-schedule boundary
 - and a valid frozen-path FD reference
+
+## 2026-05-22: safe-path AD/FD and adaptive-vs-direct AD status
+
+We now have a much cleaner comparison path than the earlier full adaptive FD or
+full frozen-path FD tests.
+
+### What is established now
+
+- The long-horizon adaptive AD NaN issue is no longer the main blocker for this
+  benchmark path.
+- For the current benchmark helper, the initial ambipolar `Er` solve is
+  effectively frozen out of the differentiated parameter path:
+  - baseline `Er_init`, `fd_minus Er_init`, `fd_plus Er_init`, and AD all start
+    from the same baseline-initialized `Er`
+  - only density/pressure are re-parameterized with `n0`
+- The new safe baseline-`dt` path test uses the earliest known frozen-FD
+  failure (`fd_plus` first bad attempt `76`) and stops two attempts earlier by
+  default (`safe_attempt_index = 74`).
+
+### Important benchmark results
+
+#### 1. Safe baseline-`dt` FD vs adaptive AD
+
+Command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-fd-check
+```
+
+Result:
+
+- baseline / `fd_minus` / `fd_plus` fixed-path replays are all finite
+- so this is a valid same-path AD-vs-FD comparison at the safe final time
+- pressure-like objectives match well
+- `Er`-sensitive objectives do not
+
+Representative output at `safe_final_time = 1.872051e-03`:
+
+- `total_pressure_volume_average`: very small relative error
+- `alpha_power_volume_average_mw_m3`: very small relative error
+- `electron_temperature_volume_average_keV`: modest relative error
+- `Er_volume_average`: large relative error
+- `Er2_volume_average`: large relative error
+
+#### 2. Safe baseline-`dt` direct AD vs adaptive AD
+
+Command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-compose-check
+```
+
+Result:
+
+- `fixed_dt_direct_ad` closely matches the fixed-path FD
+- `adaptive_ad` shows the same mismatch pattern as in the AD-vs-FD safe test
+
+Conclusion:
+
+- the remaining mismatch is **not mainly an FD artifact**
+- the problem is in the **custom adaptive realized-schedule AD path**
+
+### Objective-trajectory debug status
+
+We added an opt-in sampled trajectory objective-compare mode:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-trajectory-compare-check --baseline-dt-path-safe-trajectory-sample-every 5
+```
+
+Latest result:
+
+- mismatch starts early
+- pressure channel remains very accurate
+- `Er` and `Er2` mismatch grow steadily and dominate the error
+
+Observed pattern:
+
+- accepted step `1`: small mismatch already present
+- accepted steps `6+`: clear `Er` drift begins
+- later steps: `Er` mismatch grows strongly while pressure stays tiny
+
+This strongly suggests:
+
+- the custom adaptive tangent propagation is slightly wrong from the start
+- the error accumulates primarily in the `Er` channel
+- the bug is not a broad whole-state derivative failure
+
+### New dedicated state-slice debug mode
+
+To distinguish whether only `dEr` is drifting or whether the whole state
+tangent is drifting with `Er` amplifying it, a new opt-in state-slice trajectory
+mode was added.
+
+Command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-state-trajectory-compare-check --baseline-dt-path-safe-trajectory-sample-every 5
+```
+
+What it is intended to print at sampled accepted steps:
+
+- `full_state_rel_err`
+- `density_rel_err`
+- `pressure_rel_err`
+- `Er_rel_err`
+
+This mode is separate from the standard benchmark path and shares the same
+sampling knob:
+
+- `--baseline-dt-path-safe-trajectory-sample-every K`
+
+so it can be made sparse to reduce memory / output volume.
+
+### Current best interpretation
+
+- initial ambipolar `Er` differentiation is **not** the source of the current
+  mismatch in this benchmark path
+- fixed-path direct AD is the trusted reference
+- custom adaptive AD is the path that is wrong
+- the mismatch appears early and accumulates primarily in `Er`
+
+### Immediate next thing to run
+
+Run the new state-slice sampled compare:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-safe-state-trajectory-compare-check --baseline-dt-path-safe-trajectory-sample-every 5
+```
+
+If that confirms that pressure/density remain tight while `Er` diverges, the
+next debugging target should be the custom adaptive propagation of:
+
+- `dEr`
+- and any carry/history that feeds the `Er` update, especially `prev_stages`
