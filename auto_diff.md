@@ -2832,3 +2832,38 @@ This mode prints, for the first accepted step only:
 This is the current best localizer for the next debugging step, because it
 removes long-horizon accumulation and focuses directly on the first accepted
 step where the `dEr` mismatch already exists.
+
+### New first-step local tangent split
+
+A second first-step diagnostic was added to separate:
+
+- mismatch in the stage tangent solve itself
+- mismatch only in the accepted-state reconstruction
+
+Run:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-local-tangent-compare-check
+```
+
+This compares, on the first accepted step only, the custom adaptive JVP
+against direct JAX differentiation of the raw one-step attempt for:
+
+- `trial_y`
+- `carry_after_attempt.y`
+- `stage_history`
+
+and reports:
+
+- `full_rel_err`
+- `pressure_rel_err`
+- `Er_rel_err`
+
+Interpretation:
+
+- if `stage_history` is already wrong, the bias starts in the local stage
+  tangent solve
+- if `stage_history` is fine but `trial_y` is wrong, the bias is introduced in
+  the accepted-step reconstruction / carry shaping
+- if `carry_after_attempt.y` differs much more strongly than `trial_y`, that
+  points at the tangent packaging in `_radau_build_approximate_tangent_result`
