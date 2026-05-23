@@ -53,6 +53,9 @@ from NEOPAX._transport_solvers import (
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
+    _radau_eval_rhs,
+    _radau_prepare_lagged_response,
+    _radau_stage_residual,
     _execute_radau_accepted_step_attempt,
     _execute_radau_accepted_step_attempt_autodiff,
     _build_prepared_radau_execution_context,
@@ -2465,6 +2468,39 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
                 f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
             )
+        return
+
+    if report.get("baseline_dt_path_first_step_exact_local_tangent_compare_check"):
+        print(
+            f"[autodiff-gate] mode=baseline_dt_path_first_step_exact_local_tangent_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e} "
+            f"first_step_time={report.get('first_step_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        for family in ("custom_vs_direct", "exact_vs_direct", "custom_vs_exact"):
+            print(f"[autodiff-gate] {family}:")
+            section = report.get(family, {})
+            for label in ("trial_y", "stage_history"):
+                entry = section.get(label, {})
+                print(
+                    "  - "
+                    f"{label}: "
+                    f"full_rel_err={float(entry.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+                )
         return
 
     if report.get("realized_schedule_rollout_check"):
@@ -5037,6 +5073,281 @@ def build_baseline_dt_path_first_step_local_tangent_compare_report(
     }
 
 
+def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_time_list = _accepted_time_list_until_attempt_index(baseline_rollout.trace, safe_attempt_index)
+    if len(safe_time_list) <= 0:
+        raise ValueError("Safe baseline dt path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+
+    print(
+        "[autodiff-gate] baseline-dt-first-step-exact-local baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_final_time={float(safe_time_list[-1]):.6e}",
+        flush=True,
+    )
+
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    print(
+        "[autodiff-gate] baseline-dt-first-step-exact-local progress: running custom, direct, and exact first-step tangents",
+        flush=True,
+    )
+
+    custom_primal, custom_tangent = jax.jvp(
+        lambda carry: _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry,
+            execution_context.attempt_context,
+        ),
+        (carry0,),
+        (carry0_dot,),
+    )
+    _, direct_tangent = jax.jvp(
+        lambda carry: _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry,
+            execution_context.attempt_context,
+        ),
+        (carry0,),
+        (carry0_dot,),
+    )
+
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        execution_context.kernel_context,
+        carry0,
+        execution_context.physics_context.unpack_flat,
+        execution_context.physics_context.project_flat,
+        execution_context.physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval(t_eval, y_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            y_eval,
+            lagged_response,
+            execution_context.physics_context.flat_rhs,
+            execution_context.physics_context.flat_rhs_with_lagged_response,
+        )
+
+    f0 = _rhs_eval(carry0.t, carry0.y)
+    z_final = custom_primal.stage_history
+    h_value = custom_primal.trial_dt
+    jacobian_ref = custom_primal.jacobian_out
+
+    def _residual_wrt_z(z_flat):
+        return _radau_stage_residual(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            flat_y=carry0.y,
+            t_value=carry0.t,
+            h_value=h_value,
+            z_flat=z_flat,
+            f0=f0,
+            jacobian_ref=jacobian_ref,
+            lagged_response=lagged_response,
+        )
+
+    def _residual_wrt_y_h(flat_y, h_scalar):
+        f0_local = _rhs_eval(carry0.t, flat_y)
+        return _radau_stage_residual(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            flat_y=flat_y,
+            t_value=carry0.t,
+            h_value=h_scalar,
+            z_flat=z_final,
+            f0=f0_local,
+            jacobian_ref=jacobian_ref,
+            lagged_response=lagged_response,
+        )
+
+    residual_z_jacobian = jax.jacfwd(_residual_wrt_z)(z_final)
+    _, residual_source = jax.jvp(
+        _residual_wrt_y_h,
+        (carry0.y, h_value),
+        (carry0_dot.y, carry0_dot.dt),
+    )
+    exact_dz_flat = -jnp.linalg.solve(residual_z_jacobian, residual_source)
+    exact_dz_stages = exact_dz_flat.reshape(
+        (execution_context.kernel_context.num_stages, execution_context.kernel_context.state_dim)
+    )
+    exact_dy_next = (
+        carry0_dot.y
+        + carry0_dot.dt
+        * (
+            execution_context.kernel_context.b
+            @ z_final.reshape(
+                (execution_context.kernel_context.num_stages, execution_context.kernel_context.state_dim)
+            )
+        )
+        + h_value * (execution_context.kernel_context.b @ exact_dz_stages)
+    )
+
+    unpack_flat = prepared_rollout_static.physics_context.unpack_flat
+
+    def _field_relative_errors(ad_state, ref_state):
+        ad_pressure = np.asarray(jax.device_get(ad_state.pressure), dtype=float)
+        ref_pressure = np.asarray(jax.device_get(ref_state.pressure), dtype=float)
+        ad_er = np.asarray(jax.device_get(ad_state.Er), dtype=float)
+        ref_er = np.asarray(jax.device_get(ref_state.Er), dtype=float)
+        return {
+            "pressure_relative_error": float(
+                np.linalg.norm(ad_pressure - ref_pressure)
+                / max(float(np.linalg.norm(ref_pressure)), 1.0e-10)
+            ),
+            "Er_relative_error": float(
+                np.linalg.norm(ad_er - ref_er)
+                / max(float(np.linalg.norm(ref_er)), 1.0e-10)
+            ),
+        }
+
+    def _flat_component_report(ad_arr, ref_arr):
+        ad_flat = np.asarray(jax.device_get(ad_arr), dtype=float)
+        ref_flat = np.asarray(jax.device_get(ref_arr), dtype=float)
+        ad_state = unpack_flat(jnp.asarray(ad_flat))
+        ref_state = unpack_flat(jnp.asarray(ref_flat))
+        report = _field_relative_errors(ad_state, ref_state)
+        report["full_relative_error"] = float(
+            np.linalg.norm(ad_flat - ref_flat) / max(float(np.linalg.norm(ref_flat)), 1.0e-10)
+        )
+        return report
+
+    def _stage_history_report(ad_stage_history, ref_stage_history):
+        num_stages = int(execution_context.kernel_context.num_stages)
+        state_dim = int(execution_context.kernel_context.state_dim)
+        ad_hist = np.asarray(jax.device_get(ad_stage_history), dtype=float).reshape((num_stages, state_dim))
+        ref_hist = np.asarray(jax.device_get(ref_stage_history), dtype=float).reshape((num_stages, state_dim))
+        ad_pressure = []
+        ref_pressure = []
+        ad_er = []
+        ref_er = []
+        for stage_idx in range(num_stages):
+            ad_state = unpack_flat(jnp.asarray(ad_hist[stage_idx]))
+            ref_state = unpack_flat(jnp.asarray(ref_hist[stage_idx]))
+            ad_pressure.append(np.asarray(jax.device_get(ad_state.pressure), dtype=float))
+            ref_pressure.append(np.asarray(jax.device_get(ref_state.pressure), dtype=float))
+            ad_er.append(np.asarray(jax.device_get(ad_state.Er), dtype=float))
+            ref_er.append(np.asarray(jax.device_get(ref_state.Er), dtype=float))
+        ad_pressure_np = np.stack(ad_pressure, axis=0)
+        ref_pressure_np = np.stack(ref_pressure, axis=0)
+        ad_er_np = np.stack(ad_er, axis=0)
+        ref_er_np = np.stack(ref_er, axis=0)
+        return {
+            "full_relative_error": float(
+                np.linalg.norm(ad_hist - ref_hist) / max(float(np.linalg.norm(ref_hist)), 1.0e-10)
+            ),
+            "pressure_relative_error": float(
+                np.linalg.norm(ad_pressure_np - ref_pressure_np)
+                / max(float(np.linalg.norm(ref_pressure_np)), 1.0e-10)
+            ),
+            "Er_relative_error": float(
+                np.linalg.norm(ad_er_np - ref_er_np)
+                / max(float(np.linalg.norm(ref_er_np)), 1.0e-10)
+            ),
+        }
+
+    exact_trial_y = exact_dy_next
+    exact_stage_history = exact_dz_flat
+
+    custom_vs_direct = {
+        "trial_y": _flat_component_report(custom_tangent.trial_y, direct_tangent.trial_y),
+        "stage_history": _stage_history_report(custom_tangent.stage_history, direct_tangent.stage_history),
+    }
+    exact_vs_direct = {
+        "trial_y": _flat_component_report(exact_trial_y, direct_tangent.trial_y),
+        "stage_history": _stage_history_report(exact_stage_history, direct_tangent.stage_history),
+    }
+    custom_vs_exact = {
+        "trial_y": _flat_component_report(custom_tangent.trial_y, exact_trial_y),
+        "stage_history": _stage_history_report(custom_tangent.stage_history, exact_stage_history),
+    }
+
+    return {
+        "config_path": str(config_path),
+        "baseline_dt_path_first_step_exact_local_tangent_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_final_time": float(safe_time_list[-1]),
+        "first_step_time": float(np.asarray(jax.device_get(carry0.t + custom_primal.trial_dt), dtype=float)),
+        "custom_vs_direct": custom_vs_direct,
+        "exact_vs_direct": exact_vs_direct,
+        "custom_vs_exact": custom_vs_exact,
+        "max_relative_error": float(
+            max(
+                custom_vs_direct["trial_y"]["Er_relative_error"],
+                custom_vs_direct["stage_history"]["Er_relative_error"],
+                exact_vs_direct["trial_y"]["Er_relative_error"],
+                exact_vs_direct["stage_history"]["Er_relative_error"],
+            )
+        ),
+        "passed": True,
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
 def build_realized_schedule_windowed_frozen_fd_report(
     *,
     config_path: Path,
@@ -5585,6 +5896,11 @@ def main() -> None:
         help="Dedicated opt-in mode: compare custom vs direct first-step local tangents for trial_y, carry_after_attempt.y, and stage_history.",
     )
     parser.add_argument(
+        "--baseline-dt-path-first-step-exact-local-tangent-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: compare custom and exact-residual one-step local tangents against direct AD for the first accepted step.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-safe-trajectory-sample-every",
         type=int,
         default=5,
@@ -5765,6 +6081,14 @@ def main() -> None:
         )
     elif args.baseline_dt_path_first_step_local_tangent_compare_check:
         report = build_baseline_dt_path_first_step_local_tangent_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+        )
+    elif args.baseline_dt_path_first_step_exact_local_tangent_compare_check:
+        report = build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
             config_path=args.config,
             parameter_name=args.parameter,
             device=args.device,

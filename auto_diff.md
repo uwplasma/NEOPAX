@@ -2867,3 +2867,34 @@ Interpretation:
   the accepted-step reconstruction / carry shaping
 - if `carry_after_attempt.y` differs much more strongly than `trial_y`, that
   points at the tangent packaging in `_radau_build_approximate_tangent_result`
+
+### Exact one-step residual debug
+
+A second debug-only first-step mode was added to test whether the current
+approximation itself is the issue:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-first-step-exact-local-tangent-compare-check
+```
+
+This computes an exact local implicit-diff tangent for the first accepted step
+by:
+
+- forming the full collocation residual Jacobian with respect to `z`
+- differentiating the residual source with respect to `(y_n, h)`
+- solving the dense linear system for `dZ`
+
+and then compares:
+
+- `custom_vs_direct`
+- `exact_vs_direct`
+- `custom_vs_exact`
+
+for:
+
+- `trial_y`
+- `stage_history`
+
+If `exact_vs_direct` is much better than `custom_vs_direct`, then the custom
+accepted-step tangent approximation is the root cause, not the later adaptive
+composition machinery.
