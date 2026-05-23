@@ -2889,6 +2889,8 @@ and then compares:
 - `custom_vs_direct`
 - `exact_vs_direct`
 - `custom_vs_exact`
+- `restricted_direct_vs_direct`
+- `custom_vs_restricted_direct`
 
 for:
 
@@ -2898,3 +2900,13 @@ for:
 If `exact_vs_direct` is much better than `custom_vs_direct`, then the custom
 accepted-step tangent approximation is the root cause, not the later adaptive
 composition machinery.
+
+The mode also now compares against a "restricted direct" JVP where only
+`(y, dt)` tangents are active and all other carry tangents are zeroed. That is
+the key discriminator for whether the current mismatch is really coming from
+ignored carry-field tangents such as:
+
+- `lagged_response_cache`
+- `lagged_reference_y`
+- `prev_stages`
+- other cached/controller carry fields

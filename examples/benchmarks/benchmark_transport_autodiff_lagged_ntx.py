@@ -2489,7 +2489,13 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"failed={diag.get('failed')} "
             f"fail_code={diag.get('fail_code')}"
         )
-        for family in ("custom_vs_direct", "exact_vs_direct", "custom_vs_exact"):
+        for family in (
+            "custom_vs_direct",
+            "exact_vs_direct",
+            "custom_vs_exact",
+            "restricted_direct_vs_direct",
+            "custom_vs_restricted_direct",
+        ):
             print(f"[autodiff-gate] {family}:")
             section = report.get(family, {})
             for label in ("trial_y", "stage_history"):
@@ -4969,6 +4975,26 @@ def build_baseline_dt_path_first_step_local_tangent_compare_report(
         (carry0,),
         (carry0_dot,),
     )
+    carry0_dot_restricted = jax.tree_util.tree_map(
+        lambda x: None if x is None else jnp.zeros_like(x),
+        carry0_dot,
+        is_leaf=lambda x: x is None,
+    )
+    carry0_dot_restricted = dataclasses.replace(
+        carry0_dot_restricted,
+        y=carry0_dot.y,
+        dt=carry0_dot.dt,
+    )
+    _, restricted_direct_tangent = jax.jvp(
+        lambda carry: _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry,
+            execution_context.attempt_context,
+        ),
+        (carry0,),
+        (carry0_dot_restricted,),
+    )
 
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
     num_stages = int(execution_context.kernel_context.num_stages)
@@ -5323,6 +5349,14 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         "trial_y": _flat_component_report(custom_tangent.trial_y, exact_trial_y),
         "stage_history": _stage_history_report(custom_tangent.stage_history, exact_stage_history),
     }
+    restricted_direct_vs_direct = {
+        "trial_y": _flat_component_report(restricted_direct_tangent.trial_y, direct_tangent.trial_y),
+        "stage_history": _stage_history_report(restricted_direct_tangent.stage_history, direct_tangent.stage_history),
+    }
+    custom_vs_restricted_direct = {
+        "trial_y": _flat_component_report(custom_tangent.trial_y, restricted_direct_tangent.trial_y),
+        "stage_history": _stage_history_report(custom_tangent.stage_history, restricted_direct_tangent.stage_history),
+    }
 
     return {
         "config_path": str(config_path),
@@ -5335,6 +5369,8 @@ def build_baseline_dt_path_first_step_exact_local_tangent_compare_report(
         "custom_vs_direct": custom_vs_direct,
         "exact_vs_direct": exact_vs_direct,
         "custom_vs_exact": custom_vs_exact,
+        "restricted_direct_vs_direct": restricted_direct_vs_direct,
+        "custom_vs_restricted_direct": custom_vs_restricted_direct,
         "max_relative_error": float(
             max(
                 custom_vs_direct["trial_y"]["Er_relative_error"],
