@@ -928,6 +928,25 @@ def _sampled_adaptive_state_tangent_trajectory(
     trace,
     sample_every: int,
 ):
+    return _sampled_realized_trace_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=trace,
+        sample_every=sample_every,
+        use_custom=True,
+    )
+
+
+def _sampled_realized_trace_state_tangent_trajectory(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+    sample_every: int,
+    use_custom: bool,
+):
     sample_indices = _sample_accepted_step_indices(
         int(np.sum(np.asarray(jax.device_get(trace.accepted_mask), dtype=bool))),
         sample_every,
@@ -962,7 +981,8 @@ def _sampled_adaptive_state_tangent_trajectory(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
+        attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_for_step),
@@ -1010,7 +1030,8 @@ def _sampled_adaptive_state_tangent_trajectory(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
-        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
+        attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
             _radau_carry_with_forward_only_jvp_fields(carry_for_step),
@@ -2528,6 +2549,39 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             print(
                 "  - "
                 f"accepted_index={entry.get('accepted_index')} "
+                f"time={float(entry.get('time')):.6e} "
+                f"full_state_rel_err={float(entry.get('full_state_relative_error')):.6e} "
+                f"density_rel_err={float(entry.get('density_relative_error')):.6e} "
+                f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+            )
+        return
+
+    if report.get("realized_trace_safe_state_trajectory_compare_check"):
+        print(
+            f"[autodiff-gate] mode=realized_trace_safe_state_trajectory_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"safe_attempt_index={report.get('safe_attempt_index')} "
+            f"safe_accepted_count={report.get('safe_accepted_count')} "
+            f"sample_every={report.get('sample_every')} "
+            f"safe_final_time={report.get('safe_final_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] accepted-step realized-trace state-tangent errors:")
+        for entry in report.get("entries", []):
+            print(
+                "  - "
+                f"accepted_index={int(entry.get('accepted_index'))} "
                 f"time={float(entry.get('time')):.6e} "
                 f"full_state_rel_err={float(entry.get('full_state_relative_error')):.6e} "
                 f"density_rel_err={float(entry.get('density_relative_error')):.6e} "
@@ -4965,6 +5019,167 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
     }
 
 
+def build_realized_trace_safe_state_trajectory_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    known_first_bad_attempt_index: int,
+    safe_attempt_margin: int,
+    sample_every: int,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
+    safe_time_list = _accepted_time_list_until_attempt_index(baseline_rollout.trace, safe_attempt_index)
+    safe_accepted_count = len(safe_time_list)
+    if safe_accepted_count <= 0:
+        raise ValueError("Safe realized trace path is empty; adjust known_first_bad_attempt_index or safe_attempt_margin.")
+    safe_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=safe_accepted_count,
+    )
+
+    print(
+        "[autodiff-gate] realized-trace-safe-state-trajectory baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"known_first_bad_attempt_index={known_first_bad_attempt_index} "
+        f"safe_attempt_index={safe_attempt_index} "
+        f"safe_accepted_count={safe_accepted_count} "
+        f"sample_every={int(max(1, sample_every))} "
+        f"safe_final_time={float(safe_time_list[-1]):.6e}",
+        flush=True,
+    )
+
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    print("[autodiff-gate] realized-trace-safe-state-trajectory progress: running realized-trace custom state tangent trajectory", flush=True)
+    custom_result = _sampled_realized_trace_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=safe_trace,
+        sample_every=sample_every,
+        use_custom=True,
+    )
+    print("[autodiff-gate] realized-trace-safe-state-trajectory progress: custom trajectory complete; running realized-trace direct state tangent trajectory", flush=True)
+    direct_result = _sampled_realized_trace_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=safe_trace,
+        sample_every=sample_every,
+        use_custom=False,
+    )
+
+    sample_indices = custom_result["sampled_indices"]
+    custom_np = np.asarray(jax.device_get(custom_result["sampled_state_tangents"]), dtype=float)
+    direct_np = np.asarray(jax.device_get(direct_result["sampled_state_tangents"]), dtype=float)
+    sampled_times_np = np.asarray(jax.device_get(custom_result["sampled_times"]), dtype=float)
+    unpack_flat = prepared_rollout_static.physics_context.unpack_flat
+
+    def _rel_norm(a: np.ndarray, b: np.ndarray) -> float:
+        num = float(np.linalg.norm(a - b))
+        den = max(float(np.linalg.norm(b)), 1.0e-10)
+        return num / den
+
+    entries = []
+    global_max_rel_error = 0.0
+    for idx, sample_idx in enumerate(sample_indices):
+        custom_step = custom_np[idx]
+        direct_step = direct_np[idx]
+        custom_state = unpack_flat(jnp.asarray(custom_step))
+        direct_state = unpack_flat(jnp.asarray(direct_step))
+        custom_density = np.asarray(jax.device_get(custom_state.density), dtype=float)
+        direct_density = np.asarray(jax.device_get(direct_state.density), dtype=float)
+        custom_pressure = np.asarray(jax.device_get(custom_state.pressure), dtype=float)
+        direct_pressure = np.asarray(jax.device_get(direct_state.pressure), dtype=float)
+        custom_er = np.asarray(jax.device_get(custom_state.Er), dtype=float)
+        direct_er = np.asarray(jax.device_get(direct_state.Er), dtype=float)
+        full_rel = _rel_norm(custom_step, direct_step)
+        density_rel = _rel_norm(custom_density, direct_density)
+        pressure_rel = _rel_norm(custom_pressure, direct_pressure)
+        er_rel = _rel_norm(custom_er, direct_er)
+        global_max_rel_error = max(global_max_rel_error, full_rel, density_rel, pressure_rel, er_rel)
+        entries.append(
+            {
+                "accepted_index": int(sample_idx + 1),
+                "time": float(sampled_times_np[idx]),
+                "full_state_relative_error": float(full_rel),
+                "density_relative_error": float(density_rel),
+                "pressure_relative_error": float(pressure_rel),
+                "Er_relative_error": float(er_rel),
+            }
+        )
+
+    return {
+        "config_path": str(config_path),
+        "realized_trace_safe_state_trajectory_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "known_first_bad_attempt_index": int(known_first_bad_attempt_index),
+        "safe_attempt_margin": int(safe_attempt_margin),
+        "safe_attempt_index": int(safe_attempt_index),
+        "safe_accepted_count": int(safe_accepted_count),
+        "safe_final_time": float(safe_time_list[-1]),
+        "sample_every": int(max(1, sample_every)),
+        "entries": entries,
+        "max_relative_error": float(global_max_rel_error),
+        "passed": bool(np.isfinite(global_max_rel_error) and global_max_rel_error <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
 def build_baseline_dt_path_first_step_field_compare_report(
     *,
     config_path: Path,
@@ -6894,6 +7109,11 @@ def main() -> None:
         help="Dedicated opt-in mode: run one realized-trace adaptive state-tangent trajectory and one fixed-dt direct state-tangent trajectory, then compare state-slice mismatches along the safe baseline path.",
     )
     parser.add_argument(
+        "--realized-trace-safe-state-trajectory-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: run one realized-trace custom state-tangent trajectory and one realized-trace direct state-tangent trajectory on the same safe frozen trace.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-first-step-field-compare-check",
         action="store_true",
         help="Dedicated opt-in mode: compare adaptive vs direct fixed-dt tangent fields at the first accepted step only.",
@@ -7082,6 +7302,15 @@ def main() -> None:
         )
     elif args.baseline_dt_path_safe_state_trajectory_compare_check:
         report = build_baseline_dt_path_safe_state_trajectory_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            known_first_bad_attempt_index=args.known_first_bad_attempt_index,
+            safe_attempt_margin=args.safe_attempt_margin,
+            sample_every=args.baseline_dt_path_safe_trajectory_sample_every,
+        )
+    elif args.realized_trace_safe_state_trajectory_compare_check:
+        report = build_realized_trace_safe_state_trajectory_compare_report(
             config_path=args.config,
             parameter_name=args.parameter,
             device=args.device,
