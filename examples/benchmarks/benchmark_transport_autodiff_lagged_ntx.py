@@ -7635,7 +7635,7 @@ def build_realized_trace_checkpoint_compare_report(
         lambda carry_value, carry_dot_value, dt_value, next_dt_value, recent_reject_count_value, regrowth_cooldown_value, easy_growth_streak_value, lagged_response_valid_value: jax.jvp(
             lambda c: _attempt_update(
                 c,
-                _execute_radau_accepted_step_attempt_autodiff,
+                attempt_fn=_execute_radau_accepted_step_attempt_autodiff,
                 dt_value=dt_value,
                 next_dt_value=next_dt_value,
                 recent_reject_count_value=recent_reject_count_value,
@@ -7651,7 +7651,7 @@ def build_realized_trace_checkpoint_compare_report(
         lambda carry_value, carry_dot_value, dt_value, next_dt_value, recent_reject_count_value, regrowth_cooldown_value, easy_growth_streak_value, lagged_response_valid_value: jax.jvp(
             lambda c: _attempt_update(
                 c,
-                _execute_radau_accepted_step_attempt,
+                attempt_fn=_execute_radau_accepted_step_attempt,
                 dt_value=dt_value,
                 next_dt_value=next_dt_value,
                 recent_reject_count_value=recent_reject_count_value,
