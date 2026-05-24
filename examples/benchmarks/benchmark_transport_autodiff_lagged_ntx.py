@@ -5296,14 +5296,15 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
 
-    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+    _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
-        use_realized_schedule_jvp=True,
+        use_realized_schedule_jvp=False,
+        accepted_step_limit_override=checkpoint_index,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -6612,8 +6613,7 @@ def build_baseline_dt_path_second_step_carry_ablation_report(
 
     def _attempt_update(
         carry_value,
-        *,
-        use_custom: bool,
+        attempt_fn,
         dt_value,
         next_dt_value,
         recent_reject_count_value,
@@ -7630,24 +7630,65 @@ def build_realized_trace_checkpoint_compare_report(
     direct_carry = carry0
     direct_carry_dot = carry0_dot
 
-    for idx in accepted_attempt_indices:
-        kwargs = {
-            "dt_value": attempted_dts[idx],
-            "next_dt_value": next_dts[idx],
-            "recent_reject_count_value": next_recent_reject_count[idx],
-            "regrowth_cooldown_value": next_regrowth_cooldown[idx],
-            "easy_growth_streak_value": next_easy_growth_streak[idx],
-            "lagged_response_valid_value": next_lagged_response_valid[idx],
-        }
-        custom_carry, custom_carry_dot = jax.jvp(
-            lambda c, kwargs=kwargs: _attempt_update(c, use_custom=True, **kwargs),
-            (custom_carry,),
-            (custom_carry_dot,),
+    compiled_custom_attempt_update = jax.jit(
+        lambda carry_value, carry_dot_value, dt_value, next_dt_value, recent_reject_count_value, regrowth_cooldown_value, easy_growth_streak_value, lagged_response_valid_value: jax.jvp(
+            lambda c: _attempt_update(
+                c,
+                _execute_radau_accepted_step_attempt_autodiff,
+                dt_value,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+            ),
+            (carry_value,),
+            (carry_dot_value,),
         )
-        direct_carry, direct_carry_dot = jax.jvp(
-            lambda c, kwargs=kwargs: _attempt_update(c, use_custom=False, **kwargs),
-            (direct_carry,),
-            (direct_carry_dot,),
+    )
+    compiled_direct_attempt_update = jax.jit(
+        lambda carry_value, carry_dot_value, dt_value, next_dt_value, recent_reject_count_value, regrowth_cooldown_value, easy_growth_streak_value, lagged_response_valid_value: jax.jvp(
+            lambda c: _attempt_update(
+                c,
+                _execute_radau_accepted_step_attempt,
+                dt_value,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+            ),
+            (carry_value,),
+            (carry_dot_value,),
+        )
+    )
+
+    for idx in accepted_attempt_indices:
+        dt_value = jnp.asarray(attempted_dts[idx], dtype=execution_context.dtype)
+        next_dt_value = jnp.asarray(next_dts[idx], dtype=execution_context.dtype)
+        recent_reject_count_value = jnp.asarray(next_recent_reject_count[idx])
+        regrowth_cooldown_value = jnp.asarray(next_regrowth_cooldown[idx])
+        easy_growth_streak_value = jnp.asarray(next_easy_growth_streak[idx])
+        lagged_response_valid_value = jnp.asarray(next_lagged_response_valid[idx])
+        custom_carry, custom_carry_dot = compiled_custom_attempt_update(
+            custom_carry,
+            custom_carry_dot,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        )
+        direct_carry, direct_carry_dot = compiled_direct_attempt_update(
+            direct_carry,
+            direct_carry_dot,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
         )
 
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
