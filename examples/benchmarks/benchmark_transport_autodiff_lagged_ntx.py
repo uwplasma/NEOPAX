@@ -1439,6 +1439,135 @@ def _manual_sampled_realized_trace_state_tangent_trajectory(
     }
 
 
+def _manual_realized_trace_state_tangent_checkpoints(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+    accepted_checkpoints: tuple[int, ...],
+    use_custom: bool,
+):
+    checkpoints = tuple(sorted({int(v) for v in accepted_checkpoints if int(v) >= 1}))
+    if not checkpoints:
+        return {"times": jnp.zeros((0,), dtype=execution_context.dtype), "state_tangents": jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype), "accepted_indices": ()}
+
+    accepted_mask_np = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask_np = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    attempted_dts_np = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
+    next_dts_np = np.asarray(jax.device_get(trace.next_dts), dtype=float)
+    next_recent_reject_count_np = np.asarray(jax.device_get(trace.next_recent_reject_count))
+    next_regrowth_cooldown_np = np.asarray(jax.device_get(trace.next_regrowth_cooldown))
+    next_easy_growth_streak_np = np.asarray(jax.device_get(trace.next_easy_growth_streak))
+    next_lagged_response_valid_np = np.asarray(jax.device_get(trace.next_lagged_response_valid))
+    step_ts_np = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+
+    attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
+    project_flat = execution_context.physics_context.project_flat
+    carry = carry0
+    carry_dot = carry0_dot
+    accepted_seen = 0
+    checkpoint_ptr = 0
+    sampled_times: list[float] = []
+    sampled_tangents: list[np.ndarray] = []
+
+    for idx in range(len(active_mask_np)):
+        if not active_mask_np[idx]:
+            continue
+        if checkpoint_ptr >= len(checkpoints):
+            break
+
+        accepted = bool(accepted_mask_np[idx])
+        dt_value = jnp.asarray(attempted_dts_np[idx], dtype=execution_context.dtype)
+        next_dt_value = jnp.asarray(next_dts_np[idx], dtype=execution_context.dtype)
+        recent_reject_count_value = jnp.asarray(next_recent_reject_count_np[idx])
+        regrowth_cooldown_value = jnp.asarray(next_regrowth_cooldown_np[idx])
+        easy_growth_streak_value = jnp.asarray(next_easy_growth_streak_np[idx])
+        lagged_response_valid_value = jnp.asarray(next_lagged_response_valid_np[idx])
+
+        def _accepted_attempt(carry_value):
+            carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+            attempt_result = attempt_fn(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+            if accepted_y is None:
+                accepted_y = attempt_result.trial_y
+            return dataclasses.replace(
+                attempt_result.carry_after_attempt,
+                t=carry_value.t + dt_value,
+                y=accepted_y,
+                dt=next_dt_value,
+                prev_error=jnp.maximum(attempt_result.err_norm, jnp.asarray(1.0e-12, dtype=execution_context.dtype)),
+                prev_stages=attempt_result.stage_history,
+                prev_dt=dt_value,
+                recent_reject_count=recent_reject_count_value,
+                regrowth_cooldown=regrowth_cooldown_value,
+                easy_growth_streak=easy_growth_streak_value,
+                lagged_response_valid=lagged_response_valid_value,
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+
+        def _rejected_attempt(carry_value):
+            carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+            attempt_result = attempt_fn(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            return dataclasses.replace(
+                carry_value,
+                dt=next_dt_value,
+                recent_reject_count=recent_reject_count_value,
+                regrowth_cooldown=regrowth_cooldown_value,
+                easy_growth_streak=easy_growth_streak_value,
+                lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+                lagged_response_valid=lagged_response_valid_value,
+                lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+                jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+                cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+                cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+                cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+                real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+                real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+                complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+                complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+                prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+                prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+            )
+
+        step_fn = _accepted_attempt if accepted else _rejected_attempt
+        carry, carry_dot = jax.jvp(step_fn, (carry,), (carry_dot,))
+
+        if accepted:
+            accepted_seen += 1
+            if accepted_seen == checkpoints[checkpoint_ptr]:
+                sampled_times.append(float(step_ts_np[idx]))
+                sampled_tangents.append(np.asarray(jax.device_get(carry_dot.y), dtype=float))
+                checkpoint_ptr += 1
+
+    if sampled_tangents:
+        tangent_array = jnp.asarray(np.stack(sampled_tangents, axis=0), dtype=execution_context.dtype)
+        times_array = jnp.asarray(np.asarray(sampled_times, dtype=float), dtype=execution_context.dtype)
+    else:
+        tangent_array = jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype)
+        times_array = jnp.zeros((0,), dtype=execution_context.dtype)
+    return {"times": times_array, "state_tangents": tangent_array, "accepted_indices": checkpoints}
+
+
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     parameter_value,
     *,
@@ -2717,6 +2846,36 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"fail_code={diag.get('fail_code')}"
         )
         print("[autodiff-gate] accepted-step realized-trace state-tangent errors:")
+        for entry in report.get("entries", []):
+            print(
+                "  - "
+                f"accepted_index={int(entry.get('accepted_index'))} "
+                f"time={float(entry.get('time')):.6e} "
+                f"full_state_rel_err={float(entry.get('full_state_relative_error')):.6e} "
+                f"density_rel_err={float(entry.get('density_relative_error')):.6e} "
+                f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+            )
+        return
+
+    if report.get("realized_trace_sparse_checkpoint_compare_check"):
+        print(
+            f"[autodiff-gate] mode=realized_trace_sparse_checkpoint_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"checkpoints={','.join(str(v) for v in report.get('checkpoint_counts', []))}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] sparse realized-trace checkpoint errors:")
         for entry in report.get("entries", []):
             print(
                 "  - "
@@ -5371,6 +5530,157 @@ def build_realized_trace_safe_state_trajectory_compare_report(
         "rollout_path": {"baseline": baseline_diag},
     }
 
+def build_realized_trace_sparse_checkpoint_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    checkpoint_counts: tuple[int, ...],
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    checkpoints = tuple(sorted({int(v) for v in checkpoint_counts if int(v) >= 1}))
+    if not checkpoints:
+        raise ValueError("checkpoint_counts must contain at least one positive accepted-step index.")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    total_accepted = int(np.sum(np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)))
+    max_checkpoint = max(checkpoints)
+    if max_checkpoint > total_accepted:
+        raise ValueError(f"Requested checkpoint {max_checkpoint} exceeds accepted-count {total_accepted}.")
+    checkpoint_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=max_checkpoint,
+    )
+
+    print(
+        "[autodiff-gate] realized-trace-sparse-checkpoints baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"checkpoints={','.join(str(v) for v in checkpoints)}",
+        flush=True,
+    )
+
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    print("[autodiff-gate] realized-trace-sparse-checkpoints progress: running custom checkpoints", flush=True)
+    custom_result = _manual_realized_trace_state_tangent_checkpoints(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=checkpoint_trace,
+        accepted_checkpoints=checkpoints,
+        use_custom=True,
+    )
+    print("[autodiff-gate] realized-trace-sparse-checkpoints progress: custom complete; running direct checkpoints", flush=True)
+    direct_result = _manual_realized_trace_state_tangent_checkpoints(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=checkpoint_trace,
+        accepted_checkpoints=checkpoints,
+        use_custom=False,
+    )
+
+    custom_np = np.asarray(jax.device_get(custom_result["state_tangents"]), dtype=float)
+    direct_np = np.asarray(jax.device_get(direct_result["state_tangents"]), dtype=float)
+    sampled_times_np = np.asarray(jax.device_get(custom_result["times"]), dtype=float)
+    unpack_flat = prepared_rollout_static.physics_context.unpack_flat
+
+    def _rel_norm(a: np.ndarray, b: np.ndarray) -> float:
+        num = float(np.linalg.norm(a - b))
+        den = max(float(np.linalg.norm(b)), 1.0e-10)
+        return num / den
+
+    entries = []
+    global_max_rel_error = 0.0
+    for idx, accepted_idx in enumerate(checkpoints):
+        custom_step = custom_np[idx]
+        direct_step = direct_np[idx]
+        custom_state = unpack_flat(jnp.asarray(custom_step))
+        direct_state = unpack_flat(jnp.asarray(direct_step))
+        custom_density = np.asarray(jax.device_get(custom_state.density), dtype=float)
+        direct_density = np.asarray(jax.device_get(direct_state.density), dtype=float)
+        custom_pressure = np.asarray(jax.device_get(custom_state.pressure), dtype=float)
+        direct_pressure = np.asarray(jax.device_get(direct_state.pressure), dtype=float)
+        custom_er = np.asarray(jax.device_get(custom_state.Er), dtype=float)
+        direct_er = np.asarray(jax.device_get(direct_state.Er), dtype=float)
+        full_rel = _rel_norm(custom_step, direct_step)
+        density_rel = _rel_norm(custom_density, direct_density)
+        pressure_rel = _rel_norm(custom_pressure, direct_pressure)
+        er_rel = _rel_norm(custom_er, direct_er)
+        global_max_rel_error = max(global_max_rel_error, full_rel, density_rel, pressure_rel, er_rel)
+        entries.append(
+            {
+                "accepted_index": int(accepted_idx),
+                "time": float(sampled_times_np[idx]),
+                "full_state_relative_error": float(full_rel),
+                "density_relative_error": float(density_rel),
+                "pressure_relative_error": float(pressure_rel),
+                "Er_relative_error": float(er_rel),
+            }
+        )
+
+    return {
+        "config_path": str(config_path),
+        "realized_trace_sparse_checkpoint_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "checkpoint_counts": [int(v) for v in checkpoints],
+        "entries": entries,
+        "max_relative_error": float(global_max_rel_error),
+        "passed": bool(np.isfinite(global_max_rel_error) and global_max_rel_error <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
 
 def build_baseline_dt_path_first_step_field_compare_report(
     *,
@@ -7640,6 +7950,16 @@ def main() -> None:
         help="Dedicated opt-in mode: compare custom vs direct on the sixth accepted realized-trace step and ablate carried step-5 tangent fields one at a time.",
     )
     parser.add_argument(
+        "--realized-trace-sparse-checkpoint-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: compare realized-trace custom vs direct only at a small set of accepted-step checkpoints.",
+    )
+    parser.add_argument(
+        "--realized-trace-sparse-checkpoint-counts",
+        default="6,10,20,45",
+        help="Comma-separated accepted-step checkpoints used by --realized-trace-sparse-checkpoint-compare-check.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-first-step-field-compare-check",
         action="store_true",
         help="Dedicated opt-in mode: compare adaptive vs direct fixed-dt tangent fields at the first accepted step only.",
@@ -7849,6 +8169,13 @@ def main() -> None:
             config_path=args.config,
             parameter_name=args.parameter,
             device=args.device,
+        )
+    elif args.realized_trace_sparse_checkpoint_compare_check:
+        report = build_realized_trace_sparse_checkpoint_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            checkpoint_counts=_parse_int_csv(args.realized_trace_sparse_checkpoint_counts),
         )
     elif args.baseline_dt_path_first_step_field_compare_check:
         report = build_baseline_dt_path_first_step_field_compare_report(
