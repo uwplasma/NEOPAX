@@ -274,6 +274,7 @@ def _adaptive_rollout_final_state_for_parameter(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     use_realized_schedule_jvp: bool = False,
+    accepted_step_limit_override: int | None = None,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -314,7 +315,11 @@ def _adaptive_rollout_final_state_for_parameter(
             species=runtime.species,
         )
         max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-        stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
         final_y = _radau_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
@@ -343,7 +348,11 @@ def _adaptive_rollout_final_state_for_parameter(
             prepared_rollout=prepared_rollout,
         )
         max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-        stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
         rollout = _radau_adaptive_final_state_rollout(
             execution_context,
             prepared_rollout.initial_carry,
@@ -363,6 +372,7 @@ def _adaptive_rollout_objectives_for_parameter(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     use_realized_schedule_jvp: bool = False,
+    accepted_step_limit_override: int | None = None,
 ):
     final_state, rollout = _adaptive_rollout_final_state_for_parameter(
         parameter_value,
@@ -372,6 +382,7 @@ def _adaptive_rollout_objectives_for_parameter(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=use_realized_schedule_jvp,
+        accepted_step_limit_override=accepted_step_limit_override,
     )
     return _objective_vector(final_state, runtime), rollout
 
@@ -4960,6 +4971,7 @@ def build_baseline_dt_path_safe_compose_scan_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
+        accepted_step_limit_override=max_checkpoint,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -5103,6 +5115,7 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
+        accepted_step_limit_override=checkpoint_index,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -5570,6 +5583,7 @@ def build_realized_trace_sparse_checkpoint_compare_report(
     checkpoints = tuple(sorted({int(v) for v in checkpoint_counts if int(v) >= 1}))
     if not checkpoints:
         raise ValueError("checkpoint_counts must contain at least one positive accepted-step index.")
+    max_checkpoint = max(checkpoints)
 
     config = _prepare_benchmark_config(config_path, device=device)
     runtime, baseline_state = build_runtime_context(config)
@@ -5584,10 +5598,10 @@ def build_realized_trace_sparse_checkpoint_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=True,
+        accepted_step_limit_override=max_checkpoint,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     total_accepted = int(np.sum(np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)))
-    max_checkpoint = max(checkpoints)
     if max_checkpoint > total_accepted:
         raise ValueError(f"Requested checkpoint {max_checkpoint} exceeds accepted-count {total_accepted}.")
     checkpoint_trace = _truncate_rollout_trace_by_accepted_steps(
@@ -5694,6 +5708,15 @@ def build_realized_trace_sparse_checkpoint_compare_report(
                 "pressure_relative_error": float(pressure_rel),
                 "Er_relative_error": float(er_rel),
             }
+        )
+        print(
+            "[autodiff-gate] sparse checkpoint comparison: "
+            f"accepted_index={int(accepted_idx)} "
+            f"time={float(sampled_times_np[idx]):.6e} "
+            f"full_rel_err={float(full_rel):.6e} "
+            f"pressure_rel_err={float(pressure_rel):.6e} "
+            f"Er_rel_err={float(er_rel):.6e}",
+            flush=True,
         )
 
     return {
