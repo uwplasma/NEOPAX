@@ -2797,6 +2797,47 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 )
         return
 
+    if report.get("realized_trace_sixth_step_carry_ablation_check"):
+        print(
+            f"[autodiff-gate] mode=realized_trace_sixth_step_carry_ablation "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"sixth_step_time={report.get('sixth_step_time'):.6e}"
+        )
+        path = report.get("rollout_path", {})
+        diag = path.get("baseline", {})
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
+        print("[autodiff-gate] sixth-step comparisons:")
+        for label in ("custom_vs_direct", "carry_after_step5_custom_vs_direct"):
+            entry = report.get(label, {}).get("trial_y", {})
+            print(
+                "  - "
+                f"{label}: "
+                f"full_rel_err={float(entry.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+            )
+        ablations = report.get("carry_field_ablations") or {}
+        if ablations:
+            print("[autodiff-gate] sixth-step carry-field ablations:")
+            for label, section in ablations.items():
+                direct_entry = section.get("ablated_direct_vs_direct", {}).get("trial_y", {})
+                custom_entry = section.get("custom_vs_ablated_direct", {}).get("trial_y", {})
+                print(
+                    "  - "
+                    f"{label}: "
+                    f"ablated_direct_Er_rel_err={float(direct_entry.get('Er_relative_error')):.6e} "
+                    f"custom_vs_ablated_Er_rel_err={float(custom_entry.get('Er_relative_error')):.6e}"
+                )
+        return
+
     if report.get("realized_schedule_rollout_check"):
         print(
             f"[autodiff-gate] mode=realized_schedule_rollout "
@@ -6571,6 +6612,300 @@ def build_baseline_dt_path_third_step_carry_ablation_report(
     }
 
 
+def build_realized_trace_sixth_step_carry_ablation_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+
+    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+
+    accepted_mask_np = np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)
+    accepted_attempt_indices = np.flatnonzero(accepted_mask_np)
+    if accepted_attempt_indices.size < 6:
+        raise ValueError("Need at least six accepted attempts for sixth-step carry ablation debug.")
+    accepted_attempt_indices = [int(v) for v in accepted_attempt_indices[:6]]
+
+    print(
+        "[autodiff-gate] realized-trace-sixth-step-carry baseline summary: "
+        f"attempt_count={baseline_diag['attempt_count']} "
+        f"accepted_count={baseline_diag['accepted_count']} "
+        f"sixth_accepted_attempt={accepted_attempt_indices[5]}",
+        flush=True,
+    )
+
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(jnp.asarray(baseline_value)),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver_static = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver_static,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver_static,
+        prepared_rollout=prepared_rollout_static,
+    )
+
+    carry0, carry0_dot = jax.jvp(
+        lambda p: _adaptive_rollout_initial_carry_for_parameter(
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        ),
+        (jnp.asarray(baseline_value),),
+        (jnp.asarray(1.0),),
+    )
+
+    attempted_dts = np.asarray(jax.device_get(baseline_rollout.trace.attempted_dts), dtype=float)
+    next_dts = np.asarray(jax.device_get(baseline_rollout.trace.next_dts), dtype=float)
+    next_recent_reject_count = np.asarray(jax.device_get(baseline_rollout.trace.next_recent_reject_count))
+    next_regrowth_cooldown = np.asarray(jax.device_get(baseline_rollout.trace.next_regrowth_cooldown))
+    next_easy_growth_streak = np.asarray(jax.device_get(baseline_rollout.trace.next_easy_growth_streak))
+    next_lagged_response_valid = np.asarray(jax.device_get(baseline_rollout.trace.next_lagged_response_valid))
+    step_ts = np.asarray(jax.device_get(baseline_rollout.trace.step_ts), dtype=float)
+
+    def _zero_optional_pytree(tree):
+        return jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            tree,
+            is_leaf=lambda x: x is None,
+        )
+
+    def _attempt_update(
+        carry_value,
+        *,
+        use_custom: bool,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(carry_value, dt=jnp.asarray(dt_value, dtype=execution_context.dtype))
+        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
+        attempt_result = attempt_fn(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        project_flat = execution_context.physics_context.project_flat
+        accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+        if accepted_y is None:
+            accepted_y = attempt_result.trial_y
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + jnp.asarray(dt_value, dtype=execution_context.dtype),
+            y=accepted_y,
+            dt=jnp.asarray(next_dt_value, dtype=execution_context.dtype),
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=jnp.asarray(dt_value, dtype=execution_context.dtype),
+            recent_reject_count=jnp.asarray(recent_reject_count_value),
+            regrowth_cooldown=jnp.asarray(regrowth_cooldown_value),
+            easy_growth_streak=jnp.asarray(easy_growth_streak_value),
+            lagged_response_valid=jnp.asarray(lagged_response_valid_value),
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    step_kwargs = []
+    for idx in accepted_attempt_indices:
+        step_kwargs.append(
+            {
+                "dt_value": attempted_dts[idx],
+                "next_dt_value": next_dts[idx],
+                "recent_reject_count_value": next_recent_reject_count[idx],
+                "regrowth_cooldown_value": next_regrowth_cooldown[idx],
+                "easy_growth_streak_value": next_easy_growth_streak[idx],
+                "lagged_response_valid_value": next_lagged_response_valid[idx],
+            }
+        )
+
+    custom_carry = carry0
+    custom_carry_dot = carry0_dot
+    direct_carry = carry0
+    direct_carry_dot = carry0_dot
+    carry_after_step5_custom_dot = None
+    carry_after_step5_direct_dot = None
+    custom_step6_result = None
+    direct_step6_result = None
+
+    for i, kwargs in enumerate(step_kwargs):
+        custom_carry, custom_carry_dot = jax.jvp(
+            lambda c, kwargs=kwargs: _attempt_update(c, use_custom=True, **kwargs),
+            (custom_carry,),
+            (custom_carry_dot,),
+        )
+        direct_carry, direct_carry_dot = jax.jvp(
+            lambda c, kwargs=kwargs: _attempt_update(c, use_custom=False, **kwargs),
+            (direct_carry,),
+            (direct_carry_dot,),
+        )
+        if i == 4:
+            carry_after_step5_custom_dot = custom_carry_dot
+            carry_after_step5_direct_dot = direct_carry_dot
+        if i == 5:
+            custom_step6_result = custom_carry_dot
+            direct_step6_result = direct_carry_dot
+
+    def _direct_step6_with_ablation(**replacements):
+        ablated_dot = dataclasses.replace(carry_after_step5_direct_dot, **replacements)
+        _, tangent = jax.jvp(
+            lambda c: _attempt_update(c, use_custom=False, **step_kwargs[5]),
+            (direct_carry,),
+            (ablated_dot,),
+        )
+        return tangent
+
+    unpack_flat = prepared_rollout_static.physics_context.unpack_flat
+
+    def _field_relative_errors(ad_state, ref_state):
+        ad_pressure = np.asarray(jax.device_get(ad_state.pressure), dtype=float)
+        ref_pressure = np.asarray(jax.device_get(ref_state.pressure), dtype=float)
+        ad_er = np.asarray(jax.device_get(ad_state.Er), dtype=float)
+        ref_er = np.asarray(jax.device_get(ref_state.Er), dtype=float)
+        return {
+            "pressure_relative_error": float(
+                np.linalg.norm(ad_pressure - ref_pressure)
+                / max(float(np.linalg.norm(ref_pressure)), 1.0e-10)
+            ),
+            "Er_relative_error": float(
+                np.linalg.norm(ad_er - ref_er)
+                / max(float(np.linalg.norm(ref_er)), 1.0e-10)
+            ),
+        }
+
+    def _flat_component_report(ad_arr, ref_arr):
+        ad_flat = np.asarray(jax.device_get(ad_arr), dtype=float)
+        ref_flat = np.asarray(jax.device_get(ref_arr), dtype=float)
+        ad_state = unpack_flat(jnp.asarray(ad_flat))
+        ref_state = unpack_flat(jnp.asarray(ref_flat))
+        report = _field_relative_errors(ad_state, ref_state)
+        report["full_relative_error"] = float(
+            np.linalg.norm(ad_flat - ref_flat) / max(float(np.linalg.norm(ref_flat)), 1.0e-10)
+        )
+        return report
+
+    custom_vs_direct = {
+        "trial_y": _flat_component_report(custom_step6_result.y, direct_step6_result.y),
+    }
+    carry_after_step5_custom_vs_direct = {
+        "trial_y": _flat_component_report(carry_after_step5_custom_dot.y, carry_after_step5_direct_dot.y),
+    }
+
+    ablation_specs = {
+        "prev_stages_zeroed": {
+            "prev_stages": jnp.zeros_like(carry_after_step5_direct_dot.prev_stages),
+        },
+        "prev_dt_zeroed": {
+            "prev_dt": jnp.zeros_like(carry_after_step5_direct_dot.prev_dt),
+        },
+        "prev_theta_final_zeroed": {
+            "prev_theta_final": jnp.zeros_like(carry_after_step5_direct_dot.prev_theta_final),
+        },
+        "prev_newton_iter_count_zeroed": {
+            "prev_newton_iter_count": jnp.zeros(
+                carry_after_step5_direct_dot.prev_newton_iter_count.shape,
+                dtype=carry_after_step5_direct_dot.prev_newton_iter_count.dtype,
+            ),
+        },
+        "lagged_response_cache_zeroed": {
+            "lagged_response_cache": _zero_optional_pytree(carry_after_step5_direct_dot.lagged_response_cache),
+        },
+        "lagged_reference_y_zeroed": {
+            "lagged_reference_y": jnp.zeros_like(carry_after_step5_direct_dot.lagged_reference_y),
+        },
+        "linearization_cache_zeroed": {
+            "jacobian": jnp.zeros_like(carry_after_step5_direct_dot.jacobian),
+            "cache_valid": jnp.zeros_like(carry_after_step5_direct_dot.cache_valid),
+            "cache_dt": jnp.zeros_like(carry_after_step5_direct_dot.cache_dt),
+            "cache_age": jnp.zeros_like(carry_after_step5_direct_dot.cache_age),
+            "real_lu": jnp.zeros_like(carry_after_step5_direct_dot.real_lu),
+            "real_piv": jnp.zeros(carry_after_step5_direct_dot.real_piv.shape, dtype=carry_after_step5_direct_dot.real_piv.dtype),
+            "complex_lu": jnp.zeros_like(carry_after_step5_direct_dot.complex_lu),
+            "complex_piv": jnp.zeros(carry_after_step5_direct_dot.complex_piv.shape, dtype=carry_after_step5_direct_dot.complex_piv.dtype),
+        },
+        "step_history_meta_zeroed": {
+            "prev_error": jnp.zeros_like(carry_after_step5_direct_dot.prev_error),
+            "prev_dt": jnp.zeros_like(carry_after_step5_direct_dot.prev_dt),
+            "prev_theta_final": jnp.zeros_like(carry_after_step5_direct_dot.prev_theta_final),
+            "prev_newton_iter_count": jnp.zeros(
+                carry_after_step5_direct_dot.prev_newton_iter_count.shape,
+                dtype=carry_after_step5_direct_dot.prev_newton_iter_count.dtype,
+            ),
+        },
+    }
+
+    carry_field_ablations = {}
+    for label, replacements in ablation_specs.items():
+        ablated_direct_step6 = _direct_step6_with_ablation(**replacements)
+        carry_field_ablations[label] = {
+            "ablated_direct_vs_direct": {
+                "trial_y": _flat_component_report(ablated_direct_step6.y, direct_step6_result.y),
+            },
+            "custom_vs_ablated_direct": {
+                "trial_y": _flat_component_report(custom_step6_result.y, ablated_direct_step6.y),
+            },
+        }
+
+    return {
+        "config_path": str(config_path),
+        "realized_trace_sixth_step_carry_ablation_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "sixth_step_time": float(step_ts[accepted_attempt_indices[5]]),
+        "custom_vs_direct": custom_vs_direct,
+        "carry_after_step5_custom_vs_direct": carry_after_step5_custom_vs_direct,
+        "carry_field_ablations": carry_field_ablations,
+        "max_relative_error": float(custom_vs_direct["trial_y"]["Er_relative_error"]),
+        "passed": bool(custom_vs_direct["trial_y"]["Er_relative_error"] <= 5.0e-2),
+        "rollout_path": {"baseline": baseline_diag},
+    }
+
+
 def build_realized_schedule_windowed_frozen_fd_report(
     *,
     config_path: Path,
@@ -7114,6 +7449,11 @@ def main() -> None:
         help="Dedicated opt-in mode: run one realized-trace custom state-tangent trajectory and one realized-trace direct state-tangent trajectory on the same safe frozen trace.",
     )
     parser.add_argument(
+        "--realized-trace-sixth-step-carry-ablation-check",
+        action="store_true",
+        help="Dedicated opt-in mode: compare custom vs direct on the sixth accepted realized-trace step and ablate carried step-5 tangent fields one at a time.",
+    )
+    parser.add_argument(
         "--baseline-dt-path-first-step-field-compare-check",
         action="store_true",
         help="Dedicated opt-in mode: compare adaptive vs direct fixed-dt tangent fields at the first accepted step only.",
@@ -7317,6 +7657,12 @@ def main() -> None:
             known_first_bad_attempt_index=args.known_first_bad_attempt_index,
             safe_attempt_margin=args.safe_attempt_margin,
             sample_every=args.baseline_dt_path_safe_trajectory_sample_every,
+        )
+    elif args.realized_trace_sixth_step_carry_ablation_check:
+        report = build_realized_trace_sixth_step_carry_ablation_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
         )
     elif args.baseline_dt_path_first_step_field_compare_check:
         report = build_baseline_dt_path_first_step_field_compare_report(
