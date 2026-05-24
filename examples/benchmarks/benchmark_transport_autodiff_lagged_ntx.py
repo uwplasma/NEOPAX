@@ -8172,17 +8172,17 @@ def main() -> None:
     parser.add_argument(
         "--baseline-dt-path-safe-trajectory-compare-check",
         action="store_true",
-        help="Dedicated opt-in mode: run one realized-trace adaptive AD trajectory and one fixed-dt direct AD trajectory, then compare per-accepted-step objective tangents along the safe baseline path.",
+        help="Heavy opt-in mode: run one realized-trace adaptive AD trajectory and one fixed-dt direct AD trajectory, then compare per-accepted-step objective tangents along the safe baseline path.",
     )
     parser.add_argument(
         "--baseline-dt-path-safe-state-trajectory-compare-check",
         action="store_true",
-        help="Dedicated opt-in mode: run one realized-trace adaptive state-tangent trajectory and one fixed-dt direct state-tangent trajectory, then compare state-slice mismatches along the safe baseline path.",
+        help="Heavy opt-in mode: run one realized-trace adaptive state-tangent trajectory and one fixed-dt direct state-tangent trajectory, then compare state-slice mismatches along the safe baseline path.",
     )
     parser.add_argument(
         "--realized-trace-safe-state-trajectory-compare-check",
         action="store_true",
-        help="Dedicated opt-in mode: run one realized-trace custom state-tangent trajectory and one realized-trace direct state-tangent trajectory on the same safe frozen trace.",
+        help="Heavy opt-in mode: run one realized-trace custom state-tangent trajectory and one realized-trace direct state-tangent trajectory on the same safe frozen trace.",
     )
     parser.add_argument(
         "--realized-trace-sixth-step-carry-ablation-check",
@@ -8207,8 +8207,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--realized-trace-sparse-checkpoint-counts",
-        default="6,10,20,45",
+        default="10,20",
         help="Comma-separated accepted-step checkpoints used by --realized-trace-sparse-checkpoint-compare-check.",
+    )
+    parser.add_argument(
+        "--allow-heavy-trajectory-diagnostics",
+        action="store_true",
+        help="Allow RAM-heavy full-trajectory diagnostics. Without this flag, use cheap checkpoint/localized modes instead.",
     )
     parser.add_argument(
         "--baseline-dt-path-first-step-field-compare-check",
@@ -8310,6 +8315,21 @@ def main() -> None:
     parser.add_argument("--outdir", type=Path, default=Path("outputs/autodiff_transport_lagged_ntx"))
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
+
+    heavy_trajectory_flags = (
+        args.baseline_dt_path_safe_trajectory_compare_check,
+        args.baseline_dt_path_safe_state_trajectory_compare_check,
+        args.realized_trace_safe_state_trajectory_compare_check,
+    )
+    if any(heavy_trajectory_flags) and not args.allow_heavy_trajectory_diagnostics:
+        raise SystemExit(
+            "Refusing to run RAM-heavy trajectory diagnostics without "
+            "--allow-heavy-trajectory-diagnostics. "
+            "Use cheap checkpoint modes instead, for example: "
+            "--realized-trace-checkpoint-compare-check --realized-trace-checkpoint-index 10 "
+            "or --realized-trace-sparse-checkpoint-compare-check "
+            "--realized-trace-sparse-checkpoint-counts 10,20."
+        )
 
     if args.realized_schedule_ad_debug_fast:
         report = build_realized_schedule_ad_debug_fast_report(

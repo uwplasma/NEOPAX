@@ -3144,8 +3144,17 @@ python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --paramete
 If later we want a small batch, use sparse checkpoints only:
 
 ```bash
-python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-sparse-checkpoint-compare-check --realized-trace-sparse-checkpoint-counts 6,10,20,45
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-sparse-checkpoint-compare-check --realized-trace-sparse-checkpoint-counts 10,20
 ```
+
+Full-trajectory compare modes are now treated as RAM-heavy diagnostics and should
+only be run with:
+
+```bash
+--allow-heavy-trajectory-diagnostics
+```
+
+Without that override, prefer the checkpoint-localized modes above.
 
 These modes were added specifically to avoid the RAM blow-up from full
 trajectory scans.
