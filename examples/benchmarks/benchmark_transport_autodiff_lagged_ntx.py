@@ -5284,7 +5284,7 @@ def build_realized_trace_safe_state_trajectory_compare_report(
     )
 
     print("[autodiff-gate] realized-trace-safe-state-trajectory progress: running realized-trace custom state tangent trajectory", flush=True)
-    custom_result = _manual_sampled_realized_trace_state_tangent_trajectory(
+    custom_result = _sampled_realized_trace_state_tangent_trajectory(
         execution_context=execution_context,
         carry0=carry0,
         carry0_dot=carry0_dot,
@@ -5293,7 +5293,7 @@ def build_realized_trace_safe_state_trajectory_compare_report(
         use_custom=True,
     )
     print("[autodiff-gate] realized-trace-safe-state-trajectory progress: custom trajectory complete; running realized-trace direct state tangent trajectory", flush=True)
-    direct_result = _manual_sampled_realized_trace_state_tangent_trajectory(
+    direct_result = _sampled_realized_trace_state_tangent_trajectory(
         execution_context=execution_context,
         carry0=carry0,
         carry0_dot=carry0_dot,
