@@ -3018,3 +3018,144 @@ Decision rule:
 
 - if `custom_vs_restricted_direct` is much smaller than `custom_vs_direct`, then the missing derivative route is in ignored carry-field tangents
 - if it is not much smaller, then the accepted-step custom tangent math itself is still the main bug site
+
+### 2026-05-24 checkpoint
+
+Current status has moved materially beyond the 2026-05-23 first-step picture.
+
+#### What was fixed
+
+The main accepted-step custom JVP bug we found was in the tangent handling for:
+
+- `lagged_response_cache`
+
+Two distinct issues were patched:
+
+1. the lagged-response tangent contribution into the local accepted-step tangent
+   solve
+2. the tangent of the **output** lagged-response cache carried to the next step
+   (instead of incorrectly reusing the old input cache tangent as a placeholder)
+
+That second fix was the important multi-step one.
+
+#### What became exact after the fix
+
+Cheap localized realized-trace custom-vs-direct checks now show:
+
+- step 1: essentially exact
+- step 2: essentially exact
+- step 3: essentially exact
+- step 6: essentially exact
+
+Important commands/results:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-second-step-carry-ablation-check
+```
+
+Observed after the cache-output tangent fix:
+
+- `custom_vs_direct Er_rel_err ~ 9.69e-14`
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --baseline-dt-path-third-step-carry-ablation-check
+```
+
+Observed:
+
+- `custom_vs_direct Er_rel_err ~ 6.24e-11`
+- `custom_scan_vs_manual Er_rel_err ~ 3.94e-11`
+- `direct_scan_vs_manual Er_rel_err ~ 5.08e-02`
+
+Interpretation:
+
+- the custom accepted-step JVP itself is fine at step 3
+- the old trajectory helper/direct reference plumbing was part of the apparent
+  mismatch
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-sixth-step-carry-ablation-check
+```
+
+Observed:
+
+- `custom_vs_direct Er_rel_err ~ 3.37e-11`
+- `carry_after_step5_custom_vs_direct Er_rel_err ~ 4.93e-11`
+
+Interpretation:
+
+- the realized-trace custom JVP and realized-trace direct JVP match through at
+  least accepted step 6
+
+#### What is no longer the main problem
+
+At this point the evidence no longer supports:
+
+- "the accepted-step custom solver JVP is still broadly wrong"
+
+Instead, the remaining contradictions are now primarily in the **benchmark /
+trajectory debug helpers** and in **target mismatch** between:
+
+- realized-trace derivative targets
+- fixed-`dt` accepted-path derivative targets
+
+#### Important benchmark interpretation change
+
+The comparison:
+
+- custom realized-trace AD vs fixed-`dt` direct AD
+
+is not the same derivative target once history/carry dependence matters.
+So large mismatch there is no longer sufficient evidence that the custom JVP is
+wrong.
+
+The cleaner target is:
+
+- realized-trace custom AD vs realized-trace direct AD
+
+and localized checkpoint checks now support that this is matching well at least
+through step 6.
+
+#### Practical debugging policy from here
+
+Do **not** keep using the heavy long trajectory diagnostics as the main truth
+source. They were:
+
+- RAM-heavy
+- slow
+- and in some cases comparing mixed targets or buggy helper paths
+
+Instead, use only cheap localized checkpoint tests.
+
+#### Recommended low-cost validation path
+
+Use one accepted-step checkpoint at a time:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-checkpoint-compare-check --realized-trace-checkpoint-index 10
+```
+
+Then, if still good:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-checkpoint-compare-check --realized-trace-checkpoint-index 20
+```
+
+If later we want a small batch, use sparse checkpoints only:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py --parameter n0 --realized-trace-sparse-checkpoint-compare-check --realized-trace-sparse-checkpoint-counts 6,10,20,45
+```
+
+These modes were added specifically to avoid the RAM blow-up from full
+trajectory scans.
+
+#### Current concise conclusion
+
+- the key solver-side derivative bug was the `lagged_response_cache` tangent
+  propagation
+- that bug has been fixed
+- localized realized-trace custom-vs-direct checks are now very strong through
+  accepted step 6
+- the remaining work is mostly validation cleanup and efficient checkpointed
+  confirmation, not broad blind solver-derivative debugging
