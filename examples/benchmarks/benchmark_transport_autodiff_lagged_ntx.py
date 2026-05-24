@@ -1300,6 +1300,145 @@ def _sampled_fixed_dt_state_tangent_trajectory(
     }
 
 
+def _manual_sampled_realized_trace_state_tangent_trajectory(
+    *,
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+    sample_every: int,
+    use_custom: bool,
+):
+    accepted_mask_np = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask_np = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    attempted_dts_np = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
+    next_dts_np = np.asarray(jax.device_get(trace.next_dts), dtype=float)
+    next_recent_reject_count_np = np.asarray(jax.device_get(trace.next_recent_reject_count))
+    next_regrowth_cooldown_np = np.asarray(jax.device_get(trace.next_regrowth_cooldown))
+    next_easy_growth_streak_np = np.asarray(jax.device_get(trace.next_easy_growth_streak))
+    next_lagged_response_valid_np = np.asarray(jax.device_get(trace.next_lagged_response_valid))
+    step_ts_np = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+
+    sample_indices = _sample_accepted_step_indices(int(np.sum(accepted_mask_np)), sample_every)
+    if not sample_indices:
+        return {
+            "sampled_times": jnp.zeros((0,), dtype=execution_context.dtype),
+            "sampled_state_tangents": jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype),
+            "sampled_indices": (),
+        }
+
+    attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
+    project_flat = execution_context.physics_context.project_flat
+    carry = carry0
+    carry_dot = carry0_dot
+    accepted_seen = 0
+    sample_write_idx = 0
+    sampled_times: list[float] = []
+    sampled_tangents: list[np.ndarray] = []
+
+    for idx in range(len(active_mask_np)):
+        if not active_mask_np[idx]:
+            continue
+
+        accepted = bool(accepted_mask_np[idx])
+        dt_value = jnp.asarray(attempted_dts_np[idx], dtype=execution_context.dtype)
+        next_dt_value = jnp.asarray(next_dts_np[idx], dtype=execution_context.dtype)
+        recent_reject_count_value = jnp.asarray(next_recent_reject_count_np[idx])
+        regrowth_cooldown_value = jnp.asarray(next_regrowth_cooldown_np[idx])
+        easy_growth_streak_value = jnp.asarray(next_easy_growth_streak_np[idx])
+        lagged_response_valid_value = jnp.asarray(next_lagged_response_valid_np[idx])
+
+        def _accepted_attempt(carry_value):
+            carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+            attempt_result = attempt_fn(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+            if accepted_y is None:
+                accepted_y = attempt_result.trial_y
+            return dataclasses.replace(
+                attempt_result.carry_after_attempt,
+                t=carry_value.t + dt_value,
+                y=accepted_y,
+                dt=next_dt_value,
+                prev_error=jnp.maximum(
+                    attempt_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+                ),
+                prev_stages=attempt_result.stage_history,
+                prev_dt=dt_value,
+                recent_reject_count=recent_reject_count_value,
+                regrowth_cooldown=regrowth_cooldown_value,
+                easy_growth_streak=easy_growth_streak_value,
+                lagged_response_valid=lagged_response_valid_value,
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+
+        def _rejected_attempt(carry_value):
+            carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+            attempt_result = attempt_fn(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            return dataclasses.replace(
+                carry_value,
+                dt=next_dt_value,
+                recent_reject_count=recent_reject_count_value,
+                regrowth_cooldown=regrowth_cooldown_value,
+                easy_growth_streak=easy_growth_streak_value,
+                lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+                lagged_response_valid=lagged_response_valid_value,
+                lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+                jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+                cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+                cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+                cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+                real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+                real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+                complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+                complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+                prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+                prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+            )
+
+        step_fn = _accepted_attempt if accepted else _rejected_attempt
+        carry, carry_dot = jax.jvp(step_fn, (carry,), (carry_dot,))
+
+        if accepted:
+            if sample_write_idx < len(sample_indices) and accepted_seen == sample_indices[sample_write_idx]:
+                sampled_times.append(float(step_ts_np[idx]))
+                sampled_tangents.append(np.asarray(jax.device_get(carry_dot.y), dtype=float))
+                sample_write_idx += 1
+            accepted_seen += 1
+
+    if sampled_tangents:
+        tangent_array = jnp.asarray(np.stack(sampled_tangents, axis=0), dtype=execution_context.dtype)
+        times_array = jnp.asarray(np.asarray(sampled_times, dtype=float), dtype=execution_context.dtype)
+    else:
+        tangent_array = jnp.zeros((0, carry0.y.shape[0]), dtype=execution_context.dtype)
+        times_array = jnp.zeros((0,), dtype=execution_context.dtype)
+
+    return {
+        "sampled_times": times_array,
+        "sampled_state_tangents": tangent_array,
+        "sampled_indices": sample_indices,
+    }
+
+
 def _adaptive_rollout_objectives_for_parameter_on_windowed_frozen_trace(
     parameter_value,
     *,
@@ -5145,7 +5284,7 @@ def build_realized_trace_safe_state_trajectory_compare_report(
     )
 
     print("[autodiff-gate] realized-trace-safe-state-trajectory progress: running realized-trace custom state tangent trajectory", flush=True)
-    custom_result = _sampled_realized_trace_state_tangent_trajectory(
+    custom_result = _manual_sampled_realized_trace_state_tangent_trajectory(
         execution_context=execution_context,
         carry0=carry0,
         carry0_dot=carry0_dot,
@@ -5154,7 +5293,7 @@ def build_realized_trace_safe_state_trajectory_compare_report(
         use_custom=True,
     )
     print("[autodiff-gate] realized-trace-safe-state-trajectory progress: custom trajectory complete; running realized-trace direct state tangent trajectory", flush=True)
-    direct_result = _sampled_realized_trace_state_tangent_trajectory(
+    direct_result = _manual_sampled_realized_trace_state_tangent_trajectory(
         execution_context=execution_context,
         carry0=carry0,
         carry0_dot=carry0_dot,
