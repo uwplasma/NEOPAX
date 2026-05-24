@@ -2963,6 +2963,18 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
                 f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
             )
+        helper_consistency = report.get("helper_consistency") or {}
+        if helper_consistency:
+            print("[autodiff-gate] sixth-step helper consistency:")
+            for label in ("custom_scan_vs_manual", "direct_scan_vs_manual"):
+                entry = helper_consistency.get(label, {}).get("trial_y", {})
+                print(
+                    "  - "
+                    f"{label}: "
+                    f"full_rel_err={float(entry.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(entry.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(entry.get('Er_relative_error')):.6e}"
+                )
         ablations = report.get("carry_field_ablations") or {}
         if ablations:
             print("[autodiff-gate] sixth-step carry-field ablations:")
@@ -6975,6 +6987,40 @@ def build_realized_trace_sixth_step_carry_ablation_report(
         "trial_y": _flat_component_report(carry_after_step5_custom_dot.y, carry_after_step5_direct_dot.y),
     }
 
+    trace_prefix6 = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit=6,
+    )
+    helper_custom = _sampled_realized_trace_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=trace_prefix6,
+        sample_every=1,
+        use_custom=True,
+    )
+    helper_direct = _sampled_realized_trace_state_tangent_trajectory(
+        execution_context=execution_context,
+        carry0=carry0,
+        carry0_dot=carry0_dot,
+        trace=trace_prefix6,
+        sample_every=1,
+        use_custom=False,
+    )
+    helper_custom_np = np.asarray(jax.device_get(helper_custom["sampled_state_tangents"]), dtype=float)
+    helper_direct_np = np.asarray(jax.device_get(helper_direct["sampled_state_tangents"]), dtype=float)
+    helper_custom_step6 = helper_custom_np[5]
+    helper_direct_step6 = helper_direct_np[5]
+
+    helper_consistency = {
+        "custom_scan_vs_manual": {
+            "trial_y": _flat_component_report(helper_custom_step6, np.asarray(jax.device_get(custom_step6_result.y), dtype=float)),
+        },
+        "direct_scan_vs_manual": {
+            "trial_y": _flat_component_report(helper_direct_step6, np.asarray(jax.device_get(direct_step6_result.y), dtype=float)),
+        },
+    }
+
     ablation_specs = {
         "prev_stages_zeroed": {
             "prev_stages": jnp.zeros_like(carry_after_step5_direct_dot.prev_stages),
@@ -7038,6 +7084,7 @@ def build_realized_trace_sixth_step_carry_ablation_report(
         "sixth_step_time": float(step_ts[accepted_attempt_indices[5]]),
         "custom_vs_direct": custom_vs_direct,
         "carry_after_step5_custom_vs_direct": carry_after_step5_custom_vs_direct,
+        "helper_consistency": helper_consistency,
         "carry_field_ablations": carry_field_ablations,
         "max_relative_error": float(custom_vs_direct["trial_y"]["Er_relative_error"]),
         "passed": bool(custom_vs_direct["trial_y"]["Er_relative_error"] <= 5.0e-2),
