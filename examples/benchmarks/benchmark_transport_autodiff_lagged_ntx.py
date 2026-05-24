@@ -1482,6 +1482,94 @@ def _manual_realized_trace_state_tangent_checkpoints(
     sampled_times: list[float] = []
     sampled_tangents: list[np.ndarray] = []
 
+    def _advance_one_attempt(
+        carry_value,
+        carry_dot_value,
+        accepted_value,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        def _accepted_branch(_):
+            def _accepted_attempt(carry_inner):
+                carry_for_step = dataclasses.replace(carry_inner, dt=dt_value)
+                attempt_result = attempt_fn(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                )
+                accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
+                if accepted_y is None:
+                    accepted_y = attempt_result.trial_y
+                return dataclasses.replace(
+                    attempt_result.carry_after_attempt,
+                    t=carry_inner.t + dt_value,
+                    y=accepted_y,
+                    dt=next_dt_value,
+                    prev_error=jnp.maximum(
+                        attempt_result.err_norm,
+                        jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+                    ),
+                    prev_stages=attempt_result.stage_history,
+                    prev_dt=dt_value,
+                    recent_reject_count=recent_reject_count_value,
+                    regrowth_cooldown=regrowth_cooldown_value,
+                    easy_growth_streak=easy_growth_streak_value,
+                    lagged_response_valid=lagged_response_valid_value,
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    real_lu=attempt_result.real_lu_out,
+                    real_piv=attempt_result.real_piv_out,
+                    complex_lu=attempt_result.complex_lu_out,
+                    complex_piv=attempt_result.complex_piv_out,
+                    prev_theta_final=attempt_result.theta_final,
+                    prev_newton_iter_count=attempt_result.newton_iter_count,
+                )
+
+            return jax.jvp(_accepted_attempt, (carry_value,), (carry_dot_value,))
+
+        def _rejected_branch(_):
+            def _rejected_attempt(carry_inner):
+                carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_inner), dt=dt_value)
+                attempt_result = attempt_fn(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                )
+                return dataclasses.replace(
+                    carry_inner,
+                    dt=next_dt_value,
+                    recent_reject_count=recent_reject_count_value,
+                    regrowth_cooldown=regrowth_cooldown_value,
+                    easy_growth_streak=easy_growth_streak_value,
+                    lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+                    lagged_response_valid=lagged_response_valid_value,
+                    lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+                    jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+                    cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+                    cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+                    cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+                    real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+                    real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+                    complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+                    complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+                    prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+                    prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+                )
+
+            return jax.jvp(_rejected_attempt, (carry_value,), (carry_dot_value,))
+
+        return jax.lax.cond(accepted_value, _accepted_branch, _rejected_branch, operand=None)
+
+    compiled_advance_one_attempt = jax.jit(_advance_one_attempt)
+
     for idx in range(len(active_mask_np)):
         if not active_mask_np[idx]:
             continue
@@ -1495,73 +1583,17 @@ def _manual_realized_trace_state_tangent_checkpoints(
         regrowth_cooldown_value = jnp.asarray(next_regrowth_cooldown_np[idx])
         easy_growth_streak_value = jnp.asarray(next_easy_growth_streak_np[idx])
         lagged_response_valid_value = jnp.asarray(next_lagged_response_valid_np[idx])
-
-        def _accepted_attempt(carry_value):
-            carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-            attempt_result = attempt_fn(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                execution_context.attempt_context,
-            )
-            accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else None
-            if accepted_y is None:
-                accepted_y = attempt_result.trial_y
-            return dataclasses.replace(
-                attempt_result.carry_after_attempt,
-                t=carry_value.t + dt_value,
-                y=accepted_y,
-                dt=next_dt_value,
-                prev_error=jnp.maximum(attempt_result.err_norm, jnp.asarray(1.0e-12, dtype=execution_context.dtype)),
-                prev_stages=attempt_result.stage_history,
-                prev_dt=dt_value,
-                recent_reject_count=recent_reject_count_value,
-                regrowth_cooldown=regrowth_cooldown_value,
-                easy_growth_streak=easy_growth_streak_value,
-                lagged_response_valid=lagged_response_valid_value,
-                jacobian=attempt_result.jacobian_out,
-                cache_valid=attempt_result.cache_valid_out,
-                cache_dt=attempt_result.cache_dt_out,
-                cache_age=attempt_result.cache_age_out,
-                real_lu=attempt_result.real_lu_out,
-                real_piv=attempt_result.real_piv_out,
-                complex_lu=attempt_result.complex_lu_out,
-                complex_piv=attempt_result.complex_piv_out,
-                prev_theta_final=attempt_result.theta_final,
-                prev_newton_iter_count=attempt_result.newton_iter_count,
-            )
-
-        def _rejected_attempt(carry_value):
-            carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
-            attempt_result = attempt_fn(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                execution_context.attempt_context,
-            )
-            return dataclasses.replace(
-                carry_value,
-                dt=next_dt_value,
-                recent_reject_count=recent_reject_count_value,
-                regrowth_cooldown=regrowth_cooldown_value,
-                easy_growth_streak=easy_growth_streak_value,
-                lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
-                lagged_response_valid=lagged_response_valid_value,
-                lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
-                jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
-                cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
-                cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
-                cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
-                real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
-                real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
-                complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
-                complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
-                prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
-                prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
-            )
-
-        step_fn = _accepted_attempt if accepted else _rejected_attempt
-        carry, carry_dot = jax.jvp(step_fn, (carry,), (carry_dot,))
+        carry, carry_dot = compiled_advance_one_attempt(
+            carry,
+            carry_dot,
+            jnp.asarray(accepted),
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        )
 
         if accepted:
             accepted_seen += 1
@@ -4963,14 +4995,14 @@ def build_baseline_dt_path_safe_compose_scan_report(
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
 
-    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+    _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
-        use_realized_schedule_jvp=True,
+        use_realized_schedule_jvp=False,
         accepted_step_limit_override=max_checkpoint,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
@@ -5107,14 +5139,14 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
 
-    _, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+    _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
-        use_realized_schedule_jvp=True,
+        use_realized_schedule_jvp=False,
         accepted_step_limit_override=checkpoint_index,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
