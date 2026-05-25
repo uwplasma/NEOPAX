@@ -2981,16 +2981,26 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         print(
             "[autodiff-gate] objective errors:"
         )
-        for label, ad, fd, ae, re in zip(
+        for label, ad, direct, fd, ae, re, dae, dre, cde, cdr in zip(
             report["objective_labels"],
             report["gradient_autodiff"],
+            report["gradient_direct"],
             report["gradient_fd"],
             report["gradient_absolute_error"],
             report["gradient_relative_error"],
+            report["gradient_direct_absolute_error"],
+            report["gradient_direct_relative_error"],
+            report["gradient_custom_vs_direct_absolute_error"],
+            report["gradient_custom_vs_direct_relative_error"],
         ):
             print(
-                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
-                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+                f"  - {label}: "
+                f"custom_ad={float(ad):.6e} "
+                f"direct_ad={float(direct):.6e} "
+                f"fd={float(fd):.6e} "
+                f"custom_vs_fd_rel_err={float(re):.6e} "
+                f"direct_vs_fd_rel_err={float(dre):.6e} "
+                f"custom_vs_direct_rel_err={float(cdr):.6e}"
             )
         return
 
@@ -7980,9 +7990,27 @@ def build_realized_trace_checkpoint_frozen_fd_report(
             (carry_dot_value,),
         )
     )
+    compiled_direct_attempt_update = jax.jit(
+        lambda carry_value, carry_dot_value, dt_value, next_dt_value, recent_reject_count_value, regrowth_cooldown_value, easy_growth_streak_value, lagged_response_valid_value: jax.jvp(
+            lambda c: _attempt_update(
+                c,
+                _execute_radau_accepted_step_attempt,
+                dt_value=dt_value,
+                next_dt_value=next_dt_value,
+                recent_reject_count_value=recent_reject_count_value,
+                regrowth_cooldown_value=regrowth_cooldown_value,
+                easy_growth_streak_value=easy_growth_streak_value,
+                lagged_response_valid_value=lagged_response_valid_value,
+            ),
+            (carry_value,),
+            (carry_dot_value,),
+        )
+    )
 
     custom_carry = carry0
     custom_carry_dot = carry0_dot
+    direct_carry = carry0
+    direct_carry_dot = carry0_dot
     for idx in accepted_attempt_indices:
         dt_value = jnp.asarray(attempted_dts[idx], dtype=execution_context.dtype)
         next_dt_value = jnp.asarray(next_dts[idx], dtype=execution_context.dtype)
@@ -8000,12 +8028,24 @@ def build_realized_trace_checkpoint_frozen_fd_report(
             easy_growth_streak_value,
             lagged_response_valid_value,
         )
+        direct_carry, direct_carry_dot = compiled_direct_attempt_update(
+            direct_carry,
+            direct_carry_dot,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        )
 
     def _objective_from_flat_y(flat_y):
         return _objective_vector(unpack_flat(flat_y), runtime)
 
     _, objective_ad = jax.jvp(_objective_from_flat_y, (custom_carry.y,), (custom_carry_dot.y,))
     grad_ad_np = np.asarray(jax.device_get(objective_ad), dtype=float)
+    _, objective_direct = jax.jvp(_objective_from_flat_y, (direct_carry.y,), (direct_carry_dot.y,))
+    grad_direct_np = np.asarray(jax.device_get(objective_direct), dtype=float)
 
     objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         jnp.asarray(minus_value),
@@ -8031,6 +8071,10 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
     abs_err = np.abs(grad_ad_np - grad_fd_np)
     rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    direct_abs_err = np.abs(grad_direct_np - grad_fd_np)
+    direct_rel_err = direct_abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    custom_vs_direct_abs_err = np.abs(grad_ad_np - grad_direct_np)
+    custom_vs_direct_rel_err = custom_vs_direct_abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
 
     return {
         "config_path": str(config_path),
@@ -8041,9 +8085,14 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "checkpoint_index": int(checkpoint_index),
         "checkpoint_time": float(step_ts[accepted_attempt_indices[-1]]),
         "gradient_autodiff": grad_ad_np.tolist(),
+        "gradient_direct": grad_direct_np.tolist(),
         "gradient_fd": grad_fd_np.tolist(),
         "gradient_absolute_error": abs_err.tolist(),
         "gradient_relative_error": rel_err.tolist(),
+        "gradient_direct_absolute_error": direct_abs_err.tolist(),
+        "gradient_direct_relative_error": direct_rel_err.tolist(),
+        "gradient_custom_vs_direct_absolute_error": custom_vs_direct_abs_err.tolist(),
+        "gradient_custom_vs_direct_relative_error": custom_vs_direct_rel_err.tolist(),
         "max_relative_error": float(np.max(rel_err)),
         "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
         "objective_labels": OBJECTIVE_LABELS,
