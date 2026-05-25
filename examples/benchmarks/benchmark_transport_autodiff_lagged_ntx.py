@@ -479,18 +479,19 @@ def _compress_accepted_trial_ys(
             next_out = out.at[write_idx].set(flat_y)
             return write_idx + 1, next_out
 
-        return jax.lax.cond(
+        next_carry = jax.lax.cond(
             jnp.logical_and(accepted, write_idx < accepted_count),
             _write,
             lambda _: (write_idx, out),
             operand=None,
         )
+        return next_carry, None
 
     init = (
         jnp.asarray(0, dtype=jnp.int32),
         jnp.zeros((accepted_count, trial_ys.shape[-1]), dtype=trial_ys.dtype),
     )
-    (_, packed) = jax.lax.scan(_scan_body, init, (accepted_mask, trial_ys))
+    (_, packed), _ = jax.lax.scan(_scan_body, init, (accepted_mask, trial_ys))
     return packed
 
 
