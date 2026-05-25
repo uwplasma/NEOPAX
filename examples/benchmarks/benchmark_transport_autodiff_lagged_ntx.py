@@ -8253,7 +8253,7 @@ def build_realized_trace_checkpoint_interpolated_fd_report(
         accepted_step_mask = np.logical_and(active_mask, accepted_mask)
         accepted_count = int(np.sum(accepted_step_mask))
         accepted_flat_ys = _compress_accepted_trial_ys(
-            rollout.trial_ys,
+            rollout.trace.y_end,
             jnp.asarray(accepted_step_mask),
             accepted_count=accepted_count,
         )
