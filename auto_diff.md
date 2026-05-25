@@ -3168,3 +3168,175 @@ trajectory scans.
   accepted step 6
 - the remaining work is mostly validation cleanup and efficient checkpointed
   confirmation, not broad blind solver-derivative debugging
+
+### 2026-05-25 checkpoint
+
+#### Realized-trace custom-vs-direct checkpoint picture is now strong end-to-end
+
+Trusted single-checkpoint custom-vs-direct runs for `parameter=n0` gave:
+
+- accepted step `30`: `Er_rel_err ~ 3.60e-09`
+- accepted step `45`: `Er_rel_err ~ 1.62e-09`
+- accepted step `90`: `Er_rel_err ~ 1.29e-08`
+- accepted step `115`: `Er_rel_err ~ 2.65e-06`
+
+Interpretation:
+
+- the custom realized-trace AD path now matches the direct-AD reference very
+  well all the way to the final accepted step
+- there is no sign of catastrophic tangent drift
+- the main solver-side AD bug really was the `lagged_response_cache`
+  tangent-propagation/carry path
+
+At this point, custom-vs-direct mismatch is no longer the main concern.
+
+#### Same-target local AD-vs-FD is now working
+
+A same-target frozen-trace checkpoint FD mode was added:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 45
+```
+
+Important FD-step rule:
+
+```text
+fd_step = max(fd_abs_step, fd_rel_step * max(abs(parameter), 1.0))
+```
+
+Because the CLI default still has:
+
+- `--fd-abs-step 1e-4`
+
+changing only `--fd-rel-step` below that floor does **not** change the actual
+perturbation.
+
+This explained why:
+
+- `--fd-rel-step 1e-5`
+- `--fd-rel-step 1e-6`
+
+initially produced the same FD result: both were clamped to `fd_step = 1e-4`.
+
+#### Best local derivative validation found so far
+
+At checkpoint `45`, this command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 45 \
+  --fd-rel-step 1e-6 \
+  --fd-abs-step 1e-7
+```
+
+used:
+
+- `fd_step = 4.21e-06`
+
+and produced approximately:
+
+- `softmax_Er`: `5.36e-07`
+- `smooth_root_proxy`: `3.24e-05`
+- `Er2_volume_average`: `2.79e-07`
+- `Er_volume_average`: `9.02e-07`
+- `electron_temperature_volume_average_keV`: `1.19e-08`
+- `total_pressure_volume_average`: `1.44e-10`
+- `alpha_power_volume_average_mw_m3`: `1.14e-09`
+
+This is the strongest local AD-vs-FD evidence obtained so far.
+
+#### FD got worse again when made too small
+
+At the same checkpoint, this command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 45 \
+  --fd-rel-step 1e-7 \
+  --fd-abs-step 1e-8
+```
+
+used:
+
+- `fd_step = 4.21e-07`
+
+and the worst relative error increased again to about:
+
+- `smooth_root_proxy`: `6.50e-04`
+
+Interpretation:
+
+- this is normal finite-difference behavior
+- too-large `h` gives truncation/nonlinearity error
+- too-small `h` gives cancellation / solver-noise / postprocessing-noise
+- the local optimum here appears to be around `fd_step ~ 4.21e-06`, not
+  `4.21e-07`
+
+So the present conclusion is:
+
+- local AD gradients are very likely correct
+- remaining discrepancy is now dominated by FD calibration, not by a broken AD
+  path
+
+#### Important conceptual distinction
+
+The frozen-trace checkpoint FD test validates the **local derivative** of the
+baseline realized solution map.
+
+It does **not** prove:
+
+- that the same linear gradient remains accurate for large perturbations
+- or that adaptive `fd+` / `fd-` with their own evolved schedules will match
+  the same frozen-map derivative
+
+So:
+
+- local derivative correctness: strongly supported
+- larger-perturbation adaptive behavior: still a separate question
+
+#### New direction: interpolation-based adaptive FD
+
+Because larger perturbations may need their own adaptive schedules, a new mode
+was added to compare:
+
+- baseline realized-trace checkpoint AD
+- against adaptive `fd_minus` / `fd_plus`
+- with their objective trajectories interpolated to the baseline checkpoint time
+
+CLI flag:
+
+```bash
+--realized-trace-checkpoint-interpolated-fd-check
+```
+
+Recommended first command:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-interpolated-fd-check \
+  --realized-trace-checkpoint-index 45 \
+  --fd-rel-step 1e-6 \
+  --fd-abs-step 1e-7
+```
+
+Purpose:
+
+- avoid forcing `fd+` / `fd-` onto the baseline attempted-step map
+- let each perturbed solve use its own stable adaptive schedule
+- compare on a common physical time via interpolation
+
+#### Resume-next-session priorities
+
+1. Trust the checkpoint custom-vs-direct evidence as the main AD-health signal.
+2. Use `fd_rel_step=1e-6`, `fd_abs_step=1e-7` as the current best local-FD
+   calibration point.
+3. Use the new interpolated adaptive-FD mode for larger-perturbation and
+   schedule-sensitive validation.
