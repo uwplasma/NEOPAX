@@ -4093,15 +4093,28 @@ def build_realized_schedule_rollout_report(
         use_realized_schedule_jvp=True,
     )[0]
 
-    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
-        jnp.asarray(baseline_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=parameter_name,
-        use_realized_schedule_jvp=True,
-    )
+    if accepted_step_limit is None:
+        baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=True,
+        )
+    else:
+        baseline_final_state, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=False,
+            accepted_step_limit_override=accepted_step_limit,
+        )
+        baseline_objectives = _objective_vector(baseline_final_state, runtime)
     print("[autodiff-gate] realized-schedule progress: baseline rollout complete; running fd_minus rollout", flush=True)
     objectives_minus, minus_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(minus_value),
@@ -4335,11 +4348,11 @@ def build_realized_schedule_frozen_fd_report(
                 replay_trace,
                 objectives_np=np.asarray(jax.device_get(plus_objectives_accepted), dtype=float),
             )
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
+        flush=True,
+    )
     if accepted_step_limit is None:
-        print(
-            "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
-            flush=True,
-        )
         objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
             p,
             config=config,
@@ -4364,21 +4377,15 @@ def build_realized_schedule_frozen_fd_report(
         ad_mode = "frozen_trace_direct"
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    if accepted_step_limit is None:
-        gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
-        print(
-            "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
-            flush=True,
-        )
-        grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-        abs_err = np.abs(grad_ad_np - grad_fd_np)
-        rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
-        ad_available = True
-    else:
-        grad_ad_np = None
-        abs_err = None
-        rel_err = None
-        ad_available = False
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
+        flush=True,
+    )
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    abs_err = np.abs(grad_ad_np - grad_fd_np)
+    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    ad_available = True
 
     accepted_times = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
     accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
