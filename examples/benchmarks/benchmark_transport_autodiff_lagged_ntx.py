@@ -6623,7 +6623,6 @@ def build_baseline_dt_path_second_step_carry_ablation_report(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=jnp.asarray(dt_value, dtype=execution_context.dtype))
-        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
         attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
@@ -6679,22 +6678,22 @@ def build_baseline_dt_path_second_step_carry_ablation_report(
     }
 
     custom_carry1, custom_carry1_dot = jax.jvp(
-        lambda c: _attempt_update(c, use_custom=True, **step0_kwargs),
+        lambda c: _attempt_update(c, _execute_radau_accepted_step_attempt_autodiff, **step0_kwargs),
         (carry0,),
         (carry0_dot,),
     )
     direct_carry1, direct_carry1_dot = jax.jvp(
-        lambda c: _attempt_update(c, use_custom=False, **step0_kwargs),
+        lambda c: _attempt_update(c, _execute_radau_accepted_step_attempt, **step0_kwargs),
         (carry0,),
         (carry0_dot,),
     )
     _, custom_step2_result = jax.jvp(
-        lambda c: _attempt_update(c, use_custom=True, **step1_kwargs),
+        lambda c: _attempt_update(c, _execute_radau_accepted_step_attempt_autodiff, **step1_kwargs),
         (custom_carry1,),
         (custom_carry1_dot,),
     )
     _, direct_step2_result = jax.jvp(
-        lambda c: _attempt_update(c, use_custom=False, **step1_kwargs),
+        lambda c: _attempt_update(c, _execute_radau_accepted_step_attempt, **step1_kwargs),
         (direct_carry1,),
         (direct_carry1_dot,),
     )
@@ -6702,7 +6701,7 @@ def build_baseline_dt_path_second_step_carry_ablation_report(
     def _direct_step2_with_ablation(**replacements):
         ablated_dot = dataclasses.replace(direct_carry1_dot, **replacements)
         _, tangent = jax.jvp(
-            lambda c: _attempt_update(c, use_custom=False, **step1_kwargs),
+            lambda c: _attempt_update(c, _execute_radau_accepted_step_attempt, **step1_kwargs),
             (direct_carry1,),
             (ablated_dot,),
         )
@@ -6898,8 +6897,8 @@ def build_baseline_dt_path_third_step_carry_ablation_report(
 
     def _attempt_update(
         carry_value,
+        attempt_fn,
         *,
-        use_custom: bool,
         dt_value,
         next_dt_value,
         recent_reject_count_value,
@@ -6908,7 +6907,6 @@ def build_baseline_dt_path_third_step_carry_ablation_report(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=jnp.asarray(dt_value, dtype=execution_context.dtype))
-        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
         attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
@@ -7247,8 +7245,8 @@ def build_realized_trace_sixth_step_carry_ablation_report(
 
     def _attempt_update(
         carry_value,
+        attempt_fn,
         *,
-        use_custom: bool,
         dt_value,
         next_dt_value,
         recent_reject_count_value,
@@ -7257,7 +7255,6 @@ def build_realized_trace_sixth_step_carry_ablation_report(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=jnp.asarray(dt_value, dtype=execution_context.dtype))
-        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
         attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
@@ -7579,7 +7576,7 @@ def build_realized_trace_checkpoint_compare_report(
     def _attempt_update(
         carry_value,
         *,
-        use_custom: bool,
+        attempt_fn,
         dt_value,
         next_dt_value,
         recent_reject_count_value,
@@ -7588,7 +7585,6 @@ def build_realized_trace_checkpoint_compare_report(
         lagged_response_valid_value,
     ):
         carry_for_step = dataclasses.replace(carry_value, dt=jnp.asarray(dt_value, dtype=execution_context.dtype))
-        attempt_fn = _execute_radau_accepted_step_attempt_autodiff if use_custom else _execute_radau_accepted_step_attempt
         attempt_result = attempt_fn(
             execution_context.kernel_context,
             execution_context.physics_context,
