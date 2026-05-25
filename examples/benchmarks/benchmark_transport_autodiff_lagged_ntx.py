@@ -3448,6 +3448,51 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     )
         return
 
+    if report.get("realized_schedule_direct_ad_compare_check"):
+        print(
+            f"[autodiff-gate] mode=realized_schedule_direct_ad_compare "
+            f"parameter={report['parameter_name']} "
+            f"baseline_value={report['baseline_value']:.6e} "
+            f"fd_step={report['fd_step']:.6e}"
+        )
+        path = report.get("rollout_path", {})
+        for key in ("baseline", "fd_minus", "fd_plus"):
+            diag = path.get(key, {})
+            print(
+                f"[autodiff-gate] rollout {key}: "
+                f"attempt_count={diag.get('attempt_count')} "
+                f"accepted_count={diag.get('accepted_count')} "
+                f"completed={diag.get('completed')} "
+                f"failed={diag.get('failed')} "
+                f"fail_code={diag.get('fail_code')}"
+            )
+        print(
+            "[autodiff-gate] fd path parity: "
+            f"accepted_mask_equal_minus_plus={path.get('accepted_mask_equal_minus_plus')} "
+            f"attempted_dts_equal_minus_plus={path.get('attempted_dts_equal_minus_plus')} "
+            f"next_dts_equal_minus_plus={path.get('next_dts_equal_minus_plus')}"
+        )
+        print("[autodiff-gate] objective errors:")
+        for label, cad, dad, fd, cfre, dfre, cdre in zip(
+            report["objective_labels"],
+            report["gradient_custom_autodiff"],
+            report["gradient_direct_autodiff"],
+            report["gradient_fd"],
+            report["gradient_custom_vs_fd_relative_error"],
+            report["gradient_direct_vs_fd_relative_error"],
+            report["gradient_custom_vs_direct_relative_error"],
+        ):
+            print(
+                f"  - {label}: "
+                f"custom_ad={float(cad):.6e} "
+                f"direct_ad={float(dad):.6e} "
+                f"fd={float(fd):.6e} "
+                f"custom_vs_fd_rel_err={float(cfre):.6e} "
+                f"direct_vs_fd_rel_err={float(dfre):.6e} "
+                f"custom_vs_direct_rel_err={float(cdre):.6e}"
+            )
+        return
+
     print(
         f"[autodiff-gate] mode={'one_step' if report.get('one_step_diagnostic') else 'full_solve'} "
         f"parameter={report['parameter_name']} "
@@ -4273,6 +4318,141 @@ def build_realized_schedule_rollout_report(
             ),
         },
         "nan_debug": nan_debug,
+    }
+
+
+def build_realized_schedule_direct_ad_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+) -> dict[str, Any]:
+    if parameter_name not in ALLOWED_PARAMETERS:
+        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
+
+    config = _prepare_benchmark_config(config_path, device=device)
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_value = float(profile_cfg[parameter_name])
+    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
+    minus_value = baseline_value - fd_step
+    plus_value = baseline_value + fd_step
+
+    custom_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )[0]
+    direct_objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=False,
+    )[0]
+
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    print(
+        "[autodiff-gate] realized-schedule-direct-ad progress: baseline rollout complete; running fd_minus rollout",
+        flush=True,
+    )
+    objectives_minus, minus_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(minus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    print(
+        "[autodiff-gate] realized-schedule-direct-ad progress: fd_minus rollout complete; running fd_plus rollout",
+        flush=True,
+    )
+    objectives_plus, plus_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(plus_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
+    print(
+        "[autodiff-gate] realized-schedule-direct-ad progress: fd_plus rollout complete; running custom AD",
+        flush=True,
+    )
+    gradient_custom = jax.jacfwd(custom_objective_fn)(jnp.asarray(baseline_value))
+    print(
+        "[autodiff-gate] realized-schedule-direct-ad progress: custom AD complete; running direct adaptive AD",
+        flush=True,
+    )
+    gradient_direct = jax.jacfwd(direct_objective_fn)(jnp.asarray(baseline_value))
+    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+
+    grad_custom_np = np.asarray(jax.device_get(gradient_custom), dtype=float)
+    grad_direct_np = np.asarray(jax.device_get(gradient_direct), dtype=float)
+    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+    custom_vs_fd_abs = np.abs(grad_custom_np - grad_fd_np)
+    custom_vs_fd_rel = custom_vs_fd_abs / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    direct_vs_fd_abs = np.abs(grad_direct_np - grad_fd_np)
+    direct_vs_fd_rel = direct_vs_fd_abs / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    custom_vs_direct_abs = np.abs(grad_custom_np - grad_direct_np)
+    custom_vs_direct_rel = custom_vs_direct_abs / np.maximum(np.abs(grad_direct_np), 1.0e-10)
+
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    minus_diag = _adaptive_rollout_diagnostics(minus_rollout)
+    plus_diag = _adaptive_rollout_diagnostics(plus_rollout)
+
+    return {
+        "config_path": str(config_path),
+        "realized_schedule_direct_ad_compare_check": True,
+        "parameter_name": parameter_name,
+        "baseline_value": baseline_value,
+        "fd_step": float(fd_step),
+        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+        "gradient_custom_autodiff": grad_custom_np.tolist(),
+        "gradient_direct_autodiff": grad_direct_np.tolist(),
+        "gradient_fd": grad_fd_np.tolist(),
+        "gradient_custom_vs_fd_absolute_error": custom_vs_fd_abs.tolist(),
+        "gradient_custom_vs_fd_relative_error": custom_vs_fd_rel.tolist(),
+        "gradient_direct_vs_fd_absolute_error": direct_vs_fd_abs.tolist(),
+        "gradient_direct_vs_fd_relative_error": direct_vs_fd_rel.tolist(),
+        "gradient_custom_vs_direct_absolute_error": custom_vs_direct_abs.tolist(),
+        "gradient_custom_vs_direct_relative_error": custom_vs_direct_rel.tolist(),
+        "max_relative_error": float(np.max(custom_vs_fd_rel)),
+        "passed": bool(np.all(np.isfinite(custom_vs_fd_rel)) and np.max(custom_vs_fd_rel) <= 5.0e-2),
+        "objective_labels": OBJECTIVE_LABELS,
+        "rollout_path": {
+            "baseline": baseline_diag,
+            "fd_minus": minus_diag,
+            "fd_plus": plus_diag,
+            "accepted_mask_equal_minus_plus": minus_diag["accepted_mask"] == plus_diag["accepted_mask"],
+            "attempted_dts_equal_minus_plus": _sequence_allclose(
+                minus_diag["attempted_dts"],
+                plus_diag["attempted_dts"],
+            ),
+            "next_dts_equal_minus_plus": _sequence_allclose(
+                minus_diag["next_dts"],
+                plus_diag["next_dts"],
+            ),
+        },
     }
 
 
@@ -8856,6 +9036,11 @@ def main() -> None:
         help="Run a final-time-only adaptive-rollout check using the first solve-level custom JVP over the primal's realized accepted schedule.",
     )
     parser.add_argument(
+        "--realized-schedule-direct-ad-compare-check",
+        action="store_true",
+        help="Run a final-time adaptive comparison of custom AD, direct adaptive AD, and FD.",
+    )
+    parser.add_argument(
         "--realized-schedule-frozen-fd-check",
         action="store_true",
         help="Run a cheaper realized-schedule check that compares AD against FD on the baseline frozen Radau replay path instead of two fresh adaptive FD solves.",
@@ -9076,6 +9261,14 @@ def main() -> None:
             include_nan_debug=args.realized_schedule_nan_debug,
             nan_debug_mode="exhaustive" if args.realized_schedule_nan_debug_exhaustive else "minimal",
             nan_debug_include_one_step_compare=args.realized_schedule_nan_debug_one_step_compare,
+        )
+    elif args.realized_schedule_direct_ad_compare_check:
+        report = build_realized_schedule_direct_ad_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
         )
     elif args.realized_schedule_frozen_fd_check:
         report = build_realized_schedule_frozen_fd_report(
