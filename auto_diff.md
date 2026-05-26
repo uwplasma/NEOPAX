@@ -3685,3 +3685,255 @@ So if we use Diffrax as a reference point, the most careful conclusion is:
   - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_adjoint.py>
   - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_integrate.py>
   - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_step_size_controller/adaptive.py>
+
+### 2026-05-26 frozen-checkpoint FD localization in the low-`dt` region
+
+#### Purpose
+
+Before changing the custom AD architecture, the main question became:
+
+- why does frozen-path AD-vs-FD get much worse at later checkpoints?
+
+We extended the existing frozen-checkpoint report to print:
+
+- objective-level custom/direct/FD comparison
+- state-tangent comparison:
+  - `custom_vs_fd`
+  - `direct_vs_fd`
+  - `custom_vs_direct`
+  - each with:
+    - `full_rel_err`
+    - `pressure_rel_err`
+    - `Er_rel_err`
+
+This kept the target exactly the same while exposing whether the mismatch was
+already present in the checkpoint state tangent.
+
+#### Key result: the mismatch is already in the state tangent
+
+At checkpoint `115`, the report showed:
+
+- `custom_vs_fd` state tangent:
+  - `full_rel_err ~ 6.98e-02`
+  - `pressure_rel_err ~ 4.60e-02`
+  - `Er_rel_err ~ 7.10e-02`
+- `direct_vs_fd` is essentially identical
+- `custom_vs_direct` remains tiny:
+  - around `2.6e-06`
+
+So:
+
+- the late mismatch is **not** being created mainly by objective
+  postprocessing
+- it is already present in the checkpoint state derivative
+- it is **not** custom-specific
+- both AD constructions share the same disagreement with the frozen FD
+
+#### Checkpoint scan showed a localized transition, not smooth accumulation
+
+Frozen-checkpoint state-tangent errors were:
+
+- accepted step `90`:
+  - `full_rel_err ~ 6.86e-04`
+- accepted step `100`:
+  - `~1.15e-03`
+- accepted step `102` with the original FD step (`4.21e-06`):
+  - `~2.14e-01`
+- accepted step `103`:
+  - `~1.47e-01`
+- accepted step `105`:
+  - `~1.01e-01`
+- accepted step `108`:
+  - `~7.49e-02`
+- accepted step `110`:
+  - `~6.96e-02`
+- accepted step `115`:
+  - `~6.98e-02`
+
+This means:
+
+- the problem is **not** a smooth long-horizon drift
+- the main transition happens sharply between accepted steps `100` and `102`
+- the mismatch then relaxes somewhat and plateaus around the `~7e-02` level
+
+#### Interpretation: this aligns with the region where adaptive `dt` becomes very small
+
+The sharp transition was observed right around a region where the primal adaptive
+solve drops to significantly smaller `dt`.
+
+This suggests the frozen FD comparison is becoming difficult because the map is
+locally much more sensitive there:
+
+- many tiny implicit updates are accumulated
+- FD subtracts two very close long-prefix states
+- cancellation/noise becomes more important
+- the â€œgoodâ€ FD step size becomes smaller and more delicate
+
+So this looks much more like a **low-`dt` / stiff-window FD-calibration
+problem** than a generic AD breakdown.
+
+#### Crucial FD-step sweep result at checkpoint `102`
+
+Using the original effective FD step:
+
+- `fd_step = 4.21e-06`
+- checkpoint `102`
+- state tangent `full_rel_err ~ 2.14e-01`
+
+Then rerunning checkpoint `102` with a smaller FD step:
+
+- `--fd-rel-step 3e-7`
+- `--fd-abs-step 1e-8`
+- effective `fd_step = 1.263e-06`
+
+produced:
+
+- state tangent `full_rel_err ~ 1.08e-02`
+- `pressure_rel_err ~ 1.41e-02`
+- `Er_rel_err ~ 1.08e-02`
+
+Objective errors also dropped sharply.
+
+This is very strong evidence that:
+
+- the large checkpoint-102 discrepancy at the original FD step was mostly an
+  **FD-step problem**
+- not compelling evidence of an AD failure
+
+We then extended the sweep further in both directions.
+
+Larger FD step:
+
+- `--fd-rel-step 3e-6`
+- `--fd-abs-step 1e-7`
+- effective `fd_step = 1.263e-05`
+
+This produced catastrophic disagreement:
+
+- state tangent `full_rel_err ~ 1.07e+02`
+- `pressure_rel_err ~ 2.34e+00`
+- `Er_rel_err ~ 1.09e+02`
+
+So that FD step is completely unusable in the low-`dt` region.
+
+Smaller FD steps:
+
+1. `--fd-rel-step 1e-7`, `--fd-abs-step 1e-9`
+   - effective `fd_step = 4.21e-07`
+   - state tangent:
+     - `full_rel_err ~ 1.09e-03`
+     - `pressure_rel_err ~ 1.69e-03`
+     - `Er_rel_err ~ 1.09e-03`
+
+2. `--fd-rel-step 3e-8`, `--fd-abs-step 1e-10`
+   - effective `fd_step = 1.263e-07`
+   - state tangent:
+     - `full_rel_err ~ 6.27e-05`
+     - `pressure_rel_err ~ 1.65e-04`
+     - `Er_rel_err ~ 6.27e-05`
+
+The corresponding objective errors also became very small.
+
+This turns the checkpoint-102 story into a textbook FD-calibration result:
+
+- too large `h` gives catastrophic truncation / nonlinear secant error
+- modestly smaller `h` gives a large improvement
+- much smaller `h` gives excellent AD-vs-FD agreement
+
+So at checkpoint `102`, there is currently **no meaningful evidence of an AD
+failure**. The disagreement was overwhelmingly due to a poor FD step choice for
+that low-`dt` regime.
+
+#### Important practical conclusion
+
+At least in the low-`dt` window:
+
+- `custom AD` remains stable
+- `direct AD` remains stable
+- FD can change dramatically with `h`
+
+So when deciding whether the issue is AD or FD:
+
+- if FD moves a lot when `h` changes but AD does not, that points primarily to
+  **FD instability**
+- this is exactly what the checkpoint-102 sweep started to show
+
+#### Benchmark convenience change
+
+To speed up these FD sweeps, we added:
+
+- `--skip-direct-ad-in-frozen-check`
+
+for:
+
+- `--realized-trace-checkpoint-frozen-fd-check`
+
+This lets the benchmark skip the direct-AD reference path and run only:
+
+- custom AD
+- FD
+
+plus the custom-vs-FD state-tangent diagnostics.
+
+This is useful when the goal is FD calibration, not AD-path decomposition.
+
+#### Current best next-step ideas for improving FD precision
+
+The main ideas discussed were:
+
+1. **Calibrate FD step locally**
+   - especially at the onset checkpoint (`102`) or nearby
+   - the globally good FD step from easier regions may be too large in the
+     low-`dt` window
+
+2. **Use a higher-order stencil**
+   - e.g. a 5-point central FD instead of the current 2-point central FD
+   - this reduces truncation error if the local map is smooth enough
+
+3. **Use a more local comparison window**
+   - instead of FD on a long prefix from the start, use a shorter frozen window
+     around the troublesome accepted-step region
+   - this reduces accumulation of tiny numerical differences
+
+4. **Tighten the forward numerical solves if needed**
+   - stricter nonlinear/linear tolerances
+   - less approximate reuse in the sensitive region
+   - this improves the raw primal solve quality entering the FD subtraction
+
+5. **Keep state-level FD diagnostics, not just objective-level**
+   - because the state-tangent report was what made the low-`dt` diagnosis clear
+
+#### Current best interpretation
+
+The most likely picture right now is:
+
+- the custom AD path is not the main issue
+- the direct AD path is not the main issue
+- the frozen FD comparison becomes very delicate in the small-`dt` region
+- with a smaller local FD step, the AD-vs-FD agreement improves a lot
+- at checkpoint `102`, the agreement can be made excellent with sufficiently
+  small `h`
+
+So the next emphasis should be:
+
+- improve the FD reference locally
+- not immediately re-architect the custom derivative again
+
+#### Best next command recorded for resuming later
+
+The most natural follow-up after the checkpoint-102 sweep is to test whether a
+later troublesome checkpoint also improves dramatically with a smaller FD step,
+for example:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 110 \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10 \
+  --skip-direct-ad-in-frozen-check
+```
+
+This is the current best next test to check whether the apparent late-time
+frozen-FD discrepancy was also mostly an FD-calibration artifact.

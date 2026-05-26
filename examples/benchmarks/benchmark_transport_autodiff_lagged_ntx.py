@@ -2961,8 +2961,13 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         return
 
     if report.get("realized_trace_checkpoint_frozen_fd_check"):
+        mode_name = (
+            "realized_trace_checkpoint_fd_stencil"
+            if report.get("fd_stencil_check")
+            else "realized_trace_checkpoint_frozen_fd"
+        )
         print(
-            f"[autodiff-gate] mode=realized_trace_checkpoint_frozen_fd "
+            f"[autodiff-gate] mode={mode_name} "
             f"parameter={report['parameter_name']} "
             f"baseline_value={report['baseline_value']:.6e} "
             f"fd_step={report['fd_step']:.6e} "
@@ -2982,7 +2987,24 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         print(
             "[autodiff-gate] objective errors:"
         )
-        if report.get("gradient_direct") is None:
+        if report.get("fd_stencil_check"):
+            for label, ad, fd_center, fd_five, re_center, re_five in zip(
+                report["objective_labels"],
+                report["gradient_autodiff"],
+                report["gradient_fd"],
+                report["gradient_fd_five_point"],
+                report["gradient_relative_error"],
+                report["gradient_five_point_relative_error"],
+            ):
+                print(
+                    f"  - {label}: "
+                    f"custom_ad={float(ad):.6e} "
+                    f"fd_center={float(fd_center):.6e} "
+                    f"fd_five_point={float(fd_five):.6e} "
+                    f"custom_vs_center_rel_err={float(re_center):.6e} "
+                    f"custom_vs_five_point_rel_err={float(re_five):.6e}"
+                )
+        elif report.get("gradient_direct") is None:
             for label, ad, fd, re in zip(
                 report["objective_labels"],
                 report["gradient_autodiff"],
@@ -3042,6 +3064,31 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"full_rel_err={float(custom_vs_direct.get('full_relative_error')):.6e} "
                     f"pressure_rel_err={float(custom_vs_direct.get('pressure_relative_error')):.6e} "
                     f"Er_rel_err={float(custom_vs_direct.get('Er_relative_error')):.6e}"
+                )
+        state_cmp_five = report.get("state_tangent_comparison_five_point")
+        if state_cmp_five:
+            custom_vs_fd_five = state_cmp_five.get("custom_vs_fd_five_point", {})
+            center_vs_fd_five = state_cmp_five.get("center_vs_fd_five_point", {})
+            print("[autodiff-gate] state tangent errors (five-point):")
+            print(
+                "  - custom_vs_fd_five_point: "
+                f"full_rel_err={float(custom_vs_fd_five.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(custom_vs_fd_five.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(custom_vs_fd_five.get('Er_relative_error')):.6e}"
+            )
+            print(
+                "  - center_vs_fd_five_point: "
+                f"full_rel_err={float(center_vs_fd_five.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(center_vs_fd_five.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(center_vs_fd_five.get('Er_relative_error')):.6e}"
+            )
+            direct_vs_fd_five = state_cmp_five.get("direct_vs_fd_five_point")
+            if direct_vs_fd_five is not None:
+                print(
+                    "  - direct_vs_fd_five_point: "
+                    f"full_rel_err={float(direct_vs_fd_five.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(direct_vs_fd_five.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(direct_vs_fd_five.get('Er_relative_error')):.6e}"
                 )
         return
 
@@ -8053,6 +8100,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     checkpoint_index: int,
     replay_mode: str = "attempt",
     include_direct_ad: bool = True,
+    compute_five_point: bool = False,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -8068,6 +8116,8 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
+    minus2_value = baseline_value - 2.0 * fd_step
+    plus2_value = baseline_value + 2.0 * fd_step
 
     baseline_final_state, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
         jnp.asarray(baseline_value),
@@ -8277,26 +8327,20 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     else:
         grad_direct_np = None
 
-    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-        jnp.asarray(minus_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=parameter_name,
-        frozen_trace=replay_trace,
-        replay_mode=replay_mode,
-    )
-    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-        jnp.asarray(plus_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=parameter_name,
-        frozen_trace=replay_trace,
-        replay_mode=replay_mode,
-    )
+    def _evaluate_frozen_fd(value: float):
+        return _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+            jnp.asarray(value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            frozen_trace=replay_trace,
+            replay_mode=replay_mode,
+        )
+
+    objectives_minus, minus_replay = _evaluate_frozen_fd(minus_value)
+    objectives_plus, plus_replay = _evaluate_frozen_fd(plus_value)
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
     abs_err = np.abs(grad_ad_np - grad_fd_np)
@@ -8347,9 +8391,47 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "custom_vs_direct": _flat_component_report(state_custom_np, state_direct_np) if include_direct_ad else None,
     }
 
+    grad_fd_five_point_np = None
+    grad_five_point_abs_err = None
+    grad_five_point_rel_err = None
+    state_fd_five_point_np = None
+    state_comparison_five_point = None
+    state_comparison_center_vs_five_point = None
+    minus2_replay_finite = None
+    plus2_replay_finite = None
+    if compute_five_point:
+        objectives_minus2, minus2_replay = _evaluate_frozen_fd(minus2_value)
+        objectives_plus2, plus2_replay = _evaluate_frozen_fd(plus2_value)
+        gradient_fd_five_point = (
+            -objectives_plus2 + 8.0 * objectives_plus - 8.0 * objectives_minus + objectives_minus2
+        ) / (12.0 * fd_step)
+        grad_fd_five_point_np = np.asarray(jax.device_get(gradient_fd_five_point), dtype=float)
+        grad_five_point_abs_err = np.abs(grad_ad_np - grad_fd_five_point_np)
+        grad_five_point_rel_err = grad_five_point_abs_err / np.maximum(np.abs(grad_fd_five_point_np), 1.0e-10)
+
+        fd_minus2_flat = np.asarray(jax.device_get(pack_state(minus2_replay["final_state"])), dtype=float)
+        fd_plus2_flat = np.asarray(jax.device_get(pack_state(plus2_replay["final_state"])), dtype=float)
+        state_fd_five_point_np = (
+            -fd_plus2_flat + 8.0 * fd_plus_flat - 8.0 * fd_minus_flat + fd_minus2_flat
+        ) / (12.0 * fd_step)
+        state_comparison_five_point = {
+            "custom_vs_fd_five_point": _flat_component_report(state_custom_np, state_fd_five_point_np),
+            "center_vs_fd_five_point": _flat_component_report(state_fd_np, state_fd_five_point_np),
+        }
+        if include_direct_ad:
+            state_comparison_five_point["direct_vs_fd_five_point"] = _flat_component_report(
+                state_direct_np,
+                state_fd_five_point_np,
+            )
+
+        state_comparison_center_vs_five_point = _flat_component_report(state_fd_np, state_fd_five_point_np)
+        minus2_replay_finite = _tree_all_finite(minus2_replay["final_state"])
+        plus2_replay_finite = _tree_all_finite(plus2_replay["final_state"])
+
     return {
         "config_path": str(config_path),
         "realized_trace_checkpoint_frozen_fd_check": True,
+        "fd_stencil_check": bool(compute_five_point),
         "parameter_name": parameter_name,
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
@@ -8358,21 +8440,35 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "gradient_autodiff": grad_ad_np.tolist(),
         "gradient_direct": None if grad_direct_np is None else grad_direct_np.tolist(),
         "gradient_fd": grad_fd_np.tolist(),
+        "gradient_fd_five_point": None if grad_fd_five_point_np is None else grad_fd_five_point_np.tolist(),
         "gradient_absolute_error": abs_err.tolist(),
         "gradient_relative_error": rel_err.tolist(),
+        "gradient_five_point_absolute_error": None if grad_five_point_abs_err is None else grad_five_point_abs_err.tolist(),
+        "gradient_five_point_relative_error": None if grad_five_point_rel_err is None else grad_five_point_rel_err.tolist(),
         "gradient_direct_absolute_error": None if direct_abs_err is None else direct_abs_err.tolist(),
         "gradient_direct_relative_error": None if direct_rel_err is None else direct_rel_err.tolist(),
         "gradient_custom_vs_direct_absolute_error": None if custom_vs_direct_abs_err is None else custom_vs_direct_abs_err.tolist(),
         "gradient_custom_vs_direct_relative_error": None if custom_vs_direct_rel_err is None else custom_vs_direct_rel_err.tolist(),
         "state_tangent_comparison": state_comparison,
+        "state_tangent_comparison_five_point": state_comparison_five_point,
+        "state_tangent_comparison_center_vs_five_point": state_comparison_center_vs_five_point,
         "max_relative_error": float(np.max(rel_err)),
-        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "passed": bool(
+            np.all(np.isfinite(rel_err))
+            and np.max(rel_err) <= 5.0e-2
+            and (
+                grad_five_point_rel_err is None
+                or (np.all(np.isfinite(grad_five_point_rel_err)) and np.max(grad_five_point_rel_err) <= 5.0e-2)
+            )
+        ),
         "objective_labels": OBJECTIVE_LABELS,
         "replay_mode": str(replay_mode),
         "rollout_path": {
             "baseline": baseline_diag,
             "fd_minus_state_finite": _tree_all_finite(minus_replay["final_state"]),
             "fd_plus_state_finite": _tree_all_finite(plus_replay["final_state"]),
+            "fd_minus2_state_finite": minus2_replay_finite,
+            "fd_plus2_state_finite": plus2_replay_finite,
         },
     }
 
@@ -9198,6 +9294,11 @@ def main() -> None:
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint AD against frozen-trace FD at one accepted-step checkpoint.",
     )
     parser.add_argument(
+        "--realized-trace-checkpoint-fd-stencil-check",
+        action="store_true",
+        help="Dedicated opt-in mode: compare baseline realized-trace checkpoint custom AD against frozen-trace center FD and five-point FD at one accepted-step checkpoint.",
+    )
+    parser.add_argument(
         "--realized-trace-checkpoint-interpolated-fd-check",
         action="store_true",
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint AD against adaptive fd_minus/fd_plus trajectories interpolated to the baseline checkpoint time.",
@@ -9474,6 +9575,18 @@ def main() -> None:
             checkpoint_index=args.realized_trace_checkpoint_index,
             replay_mode=args.realized_schedule_frozen_replay_mode,
             include_direct_ad=not args.skip_direct_ad_in_frozen_check,
+        )
+    elif args.realized_trace_checkpoint_fd_stencil_check:
+        report = build_realized_trace_checkpoint_frozen_fd_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            checkpoint_index=args.realized_trace_checkpoint_index,
+            replay_mode=args.realized_schedule_frozen_replay_mode,
+            include_direct_ad=False,
+            compute_five_point=True,
         )
     elif args.realized_trace_checkpoint_interpolated_fd_check:
         report = build_realized_trace_checkpoint_interpolated_fd_report(
