@@ -3340,3 +3340,348 @@ Purpose:
    calibration point.
 3. Use the new interpolated adaptive-FD mode for larger-perturbation and
    schedule-sensitive validation.
+
+### 2026-05-26 derivative-target clarification
+
+#### Two different derivative notions must be kept separate
+
+There are two different derivatives in play:
+
+1. **Full adaptive-algorithm derivative**
+   - includes sensitivity through:
+     - accepted/rejected-step logic
+     - timestep-controller evolution
+     - solver-history / reuse heuristics
+   - this is the derivative of the **numerical algorithm**
+
+2. **Physical/local derivative along the realized solve path**
+   - treat adaptive logic as an auxiliary numerical device
+   - differentiate the transport evolution along the locally realized path
+   - do **not** treat timestep-controller branching as part of the desired
+     physical derivative target
+
+For the current transport-optimization use case, the second notion is probably
+the more physically meaningful one.
+
+#### Important interpretation for the current custom AD path
+
+The current custom AD path does **not** start from an externally fixed time
+grid. Instead:
+
+- the primal adaptive solve runs first
+- it realizes an adaptive trace
+- the custom JVP then differentiates **along that realized trace**
+
+So:
+
+- the primal path is still chosen adaptively
+- but the tangent replay treats the realized trace metadata as fixed
+
+This is different from saying:
+
+- “the solver always runs on a fixed prescribed time path”
+
+which is **not** what is happening.
+
+#### What is artificially frozen
+
+The artificial freezing happens mainly in the **validation comparisons**, not in
+the forward primal solve itself.
+
+Examples:
+
+- `--realized-trace-checkpoint-frozen-fd-check`
+  - uses the baseline realized trace prefix
+  - forces both `fd-` and `fd+` onto that same frozen replay trace
+  - this is a same-target local derivative validation tool
+
+- custom-vs-direct checkpoint comparisons
+  - also compare derivatives on the same realized/frozen local map
+
+These tools are intended to answer:
+
+- “is the local derivative along the realized path correct?”
+
+not:
+
+- “what is the derivative of every adaptive controller branch decision?”
+
+#### Consequence for interpretation
+
+If the intended scientific derivative is the physically meaningful local
+transport sensitivity, then it is reasonable to **not** differentiate through
+adaptive controller logic.
+
+In that case:
+
+- differentiating accepted-step state evolution along the realized path is the
+  important target
+- timestep-controller branching is a solver artifact, not part of the desired
+  physical derivative
+
+This means the current custom path may still be conceptually appropriate even if
+it is not the exact derivative of the full adaptive algorithm-as-code.
+
+#### Confirmed implementation fact
+
+For `--realized-trace-checkpoint-frozen-fd-check`, `fd-` and `fd+` really are
+evaluated on the **same frozen baseline trace prefix**:
+
+- same frozen `accepted_mask`
+- same frozen `active_mask`
+- same frozen attempted/next `dt` sequence
+- same frozen controller-trace metadata
+
+So any mismatch seen in that mode is **not** explained by adaptive path
+divergence between `fd-` and `fd+`.
+
+### 2026-05-26 Diffrax adaptive-AD reference
+
+#### Purpose of this note
+
+This note records what Diffrax is actually doing for adaptive AD, especially for
+the comparable case:
+
+- `Kvaerno5`
+- `PIDController`
+- possible rejected steps
+
+The goal was to check both the local installed Diffrax source and the upstream
+Diffrax docs/repo, and determine whether Diffrax:
+
+- differentiates through the adaptive solve loop
+- freezes the realized adaptive trace
+- differentiates through timestep-controller logic
+- differentiates through rejected steps
+
+#### High-level conclusion
+
+Diffrax does **not** use a NEOPAX-style:
+
+- run adaptive primal
+- freeze the whole realized trace
+- replay a custom tangent on that frozen trace
+
+for its main adaptive AD path.
+
+Instead, Diffrax differentiates the **discrete numerical solve loop directly**.
+
+However, Diffrax still makes a deliberate compromise:
+
+- it does **not** fully differentiate all timestep-controller quantities
+- it explicitly detaches selected controller-update quantities inside
+  `PIDController`
+
+So Diffrax is best described as:
+
+- differentiate the adaptive solver loop directly
+- but pragmatically stop gradients through selected controller scalars
+
+#### Main local source facts
+
+##### 1. Default reverse-mode AD differentiates the numerical solver directly
+
+Diffrax's default adjoint is `RecursiveCheckpointAdjoint`, whose docstring says
+it differentiates the numerical solution directly:
+
+- local source:
+  - `diffrax/_adjoint.py`
+  - `RecursiveCheckpointAdjoint`
+- upstream docs:
+  - <https://docs.kidger.site/diffrax/api/adjoints/>
+
+Relevant local source facts:
+
+- `RecursiveCheckpointAdjoint` is defined at:
+  - `diffrax/_adjoint.py:174`
+- it uses checkpointed while loops:
+  - `diffrax/_adjoint.py:289`
+- it calls the ordinary main solve loop rather than a separate replay tangent
+  path
+
+This is the discrete-adjoint / discretise-then-optimise route.
+
+##### 2. Forward-mode also goes through the solver internals
+
+`ForwardMode` is defined at:
+
+- `diffrax/_adjoint.py:864`
+
+For Runge-Kutta solvers, it forces:
+
+- `scan_kind = "lax"`
+
+when `scan_kind is None`, so that forward-mode autodiff can pass through the
+internal stage loop:
+
+- `diffrax/_adjoint.py:891`
+
+This again indicates that Diffrax is differentiating the solve internals, not a
+frozen replayed trace.
+
+##### 3. The adaptive solve loop includes rejected steps inside the AD'd loop
+
+The main solve loop is:
+
+- `diffrax/_integrate.py:273`
+
+Inside each iteration it does:
+
+1. `solver.step(...)`
+2. `stepsize_controller.adapt_step_size(...)`
+3. conditional keep/reject of the step state
+
+The controller is called at:
+
+- `diffrax/_integrate.py:360`
+
+Accepted/rejected branching is then applied with `jnp.where`-style logic:
+
+- `diffrax/_integrate.py:386`
+
+Rejected steps are counted explicitly at:
+
+- `diffrax/_integrate.py:407`
+
+So rejected steps are part of the actual differentiated adaptive loop. Diffrax
+is not removing them from the loop at the architectural level.
+
+##### 4. `Kvaerno5` uses the standard adaptive RK infrastructure
+
+`Kvaerno5` is an `AbstractESDIRK` adaptive RK solver:
+
+- `diffrax/_solver/kvaerno5.py`
+
+Its RK stage loop is implemented via the generic RK machinery:
+
+- `diffrax/_solver/runge_kutta.py:444`
+
+The internal RK stage loop uses `eqxi.while_loop` with checkpointing by
+default:
+
+- `diffrax/_solver/runge_kutta.py:1155`
+
+So for `Kvaerno5 + PIDController`, the adaptive solve is still running through
+the normal differentiated RK + controller loop.
+
+#### Important nuance: Diffrax still freezes some controller quantities
+
+This is the most important subtlety.
+
+Diffrax does **not** fully differentiate the timestep-controller update logic.
+
+The strongest evidence is in:
+
+- `diffrax/_step_size_controller/adaptive.py`
+
+##### Explicit detachments in `PIDController`
+
+1. Auto-selected initial step size:
+
+- `dt0 = lax.stop_gradient(dt0)`
+- location:
+  - `diffrax/_step_size_controller/adaptive.py:444`
+
+2. The scaled error proxy used in the PID update:
+
+- `inv_scaled_error = lax.stop_gradient(inv_scaled_error)`
+- location:
+  - `diffrax/_step_size_controller/adaptive.py:583`
+
+3. The multiplicative PID factor used to update the next timestep:
+
+- `factor = lax.stop_gradient(factor)`
+- `factor = eqxi.nondifferentiable(factor)`
+- locations:
+  - `diffrax/_step_size_controller/adaptive.py:611`
+  - `diffrax/_step_size_controller/adaptive.py:612`
+
+So the next-step `dt` update is deliberately treated as nondifferentiable in
+the controller update formula, even though the overall solve remains adaptive.
+
+##### Diffrax's own explanation for doing this
+
+The local source comments in `PIDController.init` are unusually explicit. The
+author says, in summary:
+
+- this dramatically speeds up gradient computations
+- on some training problems it improves training behaviour
+- they have not observed it hurting training
+- other libraries do something similar without remark
+- there is a folk intuition that time discretisation is â€œjust an implementation
+  detailâ€ and one â€œdoesn't need to backpropagate through rejected stepsâ€
+
+But the same comment also says the author is **not fully convinced** by this
+argument, noting in particular:
+
+- it feels morally wrong from the differentiable-programming viewpoint
+- rejected steps really are part of the computational graph
+- step-size choices do affect the computed solution
+- certain esoteric optimization goals could fail if these gradients are removed
+
+So the source itself presents this as a **pragmatic compromise**, not as a
+principled statement that controller logic should never be differentiated.
+
+#### Additional solver-side detachments
+
+There are also some solver-side `stop_gradient` / nondifferentiable choices in
+the implicit RK internals, for example around Jacobian/cache handling in:
+
+- `diffrax/_solver/runge_kutta.py`
+
+Examples:
+
+- `lax.stop_gradient(f_pred)`
+- `_filter_stop_gradient(...)`
+- `eqxi.nondifferentiable(jac_f, name="jac_f")`
+- `eqxi.nondifferentiable(jac_k, name="jac_k")`
+
+These appear to be mostly there for custom-VJP / implicit-solver practicality,
+not because Diffrax is globally freezing the realized adaptive trace.
+
+#### Side-by-side comparison with NEOPAX
+
+| Question | Diffrax | Current NEOPAX custom adaptive JVP |
+|---|---|---|
+| Does the primal solve run adaptively? | Yes | Yes |
+| Is the main AD path built by differentiating the adaptive solve loop directly? | Yes | Not exactly; primal adaptive solve runs first, then tangent replay follows the realized trace |
+| Does the main AD path freeze the whole realized adaptive trace? | No | Yes, the custom JVP reuses frozen realized-trace metadata |
+| Are rejected steps part of the differentiated loop execution? | Yes | Not in the same architectural way; the custom tangent follows the realized replay |
+| Are timestep-controller quantities fully differentiated? | No | No |
+| What controller quantities are explicitly detached? | `dt0`, inverse scaled error, PID factor | realized trace metadata, controller-history fields, cache/Jacobian/LU state, etc. |
+| Overall philosophy | Differentiate the adaptive discrete solve, but detach selected controller updates | Differentiate along the realized adaptive path using a solver-native replay approximation |
+
+#### Interpretation for NEOPAX design discussion
+
+Diffrax does **not** support either extreme:
+
+1. **Extreme A:** freeze all adaptive logic and replay a separate tangent path
+2. **Extreme B:** differentiate every adaptive-controller scalar exactly
+
+Instead Diffrax sits in the middle:
+
+- it differentiates the adaptive solve loop itself
+- but detaches selected controller-update quantities for pragmatic reasons
+
+So if we use Diffrax as a reference point, the most careful conclusion is:
+
+- Diffrax is more adaptive-loop-faithful than the current NEOPAX custom replay
+  design
+- but Diffrax still does not fully differentiate timestep-controller logic
+- therefore Diffrax does **not** provide evidence that every adaptive-control
+  quantity should be differentiated
+
+#### Useful references consulted
+
+- local installed source:
+  - `diffrax/_adjoint.py`
+  - `diffrax/_integrate.py`
+  - `diffrax/_step_size_controller/adaptive.py`
+  - `diffrax/_solver/runge_kutta.py`
+  - `diffrax/_solver/kvaerno5.py`
+- upstream docs:
+  - <https://docs.kidger.site/diffrax/api/adjoints/>
+- upstream repo pages:
+  - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_adjoint.py>
+  - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_integrate.py>
+  - <https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_step_size_controller/adaptive.py>

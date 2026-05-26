@@ -47,6 +47,7 @@ from NEOPAX._profiles import AnalyticalProfileModel
 from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
+    _make_solver_state_transform,
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
@@ -3001,6 +3002,30 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"custom_vs_fd_rel_err={float(re):.6e} "
                 f"direct_vs_fd_rel_err={float(dre):.6e} "
                 f"custom_vs_direct_rel_err={float(cdr):.6e}"
+            )
+        state_cmp = report.get("state_tangent_comparison", {})
+        if state_cmp:
+            custom_vs_fd = state_cmp.get("custom_vs_fd", {})
+            direct_vs_fd = state_cmp.get("direct_vs_fd", {})
+            custom_vs_direct = state_cmp.get("custom_vs_direct", {})
+            print("[autodiff-gate] state tangent errors:")
+            print(
+                "  - custom_vs_fd: "
+                f"full_rel_err={float(custom_vs_fd.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(custom_vs_fd.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(custom_vs_fd.get('Er_relative_error')):.6e}"
+            )
+            print(
+                "  - direct_vs_fd: "
+                f"full_rel_err={float(direct_vs_fd.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(direct_vs_fd.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(direct_vs_fd.get('Er_relative_error')):.6e}"
+            )
+            print(
+                "  - custom_vs_direct: "
+                f"full_rel_err={float(custom_vs_direct.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(custom_vs_direct.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(custom_vs_direct.get('Er_relative_error')):.6e}"
             )
         return
 
@@ -8104,6 +8129,10 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     next_lagged_response_valid = np.asarray(jax.device_get(baseline_rollout.trace.next_lagged_response_valid))
     step_ts = np.asarray(jax.device_get(baseline_rollout.trace.step_ts), dtype=float)
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
+    _flat_state0, _unpack_flat_tmp, _unpack_packed_tmp, pack_state, _project_flat_tmp = _make_solver_state_transform(
+        baseline_state,
+        runtime.species,
+    )
 
     def _attempt_update(
         carry_value,
@@ -8256,6 +8285,41 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     custom_vs_direct_abs_err = np.abs(grad_ad_np - grad_direct_np)
     custom_vs_direct_rel_err = custom_vs_direct_abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
 
+    fd_minus_flat = np.asarray(jax.device_get(pack_state(minus_replay["final_state"])), dtype=float)
+    fd_plus_flat = np.asarray(jax.device_get(pack_state(plus_replay["final_state"])), dtype=float)
+    state_fd_np = (fd_plus_flat - fd_minus_flat) / (2.0 * fd_step)
+    state_custom_np = np.asarray(jax.device_get(custom_carry_dot.y), dtype=float)
+    state_direct_np = np.asarray(jax.device_get(direct_carry_dot.y), dtype=float)
+
+    def _flat_component_report(ad_arr, ref_arr):
+        ad_flat = np.asarray(jax.device_get(ad_arr), dtype=float)
+        ref_flat = np.asarray(jax.device_get(ref_arr), dtype=float)
+        ad_state = unpack_flat(jnp.asarray(ad_flat))
+        ref_state = unpack_flat(jnp.asarray(ref_flat))
+        ad_pressure = np.asarray(jax.device_get(ad_state.pressure), dtype=float)
+        ref_pressure = np.asarray(jax.device_get(ref_state.pressure), dtype=float)
+        ad_er = np.asarray(jax.device_get(ad_state.Er), dtype=float)
+        ref_er = np.asarray(jax.device_get(ref_state.Er), dtype=float)
+        return {
+            "full_relative_error": float(
+                np.linalg.norm(ad_flat - ref_flat) / max(float(np.linalg.norm(ref_flat)), 1.0e-10)
+            ),
+            "pressure_relative_error": float(
+                np.linalg.norm(ad_pressure - ref_pressure)
+                / max(float(np.linalg.norm(ref_pressure)), 1.0e-10)
+            ),
+            "Er_relative_error": float(
+                np.linalg.norm(ad_er - ref_er)
+                / max(float(np.linalg.norm(ref_er)), 1.0e-10)
+            ),
+        }
+
+    state_comparison = {
+        "custom_vs_fd": _flat_component_report(state_custom_np, state_fd_np),
+        "direct_vs_fd": _flat_component_report(state_direct_np, state_fd_np),
+        "custom_vs_direct": _flat_component_report(state_custom_np, state_direct_np),
+    }
+
     return {
         "config_path": str(config_path),
         "realized_trace_checkpoint_frozen_fd_check": True,
@@ -8273,6 +8337,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "gradient_direct_relative_error": direct_rel_err.tolist(),
         "gradient_custom_vs_direct_absolute_error": custom_vs_direct_abs_err.tolist(),
         "gradient_custom_vs_direct_relative_error": custom_vs_direct_rel_err.tolist(),
+        "state_tangent_comparison": state_comparison,
         "max_relative_error": float(np.max(rel_err)),
         "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
         "objective_labels": OBJECTIVE_LABELS,
