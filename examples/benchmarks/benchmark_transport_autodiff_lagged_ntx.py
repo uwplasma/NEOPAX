@@ -2982,27 +2982,41 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         print(
             "[autodiff-gate] objective errors:"
         )
-        for label, ad, direct, fd, ae, re, dae, dre, cde, cdr in zip(
-            report["objective_labels"],
-            report["gradient_autodiff"],
-            report["gradient_direct"],
-            report["gradient_fd"],
-            report["gradient_absolute_error"],
-            report["gradient_relative_error"],
-            report["gradient_direct_absolute_error"],
-            report["gradient_direct_relative_error"],
-            report["gradient_custom_vs_direct_absolute_error"],
-            report["gradient_custom_vs_direct_relative_error"],
-        ):
-            print(
-                f"  - {label}: "
-                f"custom_ad={float(ad):.6e} "
-                f"direct_ad={float(direct):.6e} "
-                f"fd={float(fd):.6e} "
-                f"custom_vs_fd_rel_err={float(re):.6e} "
-                f"direct_vs_fd_rel_err={float(dre):.6e} "
-                f"custom_vs_direct_rel_err={float(cdr):.6e}"
-            )
+        if report.get("gradient_direct") is None:
+            for label, ad, fd, re in zip(
+                report["objective_labels"],
+                report["gradient_autodiff"],
+                report["gradient_fd"],
+                report["gradient_relative_error"],
+            ):
+                print(
+                    f"  - {label}: "
+                    f"custom_ad={float(ad):.6e} "
+                    f"fd={float(fd):.6e} "
+                    f"custom_vs_fd_rel_err={float(re):.6e}"
+                )
+        else:
+            for label, ad, direct, fd, ae, re, dae, dre, cde, cdr in zip(
+                report["objective_labels"],
+                report["gradient_autodiff"],
+                report["gradient_direct"],
+                report["gradient_fd"],
+                report["gradient_absolute_error"],
+                report["gradient_relative_error"],
+                report["gradient_direct_absolute_error"],
+                report["gradient_direct_relative_error"],
+                report["gradient_custom_vs_direct_absolute_error"],
+                report["gradient_custom_vs_direct_relative_error"],
+            ):
+                print(
+                    f"  - {label}: "
+                    f"custom_ad={float(ad):.6e} "
+                    f"direct_ad={float(direct):.6e} "
+                    f"fd={float(fd):.6e} "
+                    f"custom_vs_fd_rel_err={float(re):.6e} "
+                    f"direct_vs_fd_rel_err={float(dre):.6e} "
+                    f"custom_vs_direct_rel_err={float(cdr):.6e}"
+                )
         state_cmp = report.get("state_tangent_comparison", {})
         if state_cmp:
             custom_vs_fd = state_cmp.get("custom_vs_fd", {})
@@ -3015,18 +3029,20 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                 f"pressure_rel_err={float(custom_vs_fd.get('pressure_relative_error')):.6e} "
                 f"Er_rel_err={float(custom_vs_fd.get('Er_relative_error')):.6e}"
             )
-            print(
-                "  - direct_vs_fd: "
-                f"full_rel_err={float(direct_vs_fd.get('full_relative_error')):.6e} "
-                f"pressure_rel_err={float(direct_vs_fd.get('pressure_relative_error')):.6e} "
-                f"Er_rel_err={float(direct_vs_fd.get('Er_relative_error')):.6e}"
-            )
-            print(
-                "  - custom_vs_direct: "
-                f"full_rel_err={float(custom_vs_direct.get('full_relative_error')):.6e} "
-                f"pressure_rel_err={float(custom_vs_direct.get('pressure_relative_error')):.6e} "
-                f"Er_rel_err={float(custom_vs_direct.get('Er_relative_error')):.6e}"
-            )
+            if direct_vs_fd is not None:
+                print(
+                    "  - direct_vs_fd: "
+                    f"full_rel_err={float(direct_vs_fd.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(direct_vs_fd.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(direct_vs_fd.get('Er_relative_error')):.6e}"
+                )
+            if custom_vs_direct is not None:
+                print(
+                    "  - custom_vs_direct: "
+                    f"full_rel_err={float(custom_vs_direct.get('full_relative_error')):.6e} "
+                    f"pressure_rel_err={float(custom_vs_direct.get('pressure_relative_error')):.6e} "
+                    f"Er_rel_err={float(custom_vs_direct.get('Er_relative_error')):.6e}"
+                )
         return
 
     if report.get("realized_trace_checkpoint_interpolated_fd_check"):
@@ -8036,6 +8052,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     device: str | None,
     checkpoint_index: int,
     replay_mode: str = "attempt",
+    include_direct_ad: bool = True,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -8237,24 +8254,28 @@ def build_realized_trace_checkpoint_frozen_fd_report(
             easy_growth_streak_value,
             lagged_response_valid_value,
         )
-        direct_carry, direct_carry_dot = compiled_direct_attempt_update(
-            direct_carry,
-            direct_carry_dot,
-            dt_value,
-            next_dt_value,
-            recent_reject_count_value,
-            regrowth_cooldown_value,
-            easy_growth_streak_value,
-            lagged_response_valid_value,
-        )
+        if include_direct_ad:
+            direct_carry, direct_carry_dot = compiled_direct_attempt_update(
+                direct_carry,
+                direct_carry_dot,
+                dt_value,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+            )
 
     def _objective_from_flat_y(flat_y):
         return _objective_vector(unpack_flat(flat_y), runtime)
 
     _, objective_ad = jax.jvp(_objective_from_flat_y, (custom_carry.y,), (custom_carry_dot.y,))
     grad_ad_np = np.asarray(jax.device_get(objective_ad), dtype=float)
-    _, objective_direct = jax.jvp(_objective_from_flat_y, (direct_carry.y,), (direct_carry_dot.y,))
-    grad_direct_np = np.asarray(jax.device_get(objective_direct), dtype=float)
+    if include_direct_ad:
+        _, objective_direct = jax.jvp(_objective_from_flat_y, (direct_carry.y,), (direct_carry_dot.y,))
+        grad_direct_np = np.asarray(jax.device_get(objective_direct), dtype=float)
+    else:
+        grad_direct_np = None
 
     objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         jnp.asarray(minus_value),
@@ -8280,16 +8301,22 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
     abs_err = np.abs(grad_ad_np - grad_fd_np)
     rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
-    direct_abs_err = np.abs(grad_direct_np - grad_fd_np)
-    direct_rel_err = direct_abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
-    custom_vs_direct_abs_err = np.abs(grad_ad_np - grad_direct_np)
-    custom_vs_direct_rel_err = custom_vs_direct_abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
+    if include_direct_ad:
+        direct_abs_err = np.abs(grad_direct_np - grad_fd_np)
+        direct_rel_err = direct_abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+        custom_vs_direct_abs_err = np.abs(grad_ad_np - grad_direct_np)
+        custom_vs_direct_rel_err = custom_vs_direct_abs_err / np.maximum(np.abs(grad_direct_np), 1.0e-10)
+    else:
+        direct_abs_err = None
+        direct_rel_err = None
+        custom_vs_direct_abs_err = None
+        custom_vs_direct_rel_err = None
 
     fd_minus_flat = np.asarray(jax.device_get(pack_state(minus_replay["final_state"])), dtype=float)
     fd_plus_flat = np.asarray(jax.device_get(pack_state(plus_replay["final_state"])), dtype=float)
     state_fd_np = (fd_plus_flat - fd_minus_flat) / (2.0 * fd_step)
     state_custom_np = np.asarray(jax.device_get(custom_carry_dot.y), dtype=float)
-    state_direct_np = np.asarray(jax.device_get(direct_carry_dot.y), dtype=float)
+    state_direct_np = np.asarray(jax.device_get(direct_carry_dot.y), dtype=float) if include_direct_ad else None
 
     def _flat_component_report(ad_arr, ref_arr):
         ad_flat = np.asarray(jax.device_get(ad_arr), dtype=float)
@@ -8316,8 +8343,8 @@ def build_realized_trace_checkpoint_frozen_fd_report(
 
     state_comparison = {
         "custom_vs_fd": _flat_component_report(state_custom_np, state_fd_np),
-        "direct_vs_fd": _flat_component_report(state_direct_np, state_fd_np),
-        "custom_vs_direct": _flat_component_report(state_custom_np, state_direct_np),
+        "direct_vs_fd": _flat_component_report(state_direct_np, state_fd_np) if include_direct_ad else None,
+        "custom_vs_direct": _flat_component_report(state_custom_np, state_direct_np) if include_direct_ad else None,
     }
 
     return {
@@ -8329,14 +8356,14 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "checkpoint_index": int(checkpoint_index),
         "checkpoint_time": float(step_ts[accepted_attempt_indices[-1]]),
         "gradient_autodiff": grad_ad_np.tolist(),
-        "gradient_direct": grad_direct_np.tolist(),
+        "gradient_direct": None if grad_direct_np is None else grad_direct_np.tolist(),
         "gradient_fd": grad_fd_np.tolist(),
         "gradient_absolute_error": abs_err.tolist(),
         "gradient_relative_error": rel_err.tolist(),
-        "gradient_direct_absolute_error": direct_abs_err.tolist(),
-        "gradient_direct_relative_error": direct_rel_err.tolist(),
-        "gradient_custom_vs_direct_absolute_error": custom_vs_direct_abs_err.tolist(),
-        "gradient_custom_vs_direct_relative_error": custom_vs_direct_rel_err.tolist(),
+        "gradient_direct_absolute_error": None if direct_abs_err is None else direct_abs_err.tolist(),
+        "gradient_direct_relative_error": None if direct_rel_err is None else direct_rel_err.tolist(),
+        "gradient_custom_vs_direct_absolute_error": None if custom_vs_direct_abs_err is None else custom_vs_direct_abs_err.tolist(),
+        "gradient_custom_vs_direct_relative_error": None if custom_vs_direct_rel_err is None else custom_vs_direct_rel_err.tolist(),
         "state_tangent_comparison": state_comparison,
         "max_relative_error": float(np.max(rel_err)),
         "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
@@ -9176,6 +9203,11 @@ def main() -> None:
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint AD against adaptive fd_minus/fd_plus trajectories interpolated to the baseline checkpoint time.",
     )
     parser.add_argument(
+        "--skip-direct-ad-in-frozen-check",
+        action="store_true",
+        help="For --realized-trace-checkpoint-frozen-fd-check, skip the direct-AD reference path and run only custom AD vs FD.",
+    )
+    parser.add_argument(
         "--realized-trace-checkpoint-index",
         type=int,
         default=10,
@@ -9441,6 +9473,7 @@ def main() -> None:
             device=args.device,
             checkpoint_index=args.realized_trace_checkpoint_index,
             replay_mode=args.realized_schedule_frozen_replay_mode,
+            include_direct_ad=not args.skip_direct_ad_in_frozen_check,
         )
     elif args.realized_trace_checkpoint_interpolated_fd_check:
         report = build_realized_trace_checkpoint_interpolated_fd_report(
