@@ -99,7 +99,12 @@ def build_geometry_autodiff_context(
     boundary = vmec_jax.boundary_from_indata(indata, static.modes)
 
     kind = _boundary_kind_for_family(param_family)
-    specs = vmec_jax.boundary_param_specs(
+    try:
+        boundary_param_specs = vmec_jax.boundary_param_specs
+    except AttributeError:
+        from vmec_jax.optimization import boundary_param_specs
+
+    specs = boundary_param_specs(
         boundary,
         static.modes,
         include=(kind,),
@@ -166,7 +171,12 @@ def _solve_state_for_single_param(
 ) -> Any:
     vmec_jax = _import_vmec_jax()
     params = jnp.asarray([param_delta], dtype=jnp.float64)
-    boundary = vmec_jax.apply_boundary_params(context.boundary, (context.spec,), params)
+    try:
+        apply_boundary_params = vmec_jax.apply_boundary_params
+    except AttributeError:
+        from vmec_jax.optimization import apply_boundary_params
+
+    boundary = apply_boundary_params(context.boundary, (context.spec,), params)
     return vmec_jax.solve_fixed_boundary_from_boundary(
         boundary=boundary,
         static=context.static,
