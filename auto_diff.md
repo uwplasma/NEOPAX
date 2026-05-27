@@ -3937,3 +3937,135 @@ python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
 
 This is the current best next test to check whether the apparent late-time
 frozen-FD discrepancy was also mostly an FD-calibration artifact.
+
+#### Later checkpoint confirmation: `110` and `115`
+
+That follow-up was run, and it confirmed the same story at later checkpoints.
+
+At checkpoint `110`, using:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 110 \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10 \
+  --skip-direct-ad-in-frozen-check
+```
+
+the result became:
+
+- effective `fd_step = 1.263e-07`
+- state tangent:
+  - `full_rel_err ~ 1.72e-04`
+  - `pressure_rel_err ~ 2.63e-04`
+  - `Er_rel_err ~ 1.26e-04`
+- worst objective relative error:
+  - `~6.62e-04`
+
+So the earlier scary checkpoint-110 discrepancy was also an FD-step artifact.
+
+At checkpoint `115`, using:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-frozen-fd-check \
+  --realized-trace-checkpoint-index 115 \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10 \
+  --skip-direct-ad-in-frozen-check
+```
+
+the result was similarly excellent:
+
+- effective `fd_step = 1.263e-07`
+- state tangent:
+  - `full_rel_err ~ 9.28e-05`
+  - `pressure_rel_err ~ 1.64e-04`
+  - `Er_rel_err ~ 8.72e-05`
+- worst objective relative error:
+  - `~1.50e-04`
+
+So by this point the late-checkpoint picture is very consistent:
+
+- checkpoint `102`: fixed by smaller FD step
+- checkpoint `110`: fixed by smaller FD step
+- checkpoint `115`: fixed by smaller FD step
+
+This is strong evidence that, for the frozen realized-path derivative target,
+the custom AD path is working well and the previously large discrepancies were
+primarily FD-calibration artifacts in the low-`dt` region.
+
+#### Center vs 5-point stencil at checkpoint `115`
+
+We also added and ran a dedicated frozen-path stencil comparison mode:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-fd-stencil-check \
+  --realized-trace-checkpoint-index 115 \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10
+```
+
+This mode compares:
+
+- `custom_ad`
+- `fd_center`
+- `fd_five_point`
+
+while reusing the already-computed center evaluations for the 5-point stencil.
+
+With the good small FD step:
+
+- center FD was already very good
+- 5-point FD was usually a little better
+- state tangent improved from:
+  - center: `full_rel_err ~ 9.28e-05`
+  - five-point: `full_rel_err ~ 4.62e-05`
+
+Specifically for state tangent at checkpoint `115`:
+
+- `custom_vs_fd_center`
+  - `full_rel_err ~ 9.28e-05`
+  - `pressure_rel_err ~ 1.64e-04`
+  - `Er_rel_err ~ 8.72e-05`
+- `custom_vs_fd_five_point`
+  - `full_rel_err ~ 4.62e-05`
+  - `pressure_rel_err ~ 3.22e-05`
+  - `Er_rel_err ~ 4.68e-05`
+
+We also checked the same stencil mode with a much larger FD step:
+
+```bash
+python examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py \
+  --parameter n0 \
+  --realized-trace-checkpoint-fd-stencil-check \
+  --realized-trace-checkpoint-index 115 \
+  --fd-rel-step 1e-6 \
+  --fd-abs-step 1e-8
+```
+
+and both center and 5-point were poor there.
+
+So the stencil conclusion is:
+
+- 5-point FD can improve the reference once `h` is already in a good regime
+- 5-point FD does **not** rescue a badly chosen perturbation
+- higher-order stencil helps with truncation error, but does not replace local
+  FD-step calibration
+
+#### Updated overall conclusion
+
+The current best overall interpretation is:
+
+- the custom AD path is very likely good for the frozen realized-path
+  derivative target
+- the direct AD path had already agreed strongly with it
+- the remaining large discrepancies were due to FD calibration, especially in
+  the low-`dt` region
+- center and 5-point FD now both support the same conclusion once the
+  perturbation is chosen appropriately
