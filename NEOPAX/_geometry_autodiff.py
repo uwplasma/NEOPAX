@@ -338,6 +338,18 @@ def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int 
     return int(jnp.argmax(matches))
 
 
+def _surface_indices_for_s_values(static, s_values: Sequence[float]):
+    vmec_jax = _import_vmec_jax()
+    try:
+        surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
+        surface_indices, _ = surface_indices_from_static(static, list(s_values))
+        return jnp.asarray(surface_indices, dtype=jnp.int32)
+    except Exception:
+        s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
+        surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
+        return jnp.asarray(surface_indices, dtype=jnp.int32)
+
+
 def build_neopax_geometry_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
@@ -362,8 +374,16 @@ def build_neopax_geometry_from_single_param(
     )
 
     rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
-    rho_grid_half0 = 0.5 * (rho_grid[0] + rho_grid[1]) if int(n_r) > 1 else jnp.asarray(0.0, dtype=rho_grid.dtype)
-    rho_grid_half = jnp.linspace(rho_grid_half0, rho_grid_half0 + rho_grid[-1], int(n_r))
+    if int(n_r) > 1:
+        rho_grid_half = jnp.concatenate(
+            [
+                jnp.array([0.0], dtype=rho_grid.dtype),
+                0.5 * (rho_grid[:-1] + rho_grid[1:]),
+                jnp.array([1.0], dtype=rho_grid.dtype),
+            ]
+        )
+    else:
+        rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
     sample_rho = rho_grid[1:-1]
 
     observables = geometry_observables_from_single_param(
@@ -415,14 +435,13 @@ def build_neopax_geometry_from_single_param(
     r0_value = jnp.asarray(state.Rcos)[-1, 0]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
-    if int(n_r) > 1:
-        r_grid = r_grid.at[0].set(0.5 * r_grid[1])
     r_grid_half = rho_grid_half * a_b
-    dr = r_grid[2] - r_grid[1] if int(n_r) > 2 else jnp.asarray(0.0, dtype=r_grid.dtype)
+    dr = r_grid[1] - r_grid[0] if int(n_r) > 1 else jnp.asarray(0.0, dtype=r_grid.dtype)
 
     dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
-    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b
-    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b
+    volume_scale = (2.0 * jnp.pi) ** 2
+    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
+    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
     over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
 
     # Interpolate Boozer radial profiles from half-mesh surfaces onto the NEOPAX grid.
@@ -436,8 +455,8 @@ def build_neopax_geometry_from_single_param(
     )
     del booz_outputs  # keep explicit naming below for clarity
 
-    vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
+    vmec_jax = _import_vmec_jax()
     inputs = vmec_jax.booz_xform_inputs_from_state(
         state=state,
         static=context.static,
@@ -445,12 +464,11 @@ def build_neopax_geometry_from_single_param(
         signgs=context.signgs,
         flux=context.flux,
     )
-    surface_indices, _ = vmec_jax.surface_indices_from_static(context.static, list(s_values))
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=context.booz_constants,
         grids=context.booz_grids,
-        surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
+        surface_indices=_surface_indices_for_s_values(context.static, s_values),
         jit=True,
     )
     bmnc_b = jnp.asarray(out["bmnc_b"])
