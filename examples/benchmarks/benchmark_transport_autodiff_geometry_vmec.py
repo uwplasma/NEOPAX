@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_CONFIG = ROOT / "examples" / "benchmarks" / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml"
+DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires"
+
 import NEOPAX
 from NEOPAX._orchestrator import run_transport
 from NEOPAX._geometry_autodiff import (
@@ -57,7 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=str,
-        default=str(Path("NEOPAX/examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml")),
+        default=str(DEFAULT_CONFIG),
         help="NEOPAX transport config used for transport-metric comparisons.",
     )
     parser.add_argument(
@@ -70,7 +73,7 @@ def main() -> None:
     parser.add_argument(
         "--vmec-input",
         type=str,
-        default=str(Path("NEOPAX/examples/inputs/input.QI_nfp2_newNT_opt_hires")),
+        default=str(DEFAULT_VMEC_INPUT),
         help="VMEC input file used to seed the differentiable geometry path.",
     )
     parser.add_argument(
