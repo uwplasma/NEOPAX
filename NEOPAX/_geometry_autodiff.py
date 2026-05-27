@@ -41,6 +41,49 @@ def _import_booz_xform_jax_api():
     return jax_api
 
 
+def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
+    value = getattr(module, name, None)
+    if value is not None:
+        return value
+    if submodule is None:
+        raise AttributeError(f"vmec_jax does not provide '{name}'.")
+    imported = __import__(f"vmec_jax.{submodule}", fromlist=[name])
+    value = getattr(imported, name, None)
+    if value is None:
+        raise AttributeError(f"vmec_jax.{submodule} does not provide '{name}'.")
+    return value
+
+
+def _build_vmec_fixed_context(vmec_jax, *, static, indata, boundary):
+    initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
+    eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
+    signgs_from_sqrtg = _resolve_vmec_attr(vmec_jax, "signgs_from_sqrtg", submodule="field")
+    flux_profiles_from_indata = _resolve_vmec_attr(vmec_jax, "flux_profiles_from_indata", submodule="energy")
+    eval_profiles = _resolve_vmec_attr(vmec_jax, "eval_profiles", submodule="profiles")
+    booz_xform_inputs_from_state = _resolve_vmec_attr(vmec_jax, "booz_xform_inputs_from_state", submodule="booz_input")
+
+    st_guess = initial_guess_from_boundary(static, boundary, indata, vmec_project=False)
+    geom = eval_geom(st_guess, static)
+    signgs = int(signgs_from_sqrtg(np.asarray(geom.sqrtg), axis_index=1))
+    flux = flux_profiles_from_indata(indata, jnp.asarray(static.s), signgs=signgs)
+    prof = eval_profiles(indata, jnp.asarray(static.s))
+    pressure = jnp.asarray(prof.get("pressure", jnp.zeros_like(jnp.asarray(static.s))))
+    booz_inputs = booz_xform_inputs_from_state(
+        state=st_guess,
+        static=static,
+        indata=indata,
+        signgs=signgs,
+        flux=flux,
+    )
+    return {
+        "st_guess": st_guess,
+        "signgs": signgs,
+        "flux": flux,
+        "pressure": pressure,
+        "booz_inputs": booz_inputs,
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class GeometryAutodiffContext:
     input_path: Path
@@ -115,15 +158,30 @@ def build_geometry_autodiff_context(
         )
     boundary_index = int(match_indices[0])
 
-    fixed_context = vmec_jax.prepare_fixed_boundary_context(
-        static=static,
-        indata=indata,
-        boundary=boundary,
-        vmec_project=False,
-    )
-    surface_indices, _ = vmec_jax.surface_indices_from_static(static, list(surface_s))
+    try:
+        prepare_fixed_boundary_context = _resolve_vmec_attr(vmec_jax, "prepare_fixed_boundary_context")
+        fixed_context_obj = prepare_fixed_boundary_context(
+            static=static,
+            indata=indata,
+            boundary=boundary,
+            vmec_project=False,
+        )
+        fixed_context = {
+            "signgs": int(fixed_context_obj.signgs),
+            "flux": fixed_context_obj.flux,
+            "pressure": jnp.asarray(fixed_context_obj.pressure),
+            "booz_inputs": fixed_context_obj.booz_inputs,
+        }
+    except Exception:
+        fixed_context = _build_vmec_fixed_context(vmec_jax, static=static, indata=indata, boundary=boundary)
+    try:
+        surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
+        surface_indices, _ = surface_indices_from_static(static, list(surface_s))
+    except Exception:
+        s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
+        surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in surface_s]
     booz_constants, booz_grids = booz_api.prepare_booz_xform_constants_from_inputs(
-        inputs=fixed_context.booz_inputs,
+        inputs=fixed_context["booz_inputs"],
         mboz=int(mboz),
         nboz=int(nboz),
         asym=bool(cfg.lasym),
@@ -142,9 +200,9 @@ def build_geometry_autodiff_context(
         boundary=boundary,
         boundary_kind=kind,
         boundary_index=boundary_index,
-        signgs=int(fixed_context.signgs),
-        flux=fixed_context.flux,
-        pressure=jnp.asarray(fixed_context.pressure),
+        signgs=int(fixed_context["signgs"]),
+        flux=fixed_context["flux"],
+        pressure=jnp.asarray(fixed_context["pressure"]),
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
         mboz=int(mboz),
