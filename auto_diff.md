@@ -4222,6 +4222,16 @@ So the geometry implementation priority is now:
    geometry construction
 5. only after that, rerun `RBC(1,0)` frozen-path AD vs FD
 
+Immediate implementation note:
+
+- the first geometry implementation should land the **NEOPAX-owned forward lane**
+  and the **forward-mode AD lane** first
+- both lanes should still target the same final NEOPAX transport metric vector
+  used in the `n0` tests
+- once this forward lane is validated against FD on those same metrics, we
+  should be able to add a reverse-mode magnetic path afterward rather than
+  trying to start from reverse mode immediately
+
 #### Raw saved terminal values from the frozen checkpoint runs
 
 These are copied from the terminal outputs pasted during the session so the raw

@@ -100,8 +100,6 @@ class GeometryAutodiffContext:
     signgs: int
     flux: Any
     pressure: jnp.ndarray
-    ntx_boundary_context: Any
-    boundary_specs: tuple[Any, ...]
     surface_s: tuple[float, ...]
     surface_indices: jnp.ndarray
     mboz: int
@@ -111,6 +109,7 @@ class GeometryAutodiffContext:
     baseline_coefficient: float
     vmec_default_max_iter: int
     vmec_default_step_size: float
+    vmec_default_ftol: float | None
 
 
 def _boundary_kind_for_family(family: str) -> str:
@@ -180,12 +179,6 @@ def build_geometry_autodiff_context(
 ) -> GeometryAutodiffContext:
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
-    _ensure_local_stack_on_path()
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
-    import ntx
 
     vmec_input = Path(input_path).expanduser().resolve()
     cfg, indata = vmec_jax.load_input(str(vmec_input))
@@ -237,21 +230,6 @@ def build_geometry_autodiff_context(
     )
 
     boundary_array = jnp.asarray(getattr(boundary, _boundary_array_name_for_kind(kind)))
-    boundary_context = ntx.build_vmec_jax_boundary_context(
-        vmec_input,
-        signgs=int(fixed_context["signgs"]),
-        max_mode=max(abs(int(param_m)), abs(int(param_n))),
-        include=(kind,),
-        fix=(),
-        include_axis=True,
-    )
-    boundary_specs = tuple(
-        spec for spec in tuple(boundary_context.specs) if str(spec.kind).lower() == kind and int(spec.m) == int(param_m) and int(spec.n) == int(param_n)
-    )
-    if len(boundary_specs) != 1:
-        raise ValueError(
-            f"Expected exactly one NTX/vmec_jax boundary spec for {param_family}({param_m}, {param_n}); found {len(boundary_specs)}."
-        )
 
     return GeometryAutodiffContext(
         input_path=vmec_input,
@@ -267,8 +245,6 @@ def build_geometry_autodiff_context(
         signgs=int(fixed_context["signgs"]),
         flux=fixed_context["flux"],
         pressure=jnp.asarray(fixed_context["pressure"]),
-        ntx_boundary_context=boundary_context,
-        boundary_specs=boundary_specs,
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
         mboz=int(mboz),
@@ -278,6 +254,7 @@ def build_geometry_autodiff_context(
         baseline_coefficient=float(boundary_array[boundary_index]),
         vmec_default_max_iter=_vmec_default_max_iter_from_indata(indata),
         vmec_default_step_size=_vmec_default_step_size_from_indata(indata),
+        vmec_default_ftol=_vmec_default_ftol_from_indata(indata),
     )
 
 
@@ -285,26 +262,64 @@ def _solve_state_for_single_param(
     context: GeometryAutodiffContext,
     param_delta,
     *,
-    max_iter: int = 2,
-    step_size: float = 5.0e-3,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ) -> Any:
-    del jacobian_penalty
-    _ensure_local_stack_on_path()
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
-    import ntx
+    vmec_jax = _import_vmec_jax()
+    initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
+    solve_fixed_boundary_residual_iter = _resolve_vmec_attr(vmec_jax, "solve_fixed_boundary_residual_iter", submodule="solve")
 
-    params = jnp.asarray([jnp.asarray(param_delta, dtype=jnp.float64)], dtype=jnp.float64)
-    return ntx.solve_vmec_jax_boundary_state(
-        context.ntx_boundary_context,
-        params,
-        vmec_project=True,
-        max_iter=int(max_iter),
-        step_size=float(step_size),
-        ftol=_vmec_default_ftol_from_indata(context.indata),
+    lane_key = str(lane).strip().lower()
+    if lane_key not in {"forward", "ad"}:
+        raise ValueError("lane must be 'forward' or 'ad'.")
+
+    max_iter_value = int(context.vmec_default_max_iter if max_iter is None else max_iter)
+    step_size_value = float(context.vmec_default_step_size if step_size is None else step_size)
+
+    boundary_field = _boundary_array_name_for_kind(context.boundary_kind)
+    boundary_array = jnp.asarray(getattr(context.boundary, boundary_field), dtype=jnp.float64)
+    boundary_array = boundary_array.at[int(context.boundary_index)].add(jnp.asarray(param_delta, dtype=jnp.float64))
+    boundary = dataclasses.replace(context.boundary, **{boundary_field: boundary_array})
+    state0 = initial_guess_from_boundary(context.static, boundary, context.indata, vmec_project=True)
+
+    if lane_key == "forward":
+        result = solve_fixed_boundary_residual_iter(
+            state0,
+            context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+            ftol=context.vmec_default_ftol,
+            max_iter=max_iter_value,
+            step_size=step_size_value,
+            vmec2000_control=True,
+            strict_update=True,
+            backtracking=True,
+            limit_dt_from_force=True,
+            limit_update_rms=True,
+            verbose=False,
+            verbose_vmec2000_table=False,
+            jit_forces="auto",
+            use_scan=True,
+        )
+        return result.state
+
+    # AD lane: keep the implicit residual solve separate so we can add a
+    # reverse-mode path later without changing the forward lane contract.
+    del jacobian_penalty
+    return vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(
+        state0,
+        context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+        max_iter=max_iter_value,
+        step_size=step_size_value,
+        ftol=context.vmec_default_ftol,
+        edge_Rcos=state0.Rcos[-1, :],
+        edge_Rsin=state0.Rsin[-1, :],
+        edge_Zcos=state0.Zcos[-1, :],
+        edge_Zsin=state0.Zsin[-1, :],
     )
 
 
@@ -314,12 +329,99 @@ def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) 
     return None if match < 0 else match
 
 
+def solve_geometry_state_forward(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+):
+    return _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane="forward",
+        max_iter=max_iter,
+        step_size=step_size,
+    )
+
+
+def solve_geometry_state_ad(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+):
+    return _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane="ad",
+        max_iter=max_iter,
+        step_size=step_size,
+    )
+
+
+def vmec_scalar_observables_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    vmec_jax = _import_vmec_jax()
+    eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
+    volume_from_sqrtg = _resolve_vmec_attr(vmec_jax, "volume_from_sqrtg", submodule="integrals")
+    equilibrium_iota_profiles_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_iota_profiles_from_state",
+        submodule="profiles",
+    )
+    equilibrium_aspect_ratio_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_aspect_ratio_from_state",
+        submodule="profiles",
+    )
+
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    geom = eval_geom(state, context.static)
+    _dvds, volume = volume_from_sqrtg(
+        geom.sqrtg,
+        context.static.s,
+        context.static.grid.theta,
+        context.static.grid.zeta,
+        nfp=int(context.cfg.nfp),
+    )
+    _chips, _iotas, iotaf = equilibrium_iota_profiles_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    iota_mean = jnp.mean(iotaf[1:]) if int(iotaf.size) > 1 else iotaf[0]
+    return {
+        "aspect_ratio": jnp.asarray(equilibrium_aspect_ratio_from_state(state=state, static=context.static)),
+        "volume_total": jnp.asarray(volume[-1]),
+        "iota_mean": jnp.asarray(iota_mean),
+        "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
+    }
+
+
 def geometry_observables_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
     *,
-    max_iter: int = 2,
-    step_size: float = 5.0e-3,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ) -> dict[str, jnp.ndarray]:
     vmec_jax = _import_vmec_jax()
@@ -328,6 +430,7 @@ def geometry_observables_from_single_param(
     state = _solve_state_for_single_param(
         context,
         param_delta,
+        lane=lane,
         max_iter=max_iter,
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
@@ -372,6 +475,35 @@ def geometry_observables_from_single_param(
     observables["surface_indices"] = context.surface_indices.astype(jnp.float64)
     observables["nfp"] = jnp.asarray([float(nfp)], dtype=jnp.float64)
     return observables
+
+
+def vmec_booz_scalar_observables_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    observables = geometry_observables_from_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    reduced = {
+        "iota_b_mean": jnp.mean(jnp.asarray(observables["iota_b"])),
+        "b00_mean": jnp.mean(jnp.asarray(observables["b00"])),
+        "buco_b_mean": jnp.mean(jnp.asarray(observables["buco_b"])),
+        "bvco_b_mean": jnp.mean(jnp.asarray(observables["bvco_b"])),
+        "aspect_proxy": jnp.asarray(observables["aspect_proxy"]),
+    }
+    if "b10_over_b00" in observables:
+        reduced["b10_over_b00_mean"] = jnp.mean(jnp.asarray(observables["b10_over_b00"]))
+    return reduced
 
 
 def _safe_divide(num, den):
@@ -709,14 +841,16 @@ def build_neopax_geometry_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
     *,
+    lane: str = "ad",
     n_r: int,
-    max_iter: int = 2,
-    step_size: float = 5.0e-3,
+    max_iter: int | None = None,
+    step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ):
     state = _solve_state_for_single_param(
         context,
         param_delta,
+        lane=lane,
         max_iter=max_iter,
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
@@ -729,9 +863,10 @@ def build_runtime_context_for_geometry_param(
     context: GeometryAutodiffContext,
     param_delta,
     *,
+    lane: str = "ad",
     n_r: int,
-    max_iter: int = 2,
-    step_size: float = 5.0e-3,
+    max_iter: int | None = None,
+    step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ):
     from NEOPAX._orchestrator import (
@@ -751,6 +886,7 @@ def build_runtime_context_for_geometry_param(
     state_vmec = _solve_state_for_single_param(
         context,
         param_delta,
+        lane=lane,
         max_iter=max_iter,
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,

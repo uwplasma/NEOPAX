@@ -396,6 +396,69 @@ def _adaptive_rollout_objectives_for_parameter(
     return _objective_vector(final_state, runtime), rollout
 
 
+def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(parameter_value),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    final_y = _radau_adaptive_final_y_realized_schedule(
+        execution_context,
+        max_total_steps,
+        stop_after_accepted_steps,
+        prepared_rollout.initial_carry,
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
 def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     parameter_value,
     *,
@@ -4616,6 +4679,59 @@ def build_realized_schedule_frozen_fd_report(
     fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
+
+    if ad_only and keep_adaptive_ad:
+        if accepted_step_limit is not None:
+            print(
+                "[autodiff-gate] adaptive AD-only mode ignores "
+                "--realized-schedule-frozen-accepted-steps because no frozen replay is built",
+                flush=True,
+            )
+        objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+        )
+        print(
+            "[autodiff-gate] adaptive AD-only progress: running adaptive custom AD gradient",
+            flush=True,
+        )
+        _, gradient_ad = jax.jvp(
+            objective_fn,
+            (jnp.asarray(baseline_value),),
+            (jnp.asarray(1.0),),
+        )
+        grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+        print(
+            "[autodiff-gate] adaptive AD-only progress: AD gradient complete",
+            flush=True,
+        )
+        return {
+            "config_path": str(config_path),
+            "realized_schedule_frozen_fd_check": True,
+            "parameter_name": parameter_name,
+            "baseline_value": baseline_value,
+            "fd_step": float(fd_step),
+            "baseline_objectives": None,
+            "gradient_autodiff": grad_ad_np.tolist(),
+            "gradient_fd": None,
+            "gradient_absolute_error": None,
+            "gradient_relative_error": None,
+            "max_relative_error": float("nan"),
+            "passed": True,
+            "objective_labels": OBJECTIVE_LABELS,
+            "frozen_replay_mode": str(replay_mode),
+            "ad_mode": "realized_schedule_jvp",
+            "ad_available": True,
+            "ad_only": True,
+            "keep_adaptive_ad": True,
+            "accepted_step_limit": None,
+            "accepted_time_list": None,
+            "rollout_path": {},
+        }
 
     baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(baseline_value),

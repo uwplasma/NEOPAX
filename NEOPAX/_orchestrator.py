@@ -209,6 +209,9 @@ def _build_geometry(config: dict):
     from ._geometry_models import get_geometry_model
 
     geom_cfg = config.get("geometry", {})
+    backend = str(geom_cfg.get("backend", "")).strip().lower()
+    if backend in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}:
+        return None
     n_radial = int(geom_cfg.get("n_radial", 51))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
@@ -649,6 +652,35 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
 
 
 def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState | None]:
+    geom_cfg = config.get("geometry", {})
+    geometry_backend = str(geom_cfg.get("backend", "")).strip().lower()
+    if geometry_backend in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}:
+        from ._geometry_autodiff import (
+            build_geometry_autodiff_context,
+            build_runtime_context_for_geometry_param,
+        )
+
+        context = build_geometry_autodiff_context(
+            geom_cfg.get("vmec_input_file"),
+            param_family=str(geom_cfg.get("vmec_param_family", "RBC")),
+            param_m=int(geom_cfg.get("vmec_param_m", 1)),
+            param_n=int(geom_cfg.get("vmec_param_n", 0)),
+            mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
+            nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+        )
+        lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
+        param_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
+        return build_runtime_context_for_geometry_param(
+            config,
+            context,
+            jnp.asarray(param_delta, dtype=jnp.float64),
+            lane=lane,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            step_size=geom_cfg.get("vmec_step_size"),
+            jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        )
+
     species = _build_species(config)
     energy_grid = _build_energy_grid(config)
     geometry = _build_geometry(config)
