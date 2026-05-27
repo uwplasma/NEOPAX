@@ -2779,8 +2779,35 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             report["gradient_absolute_error"],
             report["gradient_relative_error"],
         ):
+                print(
+                    f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                    f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+                )
+        return
+
+    if report.get("adaptive_vs_frozen_custom_ad_check"):
+        print(
+            f"[autodiff-gate] mode=adaptive_vs_frozen_custom_ad "
+            f"parameter={report['parameter_name']} "
+            f"checkpoint_index={report['checkpoint_index']} "
+            f"replay_mode={report.get('replay_mode')}"
+        )
+        print(
+            "[autodiff-gate] timings: "
+            f"adaptive_seconds={float(report['adaptive_runtime_seconds']):.3f} "
+            f"frozen_seconds={float(report['frozen_runtime_seconds']):.3f}"
+        )
+        print("[autodiff-gate] adaptive vs frozen custom AD:")
+        for label, ad_adaptive, ad_frozen, ae, re in zip(
+            report["objective_labels"],
+            report["gradient_adaptive_custom"],
+            report["gradient_frozen_custom"],
+            report["gradient_absolute_error"],
+            report["gradient_relative_error"],
+        ):
             print(
-                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"  - {label}: adaptive={float(ad_adaptive):.6e} "
+                f"frozen={float(ad_frozen):.6e} "
                 f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
             )
         return
@@ -9153,6 +9180,64 @@ def build_realized_schedule_windowed_frozen_fd_report(
     }
 
 
+def build_adaptive_vs_frozen_custom_ad_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    device: str | None,
+    checkpoint_index: int,
+    replay_mode: str = "attempt",
+    ntx_exact_derivative_mode: str | None = None,
+) -> dict[str, Any]:
+    adaptive_started = time.perf_counter()
+    adaptive_report = build_realized_schedule_frozen_fd_report(
+        config_path=config_path,
+        parameter_name=parameter_name,
+        rel_fd_step=3.0e-8,
+        abs_fd_step=1.0e-10,
+        device=device,
+        replay_mode=replay_mode,
+        accepted_step_limit=checkpoint_index,
+        keep_adaptive_ad=True,
+        ad_only=True,
+    )
+    adaptive_seconds = time.perf_counter() - adaptive_started
+
+    frozen_started = time.perf_counter()
+    frozen_report = build_realized_trace_checkpoint_compare_report(
+        config_path=config_path,
+        parameter_name=parameter_name,
+        device=device,
+        checkpoint_index=checkpoint_index,
+    )
+    frozen_seconds = time.perf_counter() - frozen_started
+
+    grad_adaptive = np.asarray(adaptive_report["gradient_autodiff"], dtype=float)
+    grad_frozen = np.asarray(frozen_report["gradient_autodiff"], dtype=float)
+    abs_err = np.abs(grad_adaptive - grad_frozen)
+    rel_err = abs_err / np.maximum(np.abs(grad_frozen), 1.0e-10)
+
+    return {
+        "config_path": str(config_path),
+        "adaptive_vs_frozen_custom_ad_check": True,
+        "parameter_name": parameter_name,
+        "checkpoint_index": int(checkpoint_index),
+        "replay_mode": str(replay_mode),
+        "ntx_exact_derivative_mode": None if ntx_exact_derivative_mode is None else str(ntx_exact_derivative_mode),
+        "objective_labels": OBJECTIVE_LABELS,
+        "gradient_adaptive_custom": grad_adaptive.tolist(),
+        "gradient_frozen_custom": grad_frozen.tolist(),
+        "gradient_absolute_error": abs_err.tolist(),
+        "gradient_relative_error": rel_err.tolist(),
+        "max_relative_error": float(np.max(rel_err)),
+        "adaptive_runtime_seconds": float(adaptive_seconds),
+        "frozen_runtime_seconds": float(frozen_seconds),
+        "adaptive_report": adaptive_report,
+        "frozen_report": frozen_report,
+        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+    }
+
+
 def build_small_step_only_report(
     *,
     config_path: Path,
@@ -9583,6 +9668,11 @@ def main() -> None:
         help="Dedicated opt-in mode: run the same realized-trace checkpoint frozen-FD benchmark twice, once with NTX direct AD and once with NTX custom_vjp, and compare timings and custom-AD derivatives.",
     )
     parser.add_argument(
+        "--adaptive-vs-frozen-custom-ad-check",
+        action="store_true",
+        help="Dedicated opt-in mode: compare the live adaptive custom-JVP derivative against the frozen accepted-trace custom derivative at one accepted-step checkpoint.",
+    )
+    parser.add_argument(
         "--realized-trace-checkpoint-interpolated-fd-check",
         action="store_true",
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint AD against adaptive fd_minus/fd_plus trajectories interpolated to the baseline checkpoint time.",
@@ -9878,6 +9968,15 @@ def main() -> None:
             replay_mode=args.realized_schedule_frozen_replay_mode,
             include_direct_ad=not args.skip_direct_ad_in_frozen_check,
             compute_five_point=False,
+        )
+    elif args.adaptive_vs_frozen_custom_ad_check:
+        report = build_adaptive_vs_frozen_custom_ad_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            device=args.device,
+            checkpoint_index=args.realized_trace_checkpoint_index,
+            replay_mode=args.realized_schedule_frozen_replay_mode,
+            ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         )
     elif args.realized_trace_checkpoint_frozen_fd_check:
         report = build_realized_trace_checkpoint_frozen_fd_report(
