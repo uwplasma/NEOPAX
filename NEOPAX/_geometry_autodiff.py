@@ -8,6 +8,7 @@ from typing import Any, Sequence
 import jax
 import jax.numpy as jnp
 import interpax
+import numpy as np
 
 
 def _repo_root() -> Path:
@@ -50,7 +51,8 @@ class GeometryAutodiffContext:
     indata: Any
     static: Any
     boundary: Any
-    spec: Any
+    boundary_kind: str
+    boundary_index: int
     signgs: int
     flux: Any
     pressure: jnp.ndarray
@@ -99,28 +101,19 @@ def build_geometry_autodiff_context(
     boundary = vmec_jax.boundary_from_indata(indata, static.modes)
 
     kind = _boundary_kind_for_family(param_family)
-    try:
-        boundary_param_specs = vmec_jax.boundary_param_specs
-    except AttributeError:
-        from vmec_jax.optimization import boundary_param_specs
-
-    specs = boundary_param_specs(
-        boundary,
-        static.modes,
-        include=(kind,),
-        fix=(),
-        include_axis=True,
-    )
-    matches = [spec for spec in specs if int(spec.m) == int(param_m) and int(spec.n) == int(param_n) and spec.kind == kind]
-    if not matches:
+    m_arr = jnp.asarray(static.modes.m)
+    n_arr = jnp.asarray(static.modes.n)
+    matches = jnp.where((m_arr == int(param_m)) & (n_arr == int(param_n)), size=2, fill_value=-1)[0]
+    match_indices = [int(idx) for idx in np.asarray(matches) if int(idx) >= 0]
+    if not match_indices:
         raise ValueError(
             f"Could not find a {param_family} coefficient with (m, n)=({param_m}, {param_n}) in {vmec_input}."
         )
-    if len(matches) > 1:
+    if len(match_indices) > 1:
         raise ValueError(
             f"Found multiple matches for {param_family}({param_m}, {param_n}); expected exactly one."
         )
-    spec = matches[0]
+    boundary_index = int(match_indices[0])
 
     fixed_context = vmec_jax.prepare_fixed_boundary_context(
         static=static,
@@ -147,7 +140,8 @@ def build_geometry_autodiff_context(
         indata=indata,
         static=static,
         boundary=boundary,
-        spec=spec,
+        boundary_kind=kind,
+        boundary_index=boundary_index,
         signgs=int(fixed_context.signgs),
         flux=fixed_context.flux,
         pressure=jnp.asarray(fixed_context.pressure),
@@ -157,7 +151,7 @@ def build_geometry_autodiff_context(
         nboz=int(nboz),
         booz_constants=booz_constants,
         booz_grids=booz_grids,
-        baseline_coefficient=float(boundary_array[spec.index]),
+        baseline_coefficient=float(boundary_array[boundary_index]),
     )
 
 
@@ -170,13 +164,20 @@ def _solve_state_for_single_param(
     jacobian_penalty: float = 1.0e3,
 ) -> Any:
     vmec_jax = _import_vmec_jax()
-    params = jnp.asarray([param_delta], dtype=jnp.float64)
-    try:
-        apply_boundary_params = vmec_jax.apply_boundary_params
-    except AttributeError:
-        from vmec_jax.optimization import apply_boundary_params
-
-    boundary = apply_boundary_params(context.boundary, (context.spec,), params)
+    params = jnp.asarray(param_delta, dtype=jnp.float64)
+    boundary = context.boundary
+    if context.boundary_kind == "rc":
+        boundary = dataclasses.replace(
+            boundary,
+            R_cos=jnp.asarray(boundary.R_cos).at[context.boundary_index].add(params),
+        )
+    elif context.boundary_kind == "zs":
+        boundary = dataclasses.replace(
+            boundary,
+            Z_sin=jnp.asarray(boundary.Z_sin).at[context.boundary_index].add(params),
+        )
+    else:
+        raise ValueError(f"Unsupported boundary kind '{context.boundary_kind}'.")
     return vmec_jax.solve_fixed_boundary_from_boundary(
         boundary=boundary,
         static=context.static,
