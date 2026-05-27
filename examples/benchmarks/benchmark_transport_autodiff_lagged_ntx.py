@@ -2555,6 +2555,14 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
                     f"final_state_finite={accepted_mode_debug.get('final_state_finite')} "
                     f"objectives_finite={accepted_mode_debug.get('objectives_finite')}"
                 )
+        if report.get("ad_only"):
+            print("[autodiff-gate] AD derivative values:")
+            for label, ad in zip(
+                report["objective_labels"],
+                report["gradient_autodiff"],
+            ):
+                print(f"  - {label}: ad={float(ad):.6e}")
+            return
         if report.get("ad_available", True):
             print("[autodiff-gate] objective errors:")
             for label, ad, fd, ae, re in zip(
@@ -4595,6 +4603,8 @@ def build_realized_schedule_frozen_fd_report(
     device: str | None,
     replay_mode: str = "attempt",
     accepted_step_limit: int | None = None,
+    keep_adaptive_ad: bool = False,
+    ad_only: bool = False,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -4623,6 +4633,10 @@ def build_realized_schedule_frozen_fd_report(
     )
     replay_accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
     replay_active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    accepted_times = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
+    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    accepted_time_list = accepted_times[np.logical_and(active_mask, accepted_mask)].tolist()
     print(
         "[autodiff-gate] realized-schedule frozen-fd baseline summary: "
         f"attempt_count={baseline_diag['attempt_count']} "
@@ -4632,6 +4646,66 @@ def build_realized_schedule_frozen_fd_report(
         f"fail_code={baseline_diag['fail_code']}",
         flush=True,
     )
+    if accepted_step_limit is None or keep_adaptive_ad:
+        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=True,
+        )[0]
+        ad_mode = "realized_schedule_jvp"
+    else:
+        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_frozen_trace(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            frozen_trace=replay_trace,
+            replay_mode=replay_mode,
+        )[0]
+        ad_mode = "frozen_trace_direct"
+    print(
+        "[autodiff-gate] realized-schedule frozen-fd progress: baseline rollout complete; running AD gradient",
+        flush=True,
+    )
+    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
+    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    ad_available = True
+    if ad_only:
+        print(
+            "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; skipping FD replays (--realized-schedule-frozen-ad-only)",
+            flush=True,
+        )
+        return {
+            "config_path": str(config_path),
+            "realized_schedule_frozen_fd_check": True,
+            "parameter_name": parameter_name,
+            "baseline_value": baseline_value,
+            "fd_step": float(fd_step),
+            "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
+            "gradient_autodiff": grad_ad_np.tolist(),
+            "gradient_fd": None,
+            "gradient_absolute_error": None,
+            "gradient_relative_error": None,
+            "max_relative_error": float("nan"),
+            "passed": True,
+            "objective_labels": OBJECTIVE_LABELS,
+            "frozen_replay_mode": str(replay_mode),
+            "ad_mode": ad_mode,
+            "ad_available": ad_available,
+            "ad_only": True,
+            "keep_adaptive_ad": bool(keep_adaptive_ad),
+            "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
+            "accepted_time_list": accepted_time_list,
+            "rollout_path": {
+                "baseline": baseline_diag,
+            },
+        }
     print(
         "[autodiff-gate] realized-schedule frozen-fd progress: baseline rollout complete; "
         f"running frozen fd_minus replay ({replay_mode})",
@@ -4738,49 +4812,14 @@ def build_realized_schedule_frozen_fd_report(
                 replay_trace,
                 objectives_np=np.asarray(jax.device_get(plus_objectives_accepted), dtype=float),
             )
-    print(
-        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; running AD gradient",
-        flush=True,
-    )
-    if accepted_step_limit is None:
-        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            use_realized_schedule_jvp=True,
-        )[0]
-        ad_mode = "realized_schedule_jvp"
-    else:
-        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter_on_frozen_trace(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            frozen_trace=replay_trace,
-            replay_mode=replay_mode,
-        )[0]
-        ad_mode = "frozen_trace_direct"
     gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
     grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
     print(
-        "[autodiff-gate] realized-schedule frozen-fd progress: AD gradient complete; forming frozen FD gradient",
+        "[autodiff-gate] realized-schedule frozen-fd progress: frozen fd_plus replay complete; forming frozen FD gradient",
         flush=True,
     )
-    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
     abs_err = np.abs(grad_ad_np - grad_fd_np)
     rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
-    ad_available = True
-
-    accepted_times = np.asarray(jax.device_get(replay_trace.step_ts), dtype=float)
-    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
-    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
-    accepted_time_list = accepted_times[np.logical_and(active_mask, accepted_mask)].tolist()
 
     return {
         "config_path": str(config_path),
@@ -4803,6 +4842,8 @@ def build_realized_schedule_frozen_fd_report(
         "frozen_replay_mode": str(replay_mode),
         "ad_mode": ad_mode,
         "ad_available": ad_available,
+        "ad_only": False,
+        "keep_adaptive_ad": bool(keep_adaptive_ad),
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
         "accepted_time_list": accepted_time_list,
         "rollout_path": {
@@ -9524,6 +9565,16 @@ def main() -> None:
         help="Optional prefix length for --realized-schedule-frozen-fd-check. When set, replay only the first N accepted steps from the baseline realized schedule.",
     )
     parser.add_argument(
+        "--realized-schedule-frozen-keep-adaptive-ad",
+        action="store_true",
+        help="For --realized-schedule-frozen-fd-check, keep AD on the live realized-schedule custom-JVP lane even when --realized-schedule-frozen-accepted-steps truncates the FD replay prefix.",
+    )
+    parser.add_argument(
+        "--realized-schedule-frozen-ad-only",
+        action="store_true",
+        help="For --realized-schedule-frozen-fd-check, run only the AD derivative and skip the frozen FD replays.",
+    )
+    parser.add_argument(
         "--realized-schedule-ad-debug-fast",
         action="store_true",
         help="Run the cheapest realized-schedule AD failure-localization path: baseline rollout, AD gradient, and optional minimal NaN localization only.",
@@ -9610,6 +9661,8 @@ def main() -> None:
             device=args.device,
             replay_mode=args.realized_schedule_frozen_replay_mode,
             accepted_step_limit=args.realized_schedule_frozen_accepted_steps,
+            keep_adaptive_ad=args.realized_schedule_frozen_keep_adaptive_ad,
+            ad_only=args.realized_schedule_frozen_ad_only,
         )
     elif args.realized_schedule_frozen_replay_localize:
         report = build_realized_schedule_frozen_replay_localize_report(

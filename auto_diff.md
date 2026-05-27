@@ -4221,3 +4221,87 @@ So the geometry implementation priority is now:
 4. expose a NEOPAX-owned forward lane and AD lane for boundary-parameter
    geometry construction
 5. only after that, rerun `RBC(1,0)` frozen-path AD vs FD
+
+#### Raw saved terminal values from the frozen checkpoint runs
+
+These are copied from the terminal outputs pasted during the session so the raw
+FD reference values are preserved here as well, not just the relative errors.
+
+Checkpoint `110`, frozen central FD, `fd_step = 1.263000e-07`
+
+- `softmax_Er`
+  - `custom_ad = 2.027686e+01`
+  - `fd = 2.027908e+01`
+- `smooth_root_proxy`
+  - `custom_ad = -8.442966e-05`
+  - `fd = -8.437382e-05`
+- `Er2_volume_average`
+  - `custom_ad = 4.344449e+01`
+  - `fd = 4.344444e+01`
+- `Er_volume_average`
+  - `custom_ad = 3.161107e+00`
+  - `fd = 3.161492e+00`
+- `electron_temperature_volume_average_keV`
+  - `custom_ad = 1.237538e-02`
+  - `fd = 1.237539e-02`
+- `total_pressure_volume_average`
+  - `custom_ad = 7.939232e+00`
+  - `fd = 7.939232e+00`
+- `alpha_power_volume_average_mw_m3`
+  - `custom_ad = 2.876068e-01`
+  - `fd = 2.876131e-01`
+
+Checkpoint `115`, frozen central FD, `fd_step = 1.263000e-07`
+
+- `softmax_Er`
+  - `custom_ad = 4.086843e+01`
+  - `fd = 4.087382e+01`
+- `smooth_root_proxy`
+  - `custom_ad = -8.501898e-05`
+  - `fd = -8.500619e-05`
+- `Er2_volume_average`
+  - `custom_ad = 9.661756e+01`
+  - `fd = 9.662527e+01`
+- `Er_volume_average`
+  - `custom_ad = -4.321700e+00`
+  - `fd = -4.321650e+00`
+- `electron_temperature_volume_average_keV`
+  - `custom_ad = 1.300916e-02`
+  - `fd = 1.300917e-02`
+- `total_pressure_volume_average`
+  - `custom_ad = 7.942294e+00`
+  - `fd = 7.942294e+00`
+- `alpha_power_volume_average_mw_m3`
+  - `custom_ad = 2.845732e-01`
+  - `fd = 2.845785e-01`
+
+Checkpoint `115`, frozen stencil check, same `fd_step = 1.263000e-07`
+
+- `softmax_Er`
+  - `custom_ad = 4.086843e+01`
+  - `fd_center = 4.087382e+01`
+  - `fd_five_point = 4.087127e+01`
+- `smooth_root_proxy`
+  - `custom_ad = -8.501898e-05`
+  - `fd_center = -8.500619e-05`
+  - `fd_five_point = -8.500043e-05`
+- `Er2_volume_average`
+  - `custom_ad = 9.661756e+01`
+  - `fd_center = 9.662527e+01`
+  - `fd_five_point = 9.662307e+01`
+- `Er_volume_average`
+  - `custom_ad = -4.321700e+00`
+  - `fd_center = -4.321650e+00`
+  - `fd_five_point = -4.321778e+00`
+- `electron_temperature_volume_average_keV`
+  - `custom_ad = 1.300916e-02`
+  - `fd_center = 1.300917e-02`
+  - `fd_five_point = 1.300916e-02`
+- `total_pressure_volume_average`
+  - `custom_ad = 7.942294e+00`
+  - `fd_center = 7.942294e+00`
+  - `fd_five_point = 7.942294e+00`
+- `alpha_power_volume_average_mw_m3`
+  - `custom_ad = 2.845732e-01`
+  - `fd_center = 2.845785e-01`
+  - `fd_five_point = 2.845740e-01`
