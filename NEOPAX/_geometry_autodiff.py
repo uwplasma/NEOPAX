@@ -100,6 +100,8 @@ class GeometryAutodiffContext:
     signgs: int
     flux: Any
     pressure: jnp.ndarray
+    ntx_boundary_context: Any
+    boundary_specs: tuple[Any, ...]
     surface_s: tuple[float, ...]
     surface_indices: jnp.ndarray
     mboz: int
@@ -150,6 +152,22 @@ def _vmec_default_step_size_from_indata(indata: Any) -> float:
         return 1.0
 
 
+def _vmec_default_ftol_from_indata(indata: Any) -> float | None:
+    ftol_array = indata.get("FTOL_ARRAY", None)
+    if ftol_array is not None:
+        try:
+            values = [float(v) for v in ftol_array]
+            if values:
+                return float(values[-1])
+        except Exception:
+            pass
+    try:
+        value = indata.get_float("FTOL", None)
+    except Exception:
+        value = None
+    return None if value is None else float(value)
+
+
 def build_geometry_autodiff_context(
     input_path: str | Path,
     *,
@@ -162,6 +180,12 @@ def build_geometry_autodiff_context(
 ) -> GeometryAutodiffContext:
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
 
     vmec_input = Path(input_path).expanduser().resolve()
     cfg, indata = vmec_jax.load_input(str(vmec_input))
@@ -213,6 +237,21 @@ def build_geometry_autodiff_context(
     )
 
     boundary_array = jnp.asarray(getattr(boundary, _boundary_array_name_for_kind(kind)))
+    boundary_context = ntx.build_vmec_jax_boundary_context(
+        vmec_input,
+        signgs=int(fixed_context["signgs"]),
+        max_mode=max(abs(int(param_m)), abs(int(param_n))),
+        include=(kind,),
+        fix=(),
+        include_axis=True,
+    )
+    boundary_specs = tuple(
+        spec for spec in tuple(boundary_context.specs) if str(spec.kind).lower() == kind and int(spec.m) == int(param_m) and int(spec.n) == int(param_n)
+    )
+    if len(boundary_specs) != 1:
+        raise ValueError(
+            f"Expected exactly one NTX/vmec_jax boundary spec for {param_family}({param_m}, {param_n}); found {len(boundary_specs)}."
+        )
 
     return GeometryAutodiffContext(
         input_path=vmec_input,
@@ -228,6 +267,8 @@ def build_geometry_autodiff_context(
         signgs=int(fixed_context["signgs"]),
         flux=fixed_context["flux"],
         pressure=jnp.asarray(fixed_context["pressure"]),
+        ntx_boundary_context=boundary_context,
+        boundary_specs=boundary_specs,
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
         mboz=int(mboz),
@@ -248,35 +289,22 @@ def _solve_state_for_single_param(
     step_size: float = 5.0e-3,
     jacobian_penalty: float = 1.0e3,
 ) -> Any:
-    vmec_jax = _import_vmec_jax()
-    params = jnp.asarray(param_delta, dtype=jnp.float64)
-    boundary = context.boundary
-    if context.boundary_kind == "rc":
-        boundary = dataclasses.replace(
-            boundary,
-            R_cos=jnp.asarray(boundary.R_cos).at[context.boundary_index].add(params),
-        )
-    elif context.boundary_kind == "zs":
-        boundary = dataclasses.replace(
-            boundary,
-            Z_sin=jnp.asarray(boundary.Z_sin).at[context.boundary_index].add(params),
-        )
-    else:
-        raise ValueError(f"Unsupported boundary kind '{context.boundary_kind}'.")
-    return vmec_jax.solve_fixed_boundary_from_boundary(
-        boundary=boundary,
-        static=context.static,
-        indata=context.indata,
-        flux=context.flux,
-        pressure=context.pressure,
-        signgs=context.signgs,
+    del jacobian_penalty
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
+
+    params = jnp.asarray([jnp.asarray(param_delta, dtype=jnp.float64)], dtype=jnp.float64)
+    return ntx.solve_vmec_jax_boundary_state(
+        context.ntx_boundary_context,
+        params,
+        vmec_project=True,
         max_iter=int(max_iter),
         step_size=float(step_size),
-        jacobian_penalty=float(jacobian_penalty),
-        differentiable=True,
-        stop_grad_in_update=False,
-        verbose=False,
-        vmec_project=False,
+        ftol=_vmec_default_ftol_from_indata(context.indata),
     )
 
 

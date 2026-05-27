@@ -4175,3 +4175,49 @@ So the revised implementation order should be:
 3. replace the geometry benchmark VMEC lane with the NTX-style implicit
    residual path
 4. rerun `RBC(1,0)` frozen-path AD vs FD
+
+#### Refinement: decouple magnetic AD from NTX and make forward/AD lanes explicit
+
+After the first correction to the geometry benchmark, the next refinement is to
+separate the **magnetic differentiation path** from the **transport-through-NTX
+path** more cleanly.
+
+The long-term design should **not** depend on NTX wrappers for the magnetic
+solve itself. Instead, NEOPAX should own a direct magnetic pipeline based on:
+
+- boundary coefficient parameter
+- `-> vmec_jax` implicit residual solve
+- `-> booz_xform_jax`
+- `-> NEOPAX geometry/support object`
+
+Then the transport layer can consume that geometry, but it should not own the
+magnetic solve.
+
+This also means the magnetic path should expose **two explicit lanes**:
+
+1. **Forward geometry lane**
+   - used for primal runs and FD evaluations
+   - should use the proper forward VMEC/Boozer solve path
+   - should define the reference forward map for geometry perturbations
+
+2. **AD geometry lane**
+   - same mathematical map as the forward lane
+   - but implemented with the AD-capable solver-aware path
+   - should use the direct `vmec_jax` implicit residual solve API rather than
+     the old explicit GD helper
+
+Important principle:
+
+- forward/FD geometry runs should use the **forward lane**
+- AD should use the **AD lane**
+- both lanes must target the same underlying geometry map as closely as
+  possible
+
+So the geometry implementation priority is now:
+
+1. remove dependence on NTX wrappers for the magnetic solve itself
+2. replace that with direct `vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(...)`
+3. keep `booz_xform_jax` as the next stage
+4. expose a NEOPAX-owned forward lane and AD lane for boundary-parameter
+   geometry construction
+5. only after that, rerun `RBC(1,0)` frozen-path AD vs FD
