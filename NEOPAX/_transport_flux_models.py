@@ -1268,6 +1268,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     scan_batch_size: int | None = None
     response_anchor_count: int | None = None
     use_remat: bool = False
+    derivative_mode: str = "direct"
     er_v_floor: float | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
@@ -1333,6 +1334,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def with_use_remat(self, use_remat: bool) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, use_remat=bool(use_remat))
 
+    def with_derivative_mode(self, derivative_mode: str) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(self, derivative_mode=self._normalize_derivative_mode(derivative_mode))
+
     def with_er_v_floor(self, er_v_floor: float | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if er_v_floor in (None, "", 0, "0") else float(er_v_floor)
         return dataclasses.replace(self, er_v_floor=normalized)
@@ -1355,6 +1359,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "ntx_exact_radial_batch_mode must be one of: simple, lax_map, vmap, hybrid"
             )
+        return mode
+
+    @staticmethod
+    def _normalize_derivative_mode(derivative_mode: str | None) -> str:
+        mode = "direct" if derivative_mode in (None, "") else str(derivative_mode).strip().lower()
+        aliases = {
+            "plain": "direct",
+            "jax": "direct",
+            "custom": "custom_vjp",
+            "custom-vjp": "custom_vjp",
+            "customvjp": "custom_vjp",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"direct", "custom_vjp"}:
+            raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_vjp")
         return mode
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
@@ -1650,9 +1669,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def _solve_coefficient_scan_prepared_impl(self, prepared, nu_hat_a, epsi_hat_a):
         ntx = _import_ntx()
+        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
 
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
+            if derivative_mode == "custom_vjp":
+                return ntx.solve_prepared_coefficient_vector_vjp(prepared, case)
             return ntx.solve_prepared_coefficient_vector(prepared, case)
         batch_size = self.scan_batch_size
         case_count = int(nu_hat_a.shape[0])
@@ -2415,6 +2437,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_scan_batch_size=None,
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
+    ntx_exact_derivative_mode="direct",
     ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -2454,6 +2477,9 @@ def build_ntx_exact_lij_runtime_transport_model(
             else int(ntx_exact_response_anchor_count)
         ),
         use_remat=bool(ntx_exact_use_remat),
+        derivative_mode=NTXExactLijRuntimeTransportModel._normalize_derivative_mode(
+            ntx_exact_derivative_mode
+        ),
         er_v_floor=(
             None
             if ntx_exact_er_v_floor in (None, "", 0, "0")

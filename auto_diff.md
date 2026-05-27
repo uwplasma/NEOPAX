@@ -4069,3 +4069,109 @@ The current best overall interpretation is:
   the low-`dt` region
 - center and 5-point FD now both support the same conclusion once the
   perturbation is chosen appropriately
+
+### Updated priorities: NTX AD path and VMEC geometry path
+
+After inspecting the local `NTX`, `vmec_jax`, `booz_xform_jax`, and
+`SPECTRAX-GK` source more carefully, the next priorities should be updated.
+
+#### Priority 1: `n0` A/B test for NTX derivative mode
+
+We should explicitly compare the cost and derivative values of the current NTX
+path against the NTX `custom_vjp` path in the familiar fixed-geometry `n0`
+benchmark.
+
+Reason:
+
+- NTX already provides a dedicated custom-VJP monoenergetic coefficient solve:
+  - `ntx.solve_prepared_coefficient_vector_vjp(...)`
+- but the current NEOPAX exact-runtime `Lij` path appears to call:
+  - `ntx.solve_prepared_coefficient_vector(...)`
+  instead
+- this means NEOPAX is differentiating through the NTX run, but may not be
+  using NTX's more solver-aware reverse-mode path
+- this could explain part of the higher AD-side NTX cost in the old `n0` runs
+
+So the first concrete A/B should be:
+
+1. current NTX direct-AD path
+2. NTX `custom_vjp` path
+
+and compare:
+
+- derivative values
+- wall time / compile time
+- memory if practical
+
+This should be kept on the same fixed-geometry `n0` benchmark so we isolate the
+NTX derivative-cost question cleanly.
+
+#### Priority 2: geometry benchmark must switch to the NTX-style VMEC path
+
+The current geometry benchmark used the wrong VMEC helper:
+
+- `vmec_jax.solve_fixed_boundary_from_boundary(..., differentiable=True)`
+
+That path goes through the explicit GD solve and is not the normal
+convergence-aware VMEC workflow. In practice:
+
+- it is not the same staged path as `vmec_jax input.file`
+- it is not the same path used by NTX for differentiable boundary solves
+- it does not explain the local `vmec_jax` CLI behavior the user observed
+
+The correct local reference is the NTX-style boundary-param AD path:
+
+- boundary coefficient
+- `-> vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(...)`
+- `-> booz_xform_jax`
+- `-> NTX support / NEOPAX transport`
+
+This is the path we should use for geometry-parameter AD in NEOPAX.
+
+Important note:
+
+- the forward geometry map for FD should be the forward version of this same
+  AD-capable VMEC/Boozer/NTX path
+- then, as before, the actual transport derivative comparison should be done on
+  the frozen realized transport path
+
+#### Priority 3: rerun `RBC(1,0)` only after both fixes above
+
+Only after:
+
+1. the NTX derivative-mode comparison is implemented for `n0`
+2. the geometry benchmark is rebuilt around the NTX-style implicit VMEC
+   residual path
+
+should we rerun the geometry benchmark for:
+
+- `RBC(1,0)`
+
+That rerun should again target the same NEOPAX transport metrics as before, and
+the correct comparison should be:
+
+- custom AD on the frozen realized path
+- versus frozen-path FD
+
+#### Extra clarification from local code inspection
+
+The local ecosystem now looks like this:
+
+- `NTX`:
+  - serious differentiable boundary-parameter path uses the implicit VMEC
+    residual solve
+- `SPECTRAX-GK`:
+  - the strongest local geometry-gradient reports are not using the bad
+    explicit VMEC GD helper either
+  - they mostly use a solved `vmec_jax` state coefficient
+    `-> booz_xform_jax -> downstream objective` bridge
+- `booz_xform_jax`:
+  - is a JAX transform stage, not the source of the convergence/runtime issue
+
+So the revised implementation order should be:
+
+1. add an NTX derivative-mode switch for the fixed-geometry `n0` benchmark
+2. compare NTX direct AD vs NTX `custom_vjp`
+3. replace the geometry benchmark VMEC lane with the NTX-style implicit
+   residual path
+4. rerun `RBC(1,0)` frozen-path AD vs FD

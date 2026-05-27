@@ -26,6 +26,7 @@ import csv
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,12 @@ STANDALONE_SUBSOLVE_LABELS = [
 DEFAULT_SMALL_STEP_COUNTS = (2, 3, 5)
 
 
-def _prepare_benchmark_config(config_path: Path, *, device: str | None) -> dict[str, Any]:
+def _prepare_benchmark_config(
+    config_path: Path,
+    *,
+    device: str | None,
+    ntx_exact_derivative_mode: str | None = None,
+) -> dict[str, Any]:
     config = NEOPAX.prepare_config(config_path, device=device)
     config = copy.deepcopy(config)
     config.setdefault("general", {})["mode"] = "transport"
@@ -106,6 +112,8 @@ def _prepare_benchmark_config(config_path: Path, *, device: str | None) -> dict[
     solver_cfg = config.setdefault("transport_solver", {})
     solver_cfg["debug_stage_markers"] = False
     solver_cfg["debug_disable_jit"] = False
+    if ntx_exact_derivative_mode is not None:
+        config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = str(ntx_exact_derivative_mode)
     return config
 
 
@@ -2960,6 +2968,39 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
         )
         return
 
+    if report.get("ntx_derivative_mode_compare_check"):
+        print(
+            f"[autodiff-gate] mode=ntx_derivative_mode_compare "
+            f"parameter={report['parameter_name']} "
+            f"checkpoint_index={report.get('checkpoint_index')} "
+            f"replay_mode={report.get('replay_mode')}"
+        )
+        print("[autodiff-gate] timings:")
+        for mode_name in ("direct", "custom_vjp"):
+            timing = report.get("timings", {}).get(mode_name, {})
+            print(f"  - {mode_name}: wall_seconds={float(timing.get('wall_seconds', 0.0)):.3f}")
+        print("[autodiff-gate] custom AD mode-to-mode objective differences:")
+        for label, abs_err, rel_err in zip(
+            report["objective_labels"],
+            report["custom_ad_mode_difference"]["objective_absolute_error"],
+            report["custom_ad_mode_difference"]["objective_relative_error"],
+        ):
+            print(
+                f"  - {label}: "
+                f"abs_err={float(abs_err):.6e} "
+                f"rel_err={float(rel_err):.6e}"
+            )
+        for mode_name in ("direct", "custom_vjp"):
+            mode_report = report["modes"][mode_name]
+            state_cmp = mode_report.get("state_tangent_comparison", {}).get("custom_vs_fd", {})
+            print(
+                f"[autodiff-gate] {mode_name} custom_vs_fd state: "
+                f"full_rel_err={float(state_cmp.get('full_relative_error')):.6e} "
+                f"pressure_rel_err={float(state_cmp.get('pressure_relative_error')):.6e} "
+                f"Er_rel_err={float(state_cmp.get('Er_relative_error')):.6e}"
+            )
+        return
+
     if report.get("realized_trace_checkpoint_frozen_fd_check"):
         mode_name = (
             "realized_trace_checkpoint_fd_stencil"
@@ -2971,6 +3012,7 @@ def _print_terminal_summary(report: dict[str, Any]) -> None:
             f"parameter={report['parameter_name']} "
             f"baseline_value={report['baseline_value']:.6e} "
             f"fd_step={report['fd_step']:.6e} "
+            f"ntx_derivative_mode={report.get('ntx_exact_derivative_mode', 'direct')} "
             f"checkpoint_index={report.get('checkpoint_index')} "
             f"checkpoint_time={report.get('checkpoint_time'):.6e}"
         )
@@ -8101,6 +8143,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     replay_mode: str = "attempt",
     include_direct_ad: bool = True,
     compute_five_point: bool = False,
+    ntx_exact_derivative_mode: str | None = None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -8109,7 +8152,11 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     if checkpoint_index <= 0:
         raise ValueError("checkpoint_index must be positive.")
 
-    config = _prepare_benchmark_config(config_path, device=device)
+    config = _prepare_benchmark_config(
+        config_path,
+        device=device,
+        ntx_exact_derivative_mode=ntx_exact_derivative_mode,
+    )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
@@ -8432,6 +8479,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
         "config_path": str(config_path),
         "realized_trace_checkpoint_frozen_fd_check": True,
         "fd_stencil_check": bool(compute_five_point),
+        "ntx_exact_derivative_mode": None if ntx_exact_derivative_mode is None else str(ntx_exact_derivative_mode),
         "parameter_name": parameter_name,
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
@@ -8723,6 +8771,80 @@ def build_realized_trace_checkpoint_interpolated_fd_report(
             "fd_minus": _adaptive_rollout_diagnostics(minus_rollout),
             "fd_plus": _adaptive_rollout_diagnostics(plus_rollout),
         },
+    }
+
+
+def build_ntx_derivative_mode_compare_report(
+    *,
+    config_path: Path,
+    parameter_name: str,
+    rel_fd_step: float,
+    abs_fd_step: float,
+    device: str | None,
+    checkpoint_index: int,
+    replay_mode: str = "attempt",
+    include_direct_ad: bool = True,
+    compute_five_point: bool = False,
+) -> dict[str, Any]:
+    modes = ("direct", "custom_vjp")
+    reports: dict[str, dict[str, Any]] = {}
+    timings: dict[str, dict[str, float]] = {}
+
+    for mode in modes:
+        t0 = time.perf_counter()
+        report = build_realized_trace_checkpoint_frozen_fd_report(
+            config_path=config_path,
+            parameter_name=parameter_name,
+            rel_fd_step=rel_fd_step,
+            abs_fd_step=abs_fd_step,
+            device=device,
+            checkpoint_index=checkpoint_index,
+            replay_mode=replay_mode,
+            include_direct_ad=include_direct_ad,
+            compute_five_point=compute_five_point,
+            ntx_exact_derivative_mode=mode,
+        )
+        elapsed = time.perf_counter() - t0
+        reports[mode] = report
+        timings[mode] = {"wall_seconds": float(elapsed)}
+
+    direct_report = reports["direct"]
+    custom_vjp_report = reports["custom_vjp"]
+
+    grad_direct = np.asarray(direct_report["gradient_autodiff"], dtype=float)
+    grad_custom_vjp = np.asarray(custom_vjp_report["gradient_autodiff"], dtype=float)
+    grad_mode_abs_err = np.abs(grad_direct - grad_custom_vjp)
+    grad_mode_rel_err = grad_mode_abs_err / np.maximum(np.abs(grad_direct), 1.0e-10)
+
+    state_direct = direct_report.get("state_tangent_comparison", {}).get("custom_vs_fd", {})
+    state_custom_vjp = custom_vjp_report.get("state_tangent_comparison", {}).get("custom_vs_fd", {})
+
+    return {
+        "config_path": str(config_path),
+        "ntx_derivative_mode_compare_check": True,
+        "parameter_name": parameter_name,
+        "checkpoint_index": int(checkpoint_index),
+        "replay_mode": str(replay_mode),
+        "include_direct_ad": bool(include_direct_ad),
+        "compute_five_point": bool(compute_five_point),
+        "modes": {
+            "direct": direct_report,
+            "custom_vjp": custom_vjp_report,
+        },
+        "timings": timings,
+        "custom_ad_mode_difference": {
+            "objective_absolute_error": grad_mode_abs_err.tolist(),
+            "objective_relative_error": grad_mode_rel_err.tolist(),
+            "max_objective_relative_error": float(np.max(grad_mode_rel_err)),
+            "state_custom_vs_fd_direct": state_direct,
+            "state_custom_vs_fd_custom_vjp": state_custom_vjp,
+        },
+        "objective_labels": OBJECTIVE_LABELS,
+        "passed": bool(
+            direct_report.get("passed", False)
+            and custom_vjp_report.get("passed", False)
+            and np.all(np.isfinite(grad_mode_rel_err))
+        ),
     }
 
 
@@ -9299,6 +9421,11 @@ def main() -> None:
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint custom AD against frozen-trace center FD and five-point FD at one accepted-step checkpoint.",
     )
     parser.add_argument(
+        "--ntx-derivative-mode-compare-check",
+        action="store_true",
+        help="Dedicated opt-in mode: run the same realized-trace checkpoint frozen-FD benchmark twice, once with NTX direct AD and once with NTX custom_vjp, and compare timings and custom-AD derivatives.",
+    )
+    parser.add_argument(
         "--realized-trace-checkpoint-interpolated-fd-check",
         action="store_true",
         help="Dedicated opt-in mode: compare baseline realized-trace checkpoint AD against adaptive fd_minus/fd_plus trajectories interpolated to the baseline checkpoint time.",
@@ -9307,6 +9434,12 @@ def main() -> None:
         "--skip-direct-ad-in-frozen-check",
         action="store_true",
         help="For --realized-trace-checkpoint-frozen-fd-check, skip the direct-AD reference path and run only custom AD vs FD.",
+    )
+    parser.add_argument(
+        "--ntx-exact-derivative-mode",
+        default="direct",
+        choices=("direct", "custom_vjp"),
+        help="NTX exact-runtime derivative mode used by the benchmark when a single-mode run is requested.",
     )
     parser.add_argument(
         "--realized-trace-checkpoint-index",
@@ -9565,6 +9698,18 @@ def main() -> None:
             device=args.device,
             checkpoint_index=args.realized_trace_checkpoint_index,
         )
+    elif args.ntx_derivative_mode_compare_check:
+        report = build_ntx_derivative_mode_compare_report(
+            config_path=args.config,
+            parameter_name=args.parameter,
+            rel_fd_step=args.fd_rel_step,
+            abs_fd_step=args.fd_abs_step,
+            device=args.device,
+            checkpoint_index=args.realized_trace_checkpoint_index,
+            replay_mode=args.realized_schedule_frozen_replay_mode,
+            include_direct_ad=not args.skip_direct_ad_in_frozen_check,
+            compute_five_point=False,
+        )
     elif args.realized_trace_checkpoint_frozen_fd_check:
         report = build_realized_trace_checkpoint_frozen_fd_report(
             config_path=args.config,
@@ -9575,6 +9720,7 @@ def main() -> None:
             checkpoint_index=args.realized_trace_checkpoint_index,
             replay_mode=args.realized_schedule_frozen_replay_mode,
             include_direct_ad=not args.skip_direct_ad_in_frozen_check,
+            ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         )
     elif args.realized_trace_checkpoint_fd_stencil_check:
         report = build_realized_trace_checkpoint_frozen_fd_report(
@@ -9587,6 +9733,7 @@ def main() -> None:
             replay_mode=args.realized_schedule_frozen_replay_mode,
             include_direct_ad=False,
             compute_five_point=True,
+            ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         )
     elif args.realized_trace_checkpoint_interpolated_fd_check:
         report = build_realized_trace_checkpoint_interpolated_fd_report(
