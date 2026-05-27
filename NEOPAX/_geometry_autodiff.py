@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -106,6 +107,8 @@ class GeometryAutodiffContext:
     booz_constants: Any
     booz_grids: Any
     baseline_coefficient: float
+    vmec_default_max_iter: int
+    vmec_default_step_size: float
 
 
 def _boundary_kind_for_family(family: str) -> str:
@@ -123,6 +126,28 @@ def _boundary_array_name_for_kind(kind: str) -> str:
     if kind == "zs":
         return "Z_sin"
     raise ValueError(f"Unsupported boundary kind '{kind}'.")
+
+
+def _vmec_default_max_iter_from_indata(indata: Any) -> int:
+    niter_array = indata.get("NITER_ARRAY", None)
+    if niter_array is not None:
+        try:
+            values = [int(v) for v in niter_array]
+            if values:
+                return int(values[-1])
+        except Exception:
+            pass
+    try:
+        return int(indata.get_int("NITER", 100))
+    except Exception:
+        return 100
+
+
+def _vmec_default_step_size_from_indata(indata: Any) -> float:
+    try:
+        return float(indata.get_float("DELT", 1.0))
+    except Exception:
+        return 1.0
 
 
 def build_geometry_autodiff_context(
@@ -210,6 +235,8 @@ def build_geometry_autodiff_context(
         booz_constants=booz_constants,
         booz_grids=booz_grids,
         baseline_coefficient=float(boundary_array[boundary_index]),
+        vmec_default_max_iter=_vmec_default_max_iter_from_indata(indata),
+        vmec_default_step_size=_vmec_default_step_size_from_indata(indata),
     )
 
 
@@ -350,28 +377,17 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
         return jnp.asarray(surface_indices, dtype=jnp.int32)
 
 
-def build_neopax_geometry_from_single_param(
+def _build_neopax_geometry_from_state(
     context: GeometryAutodiffContext,
-    param_delta,
+    state,
     *,
     n_r: int,
-    max_iter: int = 2,
-    step_size: float = 5.0e-3,
-    jacobian_penalty: float = 1.0e3,
 ):
     from NEOPAX._geometry_models import VmecBoozer
     from vmec_jax.energy import flux_profiles_from_indata
     from vmec_jax.integrals import cumrect_s_halfmesh
     from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
     from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
-
-    state = _solve_state_for_single_param(
-        context,
-        param_delta,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
 
     rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
     if int(n_r) > 1:
@@ -386,15 +402,6 @@ def build_neopax_geometry_from_single_param(
         rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
     sample_rho = rho_grid[1:-1]
 
-    observables = geometry_observables_from_single_param(
-        context,
-        param_delta,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
-
-    # Build volume and flux profiles directly from the solved state.
     wout_like = type(
         "WoutLike",
         (),
@@ -444,17 +451,6 @@ def build_neopax_geometry_from_single_param(
     vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
     over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
 
-    # Interpolate Boozer radial profiles from half-mesh surfaces onto the NEOPAX grid.
-    s_values = tuple(float(rho_value**2) for rho_value in sample_rho)
-    booz_outputs = geometry_observables_from_single_param(
-        context,
-        param_delta,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
-    del booz_outputs  # keep explicit naming below for clarity
-
     booz_api = _import_booz_xform_jax_api()
     vmec_jax = _import_vmec_jax()
     inputs = vmec_jax.booz_xform_inputs_from_state(
@@ -468,7 +464,10 @@ def build_neopax_geometry_from_single_param(
         inputs=inputs,
         constants=context.booz_constants,
         grids=context.booz_grids,
-        surface_indices=_surface_indices_for_s_values(context.static, s_values),
+        surface_indices=_surface_indices_for_s_values(
+            context.static,
+            tuple(float(rho_value**2) for rho_value in sample_rho),
+        ),
         jit=True,
     )
     bmnc_b = jnp.asarray(out["bmnc_b"])
@@ -564,6 +563,139 @@ def build_neopax_geometry_from_single_param(
     )
 
 
+def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia):
+    from NEOPAX._transport_flux_models import NTXRuntimeScanChannels
+
+    rho_arr = jnp.asarray(rho, dtype=jnp.float64)
+    psia_value = float(jnp.asarray(psia))
+    b00 = jnp.asarray([jnp.asarray(surface.b0 if surface.b0 is not None else surface.b_cos[0], dtype=jnp.float64) for surface in surfaces])
+    boozer_i = jnp.asarray([jnp.asarray(surface.b_theta, dtype=jnp.float64) for surface in surfaces])
+    boozer_g = jnp.asarray([jnp.asarray(surface.b_zeta, dtype=jnp.float64) for surface in surfaces])
+    iota = jnp.asarray([jnp.asarray(surface.iota, dtype=jnp.float64) for surface in surfaces])
+    drds = jnp.where(rho_arr > 0.0, jnp.asarray(a_b, dtype=jnp.float64) / (2.0 * rho_arr), 0.0)
+    dpsi_drtilde = rho_arr * jnp.asarray(a_b, dtype=jnp.float64) * b00
+    dr_tildedr = 2.0 * psia_value / (jnp.asarray(a_b, dtype=jnp.float64) ** 2 * b00)
+    dr_tildeds = dr_tildedr * drds
+    denom = boozer_g + iota * boozer_i
+    fac_reference_to_sfincs_11 = 8.0 * denom * b00 * psia_value**2 / (jnp.sqrt(jnp.pi) * boozer_g**2)
+    fac_reference_to_sfincs_31 = 4.0 * b00 * psia_value / (jnp.sqrt(jnp.pi) * boozer_g)
+    fac_reference_to_sfincs_33 = -2.0 * b00 / (denom * jnp.sqrt(jnp.pi))
+    fac_sfincs_to_dkes_11 = 1.0 / (8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * jnp.sqrt(jnp.pi)))
+    fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsi_drtilde / (boozer_g * jnp.sqrt(jnp.pi)))
+    fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00 / (denom * jnp.sqrt(jnp.pi)))
+    return NTXRuntimeScanChannels(
+        rho=rho_arr,
+        a_b=float(a_b),
+        psia=psia_value,
+        b00=b00,
+        r00=jnp.ones_like(rho_arr),
+        boozer_i=boozer_i,
+        boozer_g=boozer_g,
+        iota=iota,
+        drds=drds,
+        dr_tildedr=dr_tildedr,
+        dr_tildeds=dr_tildeds,
+        fac_reference_to_sfincs_11=fac_reference_to_sfincs_11,
+        fac_reference_to_sfincs_31=fac_reference_to_sfincs_31,
+        fac_reference_to_sfincs_33=fac_reference_to_sfincs_33,
+        fac_sfincs_to_dkes_11=fac_sfincs_to_dkes_11,
+        fac_sfincs_to_dkes_31=fac_sfincs_to_dkes_31,
+        fac_sfincs_to_dkes_33=fac_sfincs_to_dkes_33,
+        fac_dkes_to_d11star=jnp.ones_like(rho_arr),
+        fac_dkes_to_d31star=jnp.ones_like(rho_arr),
+        fac_dkes_to_d33star=jnp.ones_like(rho_arr),
+    )
+
+
+def build_ntx_exact_lij_support_from_vmec_state(
+    context: GeometryAutodiffContext,
+    state,
+    geometry,
+    *,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+):
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
+    from NEOPAX._transport_flux_models import NTXExactLijRuntimeSupport
+
+    rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    center_surfaces = ntx.surfaces_from_vmec_jax_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float)),
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        psi_p=float(jnp.asarray(geometry.Psia_value)),
+    )
+    face_surfaces = ntx.surfaces_from_vmec_jax_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float)),
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        psi_p=float(jnp.asarray(geometry.Psia_value)),
+    )
+    grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
+
+    def _stack_optional(*values):
+        first = values[0]
+        if first is None:
+            return None
+        return jnp.stack([jnp.asarray(value) for value in values], axis=0)
+
+    center_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in center_surfaces)
+    face_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in face_surfaces)
+    center_prepared = jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
+    face_prepared = jax.tree_util.tree_map(_stack_optional, *face_prepared_tuple)
+    return NTXExactLijRuntimeSupport(
+        center_channels=_build_ntx_runtime_channels_from_surfaces(
+            center_surfaces,
+            rho=rho_center,
+            a_b=geometry.a_b,
+            psia=geometry.Psia_value,
+        ),
+        face_channels=_build_ntx_runtime_channels_from_surfaces(
+            face_surfaces,
+            rho=rho_face,
+            a_b=geometry.a_b,
+            psia=geometry.Psia_value,
+        ),
+        center_prepared=center_prepared,
+        face_prepared=face_prepared,
+        grid=grid_spec,
+    )
+
+
+def build_neopax_geometry_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    n_r: int,
+    max_iter: int = 2,
+    step_size: float = 5.0e-3,
+    jacobian_penalty: float = 1.0e3,
+):
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _build_neopax_geometry_from_state(context, state, n_r=n_r)
+
+
 def build_runtime_context_for_geometry_param(
     config: dict[str, Any],
     context: GeometryAutodiffContext,
@@ -588,22 +720,40 @@ def build_runtime_context_for_geometry_param(
     )
     from NEOPAX._source_models import build_source_models_from_config
 
-    geometry = build_neopax_geometry_from_single_param(
+    state_vmec = _solve_state_for_single_param(
         context,
         param_delta,
-        n_r=n_r,
         max_iter=max_iter,
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
+    geometry = _build_neopax_geometry_from_state(context, state_vmec, n_r=n_r)
     species = _build_species(config)
     energy_grid = _build_energy_grid(config)
     database = _build_database(config, geometry)
     state = _build_state(config, geometry, species)
-    solver_cfg = _normalize_solver_config(config)
+    config_eff = deepcopy(config)
+    config_eff["geometry"] = dict(config_eff.get("geometry", {}))
+    config_eff["geometry"]["vmec_file"] = None
+    config_eff["geometry"]["boozer_file"] = None
+    neoclassical_cfg = dict(config_eff.get("neoclassical", {}))
+    if str(neoclassical_cfg.get("flux_model", "")).strip().lower() == "ntx_exact_lij_runtime":
+        neoclassical_cfg["ntx_exact_lij_support"] = build_ntx_exact_lij_support_from_vmec_state(
+            context,
+            state_vmec,
+            geometry,
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+        )
+        neoclassical_cfg["preload_support"] = False
+        neoclassical_cfg["vmec_file"] = None
+        neoclassical_cfg["boozer_file"] = None
+        config_eff["neoclassical"] = neoclassical_cfg
+    solver_cfg = _normalize_solver_config(config_eff)
     source_models = build_source_models_from_config(config, species)
     models = Models(
-        flux=_build_flux_model(config, species, energy_grid, geometry, database, source_models=source_models),
+        flux=_build_flux_model(config_eff, species, energy_grid, geometry, database, source_models=source_models),
         source=source_models,
     )
     runtime = RuntimeContext(
@@ -614,10 +764,10 @@ def build_runtime_context_for_geometry_param(
         solver_parameters=solver_cfg,
         models=models,
     )
-    mode = str(config.get("general", {}).get("mode", config.get("mode", "transport"))).strip().lower()
+    mode = str(config_eff.get("general", {}).get("mode", config_eff.get("mode", "transport"))).strip().lower()
     if mode != "ambipolarity":
-        state = _maybe_initialize_er_from_ambipolarity(config, runtime, state)
-    state = _apply_configured_er_dirichlet_boundaries(config, state)
+        state = _maybe_initialize_er_from_ambipolarity(config_eff, runtime, state)
+    state = _apply_configured_er_dirichlet_boundaries(config_eff, state)
     return runtime, state
 
 

@@ -160,8 +160,8 @@ def main() -> None:
     parser.add_argument("--mboz", type=int, default=12)
     parser.add_argument("--nboz", type=int, default=12)
     parser.add_argument("--n-radial", type=int, default=51)
-    parser.add_argument("--vmec-max-iter", type=int, default=2)
-    parser.add_argument("--vmec-step-size", type=float, default=5.0e-3)
+    parser.add_argument("--vmec-max-iter", type=int, default=None)
+    parser.add_argument("--vmec-step-size", type=float, default=None)
     parser.add_argument("--vmec-jacobian-penalty", type=float, default=1.0e3)
     parser.add_argument("--checkpoint-index", type=int, default=115)
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6)
@@ -181,6 +181,8 @@ def main() -> None:
         nboz=args.nboz,
         surface_s=surface_s,
     )
+    vmec_max_iter = int(context.vmec_default_max_iter if args.vmec_max_iter is None else args.vmec_max_iter)
+    vmec_step_size = float(context.vmec_default_step_size if args.vmec_step_size is None else args.vmec_step_size)
     fd_step = _fd_step(context.baseline_coefficient, fd_rel_step=args.fd_rel_step, fd_abs_step=args.fd_abs_step)
     minus_value = -fd_step
     plus_value = fd_step
@@ -190,7 +192,8 @@ def main() -> None:
     print(
         "[autodiff-gate] geometry-frozen baseline setup: "
         f"family={context.param_family} m={context.param_m} n={context.param_n} "
-        f"baseline_coefficient={context.baseline_coefficient:.6e} fd_step={fd_step:.6e}",
+        f"baseline_coefficient={context.baseline_coefficient:.6e} fd_step={fd_step:.6e} "
+        f"vmec_max_iter={vmec_max_iter} vmec_step_size={vmec_step_size:.6e}",
         flush=True,
     )
 
@@ -199,8 +202,8 @@ def main() -> None:
         context=context,
         delta=jnp.asarray(0.0, dtype=jnp.float64),
         n_radial=args.n_radial,
-        vmec_max_iter=args.vmec_max_iter,
-        vmec_step_size=args.vmec_step_size,
+        vmec_max_iter=vmec_max_iter,
+        vmec_step_size=vmec_step_size,
         vmec_jacobian_penalty=args.vmec_jacobian_penalty,
         checkpoint_index=args.checkpoint_index,
     )
@@ -208,6 +211,15 @@ def main() -> None:
     accepted_mask_np = np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)
     accepted_attempt_indices = np.flatnonzero(accepted_mask_np)
     if accepted_attempt_indices.size < int(args.checkpoint_index):
+        print(
+            "[autodiff-gate] geometry-frozen baseline rollout diagnostics: "
+            f"attempt_count={baseline_diag['attempt_count']} "
+            f"accepted_count={baseline_diag['accepted_count']} "
+            f"completed={baseline_diag['completed']} "
+            f"failed={baseline_diag['failed']} "
+            f"fail_code={baseline_diag['fail_code']}",
+            flush=True,
+        )
         raise ValueError(
             f"Need at least {args.checkpoint_index} accepted attempts for frozen geometry comparison; "
             f"found {accepted_attempt_indices.size}."
@@ -240,8 +252,8 @@ def main() -> None:
         replay_trace=replay_trace,
         replay_mode=args.replay_mode,
         n_radial=args.n_radial,
-        vmec_max_iter=args.vmec_max_iter,
-        vmec_step_size=args.vmec_step_size,
+        vmec_max_iter=vmec_max_iter,
+        vmec_step_size=vmec_step_size,
         vmec_jacobian_penalty=args.vmec_jacobian_penalty,
         pack_state=pack_state,
     )
