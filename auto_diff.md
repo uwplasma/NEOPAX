@@ -4399,3 +4399,100 @@ Adaptive custom AD vs frozen central FD, parameter `T0`,
   - `fd = 7.220444e-02`
   - `abs_err = 1.510863e-05`
   - `rel_err = 2.092480e-04`
+
+VMEC/JAX AD-path notes for next session
+
+- The promoted `vmec_jax` optimization derivative path is the accepted-point
+  exact replay / discrete-adjoint path, not the `implicit.py` helper lane.
+- The usual primal solve path is still the standard VMEC solve; the AD path
+  builds an accepted-point replay tape around the converged solve.
+- There are two important exact-tape variants inside that accepted-point path:
+  - forward-only `jvp_only` exact tape
+  - full forward+reverse exact tape
+- `jacobian_fun(...)` can use the lighter forward-only `jvp_only` tape.
+- `residual_linear_operator(...)` builds a full exact tape because it must
+  support both:
+  - `J v` via `matvec`
+  - `J^T w` via `rmatvec`
+- Therefore matrix-free is not automatically lighter in memory than dense
+  forward Jacobian formation. On the hi-res deck, the bidirectional
+  `residual_linear_operator(...)` can be worse than `jacobian_fun(...)`.
+
+Likely source of the VMEC OOM
+
+- The small number of output observables is not the cause.
+- The main memory driver is the accepted-point exact tape / replay payload.
+- A useful mental model is:
+  - memory ~ (accepted steps to convergence) x (payload per accepted step)
+- Payload per step grows with:
+  - hi-res VMEC state size
+  - whether basepoint carries are stored
+  - whether the tape must support reverse mode
+  - replay/preconditioner/control-state payloads
+- So yes, more accepted steps to convergence is one important driver, but it is
+  not the only one.
+
+What carried information seems necessary vs shrinkable
+
+- Some accepted-step replay information is necessary for the exact replay path.
+- The repo already distinguishes:
+  - lighter forward-only tapes
+  - heavier reverse-capable tapes
+- Not every carried field appears mathematically fundamental. The local
+  `vmec_jax` notes/code suggest some of the retained payload is a practical
+  replay choice and could be reduced further.
+- The clearest already-supported shrink is:
+  - use the forward-only `jvp_only` exact tape when only forward derivatives are
+    needed
+- Reverse mode cannot use that lightest tape; it needs a fuller replay payload.
+
+Performance/reuse takeaways
+
+- The clearest improvements already identified in local `vmec_jax` docs/code:
+  - use forward-only exact tape for forward validation
+  - keep GPU `jvp_only` with basepoint carries enabled
+  - reuse one exact optimizer / one exact linearization object inside a
+    benchmark run
+  - reuse exact residual/state caches when possible
+  - reuse cached initial-state tangent information
+- The exact `vmec_jax` path already has cache/reuse machinery for:
+  - exact state
+  - exact residual
+  - exact Jacobian
+  - initial tangent columns
+  - replay scan runners
+
+Comparison against the transport custom replay
+
+- The transport custom rule is conceptually similar:
+  - primal adaptive solve first
+  - then derivative replay on the realized accepted-step path
+- The important difference is scale and payload:
+  - transport replay stores a much smaller accepted-step carry/controller/cache
+    structure
+  - VMEC accepted-point replay stores a much heavier per-step equilibrium /
+    preconditioner / replay payload
+- So both approaches share the same philosophy:
+  - reuse the realized primal path
+  - differentiate the replay map rather than naive AD through the whole live
+    loop
+- But the VMEC tape is much heavier, which is why its OOM/performance issues are
+  much sharper than in the transport custom rule.
+
+Follow-up investigation to keep for next session
+
+- Investigate the `iota_mean` mismatch in the VMEC geometry benchmark:
+  - forward exact vs FD was poor
+  - reverse exact vs forward exact was also poor
+- Likely causes to test:
+  - forward FD primal solve path and exact accepted-point solve path are not the
+    same wrapper / not linearized around the same state
+  - forward and reverse exact checks were built from separate optimizer /
+    linear-operator instances instead of one shared exact linearization object
+  - `iota_mean` is a sensitive postprocessed quantity (`equilibrium_iota_profiles_from_state(...)`
+    then averaging), so small equilibrium mismatches may show up there first
+- First clean check:
+  - build one exact optimizer and one linear operator
+  - use the same object for both forward `matvec` and reverse `rmatvec`
+  - compare primal basepoint observable values from the exact path vs the FD
+    forward-lane solve
