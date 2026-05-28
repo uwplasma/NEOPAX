@@ -4360,3 +4360,42 @@ Checkpoint `115`, frozen stencil check, same `fd_step = 1.263000e-07`
   - `custom_ad = 2.845732e-01`
   - `fd_center = 2.845785e-01`
   - `fd_five_point = 2.845740e-01`
+
+Adaptive custom AD vs frozen central FD, parameter `T0`,
+`fd_step = 5.340000e-07`, replay mode `attempt`
+
+- `softmax_Er`
+  - `ad = -2.160399e+01`
+  - `fd = -2.161529e+01`
+  - `abs_err = 1.129999e-02`
+  - `rel_err = 5.227777e-04`
+- `smooth_root_proxy`
+  - `ad = 2.070900e-05`
+  - `fd = 2.073464e-05`
+  - `abs_err = 2.563682e-08`
+  - `rel_err = 1.236424e-03`
+- `Er2_volume_average`
+  - `ad = -2.765750e+01`
+  - `fd = -2.767012e+01`
+  - `abs_err = 1.262507e-02`
+  - `rel_err = 4.562707e-04`
+- `Er_volume_average`
+  - `ad = 2.291385e+00`
+  - `fd = 2.291084e+00`
+  - `abs_err = 3.007156e-04`
+  - `rel_err = 1.312547e-04`
+- `electron_temperature_volume_average_keV`
+  - `ad = 3.571291e-01`
+  - `fd = 3.571291e-01`
+  - `abs_err = 5.455578e-08`
+  - `rel_err = 1.527621e-07`
+- `total_pressure_volume_average`
+  - `ad = 1.835267e+00`
+  - `fd = 1.835267e+00`
+  - `abs_err = 2.165264e-07`
+  - `rel_err = 1.179809e-07`
+- `alpha_power_volume_average_mw_m3`
+  - `ad = 7.221955e-02`
+  - `fd = 7.220444e-02`
+  - `abs_err = 1.510863e-05`
+  - `rel_err = 2.092480e-04`

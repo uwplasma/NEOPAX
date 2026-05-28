@@ -60,7 +60,8 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     print(
         "[geometry-fd-ad] "
         f"vmec forward_lane=run_fixed_boundary/exact accepted-point forward+reverse max_iter={resolved_max_iter} "
-        f"step_size={resolved_step_size:.6e} mboz={args.mboz} nboz={args.nboz} "
+        f"step_size={resolved_step_size:.6e} exact_solver_device={args.exact_solver_device} "
+        f"mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
     )
@@ -115,6 +116,13 @@ def main() -> None:
         help="Skip exact reverse-mode observable derivative recovery against the exact forward path.",
     )
     parser.add_argument(
+        "--exact-solver-device",
+        type=str,
+        default="cpu",
+        choices=("cpu", "gpu", "auto", "default"),
+        help="Device used by the exact accepted-point forward/reverse callbacks. Default: cpu.",
+    )
+    parser.add_argument(
         "--with-five-point",
         action="store_true",
         help="Also compute a five-point stencil FD estimate.",
@@ -159,6 +167,7 @@ def main() -> None:
         observable_kind=observable_kind,
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
+        solver_device=args.exact_solver_device,
     )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
@@ -176,6 +185,7 @@ def main() -> None:
             observable_kind=observable_kind,
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
+            solver_device=args.exact_solver_device,
         )
 
     print("[geometry-fd-ad] observable errors:")
