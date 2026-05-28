@@ -65,6 +65,12 @@ def main() -> None:
         choices=("direct", "custom_vjp"),
         help="NTX exact-runtime derivative mode. Use direct for this benchmark.",
     )
+    parser.add_argument(
+        "--ad-mode",
+        default="both",
+        choices=("both", "forward", "reverse"),
+        help="Run forward columns, reverse rows, or both.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -95,44 +101,99 @@ def main() -> None:
         derivative_mode="vjp",
     )
 
-    print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
+    jac_fwd = None
+    jac_rev = None
     n_params = len(PROFILE_VECTOR_PARAMETERS)
-    fwd_columns = []
-    for idx in range(n_params):
-        basis = np.zeros(n_params, dtype=float)
-        basis[idx] = 1.0
-        _, tangent = jax.jvp(
-            objective_fn_jvp,
-            (baseline_vector,),
-            (jnp.asarray(basis, dtype=jnp.float64),),
-        )
-        fwd_columns.append(np.asarray(jax.device_get(tangent), dtype=float))
-    jac_fwd = np.stack(fwd_columns, axis=1)
 
-    print("[autodiff-gate] progress: running reverse custom-VJP Jacobian", flush=True)
-    jac_rev = np.asarray(jax.device_get(jax.jacrev(objective_fn_vjp)(baseline_vector)), dtype=float)
+    if args.ad_mode in ("both", "forward"):
+        print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
+        fwd_columns = []
+        for idx in range(n_params):
+            basis = np.zeros(n_params, dtype=float)
+            basis[idx] = 1.0
+            _, tangent = jax.jvp(
+                objective_fn_jvp,
+                (baseline_vector,),
+                (jnp.asarray(basis, dtype=jnp.float64),),
+            )
+            fwd_columns.append(np.asarray(jax.device_get(tangent), dtype=float))
+        jac_fwd = np.stack(fwd_columns, axis=1)
 
-    abs_err = np.abs(jac_fwd - jac_rev)
-    rel_err = abs_err / np.maximum(np.abs(jac_fwd), 1.0e-10)
-    param_max_rel = np.max(rel_err, axis=0)
+    if args.ad_mode in ("both", "reverse"):
+        print("[autodiff-gate] progress: running reverse custom-VJP Jacobian", flush=True)
+        objective_base = np.asarray(jax.device_get(objective_fn_vjp(baseline_vector)), dtype=float).reshape(-1)
+        rev_rows = []
+        for idx in range(int(objective_base.size)):
+            print(
+                f"[autodiff-gate] progress: running reverse custom-VJP row {idx + 1}/{int(objective_base.size)}",
+                flush=True,
+            )
+
+            def scalar_objective(p, *, output_index=idx):
+                return _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
+                    p,
+                    config=config,
+                    runtime=runtime,
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    parameter_names=PROFILE_VECTOR_PARAMETERS,
+                    derivative_mode="vjp",
+                )[output_index]
+
+            rev_rows.append(np.asarray(jax.device_get(jax.grad(scalar_objective)(baseline_vector)), dtype=float))
+        jac_rev = np.stack(rev_rows, axis=0)
+
+    if jac_fwd is not None and jac_rev is not None:
+        abs_err = np.abs(jac_fwd - jac_rev)
+        rel_err = abs_err / np.maximum(np.abs(jac_fwd), 1.0e-10)
+        param_max_rel = np.max(rel_err, axis=0)
+        max_rel_error = float(np.max(rel_err))
+        passed = bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2)
+        abs_err_list = abs_err.tolist()
+        rel_err_list = rel_err.tolist()
+        param_max_rel_list = param_max_rel.tolist()
+    else:
+        abs_err_list = None
+        rel_err_list = None
+        param_max_rel_list = None
+        max_rel_error = float("nan")
+        passed = True
 
     report = {
         "profile_vector_ad_compare": True,
         "config_path": str(Path(args.config)),
+        "ad_mode": str(args.ad_mode),
         "parameter_names": list(PROFILE_VECTOR_PARAMETERS),
         "baseline_values": np.asarray(jax.device_get(baseline_vector), dtype=float).tolist(),
         "objective_labels": OBJECTIVE_LABELS,
-        "jacobian_forward": jac_fwd.tolist(),
-        "jacobian_reverse": jac_rev.tolist(),
-        "jacobian_absolute_error": abs_err.tolist(),
-        "jacobian_relative_error": rel_err.tolist(),
-        "parameter_max_relative_error": param_max_rel.tolist(),
-        "max_relative_error": float(np.max(rel_err)),
+        "jacobian_forward": None if jac_fwd is None else jac_fwd.tolist(),
+        "jacobian_reverse": None if jac_rev is None else jac_rev.tolist(),
+        "jacobian_absolute_error": abs_err_list,
+        "jacobian_relative_error": rel_err_list,
+        "parameter_max_relative_error": param_max_rel_list,
+        "max_relative_error": max_rel_error,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
-        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "passed": passed,
     }
 
-    _print_summary(report)
+    if jac_fwd is not None and jac_rev is not None:
+        _print_summary(report)
+    elif jac_rev is not None:
+        print("[autodiff-gate] mode=profile_vector_ad_compare reverse-only", flush=True)
+        print("[autodiff-gate] reverse Jacobian rows:")
+        for metric_index, label in enumerate(report["objective_labels"]):
+            print(f"  - {label}:")
+            for param_index, name in enumerate(report["parameter_names"]):
+                rev = report["jacobian_reverse"][metric_index][param_index]
+                print(f"    {name}: rev={float(rev):.6e}")
+    elif jac_fwd is not None:
+        print("[autodiff-gate] mode=profile_vector_ad_compare forward-only", flush=True)
+        print("[autodiff-gate] forward Jacobian columns:")
+        for metric_index, label in enumerate(report["objective_labels"]):
+            print(f"  - {label}:")
+            for param_index, name in enumerate(report["parameter_names"]):
+                fwd = report["jacobian_forward"][metric_index][param_index]
+                print(f"    {name}: fwd={float(fwd):.6e}")
     outpath = _report_path()
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
