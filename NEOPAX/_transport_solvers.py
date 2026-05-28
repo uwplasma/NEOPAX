@@ -5470,6 +5470,99 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
     return primal_out, tangent_out
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
+def _radau_adaptive_final_y_realized_schedule_vjp(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    """Final adaptive state with a solve-level VJP over the realized accepted schedule."""
+
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return rollout.final_carry.y
+
+
+def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    residuals = (
+        carry0,
+        active_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    return rollout.final_carry.y, residuals
+
+
+def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    residuals,
+    final_y_bar,
+):
+    (
+        carry0,
+        active_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    ) = residuals
+
+    def _replay(carry_value):
+        replay = _radau_replay_realized_accepted_rollout(
+            execution_context,
+            carry_value,
+            active_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        )
+        return replay.final_carry.y
+
+    _, pullback = jax.vjp(_replay, carry0)
+    (carry0_bar,) = pullback(final_y_bar)
+    return (carry0_bar,)
+
+
+_radau_adaptive_final_y_realized_schedule_vjp.defvjp(
+    _radau_adaptive_final_y_realized_schedule_vjp_fwd,
+    _radau_adaptive_final_y_realized_schedule_vjp_bwd,
+)
+
+
 def _radau_debug_realized_attempt_replay(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,

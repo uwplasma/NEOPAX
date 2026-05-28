@@ -118,6 +118,12 @@ def main() -> None:
         choices=("direct", "custom_vjp"),
         help="NTX exact-runtime derivative mode. Use direct for this forward-mode benchmark.",
     )
+    parser.add_argument(
+        "--adaptive-derivative-mode",
+        default="jvp",
+        choices=("jvp", "vjp"),
+        help="Adaptive realized-schedule derivative mode: forward custom JVP or reverse custom VJP.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -153,14 +159,18 @@ def main() -> None:
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
+        derivative_mode=args.adaptive_derivative_mode,
     )
 
-    print("[autodiff-gate] progress: running adaptive custom AD", flush=True)
-    _, gradient_ad = jax.jvp(
-        objective_fn,
-        (jnp.asarray(baseline_value),),
-        (jnp.asarray(1.0),),
-    )
+    print(f"[autodiff-gate] progress: running adaptive custom AD ({args.adaptive_derivative_mode})", flush=True)
+    if str(args.adaptive_derivative_mode).strip().lower() == "jvp":
+        _, gradient_ad = jax.jvp(
+            objective_fn,
+            (jnp.asarray(baseline_value),),
+            (jnp.asarray(1.0),),
+        )
+    else:
+        gradient_ad = jax.jacrev(objective_fn)(jnp.asarray(baseline_value))
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
@@ -202,6 +212,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
+        "adaptive_derivative_mode": str(args.adaptive_derivative_mode),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "objective_labels": OBJECTIVE_LABELS,

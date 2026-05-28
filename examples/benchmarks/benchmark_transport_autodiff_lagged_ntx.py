@@ -51,6 +51,7 @@ from NEOPAX._transport_solvers import (
     _make_solver_state_transform,
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
+    _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_apply_accepted_step_map,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
@@ -76,6 +77,7 @@ DEFAULT_CONFIG = Path(
     "examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml"
 )
 ALLOWED_PARAMETERS = {"n0", "T0", "density_shape_power", "temperature_shape_power"}
+PROFILE_VECTOR_PARAMETERS = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 OBJECTIVE_LABELS = [
     "softmax_Er",
     "smooth_root_proxy",
@@ -176,6 +178,40 @@ def _parameterized_initial_state(
         n_species,
         parameter_name=parameter_name,
         parameter_value=parameter_value,
+    )
+    density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
+    temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
+    pressure_state = density_state * temperature_state
+    return dataclasses.replace(
+        baseline_state,
+        density=density_state,
+        pressure=pressure_state,
+    )
+
+
+def _parameterized_initial_state_multi(
+    *,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    geometry,
+    n_species: int,
+    parameter_names: tuple[str, ...],
+    parameter_values,
+):
+    values = jnp.asarray(parameter_values)
+    if int(values.size) != int(len(parameter_names)):
+        raise ValueError(
+            f"parameter_values must have length {len(parameter_names)} but got {int(values.size)}."
+        )
+    cfg = dict(profile_cfg)
+    for idx, name in enumerate(parameter_names):
+        cfg[name] = values[idx]
+    profile_set = _parameterized_profile_set(
+        cfg,
+        geometry,
+        n_species,
+        parameter_name=parameter_names[0],
+        parameter_value=cfg[parameter_names[0]],
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
@@ -405,6 +441,7 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     accepted_step_limit_override: int | None = None,
+    derivative_mode: str = "jvp",
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -449,12 +486,99 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
         if accepted_step_limit_override is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
-    final_y = _radau_adaptive_final_y_realized_schedule(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        prepared_rollout.initial_carry,
+    derivative_mode_key = str(derivative_mode).strip().lower()
+    if derivative_mode_key == "jvp":
+        final_y = _radau_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+    elif derivative_mode_key == "vjp":
+        final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+    else:
+        raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
+def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+    accepted_step_limit_override: int | None = None,
+    derivative_mode: str = "jvp",
+):
+    parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
+    state0 = _parameterized_initial_state_multi(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_names=parameter_names,
+        parameter_values=parameter_values,
     )
+    state0_static = _parameterized_initial_state_multi(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_names=parameter_names,
+        parameter_values=jax.lax.stop_gradient(parameter_values),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    derivative_mode_key = str(derivative_mode).strip().lower()
+    if derivative_mode_key == "jvp":
+        final_y = _radau_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+    elif derivative_mode_key == "vjp":
+        final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+    else:
+        raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
     final_state = prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 
