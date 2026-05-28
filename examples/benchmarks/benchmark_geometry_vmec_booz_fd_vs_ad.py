@@ -14,8 +14,9 @@ if str(ROOT) not in sys.path:
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     central_fd_single_param,
-    exact_forward_scalar_observable_derivatives,
-    exact_reverse_scalar_observable_derivatives,
+    exact_forward_scalar_observable_derivatives_from_linear_operator,
+    exact_reverse_scalar_observable_derivatives_from_linear_operator,
+    exact_scalar_observable_linear_operator,
     five_point_fd_single_param,
     rel_error,
     vmec_booz_scalar_observables_from_single_param,
@@ -161,13 +162,18 @@ def main() -> None:
             step_size=resolved_step_size,
         )
 
-    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
-    ad = exact_forward_scalar_observable_derivatives(
+    print("[geometry-fd-ad] progress: building shared exact accepted-point matrix-free operator", flush=True)
+    linear_op = exact_scalar_observable_linear_operator(
         context,
         observable_kind=observable_kind,
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
         solver_device=args.exact_solver_device,
+    )
+    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
+    ad = exact_forward_scalar_observable_derivatives_from_linear_operator(
+        linear_op,
+        observable_kind=observable_kind,
     )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
@@ -180,12 +186,9 @@ def main() -> None:
     reverse = None
     if not args.skip_reverse_check:
         print("[geometry-fd-ad] progress: running exact accepted-point matrix-free reverse J^T w recovery", flush=True)
-        reverse = exact_reverse_scalar_observable_derivatives(
-            context,
+        reverse = exact_reverse_scalar_observable_derivatives_from_linear_operator(
+            linear_op,
             observable_kind=observable_kind,
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-            solver_device=args.exact_solver_device,
         )
 
     print("[geometry-fd-ad] observable errors:")

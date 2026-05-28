@@ -533,6 +533,35 @@ def exact_forward_scalar_observable_derivatives(
         solver_device=solver_device,
     )
     linear_op = optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+    return exact_forward_scalar_observable_derivatives_from_linear_operator(
+        linear_op,
+        observable_kind=observable_kind,
+    )
+
+
+def exact_scalar_observable_linear_operator(
+    context: GeometryAutodiffContext,
+    *,
+    observable_kind: str,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = None,
+):
+    optimizer = _make_exact_optimizer(
+        context,
+        observable_kind=observable_kind,
+        max_iter=max_iter,
+        step_size=step_size,
+        solver_device=solver_device,
+    )
+    return optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+
+
+def exact_forward_scalar_observable_derivatives_from_linear_operator(
+    linear_op,
+    *,
+    observable_kind: str,
+) -> dict[str, jnp.ndarray]:
     jac = np.asarray(linear_op.matvec(np.array([1.0], dtype=float)), dtype=float).reshape(-1)
     names = _observable_names_for_kind(observable_kind)
     if jac.size != len(names):
@@ -548,14 +577,24 @@ def exact_reverse_scalar_observable_derivatives(
     step_size: float | None = None,
     solver_device: str | None = None,
 ) -> dict[str, jnp.ndarray]:
-    optimizer = _make_exact_optimizer(
+    linear_op = exact_scalar_observable_linear_operator(
         context,
         observable_kind=observable_kind,
         max_iter=max_iter,
         step_size=step_size,
         solver_device=solver_device,
     )
-    linear_op = optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+    return exact_reverse_scalar_observable_derivatives_from_linear_operator(
+        linear_op,
+        observable_kind=observable_kind,
+    )
+
+
+def exact_reverse_scalar_observable_derivatives_from_linear_operator(
+    linear_op,
+    *,
+    observable_kind: str,
+) -> dict[str, jnp.ndarray]:
     names = _observable_names_for_kind(observable_kind)
     n_res = int(linear_op.shape[0])
     out: dict[str, jnp.ndarray] = {}
