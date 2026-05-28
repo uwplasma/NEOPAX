@@ -10,6 +10,7 @@ from typing import Callable, Any
 import dataclasses
 from functools import partial
 import inspect
+import os
 import time
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,16 @@ ODE_SOLVER_BACKENDS = {
     "theta",
     "theta_newton",
 }
+
+
+def _reverse_replay_device_from_env():
+    raw = str(os.environ.get("NEOPAX_TRANSPORT_REVERSE_REPLAY_DEVICE", "")).strip().lower()
+    if raw in ("", "default", "auto", "gpu"):
+        return None
+    if raw == "cpu":
+        devices = jax.devices("cpu")
+        return devices[0] if devices else None
+    return None
 
 
 def _build_real_block_transform(a: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
@@ -5537,6 +5548,19 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         next_easy_growth_streak,
         next_lagged_response_valid,
     ) = residuals
+
+    reverse_device = _reverse_replay_device_from_env()
+    if reverse_device is not None:
+        execution_context = jax.device_put(execution_context, reverse_device)
+        carry0 = jax.device_put(carry0, reverse_device)
+        active_mask = jax.device_put(active_mask, reverse_device)
+        attempted_dts = jax.device_put(attempted_dts, reverse_device)
+        next_dts = jax.device_put(next_dts, reverse_device)
+        next_recent_reject_count = jax.device_put(next_recent_reject_count, reverse_device)
+        next_regrowth_cooldown = jax.device_put(next_regrowth_cooldown, reverse_device)
+        next_easy_growth_streak = jax.device_put(next_easy_growth_streak, reverse_device)
+        next_lagged_response_valid = jax.device_put(next_lagged_response_valid, reverse_device)
+        final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
     def _replay(carry_value):
         replay = _radau_replay_realized_accepted_rollout(

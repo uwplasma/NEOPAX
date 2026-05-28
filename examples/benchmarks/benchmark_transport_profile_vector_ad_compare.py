@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,19 @@ def _report_path() -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "profile_vector"
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir / "transport_profile_vector_ad_compare_summary.json"
+
+
+def _parse_parameter_subset(text: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in str(text).split(",") if item.strip())
+    if not values:
+        raise ValueError("At least one profile-vector parameter must be provided.")
+    invalid = [name for name in values if name not in PROFILE_VECTOR_PARAMETERS]
+    if invalid:
+        raise ValueError(
+            f"Unsupported profile-vector parameter(s): {invalid}. "
+            f"Allowed values: {list(PROFILE_VECTOR_PARAMETERS)}"
+        )
+    return values
 
 
 def _print_summary(report: dict[str, Any]) -> None:
@@ -71,7 +85,20 @@ def main() -> None:
         choices=("both", "forward", "reverse"),
         help="Run forward columns, reverse rows, or both.",
     )
+    parser.add_argument(
+        "--reverse-replay-device",
+        default="cpu",
+        choices=("cpu", "gpu", "default", "auto"),
+        help="Device used by the accepted-step reverse replay in custom-VJP mode. Default: cpu.",
+    )
+    parser.add_argument(
+        "--parameters",
+        default=",".join(PROFILE_VECTOR_PARAMETERS),
+        help="Comma-separated subset of profile-vector parameters to include.",
+    )
     args = parser.parse_args()
+    os.environ["NEOPAX_TRANSPORT_REVERSE_REPLAY_DEVICE"] = str(args.reverse_replay_device)
+    parameter_names = _parse_parameter_subset(args.parameters)
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -80,7 +107,7 @@ def main() -> None:
     )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
-    baseline_vector = jnp.asarray([float(profile_cfg[name]) for name in PROFILE_VECTOR_PARAMETERS], dtype=jnp.float64)
+    baseline_vector = jnp.asarray([float(profile_cfg[name]) for name in parameter_names], dtype=jnp.float64)
 
     objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
         p,
@@ -88,7 +115,7 @@ def main() -> None:
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
-        parameter_names=PROFILE_VECTOR_PARAMETERS,
+        parameter_names=parameter_names,
         derivative_mode="jvp",
     )
     objective_fn_vjp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
@@ -97,13 +124,13 @@ def main() -> None:
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
-        parameter_names=PROFILE_VECTOR_PARAMETERS,
+        parameter_names=parameter_names,
         derivative_mode="vjp",
     )
 
     jac_fwd = None
     jac_rev = None
-    n_params = len(PROFILE_VECTOR_PARAMETERS)
+    n_params = len(parameter_names)
 
     if args.ad_mode in ("both", "forward"):
         print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
@@ -121,6 +148,10 @@ def main() -> None:
 
     if args.ad_mode in ("both", "reverse"):
         print("[autodiff-gate] progress: running reverse custom-VJP Jacobian", flush=True)
+        print(
+            f"[autodiff-gate] progress: reverse replay device={args.reverse_replay_device}",
+            flush=True,
+        )
         objective_base = np.asarray(jax.device_get(objective_fn_vjp(baseline_vector)), dtype=float).reshape(-1)
         rev_rows = []
         for idx in range(int(objective_base.size)):
@@ -136,7 +167,7 @@ def main() -> None:
                     runtime=runtime,
                     baseline_state=baseline_state,
                     profile_cfg=profile_cfg,
-                    parameter_names=PROFILE_VECTOR_PARAMETERS,
+                    parameter_names=parameter_names,
                     derivative_mode="vjp",
                 )[output_index]
 
@@ -163,7 +194,7 @@ def main() -> None:
         "profile_vector_ad_compare": True,
         "config_path": str(Path(args.config)),
         "ad_mode": str(args.ad_mode),
-        "parameter_names": list(PROFILE_VECTOR_PARAMETERS),
+        "parameter_names": list(parameter_names),
         "baseline_values": np.asarray(jax.device_get(baseline_vector), dtype=float).tolist(),
         "objective_labels": OBJECTIVE_LABELS,
         "jacobian_forward": None if jac_fwd is None else jac_fwd.tolist(),
@@ -173,6 +204,7 @@ def main() -> None:
         "parameter_max_relative_error": param_max_rel_list,
         "max_relative_error": max_rel_error,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "reverse_replay_device": str(args.reverse_replay_device),
         "passed": passed,
     }
 
