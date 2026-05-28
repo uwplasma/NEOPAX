@@ -20,6 +20,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     five_point_fd_single_param,
     rel_error,
     vmec_booz_scalar_observables_from_single_param,
+    vmec_qi_maxj_scalar_objectives_from_single_param,
     vmec_scalar_observables_from_single_param,
 )
 
@@ -29,7 +30,7 @@ DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hir
 def _parse_surface_s(text: str) -> tuple[float, ...]:
     values = [float(item.strip()) for item in str(text).split(",") if item.strip()]
     if not values:
-        raise ValueError("At least one Boozer surface must be provided.")
+        raise ValueError("At least one flux surface must be provided.")
     return tuple(values)
 
 
@@ -61,7 +62,8 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     print(
         "[geometry-fd-ad] "
         f"vmec forward_lane=run_fixed_boundary/exact accepted-point matrix-free Jv/J^T w max_iter={resolved_max_iter} "
-        f"step_size={resolved_step_size:.6e} exact_solver_device={args.exact_solver_device} "
+        f"step_size={resolved_step_size:.6e} fd_forward_device={jax.default_backend()} "
+        f"exact_operator_device={args.exact_solver_device} "
         f"mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
@@ -70,14 +72,14 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare VMEC/Boozer scalar observable derivatives between the NEOPAX AD lane and forward-lane finite differences."
+        description="Compare VMEC scalar-objective derivatives between the NEOPAX AD lane and forward-lane finite differences."
     )
     parser.add_argument(
         "--mode",
         type=str,
         default="vmec_booz_scalar_observables",
-        choices=("vmec_scalar_observables", "vmec_booz_scalar_observables"),
-        help="Run the VMEC-only scalar gate or the VMEC -> Boozer scalar gate.",
+        choices=("vmec_scalar_observables", "vmec_booz_scalar_observables", "vmec_qi_maxj_scalar_objectives"),
+        help="Run the VMEC-only scalar gate, the VMEC -> Boozer scalar gate, or the shared QI/Max-J scalar-objective gate.",
     )
     parser.add_argument(
         "--vmec-input",
@@ -98,7 +100,7 @@ def main() -> None:
         "--surface-s",
         type=str,
         default="0.25,0.5,0.75",
-        help="Comma-separated Boozer surfaces in normalized toroidal flux s.",
+        help="Comma-separated normalized toroidal-flux surfaces.",
     )
     parser.add_argument("--mboz", type=int, default=12, help="Boozer mboz.")
     parser.add_argument("--nboz", type=int, default=12, help="Boozer nboz.")
@@ -119,9 +121,9 @@ def main() -> None:
     parser.add_argument(
         "--exact-solver-device",
         type=str,
-        default="cpu",
+        default="gpu",
         choices=("cpu", "gpu", "auto", "default"),
-        help="Device used by the exact accepted-point forward/reverse callbacks. Default: cpu.",
+        help="Device used by the exact accepted-point forward/reverse callbacks. Default: gpu.",
     )
     parser.add_argument(
         "--with-five-point",
@@ -153,8 +155,16 @@ def main() -> None:
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
         )
-    else:
+    elif args.mode == "vmec_booz_scalar_observables":
         fd_func = lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
+            context,
+            delta,
+            lane="forward",
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+    else:
+        fd_func = lambda delta: vmec_qi_maxj_scalar_objectives_from_single_param(  # noqa: E731
             context,
             delta,
             lane="forward",

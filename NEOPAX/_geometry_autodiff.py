@@ -430,6 +430,305 @@ def _vmec_booz_scalar_observables_from_state(
     return reduced
 
 
+def _soft_min_idx(values, beta: float = 50.0):
+    values = jnp.asarray(values, dtype=jnp.float64)
+    weights = jax.nn.softmax(-jnp.asarray(beta, dtype=values.dtype) * values)
+    return jnp.sum(jnp.arange(values.shape[0], dtype=values.dtype) * weights)
+
+
+def _apply_smooth_goodman_transform(b_line, phi_coords):
+    b_line = jnp.asarray(b_line, dtype=jnp.float64)
+    phi_coords = jnp.asarray(phi_coords, dtype=jnp.float64)
+    n = int(b_line.shape[0])
+    indices = jnp.arange(n, dtype=b_line.dtype)
+    s_indmin = _soft_min_idx(b_line)
+    mask_l = jax.nn.sigmoid(2.0 * (s_indmin - indices))
+    mask_r = 1.0 - mask_l
+    bl_sq = jnp.minimum.accumulate(b_line)
+    br_sq = jnp.maximum.accumulate(jnp.where(indices >= s_indmin, b_line, b_line[0]))
+    pmax = jnp.asarray(50.0, dtype=b_line.dtype)
+    pmin = jnp.asarray(15.0, dtype=b_line.dtype)
+    b_min_val = jnp.interp(s_indmin, indices, b_line)
+    phi_mid = jnp.interp(s_indmin, indices, phi_coords)
+    phi_start = phi_coords[0]
+    phi_end = phi_coords[-1]
+    x1_l = (phi_coords - phi_start) / (phi_mid - phi_start + 1.0e-10)
+    x1_r = (phi_coords - phi_mid) / (phi_end - phi_mid + 1.0e-10)
+    shape_l = (jnp.cos(2.0 * jnp.pi * x1_l) + 1.0) / 2.0
+    shape_r = (jnp.cos(2.0 * jnp.pi * x1_r) + 1.0) / 2.0
+    f_l = jnp.where(x1_l < 0.5, (1.0 - bl_sq) * (shape_l**pmax), (-b_min_val) * (shape_l**pmin))
+    f_r = jnp.where(x1_r < 0.5, (-b_min_val) * (shape_r**pmin), (1.0 - br_sq[-1]) * (shape_r**pmax))
+    return mask_l * (bl_sq + f_l) + mask_r * (br_sq + f_r)
+
+
+def _compute_j_pair(phi_coords, b_input, b_target, bj_levels, dl_dphi, db_dpsi, *, nphi_int: int = 128):
+    b_target = jnp.asarray(b_target, dtype=jnp.float64)
+    phi_coords = jnp.asarray(phi_coords, dtype=jnp.float64)
+    indices = jnp.arange(b_target.shape[0], dtype=jnp.int32)
+    indmin = jnp.argmin(b_target)
+    b_l = jnp.where(indices <= indmin, b_target, jnp.asarray(1.1, dtype=b_target.dtype))
+    b_r = jnp.where(indices >= indmin, b_target, jnp.asarray(1.1, dtype=b_target.dtype))
+    p1 = jnp.interp(bj_levels, jnp.flip(b_l), jnp.flip(phi_coords))
+    p2 = jnp.interp(bj_levels, b_r, phi_coords)
+    t = jnp.linspace(0.0, 1.0, int(nphi_int), dtype=b_target.dtype)
+    phi_grid = p1[:, None] + t[None, :] * (p2 - p1)[:, None]
+    bi_g = jnp.interp(phi_grid, phi_coords, b_input)
+    bc_g = jnp.interp(phi_grid, phi_coords, b_target)
+    dl_g = jnp.interp(phi_grid, phi_coords, dl_dphi)
+    dn_g = jnp.interp(phi_grid, phi_coords, db_dpsi)
+    bj_v = bj_levels[:, None]
+    res_i = 1.0 - bi_g / (bj_v + 1.0e-9)
+    vi_g = jnp.sign(res_i) * jnp.sqrt(jnp.abs(res_i) + 1.0e-9)
+    res_c = 1.0 - bc_g / (bj_v + 1.0e-9)
+    vc_g = jnp.sign(res_c) * jnp.sqrt(jnp.abs(res_c) + 1.0e-9)
+    v_target_stab = jnp.sqrt(jnp.maximum(bj_v - bc_g, 0.0) + 1.0e-9)
+    ji = jnp.trapezoid(vi_g * dl_g, x=phi_grid, axis=1)
+    jc = jnp.trapezoid(vc_g * dl_g, x=phi_grid, axis=1)
+    dj_c = jnp.trapezoid(-(dn_g / (bc_g + 1.0e-9)) * v_target_stab * dl_g, x=phi_grid, axis=1)
+    return ji, jc, dj_c
+
+
+def _periodic_central_difference(values: jnp.ndarray, spacing: float, *, axis: int) -> jnp.ndarray:
+    spacing_value = jnp.asarray(float(spacing), dtype=jnp.asarray(values).dtype)
+    return (jnp.roll(values, -1, axis=axis) - jnp.roll(values, 1, axis=axis)) / (2.0 * spacing_value)
+
+
+def _interp_radial_grid(values_full: jnp.ndarray, s_full: jnp.ndarray, s_query: jnp.ndarray) -> jnp.ndarray:
+    values_full = jnp.asarray(values_full, dtype=jnp.float64)
+    s_full = jnp.asarray(s_full, dtype=jnp.float64)
+    s_query = jnp.asarray(s_query, dtype=jnp.float64)
+    flat = values_full.reshape(values_full.shape[0], -1).T
+    interp_one = lambda column: jnp.interp(s_query, s_full, column)
+    interpolated = jax.vmap(interp_one)(flat)
+    return interpolated.T.reshape((s_query.shape[0],) + values_full.shape[1:])
+
+
+def _vmec_state_for_custom_grid(vmec_jax, state, static):
+    VMECState = _resolve_vmec_attr(vmec_jax, "VMECState", submodule="state")
+    vmec_m1_internal_to_physical_signed = _resolve_vmec_attr(
+        vmec_jax,
+        "vmec_m1_internal_to_physical_signed",
+        submodule="vmec_parity",
+    )
+    cfg = static.cfg
+    lconm1 = bool(getattr(cfg, "lconm1", True))
+    lthreed = bool(getattr(cfg, "lthreed", int(getattr(cfg, "ntor", 0)) > 0))
+    lasym = bool(getattr(cfg, "lasym", False))
+    if not (lconm1 and (lthreed or lasym) and int(getattr(cfg, "mpol", 0)) > 1):
+        return state
+    Rcos, Zsin, Rsin, Zcos = vmec_m1_internal_to_physical_signed(
+        Rcos=state.Rcos,
+        Zsin=state.Zsin,
+        Rsin=state.Rsin,
+        Zcos=state.Zcos,
+        modes=static.modes,
+        lthreed=lthreed,
+        lasym=lasym,
+        lconm1=lconm1,
+    )
+    return VMECState(
+        layout=state.layout,
+        Rcos=Rcos,
+        Rsin=Rsin,
+        Zcos=Zcos,
+        Zsin=Zsin,
+        Lcos=state.Lcos,
+        Lsin=state.Lsin,
+    )
+
+
+def _vmec_surface_line_data_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    nphi: int,
+    ntheta: int,
+):
+    vmec_jax = _import_vmec_jax()
+    AngleGrid = _resolve_vmec_attr(vmec_jax, "AngleGrid", submodule="grids")
+    build_helical_basis = _resolve_vmec_attr(vmec_jax, "build_helical_basis", submodule="fourier")
+    eval_geom_jit = _resolve_vmec_attr(vmec_jax, "_eval_geom_jit", submodule="geom")
+    bsup_from_geom = _resolve_vmec_attr(vmec_jax, "bsup_from_geom", submodule="field")
+    b2_from_bsup = _resolve_vmec_attr(vmec_jax, "b2_from_bsup", submodule="field")
+    equilibrium_iota_profiles_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_iota_profiles_from_state",
+        submodule="profiles",
+    )
+    nfp = int(context.cfg.nfp)
+    period = 2.0 * jnp.pi / float(nfp)
+    theta = jnp.linspace(0.0, 2.0 * jnp.pi, int(ntheta), endpoint=False, dtype=jnp.float64)
+    phi = jnp.linspace(0.0, period, int(nphi), endpoint=False, dtype=jnp.float64)
+    zeta = phi * float(nfp)
+    grid = AngleGrid(theta=theta, zeta=zeta, nfp=nfp)
+    basis = build_helical_basis(context.static.modes, grid, cache=False)
+    state_use = _vmec_state_for_custom_grid(vmec_jax, state, context.static)
+    geom = eval_geom_jit(state_use, basis, context.static.s, zeta)
+    bsupu, bsupv = bsup_from_geom(
+        geom,
+        phipf=jnp.asarray(context.flux.phipf),
+        chipf=jnp.asarray(context.flux.chipf),
+        nfp=nfp,
+        signgs=int(context.signgs),
+        lamscale=jnp.asarray(context.flux.lamscale),
+    )
+    bmag_full = jnp.sqrt(jnp.maximum(jnp.asarray(b2_from_bsup(geom, bsupu, bsupv), dtype=jnp.float64), 0.0))
+    _chips, iotas_half_raw, _iotaf = equilibrium_iota_profiles_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    iotas_half = jnp.asarray(iotas_half_raw, dtype=jnp.float64)[1:]
+    cos_phi = jnp.cos(phi)[None, None, :]
+    sin_phi = jnp.sin(phi)[None, None, :]
+    x_theta = jnp.stack(
+        [
+            geom.Rt * cos_phi,
+            geom.Rt * sin_phi,
+            geom.Zt,
+        ],
+        axis=-1,
+    )
+    x_phi = jnp.stack(
+        [
+            geom.Rp * cos_phi - geom.R * sin_phi,
+            geom.Rp * sin_phi + geom.R * cos_phi,
+            geom.Zp,
+        ],
+        axis=-1,
+    )
+    iota_full = _interp_radial_grid(
+        iotas_half[:, None, None],
+        0.5 * (jnp.asarray(context.static.s[:-1], dtype=jnp.float64) + jnp.asarray(context.static.s[1:], dtype=jnp.float64)),
+        jnp.asarray(context.static.s, dtype=jnp.float64),
+    )[:, :, :, None]
+    dl_dphi_full = jnp.linalg.norm(x_phi + iota_full * x_theta, axis=-1)
+    bmag_grid_full = jnp.transpose(bmag_full, axes=(0, 2, 1))
+    dl_grid_full = jnp.transpose(dl_dphi_full, axes=(0, 2, 1))
+    s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+    s_half = 0.5 * (s_full[:-1] + s_full[1:])
+    phips_half = jnp.asarray(context.flux.phips, dtype=jnp.float64)[1:]
+    target_indices = jnp.asarray(context.surface_indices, dtype=jnp.int32)
+    neighbor_minus = jnp.clip(target_indices - 1, 0, int(s_half.shape[0]) - 1)
+    neighbor_plus = jnp.clip(target_indices + 1, 0, int(s_half.shape[0]) - 1)
+    extended_indices = jnp.unique(jnp.concatenate([neighbor_minus, target_indices, neighbor_plus], axis=0))
+    extended_s = s_half[extended_indices]
+    bmag_half = _interp_radial_grid(bmag_grid_full, s_full, extended_s)
+    dl_half = _interp_radial_grid(dl_grid_full, s_full, extended_s)
+    iota_surface = jnp.asarray(iotas_half, dtype=jnp.float64)[extended_indices]
+    surface_map = {int(idx): pos for pos, idx in enumerate(np.asarray(extended_indices, dtype=int))}
+    target_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(target_indices)], dtype=jnp.int32)
+    minus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_minus)], dtype=jnp.int32)
+    plus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_plus)], dtype=jnp.int32)
+    db_ds = (bmag_half[plus_positions] - bmag_half[minus_positions]) / jnp.maximum(
+        (s_half[neighbor_plus] - s_half[neighbor_minus])[:, None, None],
+        1.0e-12,
+    )
+    db_dpsi = db_ds / jnp.maximum(phips_half[target_indices][:, None, None], 1.0e-12)
+    return {
+        "phi_line": jnp.linspace(0.0, period, int(nphi), endpoint=True, dtype=jnp.float64),
+        "period": period,
+        "b_grid": bmag_half[target_positions],
+        "dl_grid": dl_half[target_positions],
+        "db_dpsi_grid": db_dpsi,
+        "iota_surface": iota_surface[target_positions],
+    }
+
+
+def _sample_periodic_surface_line(surface_grid: jnp.ndarray, theta_coords: jnp.ndarray, phi_coords: jnp.ndarray, *, period: jnp.ndarray):
+    nphi_g, ntheta_g = int(surface_grid.shape[0]), int(surface_grid.shape[1])
+    phi_idx = jnp.mod(phi_coords, period) / jnp.maximum(period, 1.0e-12) * float(nphi_g)
+    theta_idx = jnp.mod(theta_coords, 2.0 * jnp.pi) / (2.0 * jnp.pi) * float(ntheta_g)
+    coords = jnp.stack([phi_idx, theta_idx], axis=0)
+    return jax.scipy.ndimage.map_coordinates(surface_grid, coords, order=1, mode="wrap")
+
+
+def _vmec_qi_maxj_shared_diagnostics_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    nphi: int = 101,
+    nalpha: int = 51,
+    n_bounce: int = 66,
+    p_j: float = 1.0,
+    p_lambda: float = 1.0,
+    nphi_int: int = 128,
+):
+    nphi_value = int(nphi)
+    nalpha_value = int(nalpha)
+    n_bounce_value = int(n_bounce)
+    line_data = _vmec_surface_line_data_from_state(
+        context,
+        state,
+        nphi=nphi_value,
+        ntheta=max(nphi_value, 96),
+    )
+    phi = jnp.asarray(line_data["phi_line"], dtype=jnp.float64)
+    alpha = jnp.linspace(0.0, 2.0 * jnp.pi, nalpha_value, endpoint=False, dtype=jnp.float64)
+    b_target = jnp.asarray(line_data["b_grid"], dtype=jnp.float64)
+    dl_target = jnp.asarray(line_data["dl_grid"], dtype=jnp.float64)
+    db_dpsi = jnp.asarray(line_data["db_dpsi_grid"], dtype=jnp.float64)
+    iota_surface = jnp.asarray(line_data["iota_surface"], dtype=jnp.float64)
+    period = jnp.asarray(line_data["period"], dtype=jnp.float64)
+
+    def _per_surface(b_surface, dl_surface, db_surface):
+        def _per_line(b_line, dl_line, db_line):
+            bmin = jnp.min(b_line)
+            bmax = jnp.max(b_line)
+            scale = jnp.maximum(bmax - bmin, 1.0e-10)
+            b_norm = (b_line - bmin) / scale
+            b_target_norm = _apply_smooth_goodman_transform(b_norm, phi)
+            b_target_phys = b_target_norm * scale + bmin
+            bj_norm = jnp.power(jnp.arange(n_bounce_value, dtype=jnp.float64) / jnp.maximum(n_bounce_value - 1, 1), p_lambda)
+            bj_phys = bj_norm * scale + bmin
+            ji, jc, djc = _compute_j_pair(
+                phi,
+                b_line,
+                b_target_phys,
+                bj_phys,
+                dl_line,
+                db_line,
+                nphi_int=nphi_int,
+            )
+            return ji, jc, djc
+
+        ji_all, jc_all, djc_all = jax.vmap(_per_line, in_axes=(0, 0, 0), out_axes=(0, 0, 0))(b_surface, dl_surface, db_surface)
+        ji_pow = jnp.abs(ji_all) ** p_j
+        jc_pow = jnp.abs(jc_all) ** p_j
+        ni = jnp.asarray(float(nalpha_value), dtype=jnp.float64)
+        nc = jnp.asarray(float(nalpha_value), dtype=jnp.float64)
+        sum_ji2 = jnp.sum(ji_pow**2, axis=0)
+        sum_jc2 = jnp.sum(jc_pow**2, axis=0)
+        sum_ji = jnp.sum(ji_pow, axis=0)
+        sum_jc = jnp.sum(jc_pow, axis=0)
+        diff_sq_per_bj = (nc * sum_ji2) + (ni * sum_jc2) - (2.0 * sum_ji * sum_jc)
+        total_diff_sq = jnp.mean(diff_sq_per_bj)
+        mean_denom = (jnp.mean(ji_pow) + jnp.mean(jc_pow)) ** 2
+        qi_surface = jnp.sqrt(total_diff_sq / (mean_denom + 1.0e-10))
+        maxj_surface = jnp.sqrt(jnp.mean(jnp.maximum(djc_all, 0.0) ** 2))
+        return qi_surface, maxj_surface
+
+    def _surface_lines(b_surface, dl_surface, db_surface, iota_value):
+        def _line(alpha_value):
+            theta_coords = alpha_value + iota_value * phi
+            b_line = _sample_periodic_surface_line(b_surface, theta_coords, phi, period=period)
+            dl_line = _sample_periodic_surface_line(dl_surface, theta_coords, phi, period=period)
+            db_line = _sample_periodic_surface_line(db_surface, theta_coords, phi, period=period)
+            return b_line, dl_line, db_line
+
+        return jax.vmap(_line)(alpha)
+
+    b_lines, dl_lines, db_lines = jax.vmap(_surface_lines, in_axes=(0, 0, 0, 0))(b_target, dl_target, db_dpsi, iota_surface)
+    qi_surface, maxj_surface = jax.vmap(_per_surface, in_axes=(0, 0, 0))(b_lines, dl_lines, db_lines)
+    return {
+        "qi_surface": qi_surface,
+        "maxj_surface": maxj_surface,
+        "qi_objective": jnp.mean(qi_surface**2),
+        "maxj_objective": jnp.mean(maxj_surface**2),
+    }
+
+
 def _observable_items_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -441,9 +740,16 @@ def _observable_items_from_state(
         observables = _vmec_scalar_observables_from_state(context, state)
     elif kind == "vmec_booz_scalar_observables":
         observables = _vmec_booz_scalar_observables_from_state(context, state)
+    elif kind == "vmec_qi_maxj_scalar_objectives":
+        observables = _vmec_qi_maxj_shared_diagnostics_from_state(context, state)
+        observables = {
+            "qi_objective": jnp.asarray(observables["qi_objective"], dtype=jnp.float64),
+            "maxj_objective": jnp.asarray(observables["maxj_objective"], dtype=jnp.float64),
+        }
     else:
         raise ValueError(
-            "observable_kind must be 'vmec_scalar_observables' or 'vmec_booz_scalar_observables'."
+            "observable_kind must be 'vmec_scalar_observables', 'vmec_booz_scalar_observables', or "
+            "'vmec_qi_maxj_scalar_objectives'."
         )
     return list(observables.items())
 
@@ -461,8 +767,11 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "aspect_proxy",
             "b10_over_b00_mean",
         ]
+    if kind == "vmec_qi_maxj_scalar_objectives":
+        return ["qi_objective", "maxj_objective"]
     raise ValueError(
-        "observable_kind must be 'vmec_scalar_observables' or 'vmec_booz_scalar_observables'."
+        "observable_kind must be 'vmec_scalar_observables', 'vmec_booz_scalar_observables', or "
+        "'vmec_qi_maxj_scalar_objectives'."
     )
 
 
@@ -718,6 +1027,30 @@ def vmec_booz_scalar_observables_from_single_param(
         jacobian_penalty=jacobian_penalty,
     )
     return _vmec_booz_scalar_observables_from_state(context, state)
+
+
+def vmec_qi_maxj_scalar_objectives_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    diagnostics = _vmec_qi_maxj_shared_diagnostics_from_state(context, state)
+    return {
+        "qi_objective": jnp.asarray(diagnostics["qi_objective"], dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(diagnostics["maxj_objective"], dtype=jnp.float64),
+    }
 
 
 def _safe_divide(num, den):
