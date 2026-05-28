@@ -411,14 +411,21 @@ def _vmec_iotaf_scalar_observables_from_state(
     if npts > 2:
         interior_start = 1
         interior_stop = npts - 1
+        q1_idx = interior_start + (interior_stop - interior_start) // 4
         mid_idx = interior_start + (interior_stop - interior_start) // 2
+        q3_idx = interior_start + (3 * (interior_stop - interior_start)) // 4
         iota_mean = jnp.mean(iotaf[1:])
     else:
+        q1_idx = edge_idx
         mid_idx = edge_idx
+        q3_idx = edge_idx
         iota_mean = iotaf[edge_idx]
 
     return {
+        "iotaf_first": jnp.asarray(iotaf[1] if npts > 1 else iotaf[0]),
+        "iotaf_q1": jnp.asarray(iotaf[q1_idx]),
         "iotaf_mid": jnp.asarray(iotaf[mid_idx]),
+        "iotaf_q3": jnp.asarray(iotaf[q3_idx]),
         "iotaf_edge": jnp.asarray(iotaf[edge_idx]),
         "iota_mean": jnp.asarray(iota_mean),
     }
@@ -800,7 +807,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
     if kind == "vmec_scalar_observables":
         return ["aspect_ratio", "volume_total", "iota_mean", "edge_r00"]
     if kind == "vmec_iotaf_scalar_observables":
-        return ["iotaf_mid", "iotaf_edge", "iota_mean"]
+        return ["iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
     if kind == "vmec_booz_scalar_observables":
         return [
             "iota_b_mean",
