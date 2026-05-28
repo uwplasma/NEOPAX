@@ -4496,3 +4496,39 @@ Follow-up investigation to keep for next session
   - use the same object for both forward `matvec` and reverse `rmatvec`
   - compare primal basepoint observable values from the exact path vs the FD
     forward-lane solve
+
+Missing profile-AD architecture points to preserve
+
+- The profile-parameter transport AD should not be hard-wired to the current
+  benchmark metric vector.
+- The correct long-term abstraction is:
+  - `state_final = F(parameters)`
+  - `objective = g(state_final)`
+- So the custom AD rule should expose a general API at the `... -> state_final`
+  level, for both:
+  - forward mode
+  - reverse mode
+- Benchmark objectives such as `softmax_Er`, `smooth_root_proxy`, and volume
+  averages should sit outside that generic `state_final` AD boundary.
+
+- Initial `Er` construction from ambipolarity should eventually be included in
+  the differentiated profile-parameter map.
+- In other words, `n0`, `T0`, profile powers, and related parameters should be
+  allowed to influence:
+  - initial density/pressure
+  - and the initial ambipolar `Er`
+- Current benchmark Option A intentionally freezes the initial ambipolar `Er`
+  for tractable debugging, but this is not the desired final semantic target.
+
+- The `parameters -> carry0` map should become a more general API rather than a
+  benchmark-specific helper.
+- It should work for:
+  - more profile parameters
+  - more general parameter families
+  - and eventually non-profile controls as well
+- The current mixed reverse implementation uses forward-mode JVP columns for
+  `d(carry0)/dp` only because the active benchmark currently has very few
+  parameters.
+- The desired long-term reverse architecture should expose a true reverse-mode
+  treatment for `parameters -> carry0` as well, instead of depending on
+  forward-mode columns there.
