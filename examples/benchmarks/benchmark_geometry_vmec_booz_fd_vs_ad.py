@@ -59,7 +59,7 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     )
     print(
         "[geometry-fd-ad] "
-        f"vmec forward_lane=run_fixed_boundary/exact accepted-point forward+reverse max_iter={resolved_max_iter} "
+        f"vmec forward_lane=run_fixed_boundary/exact accepted-point matrix-free Jv/J^T w max_iter={resolved_max_iter} "
         f"step_size={resolved_step_size:.6e} exact_solver_device={args.exact_solver_device} "
         f"mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
@@ -161,7 +161,7 @@ def main() -> None:
             step_size=resolved_step_size,
         )
 
-    print("[geometry-fd-ad] progress: running exact accepted-point forward derivative", flush=True)
+    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
     ad = exact_forward_scalar_observable_derivatives(
         context,
         observable_kind=observable_kind,
@@ -179,7 +179,7 @@ def main() -> None:
 
     reverse = None
     if not args.skip_reverse_check:
-        print("[geometry-fd-ad] progress: running exact accepted-point reverse derivative recovery", flush=True)
+        print("[geometry-fd-ad] progress: running exact accepted-point matrix-free reverse J^T w recovery", flush=True)
         reverse = exact_reverse_scalar_observable_derivatives(
             context,
             observable_kind=observable_kind,

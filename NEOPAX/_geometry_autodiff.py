@@ -532,7 +532,8 @@ def exact_forward_scalar_observable_derivatives(
         step_size=step_size,
         solver_device=solver_device,
     )
-    jac = np.asarray(optimizer.jacobian_fun(np.zeros(1, dtype=float)), dtype=float).reshape(-1)
+    linear_op = optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+    jac = np.asarray(linear_op.matvec(np.array([1.0], dtype=float)), dtype=float).reshape(-1)
     names = _observable_names_for_kind(observable_kind)
     if jac.size != len(names):
         names = names[: int(jac.size)]
