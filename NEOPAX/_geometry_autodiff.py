@@ -385,6 +385,45 @@ def _vmec_scalar_observables_from_state(
     }
 
 
+def _vmec_iotaf_scalar_observables_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    vmec_jax = _import_vmec_jax()
+    equilibrium_iota_profiles_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_iota_profiles_from_state",
+        submodule="profiles",
+    )
+
+    _chips, _iotas, iotaf = equilibrium_iota_profiles_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    iotaf = jnp.asarray(iotaf, dtype=jnp.float64)
+    npts = int(iotaf.size)
+    if npts <= 0:
+        raise ValueError("equilibrium_iota_profiles_from_state returned an empty iotaf profile.")
+
+    edge_idx = npts - 1
+    if npts > 2:
+        interior_start = 1
+        interior_stop = npts - 1
+        mid_idx = interior_start + (interior_stop - interior_start) // 2
+        iota_mean = jnp.mean(iotaf[1:])
+    else:
+        mid_idx = edge_idx
+        iota_mean = iotaf[edge_idx]
+
+    return {
+        "iotaf_mid": jnp.asarray(iotaf[mid_idx]),
+        "iotaf_edge": jnp.asarray(iotaf[edge_idx]),
+        "iota_mean": jnp.asarray(iota_mean),
+    }
+
+
 def _vmec_booz_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -738,6 +777,8 @@ def _observable_items_from_state(
     kind = str(observable_kind).strip().lower()
     if kind == "vmec_scalar_observables":
         observables = _vmec_scalar_observables_from_state(context, state)
+    elif kind == "vmec_iotaf_scalar_observables":
+        observables = _vmec_iotaf_scalar_observables_from_state(context, state)
     elif kind == "vmec_booz_scalar_observables":
         observables = _vmec_booz_scalar_observables_from_state(context, state)
     elif kind == "vmec_qi_maxj_scalar_objectives":
@@ -748,8 +789,8 @@ def _observable_items_from_state(
         }
     else:
         raise ValueError(
-            "observable_kind must be 'vmec_scalar_observables', 'vmec_booz_scalar_observables', or "
-            "'vmec_qi_maxj_scalar_objectives'."
+            "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
+            "'vmec_booz_scalar_observables', or 'vmec_qi_maxj_scalar_objectives'."
         )
     return list(observables.items())
 
@@ -758,6 +799,8 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
     kind = str(observable_kind).strip().lower()
     if kind == "vmec_scalar_observables":
         return ["aspect_ratio", "volume_total", "iota_mean", "edge_r00"]
+    if kind == "vmec_iotaf_scalar_observables":
+        return ["iotaf_mid", "iotaf_edge", "iota_mean"]
     if kind == "vmec_booz_scalar_observables":
         return [
             "iota_b_mean",
@@ -770,8 +813,8 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
     if kind == "vmec_qi_maxj_scalar_objectives":
         return ["qi_objective", "maxj_objective"]
     raise ValueError(
-        "observable_kind must be 'vmec_scalar_observables', 'vmec_booz_scalar_observables', or "
-        "'vmec_qi_maxj_scalar_objectives'."
+        "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
+        "'vmec_booz_scalar_observables', or 'vmec_qi_maxj_scalar_objectives'."
     )
 
 
@@ -967,6 +1010,26 @@ def vmec_scalar_observables_from_single_param(
         jacobian_penalty=jacobian_penalty,
     )
     return _vmec_scalar_observables_from_state(context, state)
+
+
+def vmec_iotaf_scalar_observables_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _vmec_iotaf_scalar_observables_from_state(context, state)
 
 
 def geometry_observables_from_single_param(

@@ -20,6 +20,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     five_point_fd_single_param,
     rel_error,
     vmec_booz_scalar_observables_from_single_param,
+    vmec_iotaf_scalar_observables_from_single_param,
     vmec_qi_maxj_scalar_objectives_from_single_param,
     vmec_scalar_observables_from_single_param,
 )
@@ -78,8 +79,13 @@ def main() -> None:
         "--mode",
         type=str,
         default="vmec_booz_scalar_observables",
-        choices=("vmec_scalar_observables", "vmec_booz_scalar_observables", "vmec_qi_maxj_scalar_objectives"),
-        help="Run the VMEC-only scalar gate, the VMEC -> Boozer scalar gate, or the shared QI/Max-J scalar-objective gate.",
+        choices=(
+            "vmec_scalar_observables",
+            "vmec_iotaf_scalar_observables",
+            "vmec_booz_scalar_observables",
+            "vmec_qi_maxj_scalar_objectives",
+        ),
+        help="Run the VMEC-only scalar gate, focused VMEC iotaf profile probes, the VMEC -> Boozer scalar gate, or the shared QI/Max-J scalar-objective gate.",
     )
     parser.add_argument(
         "--vmec-input",
@@ -149,6 +155,14 @@ def main() -> None:
     observable_kind = args.mode
     if args.mode == "vmec_scalar_observables":
         fd_func = lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
+            context,
+            delta,
+            lane="forward",
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+    elif args.mode == "vmec_iotaf_scalar_observables":
+        fd_func = lambda delta: vmec_iotaf_scalar_observables_from_single_param(  # noqa: E731
             context,
             delta,
             lane="forward",
