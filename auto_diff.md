@@ -4203,8 +4203,8 @@ This also means the magnetic path should expose **two explicit lanes**:
 2. **AD geometry lane**
    - same mathematical map as the forward lane
    - but implemented with the AD-capable solver-aware path
-   - should use the direct `vmec_jax` implicit residual solve API rather than
-     the old explicit GD helper
+   - should not treat the direct `vmec_jax` implicit residual solve API as the
+     promoted production geometry derivative lane
 
 Important principle:
 
@@ -4216,7 +4216,8 @@ Important principle:
 So the geometry implementation priority is now:
 
 1. remove dependence on NTX wrappers for the magnetic solve itself
-2. replace that with direct `vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(...)`
+2. replace the current implicit-helper benchmark lane with the accepted-point
+   exact optimizer callbacks from `vmec_jax`
 3. keep `booz_xform_jax` as the next stage
 4. expose a NEOPAX-owned forward lane and AD lane for boundary-parameter
    geometry construction
@@ -4225,12 +4226,56 @@ So the geometry implementation priority is now:
 Immediate implementation note:
 
 - the first geometry implementation should land the **NEOPAX-owned forward lane**
-  and the **forward-mode AD lane** first
+  and the **accepted-point exact forward derivative lane** first
 - both lanes should still target the same final NEOPAX transport metric vector
   used in the `n0` tests
 - once this forward lane is validated against FD on those same metrics, we
   should be able to add a reverse-mode magnetic path afterward rather than
   trying to start from reverse mode immediately
+
+### Correct vmec_jax geometry differentiation lane
+
+After re-reading the local `vmec_jax` repository, the accepted-point derivative
+routes that still follow the usual input-driven VMEC solve are:
+
+- primal solver path:
+  - `vmec_jax.api.run_fixed_boundary(...)`
+  - documented in:
+    - `vmec_jax/docs/quickstart.rst`
+    - `vmec_jax/vmec_jax/driver.py::run_fixed_boundary(...)`
+
+- promoted forward derivative path:
+  - accepted-point exact tape replay with JVP columns
+  - documented in:
+    - `vmec_jax/docs/optimization.rst`
+    - `vmec_jax/docs/performance.rst`
+    - `vmec_jax/vmec_jax/optimization.py::FixedBoundaryExactOptimizer.jacobian_fun`
+
+- promoted reverse derivative path:
+  - accepted-point reverse discrete-adjoint replay
+  - documented in:
+    - `vmec_jax/docs/discrete_adjoint.rst`
+    - `vmec_jax/vmec_jax/optimization.py::FixedBoundaryExactOptimizer.objective_and_gradient_fun`
+    - `vmec_jax/vmec_jax/optimization.py::FixedBoundaryExactOptimizer.residual_linear_operator`
+
+Important local conclusion:
+
+- the geometry benchmark should **not** use
+  `vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(...)`
+  as the standard AD lane
+- that implicit helper is not the main promoted accepted-point optimization
+  path that matches the usual VMEC input / iteration workflow
+
+Implementation priority from here:
+
+1. build the NEOPAX geometry derivative helpers around a one-parameter
+   accepted-point `FixedBoundaryExactOptimizer`
+2. validate the accepted-point **forward** derivative path against central FD
+   on scalar VMEC / VMEC->Boozer observables
+3. validate the accepted-point **reverse** path against the trusted forward
+   derivative values
+4. only then reconnect the corrected geometry derivative lane to the full
+   NEOPAX transport metric benchmark
 
 #### Raw saved terminal values from the frozen checkpoint runs
 

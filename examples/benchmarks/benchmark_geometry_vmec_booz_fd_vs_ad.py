@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     central_fd_single_param,
+    exact_forward_scalar_observable_derivatives,
+    exact_reverse_scalar_observable_derivatives,
     five_point_fd_single_param,
     rel_error,
     vmec_booz_scalar_observables_from_single_param,
@@ -57,7 +59,7 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     )
     print(
         "[geometry-fd-ad] "
-        f"vmec forward_lane=forward ad_lane=ad max_iter={resolved_max_iter} "
+        f"vmec forward_lane=run_fixed_boundary/exact accepted-point forward+reverse max_iter={resolved_max_iter} "
         f"step_size={resolved_step_size:.6e} mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
@@ -108,6 +110,11 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6, help="Relative FD step.")
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-8, help="Absolute FD step.")
     parser.add_argument(
+        "--skip-reverse-check",
+        action="store_true",
+        help="Skip exact reverse-mode observable derivative recovery against the exact forward path.",
+    )
+    parser.add_argument(
         "--with-five-point",
         action="store_true",
         help="Also compute a five-point stencil FD estimate.",
@@ -128,14 +135,8 @@ def main() -> None:
     resolved_step_size = _resolved_step_size(context, args.vmec_step_size)
     _print_header(args, context, h, resolved_max_iter=resolved_max_iter, resolved_step_size=resolved_step_size)
 
+    observable_kind = args.mode
     if args.mode == "vmec_scalar_observables":
-        ad_func = lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="ad",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
         fd_func = lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
             context,
             delta,
@@ -144,13 +145,6 @@ def main() -> None:
             step_size=resolved_step_size,
         )
     else:
-        ad_func = lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="ad",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
         fd_func = lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
             context,
             delta,
@@ -159,8 +153,13 @@ def main() -> None:
             step_size=resolved_step_size,
         )
 
-    print("[geometry-fd-ad] progress: running AD lane directional derivative", flush=True)
-    _, ad = jax.jvp(ad_func, (jnp.asarray(0.0, dtype=jnp.float64),), (jnp.asarray(1.0, dtype=jnp.float64),))
+    print("[geometry-fd-ad] progress: running exact accepted-point forward derivative", flush=True)
+    ad = exact_forward_scalar_observable_derivatives(
+        context,
+        observable_kind=observable_kind,
+        max_iter=resolved_max_iter,
+        step_size=resolved_step_size,
+    )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
 
@@ -168,6 +167,16 @@ def main() -> None:
     if args.with_five_point:
         print("[geometry-fd-ad] progress: running forward-lane five-point finite difference", flush=True)
         fd_five = five_point_fd_single_param(fd_func, h, minus=minus, plus=plus)
+
+    reverse = None
+    if not args.skip_reverse_check:
+        print("[geometry-fd-ad] progress: running exact accepted-point reverse derivative recovery", flush=True)
+        reverse = exact_reverse_scalar_observable_derivatives(
+            context,
+            observable_kind=observable_kind,
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
 
     print("[geometry-fd-ad] observable errors:")
     for name in ad:
@@ -187,6 +196,13 @@ def main() -> None:
                 f" fd_five_point={float(jnp.asarray(five_value)):.6e}"
                 f" ad_vs_five_rel_err={five_err:.6e}"
                 f" center_vs_five_rel_err={center_vs_five:.6e}"
+            )
+        if reverse is not None:
+            reverse_value = reverse[name]
+            reverse_err = rel_error(reverse_value, ad_value)
+            line += (
+                f" reverse={float(jnp.asarray(reverse_value)):.6e}"
+                f" reverse_vs_forward_rel_err={reverse_err:.6e}"
             )
         print(line, flush=True)
 

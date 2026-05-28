@@ -42,6 +42,13 @@ def _import_vmec_jax_implicit():
     return implicit
 
 
+def _import_vmec_jax_optimization():
+    _ensure_local_stack_on_path()
+    import vmec_jax.optimization as optimization
+
+    return optimization
+
+
 def _import_booz_xform_jax_api():
     _ensure_local_stack_on_path()
     from booz_xform_jax import jax_api
@@ -337,6 +344,230 @@ def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) 
     return None if match < 0 else match
 
 
+def _vmec_scalar_observables_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    vmec_jax = _import_vmec_jax()
+    eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
+    volume_from_sqrtg = _resolve_vmec_attr(vmec_jax, "volume_from_sqrtg", submodule="integrals")
+    equilibrium_iota_profiles_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_iota_profiles_from_state",
+        submodule="profiles",
+    )
+    equilibrium_aspect_ratio_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "equilibrium_aspect_ratio_from_state",
+        submodule="profiles",
+    )
+
+    geom = eval_geom(state, context.static)
+    _dvds, volume = volume_from_sqrtg(
+        geom.sqrtg,
+        context.static.s,
+        context.static.grid.theta,
+        context.static.grid.zeta,
+        nfp=int(context.cfg.nfp),
+    )
+    _chips, _iotas, iotaf = equilibrium_iota_profiles_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    iota_mean = jnp.mean(iotaf[1:]) if int(iotaf.size) > 1 else iotaf[0]
+    return {
+        "aspect_ratio": jnp.asarray(equilibrium_aspect_ratio_from_state(state=state, static=context.static)),
+        "volume_total": jnp.asarray(volume[-1]),
+        "iota_mean": jnp.asarray(iota_mean),
+        "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
+    }
+
+
+def _vmec_booz_scalar_observables_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    vmec_jax = _import_vmec_jax()
+    booz_api = _import_booz_xform_jax_api()
+
+    inputs = vmec_jax.booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    out = booz_api.booz_xform_from_inputs(
+        inputs=inputs,
+        constants=context.booz_constants,
+        grids=context.booz_grids,
+        surface_indices=context.surface_indices,
+        jit=True,
+    )
+
+    bmnc_b = jnp.asarray(out["bmnc_b"])
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+
+    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
+    if mode00 is None:
+        raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
+    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
+
+    b00 = bmnc_b[:, mode00]
+    reduced = {
+        "iota_b_mean": jnp.mean(jnp.asarray(out["iota_b"])),
+        "b00_mean": jnp.mean(b00),
+        "buco_b_mean": jnp.mean(jnp.asarray(out["buco_b"])),
+        "bvco_b_mean": jnp.mean(jnp.asarray(out["bvco_b"])),
+        "aspect_proxy": jnp.asarray(state.Rcos[-1, mode00]),
+    }
+    if mode10 is not None:
+        b10 = bmnc_b[:, mode10]
+        reduced["b10_over_b00_mean"] = jnp.mean(b10 / b00)
+    return reduced
+
+
+def _observable_items_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    observable_kind: str,
+) -> list[tuple[str, jnp.ndarray]]:
+    kind = str(observable_kind).strip().lower()
+    if kind == "vmec_scalar_observables":
+        observables = _vmec_scalar_observables_from_state(context, state)
+    elif kind == "vmec_booz_scalar_observables":
+        observables = _vmec_booz_scalar_observables_from_state(context, state)
+    else:
+        raise ValueError(
+            "observable_kind must be 'vmec_scalar_observables' or 'vmec_booz_scalar_observables'."
+        )
+    return list(observables.items())
+
+
+def _observable_names_for_kind(observable_kind: str) -> list[str]:
+    kind = str(observable_kind).strip().lower()
+    if kind == "vmec_scalar_observables":
+        return ["aspect_ratio", "volume_total", "iota_mean", "edge_r00"]
+    if kind == "vmec_booz_scalar_observables":
+        return [
+            "iota_b_mean",
+            "b00_mean",
+            "buco_b_mean",
+            "bvco_b_mean",
+            "aspect_proxy",
+            "b10_over_b00_mean",
+        ]
+    raise ValueError(
+        "observable_kind must be 'vmec_scalar_observables' or 'vmec_booz_scalar_observables'."
+    )
+
+
+def _single_param_boundary_spec(context: GeometryAutodiffContext):
+    optimization = _import_vmec_jax_optimization()
+    prefix = "rc" if context.boundary_kind == "rc" else "zs"
+    name = f"{prefix}{int(context.param_m)}{int(context.param_n)}"
+    return optimization.BoundaryParamSpec(
+        name=name,
+        kind=prefix,
+        index=int(context.boundary_index),
+        m=int(context.param_m),
+        n=int(context.param_n),
+    )
+
+
+def _make_exact_optimizer(
+    context: GeometryAutodiffContext,
+    *,
+    observable_kind: str,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = None,
+):
+    optimization = _import_vmec_jax_optimization()
+
+    resolved_max_iter = int(context.vmec_default_max_iter if max_iter is None else max_iter)
+    resolved_step_size = float(context.vmec_default_step_size if step_size is None else step_size)
+    base_spec = _single_param_boundary_spec(context)
+
+    indata_eff = deepcopy(context.indata)
+    try:
+        indata_eff.scalars["DELT"] = float(resolved_step_size)
+    except Exception:
+        pass
+
+    def residuals_from_state(state):
+        items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+        return jnp.stack([jnp.asarray(value, dtype=jnp.float64).reshape(()) for _, value in items])
+
+    return optimization.FixedBoundaryExactOptimizer(
+        context.static,
+        indata_eff,
+        context.boundary,
+        [base_spec],
+        residuals_from_state,
+        inner_max_iter=resolved_max_iter,
+        inner_ftol=context.vmec_default_ftol,
+        trial_max_iter=resolved_max_iter,
+        trial_ftol=context.vmec_default_ftol,
+        solver_device=solver_device,
+    )
+
+
+def exact_forward_scalar_observable_derivatives(
+    context: GeometryAutodiffContext,
+    *,
+    observable_kind: str,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = None,
+) -> dict[str, jnp.ndarray]:
+    optimizer = _make_exact_optimizer(
+        context,
+        observable_kind=observable_kind,
+        max_iter=max_iter,
+        step_size=step_size,
+        solver_device=solver_device,
+    )
+    jac = np.asarray(optimizer.jacobian_fun(np.zeros(1, dtype=float)), dtype=float).reshape(-1)
+    names = _observable_names_for_kind(observable_kind)
+    if jac.size != len(names):
+        names = names[: int(jac.size)]
+    return {name: jnp.asarray(jac[idx], dtype=jnp.float64) for idx, name in enumerate(names)}
+
+
+def exact_reverse_scalar_observable_derivatives(
+    context: GeometryAutodiffContext,
+    *,
+    observable_kind: str,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = None,
+) -> dict[str, jnp.ndarray]:
+    optimizer = _make_exact_optimizer(
+        context,
+        observable_kind=observable_kind,
+        max_iter=max_iter,
+        step_size=step_size,
+        solver_device=solver_device,
+    )
+    linear_op = optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+    names = _observable_names_for_kind(observable_kind)
+    n_res = int(linear_op.shape[0])
+    out: dict[str, jnp.ndarray] = {}
+    for idx, name in enumerate(names):
+        if idx >= n_res:
+            break
+        basis = np.zeros(n_res, dtype=float)
+        basis[idx] = 1.0
+        grad = np.asarray(linear_op.rmatvec(basis), dtype=float).reshape(-1)
+        out[name] = jnp.asarray(float(grad[0]), dtype=jnp.float64)
+    return out
+
+
 def solve_geometry_state_forward(
     context: GeometryAutodiffContext,
     param_delta,
@@ -378,20 +609,6 @@ def vmec_scalar_observables_from_single_param(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ) -> dict[str, jnp.ndarray]:
-    vmec_jax = _import_vmec_jax()
-    eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
-    volume_from_sqrtg = _resolve_vmec_attr(vmec_jax, "volume_from_sqrtg", submodule="integrals")
-    equilibrium_iota_profiles_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "equilibrium_iota_profiles_from_state",
-        submodule="profiles",
-    )
-    equilibrium_aspect_ratio_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "equilibrium_aspect_ratio_from_state",
-        submodule="profiles",
-    )
-
     state = _solve_state_for_single_param(
         context,
         param_delta,
@@ -400,27 +617,7 @@ def vmec_scalar_observables_from_single_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
-    geom = eval_geom(state, context.static)
-    _dvds, volume = volume_from_sqrtg(
-        geom.sqrtg,
-        context.static.s,
-        context.static.grid.theta,
-        context.static.grid.zeta,
-        nfp=int(context.cfg.nfp),
-    )
-    _chips, _iotas, iotaf = equilibrium_iota_profiles_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=int(context.signgs),
-    )
-    iota_mean = jnp.mean(iotaf[1:]) if int(iotaf.size) > 1 else iotaf[0]
-    return {
-        "aspect_ratio": jnp.asarray(equilibrium_aspect_ratio_from_state(state=state, static=context.static)),
-        "volume_total": jnp.asarray(volume[-1]),
-        "iota_mean": jnp.asarray(iota_mean),
-        "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
-    }
+    return _vmec_scalar_observables_from_state(context, state)
 
 
 def geometry_observables_from_single_param(
@@ -432,9 +629,6 @@ def geometry_observables_from_single_param(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ) -> dict[str, jnp.ndarray]:
-    vmec_jax = _import_vmec_jax()
-    booz_api = _import_booz_xform_jax_api()
-
     state = _solve_state_for_single_param(
         context,
         param_delta,
@@ -443,6 +637,8 @@ def geometry_observables_from_single_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
+    vmec_jax = _import_vmec_jax()
+    booz_api = _import_booz_xform_jax_api()
     inputs = vmec_jax.booz_xform_inputs_from_state(
         state=state,
         static=context.static,
@@ -457,32 +653,11 @@ def geometry_observables_from_single_param(
         surface_indices=context.surface_indices,
         jit=True,
     )
-
-    bmnc_b = jnp.asarray(out["bmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    nfp = int(jnp.asarray(out["nfp_b"]).reshape(()))
-
-    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
-    if mode00 is None:
-        raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
-    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
-
-    b00 = bmnc_b[:, mode00]
-    observables = {
-        "iota_b": jnp.asarray(out["iota_b"]),
-        "b00": b00,
-        "buco_b": jnp.asarray(out["buco_b"]),
-        "bvco_b": jnp.asarray(out["bvco_b"]),
-    }
-    if mode10 is not None:
-        b10 = bmnc_b[:, mode10]
-        observables["b10"] = b10
-        observables["b10_over_b00"] = b10 / b00
-    observables["aspect_proxy"] = jnp.asarray(state.Rcos[-1, mode00])
-    observables["surface_indices"] = context.surface_indices.astype(jnp.float64)
-    observables["nfp"] = jnp.asarray([float(nfp)], dtype=jnp.float64)
-    return observables
+    observables = _vmec_booz_scalar_observables_from_state(context, state)
+    full = {name: jnp.asarray(value) for name, value in observables.items()}
+    full["surface_indices"] = context.surface_indices.astype(jnp.float64)
+    full["nfp"] = jnp.asarray([float(jnp.asarray(out["nfp_b"]).reshape(()))], dtype=jnp.float64)
+    return full
 
 
 def vmec_booz_scalar_observables_from_single_param(
@@ -494,7 +669,7 @@ def vmec_booz_scalar_observables_from_single_param(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ) -> dict[str, jnp.ndarray]:
-    observables = geometry_observables_from_single_param(
+    state = _solve_state_for_single_param(
         context,
         param_delta,
         lane=lane,
@@ -502,16 +677,7 @@ def vmec_booz_scalar_observables_from_single_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
-    reduced = {
-        "iota_b_mean": jnp.mean(jnp.asarray(observables["iota_b"])),
-        "b00_mean": jnp.mean(jnp.asarray(observables["b00"])),
-        "buco_b_mean": jnp.mean(jnp.asarray(observables["buco_b"])),
-        "bvco_b_mean": jnp.mean(jnp.asarray(observables["bvco_b"])),
-        "aspect_proxy": jnp.asarray(observables["aspect_proxy"]),
-    }
-    if "b10_over_b00" in observables:
-        reduced["b10_over_b00_mean"] = jnp.mean(jnp.asarray(observables["b10_over_b00"]))
-    return reduced
+    return _vmec_booz_scalar_observables_from_state(context, state)
 
 
 def _safe_divide(num, den):
