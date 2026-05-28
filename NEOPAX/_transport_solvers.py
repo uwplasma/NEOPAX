@@ -5057,6 +5057,93 @@ def _radau_replay_realized_accepted_rollout(
     )
 
 
+def _radau_replay_realized_accepted_final_y(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    accepted_active_mask,
+    accepted_dts,
+    next_dts,
+    next_recent_reject_count,
+    next_regrowth_cooldown,
+    next_easy_growth_streak,
+    next_lagged_response_valid,
+):
+    """Replay the realized accepted-step map and return only the final flat state."""
+
+    dtype = execution_context.dtype
+
+    def _scan_body(carry, xs):
+        (
+            active,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
+
+        def _do_step(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+            attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+            )
+            accepted_y = _project_flat_state_if_needed(
+                attempt_result.trial_y,
+                execution_context.physics_context.project_flat,
+            )
+            next_carry = dataclasses.replace(
+                attempt_result.carry_after_attempt,
+                t=carry.t + dt_value,
+                y=accepted_y,
+                dt=next_dt_value,
+                prev_error=jnp.maximum(
+                    attempt_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=dtype),
+                ),
+                prev_stages=attempt_result.stage_history,
+                prev_dt=dt_value,
+                recent_reject_count=recent_reject_count_value,
+                regrowth_cooldown=regrowth_cooldown_value,
+                easy_growth_streak=easy_growth_streak_value,
+                lagged_response_valid=lagged_response_valid_value,
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+            return next_carry, None
+
+        def _skip(_):
+            return carry, None
+
+        return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+    final_carry, _ = jax.lax.scan(
+        _scan_body,
+        carry0,
+        (
+            accepted_active_mask,
+            accepted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ),
+    )
+    return final_carry.y
+
+
 def _radau_dt_sequence_from_time_list(
     time_list,
     *,
@@ -5551,7 +5638,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     reverse_device = _reverse_replay_device_from_env()
     if reverse_device is not None:
-        execution_context = jax.device_put(execution_context, reverse_device)
         carry0 = jax.device_put(carry0, reverse_device)
         active_mask = jax.device_put(active_mask, reverse_device)
         attempted_dts = jax.device_put(attempted_dts, reverse_device)
@@ -5563,7 +5649,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
     def _replay(carry_value):
-        replay = _radau_replay_realized_accepted_rollout(
+        return _radau_replay_realized_accepted_final_y(
             execution_context,
             carry_value,
             active_mask,
@@ -5574,7 +5660,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             next_easy_growth_streak,
             next_lagged_response_valid,
         )
-        return replay.final_carry.y
 
     _, pullback = jax.vjp(_replay, carry0)
     (carry0_bar,) = pullback(final_y_bar)

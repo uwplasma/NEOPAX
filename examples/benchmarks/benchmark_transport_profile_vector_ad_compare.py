@@ -87,9 +87,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-replay-device",
-        default="cpu",
+        default="default",
         choices=("cpu", "gpu", "default", "auto"),
-        help="Device used by the accepted-step reverse replay in custom-VJP mode. Default: cpu.",
+        help="Device used by the accepted-step reverse replay in custom-VJP mode. Default: default.",
     )
     parser.add_argument(
         "--parameters",
