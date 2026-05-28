@@ -35,6 +35,13 @@ def _import_vmec_jax():
     return vmec_jax
 
 
+def _import_vmec_jax_implicit():
+    _ensure_local_stack_on_path()
+    import vmec_jax.implicit as implicit
+
+    return implicit
+
+
 def _import_booz_xform_jax_api():
     _ensure_local_stack_on_path()
     from booz_xform_jax import jax_api
@@ -308,7 +315,8 @@ def _solve_state_for_single_param(
     # AD lane: keep the implicit residual solve separate so we can add a
     # reverse-mode path later without changing the forward lane contract.
     del jacobian_penalty
-    return vmec_jax.implicit.solve_fixed_boundary_state_implicit_vmec_residual(
+    implicit = _import_vmec_jax_implicit()
+    return implicit.solve_fixed_boundary_state_implicit_vmec_residual(
         state0,
         context.static,
         indata=context.indata,
