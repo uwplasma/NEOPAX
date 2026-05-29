@@ -2465,6 +2465,8 @@ class _RadauAcceptedStepZeroTangentComparison:
 
 
 def _radau_zero_cotangent_like(x):
+    if x is None:
+        return None
     arr = jnp.asarray(x)
     if jnp.issubdtype(arr.dtype, jnp.inexact):
         return jnp.zeros_like(arr)
