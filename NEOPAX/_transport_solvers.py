@@ -5866,24 +5866,7 @@ def _radau_replay_realized_accepted_carry_pullback(
             )
 
         if replay_output_diagnostic == "y":
-            carry_before = _radau_replay_state_to_carry(
-                replay_state_before,
-                lagged_response_cache=lagged_response_cache_value,
-                lagged_response_valid=lagged_response_valid_value,
-                prev_newton_iter_count=prev_newton_iter_count_value,
-                prev_error=zero_prev_error,
-                recent_reject_count=zero_recent_reject_count,
-                regrowth_cooldown=zero_regrowth_cooldown,
-                easy_growth_streak=zero_easy_growth_streak,
-                jacobian=jacobian_value,
-                cache_valid=cache_valid_value,
-                cache_dt=cache_dt_value,
-                cache_age=cache_age_value,
-                real_lu=real_lu_value,
-                real_piv=real_piv_value,
-                complex_lu=complex_lu_value,
-                complex_piv=complex_piv_value,
-            )
+            carry_before = _carry_from_payload(step_xs)
             carry_before_bar = _radau_apply_accepted_step_y_pullback_linearized(
                 execution_context.kernel_context,
                 execution_context.physics_context,
