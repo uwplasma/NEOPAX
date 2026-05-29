@@ -2489,6 +2489,14 @@ def _radau_replay_output_diagnostic_mode() -> str | None:
     return name or None
 
 
+def _radau_replay_use_primal_step_diagnostic() -> bool:
+    """Optional reverse diagnostic: bypass accepted-step custom JVP in local replay."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_USE_PRIMAL_STEP")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -5433,6 +5441,7 @@ def _radau_replay_realized_accepted_carry_pullback(
     dtype = execution_context.dtype
     replay_leaf_diagnostic = _radau_replay_leaf_diagnostic_name()
     replay_output_diagnostic = _radau_replay_output_diagnostic_mode()
+    use_primal_step_diagnostic = _radau_replay_use_primal_step_diagnostic()
     xs = (
         accepted_active_mask,
         accepted_dts,
@@ -5549,12 +5558,20 @@ def _radau_replay_realized_accepted_carry_pullback(
 
         def _do_step(_):
             carry_for_step = dataclasses.replace(carry, dt=dt_value)
-            attempt_result = _execute_radau_accepted_step_attempt_autodiff(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                execution_context.attempt_context,
-            )
+            if use_primal_step_diagnostic:
+                attempt_result = _execute_radau_accepted_step_attempt(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                )
+            else:
+                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                )
             accepted_y = _project_flat_state_if_needed(
                 attempt_result.trial_y,
                 execution_context.physics_context.project_flat,
