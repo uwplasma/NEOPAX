@@ -2452,6 +2452,13 @@ class _RadauAcceptedStepZeroTangentComparison:
     direct_finite: Any
 
 
+def _radau_zero_cotangent_like(x):
+    arr = jnp.asarray(x)
+    if jnp.issubdtype(arr.dtype, jnp.inexact):
+        return jnp.zeros_like(arr)
+    return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
@@ -5227,7 +5234,7 @@ def _radau_replay_realized_accepted_final_y_pullback(
     final_y_bar,
 ):
     """Manual reverse sweep for the realized accepted-step final-state replay."""
-    final_carry_bar = jax.tree_util.tree_map(jnp.zeros_like, carry0)
+    final_carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry0)
     final_carry_bar = dataclasses.replace(final_carry_bar, y=final_y_bar)
     return _radau_replay_realized_accepted_carry_pullback(
         execution_context,
@@ -6412,7 +6419,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_lagged_response_valid = jax.device_put(segmented_next_lagged_response_valid, reverse_device)
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
-    final_carry_bar = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x[0]), checkpoint_carries)
+    final_carry_bar = jax.tree_util.tree_map(lambda x: _radau_zero_cotangent_like(x[0]), checkpoint_carries)
     final_carry_bar = dataclasses.replace(final_carry_bar, y=final_y_bar)
 
     def _reverse_segment(carry_bar, inputs):
