@@ -510,7 +510,7 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     maxj = maximum_j_residual_from_boozer_output(booz)
     return {
         "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
-        "maxj_objective": jnp.asarray(maxj["total"], dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(maxj.diagnostics["total"], dtype=jnp.float64),
     }
 
 
