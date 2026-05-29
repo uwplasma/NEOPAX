@@ -2251,6 +2251,21 @@ class _RadauAcceptedStepCarry:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauReplayState:
+    t: Any
+    y: Any
+    dt: Any
+    prev_stages: Any
+    prev_dt: Any
+    lagged_response_cache: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+    prev_theta_final: Any
+    prev_newton_iter_count: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepAttemptResult:
     carry_after_attempt: Any
     trial_dt: Any
@@ -3791,24 +3806,62 @@ def _radau_carry_with_forward_only_jvp_fields(
     )
 
 
-def _radau_carry_cotangent_with_forward_only_fields(
-    carry_bar: _RadauAcceptedStepCarry,
+def _radau_replay_state_from_carry(
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauReplayState:
+    return _RadauReplayState(
+        t=carry.t,
+        y=carry.y,
+        dt=carry.dt,
+        prev_stages=carry.prev_stages,
+        prev_dt=carry.prev_dt,
+        lagged_response_cache=carry.lagged_response_cache,
+        lagged_response_valid=carry.lagged_response_valid,
+        lagged_reference_y=carry.lagged_reference_y,
+        prev_theta_final=carry.prev_theta_final,
+        prev_newton_iter_count=carry.prev_newton_iter_count,
+    )
+
+
+def _radau_replay_state_to_carry(
+    replay_state: _RadauReplayState,
+    *,
+    prev_error,
+    recent_reject_count,
+    regrowth_cooldown,
+    easy_growth_streak,
+    jacobian,
+    cache_valid,
+    cache_dt,
+    cache_age,
+    real_lu,
+    real_piv,
+    complex_lu,
+    complex_piv,
 ) -> _RadauAcceptedStepCarry:
-    """Mask cotangents on carry fields treated as forward-only in the step map."""
-    return dataclasses.replace(
-        carry_bar,
-        prev_error=_radau_zero_cotangent_like(carry_bar.prev_error),
-        recent_reject_count=_radau_zero_cotangent_like(carry_bar.recent_reject_count),
-        regrowth_cooldown=_radau_zero_cotangent_like(carry_bar.regrowth_cooldown),
-        easy_growth_streak=_radau_zero_cotangent_like(carry_bar.easy_growth_streak),
-        jacobian=_radau_zero_cotangent_like(carry_bar.jacobian),
-        cache_valid=_radau_zero_cotangent_like(carry_bar.cache_valid),
-        cache_dt=_radau_zero_cotangent_like(carry_bar.cache_dt),
-        cache_age=_radau_zero_cotangent_like(carry_bar.cache_age),
-        real_lu=_radau_zero_cotangent_like(carry_bar.real_lu),
-        real_piv=_radau_zero_cotangent_like(carry_bar.real_piv),
-        complex_lu=_radau_zero_cotangent_like(carry_bar.complex_lu),
-        complex_piv=_radau_zero_cotangent_like(carry_bar.complex_piv),
+    return _RadauAcceptedStepCarry(
+        t=replay_state.t,
+        y=replay_state.y,
+        dt=replay_state.dt,
+        prev_error=prev_error,
+        prev_stages=replay_state.prev_stages,
+        prev_dt=replay_state.prev_dt,
+        recent_reject_count=recent_reject_count,
+        regrowth_cooldown=regrowth_cooldown,
+        easy_growth_streak=easy_growth_streak,
+        lagged_response_cache=replay_state.lagged_response_cache,
+        lagged_response_valid=replay_state.lagged_response_valid,
+        lagged_reference_y=replay_state.lagged_reference_y,
+        jacobian=jacobian,
+        cache_valid=cache_valid,
+        cache_dt=cache_dt,
+        cache_age=cache_age,
+        real_lu=real_lu,
+        real_piv=real_piv,
+        complex_lu=complex_lu,
+        complex_piv=complex_piv,
+        prev_theta_final=replay_state.prev_theta_final,
+        prev_newton_iter_count=replay_state.prev_newton_iter_count,
     )
 
 
@@ -5255,9 +5308,12 @@ def _radau_replay_realized_accepted_final_y_pullback(
     final_y_bar,
 ):
     """Manual reverse sweep for the realized accepted-step final-state replay."""
-    final_carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry0)
-    final_carry_bar = dataclasses.replace(final_carry_bar, y=final_y_bar)
-    return _radau_replay_realized_accepted_carry_pullback(
+    final_replay_state_bar = jax.tree_util.tree_map(
+        _radau_zero_cotangent_like,
+        _radau_replay_state_from_carry(carry0),
+    )
+    final_replay_state_bar = dataclasses.replace(final_replay_state_bar, y=final_y_bar)
+    replay_state0_bar = _radau_replay_realized_accepted_carry_pullback(
         execution_context,
         carry0,
         accepted_active_mask,
@@ -5284,7 +5340,22 @@ def _radau_replay_realized_accepted_final_y_pullback(
         next_regrowth_cooldown,
         next_easy_growth_streak,
         next_lagged_response_valid,
-        final_carry_bar,
+        final_replay_state_bar,
+    )
+    return _radau_replay_state_to_carry(
+        replay_state0_bar,
+        prev_error=_radau_zero_cotangent_like(carry0.prev_error),
+        recent_reject_count=_radau_zero_cotangent_like(carry0.recent_reject_count),
+        regrowth_cooldown=_radau_zero_cotangent_like(carry0.regrowth_cooldown),
+        easy_growth_streak=_radau_zero_cotangent_like(carry0.easy_growth_streak),
+        jacobian=_radau_zero_cotangent_like(carry0.jacobian),
+        cache_valid=_radau_zero_cotangent_like(carry0.cache_valid),
+        cache_dt=_radau_zero_cotangent_like(carry0.cache_dt),
+        cache_age=_radau_zero_cotangent_like(carry0.cache_age),
+        real_lu=_radau_zero_cotangent_like(carry0.real_lu),
+        real_piv=_radau_zero_cotangent_like(carry0.real_piv),
+        complex_lu=_radau_zero_cotangent_like(carry0.complex_lu),
+        complex_piv=_radau_zero_cotangent_like(carry0.complex_piv),
     )
 
 
@@ -5315,9 +5386,9 @@ def _radau_replay_realized_accepted_carry_pullback(
     next_regrowth_cooldown,
     next_easy_growth_streak,
     next_lagged_response_valid,
-    final_carry_bar,
+    final_replay_state_bar,
 ):
-    """Manual reverse sweep for the realized accepted-step replay over full carry."""
+    """Manual reverse sweep for the realized accepted-step replay over reduced replay state."""
 
     dtype = execution_context.dtype
     xs = (
@@ -5403,6 +5474,9 @@ def _radau_replay_realized_accepted_carry_pullback(
             prev_newton_iter_count=prev_newton_iter_count_value,
         )
 
+    def _replay_state_from_payload(step_xs):
+        return _radau_replay_state_from_carry(_carry_from_payload(step_xs))
+
     def _step(carry, step_xs):
         (
             active,
@@ -5477,23 +5551,67 @@ def _radau_replay_realized_accepted_carry_pullback(
 
     rev_xs = jax.tree_util.tree_map(lambda a: jnp.flip(a, axis=0), xs)
 
-    def _reverse_body(carry_cotangent, inputs):
+    def _reverse_body(replay_state_cotangent, inputs):
         step_xs = inputs
-        carry_before = _carry_from_payload(step_xs)
-        carry_cotangent = _radau_carry_cotangent_with_forward_only_fields(carry_cotangent)
-        _, pullback = jax.vjp(
-            lambda c: _radau_carry_with_forward_only_jvp_fields(_step(c, step_xs)),
-            carry_before,
-        )
-        (carry_before_bar,) = pullback(carry_cotangent)
-        return carry_before_bar, None
+        replay_state_before = _replay_state_from_payload(step_xs)
 
-    carry0_bar, _ = jax.lax.scan(
+        def _step_replay_state(replay_state):
+            (
+                _active,
+                dt_value,
+                _t_start_value,
+                _y_start_value,
+                _prev_stages_value,
+                _prev_dt_value,
+                _prev_theta_final_value,
+                _prev_newton_iter_count_value,
+                _lagged_response_cache_value,
+                _lagged_response_valid_value,
+                _lagged_reference_y_value,
+                jacobian_value,
+                cache_valid_value,
+                cache_dt_value,
+                cache_age_value,
+                real_lu_value,
+                real_piv_value,
+                complex_lu_value,
+                complex_piv_value,
+                _next_dt_value,
+                _recent_reject_count_value,
+                _regrowth_cooldown_value,
+                _easy_growth_streak_value,
+                _next_lagged_response_valid_value,
+            ) = step_xs
+            carry_before = _radau_replay_state_to_carry(
+                replay_state,
+                prev_error=zero_prev_error,
+                recent_reject_count=zero_recent_reject_count,
+                regrowth_cooldown=zero_regrowth_cooldown,
+                easy_growth_streak=zero_easy_growth_streak,
+                jacobian=jacobian_value,
+                cache_valid=cache_valid_value,
+                cache_dt=cache_dt_value,
+                cache_age=cache_age_value,
+                real_lu=real_lu_value,
+                real_piv=real_piv_value,
+                complex_lu=complex_lu_value,
+                complex_piv=complex_piv_value,
+            )
+            carry_after = _step(carry_before, step_xs)
+            return _radau_replay_state_from_carry(
+                _radau_carry_with_forward_only_jvp_fields(carry_after)
+            )
+
+        _, pullback = jax.vjp(_step_replay_state, replay_state_before)
+        (replay_state_before_bar,) = pullback(replay_state_cotangent)
+        return replay_state_before_bar, None
+
+    replay_state0_bar, _ = jax.lax.scan(
         _reverse_body,
-        final_carry_bar,
+        final_replay_state_bar,
         rev_xs,
     )
-    return carry0_bar
+    return replay_state0_bar
 
 
 def _radau_dt_sequence_from_time_list(
@@ -6444,8 +6562,11 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_lagged_response_valid = jax.device_put(segmented_next_lagged_response_valid, reverse_device)
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
-    final_carry_bar = jax.tree_util.tree_map(lambda x: _radau_zero_cotangent_like(x[0]), checkpoint_carries)
-    final_carry_bar = dataclasses.replace(final_carry_bar, y=final_y_bar)
+    final_replay_state_bar = jax.tree_util.tree_map(
+        _radau_zero_cotangent_like,
+        _radau_replay_state_from_carry(jax.tree_util.tree_map(lambda x: x[0], checkpoint_carries)),
+    )
+    final_replay_state_bar = dataclasses.replace(final_replay_state_bar, y=final_y_bar)
 
     def _reverse_segment(carry_bar, inputs):
         (
@@ -6513,7 +6634,22 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segmented_next_lagged_response_valid,
         ),
     )
-    carry0_bar, _ = jax.lax.scan(_reverse_segment, final_carry_bar, rev_inputs)
+    replay_state0_bar, _ = jax.lax.scan(_reverse_segment, final_replay_state_bar, rev_inputs)
+    carry0_bar = _radau_replay_state_to_carry(
+        replay_state0_bar,
+        prev_error=_radau_zero_cotangent_like(checkpoint_carries.prev_error[0]),
+        recent_reject_count=_radau_zero_cotangent_like(checkpoint_carries.recent_reject_count[0]),
+        regrowth_cooldown=_radau_zero_cotangent_like(checkpoint_carries.regrowth_cooldown[0]),
+        easy_growth_streak=_radau_zero_cotangent_like(checkpoint_carries.easy_growth_streak[0]),
+        jacobian=_radau_zero_cotangent_like(checkpoint_carries.jacobian[0]),
+        cache_valid=_radau_zero_cotangent_like(checkpoint_carries.cache_valid[0]),
+        cache_dt=_radau_zero_cotangent_like(checkpoint_carries.cache_dt[0]),
+        cache_age=_radau_zero_cotangent_like(checkpoint_carries.cache_age[0]),
+        real_lu=_radau_zero_cotangent_like(checkpoint_carries.real_lu[0]),
+        real_piv=_radau_zero_cotangent_like(checkpoint_carries.real_piv[0]),
+        complex_lu=_radau_zero_cotangent_like(checkpoint_carries.complex_lu[0]),
+        complex_piv=_radau_zero_cotangent_like(checkpoint_carries.complex_piv[0]),
+    )
     return (carry0_bar,)
 
 
