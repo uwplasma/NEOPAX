@@ -2480,6 +2480,15 @@ def _radau_replay_leaf_diagnostic_name() -> str | None:
     return name or None
 
 
+def _radau_replay_output_diagnostic_mode() -> str | None:
+    """Optional reverse diagnostic: restrict local VJP to a simpler output."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT")
+    if raw_value is None:
+        return None
+    name = raw_value.strip()
+    return name or None
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -5423,6 +5432,7 @@ def _radau_replay_realized_accepted_carry_pullback(
 
     dtype = execution_context.dtype
     replay_leaf_diagnostic = _radau_replay_leaf_diagnostic_name()
+    replay_output_diagnostic = _radau_replay_output_diagnostic_mode()
     xs = (
         accepted_active_mask,
         accepted_dts,
@@ -5641,8 +5651,15 @@ def _radau_replay_realized_accepted_carry_pullback(
                 _radau_carry_with_forward_only_jvp_fields(carry_after)
             )
 
-        _, pullback = jax.vjp(_step_replay_state, replay_state_before)
-        (replay_state_before_bar,) = pullback(replay_state_cotangent)
+        if replay_output_diagnostic == "y":
+            def _step_replay_y(replay_state):
+                return _step_replay_state(replay_state).y
+
+            _, pullback = jax.vjp(_step_replay_y, replay_state_before)
+            (replay_state_before_bar,) = pullback(replay_state_cotangent.y)
+        else:
+            _, pullback = jax.vjp(_step_replay_state, replay_state_before)
+            (replay_state_before_bar,) = pullback(replay_state_cotangent)
         return replay_state_before_bar, None
 
     replay_state0_bar, _ = jax.lax.scan(
