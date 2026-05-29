@@ -5491,7 +5491,14 @@ def _radau_dt_sequence_from_time_list(
 
 def _radau_checkpoint_interval() -> int:
     """Fixed replay checkpoint interval for custom VJP reverse recomputation."""
-    return 16
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CHECKPOINT_INTERVAL")
+    if raw_value is None:
+        return 64
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return 64
+    return max(parsed, 1)
 
 
 def _radau_pad_schedule_array(values, *, target_len: int):
