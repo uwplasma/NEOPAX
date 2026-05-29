@@ -5481,7 +5481,10 @@ def _radau_replay_realized_accepted_carry_pullback(
         step_xs = inputs
         carry_before = _carry_from_payload(step_xs)
         carry_cotangent = _radau_carry_cotangent_with_forward_only_fields(carry_cotangent)
-        _, pullback = jax.vjp(lambda c: _step(c, step_xs), carry_before)
+        _, pullback = jax.vjp(
+            lambda c: _radau_carry_with_forward_only_jvp_fields(_step(c, step_xs)),
+            carry_before,
+        )
         (carry_before_bar,) = pullback(carry_cotangent)
         return carry_before_bar, None
 

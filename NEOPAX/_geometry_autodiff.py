@@ -479,6 +479,41 @@ def _vmec_booz_scalar_observables_from_state(
     return reduced
 
 
+def _vmec_booz_qi_maxj_scalar_objectives_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    vmec_jax = _import_vmec_jax()
+    booz_api = _import_booz_xform_jax_api()
+    from balloon_jax.objectives import maximum_j_residual_from_boozer_output
+    from vmec_jax.quasi_isodynamic import quasi_isodynamic_residual_from_boozer_output
+
+    inputs = vmec_jax.booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    booz = dict(
+        booz_api.booz_xform_from_inputs(
+            inputs=inputs,
+            constants=context.booz_constants,
+            grids=context.booz_grids,
+            surface_indices=context.surface_indices,
+            jit=True,
+        )
+    )
+    booz["surfaces"] = jnp.asarray(context.surface_s, dtype=jnp.float64)
+
+    qi = quasi_isodynamic_residual_from_boozer_output(booz)
+    maxj = maximum_j_residual_from_boozer_output(booz)
+    return {
+        "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(maxj["total"], dtype=jnp.float64),
+    }
+
+
 def _soft_min_idx(values, beta: float = 50.0):
     values = jnp.asarray(values, dtype=jnp.float64)
     weights = jax.nn.softmax(-jnp.asarray(beta, dtype=values.dtype) * values)
@@ -791,6 +826,8 @@ def _observable_items_from_state(
         observables = _vmec_iotaf_scalar_observables_from_state(context, state)
     elif kind == "vmec_booz_scalar_observables":
         observables = _vmec_booz_scalar_observables_from_state(context, state)
+    elif kind == "vmec_booz_qi_maxj_scalar_objectives":
+        observables = _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
     elif kind == "vmec_qi_maxj_scalar_objectives":
         observables = _vmec_qi_maxj_shared_diagnostics_from_state(context, state)
         observables = {
@@ -800,7 +837,8 @@ def _observable_items_from_state(
     else:
         raise ValueError(
             "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
-            "'vmec_booz_scalar_observables', or 'vmec_qi_maxj_scalar_objectives'."
+            "'vmec_booz_scalar_observables', 'vmec_booz_qi_maxj_scalar_objectives', or "
+            "'vmec_qi_maxj_scalar_objectives'."
         )
     return list(observables.items())
 
@@ -822,9 +860,12 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
         ]
     if kind == "vmec_qi_maxj_scalar_objectives":
         return ["qi_objective", "maxj_objective"]
+    if kind == "vmec_booz_qi_maxj_scalar_objectives":
+        return ["qi_objective", "maxj_objective"]
     raise ValueError(
         "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
-        "'vmec_booz_scalar_observables', or 'vmec_qi_maxj_scalar_objectives'."
+        "'vmec_booz_scalar_observables', 'vmec_booz_qi_maxj_scalar_objectives', or "
+        "'vmec_qi_maxj_scalar_objectives'."
     )
 
 
@@ -1184,6 +1225,26 @@ def vmec_qi_maxj_scalar_objectives_from_single_param(
         "qi_objective": jnp.asarray(diagnostics["qi_objective"], dtype=jnp.float64),
         "maxj_objective": jnp.asarray(diagnostics["maxj_objective"], dtype=jnp.float64),
     }
+
+
+def vmec_booz_qi_maxj_scalar_objectives_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
 
 
 def _safe_divide(num, den):
