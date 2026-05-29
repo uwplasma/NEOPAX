@@ -4644,3 +4644,221 @@ NEOPAX VMEC scalar benchmark implication
   iota-related reverse blocks, following the same mechanism used by
   `vmec_jax`'s own workflow-specific residual builders.
 - This is the main VMEC iota reverse fix currently under test.
+
+Latest follow-up: transport reverse checkpointed reduced-state path
+
+- The transport reverse custom-VJP path has now been reworked further:
+  - the VJP forward pass no longer stores the heavyweight full adaptive rollout
+    trace for reverse
+  - it now records only the realized schedule/controller metadata
+  - it then stores sparse checkpoint carries for reverse replay
+- Current default reverse checkpoint interval:
+  - `64`
+- Environment override:
+  - `NEOPAX_TRANSPORT_REVERSE_CHECKPOINT_INTERVAL`
+
+What improved
+
+- The original reverse memory blowups were reduced substantially:
+  - from the earlier PiB-scale whole-scan transpose explosion
+  - to large but finite OOMs
+  - then to a local structural reverse assertion
+- So the current transport reverse failure is no longer dominated by global
+  replay memory; it is now a local reverse-structure issue.
+
+Current local reverse diagnosis
+
+- The remaining failure now occurs at the local step-replay pullback:
+  - `pullback(replay_state_cotangent)`
+- This means the reverse path is now failing because the local VJP target still
+  did not define a clean cotangent space for JAX.
+
+Reduced replay-state redesign
+
+- To address this, the local reverse no longer tries to VJP through:
+  - `full_carry -> full_carry`
+- Instead it now attempts to VJP through:
+  - `replay_state -> replay_state`
+- Full carry reconstruction remains in the closure so the primal accepted-step
+  path is unchanged.
+
+Current replay-state cleanup sequence
+
+- `_RadauReplayState` was introduced as the reduced local AD state.
+- Fields progressively removed from `_RadauReplayState` because they are poor
+  reverse-mode state outputs and should instead live in frozen replay payload:
+  - `lagged_response_valid`
+  - `prev_newton_iter_count`
+  - `lagged_response_cache`
+- These fields still affect the primal replay path, but only through frozen
+  payload/carry reconstruction, not through the local reverse AD state.
+
+Current likely remaining transport reverse issue
+
+- If the reverse assertion still persists after these reductions, then at least
+  one remaining replay-state field is still not a clean reverse-mode state
+  output.
+- The next debugging step in that case is to instrument the remaining
+  `_RadauReplayState` leaves directly and identify which leaf still breaks the
+  local pullback contract.
+
+Latest transport reverse status for next session
+
+- The transport reverse benchmark is still failing with:
+  - `AssertionError`
+  - at the local replay-state pullback:
+    - `pullback(replay_state_cotangent)`
+  - inside the segmented reverse replay scan
+
+- Important interpretation:
+  - this is no longer a memory-scaling failure
+  - this is no longer the old full-carry reverse target problem
+  - this is no longer obviously due to bool/int leaves in the reduced replay
+    state
+  - it is now a narrow **local reverse structural mismatch** for the
+    `replay_state -> replay_state` VJP target
+
+- Current remaining replay-state fields are approximately:
+  - `t`
+  - `y`
+  - `dt`
+  - `prev_stages`
+  - `prev_dt`
+  - `lagged_reference_y`
+  - `prev_theta_final`
+
+- So the likely remaining cause is now one of:
+  - `prev_stages` not behaving as a clean local reverse state leaf
+  - `lagged_reference_y` not behaving as a clean local reverse state leaf
+  - or a remaining mismatch between the local output tangent space and the
+    cotangent being fed into `pullback(...)`
+
+- Recommended next debugging step:
+  - do **leaf-by-leaf local reverse diagnostics**
+  - test the local pullback with only one replay-state leaf active at a time:
+    - `y`
+    - `t`
+    - `dt`
+    - `prev_stages`
+    - `prev_dt`
+    - `lagged_reference_y`
+    - `prev_theta_final`
+  - identify exactly which leaf first breaks the local VJP contract
+
+- Current conclusion:
+  - the transport reverse issue is now highly localized
+  - the next move should be instrumentation of the remaining replay-state
+    leaves, not another broad structural rewrite
+
+Latest follow-up: Boozer-based QI / Maximum-J gate
+
+- A new geometry benchmark mode has been added:
+  - `vmec_booz_qi_maxj_scalar_objectives`
+- This mode is intended to test the full AD path that goes through:
+  - VMEC solve
+  - one shared `booz_xform`
+  - Boozer-based QI objective
+  - Boozer-based Maximum-J objective
+
+Metric definitions used in this new mode
+
+- QI objective:
+  - `vmec_jax.quasi_isodynamic_residual_from_boozer_output(...)`
+  - scalar objective = returned `total`
+- Maximum-J objective:
+  - `balloon_jax.maximum_j_residual_from_boozer_output(...)`
+  - scalar objective = `ObjectiveResult.diagnostics["total"]`
+
+Important efficiency note
+
+- Both Boozer-based objectives are computed from one shared Boozer output.
+- This is intended to be a cleaner Boozer-path forward/reverse/FD gate than
+  the earlier ad hoc VMEC-line QI/Maximum-J implementation.
+
+Current Boozer-based QI / Maximum-J results
+
+- Benchmark command:
+  - `python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py --mode vmec_booz_qi_maxj_scalar_objectives --param-family RBC --param-m 1 --param-n 0 --exact-solver-device gpu`
+
+- With default FD step (`fd_step=1.561818e-06`):
+  - `qi_objective`
+    - `ad=1.244365e-04`
+    - `fd_center=1.834994e-02`
+    - `ad_vs_center_rel_err=9.932187e-01`
+    - `reverse=1.244365e-04`
+    - `reverse_vs_forward_rel_err=4.933078e-10`
+  - `maxj_objective`
+    - `ad=5.166964e-03`
+    - `fd_center=6.810710e-02`
+    - `ad_vs_center_rel_err=9.241347e-01`
+    - `reverse=5.166964e-03`
+    - `reverse_vs_forward_rel_err=3.022056e-11`
+
+- With tighter FD step (`fd_step=1.561818e-08`):
+  - `qi_objective`
+    - `fd_center=-3.283983e-04`
+    - `ad_vs_center_rel_err=1.378919e+00`
+    - `reverse_vs_forward_rel_err=4.420269e-11`
+  - `maxj_objective`
+    - `fd_center=1.093367e-02`
+    - `ad_vs_center_rel_err=5.274263e-01`
+    - `reverse_vs_forward_rel_err=3.751068e-11`
+
+- With intermediate FD step (`fd_step=4.685455e-07`):
+  - `qi_objective`
+    - `fd_center=1.163615e-04`
+    - `ad_vs_center_rel_err=6.939618e-02`
+    - `reverse_vs_forward_rel_err=3.760461e-10`
+  - `maxj_objective`
+    - `fd_center=1.284432e-02`
+    - `ad_vs_center_rel_err=5.977240e-01`
+    - `reverse_vs_forward_rel_err=6.071893e-11`
+
+- With another intermediate FD step (`fd_step=1.561818e-07`):
+  - `qi_objective`
+    - `fd_center=3.093686e-04`
+    - `ad_vs_center_rel_err=5.977726e-01`
+    - `reverse_vs_forward_rel_err=2.440547e-11`
+  - `maxj_objective`
+    - `fd_center=1.352614e-02`
+    - `ad_vs_center_rel_err=6.180017e-01`
+    - `reverse_vs_forward_rel_err=2.716202e-11`
+
+Current interpretation
+
+- For the Boozer-based QI / Maximum-J objectives:
+  - forward exact and reverse exact match extremely well
+  - this strongly suggests the exact VMEC + `booz_xform` AD path is internally
+    consistent for these objectives
+- FD remains step-sensitive:
+  - `qi_objective` can get reasonably close at `fd_step=4.685455e-07`
+  - `maxj_objective` still shows large FD-vs-AD mismatch across tested steps
+- So the current evidence is:
+  - forward/reverse exact consistency is good
+  - FD is still not a clean truth signal for these Boozer-based objectives,
+    especially for Maximum-J
+
+Current end-to-end implication
+
+- The magnetic / geometry side now looks much closer to being usable as the
+  upstream AD block for the coupled workflow:
+  - VMEC exact forward/reverse is good for the Boozer-based QI / Maximum-J
+    objectives
+  - so the VMEC + `booz_xform` AD path is no longer the main concern there
+
+- This suggests the natural downstream path is:
+  - geometry / magnetics
+  - then `NTX`
+  - then the full transport solve
+
+- However, the full coupled reverse path is still blocked by the transport
+  reverse custom-VJP problem:
+  - even if the magnetic / Boozer / VMEC part is good,
+  - the outer transport reverse path still has to propagate through
+    `parameters -> carry0`, the adaptive accepted-step transport replay, and
+    the downstream transport objectives
+
+- Therefore:
+  - the geometry / magnetics AD path is no longer the main blocker
+  - the transport reverse custom-VJP remains the main blocker for a true
+    end-to-end reverse-mode path through magnetics -> NTX -> transport

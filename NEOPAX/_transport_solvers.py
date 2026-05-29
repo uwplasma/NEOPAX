@@ -2471,6 +2471,37 @@ def _radau_zero_cotangent_like(x):
     return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
 
+def _radau_replay_leaf_diagnostic_name() -> str | None:
+    """Optional reverse diagnostic: keep only one replay-state cotangent leaf."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_REPLAY_LEAF")
+    if raw_value is None:
+        return None
+    name = raw_value.strip()
+    return name or None
+
+
+def _radau_select_replay_state_leaf(
+    replay_state: _RadauReplayState,
+    selected_leaf: str | None,
+) -> _RadauReplayState:
+    """Zero every replay-state cotangent leaf except the selected one."""
+    if selected_leaf is None:
+        return replay_state
+    valid_names = {
+        "t",
+        "y",
+        "dt",
+        "prev_stages",
+        "prev_dt",
+        "lagged_reference_y",
+        "prev_theta_final",
+    }
+    if selected_leaf not in valid_names:
+        return replay_state
+    zero_state = jax.tree_util.tree_map(_radau_zero_cotangent_like, replay_state)
+    return dataclasses.replace(zero_state, **{selected_leaf: getattr(replay_state, selected_leaf)})
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
@@ -5391,6 +5422,7 @@ def _radau_replay_realized_accepted_carry_pullback(
     """Manual reverse sweep for the realized accepted-step replay over reduced replay state."""
 
     dtype = execution_context.dtype
+    replay_leaf_diagnostic = _radau_replay_leaf_diagnostic_name()
     xs = (
         accepted_active_mask,
         accepted_dts,
@@ -5553,6 +5585,10 @@ def _radau_replay_realized_accepted_carry_pullback(
 
     def _reverse_body(replay_state_cotangent, inputs):
         step_xs = inputs
+        replay_state_cotangent = _radau_select_replay_state_leaf(
+            replay_state_cotangent,
+            replay_leaf_diagnostic,
+        )
         replay_state_before = _replay_state_from_payload(step_xs)
 
         def _step_replay_state(replay_state):
