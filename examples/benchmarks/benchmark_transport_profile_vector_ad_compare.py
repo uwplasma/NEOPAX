@@ -152,11 +152,11 @@ def main() -> None:
             f"[autodiff-gate] progress: reverse replay device={args.reverse_replay_device}",
             flush=True,
         )
-        objective_base = np.asarray(jax.device_get(objective_fn_vjp(baseline_vector)), dtype=float).reshape(-1)
         rev_rows = []
-        for idx in range(int(objective_base.size)):
+        n_objectives = int(len(OBJECTIVE_LABELS))
+        for idx in range(n_objectives):
             print(
-                f"[autodiff-gate] progress: running reverse custom-VJP row {idx + 1}/{int(objective_base.size)}",
+                f"[autodiff-gate] progress: running reverse custom-VJP row {idx + 1}/{n_objectives}",
                 flush=True,
             )
 

@@ -4532,3 +4532,115 @@ Missing profile-AD architecture points to preserve
 - The desired long-term reverse architecture should expose a true reverse-mode
   treatment for `parameters -> carry0` as well, instead of depending on
   forward-mode columns there.
+
+Latest follow-up findings
+
+Transport reverse replay
+
+- The profile-vector reverse benchmark still fails in the custom VJP path, but
+  the failure has been localized much better.
+- First failure mode:
+  - whole-scan reverse transpose through
+    `_radau_replay_realized_accepted_rollout(...)`
+  - produced absurd PiB-scale inferred sizes / GPU XLA transpose explosion
+- First structural fix:
+  - reverse replay was reduced from a full replay-result map to a final-state
+    only map `carry0 -> final_y`
+  - this removed unnecessary `scan_outputs`, but did not fix the core scan
+    transpose problem
+- Second structural fix:
+  - removed `jax.vjp` on the whole replay `lax.scan`
+  - replaced it with a manual backward sweep that applies `jax.vjp` only to the
+    single accepted-step map at each step
+- This removed the catastrophic whole-scan transpose, but then exposed a new
+  memory problem:
+  - storing the full carry before every accepted step was too heavy
+- Third structural fix:
+  - switched the reverse sweep to reuse the compact per-step payloads already
+    recorded in the primal adaptive rollout trace
+  - this avoids saving a full carry history in the backward pass
+
+Very important replay-fidelity conclusion
+
+- Forward and reverse must replay the same accepted-step primal path.
+- In the transport solver, the accepted-step primal really does read the cached
+  Jacobian/LU reuse state as values:
+  - `jacobian`
+  - `cache_valid`
+  - `cache_dt`
+  - `cache_age`
+  - `real_lu`, `real_piv`
+  - `complex_lu`, `complex_piv`
+- Forward JVP does *not* propagate tangents through those fields because
+  `_radau_carry_with_forward_only_jvp_fields(...)` applies `stop_gradient(...)`
+  to them.
+- But the primal step still uses them as frozen replay values.
+- Therefore reverse replay must also preserve those values in the replayed
+  forward pass, even if reverse does not propagate cotangents through them.
+- A temporary reverse reduction that zeroed/disabled those values was *not*
+  faithful to the forward replay path and should not be treated as correct.
+- The current reverse payload has been updated to carry those reuse values
+  again, while still avoiding a full carry-history scan.
+
+Remaining likely transport reverse memory targets
+
+- `prev_stages`
+- `lagged_response_cache`
+- cached Jacobian/LU reuse blocks
+- The main rule for future reductions:
+  - do not save memory by changing the replayed primal path
+  - save memory by shrinking storage around the same replay path
+- Next likely step if reverse still OOMs:
+  - inspect which of the compact payload blocks dominates memory
+  - especially `prev_stages`, `lagged_response_cache`, and the cached
+    Jacobian/LU blocks
+
+VMEC iota mismatch: current localization
+
+- The reverse mismatch is not spread across the whole `iotaf` profile.
+- The current probes show:
+  - `iotaf_q1`, `iotaf_mid`, `iotaf_q3`, `iotaf_edge`
+    have excellent forward/reverse agreement
+  - `iotaf_first` is bad
+  - `iota_mean` is bad because it includes that first interior contribution
+- Deeper probing shows the problem is already below `iotaf`, in the underlying
+  half-mesh `iotas` near the axis:
+  - `iotas_1` forward/reverse disagree badly
+  - `iotas_2` forward/reverse disagree even worse
+- Since non-RFP `iotaf_first = 0.5 * (iotas[1] + iotas[2])`, this explains the
+  `iotaf_first` mismatch.
+
+What local `vmec_jax` code/docs suggest about the iota reverse issue
+
+- `equilibrium_iota_profiles_from_state(...)` itself is not doing anything
+  exotic at `iotaf_first`; the full-mesh smoothing helper `_iotaf_from_iotas`
+  uses:
+  - `iotaf[0] = 1.5*iotas[1] - 0.5*iotas[2]`
+  - `iotaf[1:-1] = 0.5*(iotas[1:-1] + iotas[2:])`
+  - `iotaf[-1] = 1.5*iotas[-1] - 0.5*iotas[-2]`
+- So the bad point is not an `iotaf`-specific axis-closure branch; it is the
+  first interior average of already-bad `iotas`.
+- `vmec_jax/docs/performance.rst` explicitly notes that for current-driven iota
+  diagnostics, reverse `J.T v` only matches to about `1e-6` relative because
+  current-driven iota still needs axis-gauge cotangent cleanup.
+- `vmec_jax/optimization.py` already contains special reverse sanitization for
+  current-driven iota blocks, with comments stating:
+  - current-driven iota has axis/near-axis gauge-null cotangent entries
+  - dense JVP columns remain finite there
+  - zeroing the null reverse entries gives the matching transpose on the
+    boundary-parameter subspace
+
+NEOPAX VMEC scalar benchmark implication
+
+- The generic NEOPAX scalar observable wrapper was originally bypassing that
+  current-driven-iota-specific reverse helper path and using only the more
+  generic packed-state reverse route.
+- A new custom packed-state cotangent helper has been added to the NEOPAX exact
+  observable wrapper for:
+  - `vmec_scalar_observables`
+  - `vmec_iotaf_scalar_observables`
+  when `NCURR = 1`
+- This helper applies targeted `nan_to_num(...)` sanitization only on the
+  iota-related reverse blocks, following the same mechanism used by
+  `vmec_jax`'s own workflow-specific residual builders.
+- This is the main VMEC iota reverse fix currently under test.
