@@ -3791,6 +3791,27 @@ def _radau_carry_with_forward_only_jvp_fields(
     )
 
 
+def _radau_carry_cotangent_with_forward_only_fields(
+    carry_bar: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepCarry:
+    """Mask cotangents on carry fields treated as forward-only in the step map."""
+    return dataclasses.replace(
+        carry_bar,
+        prev_error=_radau_zero_cotangent_like(carry_bar.prev_error),
+        recent_reject_count=_radau_zero_cotangent_like(carry_bar.recent_reject_count),
+        regrowth_cooldown=_radau_zero_cotangent_like(carry_bar.regrowth_cooldown),
+        easy_growth_streak=_radau_zero_cotangent_like(carry_bar.easy_growth_streak),
+        jacobian=_radau_zero_cotangent_like(carry_bar.jacobian),
+        cache_valid=_radau_zero_cotangent_like(carry_bar.cache_valid),
+        cache_dt=_radau_zero_cotangent_like(carry_bar.cache_dt),
+        cache_age=_radau_zero_cotangent_like(carry_bar.cache_age),
+        real_lu=_radau_zero_cotangent_like(carry_bar.real_lu),
+        real_piv=_radau_zero_cotangent_like(carry_bar.real_piv),
+        complex_lu=_radau_zero_cotangent_like(carry_bar.complex_lu),
+        complex_piv=_radau_zero_cotangent_like(carry_bar.complex_piv),
+    )
+
+
 def _radau_step_state_with_forward_only_controller_fields(
     step_state: _RadauStepState,
 ) -> _RadauStepState:
@@ -5459,6 +5480,7 @@ def _radau_replay_realized_accepted_carry_pullback(
     def _reverse_body(carry_cotangent, inputs):
         step_xs = inputs
         carry_before = _carry_from_payload(step_xs)
+        carry_cotangent = _radau_carry_cotangent_with_forward_only_fields(carry_cotangent)
         _, pullback = jax.vjp(lambda c: _step(c, step_xs), carry_before)
         (carry_before_bar,) = pullback(carry_cotangent)
         return carry_before_bar, None
