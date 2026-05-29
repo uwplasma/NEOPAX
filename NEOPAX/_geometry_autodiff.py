@@ -850,6 +850,8 @@ def _make_exact_optimizer(
     solver_device: str | None = None,
 ):
     optimization = _import_vmec_jax_optimization()
+    vmec_jax = _import_vmec_jax()
+    unpack_state = _resolve_vmec_attr(vmec_jax, "unpack_state", submodule="state")
 
     resolved_max_iter = int(context.vmec_default_max_iter if max_iter is None else max_iter)
     resolved_step_size = float(context.vmec_default_step_size if step_size is None else step_size)
@@ -864,6 +866,64 @@ def _make_exact_optimizer(
     def residuals_from_state(state):
         items = _observable_items_from_state(context, state, observable_kind=observable_kind)
         return jnp.stack([jnp.asarray(value, dtype=jnp.float64).reshape(()) for _, value in items])
+
+    current_driven_iota_kind = bool(int(context.indata.get_int("NCURR", 0)) == 1) and observable_kind in (
+        "vmec_scalar_observables",
+        "vmec_iotaf_scalar_observables",
+    )
+    if current_driven_iota_kind:
+        observable_names = _observable_names_for_kind(observable_kind)
+        sanitize_indices = {
+            idx
+            for idx, name in enumerate(observable_names)
+            if str(name).startswith(("iota", "iotas_", "iotaf_"))
+        }
+
+        def state_cotangent_operator_from_packed(packed_state, layout):
+            packed_state = jnp.asarray(packed_state, dtype=jnp.float64)
+            blocks = []
+            for idx, name in enumerate(observable_names):
+                sanitize = idx in sanitize_indices
+
+                def _scalar_from_packed(packed, *, output_index=idx):
+                    state = unpack_state(packed, layout)
+                    items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+                    return jnp.asarray(items[output_index][1], dtype=jnp.float64).reshape(())
+
+                _, vjp_fun = jax.vjp(_scalar_from_packed, packed_state)
+                blocks.append((idx, vjp_fun, sanitize, name))
+
+            def _apply(residual_cotangent):
+                residual_cotangent = jnp.asarray(residual_cotangent, dtype=jnp.float64).reshape(-1)
+                total = jnp.zeros_like(packed_state)
+                for idx, vjp_fun, sanitize, _name in blocks:
+                    cot = residual_cotangent[idx]
+
+                    def _active(cot_block):
+                        contribution = vjp_fun(cot_block)[0]
+                        if sanitize:
+                            # Match vmec_jax's current-driven-iota reverse cleanup:
+                            # near-axis gauge-null cotangent entries can produce
+                            # nonfinite or unstable reverse contributions even when
+                            # forward JVP columns remain finite.
+                            contribution = jnp.nan_to_num(contribution, nan=0.0, posinf=0.0, neginf=0.0)
+                        return contribution
+
+                    total = total + jax.lax.cond(
+                        cot != 0.0,
+                        _active,
+                        lambda cot_block: jnp.zeros_like(packed_state),
+                        cot,
+                    )
+                return total
+
+            return _apply
+
+        def state_cotangent_from_packed(packed_state, layout, residual_cotangent):
+            return state_cotangent_operator_from_packed(packed_state, layout)(residual_cotangent)
+
+        residuals_from_state._state_cotangent_operator_from_packed = state_cotangent_operator_from_packed
+        residuals_from_state._state_cotangent_from_packed = state_cotangent_from_packed
 
     return optimization.FixedBoundaryExactOptimizer(
         context.static,
