@@ -396,12 +396,13 @@ def _vmec_iotaf_scalar_observables_from_state(
         submodule="profiles",
     )
 
-    _chips, _iotas, iotaf = equilibrium_iota_profiles_from_state(
+    _chips, iotas, iotaf = equilibrium_iota_profiles_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
         signgs=int(context.signgs),
     )
+    iotas = jnp.asarray(iotas, dtype=jnp.float64)
     iotaf = jnp.asarray(iotaf, dtype=jnp.float64)
     npts = int(iotaf.size)
     if npts <= 0:
@@ -422,6 +423,8 @@ def _vmec_iotaf_scalar_observables_from_state(
         iota_mean = iotaf[edge_idx]
 
     return {
+        "iotas_1": jnp.asarray(iotas[1] if int(iotas.size) > 1 else iotas[0]),
+        "iotas_2": jnp.asarray(iotas[2] if int(iotas.size) > 2 else iotas[-1]),
         "iotaf_first": jnp.asarray(iotaf[1] if npts > 1 else iotaf[0]),
         "iotaf_q1": jnp.asarray(iotaf[q1_idx]),
         "iotaf_mid": jnp.asarray(iotaf[mid_idx]),
@@ -807,7 +810,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
     if kind == "vmec_scalar_observables":
         return ["aspect_ratio", "volume_total", "iota_mean", "edge_r00"]
     if kind == "vmec_iotaf_scalar_observables":
-        return ["iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
+        return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
     if kind == "vmec_booz_scalar_observables":
         return [
             "iota_b_mean",
