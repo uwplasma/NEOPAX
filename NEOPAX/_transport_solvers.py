@@ -2300,6 +2300,14 @@ class _RadauAcceptedStepBackwardPayloadCandidate:
     lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    real_lu: Any
+    real_piv: Any
+    complex_lu: Any
+    complex_piv: Any
     y_end: Any
 
 
@@ -2348,6 +2356,14 @@ class _RadauAdaptiveRolloutTrace:
     lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    real_lu: Any
+    real_piv: Any
+    complex_lu: Any
+    complex_piv: Any
     y_end: Any
     err_norms: Any
     theta_finals: Any
@@ -2719,9 +2735,9 @@ def _radau_backward_payload_candidate(
 ) -> _RadauAcceptedStepBackwardPayloadCandidate:
     """Candidate minimal payload for future accepted-step backward rules.
 
-    This is intentionally conservative: it keeps predictor and lagged-response
-    context, but excludes controller bookkeeping and recomputable Jacobian/LU
-    caches.
+    This keeps the predictor / lagged-response context and the cached
+    Jacobian/LU reuse state that the accepted-step primal actually reads.
+    Controller bookkeeping is still excluded.
     """
     return _RadauAcceptedStepBackwardPayloadCandidate(
         t_start=carry_in.t,
@@ -2734,6 +2750,14 @@ def _radau_backward_payload_candidate(
         lagged_response_cache=carry_in.lagged_response_cache,
         lagged_response_valid=carry_in.lagged_response_valid,
         lagged_reference_y=carry_in.lagged_reference_y,
+        jacobian=carry_in.jacobian,
+        cache_valid=carry_in.cache_valid,
+        cache_dt=carry_in.cache_dt,
+        cache_age=carry_in.cache_age,
+        real_lu=carry_in.real_lu,
+        real_piv=carry_in.real_piv,
+        complex_lu=carry_in.complex_lu,
+        complex_piv=carry_in.complex_piv,
         y_end=attempt_result.trial_y,
     )
 
@@ -5152,6 +5176,23 @@ def _radau_replay_realized_accepted_final_y_pullback(
     carry0: _RadauAcceptedStepCarry,
     accepted_active_mask,
     accepted_dts,
+    payload_t_start,
+    payload_y_start,
+    payload_prev_stages,
+    payload_prev_dt,
+    payload_prev_theta_final,
+    payload_prev_newton_iter_count,
+    payload_lagged_response_cache,
+    payload_lagged_response_valid,
+    payload_lagged_reference_y,
+    payload_jacobian,
+    payload_cache_valid,
+    payload_cache_dt,
+    payload_cache_age,
+    payload_real_lu,
+    payload_real_piv,
+    payload_complex_lu,
+    payload_complex_piv,
     next_dts,
     next_recent_reject_count,
     next_regrowth_cooldown,
@@ -5165,6 +5206,23 @@ def _radau_replay_realized_accepted_final_y_pullback(
     xs = (
         accepted_active_mask,
         accepted_dts,
+        payload_t_start,
+        payload_y_start,
+        payload_prev_stages,
+        payload_prev_dt,
+        payload_prev_theta_final,
+        payload_prev_newton_iter_count,
+        payload_lagged_response_cache,
+        payload_lagged_response_valid,
+        payload_lagged_reference_y,
+        payload_jacobian,
+        payload_cache_valid,
+        payload_cache_dt,
+        payload_cache_age,
+        payload_real_lu,
+        payload_real_piv,
+        payload_complex_lu,
+        payload_complex_piv,
         next_dts,
         next_recent_reject_count,
         next_regrowth_cooldown,
@@ -5172,10 +5230,83 @@ def _radau_replay_realized_accepted_final_y_pullback(
         next_lagged_response_valid,
     )
 
+    zero_prev_error = jnp.zeros_like(carry0.prev_error)
+    zero_recent_reject_count = jnp.zeros_like(carry0.recent_reject_count)
+    zero_regrowth_cooldown = jnp.zeros_like(carry0.regrowth_cooldown)
+    zero_easy_growth_streak = jnp.zeros_like(carry0.easy_growth_streak)
+    def _carry_from_payload(step_xs):
+        (
+            _active,
+            dt_value,
+            t_start_value,
+            y_start_value,
+            prev_stages_value,
+            prev_dt_value,
+            prev_theta_final_value,
+            prev_newton_iter_count_value,
+            lagged_response_cache_value,
+            lagged_response_valid_value,
+            lagged_reference_y_value,
+            jacobian_value,
+            cache_valid_value,
+            cache_dt_value,
+            cache_age_value,
+            real_lu_value,
+            real_piv_value,
+            complex_lu_value,
+            complex_piv_value,
+            _next_dt_value,
+            _recent_reject_count_value,
+            _regrowth_cooldown_value,
+            _easy_growth_streak_value,
+            _next_lagged_response_valid_value,
+        ) = step_xs
+        return _RadauAcceptedStepCarry(
+            t=t_start_value,
+            y=y_start_value,
+            dt=dt_value,
+            prev_error=zero_prev_error,
+            prev_stages=prev_stages_value,
+            prev_dt=prev_dt_value,
+            recent_reject_count=zero_recent_reject_count,
+            regrowth_cooldown=zero_regrowth_cooldown,
+            easy_growth_streak=zero_easy_growth_streak,
+            lagged_response_cache=lagged_response_cache_value,
+            lagged_response_valid=lagged_response_valid_value,
+            lagged_reference_y=lagged_reference_y_value,
+            jacobian=jacobian_value,
+            cache_valid=cache_valid_value,
+            cache_dt=cache_dt_value,
+            cache_age=cache_age_value,
+            real_lu=real_lu_value,
+            real_piv=real_piv_value,
+            complex_lu=complex_lu_value,
+            complex_piv=complex_piv_value,
+            prev_theta_final=prev_theta_final_value,
+            prev_newton_iter_count=prev_newton_iter_count_value,
+        )
+
     def _step(carry, step_xs):
         (
             active,
             dt_value,
+            _t_start_value,
+            _y_start_value,
+            _prev_stages_value,
+            _prev_dt_value,
+            _prev_theta_final_value,
+            _prev_newton_iter_count_value,
+            _lagged_response_cache_value,
+            _lagged_response_valid_value,
+            _lagged_reference_y_value,
+            _jacobian_value,
+            _cache_valid_value,
+            _cache_dt_value,
+            _cache_age_value,
+            _real_lu_value,
+            _real_piv_value,
+            _complex_lu_value,
+            _complex_piv_value,
             next_dt_value,
             recent_reject_count_value,
             regrowth_cooldown_value,
@@ -5227,21 +5358,14 @@ def _radau_replay_realized_accepted_final_y_pullback(
 
         return jax.lax.cond(active, _do_step, _skip, operand=None)
 
-    def _forward_body(carry, step_xs):
-        next_carry = _step(carry, step_xs)
-        return next_carry, carry
-
-    final_carry, carries_before = jax.lax.scan(_forward_body, carry0, xs)
-    del final_carry
-
-    carry_bar = jax.tree_util.tree_map(jnp.zeros_like, carries_before[0])
+    carry_bar = jax.tree_util.tree_map(jnp.zeros_like, carry0)
     carry_bar = dataclasses.replace(carry_bar, y=final_y_bar)
 
     rev_xs = jax.tree_util.tree_map(lambda a: jnp.flip(a, axis=0), xs)
-    rev_carries_before = jax.tree_util.tree_map(lambda a: jnp.flip(a, axis=0), carries_before)
 
     def _reverse_body(carry_cotangent, inputs):
-        carry_before, step_xs = inputs
+        step_xs = inputs
+        carry_before = _carry_from_payload(step_xs)
         _, pullback = jax.vjp(lambda c: _step(c, step_xs), carry_before)
         (carry_before_bar,) = pullback(carry_cotangent)
         return carry_before_bar, None
@@ -5249,7 +5373,7 @@ def _radau_replay_realized_accepted_final_y_pullback(
     carry0_bar, _ = jax.lax.scan(
         _reverse_body,
         carry_bar,
-        (rev_carries_before, rev_xs),
+        rev_xs,
     )
     return carry0_bar
 
@@ -5484,6 +5608,14 @@ def _radau_adaptive_final_state_rollout(
             lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=carry.lagged_response_valid,
             lagged_reference_y=carry.lagged_reference_y,
+            jacobian=carry.jacobian,
+            cache_valid=carry.cache_valid,
+            cache_dt=carry.cache_dt,
+            cache_age=carry.cache_age,
+            real_lu=carry.real_lu,
+            real_piv=carry.real_piv,
+            complex_lu=carry.complex_lu,
+            complex_piv=carry.complex_piv,
             y_end=carry.y,
         )
 
@@ -5587,6 +5719,14 @@ def _radau_adaptive_final_state_rollout(
         lagged_response_cache=payloads.lagged_response_cache,
         lagged_response_valid=payloads.lagged_response_valid,
         lagged_reference_y=payloads.lagged_reference_y,
+        jacobian=payloads.jacobian,
+        cache_valid=payloads.cache_valid,
+        cache_dt=payloads.cache_dt,
+        cache_age=payloads.cache_age,
+        real_lu=payloads.real_lu,
+        real_piv=payloads.real_piv,
+        complex_lu=payloads.complex_lu,
+        complex_piv=payloads.complex_piv,
         y_end=payloads.y_end,
         err_norms=err_norms,
         theta_finals=theta_finals,
@@ -5715,10 +5855,44 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
     next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
     next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    payload_t_start = jax.lax.stop_gradient(rollout.trace.t_start)
+    payload_y_start = jax.lax.stop_gradient(rollout.trace.y_start)
+    payload_prev_stages = jax.lax.stop_gradient(rollout.trace.prev_stages)
+    payload_prev_dt = jax.lax.stop_gradient(rollout.trace.prev_dt)
+    payload_prev_theta_final = jax.lax.stop_gradient(rollout.trace.prev_theta_final)
+    payload_prev_newton_iter_count = jax.lax.stop_gradient(rollout.trace.prev_newton_iter_count)
+    payload_lagged_response_cache = jax.lax.stop_gradient(rollout.trace.lagged_response_cache)
+    payload_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.lagged_response_valid)
+    payload_lagged_reference_y = jax.lax.stop_gradient(rollout.trace.lagged_reference_y)
+    payload_jacobian = jax.lax.stop_gradient(rollout.trace.jacobian)
+    payload_cache_valid = jax.lax.stop_gradient(rollout.trace.cache_valid)
+    payload_cache_dt = jax.lax.stop_gradient(rollout.trace.cache_dt)
+    payload_cache_age = jax.lax.stop_gradient(rollout.trace.cache_age)
+    payload_real_lu = jax.lax.stop_gradient(rollout.trace.real_lu)
+    payload_real_piv = jax.lax.stop_gradient(rollout.trace.real_piv)
+    payload_complex_lu = jax.lax.stop_gradient(rollout.trace.complex_lu)
+    payload_complex_piv = jax.lax.stop_gradient(rollout.trace.complex_piv)
     residuals = (
         carry0,
         active_mask,
         attempted_dts,
+        payload_t_start,
+        payload_y_start,
+        payload_prev_stages,
+        payload_prev_dt,
+        payload_prev_theta_final,
+        payload_prev_newton_iter_count,
+        payload_lagged_response_cache,
+        payload_lagged_response_valid,
+        payload_lagged_reference_y,
+        payload_jacobian,
+        payload_cache_valid,
+        payload_cache_dt,
+        payload_cache_age,
+        payload_real_lu,
+        payload_real_piv,
+        payload_complex_lu,
+        payload_complex_piv,
         next_dts,
         next_recent_reject_count,
         next_regrowth_cooldown,
@@ -5739,6 +5913,23 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         carry0,
         active_mask,
         attempted_dts,
+        payload_t_start,
+        payload_y_start,
+        payload_prev_stages,
+        payload_prev_dt,
+        payload_prev_theta_final,
+        payload_prev_newton_iter_count,
+        payload_lagged_response_cache,
+        payload_lagged_response_valid,
+        payload_lagged_reference_y,
+        payload_jacobian,
+        payload_cache_valid,
+        payload_cache_dt,
+        payload_cache_age,
+        payload_real_lu,
+        payload_real_piv,
+        payload_complex_lu,
+        payload_complex_piv,
         next_dts,
         next_recent_reject_count,
         next_regrowth_cooldown,
@@ -5763,6 +5954,23 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         carry0,
         active_mask,
         attempted_dts,
+        payload_t_start,
+        payload_y_start,
+        payload_prev_stages,
+        payload_prev_dt,
+        payload_prev_theta_final,
+        payload_prev_newton_iter_count,
+        payload_lagged_response_cache,
+        payload_lagged_response_valid,
+        payload_lagged_reference_y,
+        payload_jacobian,
+        payload_cache_valid,
+        payload_cache_dt,
+        payload_cache_age,
+        payload_real_lu,
+        payload_real_piv,
+        payload_complex_lu,
+        payload_complex_piv,
         next_dts,
         next_recent_reject_count,
         next_regrowth_cooldown,
