@@ -4862,3 +4862,42 @@ Current end-to-end implication
   - the geometry / magnetics AD path is no longer the main blocker
   - the transport reverse custom-VJP remains the main blocker for a true
     end-to-end reverse-mode path through magnetics -> NTX -> transport
+
+Latest transport reverse diagnosis update
+
+- The leaf-by-leaf replay-state diagnostics and local output restriction have
+  now ruled out the outer replay-state packaging as the primary blocker.
+- Concrete result:
+  - even with only the local `y` cotangent active
+  - and even when the local reverse target is reduced to
+    `replay_state -> next_y`
+  - the segmented reverse still fails at the local pullback.
+
+- Additional decisive test:
+  - with
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_LEAF=y`
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y`
+    `NEOPAX_TRANSPORT_REVERSE_USE_PRIMAL_STEP=1`
+  - the local reverse no longer gave the vague `AssertionError`
+  - instead it failed with:
+    - `ValueError: Reverse-mode differentiation does not work for lax.while_loop or lax.fori_loop with dynamic start/stop values`
+
+- Interpretation:
+  - the real blocker is now clearly below the replay-state boundary
+  - the raw accepted-step primal is not reverse-differentiable by generic
+    `jax.vjp(...)` because it contains dynamic control flow
+  - the accepted-step `custom_jvp` wrapper had been hiding that lower-level
+    issue behind a less informative assertion during reverse transposition
+
+- Current conclusion:
+  - the next real fix is not another replay-state pruning step
+  - it is an explicit accepted-step reverse rule at the accepted-step boundary
+  - likely first for the local `carry_in -> accepted_y` or reduced accepted-step
+    state map
+  - rather than relying on `jax.vjp` through the raw primal step
+
+- Practical next work item:
+  - extract / centralize the accepted-step `y` map boundary so a manual
+    pullback can attach there
+  - then build the accepted-step reverse from the same approximate
+    implicit-diff philosophy already used for the forward JVP

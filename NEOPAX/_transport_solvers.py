@@ -2981,6 +2981,181 @@ def _radau_compute_approximate_attempt_tangent(
     )
 
 
+def _radau_zero_accepted_step_tangent_inputs_like(
+    carry_in: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepTangentInputs:
+    """Zero tangent-input object matching the accepted-step JVP boundary."""
+    return _RadauAcceptedStepTangentInputs(
+        dy=jnp.zeros_like(carry_in.y),
+        dh=jnp.zeros_like(carry_in.dt),
+        dlagged_response_cache=_radau_zero_cotangent_like(carry_in.lagged_response_cache),
+    )
+
+
+def _radau_accepted_step_y_tangent_from_primal_linearized(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    tangent_inputs: _RadauAcceptedStepTangentInputs,
+    primal_result: _RadauAcceptedStepAttemptResult,
+):
+    """Linearized accepted-step `accepted_y` tangent on the reduced JVP boundary.
+
+    This is the first explicit local reverse target for the accepted-step map.
+    It intentionally uses the always-linear approximate implicit-diff tangent
+    path so it can later be transposed safely, instead of relying on reverse AD
+    through the raw accepted-step primal implementation.
+    """
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval_at_state(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_in.y,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
+
+    def _lagged_output_tangent():
+        if not kernel_context.use_transport_lagged_response:
+            return None
+
+        def _reuse_lagged_response(_):
+            return tangent_inputs.dlagged_response_cache
+
+        def _rebuild_lagged_response(_):
+            if physics_context.build_lagged_response is None:
+                return None
+
+            def _build_from_flat(flat_y):
+                candidate_state = physics_context.unpack_flat(
+                    _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+                )
+                return physics_context.build_lagged_response(candidate_state)
+
+            _, dlagged_response_out = jax.jvp(
+                _build_from_flat,
+                (carry_in.y,),
+                (tangent_inputs.dy,),
+            )
+            return dlagged_response_out
+
+        return jax.lax.cond(
+            carry_in.lagged_response_valid,
+            _reuse_lagged_response,
+            _rebuild_lagged_response,
+            operand=None,
+        )
+
+    dlagged_response_cache_out = _lagged_output_tangent()
+
+    if lagged_response is None or dlagged_response_cache_out is None:
+        lagged_eval_tangent = jnp.zeros(
+            (kernel_context.num_stages, kernel_context.state_dim),
+            dtype=kernel_context.dtype,
+        )
+    else:
+        stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+        stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
+
+        _, lagged_eval_tangent = jax.jvp(
+            _stage_evals_from_lagged,
+            (lagged_response,),
+            (dlagged_response_cache_out,),
+        )
+
+    tangent_result = _radau_compute_approximate_attempt_tangent(
+        kernel_context,
+        tangent_inputs=tangent_inputs,
+        jacobian_ref=primal_result.jacobian_out,
+        lagged_eval_tangent=lagged_eval_tangent,
+        rhs_time_ref=rhs_time_ref,
+        trial_dt=primal_result.trial_dt,
+        stage_history=primal_result.stage_history,
+        real_lu_out=primal_result.real_lu_out,
+        real_piv_out=primal_result.real_piv_out,
+        complex_lu_out=primal_result.complex_lu_out,
+        complex_piv_out=primal_result.complex_piv_out,
+    )
+
+    accepted_y = _project_flat_state_if_needed(
+        primal_result.trial_y,
+        physics_context.project_flat,
+    )
+    if physics_context.project_flat is None:
+        accepted_y_tangent = tangent_result.dtrial_y
+    else:
+        _, accepted_y_tangent = jax.jvp(
+            lambda flat_y: _project_flat_state_if_needed(flat_y, physics_context.project_flat),
+            (primal_result.trial_y,),
+            (tangent_result.dtrial_y,),
+        )
+    return accepted_y, accepted_y_tangent
+
+
+def _radau_apply_accepted_step_y_pullback_linearized(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+    accepted_y_bar,
+) -> _RadauAcceptedStepCarry:
+    """First explicit local pullback candidate for the accepted-step `accepted_y` map.
+
+    This avoids reverse AD through the raw accepted-step primal step. Instead it
+    transposes the same reduced approximate tangent model already used by the
+    forward accepted-step JVP.
+    """
+    primal_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        attempt_context,
+    )
+    tangent_inputs0 = _radau_zero_accepted_step_tangent_inputs_like(carry_in)
+
+    def _linearized_y_map(tangent_inputs):
+        _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+            kernel_context,
+            physics_context,
+            carry_in,
+            tangent_inputs,
+            primal_result,
+        )
+        return accepted_y_tangent
+
+    (tangent_inputs_bar,) = jax.linear_transpose(_linearized_y_map, tangent_inputs0)(accepted_y_bar)
+    carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
+    return dataclasses.replace(
+        carry_bar,
+        y=tangent_inputs_bar.dy,
+        dt=tangent_inputs_bar.dh,
+        lagged_response_cache=tangent_inputs_bar.dlagged_response_cache,
+    )
+
+
 def _execute_radau_accepted_step_attempt_with_approx_tangent(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3362,6 +3537,28 @@ def _radau_apply_accepted_step_map(
         pressure_err_norm=attempt_result.pressure_err_norm,
         er_err_norm=attempt_result.er_err_norm,
     )
+
+
+def _radau_apply_accepted_step_y_map(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+):
+    """Accepted-step boundary reduced to the physical accepted state only.
+
+    This is the natural local reverse target now that the replay-state
+    diagnostics have shown the real blocker is below the outer replay
+    packaging. The next explicit pullback should attach to this map, or to a
+    closely related reduced accepted-step state map, rather than relying on
+    `jax.vjp` through the raw accepted-step primal implementation.
+    """
+    return _radau_apply_accepted_step_map(
+        kernel_context,
+        physics_context,
+        carry_in,
+        attempt_context,
+    ).accepted_y
 
 
 def _radau_attempt_step_lean(
@@ -5669,11 +5866,32 @@ def _radau_replay_realized_accepted_carry_pullback(
             )
 
         if replay_output_diagnostic == "y":
-            def _step_replay_y(replay_state):
-                return _step_replay_state(replay_state).y
-
-            _, pullback = jax.vjp(_step_replay_y, replay_state_before)
-            (replay_state_before_bar,) = pullback(replay_state_cotangent.y)
+            carry_before = _radau_replay_state_to_carry(
+                replay_state_before,
+                lagged_response_cache=_lagged_response_cache_value,
+                lagged_response_valid=_lagged_response_valid_value,
+                prev_newton_iter_count=_prev_newton_iter_count_value,
+                prev_error=zero_prev_error,
+                recent_reject_count=zero_recent_reject_count,
+                regrowth_cooldown=zero_regrowth_cooldown,
+                easy_growth_streak=zero_easy_growth_streak,
+                jacobian=jacobian_value,
+                cache_valid=cache_valid_value,
+                cache_dt=cache_dt_value,
+                cache_age=cache_age_value,
+                real_lu=real_lu_value,
+                real_piv=real_piv_value,
+                complex_lu=complex_lu_value,
+                complex_piv=complex_piv_value,
+            )
+            carry_before_bar = _radau_apply_accepted_step_y_pullback_linearized(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_before,
+                execution_context.attempt_context,
+                replay_state_cotangent.y,
+            )
+            replay_state_before_bar = _radau_replay_state_from_carry(carry_before_bar)
         else:
             _, pullback = jax.vjp(_step_replay_state, replay_state_before)
             (replay_state_before_bar,) = pullback(replay_state_cotangent)
