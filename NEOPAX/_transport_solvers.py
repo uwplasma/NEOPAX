@@ -3139,9 +3139,14 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         _radau_carry_with_forward_only_jvp_fields(carry_in),
         attempt_context,
     )
-    tangent_inputs0 = _radau_zero_accepted_step_tangent_inputs_like(carry_in)
+    zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
 
-    def _linearized_y_map(tangent_inputs):
+    def _linearized_y_map(dy, dh):
+        tangent_inputs = _RadauAcceptedStepTangentInputs(
+            dy=dy,
+            dh=dh,
+            dlagged_response_cache=zero_lagged_cache_tangent,
+        )
         _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
             kernel_context,
             physics_context,
@@ -3151,13 +3156,15 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         )
         return accepted_y_tangent
 
-    (tangent_inputs_bar,) = jax.linear_transpose(_linearized_y_map, tangent_inputs0)(accepted_y_bar)
+    dy0 = jnp.zeros_like(carry_in.y)
+    dh0 = jnp.zeros_like(carry_in.dt)
+    dy_bar, dh_bar = jax.linear_transpose(_linearized_y_map, dy0, dh0)(accepted_y_bar)
     carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
     return dataclasses.replace(
         carry_bar,
-        y=tangent_inputs_bar.dy,
-        dt=tangent_inputs_bar.dh,
-        lagged_response_cache=tangent_inputs_bar.dlagged_response_cache,
+        y=dy_bar,
+        dt=dh_bar,
+        lagged_response_cache=zero_lagged_cache_tangent,
     )
 
 
