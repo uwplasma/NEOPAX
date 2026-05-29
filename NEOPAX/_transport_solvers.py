@@ -2257,7 +2257,6 @@ class _RadauReplayState:
     dt: Any
     prev_stages: Any
     prev_dt: Any
-    lagged_response_cache: Any
     lagged_reference_y: Any
     prev_theta_final: Any
 
@@ -3813,7 +3812,6 @@ def _radau_replay_state_from_carry(
         dt=carry.dt,
         prev_stages=carry.prev_stages,
         prev_dt=carry.prev_dt,
-        lagged_response_cache=carry.lagged_response_cache,
         lagged_reference_y=carry.lagged_reference_y,
         prev_theta_final=carry.prev_theta_final,
     )
@@ -3822,6 +3820,7 @@ def _radau_replay_state_from_carry(
 def _radau_replay_state_to_carry(
     replay_state: _RadauReplayState,
     *,
+    lagged_response_cache,
     lagged_response_valid,
     prev_newton_iter_count,
     prev_error,
@@ -3847,7 +3846,7 @@ def _radau_replay_state_to_carry(
         recent_reject_count=recent_reject_count,
         regrowth_cooldown=regrowth_cooldown,
         easy_growth_streak=easy_growth_streak,
-        lagged_response_cache=replay_state.lagged_response_cache,
+        lagged_response_cache=lagged_response_cache,
         lagged_response_valid=lagged_response_valid,
         lagged_reference_y=replay_state.lagged_reference_y,
         jacobian=jacobian,
@@ -5342,6 +5341,7 @@ def _radau_replay_realized_accepted_final_y_pullback(
     )
     return _radau_replay_state_to_carry(
         replay_state0_bar,
+        lagged_response_cache=_radau_zero_cotangent_like(carry0.lagged_response_cache),
         lagged_response_valid=_radau_zero_cotangent_like(carry0.lagged_response_valid),
         prev_newton_iter_count=_radau_zero_cotangent_like(carry0.prev_newton_iter_count),
         prev_error=_radau_zero_cotangent_like(carry0.prev_error),
@@ -5584,6 +5584,7 @@ def _radau_replay_realized_accepted_carry_pullback(
             ) = step_xs
             carry_before = _radau_replay_state_to_carry(
                 replay_state,
+                lagged_response_cache=_lagged_response_cache_value,
                 lagged_response_valid=_lagged_response_valid_value,
                 prev_newton_iter_count=_prev_newton_iter_count_value,
                 prev_error=zero_prev_error,
@@ -6639,6 +6640,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     replay_state0_bar, _ = jax.lax.scan(_reverse_segment, final_replay_state_bar, rev_inputs)
     carry0_bar = _radau_replay_state_to_carry(
         replay_state0_bar,
+        lagged_response_cache=_radau_zero_cotangent_like(checkpoint_carries.lagged_response_cache[0]),
         lagged_response_valid=_radau_zero_cotangent_like(checkpoint_carries.lagged_response_valid[0]),
         prev_newton_iter_count=_radau_zero_cotangent_like(checkpoint_carries.prev_newton_iter_count[0]),
         prev_error=_radau_zero_cotangent_like(checkpoint_carries.prev_error[0]),
