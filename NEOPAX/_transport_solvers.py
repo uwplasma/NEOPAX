@@ -5844,9 +5844,9 @@ def _radau_replay_realized_accepted_carry_pullback(
             ) = step_xs
             carry_before = _radau_replay_state_to_carry(
                 replay_state,
-                lagged_response_cache=_lagged_response_cache_value,
-                lagged_response_valid=_lagged_response_valid_value,
-                prev_newton_iter_count=_prev_newton_iter_count_value,
+                lagged_response_cache=lagged_response_cache_value,
+                lagged_response_valid=lagged_response_valid_value,
+                prev_newton_iter_count=prev_newton_iter_count_value,
                 prev_error=zero_prev_error,
                 recent_reject_count=zero_recent_reject_count,
                 regrowth_cooldown=zero_regrowth_cooldown,
@@ -5868,9 +5868,9 @@ def _radau_replay_realized_accepted_carry_pullback(
         if replay_output_diagnostic == "y":
             carry_before = _radau_replay_state_to_carry(
                 replay_state_before,
-                lagged_response_cache=_lagged_response_cache_value,
-                lagged_response_valid=_lagged_response_valid_value,
-                prev_newton_iter_count=_prev_newton_iter_count_value,
+                lagged_response_cache=lagged_response_cache_value,
+                lagged_response_valid=lagged_response_valid_value,
+                prev_newton_iter_count=prev_newton_iter_count_value,
                 prev_error=zero_prev_error,
                 recent_reject_count=zero_recent_reject_count,
                 regrowth_cooldown=zero_regrowth_cooldown,
