@@ -2957,6 +2957,7 @@ def _radau_compute_approximate_attempt_tangent(
     real_piv_out,
     complex_lu_out,
     complex_piv_out,
+    allow_zero_shortcut: bool = True,
 ) -> _RadauAcceptedStepApproximateTangentResult:
     """Compute the first approximate implicit-diff tangent for one accepted step.
 
@@ -2976,6 +2977,7 @@ def _radau_compute_approximate_attempt_tangent(
         real_piv_out=real_piv_out,
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
+        allow_zero_shortcut=allow_zero_shortcut,
     )
     return _RadauAcceptedStepApproximateTangentResult(
         dy_next=dy_next,
@@ -3003,6 +3005,9 @@ def _radau_accepted_step_y_tangent_from_primal_linearized(
     carry_in: _RadauAcceptedStepCarry,
     tangent_inputs: _RadauAcceptedStepTangentInputs,
     primal_result: _RadauAcceptedStepAttemptResult,
+    *,
+    allow_zero_shortcut: bool = True,
+    project_output: bool = True,
 ):
     """Linearized accepted-step `accepted_y` tangent on the reduced JVP boundary.
 
@@ -3103,13 +3108,14 @@ def _radau_accepted_step_y_tangent_from_primal_linearized(
         real_piv_out=primal_result.real_piv_out,
         complex_lu_out=primal_result.complex_lu_out,
         complex_piv_out=primal_result.complex_piv_out,
+        allow_zero_shortcut=allow_zero_shortcut,
     )
 
     accepted_y = _project_flat_state_if_needed(
         primal_result.trial_y,
         physics_context.project_flat,
     )
-    if physics_context.project_flat is None:
+    if not project_output or physics_context.project_flat is None:
         accepted_y_tangent = tangent_result.dtrial_y
     else:
         _, accepted_y_tangent = jax.jvp(
@@ -3140,6 +3146,17 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         attempt_context,
     )
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
+    project_flat = physics_context.project_flat
+
+    def _project_trial_y_tangent(flat_y_tangent):
+        if project_flat is None:
+            return flat_y_tangent
+        _, projected_tangent = jax.jvp(
+            lambda flat_y: _project_flat_state_if_needed(flat_y, project_flat),
+            (primal_result.trial_y,),
+            (flat_y_tangent,),
+        )
+        return projected_tangent
 
     def _linearized_y_map(dy, dh):
         tangent_inputs = _RadauAcceptedStepTangentInputs(
@@ -3153,8 +3170,10 @@ def _radau_apply_accepted_step_y_pullback_linearized(
             carry_in,
             tangent_inputs,
             primal_result,
+            allow_zero_shortcut=False,
+            project_output=False,
         )
-        return accepted_y_tangent
+        return _project_trial_y_tangent(accepted_y_tangent)
 
     dy0 = jnp.zeros_like(carry_in.y)
     dh0 = jnp.zeros_like(carry_in.dt)
@@ -3974,6 +3993,7 @@ def _radau_approximate_accepted_step_tangent(
     real_piv_out,
     complex_lu_out,
     complex_piv_out,
+    allow_zero_shortcut: bool = True,
 ):
     """Approximate accepted-step tangent via the current Newton linearization.
 
@@ -3996,11 +4016,6 @@ def _radau_approximate_accepted_step_tangent(
     dy_source = jnp.asarray(dy_source, dtype=kernel_context.dtype)
     dh_source = jnp.asarray(dh_source, dtype=kernel_context.dtype)
     lagged_eval_tangent = jnp.asarray(lagged_eval_tangent, dtype=kernel_context.dtype)
-    zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
-    zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
-    zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
-    zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
-
     def _zero_tangent(_):
         dz_zero = jnp.zeros((kernel_context.num_stages, kernel_context.state_dim), dtype=kernel_context.dtype)
         dy_zero = jnp.zeros((kernel_context.state_dim,), dtype=kernel_context.dtype)
@@ -4030,7 +4045,13 @@ def _radau_approximate_accepted_step_tangent(
         )
         return dy_next, dz_stages
 
-    return jax.lax.cond(zero_input, _zero_tangent, _compute_tangent, operand=None)
+    if allow_zero_shortcut:
+        zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
+        zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
+        zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
+        zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
+        return jax.lax.cond(zero_input, _zero_tangent, _compute_tangent, operand=None)
+    return _compute_tangent(None)
 
 
 def _radau_carry_with_forward_only_jvp_fields(
