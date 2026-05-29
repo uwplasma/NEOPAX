@@ -2467,7 +2467,10 @@ class _RadauAcceptedStepZeroTangentComparison:
 def _radau_zero_cotangent_like(x):
     if x is None:
         return None
-    arr = jnp.asarray(x)
+    try:
+        arr = jnp.asarray(x)
+    except (TypeError, ValueError):
+        return jax.tree_util.tree_map(_radau_zero_cotangent_like, x)
     if jnp.issubdtype(arr.dtype, jnp.inexact):
         return jnp.zeros_like(arr)
     return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
