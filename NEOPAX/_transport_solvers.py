@@ -3146,38 +3146,57 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         attempt_context,
     )
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
-    project_flat = physics_context.project_flat
-
-    def _project_trial_y_tangent(flat_y_tangent):
-        if project_flat is None:
-            return flat_y_tangent
-        _, projected_tangent = jax.jvp(
-            lambda flat_y: _project_flat_state_if_needed(flat_y, project_flat),
-            (primal_result.trial_y,),
-            (flat_y_tangent,),
+    accepted_y_bar = jnp.asarray(accepted_y_bar, dtype=kernel_context.dtype)
+    if physics_context.project_flat is None:
+        trial_y_bar = accepted_y_bar
+    else:
+        _, project_pullback = jax.vjp(
+            lambda flat_y: _project_flat_state_if_needed(flat_y, physics_context.project_flat),
+            primal_result.trial_y,
         )
-        return projected_tangent
+        (trial_y_bar,) = project_pullback(accepted_y_bar)
 
-    def _linearized_y_map(dy, dh):
-        tangent_inputs = _RadauAcceptedStepTangentInputs(
-            dy=dy,
-            dh=dh,
-            dlagged_response_cache=zero_lagged_cache_tangent,
-        )
-        _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
-            kernel_context,
-            physics_context,
-            carry_in,
-            tangent_inputs,
-            primal_result,
-            allow_zero_shortcut=False,
-            project_output=False,
-        )
-        return _project_trial_y_tangent(accepted_y_tangent)
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
 
-    dy0 = jnp.zeros_like(carry_in.y)
-    dh0 = jnp.zeros_like(carry_in.dt)
-    dy_bar, dh_bar = jax.linear_transpose(_linearized_y_map, dy0, dh0)(accepted_y_bar)
+    def _rhs_eval_at_state(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_in.y,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_combo = kernel_context.a @ stages_final
+    stage_weighted = kernel_context.b @ stages_final
+
+    dz_stages_bar = (
+        primal_result.trial_dt
+        * kernel_context.b[:, None]
+        * trial_y_bar[None, :]
+    )
+    stage_rhs_bar = _radau_apply_stage_linear_solve_transpose(
+        kernel_context,
+        rhs_bar=dz_stages_bar.reshape((-1,)),
+        real_lu_out=primal_result.real_lu_out,
+        real_piv_out=primal_result.real_piv_out,
+        complex_lu_out=primal_result.complex_lu_out,
+        complex_piv_out=primal_result.complex_piv_out,
+    ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+
+    jacobian_ref = jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype)
+    dy_bar = trial_y_bar + jnp.sum(stage_rhs_bar @ jacobian_ref, axis=0)
+    rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
+    stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
+    dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
     carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
     return dataclasses.replace(
         carry_bar,
@@ -3977,6 +3996,51 @@ def _radau_apply_stage_linear_solve(
         return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
 
     return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
+
+
+def _radau_apply_stage_linear_solve_transpose(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    rhs_bar,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+):
+    rhs_bar_arr = jnp.asarray(rhs_bar, dtype=kernel_context.dtype).reshape((-1,))
+    zero_rhs = jnp.all(rhs_bar_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
+
+    def _solve_zero_rhs(rhs_flat):
+        return jnp.zeros_like(rhs_flat)
+
+    def _solve_nonzero_rhs(rhs_flat):
+        rhs_stages = rhs_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
+        rhs_real = rhs_transformed[0]
+        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real, trans=1)
+        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
+
+        def _solve_pair(i, pair_solutions):
+            delta_pair = jax.scipy.linalg.lu_solve(
+                (complex_lu_out[i], complex_piv_out[i]),
+                rhs_complex_pairs[i].reshape((-1,)),
+                trans=1,
+            ).reshape((2, kernel_context.state_dim))
+            return pair_solutions.at[i].set(delta_pair)
+
+        delta_complex_pairs = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _solve_pair,
+            jnp.zeros_like(rhs_complex_pairs),
+        )
+        delta_transformed = jnp.concatenate(
+            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
+            axis=0,
+        )
+        return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+
+    return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_bar_arr)
 
 
 def _radau_approximate_accepted_step_tangent(
