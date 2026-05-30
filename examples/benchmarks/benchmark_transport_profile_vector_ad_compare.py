@@ -45,6 +45,24 @@ def _parse_parameter_subset(text: str) -> tuple[str, ...]:
     return values
 
 
+def _parse_objective_subset(text: str) -> tuple[int, ...]:
+    values = tuple(item.strip() for item in str(text).split(",") if item.strip())
+    if not values:
+        raise ValueError("At least one objective index must be provided.")
+    out = []
+    n_objectives = len(OBJECTIVE_LABELS)
+    for item in values:
+        idx = int(item)
+        if idx < 0:
+            idx = n_objectives + idx
+        if idx < 0 or idx >= n_objectives:
+            raise ValueError(
+                f"Objective index {item} out of range. Allowed range: 0..{n_objectives - 1} or negative Python-style indices."
+            )
+        out.append(idx)
+    return tuple(out)
+
+
 def _print_summary(report: dict[str, Any]) -> None:
     print(
         "[autodiff-gate] "
@@ -96,9 +114,19 @@ def main() -> None:
         default=",".join(PROFILE_VECTOR_PARAMETERS),
         help="Comma-separated subset of profile-vector parameters to include.",
     )
+    parser.add_argument(
+        "--objective-indices",
+        default=None,
+        help="Optional comma-separated subset of objective row indices to run in reverse mode.",
+    )
     args = parser.parse_args()
     os.environ["NEOPAX_TRANSPORT_REVERSE_REPLAY_DEVICE"] = str(args.reverse_replay_device)
     parameter_names = _parse_parameter_subset(args.parameters)
+    objective_indices = (
+        tuple(range(len(OBJECTIVE_LABELS)))
+        if args.objective_indices is None
+        else _parse_objective_subset(args.objective_indices)
+    )
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -143,7 +171,9 @@ def main() -> None:
                 (baseline_vector,),
                 (jnp.asarray(basis, dtype=jnp.float64),),
             )
-            fwd_columns.append(np.asarray(jax.device_get(tangent), dtype=float))
+            tangent_arr = np.asarray(jax.device_get(tangent), dtype=float)
+            tangent_arr = tangent_arr[np.asarray(objective_indices, dtype=int)]
+            fwd_columns.append(tangent_arr)
         jac_fwd = np.stack(fwd_columns, axis=1)
 
     if args.ad_mode in ("both", "reverse"):
@@ -153,10 +183,10 @@ def main() -> None:
             flush=True,
         )
         rev_rows = []
-        n_objectives = int(len(OBJECTIVE_LABELS))
-        for idx in range(n_objectives):
+        n_objectives = int(len(objective_indices))
+        for row_pos, idx in enumerate(objective_indices):
             print(
-                f"[autodiff-gate] progress: running reverse custom-VJP row {idx + 1}/{n_objectives}",
+                f"[autodiff-gate] progress: running reverse custom-VJP row {row_pos + 1}/{n_objectives} (objective_index={idx})",
                 flush=True,
             )
 
@@ -196,7 +226,8 @@ def main() -> None:
         "ad_mode": str(args.ad_mode),
         "parameter_names": list(parameter_names),
         "baseline_values": np.asarray(jax.device_get(baseline_vector), dtype=float).tolist(),
-        "objective_labels": OBJECTIVE_LABELS,
+        "objective_indices": list(objective_indices),
+        "objective_labels": [OBJECTIVE_LABELS[i] for i in objective_indices],
         "jacobian_forward": None if jac_fwd is None else jac_fwd.tolist(),
         "jacobian_reverse": None if jac_rev is None else jac_rev.tolist(),
         "jacobian_absolute_error": abs_err_list,
