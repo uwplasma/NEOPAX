@@ -6992,20 +6992,29 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         )
         return carry_before_bar, None
 
-    rev_inputs = jax.tree_util.tree_map(
-        lambda a: jnp.flip(a, axis=0),
-        (
-            checkpoint_carries,
-            segmented_active_mask,
-            segmented_attempted_dts,
-            segmented_next_dts,
-            segmented_next_recent_reject_count,
-            segmented_next_regrowth_cooldown,
-            segmented_next_easy_growth_streak,
-            segmented_next_lagged_response_valid,
-        ),
+    n_segments = int(segmented_active_mask.shape[0])
+
+    def _reverse_loop_body(i, carry_bar):
+        idx = n_segments - 1 - i
+        inputs = (
+            jax.tree_util.tree_map(lambda x: x[idx], checkpoint_carries),
+            segmented_active_mask[idx],
+            segmented_attempted_dts[idx],
+            segmented_next_dts[idx],
+            segmented_next_recent_reject_count[idx],
+            segmented_next_regrowth_cooldown[idx],
+            segmented_next_easy_growth_streak[idx],
+            segmented_next_lagged_response_valid[idx],
+        )
+        carry_before_bar, _ = _reverse_segment(carry_bar, inputs)
+        return carry_before_bar
+
+    replay_state0_bar = jax.lax.fori_loop(
+        0,
+        n_segments,
+        _reverse_loop_body,
+        final_replay_state_bar,
     )
-    replay_state0_bar, _ = jax.lax.scan(_reverse_segment, final_replay_state_bar, rev_inputs)
     carry0_bar = _radau_replay_state_to_carry(
         replay_state0_bar,
         lagged_response_cache=_radau_zero_cotangent_like(checkpoint_carries.lagged_response_cache[0]),
