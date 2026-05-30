@@ -4015,7 +4015,7 @@ def _radau_apply_stage_linear_solve_transpose(
 
     def _solve_nonzero_rhs(rhs_flat):
         rhs_stages = rhs_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
+        rhs_transformed = kernel_context.radau_transform.T @ rhs_stages
         rhs_real = rhs_transformed[0]
         delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real, trans=1)
         rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
@@ -4038,7 +4038,7 @@ def _radau_apply_stage_linear_solve_transpose(
             [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
             axis=0,
         )
-        return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+        return (kernel_context.radau_inv_transform.T @ delta_transformed).reshape((-1,))
 
     return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_bar_arr)
 
