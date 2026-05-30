@@ -3209,24 +3209,68 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
     stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
     dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
-    carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
+
     lagged_reference_y_bar = jnp.asarray(
         replay_state_bar.lagged_reference_y,
         dtype=kernel_context.dtype,
     )
+    lagged_response_cache_bar = zero_lagged_cache_tangent
+    if lagged_response is not None:
+        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+        stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
+
+        _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+        (lagged_response_bar,) = lagged_pullback(stage_rhs_bar)
+
+        def _reuse_case(_):
+            return lagged_response_bar, lagged_reference_y_bar, jnp.asarray(0.0, dtype=kernel_context.dtype)
+
+        def _rebuild_case(_):
+            y_from_lagged_bar = jnp.zeros_like(carry_in.y)
+            if physics_context.build_lagged_response is not None:
+                def _build_from_flat(flat_y):
+                    candidate_state = physics_context.unpack_flat(
+                        _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+                    )
+                    return physics_context.build_lagged_response(candidate_state)
+
+                _, build_pullback = jax.vjp(_build_from_flat, carry_in.y)
+                (y_from_lagged_bar,) = build_pullback(lagged_response_bar)
+            dy_extra = y_from_lagged_bar + lagged_reference_y_bar
+            return zero_lagged_cache_tangent, _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
+
+        lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = jax.lax.cond(
+            carry_in.lagged_response_valid,
+            _reuse_case,
+            _rebuild_case,
+            operand=None,
+        )
+        dy_bar = dy_bar + dy_extra
+    else:
+        lagged_reference_y_out_bar = _radau_zero_cotangent_like(carry_in.lagged_reference_y)
+
+    carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
     carry_bar = dataclasses.replace(
         carry_bar,
         t=jnp.asarray(replay_state_bar.t, dtype=kernel_context.dtype),
         y=dy_bar,
         dt=dh_bar,
-        lagged_response_cache=zero_lagged_cache_tangent,
+        lagged_response_cache=lagged_response_cache_bar,
+        lagged_reference_y=lagged_reference_y_out_bar,
     )
-    return jax.lax.cond(
-        carry_in.lagged_response_valid,
-        lambda cb: dataclasses.replace(cb, lagged_reference_y=lagged_reference_y_bar),
-        lambda cb: dataclasses.replace(cb, y=cb.y + lagged_reference_y_bar),
-        carry_bar,
-    )
+    return carry_bar
 
 
 def _execute_radau_accepted_step_attempt_with_approx_tangent(
