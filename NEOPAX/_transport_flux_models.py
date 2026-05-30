@@ -332,7 +332,7 @@ def _ntx_interpolated_response_flux_impl(model, state, center_response):
     return {"Gamma": gamma, "Q": q, "Upar": upar}
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+@partial(jax.custom_vjp, nondiff_argnums=(0,))
 def _ntx_interpolated_response_flux_vjp(model, state, center_response):
     """Custom-VJP contract point for NTX interpolated lagged responses."""
     return _ntx_interpolated_response_flux_impl(model, state, center_response)
@@ -340,11 +340,13 @@ def _ntx_interpolated_response_flux_vjp(model, state, center_response):
 
 def _ntx_interpolated_response_flux_vjp_fwd(model, state, center_response):
     fluxes = _ntx_interpolated_response_flux_impl(model, state, center_response)
-    return fluxes, center_response
+    return fluxes, (state, center_response)
 
 
-def _ntx_interpolated_response_flux_vjp_bwd(model, state, center_response, flux_bar):
+def _ntx_interpolated_response_flux_vjp_bwd(model, residuals, flux_bar):
+    state, center_response = residuals
     def _reduced_response(
+        state_value,
         reference_er,
         reference_log_nu_star,
         reference_transport_moments,
@@ -353,7 +355,7 @@ def _ntx_interpolated_response_flux_vjp_bwd(model, state, center_response, flux_
     ):
         return _ntx_interpolated_response_flux_impl(
             model,
-            state,
+            state_value,
             NTXInterpolatedMomentResponse(
                 reference_er=reference_er,
                 reference_log_nu_star=reference_log_nu_star,
@@ -365,6 +367,7 @@ def _ntx_interpolated_response_flux_vjp_bwd(model, state, center_response, flux_
 
     _, pullback = jax.vjp(
         _reduced_response,
+        state,
         center_response.reference_er,
         center_response.reference_log_nu_star,
         center_response.reference_transport_moments,
@@ -372,6 +375,7 @@ def _ntx_interpolated_response_flux_vjp_bwd(model, state, center_response, flux_
         center_response.dtransport_moments_d_log_nu_star,
     )
     (
+        state_bar,
         reference_er_bar,
         reference_log_nu_star_bar,
         reference_transport_moments_bar,
@@ -379,6 +383,7 @@ def _ntx_interpolated_response_flux_vjp_bwd(model, state, center_response, flux_
         dtransport_moments_d_log_nu_star_bar,
     ) = pullback(flux_bar)
     return (
+        state_bar,
         NTXInterpolatedMomentResponse(
             reference_er=reference_er_bar,
             reference_log_nu_star=reference_log_nu_star_bar,
