@@ -1303,6 +1303,7 @@ class ComposedEquationSystem:
 
     def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
         del t, runtime
+        from ._state import TransportState
         working_state, eidx = self._prepare_working_state(state)
         density_eq, temperature_eq, er_eq = self._resolve_equations()
 
