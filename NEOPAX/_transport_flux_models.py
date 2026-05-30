@@ -1667,9 +1667,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         row2 = jnp.stack((-l02, -l12, l22), axis=-1)
         return jnp.stack((row0, row1, row2), axis=-2)
 
-    def _solve_coefficient_scan_prepared_impl(self, prepared, nu_hat_a, epsi_hat_a):
+    def _solve_coefficient_scan_prepared_impl(self, prepared, nu_hat_a, epsi_hat_a, *, derivative_mode_override=None):
         ntx = _import_ntx()
-        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
+        derivative_mode = (
+            self._normalize_derivative_mode(self.derivative_mode)
+            if derivative_mode_override is None
+            else self._normalize_derivative_mode(derivative_mode_override)
+        )
 
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
@@ -1707,11 +1711,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return outputs[0]
         return jnp.concatenate(outputs, axis=0)
 
-    def _solve_coefficient_scan_prepared(self, prepared, nu_hat_a, epsi_hat_a):
+    def _solve_coefficient_scan_prepared(self, prepared, nu_hat_a, epsi_hat_a, *, derivative_mode_override=None):
         evaluator = self._solve_coefficient_scan_prepared_impl
         if self.use_remat:
             evaluator = jax.checkpoint(evaluator)
-        return evaluator(prepared, nu_hat_a, epsi_hat_a)
+        return evaluator(prepared, nu_hat_a, epsi_hat_a, derivative_mode_override=derivative_mode_override)
 
     def _coefficient_scan_from_inputs(self, prepared, nu_hat_a, epsi_hat_a):
         return self._solve_coefficient_scan_prepared(prepared, nu_hat_a, epsi_hat_a)
@@ -1727,6 +1731,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         density_local,
         vthermal_local,
         collisionality_kind,
+        derivative_mode_override=None,
     ):
         nu_hat_a, epsi_hat_a, vth_a = self._local_scan_inputs(
             drds_value=drds_value,
@@ -1737,7 +1742,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vthermal_local=vthermal_local,
             collisionality_kind=collisionality_kind,
         )
-        coeff_scan = self._solve_coefficient_scan_prepared(prepared, nu_hat_a, epsi_hat_a)
+        coeff_scan = self._solve_coefficient_scan_prepared(
+            prepared,
+            nu_hat_a,
+            epsi_hat_a,
+            derivative_mode_override=derivative_mode_override,
+        )
         return self._lij_from_coefficient_scan(
             coeff_scan,
             drds_value=drds_value,
@@ -1756,6 +1766,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         density_local,
         vthermal_local,
         collisionality_kind,
+        derivative_mode_override=None,
     ):
         return self._solve_lij_prepared_local_impl(
             prepared,
@@ -1766,6 +1777,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local=density_local,
             vthermal_local=vthermal_local,
             collisionality_kind=collisionality_kind,
+            derivative_mode_override=derivative_mode_override,
         )
 
     def _build_coefficient_response_local(
@@ -2329,6 +2341,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     density_local=density_local,
                     vthermal_local=vthermal_local,
                     collisionality_kind=collisionality_kind,
+                    derivative_mode_override="direct",
                 )
             )(species_indices)
             a1 = jax.vmap(
