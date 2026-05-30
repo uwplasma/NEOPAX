@@ -1301,6 +1301,47 @@ class ComposedEquationSystem:
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
 
+    def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
+        del t, runtime
+        working_state, eidx = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+
+        density_rhs = (
+            density_eq(working_state, fluxes=shared_fluxes)
+            if density_eq is not None
+            else jnp.zeros_like(state.density)
+        )
+        pressure_rhs = (
+            temperature_eq(working_state, fluxes=shared_fluxes)
+            if temperature_eq is not None
+            else jnp.zeros_like(state.pressure)
+        )
+        Er_rhs = (
+            er_eq(working_state, fluxes=shared_fluxes)
+            if er_eq is not None
+            else jnp.zeros_like(state.Er)
+        )
+
+        density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+
+        if eidx is not None:
+            density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+
+        if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+            density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+
+        if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+
+        if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+            Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
+
+        return TransportState(
+            density=density_rhs,
+            pressure=pressure_rhs,
+            Er=Er_rhs,
+        )
+
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState
@@ -1317,6 +1358,9 @@ class ComposedEquationSystem:
                     working_state,
                     lagged_response.flux_response,
                 )
+
+        if shared_fluxes is not None:
+            return self.evaluate_with_shared_fluxes(0.0, state, None, shared_fluxes)
 
         density_rhs = (
             density_eq(working_state, fluxes=shared_fluxes)
