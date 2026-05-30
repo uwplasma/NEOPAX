@@ -3285,9 +3285,10 @@ def _radau_stage_flux_response_pullback_factory(
         return pullback_fn(state_y, flux_response_value, shared_flux_bar_eval)
 
     def _stage_flux_response_pullback(flux_response_value, stage_shared_fluxes_bar):
-        return jax.vmap(
+        per_stage_bar = jax.vmap(
             lambda y_eval, flux_bar_eval: _pullback_one(y_eval, flux_response_value, flux_bar_eval)
         )(stage_states, stage_shared_fluxes_bar)
+        return jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), per_stage_bar)
 
     return _stage_flux_response_pullback
 
