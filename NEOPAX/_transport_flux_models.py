@@ -2438,27 +2438,98 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 + center_response.dtransport_moments_d_er * delta_er[None, :, None]
                 + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
             )
-
-            def _fluxes_from_transport_moments(transport_moments_value):
-                lij = self._batched_lij_from_transport_moments(transport_moments_value, v_thermal)
-                gamma, q, upar = self._assemble_center_fluxes(
-                    state.Er,
-                    temperature,
-                    density,
-                    lij,
-                    n_right,
-                    n_right_grad,
-                    t_right,
-                    t_right_grad,
-                )
-                gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
-                return {"Gamma": gamma, "Q": q, "Upar": upar}
-
-            _, transport_moments_pullback = jax.vjp(
-                _fluxes_from_transport_moments,
-                transport_moments,
+            lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
+            gamma, q, upar = self._assemble_center_fluxes(
+                state.Er,
+                temperature,
+                density,
+                lij,
+                n_right,
+                n_right_grad,
+                t_right,
+                t_right_grad,
             )
-            (transport_moments_bar,) = transport_moments_pullback(flux_bar)
+            _, regularize_pullback = jax.vjp(
+                lambda gamma_value, q_value, upar_value: self._regularize_center_fluxes_axis0(
+                    gamma_value,
+                    q_value,
+                    upar_value,
+                ),
+                gamma,
+                q,
+                upar,
+            )
+            gamma_bar, q_bar, upar_bar = regularize_pullback(
+                (
+                    flux_bar["Gamma"],
+                    flux_bar["Q"],
+                    flux_bar["Upar"],
+                )
+            )
+
+            dndr_all = jax.vmap(
+                lambda density_a, right_value, right_grad: get_gradient_density(
+                    density_a,
+                    self.geometry.r_grid,
+                    self.geometry.r_grid_half,
+                    self.geometry.dr,
+                    right_face_constraint=right_value,
+                    right_face_grad_constraint=right_grad,
+                )
+            )(density, n_right, n_right_grad)
+            dTdr_all = jax.vmap(
+                lambda temperature_a, right_value, right_grad: get_gradient_temperature(
+                    temperature_a,
+                    self.geometry.r_grid,
+                    self.geometry.r_grid_half,
+                    self.geometry.dr,
+                    right_face_constraint=right_value,
+                    right_face_grad_constraint=right_grad,
+                )
+            )(temperature, t_right, t_right_grad)
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                    charge,
+                    density_a,
+                    temperature_a,
+                    dndr_a,
+                    dTdr_a,
+                    state.Er,
+                )
+            )(self.species.charge, density, temperature, dndr_all, dTdr_all)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
+            a3 = get_Thermodynamical_Forces_A3(state.Er)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+
+            lij_bar = jnp.zeros_like(lij)
+            lij_bar = lij_bar.at[:, :, 0, 0].add(-density_phys * a1 * gamma_bar)
+            lij_bar = lij_bar.at[:, :, 0, 1].add(-density_phys * a2 * gamma_bar)
+            lij_bar = lij_bar.at[:, :, 0, 2].add(-density_phys * a3[None, :] * gamma_bar)
+            lij_bar = lij_bar.at[:, :, 1, 0].add(-temperature_phys * density_phys * a1 * q_bar)
+            lij_bar = lij_bar.at[:, :, 1, 1].add(-temperature_phys * density_phys * a2 * q_bar)
+            lij_bar = lij_bar.at[:, :, 1, 2].add(-temperature_phys * density_phys * a3[None, :] * q_bar)
+            lij_bar = lij_bar.at[:, :, 2, 0].add(-density_phys * a1 * upar_bar)
+            lij_bar = lij_bar.at[:, :, 2, 1].add(-density_phys * a2 * upar_bar)
+            lij_bar = lij_bar.at[:, :, 2, 2].add(-density_phys * a3[None, :] * upar_bar)
+
+            charge = jnp.asarray(self.species.charge, dtype=jnp.float64)[:, None]
+            mass = jnp.asarray(self.species.mass, dtype=jnp.float64)[:, None]
+            inv_sqrt_pi = 1.0 / jnp.sqrt(jnp.pi)
+            l11_fac = -inv_sqrt_pi * (mass / charge) ** 2 * v_thermal**3
+            l13_fac = -inv_sqrt_pi * (mass / charge) * v_thermal**2
+            l33_fac = -inv_sqrt_pi * v_thermal
+            transport_moments_bar = jnp.stack(
+                (
+                    l11_fac * lij_bar[:, :, 0, 0],
+                    l11_fac * (lij_bar[:, :, 0, 1] + lij_bar[:, :, 1, 0]),
+                    l11_fac * lij_bar[:, :, 1, 1],
+                    l13_fac * (lij_bar[:, :, 0, 2] - lij_bar[:, :, 2, 0]),
+                    l13_fac * (lij_bar[:, :, 1, 2] - lij_bar[:, :, 2, 1]),
+                    l33_fac * lij_bar[:, :, 2, 2],
+                ),
+                axis=2,
+            )
 
             reference_transport_moments_bar = transport_moments_bar
             dtransport_moments_d_er_bar = transport_moments_bar * delta_er[None, :, None]
