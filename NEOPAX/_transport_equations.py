@@ -1284,6 +1284,14 @@ class ComposedEquationSystem:
             er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
         return density_eq, temperature_eq, er_eq
 
+    @staticmethod
+    def _shared_fluxes_zero_like(shared_fluxes):
+        return jax.tree_util.tree_map(jnp.zeros_like, shared_fluxes)
+
+    @staticmethod
+    def _shared_fluxes_add(lhs, rhs):
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
     def build_lagged_response(self, state):
         working_state, _ = self._prepare_working_state(state)
         if lagged_timing_enabled():
@@ -1342,6 +1350,77 @@ class ComposedEquationSystem:
             pressure=pressure_rhs,
             Er=Er_rhs,
         )
+
+    def pullback_shared_fluxes(self, state, shared_fluxes, rhs_bar):
+        """Reverse-only pullback for the shared-flux -> RHS assembly.
+
+        This keeps the primal map unchanged, but lets reverse split the shared
+        transport flux assembly by equation instead of VJP-ing the whole
+        composed RHS map as one giant object.
+        """
+        working_state, eidx = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        zero_flux_bar = self._shared_fluxes_zero_like(shared_fluxes)
+
+        density_bar = rhs_bar.density
+        pressure_bar = rhs_bar.pressure
+        er_bar = rhs_bar.Er
+
+        def _density_map(fluxes_value):
+            density_rhs = (
+                density_eq(working_state, fluxes=fluxes_value)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+            return density_rhs
+
+        def _pressure_map(fluxes_value):
+            density_rhs = (
+                density_eq(working_state, fluxes=fluxes_value)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            pressure_rhs = (
+                temperature_eq(working_state, fluxes=fluxes_value)
+                if temperature_eq is not None
+                else jnp.zeros_like(state.pressure)
+            )
+            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+            return pressure_rhs
+
+        def _er_map(fluxes_value):
+            er_rhs = (
+                er_eq(working_state, fluxes=fluxes_value)
+                if er_eq is not None
+                else jnp.zeros_like(state.Er)
+            )
+            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, er_rhs)
+            return er_rhs
+
+        flux_bar = zero_flux_bar
+        if density_eq is not None:
+            _, density_pullback = jax.vjp(_density_map, shared_fluxes)
+            (density_flux_bar,) = density_pullback(density_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, density_flux_bar)
+        if temperature_eq is not None:
+            _, pressure_pullback = jax.vjp(_pressure_map, shared_fluxes)
+            (pressure_flux_bar,) = pressure_pullback(pressure_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, pressure_flux_bar)
+        if er_eq is not None:
+            _, er_pullback = jax.vjp(_er_map, shared_fluxes)
+            (er_flux_bar,) = er_pullback(er_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, er_flux_bar)
+        return flux_bar
 
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
