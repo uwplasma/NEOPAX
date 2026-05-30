@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any, Callable
 import abc
 import dataclasses
-from functools import partial
 import h5py
 import jax
 import jax.numpy as jnp
@@ -254,150 +253,6 @@ class NTXInterpolatedMomentResponse:
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXExactLijLaggedResponse:
         center_response: Any
-
-
-def _ntx_interpolated_response_flux_impl(model, state, center_response):
-    """Evaluate NTX lagged fluxes for the interpolated-response branch only."""
-    density = safe_density(state.density)
-    temperature = state.temperature
-    n_species = int(temperature.shape[0])
-    n_right = _as_species_constraint(None if model.bc_density is None else getattr(model.bc_density, "right_value", None), n_species)
-    if n_right is None:
-        n_right = density[:, -1]
-    n_right_grad = _as_species_constraint(None if model.bc_density is None else getattr(model.bc_density, "right_gradient", None), n_species)
-    if n_right_grad is None:
-        n_right_grad = jnp.zeros_like(n_right)
-    t_right = _as_species_constraint(None if model.bc_temperature is None else getattr(model.bc_temperature, "right_value", None), n_species)
-    if t_right is None:
-        t_right = temperature[:, -1]
-    t_right_grad = _as_species_constraint(None if model.bc_temperature is None else getattr(model.bc_temperature, "right_gradient", None), n_species)
-    if t_right_grad is None:
-        t_right_grad = jnp.zeros_like(t_right)
-
-    support = model._static_support()
-    collisionality_kind = _collisionality_kind(model.collisionality_model)
-    v_thermal = get_v_thermal(model.species.mass, temperature)
-    species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
-    radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
-
-    def _current_log_nu_star_per_radius(radius_index):
-        drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
-        er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
-        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
-        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
-        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
-        return jax.vmap(
-            lambda species_index: model._log_nu_star_from_nu_hat(
-                model._local_scan_inputs(
-                    drds_value=drds_value,
-                    species_index=species_index,
-                    er_value=er_value,
-                    temperature_local=temperature_local,
-                    density_local=density_local,
-                    vthermal_local=vthermal_local,
-                    collisionality_kind=collisionality_kind,
-                )[0]
-            )
-        )(species_indices)
-
-    current_log_nu_star = jnp.swapaxes(
-        model._map_radius_axis_regularized_at_axis0(
-            _current_log_nu_star_per_radius,
-            radius_indices,
-            model.geometry.r_grid,
-            unbatched=True,
-        ),
-        0,
-        1,
-    )
-    delta_er = state.Er - center_response.reference_er
-    delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
-    transport_moments = (
-        center_response.reference_transport_moments
-        + center_response.dtransport_moments_d_er * delta_er[None, :, None]
-        + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
-    )
-    lij = model._batched_lij_from_transport_moments(transport_moments, v_thermal)
-    gamma, q, upar = model._assemble_center_fluxes(
-        state.Er,
-        temperature,
-        density,
-        lij,
-        n_right,
-        n_right_grad,
-        t_right,
-        t_right_grad,
-    )
-    gamma, q, upar = model._regularize_center_fluxes_axis0(gamma, q, upar)
-    return {"Gamma": gamma, "Q": q, "Upar": upar}
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(0,))
-def _ntx_interpolated_response_flux_vjp(model, state, center_response):
-    """Custom-VJP contract point for NTX interpolated lagged responses."""
-    return _ntx_interpolated_response_flux_impl(model, state, center_response)
-
-
-def _ntx_interpolated_response_flux_vjp_fwd(model, state, center_response):
-    fluxes = _ntx_interpolated_response_flux_impl(model, state, center_response)
-    return fluxes, (state, center_response)
-
-
-def _ntx_interpolated_response_flux_vjp_bwd(model, residuals, flux_bar):
-    state, center_response = residuals
-    def _reduced_response(
-        state_value,
-        reference_er,
-        reference_log_nu_star,
-        reference_transport_moments,
-        dtransport_moments_d_er,
-        dtransport_moments_d_log_nu_star,
-    ):
-        return _ntx_interpolated_response_flux_impl(
-            model,
-            state_value,
-            NTXInterpolatedMomentResponse(
-                reference_er=reference_er,
-                reference_log_nu_star=reference_log_nu_star,
-                reference_transport_moments=reference_transport_moments,
-                dtransport_moments_d_er=dtransport_moments_d_er,
-                dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star,
-            ),
-        )
-
-    _, pullback = jax.vjp(
-        _reduced_response,
-        state,
-        center_response.reference_er,
-        center_response.reference_log_nu_star,
-        center_response.reference_transport_moments,
-        center_response.dtransport_moments_d_er,
-        center_response.dtransport_moments_d_log_nu_star,
-    )
-    (
-        state_bar,
-        reference_er_bar,
-        reference_log_nu_star_bar,
-        reference_transport_moments_bar,
-        dtransport_moments_d_er_bar,
-        dtransport_moments_d_log_nu_star_bar,
-    ) = pullback(flux_bar)
-    return (
-        state_bar,
-        NTXInterpolatedMomentResponse(
-            reference_er=reference_er_bar,
-            reference_log_nu_star=reference_log_nu_star_bar,
-            reference_transport_moments=reference_transport_moments_bar,
-            dtransport_moments_d_er=dtransport_moments_d_er_bar,
-            dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star_bar,
-        ),
-    )
-
-
-_ntx_interpolated_response_flux_vjp.defvjp(
-    _ntx_interpolated_response_flux_vjp_fwd,
-    _ntx_interpolated_response_flux_vjp_bwd,
-)
 
 
 @jax.tree_util.register_dataclass
@@ -2296,10 +2151,60 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if isinstance(center_response, NTXInterpolatedMomentResponse):
             if lagged_timing_enabled():
                 jax.debug.callback(lambda: lagged_timing_start("ntx.evaluate_with_lagged_response.coarse"), ordered=True)
-            fluxes = _ntx_interpolated_response_flux_vjp(self, state, center_response)
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+            def _current_log_nu_star_per_radius(radius_index):
+                drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                return jax.vmap(
+                    lambda species_index: self._log_nu_star_from_nu_hat(
+                        self._local_scan_inputs(
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )[0]
+                    )
+                )(species_indices)
+
+            current_log_nu_star = jnp.swapaxes(
+                self._map_radius_axis_regularized_at_axis0(
+                    _current_log_nu_star_per_radius,
+                    radius_indices,
+                    self.geometry.r_grid,
+                    unbatched=True,
+                ),
+                0,
+                1,
+            )
+            delta_er = state.Er - center_response.reference_er
+            delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
+            transport_moments = (
+                center_response.reference_transport_moments
+                + center_response.dtransport_moments_d_er * delta_er[None, :, None]
+                + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+            )
+            lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
+            gamma, q, upar = self._assemble_center_fluxes(
+                state.Er,
+                temperature,
+                density,
+                lij,
+                n_right,
+                n_right_grad,
+                t_right,
+                t_right_grad,
+            )
+            gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
             if lagged_timing_enabled():
                 jax.debug.callback(lambda: lagged_timing_end("ntx.evaluate_with_lagged_response.coarse"), ordered=True)
-            return fluxes
+            return {"Gamma": gamma, "Q": q, "Upar": upar}
 
         radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 

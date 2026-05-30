@@ -3163,6 +3163,61 @@ def _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stag
     return lagged_response_bar
 
 
+def _radau_lagged_response_pullback_ntx_interpolated(
+    stage_eval_fn,
+    response,
+    stage_rhs_bar,
+):
+    """Reduced pullback for `NTXInterpolatedMomentResponse`.
+
+    This keeps the primal flux-model path fully JVP-compatible, while giving the
+    reverse path a smaller contract than a whole-object VJP through the wrapped
+    lagged-response tree.
+    """
+    def _reduced_response(
+        reference_er,
+        reference_log_nu_star,
+        reference_transport_moments,
+        dtransport_moments_d_er,
+        dtransport_moments_d_log_nu_star,
+    ):
+        from ._transport_flux_models import NTXInterpolatedMomentResponse
+
+        return stage_eval_fn(
+            NTXInterpolatedMomentResponse(
+                reference_er=reference_er,
+                reference_log_nu_star=reference_log_nu_star,
+                reference_transport_moments=reference_transport_moments,
+                dtransport_moments_d_er=dtransport_moments_d_er,
+                dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star,
+            )
+        )
+
+    _, pullback = jax.vjp(
+        _reduced_response,
+        response.reference_er,
+        response.reference_log_nu_star,
+        response.reference_transport_moments,
+        response.dtransport_moments_d_er,
+        response.dtransport_moments_d_log_nu_star,
+    )
+    (
+        reference_er_bar,
+        reference_log_nu_star_bar,
+        reference_transport_moments_bar,
+        dtransport_moments_d_er_bar,
+        dtransport_moments_d_log_nu_star_bar,
+    ) = pullback(stage_rhs_bar)
+    return dataclasses.replace(
+        jax.tree_util.tree_map(_radau_zero_cotangent_like, response),
+        reference_er=reference_er_bar,
+        reference_log_nu_star=reference_log_nu_star_bar,
+        reference_transport_moments=reference_transport_moments_bar,
+        dtransport_moments_d_er=dtransport_moments_d_er_bar,
+        dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star_bar,
+    )
+
+
 def _radau_lagged_response_pullback_single_field(
     stage_eval_fn,
     response,
@@ -3252,10 +3307,11 @@ def _radau_lagged_response_pullback_dispatch(
         return NTXExactLijLaggedResponse(center_response=center_response_bar)
 
     if isinstance(lagged_response, NTXInterpolatedMomentResponse):
-        # TODO: replace with a true analytic pullback for the interpolated NTX
-        # response. Doing several separate field-level VJPs here would likely
-        # be as expensive as, or worse than, the original whole-object VJP.
-        return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+        return _radau_lagged_response_pullback_ntx_interpolated(
+            stage_eval_fn,
+            lagged_response,
+            stage_rhs_bar,
+        )
 
     if isinstance(lagged_response, NTXPreparedCoefficientResponse):
         return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
