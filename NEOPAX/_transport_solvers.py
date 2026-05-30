@@ -3261,6 +3261,37 @@ def _radau_stage_shared_fluxes_from_flux_response_factory(
     return _stage_shared_fluxes_from_flux_response
 
 
+def _radau_stage_flux_response_pullback_factory(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+):
+    owner = None if physics_context.build_lagged_response is None else getattr(physics_context.build_lagged_response, "__self__", None)
+    shared_flux_model = None if owner is None else getattr(owner, "shared_flux_model", None)
+    if shared_flux_model is None:
+        return None
+    pullback_fn = getattr(shared_flux_model, "pullback_evaluate_with_lagged_response", None)
+    if not callable(pullback_fn):
+        return None
+
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+    def _pullback_one(y_eval, flux_response_value, shared_flux_bar_eval):
+        state_y = physics_context.unpack_flat(
+            _project_flat_state_if_needed(y_eval, physics_context.project_flat)
+        )
+        return pullback_fn(state_y, flux_response_value, shared_flux_bar_eval)
+
+    def _stage_flux_response_pullback(flux_response_value, stage_shared_fluxes_bar):
+        return jax.vmap(
+            lambda y_eval, flux_bar_eval: _pullback_one(y_eval, flux_response_value, flux_bar_eval)
+        )(stage_states, stage_shared_fluxes_bar)
+
+    return _stage_flux_response_pullback
+
+
 def _radau_stage_shared_fluxes_pullback_factory(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3574,6 +3605,12 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
                 carry_in,
                 primal_result,
             )
+            stage_flux_response_pullback_fn = _radau_stage_flux_response_pullback_factory(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+            )
             stage_shared_fluxes_pullback_fn = _radau_stage_shared_fluxes_pullback_factory(
                 kernel_context,
                 physics_context,
@@ -3590,8 +3627,14 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
                     stage_shared_fluxes,
                     stage_rhs_bar,
                 )
-                _, flux_response_pullback = jax.vjp(stage_shared_fluxes_fn, lagged_response.flux_response)
-                (flux_response_bar,) = flux_response_pullback(stage_shared_fluxes_bar)
+                if stage_flux_response_pullback_fn is not None:
+                    flux_response_bar = stage_flux_response_pullback_fn(
+                        lagged_response.flux_response,
+                        stage_shared_fluxes_bar,
+                    )
+                else:
+                    _, flux_response_pullback = jax.vjp(stage_shared_fluxes_fn, lagged_response.flux_response)
+                    (flux_response_bar,) = flux_response_pullback(stage_shared_fluxes_bar)
                 lagged_response_bar = TransportLaggedResponse(flux_response=flux_response_bar)
         if lagged_response_bar is None:
             lagged_response_bar = _radau_lagged_response_pullback_dispatch(

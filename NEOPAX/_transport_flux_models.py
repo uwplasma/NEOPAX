@@ -677,6 +677,67 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             "Upar_classical": classical.get("Upar", 0),
         }
 
+    def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
+        def _submodel_pullback(model, subresponse, subflux_bar):
+            if subresponse is None:
+                return None
+            pullback_fn = getattr(model, "pullback_evaluate_with_lagged_response", None)
+            if callable(pullback_fn):
+                return pullback_fn(state, subresponse, subflux_bar, **kwargs)
+            _, pb = jax.vjp(
+                lambda response_value: model.evaluate_with_lagged_response(
+                    state,
+                    response_value,
+                    **kwargs,
+                ),
+                subresponse,
+            )
+            (subresponse_bar,) = pb(subflux_bar)
+            return subresponse_bar
+
+        gamma_total_bar = flux_bar.get("Gamma", 0)
+        q_total_bar = flux_bar.get("Q", 0)
+        upar_total_bar = flux_bar.get("Upar", 0)
+
+        zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
+        neo_flux_bar = {
+            "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
+            "Q": q_total_bar + flux_bar.get("Q_neo", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+        }
+        turb_flux_bar = {
+            "Gamma": (
+                gamma_total_bar + flux_bar.get("Gamma_turb", zero_gamma)
+                if self.include_turbulent_particle_flux
+                else flux_bar.get("Gamma_turb", zero_gamma)
+            ),
+            "Q": q_total_bar + flux_bar.get("Q_turb", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+        }
+        classical_flux_bar = {
+            "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
+            "Q": q_total_bar + flux_bar.get("Q_classical", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+        }
+
+        return CombinedTransportLaggedResponse(
+            neoclassical_response=_submodel_pullback(
+                self.neoclassical_model,
+                lagged_response.neoclassical_response,
+                neo_flux_bar,
+            ),
+            turbulent_response=_submodel_pullback(
+                self.turbulent_model,
+                lagged_response.turbulent_response,
+                turb_flux_bar,
+            ),
+            classical_response=_submodel_pullback(
+                self.classical_model,
+                lagged_response.classical_response,
+                classical_flux_bar,
+            ),
+        )
+
 
 
 
@@ -2312,6 +2373,66 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+    def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
+        del kwargs
+        center_response = lagged_response.center_response
+
+        if isinstance(center_response, NTXInterpolatedMomentResponse):
+            def _reduced_response(
+                reference_er,
+                reference_log_nu_star,
+                reference_transport_moments,
+                dtransport_moments_d_er,
+                dtransport_moments_d_log_nu_star,
+            ):
+                return self.evaluate_with_lagged_response(
+                    state,
+                    NTXExactLijLaggedResponse(
+                        center_response=NTXInterpolatedMomentResponse(
+                            reference_er=reference_er,
+                            reference_log_nu_star=reference_log_nu_star,
+                            reference_transport_moments=reference_transport_moments,
+                            dtransport_moments_d_er=dtransport_moments_d_er,
+                            dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star,
+                        )
+                    ),
+                )
+
+            _, pb = jax.vjp(
+                _reduced_response,
+                center_response.reference_er,
+                center_response.reference_log_nu_star,
+                center_response.reference_transport_moments,
+                center_response.dtransport_moments_d_er,
+                center_response.dtransport_moments_d_log_nu_star,
+            )
+            (
+                reference_er_bar,
+                reference_log_nu_star_bar,
+                reference_transport_moments_bar,
+                dtransport_moments_d_er_bar,
+                dtransport_moments_d_log_nu_star_bar,
+            ) = pb(flux_bar)
+            return NTXExactLijLaggedResponse(
+                center_response=NTXInterpolatedMomentResponse(
+                    reference_er=reference_er_bar,
+                    reference_log_nu_star=reference_log_nu_star_bar,
+                    reference_transport_moments=reference_transport_moments_bar,
+                    dtransport_moments_d_er=dtransport_moments_d_er_bar,
+                    dtransport_moments_d_log_nu_star=dtransport_moments_d_log_nu_star_bar,
+                )
+            )
+
+        _, pb = jax.vjp(
+            lambda response_value: self.evaluate_with_lagged_response(
+                state,
+                NTXExactLijLaggedResponse(center_response=response_value),
+            ),
+            center_response,
+        )
+        (center_response_bar,) = pb(flux_bar)
+        return NTXExactLijLaggedResponse(center_response=center_response_bar)
 
     def build_local_particle_flux_evaluator(self, state):
         density = safe_density(state.density)
