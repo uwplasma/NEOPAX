@@ -3235,7 +3235,11 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
         (lagged_response_bar,) = lagged_pullback(stage_rhs_bar)
 
         def _reuse_case(_):
-            return lagged_response_bar, lagged_reference_y_bar, jnp.asarray(0.0, dtype=kernel_context.dtype)
+            return (
+                lagged_response_bar,
+                lagged_reference_y_bar,
+                jnp.zeros_like(carry_in.y),
+            )
 
         def _rebuild_case(_):
             y_from_lagged_bar = jnp.zeros_like(carry_in.y)
