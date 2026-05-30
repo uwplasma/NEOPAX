@@ -641,8 +641,20 @@ def _objective_vector_from_final_y(
 
 
 def _tree_vdot(lhs, rhs):
+    def _leaf_vdot(a, b):
+        a_arr = jnp.asarray(a)
+        b_arr = jnp.asarray(b)
+        if not jnp.issubdtype(a_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        if not jnp.issubdtype(b_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.asarray(
+            jnp.vdot(jnp.ravel(a_arr), jnp.ravel(b_arr)),
+            dtype=jnp.float64,
+        )
+
     leaves = jax.tree_util.tree_map(
-        lambda a, b: jnp.vdot(jnp.ravel(jnp.asarray(a)), jnp.ravel(jnp.asarray(b))),
+        _leaf_vdot,
         lhs,
         rhs,
     )
