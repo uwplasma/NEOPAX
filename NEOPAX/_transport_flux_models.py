@@ -1607,19 +1607,41 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             axis=0,
         )
 
-    def _transport_moments_from_inputs_impl(self, prepared, nu_hat_a, epsi_hat_a, *, drds_value):
-        coeff_scan = self._coefficient_scan_from_inputs(prepared, nu_hat_a, epsi_hat_a)
+    def _transport_moments_from_inputs_impl(
+        self,
+        prepared,
+        nu_hat_a,
+        epsi_hat_a,
+        *,
+        drds_value,
+        derivative_mode_override=None,
+    ):
+        coeff_scan = self._coefficient_scan_from_inputs(
+            prepared,
+            nu_hat_a,
+            epsi_hat_a,
+            derivative_mode_override=derivative_mode_override,
+        )
         return self._transport_moments_from_coefficient_scan(
             coeff_scan,
             drds_value=drds_value,
         )
 
-    def _transport_moments_from_inputs(self, prepared, nu_hat_a, epsi_hat_a, *, drds_value):
+    def _transport_moments_from_inputs(
+        self,
+        prepared,
+        nu_hat_a,
+        epsi_hat_a,
+        *,
+        drds_value,
+        derivative_mode_override=None,
+    ):
         return self._transport_moments_from_inputs_impl(
             prepared,
             nu_hat_a,
             epsi_hat_a,
             drds_value=drds_value,
+            derivative_mode_override=derivative_mode_override,
         )
 
     def _lij_from_transport_moments(
@@ -1717,8 +1739,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             evaluator = jax.checkpoint(evaluator)
         return evaluator(prepared, nu_hat_a, epsi_hat_a, derivative_mode_override=derivative_mode_override)
 
-    def _coefficient_scan_from_inputs(self, prepared, nu_hat_a, epsi_hat_a):
-        return self._solve_coefficient_scan_prepared(prepared, nu_hat_a, epsi_hat_a)
+    def _coefficient_scan_from_inputs(self, prepared, nu_hat_a, epsi_hat_a, *, derivative_mode_override=None):
+        return self._solve_coefficient_scan_prepared(
+            prepared,
+            nu_hat_a,
+            epsi_hat_a,
+            derivative_mode_override=derivative_mode_override,
+        )
 
     def _solve_lij_prepared_local_impl(
         self,
@@ -1806,6 +1833,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ref_nu_hat,
             ref_epsi_hat,
             drds_value=drds_value,
+            derivative_mode_override="direct",
         )
         return NTXPreparedCoefficientResponse(
             reference_transport_moments=reference_transport_moments,
@@ -1841,6 +1869,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hat_a,
                 epsi_hat_a,
                 drds_value=drds_value,
+                derivative_mode_override="direct",
             ),
             reference_nu_hat,
             reference_epsi_hat,
@@ -2239,6 +2268,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         nu_hat_a,
                         epsi_hat_a,
                         drds_value=drds_value,
+                        derivative_mode_override="direct",
                     ),
                     (ref_nu_species, ref_epsi_species),
                     tuple(
