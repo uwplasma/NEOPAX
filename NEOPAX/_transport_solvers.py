@@ -3126,6 +3126,146 @@ def _radau_accepted_step_y_tangent_from_primal_linearized(
     return accepted_y, accepted_y_tangent
 
 
+def _radau_stage_evals_from_lagged_factory(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+):
+    """Build the stage-evaluation map with only lagged response active.
+
+    This isolates the reverse boundary we need for the lagged-response cache
+    pullback so we can progressively replace broad whole-object VJPs with
+    smaller type-specific ones.
+    """
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+    def _stage_evals_from_lagged(lagged_response_value):
+        return jax.vmap(
+            lambda t_eval, y_eval: _radau_eval_rhs(
+                t_eval,
+                y_eval,
+                lagged_response_value,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            ),
+            in_axes=(0, 0),
+        )(stage_times, stage_states)
+
+    return _stage_evals_from_lagged
+
+
+def _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar):
+    _, lagged_pullback = jax.vjp(stage_eval_fn, lagged_response)
+    (lagged_response_bar,) = lagged_pullback(stage_rhs_bar)
+    return lagged_response_bar
+
+
+def _radau_lagged_response_pullback_single_field(
+    stage_eval_fn,
+    response,
+    field_name: str,
+    stage_rhs_bar,
+):
+    field_value = getattr(response, field_name)
+    _, field_pullback = jax.vjp(
+        lambda field_leaf: stage_eval_fn(dataclasses.replace(response, **{field_name: field_leaf})),
+        field_value,
+    )
+    (field_bar,) = field_pullback(stage_rhs_bar)
+    zero_response_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, response)
+    return dataclasses.replace(zero_response_bar, **{field_name: field_bar})
+
+
+def _radau_lagged_response_pullback_dispatch(
+    stage_eval_fn,
+    lagged_response,
+    stage_rhs_bar,
+):
+    """Type-dispatched lagged-response pullback.
+
+    Forward mode already treats lagged response as a structured, compressed
+    object with explicit reuse/rebuild logic. This helper starts mirroring that
+    by avoiding a single broad VJP over the entire cached object whenever we can
+    split the reverse into smaller typed subproblems.
+    """
+    from ._transport_equations import TransportLaggedResponse
+    from ._transport_flux_models import (
+        CombinedTransportLaggedResponse,
+        JVPTransportFluxResponse,
+        NTXExactLijLaggedResponse,
+        NTXInterpolatedMomentResponse,
+        NTXPreparedCoefficientResponse,
+    )
+
+    if lagged_response is None:
+        return None
+
+    if isinstance(lagged_response, TransportLaggedResponse):
+        flux_response_bar = _radau_lagged_response_pullback_dispatch(
+            lambda flux_response: stage_eval_fn(
+                dataclasses.replace(lagged_response, flux_response=flux_response)
+            ),
+            lagged_response.flux_response,
+            stage_rhs_bar,
+        )
+        return TransportLaggedResponse(flux_response=flux_response_bar)
+
+    if isinstance(lagged_response, CombinedTransportLaggedResponse):
+        neo_bar = _radau_lagged_response_pullback_dispatch(
+            lambda subresponse: stage_eval_fn(
+                dataclasses.replace(lagged_response, neoclassical_response=subresponse)
+            ),
+            lagged_response.neoclassical_response,
+            stage_rhs_bar,
+        ) if lagged_response.neoclassical_response is not None else None
+        turb_bar = _radau_lagged_response_pullback_dispatch(
+            lambda subresponse: stage_eval_fn(
+                dataclasses.replace(lagged_response, turbulent_response=subresponse)
+            ),
+            lagged_response.turbulent_response,
+            stage_rhs_bar,
+        ) if lagged_response.turbulent_response is not None else None
+        classical_bar = _radau_lagged_response_pullback_dispatch(
+            lambda subresponse: stage_eval_fn(
+                dataclasses.replace(lagged_response, classical_response=subresponse)
+            ),
+            lagged_response.classical_response,
+            stage_rhs_bar,
+        ) if lagged_response.classical_response is not None else None
+        return CombinedTransportLaggedResponse(
+            neoclassical_response=neo_bar,
+            turbulent_response=turb_bar,
+            classical_response=classical_bar,
+        )
+
+    if isinstance(lagged_response, NTXExactLijLaggedResponse):
+        center_response_bar = _radau_lagged_response_pullback_dispatch(
+            lambda center_response: stage_eval_fn(
+                dataclasses.replace(lagged_response, center_response=center_response)
+            ),
+            lagged_response.center_response,
+            stage_rhs_bar,
+        )
+        return NTXExactLijLaggedResponse(center_response=center_response_bar)
+
+    if isinstance(lagged_response, NTXInterpolatedMomentResponse):
+        # TODO: replace with a true analytic pullback for the interpolated NTX
+        # response. Doing several separate field-level VJPs here would likely
+        # be as expensive as, or worse than, the original whole-object VJP.
+        return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+
+    if isinstance(lagged_response, NTXPreparedCoefficientResponse):
+        return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+
+    if isinstance(lagged_response, JVPTransportFluxResponse):
+        return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+
+    return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+
+
 def _radau_apply_accepted_step_replay_state_pullback_linearized(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3216,23 +3356,17 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     )
     lagged_response_cache_bar = zero_lagged_cache_tangent
     if lagged_response is not None:
-        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
-        stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
-
-        def _stage_evals_from_lagged(lagged_response_value):
-            return jax.vmap(
-                lambda t_eval, y_eval: _radau_eval_rhs(
-                    t_eval,
-                    y_eval,
-                    lagged_response_value,
-                    physics_context.flat_rhs,
-                    physics_context.flat_rhs_with_lagged_response,
-                ),
-                in_axes=(0, 0),
-            )(stage_times, stage_states)
-
-        _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
-        (lagged_response_bar,) = lagged_pullback(stage_rhs_bar)
+        stage_eval_fn = _radau_stage_evals_from_lagged_factory(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+        )
+        lagged_response_bar = _radau_lagged_response_pullback_dispatch(
+            stage_eval_fn,
+            lagged_response,
+            stage_rhs_bar,
+        )
 
         def _reuse_case(_):
             return (

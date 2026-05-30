@@ -4901,3 +4901,92 @@ Latest transport reverse diagnosis update
     pullback can attach there
   - then build the accepted-step reverse from the same approximate
     implicit-diff philosophy already used for the forward JVP
+
+Latest lagged-response reverse diagnosis and plan
+
+- Forward mode already treats lagged response explicitly rather than as one
+  giant black-box object.
+- In `NEOPAX/_transport_solvers.py`, the forward accepted-step tangent splits
+  lagged-response handling into:
+  - reuse vs rebuild of the cache
+  - separate tangent propagation through `build_lagged_response(...)`
+  - separate `lagged_eval_tangent` through
+    `evaluate_with_lagged_response(...)`
+
+- This means the correct reverse path must mirror the same compressed
+  contract.
+- The current reverse is still too generic in the lagged-response block of
+  `_radau_apply_accepted_step_replay_state_pullback_linearized(...)` because
+  it uses broad VJPs like:
+  - `jax.vjp(_stage_evals_from_lagged, lagged_response)`
+  - `jax.vjp(_build_from_flat, carry_in.y)`
+
+- That generic lagged-response VJP appears to be the main reason the reverse
+  path now blows memory back up to very large allocations once the missing
+  lagged-response adjoint terms are restored.
+
+- NTX-side inspection confirms that there is already local derivative support
+  we should reuse:
+  - `NTX/src/ntx/_solver_prepared.py`
+    - `solve_prepared_coefficient_vector_vjp(...)`
+  - `NTX/src/ntx/_solver_adjoint.py`
+    - explicit adjoint helper algebra
+  - `NTX/tests/test_solver.py`
+    - test that the custom VJP matches direct forward value and gradient
+
+- NEOPAX NTX lagged-response objects are already compressed:
+  - `NTXInterpolatedMomentResponse`
+  - `NTXPreparedCoefficientResponse`
+  - `NTXExactLijLaggedResponse`
+  - and `CombinedTransportLaggedResponse` at the model-composition level
+
+- This strongly suggests the reverse should not VJP through the entire
+  lagged-response object.
+- Instead it should use model-aware pullbacks, especially for NTX.
+
+Reverse redesign plan
+
+- 1. Keep the current checkpointed exact discrete outer replay.
+- 2. Keep the explicit accepted-step reverse boundary.
+- 3. Replace the generic lagged-response reverse with branch-aware handling:
+  - cache reused
+  - cache rebuilt
+- 4. For rebuild:
+  - reverse `build_lagged_response(state)` in a model-aware way
+  - for NTX exact mode, prefer the NTX `custom_vjp` derivative lane rather
+    than raw direct reverse AD
+- 5. For reuse:
+  - implement reduced pullbacks for the actual cached response types
+  - first target:
+    - `NTXInterpolatedMomentResponse`
+  - then:
+    - `NTXPreparedCoefficientResponse`
+    - `JVPTransportFluxResponse`
+    - `CombinedTransportLaggedResponse`
+- 6. Make `CombinedTransportLaggedResponse` reverse recursive by submodel
+  rather than one big object VJP.
+- 7. Keep validation narrow until the lagged-response reverse is model-aware:
+  - one-row benchmark first
+  - then compare against forward
+  - only then widen to more objectives and remove debug narrowing
+
+Implementation order
+
+- add a lagged-response pullback dispatch helper by response type
+- implement `NTXInterpolatedMomentResponse` reverse first
+- implement `CombinedTransportLaggedResponse` recursive dispatch
+- hook dispatch into
+  `_radau_apply_accepted_step_replay_state_pullback_linearized(...)`
+- then decide whether the NTX rebuild branch also needs stronger forced
+  `custom_vjp` plumbing in the exact-mode setup
+
+Architectural conclusion
+
+- The right architecture is:
+  - checkpointed exact discrete outer replay
+  - plus model-aware local reverse rules for lagged-response objects
+- not:
+  - full generic reverse AD through the entire lagged-response cache
+
+- This is also the closest match to how the forward accepted-step tangent
+  already treats lagged response.
