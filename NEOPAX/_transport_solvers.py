@@ -3126,18 +3126,26 @@ def _radau_accepted_step_y_tangent_from_primal_linearized(
     return accepted_y, accepted_y_tangent
 
 
-def _radau_apply_accepted_step_y_pullback_linearized(
+def _radau_apply_accepted_step_replay_state_pullback_linearized(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     attempt_context: _RadauAcceptedStepAttemptContext,
-    accepted_y_bar,
+    replay_state_bar: _RadauReplayState,
 ) -> _RadauAcceptedStepCarry:
-    """First explicit local pullback candidate for the accepted-step `accepted_y` map.
+    """Explicit local pullback for the replay-state boundary used by accepted-step replay.
 
     This avoids reverse AD through the raw accepted-step primal step. Instead it
-    transposes the same reduced approximate tangent model already used by the
-    forward accepted-step JVP.
+    pulls back the forward-active replay-state outputs that the accepted-step
+    replay actually threads across steps:
+    - `t`
+    - `y`
+    - `prev_stages`
+    - `lagged_reference_y`
+
+    Other replay-state leaves are either frozen by the realized schedule or
+    zero-tangent in the accepted-step forward JVP and therefore do not
+    contribute here.
     """
     primal_result = _execute_radau_accepted_step_attempt(
         kernel_context,
@@ -3146,7 +3154,7 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         attempt_context,
     )
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
-    accepted_y_bar = jnp.asarray(accepted_y_bar, dtype=kernel_context.dtype)
+    accepted_y_bar = jnp.asarray(replay_state_bar.y, dtype=kernel_context.dtype)
     if physics_context.project_flat is None:
         trial_y_bar = accepted_y_bar
     else:
@@ -3183,6 +3191,10 @@ def _radau_apply_accepted_step_y_pullback_linearized(
         * kernel_context.b[:, None]
         * trial_y_bar[None, :]
     )
+    dz_stages_bar = dz_stages_bar + jnp.asarray(
+        replay_state_bar.prev_stages,
+        dtype=kernel_context.dtype,
+    ).reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_rhs_bar = _radau_apply_stage_linear_solve_transpose(
         kernel_context,
         rhs_bar=dz_stages_bar.reshape((-1,)),
@@ -3198,11 +3210,22 @@ def _radau_apply_accepted_step_y_pullback_linearized(
     stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
     dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
     carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
-    return dataclasses.replace(
+    lagged_reference_y_bar = jnp.asarray(
+        replay_state_bar.lagged_reference_y,
+        dtype=kernel_context.dtype,
+    )
+    carry_bar = dataclasses.replace(
         carry_bar,
+        t=jnp.asarray(replay_state_bar.t, dtype=kernel_context.dtype),
         y=dy_bar,
         dt=dh_bar,
         lagged_response_cache=zero_lagged_cache_tangent,
+    )
+    return jax.lax.cond(
+        carry_in.lagged_response_valid,
+        lambda cb: dataclasses.replace(cb, lagged_reference_y=lagged_reference_y_bar),
+        lambda cb: dataclasses.replace(cb, y=cb.y + lagged_reference_y_bar),
+        carry_bar,
     )
 
 
@@ -5962,14 +5985,14 @@ def _radau_replay_realized_accepted_carry_pullback(
                 _radau_carry_with_forward_only_jvp_fields(carry_after)
             )
 
-        if replay_output_diagnostic == "y":
+        if replay_output_diagnostic in {None, "y"}:
             carry_before = _carry_from_payload(step_xs)
-            carry_before_bar = _radau_apply_accepted_step_y_pullback_linearized(
+            carry_before_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
                 execution_context.kernel_context,
                 execution_context.physics_context,
                 carry_before,
                 execution_context.attempt_context,
-                replay_state_cotangent.y,
+                replay_state_cotangent,
             )
             replay_state_before_bar = _radau_replay_state_from_carry(carry_before_bar)
         else:
