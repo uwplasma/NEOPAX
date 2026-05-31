@@ -62,7 +62,6 @@ from NEOPAX._transport_solvers import (
     _radau_apply_accepted_step_replay_state_pullback_linearized,
     _radau_accepted_step_y_tangent_from_primal_linearized,
     _radau_carry_from_step_state,
-    _radau_carry_to_replay_state,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
@@ -70,6 +69,7 @@ from NEOPAX._transport_solvers import (
     _radau_eval_rhs,
     _radau_extract_tangent_inputs_from_carry,
     _radau_prepare_lagged_response,
+    _radau_replay_state_from_carry,
     _radau_stage_residual,
     _execute_radau_accepted_step_attempt,
     _execute_radau_accepted_step_attempt_autodiff,
@@ -830,7 +830,7 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
             carry_with_forward_only_fields,
             execution_context.attempt_context,
         )
-        zero_replay_bar = _zero_optional_pytree(_radau_carry_to_replay_state(initial_carry))
+        zero_replay_bar = _zero_optional_pytree(_radau_replay_state_from_carry(initial_carry))
         local_replay_bar = dataclasses.replace(
             zero_replay_bar,
             y=final_y_bar,
