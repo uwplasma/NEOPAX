@@ -665,6 +665,39 @@ def _tree_vdot(lhs, rhs):
     )
 
 
+def _initial_carry_vdot_leaf_filter() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_INITIAL_CARRY_LEAF")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _zero_initial_carry_optional_pytree(tree):
+    if tree is None:
+        return None
+
+    def _zero_leaf(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    return jax.tree_util.tree_map(_zero_leaf, tree)
+
+
+def _select_initial_carry_leaf(carry, selected_leaf: str | None):
+    if selected_leaf is None:
+        return carry
+    zeroed = jax.tree_util.tree_map(_zero_initial_carry_optional_pytree, carry)
+    if not hasattr(carry, selected_leaf):
+        raise ValueError(f"Unknown initial carry leaf '{selected_leaf}'.")
+    return dataclasses.replace(
+        zeroed,
+        **{selected_leaf: getattr(carry, selected_leaf)},
+    )
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
 def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(
     parameter_values,
@@ -764,6 +797,8 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
 
     _, carry_pullback = jax.vjp(_final_y_from_carry, initial_carry)
     (carry0_bar,) = carry_pullback(final_y_bar)
+    selected_carry_leaf = _initial_carry_vdot_leaf_filter()
+    carry0_bar_for_vdot = _select_initial_carry_leaf(carry0_bar, selected_carry_leaf)
 
     def _carry0_from_parameter_values(values):
         state_values = _parameterized_initial_state_multi(
@@ -792,7 +827,8 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
             (parameter_values,),
             (basis,),
         )
-        grad_entries.append(_tree_vdot(carry0_tangent, carry0_bar))
+        carry0_tangent_for_vdot = _select_initial_carry_leaf(carry0_tangent, selected_carry_leaf)
+        grad_entries.append(_tree_vdot(carry0_tangent_for_vdot, carry0_bar_for_vdot))
     parameter_bar = jnp.stack(grad_entries)
     return (parameter_bar,)
 
