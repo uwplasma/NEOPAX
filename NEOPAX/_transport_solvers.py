@@ -6222,6 +6222,7 @@ def _radau_replay_realized_accepted_final_y_pullback(
 
 def _radau_replay_realized_accepted_carry_pullback(
     execution_context: _RadauSolveExecutionContext,
+    segment_index,
     carry0: _RadauAcceptedStepCarry,
     accepted_active_mask,
     accepted_dts,
@@ -6255,7 +6256,10 @@ def _radau_replay_realized_accepted_carry_pullback(
     replay_leaf_diagnostic = _radau_replay_leaf_diagnostic_name()
     replay_output_diagnostic = _radau_replay_output_diagnostic_mode()
     use_primal_step_diagnostic = _radau_replay_use_primal_step_diagnostic()
+    replay_segment_detail_diagnostic = _radau_replay_segment_detail_diagnostic()
+    replay_segment_diagnostic_max_index = _radau_replay_segment_diagnostic_max_index()
     xs = (
+        jnp.arange(accepted_active_mask.shape[0], dtype=jnp.int32),
         accepted_active_mask,
         accepted_dts,
         payload_t_start,
@@ -6288,6 +6292,7 @@ def _radau_replay_realized_accepted_carry_pullback(
     zero_easy_growth_streak = jnp.zeros_like(carry0.easy_growth_streak)
     def _carry_from_payload(step_xs):
         (
+            _step_index,
             _active,
             dt_value,
             t_start_value,
@@ -6343,6 +6348,7 @@ def _radau_replay_realized_accepted_carry_pullback(
 
     def _step(carry, step_xs):
         (
+            _step_index,
             active,
             dt_value,
             _t_start_value,
@@ -6425,6 +6431,7 @@ def _radau_replay_realized_accepted_carry_pullback(
 
     def _reverse_body(replay_state_cotangent, inputs):
         step_xs = inputs
+        step_index = step_xs[0]
         replay_state_cotangent = _radau_select_replay_state_leaf(
             replay_state_cotangent,
             replay_leaf_diagnostic,
@@ -6433,6 +6440,7 @@ def _radau_replay_realized_accepted_carry_pullback(
 
         def _step_replay_state(replay_state):
             (
+                _step_index,
                 _active,
                 dt_value,
                 _t_start_value,
@@ -6494,6 +6502,29 @@ def _radau_replay_realized_accepted_carry_pullback(
         else:
             _, pullback = jax.vjp(_step_replay_state, replay_state_before)
             (replay_state_before_bar,) = pullback(replay_state_cotangent)
+
+        if replay_segment_detail_diagnostic:
+            def _print_step_detail(_):
+                jax.debug.print(
+                    "[autodiff-gate] replay-step-detail seg={seg} step={step} "
+                    "replay_y_bar_l2_before={replay_before_l2:.6e} "
+                    "replay_y_bar_l2_after={replay_after_l2:.6e} "
+                    "carry_before_bar_y_l2={carry_y_l2:.6e}",
+                    seg=segment_index,
+                    step=step_index,
+                    replay_before_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
+                    replay_after_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_before_bar.y, dtype=dtype))),
+                    carry_y_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_before_bar.y, dtype=dtype))),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                segment_index <= replay_segment_diagnostic_max_index,
+                _print_step_detail,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         return replay_state_before_bar, None
 
     replay_state0_bar, _ = jax.lax.scan(
@@ -7486,6 +7517,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         )
         carry_before_bar = _radau_replay_realized_accepted_carry_pullback(
             execution_context,
+            segment_index,
             checkpoint_carry,
             segment_active_mask,
             segment_attempted_dts,
