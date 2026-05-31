@@ -59,12 +59,16 @@ from NEOPAX._transport_solvers import (
     _radau_adaptive_final_y_realized_schedule,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_apply_accepted_step_map,
+    _radau_apply_accepted_step_replay_state_pullback_linearized,
+    _radau_accepted_step_y_tangent_from_primal_linearized,
     _radau_carry_from_step_state,
+    _radau_carry_to_replay_state,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
     _radau_dt_sequence_from_time_list,
     _radau_eval_rhs,
+    _radau_extract_tangent_inputs_from_carry,
     _radau_prepare_lagged_response,
     _radau_stage_residual,
     _execute_radau_accepted_step_attempt,
@@ -699,6 +703,23 @@ def _select_initial_carry_leaf(carry, selected_leaf: str | None):
     )
 
 
+def _local_adjoint_check_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _zero_optional_pytree(tree):
+    if tree is None:
+        return None
+    return jax.tree_util.tree_map(
+        lambda x: None if x is None else jnp.zeros_like(x),
+        tree,
+        is_leaf=lambda x: x is None,
+    )
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
 def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(
     parameter_values,
@@ -800,6 +821,50 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
     (carry0_bar,) = carry_pullback(final_y_bar)
     selected_carry_leaf = _initial_carry_vdot_leaf_filter()
     carry0_bar_for_vdot = _select_initial_carry_leaf(carry0_bar, selected_carry_leaf)
+
+    if _local_adjoint_check_enabled():
+        carry_with_forward_only_fields = _radau_carry_with_forward_only_jvp_fields(initial_carry)
+        primal_attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_with_forward_only_fields,
+            execution_context.attempt_context,
+        )
+        zero_replay_bar = _zero_optional_pytree(_radau_carry_to_replay_state(initial_carry))
+        local_replay_bar = dataclasses.replace(
+            zero_replay_bar,
+            y=final_y_bar,
+        )
+        local_carry_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_with_forward_only_fields,
+            execution_context.attempt_context,
+            local_replay_bar,
+        )
+        local_carry_tangent = _zero_optional_pytree(initial_carry)
+        local_carry_tangent = dataclasses.replace(
+            local_carry_tangent,
+            y=jnp.ones_like(initial_carry.y),
+            dt=jnp.asarray(0.0, dtype=initial_carry.dt.dtype),
+        )
+        _, local_forward_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_with_forward_only_fields,
+            _radau_extract_tangent_inputs_from_carry(local_carry_tangent),
+            primal_attempt_result,
+            allow_zero_shortcut=False,
+            project_output=True,
+        )
+        lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(final_y_bar))
+        rhs = _tree_vdot(local_carry_tangent, local_carry_bar)
+        jax.debug.print(
+            "[autodiff-gate] local-adjoint-check lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
+            lhs=lhs,
+            rhs=rhs,
+            err=jnp.abs(lhs - rhs),
+        )
 
     def _carry0_from_parameter_values(values):
         state_values = _parameterized_initial_state_multi(
