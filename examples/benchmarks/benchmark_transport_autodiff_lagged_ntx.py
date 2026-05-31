@@ -710,6 +710,20 @@ def _local_adjoint_check_enabled() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _rollout_adjoint_check_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_ROLLOUT_ADJOINT_CHECK")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rollout_adjoint_check_basis_index() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_ROLLOUT_ADJOINT_BASIS")
+    if raw_value is None:
+        return 0
+    return max(0, int(raw_value))
+
+
 def _zero_optional_pytree(tree):
     if tree is None:
         return None
@@ -883,6 +897,29 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
             prepared_rollout_static=prepared_rollout,
         )
         return replay_initial_carry
+
+    if _rollout_adjoint_check_enabled():
+        basis_index = min(_rollout_adjoint_check_basis_index(), int(parameter_values.size) - 1)
+        basis = jnp.zeros_like(parameter_values).at[basis_index].set(1.0)
+        _, carry0_tangent_for_rollout = jax.jvp(
+            _carry0_from_parameter_values,
+            (parameter_values,),
+            (basis,),
+        )
+        _, final_y_tangent = jax.jvp(
+            _final_y_from_carry,
+            (initial_carry,),
+            (carry0_tangent_for_rollout,),
+        )
+        rollout_lhs = jnp.vdot(jnp.ravel(final_y_tangent), jnp.ravel(final_y_bar))
+        rollout_rhs = _tree_vdot(carry0_tangent_for_rollout, carry0_bar)
+        jax.debug.print(
+            "[autodiff-gate] rollout-adjoint-check basis={basis} lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
+            basis=jnp.asarray(basis_index),
+            lhs=rollout_lhs,
+            rhs=rollout_rhs,
+            err=jnp.abs(rollout_lhs - rollout_rhs),
+        )
 
     n_params = int(parameter_values.size)
     grad_entries = []
