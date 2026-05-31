@@ -7484,35 +7484,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         )
-        if replay_segment_detail_diagnostic:
-            def _print_segment_detail(_):
-                active_count = jnp.sum(segment_active_mask.astype(jnp.int32))
-                jax.debug.print(
-                    "[autodiff-gate] replay-segment-detail seg={seg} active_steps={active_steps} "
-                    "checkpoint_y_l2={checkpoint_y_l2:.6e} checkpoint_y_max={checkpoint_y_max:.6e} "
-                    "payload_y0_l2={payload_y0_l2:.6e} payload_y0_max={payload_y0_max:.6e} "
-                    "payload_yN_l2={payload_yN_l2:.6e} payload_yN_max={payload_yN_max:.6e} "
-                    "payload_prev_stages0_l2={payload_prev_stages0_l2:.6e} payload_prev_stagesN_l2={payload_prev_stagesN_l2:.6e}",
-                    seg=segment_index,
-                    active_steps=active_count,
-                    checkpoint_y_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
-                    checkpoint_y_max=jnp.max(jnp.abs(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
-                    payload_y0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
-                    payload_y0_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
-                    payload_yN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
-                    payload_yN_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
-                    payload_prev_stages0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[0], dtype=execution_context.dtype))),
-                    payload_prev_stagesN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[-1], dtype=execution_context.dtype))),
-                    ordered=True,
-                )
-                return jnp.asarray(0, dtype=jnp.int32)
-
-            jax.lax.cond(
-                segment_index <= replay_segment_diagnostic_max_index,
-                _print_segment_detail,
-                lambda _: jnp.asarray(0, dtype=jnp.int32),
-                operand=None,
-            )
         carry_before_bar = _radau_replay_realized_accepted_carry_pullback(
             execution_context,
             checkpoint_carry,
@@ -7542,6 +7513,44 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_lagged_response_valid,
             carry_bar,
         )
+        if replay_segment_detail_diagnostic:
+            def _print_segment_detail(_):
+                active_count = jnp.sum(segment_active_mask.astype(jnp.int32))
+                jax.debug.print(
+                    "[autodiff-gate] replay-segment-detail seg={seg} active_steps={active_steps} "
+                    "checkpoint_y_l2={checkpoint_y_l2:.6e} checkpoint_y_max={checkpoint_y_max:.6e} "
+                    "payload_y0_l2={payload_y0_l2:.6e} payload_y0_max={payload_y0_max:.6e} "
+                    "payload_yN_l2={payload_yN_l2:.6e} payload_yN_max={payload_yN_max:.6e} "
+                    "payload_prev_stages0_l2={payload_prev_stages0_l2:.6e} payload_prev_stagesN_l2={payload_prev_stagesN_l2:.6e} "
+                    "carry_bar_prev_stages_l2={carry_prev_l2:.6e} carry_bar_prev_stages_max={carry_prev_max:.6e} "
+                    "carry_before_bar_prev_stages_l2={before_prev_l2:.6e} carry_before_bar_prev_stages_max={before_prev_max:.6e} "
+                    "carry_bar_lagged_ref_l2={carry_lagged_l2:.6e} carry_before_bar_lagged_ref_l2={before_lagged_l2:.6e}",
+                    seg=segment_index,
+                    active_steps=active_count,
+                    checkpoint_y_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
+                    checkpoint_y_max=jnp.max(jnp.abs(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
+                    payload_y0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
+                    payload_y0_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
+                    payload_yN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
+                    payload_yN_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
+                    payload_prev_stages0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[0], dtype=execution_context.dtype))),
+                    payload_prev_stagesN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[-1], dtype=execution_context.dtype))),
+                    carry_prev_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_bar.prev_stages, dtype=execution_context.dtype))),
+                    carry_prev_max=jnp.max(jnp.abs(jnp.asarray(carry_bar.prev_stages, dtype=execution_context.dtype))),
+                    before_prev_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_before_bar.prev_stages, dtype=execution_context.dtype))),
+                    before_prev_max=jnp.max(jnp.abs(jnp.asarray(carry_before_bar.prev_stages, dtype=execution_context.dtype))),
+                    carry_lagged_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_bar.lagged_reference_y, dtype=execution_context.dtype))),
+                    before_lagged_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_before_bar.lagged_reference_y, dtype=execution_context.dtype))),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                segment_index <= replay_segment_diagnostic_max_index,
+                _print_segment_detail,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         return carry_before_bar, None
 
     n_segments = int(segmented_active_mask.shape[0])
