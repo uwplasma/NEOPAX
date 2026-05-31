@@ -5121,3 +5121,46 @@ Current next recommended test
   - whether `carry0_bar.y` itself is already huge
   - or whether the parameter-to-initial-carry `y` tangents are what make the
     final scalar contractions blow up
+
+Latest reverse-segment localization
+
+- Parameter/carry diagnostic result:
+  - `carry0_tangent.y` is ordinary size for all four basis parameters
+  - `carry0_bar.y` is already enormous:
+    - `carry0_bar_y_l2=1.463782e+33`
+    - `carry0_bar_y_max=7.577226e+32`
+  - conclusion:
+    - the blow-up is in the rollout cotangent itself
+    - not in the parameter-to-initial-carry tangent map
+
+- Added env in `NEOPAX/_transport_solvers.py`:
+  - `NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC=1`
+  - purpose:
+    - print `||replay_state_bar.y||` and `max(abs(...))` before and after each
+      reverse segment in `_radau_adaptive_final_y_realized_schedule_vjp_bwd`
+
+- Run:
+  - command:
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+
+- Decisive result:
+  - for segments `312` down through `3`, the replay-state `y` cotangent stays
+    exactly at:
+    - `l2 = 1.0`
+    - `max = 1.0`
+  - first blow-up occurs only at the initial segments:
+    - `seg=2`:
+      - after: `l2=5.638296e+21`, `max=2.882411e+21`
+    - `seg=1`:
+      - after: `l2=4.333196e+26`, `max=1.972291e+26`
+    - `seg=0`:
+      - after: `l2=1.463782e+33`, `max=7.577226e+32`
+
+- Strong updated conclusion:
+  - the instability is highly localized
+  - it is not a gradual accumulation across the whole replay
+  - it enters in the first few reverse segments near the initial carry
+  - next debugging should focus specifically on segment `0-2`, especially:
+    - payload reconstruction there
+    - `_radau_replay_realized_accepted_carry_pullback(...)`
+    - the way replay-state bars are threaded across those earliest segments

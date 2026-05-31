@@ -283,3 +283,57 @@ Purpose:
 ```bash
 NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK=1 NEOPAX_TRANSPORT_REVERSE_PARAMETER_CARRY_DIAGNOSTIC=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
 ```
+
+### New localization result
+
+#### Parameter/carry diagnostic
+Run with:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK=1 NEOPAX_TRANSPORT_REVERSE_PARAMETER_CARRY_DIAGNOSTIC=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Result:
+- `carry0_tangent.y` stays ordinary-sized for all parameter bases
+- `carry0_bar.y` is already huge:
+  - `carry0_bar_y_l2=1.463782e+33`
+  - `carry0_bar_y_max=7.577226e+32`
+
+Conclusion:
+- the blow-up is in the rollout cotangent itself
+- not in the parameter-to-initial-carry tangent map
+
+#### Replay segment diagnostic
+Added env:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC=1
+```
+
+Run with:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Decisive result:
+- for reverse segments `312` down through `3`, replay-state `y` cotangent stays
+  exactly at:
+  - `l2 = 1.0`
+  - `max = 1.0`
+- blow-up begins only in the first few reverse segments:
+  - `seg=2`:
+    - after: `l2=5.638296e+21`, `max=2.882411e+21`
+  - `seg=1`:
+    - after: `l2=4.333196e+26`, `max=1.972291e+26`
+  - `seg=0`:
+    - after: `l2=1.463782e+33`, `max=7.577226e+32`
+
+Updated conclusion:
+- the instability is highly localized
+- it is not a diffuse accumulation over the whole replay
+- the next debugging target should be the earliest reverse segments only,
+  especially:
+  - payload reconstruction in segment `0-2`
+  - `_radau_replay_realized_accepted_carry_pullback(...)`
+  - how replay-state bars are threaded across those first segments
