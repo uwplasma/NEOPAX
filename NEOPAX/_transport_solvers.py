@@ -2580,6 +2580,14 @@ def _radau_replay_segment_detail_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_local_pullback_diagnostic() -> bool:
+    """Optional reverse diagnostic: print local y-pullback intermediates for early segments."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_LOCAL_PULLBACK_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -3533,6 +3541,9 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     carry_in: _RadauAcceptedStepCarry,
     attempt_context: _RadauAcceptedStepAttemptContext,
     replay_state_bar: _RadauReplayState,
+    *,
+    diagnostic_segment_index=None,
+    diagnostic_step_index=None,
 ) -> _RadauAcceptedStepCarry:
     """Explicit local pullback for the replay-state boundary used by accepted-step replay.
 
@@ -3610,6 +3621,39 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
     stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
     dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
+
+    if (
+        _radau_replay_local_pullback_diagnostic()
+        and diagnostic_segment_index is not None
+        and diagnostic_step_index is not None
+    ):
+        def _print_local_pullback(_):
+            jax.debug.print(
+                "[autodiff-gate] local-pullback-detail seg={seg} step={step} "
+                "trial_y_bar_l2={trial_l2:.6e} dz_stages_bar_l2={dz_l2:.6e} "
+                "stage_rhs_bar_l2={rhs_l2:.6e} stage_rhs_bar_max={rhs_max:.6e} "
+                "jacobian_l2={jac_l2:.6e} jacobian_max={jac_max:.6e} "
+                "dy_bar_l2={dy_l2:.6e} dy_bar_max={dy_max:.6e}",
+                seg=diagnostic_segment_index,
+                step=diagnostic_step_index,
+                trial_l2=jnp.linalg.norm(jnp.ravel(trial_y_bar)),
+                dz_l2=jnp.linalg.norm(jnp.ravel(dz_stages_bar)),
+                rhs_l2=jnp.linalg.norm(jnp.ravel(stage_rhs_bar)),
+                rhs_max=jnp.max(jnp.abs(stage_rhs_bar)),
+                jac_l2=jnp.linalg.norm(jnp.ravel(jacobian_ref)),
+                jac_max=jnp.max(jnp.abs(jacobian_ref)),
+                dy_l2=jnp.linalg.norm(jnp.ravel(dy_bar)),
+                dy_max=jnp.max(jnp.abs(dy_bar)),
+                ordered=True,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            jnp.asarray(diagnostic_segment_index <= _radau_replay_segment_diagnostic_max_index()),
+            _print_local_pullback,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
 
     lagged_reference_y_bar = jnp.asarray(
         replay_state_bar.lagged_reference_y,
@@ -6497,6 +6541,8 @@ def _radau_replay_realized_accepted_carry_pullback(
                 carry_before,
                 execution_context.attempt_context,
                 replay_state_cotangent,
+                diagnostic_segment_index=segment_index,
+                diagnostic_step_index=step_index,
             )
             replay_state_before_bar = _radau_replay_state_from_carry(carry_before_bar)
         else:
