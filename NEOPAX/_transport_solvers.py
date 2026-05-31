@@ -2553,6 +2553,14 @@ def _radau_replay_force_reuse_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_segment_diagnostic() -> bool:
+    """Optional reverse diagnostic: print replay-state y norm per reverse segment."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -7430,6 +7438,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         _radau_replay_state_from_carry(jax.tree_util.tree_map(lambda x: x[0], checkpoint_carries)),
     )
     final_replay_state_bar = dataclasses.replace(final_replay_state_bar, y=final_y_bar)
+    replay_segment_diagnostic = _radau_replay_segment_diagnostic()
 
     def _reverse_segment(carry_bar, inputs):
         (
@@ -7488,6 +7497,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     def _reverse_loop_body(i, carry_bar):
         idx = n_segments - 1 - i
+        carry_bar_y_before = jnp.asarray(carry_bar.y, dtype=execution_context.dtype)
         inputs = (
             jax.tree_util.tree_map(lambda x: x[idx], checkpoint_carries),
             segmented_active_mask[idx],
@@ -7499,6 +7509,19 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segmented_next_lagged_response_valid[idx],
         )
         carry_before_bar, _ = _reverse_segment(carry_bar, inputs)
+        if replay_segment_diagnostic:
+            carry_bar_y_after = jnp.asarray(carry_before_bar.y, dtype=execution_context.dtype)
+            jax.debug.print(
+                "[autodiff-gate] replay-segment-check seg={seg} "
+                "y_bar_l2_before={l2_before:.6e} y_bar_max_before={max_before:.6e} "
+                "y_bar_l2_after={l2_after:.6e} y_bar_max_after={max_after:.6e}",
+                seg=idx,
+                l2_before=jnp.linalg.norm(jnp.ravel(carry_bar_y_before)),
+                max_before=jnp.max(jnp.abs(carry_bar_y_before)),
+                l2_after=jnp.linalg.norm(jnp.ravel(carry_bar_y_after)),
+                max_after=jnp.max(jnp.abs(carry_bar_y_after)),
+                ordered=True,
+            )
         return carry_before_bar
 
     replay_state0_bar = jax.lax.fori_loop(
