@@ -7463,6 +7463,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     def _reverse_segment(carry_bar, inputs):
         (
+            segment_index,
             checkpoint_carry,
             segment_active_mask,
             segment_attempted_dts,
@@ -7483,7 +7484,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         )
-        if replay_segment_detail_diagnostic and idx <= replay_segment_diagnostic_max_index:
+        if replay_segment_detail_diagnostic and segment_index <= replay_segment_diagnostic_max_index:
             active_count = jnp.sum(segment_active_mask.astype(jnp.int32))
             jax.debug.print(
                 "[autodiff-gate] replay-segment-detail seg={seg} active_steps={active_steps} "
@@ -7491,7 +7492,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 "payload_y0_l2={payload_y0_l2:.6e} payload_y0_max={payload_y0_max:.6e} "
                 "payload_yN_l2={payload_yN_l2:.6e} payload_yN_max={payload_yN_max:.6e} "
                 "payload_prev_stages0_l2={payload_prev_stages0_l2:.6e} payload_prev_stagesN_l2={payload_prev_stagesN_l2:.6e}",
-                seg=idx,
+                seg=segment_index,
                 active_steps=active_count,
                 checkpoint_y_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
                 checkpoint_y_max=jnp.max(jnp.abs(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
@@ -7540,6 +7541,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         idx = n_segments - 1 - i
         carry_bar_y_before = jnp.asarray(carry_bar.y, dtype=execution_context.dtype)
         inputs = (
+            idx,
             jax.tree_util.tree_map(lambda x: x[idx], checkpoint_carries),
             segmented_active_mask[idx],
             segmented_attempted_dts[idx],
