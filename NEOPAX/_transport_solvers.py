@@ -7521,18 +7521,28 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segmented_next_lagged_response_valid[idx],
         )
         carry_before_bar, _ = _reverse_segment(carry_bar, inputs)
-        if replay_segment_diagnostic and idx <= replay_segment_diagnostic_max_index:
+        if replay_segment_diagnostic:
             carry_bar_y_after = jnp.asarray(carry_before_bar.y, dtype=execution_context.dtype)
-            jax.debug.print(
-                "[autodiff-gate] replay-segment-check seg={seg} "
-                "y_bar_l2_before={l2_before:.6e} y_bar_max_before={max_before:.6e} "
-                "y_bar_l2_after={l2_after:.6e} y_bar_max_after={max_after:.6e}",
-                seg=idx,
-                l2_before=jnp.linalg.norm(jnp.ravel(carry_bar_y_before)),
-                max_before=jnp.max(jnp.abs(carry_bar_y_before)),
-                l2_after=jnp.linalg.norm(jnp.ravel(carry_bar_y_after)),
-                max_after=jnp.max(jnp.abs(carry_bar_y_after)),
-                ordered=True,
+
+            def _print_segment(_):
+                jax.debug.print(
+                    "[autodiff-gate] replay-segment-check seg={seg} "
+                    "y_bar_l2_before={l2_before:.6e} y_bar_max_before={max_before:.6e} "
+                    "y_bar_l2_after={l2_after:.6e} y_bar_max_after={max_after:.6e}",
+                    seg=idx,
+                    l2_before=jnp.linalg.norm(jnp.ravel(carry_bar_y_before)),
+                    max_before=jnp.max(jnp.abs(carry_bar_y_before)),
+                    l2_after=jnp.linalg.norm(jnp.ravel(carry_bar_y_after)),
+                    max_after=jnp.max(jnp.abs(carry_bar_y_after)),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                idx <= replay_segment_diagnostic_max_index,
+                _print_segment,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
             )
         return carry_before_bar
 
