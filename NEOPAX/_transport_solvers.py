@@ -2572,6 +2572,14 @@ def _radau_replay_segment_diagnostic_max_index() -> int:
         return 2
 
 
+def _radau_replay_segment_detail_diagnostic() -> bool:
+    """Optional reverse diagnostic: print payload/checkpoint details for early segments."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SEGMENT_DETAIL_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -7451,6 +7459,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     final_replay_state_bar = dataclasses.replace(final_replay_state_bar, y=final_y_bar)
     replay_segment_diagnostic = _radau_replay_segment_diagnostic()
     replay_segment_diagnostic_max_index = _radau_replay_segment_diagnostic_max_index()
+    replay_segment_detail_diagnostic = _radau_replay_segment_detail_diagnostic()
 
     def _reverse_segment(carry_bar, inputs):
         (
@@ -7474,6 +7483,26 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         )
+        if replay_segment_detail_diagnostic and idx <= replay_segment_diagnostic_max_index:
+            active_count = jnp.sum(segment_active_mask.astype(jnp.int32))
+            jax.debug.print(
+                "[autodiff-gate] replay-segment-detail seg={seg} active_steps={active_steps} "
+                "checkpoint_y_l2={checkpoint_y_l2:.6e} checkpoint_y_max={checkpoint_y_max:.6e} "
+                "payload_y0_l2={payload_y0_l2:.6e} payload_y0_max={payload_y0_max:.6e} "
+                "payload_yN_l2={payload_yN_l2:.6e} payload_yN_max={payload_yN_max:.6e} "
+                "payload_prev_stages0_l2={payload_prev_stages0_l2:.6e} payload_prev_stagesN_l2={payload_prev_stagesN_l2:.6e}",
+                seg=idx,
+                active_steps=active_count,
+                checkpoint_y_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
+                checkpoint_y_max=jnp.max(jnp.abs(jnp.asarray(checkpoint_carry.y, dtype=execution_context.dtype))),
+                payload_y0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
+                payload_y0_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[0], dtype=execution_context.dtype))),
+                payload_yN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
+                payload_yN_max=jnp.max(jnp.abs(jnp.asarray(payloads.y_start[-1], dtype=execution_context.dtype))),
+                payload_prev_stages0_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[0], dtype=execution_context.dtype))),
+                payload_prev_stagesN_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(payloads.prev_stages[-1], dtype=execution_context.dtype))),
+                ordered=True,
+            )
         carry_before_bar = _radau_replay_realized_accepted_carry_pullback(
             execution_context,
             checkpoint_carry,
