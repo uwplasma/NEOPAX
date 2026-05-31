@@ -2545,6 +2545,14 @@ def _radau_replay_use_primal_step_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_force_reuse_diagnostic() -> bool:
+    """Optional reverse diagnostic: bypass rebuild-branch pullback in local replay."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -3665,12 +3673,15 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
             dy_extra = y_from_lagged_bar + lagged_reference_y_bar
             return zero_lagged_cache_tangent, _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
 
-        lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = jax.lax.cond(
-            carry_in.lagged_response_valid,
-            _reuse_case,
-            _rebuild_case,
-            operand=None,
-        )
+        if _radau_replay_force_reuse_diagnostic():
+            lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = _reuse_case(None)
+        else:
+            lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = jax.lax.cond(
+                carry_in.lagged_response_valid,
+                _reuse_case,
+                _rebuild_case,
+                operand=None,
+            )
         dy_bar = dy_bar + dy_extra
     else:
         lagged_reference_y_out_bar = _radau_zero_cotangent_like(carry_in.lagged_reference_y)
