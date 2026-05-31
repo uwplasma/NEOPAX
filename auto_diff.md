@@ -4990,3 +4990,134 @@ Architectural conclusion
 
 - This is also the closest match to how the forward accepted-step tangent
   already treats lagged response.
+
+Latest decisive diagnostics
+
+- Reuse-only narrowed reverse removes the giant OOM:
+  - command:
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+  - result:
+    - memory dropped from about `145 GiB` to about `4.23 GiB`
+    - run completed
+    - reverse values still absurd:
+      - `n0: -8.216707e+31`
+      - `T0: 5.389379e+31`
+      - `density_shape_power: -9.917097e+29`
+      - `temperature_shape_power: 1.692342e+32`
+
+- Conclusion from that run:
+  - the dominant memory blocker is the rebuild-branch reverse
+  - the reuse-only path is not the source of the giant OOM
+  - correctness is still wrong even when the reuse-only path runs
+
+- Initial-carry leaf filter diagnostics were added in
+  `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py`:
+  - env:
+    `NEOPAX_TRANSPORT_REVERSE_INITIAL_CARRY_LEAF`
+  - purpose:
+    - filter the final benchmark contraction
+      `carry0_tangent • carry0_bar`
+      to one initial-carry leaf at a time
+
+- `y`-only initial-carry contraction:
+  - command:
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_INITIAL_CARRY_LEAF=y python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+  - result:
+    - same absurd values as the full reuse-only contraction
+  - conclusion:
+    - the bad signal is already present in the `y` contribution
+
+- `lagged_response_cache`-only initial-carry contraction:
+  - command:
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_INITIAL_CARRY_LEAF=lagged_response_cache python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+  - result:
+    - all reported sensitivities were exactly zero
+  - conclusion:
+    - the absurd reverse values are not coming from the final
+      `lagged_response_cache` carry contraction
+
+Local adjoint consistency diagnostics
+
+- Added env:
+  `NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK=1`
+  in `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py`
+
+- This diagnostic checks the local reuse-only accepted-step adjoint consistency
+  against the forward approximate tangent map:
+  - compares
+    `⟨J v, w⟩`
+    vs
+    `⟨v, J^T w⟩`
+  - at the local accepted-step replay-state boundary
+
+- Run:
+  - command:
+    `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+  - result:
+    - `[autodiff-gate] local-adjoint-check lhs=1.074419e-01 rhs=1.074419e-01 abs_err=1.537659e-14`
+  - conclusion:
+    - the local reuse-only accepted-step `y -> accepted_y` pullback is
+      internally consistent
+    - the core one-step local reverse is probably not the source of the
+      `1e31` scale explosion
+
+Rollout-level adjoint diagnostic attempt
+
+- Added env:
+  - `NEOPAX_TRANSPORT_REVERSE_ROLLOUT_ADJOINT_CHECK=1`
+  - optional:
+    `NEOPAX_TRANSPORT_REVERSE_ROLLOUT_ADJOINT_BASIS=<int>`
+
+- Purpose:
+  - check adjoint consistency one layer outward at the full
+    `carry -> final_y` realized-schedule boundary
+
+- Result:
+  - this diagnostic is currently too expensive
+  - it uses `jax.jvp(_final_y_from_carry, ...)`
+  - the run OOMed at about `2.84 GiB` extra allocation while building
+    checkpoint carries in `_radau_replay_realized_checkpoint_carries(...)`
+
+- Important interpretation:
+  - this OOM is from the diagnostic itself, not a new solver regression
+  - it means rollout-level forward-mode probing through the replayed rollout is
+    too expensive for routine use here
+
+Cheaper parameter/carry diagnostic
+
+- Added env:
+  `NEOPAX_TRANSPORT_REVERSE_PARAMETER_CARRY_DIAGNOSTIC=1`
+
+- Purpose:
+  - print cheap quantities already available in the backward pass:
+    - `||carry0_bar.y||`
+    - `max(abs(carry0_bar.y))`
+    - `||carry0_tangent.y||` for each parameter basis
+    - `max(abs(carry0_tangent.y))`
+    - `vdot(carry0_tangent.y, carry0_bar.y)`
+  - this should help distinguish:
+    - huge rollout cotangent `carry0_bar.y`
+    - vs a bad parameter-to-initial-carry tangent
+
+Current best diagnosis
+
+- Giant memory OOM:
+  - still due to the rebuild-branch reverse being traced in the normal narrowed
+    reverse
+- Wrong huge gradients:
+  - not due to the final `lagged_response_cache` contraction
+  - not obviously due to the local accepted-step reuse-only pullback, since the
+    local adjoint check passes to `1e-14`
+  - most likely live one layer outward:
+    - in the outer realized-schedule reverse accumulation
+    - or in the parameter-to-initial-carry tangent / contraction layer
+
+Current next recommended test
+
+- command:
+  `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_LOCAL_ADJOINT_CHECK=1 NEOPAX_TRANSPORT_REVERSE_PARAMETER_CARRY_DIAGNOSTIC=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0`
+
+- what it should tell us:
+  - whether `carry0_bar.y` itself is already huge
+  - or whether the parameter-to-initial-carry `y` tangents are what make the
+    final scalar contractions blow up

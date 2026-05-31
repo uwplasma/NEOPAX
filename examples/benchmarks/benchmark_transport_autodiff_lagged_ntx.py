@@ -724,6 +724,13 @@ def _rollout_adjoint_check_basis_index() -> int:
     return max(0, int(raw_value))
 
 
+def _parameter_carry_diagnostic_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_PARAMETER_CARRY_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _zero_optional_pytree(tree):
     if tree is None:
         return None
@@ -923,6 +930,9 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
 
     n_params = int(parameter_values.size)
     grad_entries = []
+    carry0_bar_y = jnp.asarray(carry0_bar.y, dtype=jnp.float64)
+    carry0_bar_y_l2 = jnp.linalg.norm(jnp.ravel(carry0_bar_y))
+    carry0_bar_y_max = jnp.max(jnp.abs(carry0_bar_y))
     for idx in range(n_params):
         basis = jnp.zeros_like(parameter_values).at[idx].set(1.0)
         _, carry0_tangent = jax.jvp(
@@ -931,6 +941,21 @@ def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
             (basis,),
         )
         carry0_tangent_for_vdot = _select_initial_carry_leaf(carry0_tangent, selected_carry_leaf)
+        if _parameter_carry_diagnostic_enabled():
+            carry0_tangent_y = jnp.asarray(carry0_tangent.y, dtype=jnp.float64)
+            y_leaf_vdot = jnp.vdot(jnp.ravel(carry0_tangent_y), jnp.ravel(carry0_bar_y))
+            jax.debug.print(
+                "[autodiff-gate] parameter-carry-check basis={basis} "
+                "carry0_bar_y_l2={bar_l2:.6e} carry0_bar_y_max={bar_max:.6e} "
+                "carry0_tangent_y_l2={tan_l2:.6e} carry0_tangent_y_max={tan_max:.6e} "
+                "y_leaf_vdot={y_vdot:.6e}",
+                basis=jnp.asarray(idx),
+                bar_l2=carry0_bar_y_l2,
+                bar_max=carry0_bar_y_max,
+                tan_l2=jnp.linalg.norm(jnp.ravel(carry0_tangent_y)),
+                tan_max=jnp.max(jnp.abs(carry0_tangent_y)),
+                y_vdot=y_leaf_vdot,
+            )
         grad_entries.append(_tree_vdot(carry0_tangent_for_vdot, carry0_bar_for_vdot))
     parameter_bar = jnp.stack(grad_entries)
     return (parameter_bar,)
