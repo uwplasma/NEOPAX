@@ -2561,6 +2561,17 @@ def _radau_replay_segment_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_segment_diagnostic_max_index() -> int:
+    """Highest reverse-segment index to print for the segment diagnostic."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC_MAX_INDEX")
+    if raw_value is None:
+        return 2
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 2
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -7439,6 +7450,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     )
     final_replay_state_bar = dataclasses.replace(final_replay_state_bar, y=final_y_bar)
     replay_segment_diagnostic = _radau_replay_segment_diagnostic()
+    replay_segment_diagnostic_max_index = _radau_replay_segment_diagnostic_max_index()
 
     def _reverse_segment(carry_bar, inputs):
         (
@@ -7509,7 +7521,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segmented_next_lagged_response_valid[idx],
         )
         carry_before_bar, _ = _reverse_segment(carry_bar, inputs)
-        if replay_segment_diagnostic:
+        if replay_segment_diagnostic and idx <= replay_segment_diagnostic_max_index:
             carry_bar_y_after = jnp.asarray(carry_before_bar.y, dtype=execution_context.dtype)
             jax.debug.print(
                 "[autodiff-gate] replay-segment-check seg={seg} "
