@@ -4618,39 +4618,20 @@ def _radau_apply_stage_linear_solve_transpose(
     complex_piv_out,
 ):
     rhs_bar_arr = jnp.asarray(rhs_bar, dtype=kernel_context.dtype).reshape((-1,))
-    zero_rhs = jnp.all(rhs_bar_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
 
-    def _solve_zero_rhs(rhs_flat):
-        return jnp.zeros_like(rhs_flat)
-
-    def _solve_nonzero_rhs(rhs_flat):
-        rhs_stages = rhs_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        rhs_transformed = kernel_context.radau_transform.T @ rhs_stages
-        rhs_real = rhs_transformed[0]
-        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real, trans=1)
-        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
-
-        def _solve_pair(i, pair_solutions):
-            delta_pair = jax.scipy.linalg.lu_solve(
-                (complex_lu_out[i], complex_piv_out[i]),
-                rhs_complex_pairs[i].reshape((-1,)),
-                trans=1,
-            ).reshape((2, kernel_context.state_dim))
-            return pair_solutions.at[i].set(delta_pair)
-
-        delta_complex_pairs = jax.lax.fori_loop(
-            0,
-            kernel_context.num_complex_pairs,
-            _solve_pair,
-            jnp.zeros_like(rhs_complex_pairs),
+    def _forward_stage_solve(rhs_flat):
+        return _radau_apply_stage_linear_solve(
+            kernel_context,
+            rhs=rhs_flat,
+            real_lu_out=real_lu_out,
+            real_piv_out=real_piv_out,
+            complex_lu_out=complex_lu_out,
+            complex_piv_out=complex_piv_out,
         )
-        delta_transformed = jnp.concatenate(
-            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
-            axis=0,
-        )
-        return (kernel_context.radau_inv_transform.T @ delta_transformed).reshape((-1,))
 
-    return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_bar_arr)
+    _, solve_pullback = jax.vjp(_forward_stage_solve, jnp.zeros_like(rhs_bar_arr))
+    (rhs_in_bar,) = solve_pullback(rhs_bar_arr)
+    return jnp.asarray(rhs_in_bar, dtype=kernel_context.dtype).reshape((-1,))
 
 
 def _radau_approximate_accepted_step_tangent(
