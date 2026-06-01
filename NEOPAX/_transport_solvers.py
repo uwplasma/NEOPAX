@@ -3753,44 +3753,39 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
                 )
             return accepted_y_tangent, tangent_result.dz_stages
 
-        jacobian_ref = jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype)
-        rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
-        stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
-
         if replay_output_mode == "y":
-            def _reuse_only_y_tangent_core(dy_source, dh_source, lagged_eval_tangent):
-                accepted_y_tangent, _ = _reuse_only_tangent_core(
-                    dy_source,
-                    dh_source,
-                    lagged_eval_tangent,
+            zero_tangent_inputs = _RadauAcceptedStepTangentInputs(
+                dy=jnp.zeros_like(carry_in.y),
+                dh=jnp.zeros_like(carry_in.dt),
+                dlagged_response_cache=zero_lagged_cache_tangent,
+            )
+
+            def _reuse_only_y_from_tangent_inputs(tangent_inputs):
+                _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+                    kernel_context,
+                    physics_context,
+                    carry_in,
+                    tangent_inputs,
+                    primal_result,
+                    allow_zero_shortcut=False,
+                    project_output=True,
                 )
                 return accepted_y_tangent
 
             _, reuse_pullback = jax.vjp(
-                _reuse_only_y_tangent_core,
-                jnp.zeros_like(carry_in.y),
-                jnp.zeros_like(carry_in.dt),
-                lagged_eval_zero,
+                _reuse_only_y_from_tangent_inputs,
+                zero_tangent_inputs,
             )
-            dy_bar_reuse, dh_bar_reuse, lagged_eval_bar = reuse_pullback(
+            (tangent_inputs_bar,) = reuse_pullback(
                 accepted_y_bar
             )
-            prev_stages_bar = jnp.asarray(
-                replay_state_bar.prev_stages,
-                dtype=kernel_context.dtype,
-            ).reshape((kernel_context.num_stages, kernel_context.state_dim))
-            stage_rhs_bar_prev = _radau_apply_stage_linear_solve_transpose(
-                kernel_context,
-                rhs_bar=prev_stages_bar.reshape((-1,)),
-                real_lu_out=primal_result.real_lu_out,
-                real_piv_out=primal_result.real_piv_out,
-                complex_lu_out=primal_result.complex_lu_out,
-                complex_piv_out=primal_result.complex_piv_out,
-            ).reshape((kernel_context.num_stages, kernel_context.state_dim))
-            dy_bar_reuse = dy_bar_reuse + jnp.sum(stage_rhs_bar_prev @ jacobian_ref, axis=0)
-            dh_bar_reuse = dh_bar_reuse + jnp.sum(stage_rhs_bar_prev * stage_dh_source)
-            lagged_eval_bar = lagged_eval_bar + stage_rhs_bar_prev
+            dy_bar_reuse = jnp.asarray(tangent_inputs_bar.dy, dtype=kernel_context.dtype)
+            dh_bar_reuse = jnp.asarray(tangent_inputs_bar.dh, dtype=kernel_context.dtype)
+            lagged_response_cache_bar = tangent_inputs_bar.dlagged_response_cache
         else:
+            jacobian_ref = jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype)
+            rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
+            stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
             _, reuse_pullback = jax.vjp(
                 _reuse_only_tangent_core,
                 jnp.zeros_like(carry_in.y),
@@ -3804,24 +3799,24 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
             dy_bar_reuse, dh_bar_reuse, lagged_eval_bar = reuse_pullback(
                 (accepted_y_bar, prev_stages_bar)
             )
+            if lagged_response is not None:
+                stage_eval_fn = _radau_stage_evals_from_lagged_factory(
+                    kernel_context,
+                    physics_context,
+                    carry_in,
+                    primal_result,
+                )
+                lagged_response_cache_bar = _radau_lagged_response_pullback_dispatch(
+                    stage_eval_fn,
+                    lagged_response,
+                    lagged_eval_bar,
+                )
+            else:
+                lagged_response_cache_bar = zero_lagged_cache_tangent
         lagged_reference_y_bar = jnp.asarray(
             replay_state_bar.lagged_reference_y,
             dtype=kernel_context.dtype,
         )
-        if lagged_response is not None:
-            stage_eval_fn = _radau_stage_evals_from_lagged_factory(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
-            )
-            lagged_response_cache_bar = _radau_lagged_response_pullback_dispatch(
-                stage_eval_fn,
-                lagged_response,
-                lagged_eval_bar,
-            )
-        else:
-            lagged_response_cache_bar = zero_lagged_cache_tangent
 
         carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
         carry_bar = dataclasses.replace(
