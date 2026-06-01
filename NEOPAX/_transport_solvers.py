@@ -6570,7 +6570,7 @@ def _radau_replay_realized_accepted_carry_pullback(
                 _prev_stages_value,
                 _prev_dt_value,
                 _prev_theta_final_value,
-                _prev_newton_iter_count_value,
+                prev_newton_iter_count_value,
                 lagged_response_cache_value,
                 lagged_response_valid_value,
                 lagged_reference_y_value,
