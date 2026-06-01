@@ -2588,6 +2588,14 @@ def _radau_replay_local_pullback_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_stage_solve_check() -> bool:
+    """Optional reverse diagnostic: compare manual stage-solve transpose to JAX transpose."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STAGE_SOLVE_CHECK")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -3615,6 +3623,45 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
         complex_lu_out=primal_result.complex_lu_out,
         complex_piv_out=primal_result.complex_piv_out,
     ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+    if (
+        _radau_replay_stage_solve_check()
+        and diagnostic_segment_index is not None
+        and diagnostic_step_index is not None
+    ):
+        def _print_stage_solve_check(_):
+            _, solve_pullback = jax.vjp(
+                lambda rhs: _radau_apply_stage_linear_solve(
+                    kernel_context,
+                    rhs=rhs,
+                    real_lu_out=primal_result.real_lu_out,
+                    real_piv_out=primal_result.real_piv_out,
+                    complex_lu_out=primal_result.complex_lu_out,
+                    complex_piv_out=primal_result.complex_piv_out,
+                ),
+                jnp.zeros_like(dz_stages_bar.reshape((-1,))),
+            )
+            (stage_rhs_bar_ref_flat,) = solve_pullback(dz_stages_bar.reshape((-1,)))
+            stage_rhs_bar_ref = stage_rhs_bar_ref_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+            diff = stage_rhs_bar - stage_rhs_bar_ref
+            jax.debug.print(
+                "[autodiff-gate] stage-solve-check seg={seg} step={step} "
+                "manual_l2={manual_l2:.6e} ref_l2={ref_l2:.6e} diff_l2={diff_l2:.6e} diff_max={diff_max:.6e}",
+                seg=diagnostic_segment_index,
+                step=diagnostic_step_index,
+                manual_l2=jnp.linalg.norm(jnp.ravel(stage_rhs_bar)),
+                ref_l2=jnp.linalg.norm(jnp.ravel(stage_rhs_bar_ref)),
+                diff_l2=jnp.linalg.norm(jnp.ravel(diff)),
+                diff_max=jnp.max(jnp.abs(diff)),
+                ordered=True,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            jnp.asarray(diagnostic_segment_index <= _radau_replay_segment_diagnostic_max_index()),
+            _print_stage_solve_check,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
 
     jacobian_ref = jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype)
     dy_bar = trial_y_bar + jnp.sum(stage_rhs_bar @ jacobian_ref, axis=0)
