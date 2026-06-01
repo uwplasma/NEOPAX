@@ -3753,6 +3753,10 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
                 )
             return accepted_y_tangent, tangent_result.dz_stages
 
+        jacobian_ref = jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype)
+        rhs_time_ref_arr = jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)
+        stage_dh_source = stage_combo @ jacobian_ref.T + kernel_context.c[:, None] * rhs_time_ref_arr[None, :]
+
         if replay_output_mode == "y":
             def _reuse_only_y_tangent_core(dy_source, dh_source, lagged_eval_tangent):
                 accepted_y_tangent, _ = _reuse_only_tangent_core(
@@ -3771,6 +3775,21 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
             dy_bar_reuse, dh_bar_reuse, lagged_eval_bar = reuse_pullback(
                 accepted_y_bar
             )
+            prev_stages_bar = jnp.asarray(
+                replay_state_bar.prev_stages,
+                dtype=kernel_context.dtype,
+            ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+            stage_rhs_bar_prev = _radau_apply_stage_linear_solve_transpose(
+                kernel_context,
+                rhs_bar=prev_stages_bar.reshape((-1,)),
+                real_lu_out=primal_result.real_lu_out,
+                real_piv_out=primal_result.real_piv_out,
+                complex_lu_out=primal_result.complex_lu_out,
+                complex_piv_out=primal_result.complex_piv_out,
+            ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+            dy_bar_reuse = dy_bar_reuse + jnp.sum(stage_rhs_bar_prev @ jacobian_ref, axis=0)
+            dh_bar_reuse = dh_bar_reuse + jnp.sum(stage_rhs_bar_prev * stage_dh_source)
+            lagged_eval_bar = lagged_eval_bar + stage_rhs_bar_prev
         else:
             _, reuse_pullback = jax.vjp(
                 _reuse_only_tangent_core,
