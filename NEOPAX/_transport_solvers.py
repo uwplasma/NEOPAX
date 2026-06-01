@@ -2597,7 +2597,7 @@ def _radau_replay_stage_solve_check() -> bool:
 
 
 def _radau_replay_step_pullback_check() -> bool:
-    """Optional reverse diagnostic: compare local replay-step pullback to JAX VJP at one payload step."""
+    """Optional reverse diagnostic: adjoint identity check at one payload replay step."""
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK")
     if raw_value is None:
         return False
@@ -6598,18 +6598,39 @@ def _radau_replay_realized_accepted_carry_pullback(
             and replay_output_diagnostic in {None, "y"}
         ):
             def _print_step_pullback_check(_):
-                _, pullback = jax.vjp(_step_replay_state, replay_state_before)
-                (replay_state_before_bar_ref,) = pullback(replay_state_cotangent)
-                diff_y = jnp.asarray(replay_state_before_bar.y, dtype=dtype) - jnp.asarray(replay_state_before_bar_ref.y, dtype=dtype)
+                carry_before_for_check = _carry_from_payload(step_xs)
+                carry_before_for_check = _radau_carry_with_forward_only_jvp_fields(carry_before_for_check)
+                primal_attempt_result = _execute_radau_accepted_step_attempt(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    carry_before_for_check,
+                    execution_context.attempt_context,
+                )
+                carry_tangent = _zero_optional_pytree(carry_before_for_check)
+                carry_tangent = dataclasses.replace(
+                    carry_tangent,
+                    y=jnp.ones_like(carry_before_for_check.y),
+                    dt=jnp.asarray(0.0, dtype=carry_before_for_check.dt.dtype),
+                )
+                _, local_forward_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    carry_before_for_check,
+                    _radau_extract_tangent_inputs_from_carry(carry_tangent),
+                    primal_attempt_result,
+                    allow_zero_shortcut=False,
+                    project_output=True,
+                )
+                lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(replay_state_cotangent.y))
+                rhs = _tree_vdot(carry_tangent, carry_before_bar)
                 jax.debug.print(
                     "[autodiff-gate] step-pullback-check seg={seg} step={step} "
-                    "manual_y_l2={manual_l2:.6e} ref_y_l2={ref_l2:.6e} diff_y_l2={diff_l2:.6e} diff_y_max={diff_max:.6e}",
+                    "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
                     seg=segment_index,
                     step=step_index,
-                    manual_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_before_bar.y, dtype=dtype))),
-                    ref_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_before_bar_ref.y, dtype=dtype))),
-                    diff_l2=jnp.linalg.norm(jnp.ravel(diff_y)),
-                    diff_max=jnp.max(jnp.abs(diff_y)),
+                    lhs=lhs,
+                    rhs=rhs,
+                    err=jnp.abs(lhs - rhs),
                     ordered=True,
                 )
                 return jnp.asarray(0, dtype=jnp.int32)
