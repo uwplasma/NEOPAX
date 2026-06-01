@@ -2596,6 +2596,34 @@ def _radau_replay_stage_solve_check() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_replay_step_pullback_check() -> bool:
+    """Optional reverse diagnostic: compare local replay-step pullback to JAX VJP at one payload step."""
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _radau_replay_step_pullback_check_segment() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
+    if raw_value is None:
+        return 1
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 1
+
+
+def _radau_replay_step_pullback_check_step() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP")
+    if raw_value is None:
+        return 10
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 10
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -6598,6 +6626,39 @@ def _radau_replay_realized_accepted_carry_pullback(
         else:
             _, pullback = jax.vjp(_step_replay_state, replay_state_before)
             (replay_state_before_bar,) = pullback(replay_state_cotangent)
+            carry_before_bar = None
+
+        if (
+            _radau_replay_step_pullback_check()
+            and replay_output_diagnostic in {None, "y"}
+        ):
+            def _print_step_pullback_check(_):
+                _, pullback = jax.vjp(_step_replay_state, replay_state_before)
+                (replay_state_before_bar_ref,) = pullback(replay_state_cotangent)
+                diff_y = jnp.asarray(replay_state_before_bar.y, dtype=dtype) - jnp.asarray(replay_state_before_bar_ref.y, dtype=dtype)
+                jax.debug.print(
+                    "[autodiff-gate] step-pullback-check seg={seg} step={step} "
+                    "manual_y_l2={manual_l2:.6e} ref_y_l2={ref_l2:.6e} diff_y_l2={diff_l2:.6e} diff_y_max={diff_max:.6e}",
+                    seg=segment_index,
+                    step=step_index,
+                    manual_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_before_bar.y, dtype=dtype))),
+                    ref_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_before_bar_ref.y, dtype=dtype))),
+                    diff_l2=jnp.linalg.norm(jnp.ravel(diff_y)),
+                    diff_max=jnp.max(jnp.abs(diff_y)),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            should_print_step_check = jnp.logical_and(
+                segment_index == _radau_replay_step_pullback_check_segment(),
+                step_index == _radau_replay_step_pullback_check_step(),
+            )
+            jax.lax.cond(
+                should_print_step_check,
+                _print_step_pullback_check,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
 
         if replay_segment_detail_diagnostic:
             def _print_step_detail(_):
