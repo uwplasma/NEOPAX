@@ -2656,6 +2656,31 @@ def _radau_zero_optional_pytree(tree):
     )
 
 
+def _radau_tree_vdot(lhs, rhs):
+    def _leaf_vdot(a, b):
+        if a is None or b is None:
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        a_arr = jnp.asarray(a)
+        b_arr = jnp.asarray(b)
+        if not jnp.issubdtype(a_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        if not jnp.issubdtype(b_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.asarray(jnp.vdot(jnp.ravel(a_arr), jnp.ravel(b_arr)), dtype=jnp.float64)
+
+    leaves = jax.tree_util.tree_map(
+        _leaf_vdot,
+        lhs,
+        rhs,
+        is_leaf=lambda x: x is None,
+    )
+    return jax.tree_util.tree_reduce(
+        lambda acc, x: acc + x,
+        leaves,
+        initializer=jnp.asarray(0.0, dtype=jnp.float64),
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
@@ -6632,7 +6657,7 @@ def _radau_replay_realized_accepted_carry_pullback(
                     project_output=True,
                 )
                 lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(replay_state_cotangent.y))
-                rhs = _tree_vdot(carry_tangent, carry_before_bar)
+                rhs = _radau_tree_vdot(carry_tangent, carry_before_bar)
                 jax.debug.print(
                     "[autodiff-gate] step-pullback-check seg={seg} step={step} "
                     "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
