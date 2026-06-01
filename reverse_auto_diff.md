@@ -337,3 +337,70 @@ Updated conclusion:
   - payload reconstruction in segment `0-2`
   - `_radau_replay_realized_accepted_carry_pullback(...)`
   - how replay-state bars are threaded across those first segments
+
+### Most important current result
+
+Run with:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Decisive result:
+
+- `step-pullback-check seg=1 step=10 lhs=1.843063e+23 rhs=1.577166e+22 abs_err=1.685347e+23`
+
+Interpretation:
+
+- the remaining bug is in the local replay-step pullback itself at later carries
+- it is not just outer replay composition
+- the earlier initial-carry local adjoint check was too narrow and does not validate the problematic early replay steps
+- the stage-solve transpose fix was real and should stay, but it was not the final bug
+
+### Most important next steps
+
+1. Treat the issue as a local replay-step pullback mismatch.
+   - Main target:
+     - `_radau_apply_accepted_step_replay_state_pullback_linearized(...)`
+   - Proven failing site:
+     - `seg=1 step=10`
+
+2. Stop adding broad diagnostics unless they directly validate a patch.
+   - The current step-level adjoint check is enough.
+   - Use it as the main correctness probe.
+
+3. Refactor the local replay-step reverse to mirror the forward tangent helper more literally.
+   - Forward source of truth:
+     - `_radau_accepted_step_y_tangent_from_primal_linearized(...)`
+   - Reverse should be derived from that same reduced map, not maintained as separate handwritten algebra that can drift.
+
+4. Split the local reverse into explicit submaps.
+   - output projection pullback
+   - accepted-`y` accumulation pullback
+   - stage linear solve transpose
+   - Jacobian/time-source accumulation pullback
+   - lagged-response contribution pullback
+
+5. Replace the current handwritten `dy_bar` / `dh_bar` assembly with the transpose of the same reduced forward tangent map.
+   - The now-proven mismatch site is the local algebra after `stage_rhs_bar`.
+
+6. Keep the reuse-only narrowed test while fixing correctness.
+   - Continue using:
+     - `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y`
+     - `NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1`
+     - `--objective-indices 0`
+
+7. Primary validation after each patch:
+   - rerun the same `STEP_PULLBACK_CHECK=1` command
+   - success criterion:
+     - `lhs` and `rhs` agree closely for `seg=1 step=10`
+
+8. After the local replay-step pullback matches, re-check segment growth.
+   - rerun:
+     - `NEOPAX_TRANSPORT_REVERSE_SEGMENT_DIAGNOSTIC=1`
+   - expectation:
+     - the early-segment `y_bar` explosion should disappear or drop sharply
+
+9. Only after reuse-only correctness is fixed, return to rebuild OOM work.
+   - rebuild branch is still the memory blocker for the full reverse path
+   - but it is not the current correctness blocker
