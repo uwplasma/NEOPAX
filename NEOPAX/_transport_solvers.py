@@ -2646,6 +2646,16 @@ def _radau_select_replay_state_leaf(
     return dataclasses.replace(zero_state, **{selected_leaf: getattr(replay_state, selected_leaf)})
 
 
+def _radau_zero_optional_pytree(tree):
+    if tree is None:
+        return None
+    return jax.tree_util.tree_map(
+        lambda x: None if x is None else jnp.zeros_like(x),
+        tree,
+        is_leaf=lambda x: x is None,
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
@@ -6606,7 +6616,7 @@ def _radau_replay_realized_accepted_carry_pullback(
                     carry_before_for_check,
                     execution_context.attempt_context,
                 )
-                carry_tangent = _zero_optional_pytree(carry_before_for_check)
+                carry_tangent = _radau_zero_optional_pytree(carry_before_for_check)
                 carry_tangent = dataclasses.replace(
                     carry_tangent,
                     y=jnp.ones_like(carry_before_for_check.y),
