@@ -3630,7 +3630,7 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     ):
         def _print_stage_solve_check(_):
             _, solve_pullback = jax.vjp(
-                lambda rhs: _radau_apply_stage_linear_solve(
+                lambda rhs: _radau_apply_stage_linear_solve_no_shortcut(
                     kernel_context,
                     rhs=rhs,
                     real_lu_out=primal_result.real_lu_out,
@@ -4579,33 +4579,55 @@ def _radau_apply_stage_linear_solve(
     def _solve_zero_rhs(rhs_flat):
         return jnp.zeros_like(rhs_flat)
 
-    def _solve_nonzero_rhs(rhs_flat):
-        rhs_stages = rhs_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
-        rhs_real = rhs_transformed[0]
-        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
-        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
+    return jax.lax.cond(
+        zero_rhs,
+        _solve_zero_rhs,
+        lambda rhs_flat: _radau_apply_stage_linear_solve_no_shortcut(
+            kernel_context,
+            rhs=rhs_flat,
+            real_lu_out=real_lu_out,
+            real_piv_out=real_piv_out,
+            complex_lu_out=complex_lu_out,
+            complex_piv_out=complex_piv_out,
+        ),
+        rhs_arr,
+    )
 
-        def _solve_pair(i, pair_solutions):
-            delta_pair = jax.scipy.linalg.lu_solve(
-                (complex_lu_out[i], complex_piv_out[i]),
-                rhs_complex_pairs[i].reshape((-1,)),
-            ).reshape((2, kernel_context.state_dim))
-            return pair_solutions.at[i].set(delta_pair)
 
-        delta_complex_pairs = jax.lax.fori_loop(
-            0,
-            kernel_context.num_complex_pairs,
-            _solve_pair,
-            jnp.zeros_like(rhs_complex_pairs),
-        )
-        delta_transformed = jnp.concatenate(
-            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
-            axis=0,
-        )
-        return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+def _radau_apply_stage_linear_solve_no_shortcut(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    rhs,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+):
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
+    rhs_stages = rhs_arr.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    rhs_transformed = _radau_transform_stage_stack(kernel_context, rhs_stages)
+    rhs_real = rhs_transformed[0]
+    delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real)
+    rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
 
-    return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
+    def _solve_pair(i, pair_solutions):
+        delta_pair = jax.scipy.linalg.lu_solve(
+            (complex_lu_out[i], complex_piv_out[i]),
+            rhs_complex_pairs[i].reshape((-1,)),
+        ).reshape((2, kernel_context.state_dim))
+        return pair_solutions.at[i].set(delta_pair)
+
+    delta_complex_pairs = jax.lax.fori_loop(
+        0,
+        kernel_context.num_complex_pairs,
+        _solve_pair,
+        jnp.zeros_like(rhs_complex_pairs),
+    )
+    delta_transformed = jnp.concatenate(
+        [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
+        axis=0,
+    )
+    return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
 
 
 def _radau_apply_stage_linear_solve_transpose(
@@ -4620,7 +4642,7 @@ def _radau_apply_stage_linear_solve_transpose(
     rhs_bar_arr = jnp.asarray(rhs_bar, dtype=kernel_context.dtype).reshape((-1,))
 
     def _forward_stage_solve(rhs_flat):
-        return _radau_apply_stage_linear_solve(
+        return _radau_apply_stage_linear_solve_no_shortcut(
             kernel_context,
             rhs=rhs_flat,
             real_lu_out=real_lu_out,
