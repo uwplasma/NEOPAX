@@ -3303,89 +3303,23 @@ def _radau_replay_state_tangent_from_primal_linearized_reuse_only(
     It intentionally avoids the rebuild-lagged-response branch, which remains
     the separate full-reverse memory problem.
     """
-    tangent_inputs = _radau_extract_tangent_inputs_from_carry(carry_tangent)
-    lagged_response, _, _ = _radau_prepare_lagged_response(
+    _primal_attempt, tangent_attempt = _execute_radau_accepted_step_attempt_with_approx_tangent(
         kernel_context,
+        physics_context,
         carry_in,
-        physics_context.unpack_flat,
-        physics_context.project_flat,
-        physics_context.build_lagged_response,
+        carry_tangent,
+        _RadauAcceptedStepAttemptContext(
+            t_final=carry_in.t + primal_result.trial_dt,
+            use_transport_lagged_response=kernel_context.use_transport_lagged_response,
+        ),
     )
-
-    def _rhs_eval_at_state(t_eval):
-        return _radau_eval_rhs(
-            t_eval,
-            carry_in.y,
-            lagged_response,
-            physics_context.flat_rhs,
-            physics_context.flat_rhs_with_lagged_response,
-        )
-
-    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
-
-    if lagged_response is None or tangent_inputs.dlagged_response_cache is None:
-        lagged_eval_tangent = jnp.zeros(
-            (kernel_context.num_stages, kernel_context.state_dim),
-            dtype=kernel_context.dtype,
-        )
-    else:
-        stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
-        stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
-
-        def _stage_evals_from_lagged(lagged_response_value):
-            return jax.vmap(
-                lambda t_eval, y_eval: _radau_eval_rhs(
-                    t_eval,
-                    y_eval,
-                    lagged_response_value,
-                    physics_context.flat_rhs,
-                    physics_context.flat_rhs_with_lagged_response,
-                ),
-                in_axes=(0, 0),
-            )(stage_times, stage_states)
-
-        _, lagged_eval_tangent = jax.jvp(
-            _stage_evals_from_lagged,
-            (lagged_response,),
-            (tangent_inputs.dlagged_response_cache,),
-        )
-
-    tangent_result = _radau_compute_approximate_attempt_tangent(
-        kernel_context,
-        tangent_inputs=tangent_inputs,
-        jacobian_ref=primal_result.jacobian_out,
-        lagged_eval_tangent=lagged_eval_tangent,
-        rhs_time_ref=rhs_time_ref,
-        trial_dt=primal_result.trial_dt,
-        stage_history=primal_result.stage_history,
-        real_lu_out=primal_result.real_lu_out,
-        real_piv_out=primal_result.real_piv_out,
-        complex_lu_out=primal_result.complex_lu_out,
-        complex_piv_out=primal_result.complex_piv_out,
-        allow_zero_shortcut=False,
-    )
-
-    if physics_context.project_flat is None:
-        accepted_y_tangent = tangent_result.dtrial_y
-    else:
-        _, accepted_y_tangent = jax.jvp(
-            lambda flat_y: _project_flat_state_if_needed(flat_y, physics_context.project_flat),
-            (primal_result.trial_y,),
-            (tangent_result.dtrial_y,),
-        )
-
-    zero_replay_state = jax.tree_util.tree_map(
-        _radau_zero_cotangent_like,
-        _radau_replay_state_from_carry(carry_in),
-    )
+    carry_after_tangent = tangent_attempt.carry_after_attempt
+    replay_state_tangent = _radau_replay_state_from_carry(carry_after_tangent)
     return dataclasses.replace(
-        zero_replay_state,
-        t=jnp.asarray(carry_tangent.t + carry_tangent.dt, dtype=kernel_context.dtype),
-        y=accepted_y_tangent,
-        prev_stages=tangent_result.dstage_history,
+        replay_state_tangent,
+        y=jnp.asarray(tangent_attempt.trial_y, dtype=kernel_context.dtype),
+        prev_stages=jnp.asarray(tangent_attempt.stage_history, dtype=kernel_context.dtype),
         prev_dt=jnp.asarray(carry_tangent.dt, dtype=kernel_context.dtype),
-        lagged_reference_y=jnp.asarray(carry_tangent.lagged_reference_y, dtype=kernel_context.dtype),
     )
 
 

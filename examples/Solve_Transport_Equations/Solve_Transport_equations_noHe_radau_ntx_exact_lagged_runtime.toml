@@ -19,7 +19,8 @@ ntx_exact_n_zeta = 21
 ntx_exact_n_xi = 33
 ntx_exact_surface_backend = "vmec"
 ntx_exact_face_response_mode = "interpolate_center_response"
-ntx_exact_response_anchor_count = 0
+ntx_exact_response_anchor_count = 48
+
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -132,14 +133,19 @@ transport_solver_backend = "radau"
 integrator = "radau"
 radau_rhs_mode = "lagged_response"
 radau_num_stages = 7
-radau_error_estimator = "embedded2"
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
 radau_newton_tol_mode = "hairer"
 radau_newton_fnewt_mode = "hairer"
+radau_error_estimator = "embedded2_ntss_transport_scale"
+radau_controller_mode = "hairer_lean_transport_discounted"
+radau_predictor_mode = "collocation_transport_weighted"
+lagged_response_reuse_mode = "global_state_drift"
+lagged_response_reuse_rtol = 1.0e-2
+lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
-t_final = 20.0
-dt = 1.0e-8
+t_final = 0.01
+dt = 1.0e-5
 rtol = 1.0e-6
 atol = 1.0e-8
 max_step = 1.0
@@ -147,6 +153,7 @@ min_step = 1.0e-14
 max_steps = 20000
 throw = false
 debug_stage_markers = true
+debug_walltime_attempts = true
 debug_disable_jit = false
 save_n = 10
 
@@ -165,7 +172,7 @@ Er_permittivity_mode = "ntss_like_midpoint"
 
 [transport_output]
 transport_plot = true
-transport_write_hdf5 = false
+transport_write_hdf5 = true
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
