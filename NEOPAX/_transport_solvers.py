@@ -6953,12 +6953,15 @@ def _radau_replay_realized_accepted_carry_pullback(
                 rhs = _radau_tree_vdot(carry_tangent, carry_before_bar)
                 jax.debug.print(
                     "[autodiff-gate] step-pullback-check seg={seg} step={step} "
+                    "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e} "
                     "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e} "
                     "dy_ref_l2={dy_ref_l2:.6e} dy_manual_l2={dy_manual_l2:.6e} dy_diff_l2={dy_diff_l2:.6e} "
                     "dh_ref={dh_ref:.6e} dh_manual={dh_manual:.6e} dh_diff={dh_diff:.6e} "
                     "lagged_ref_l2={lagged_ref_l2:.6e} lagged_manual_l2={lagged_manual_l2:.6e} lagged_diff_l2={lagged_diff_l2:.6e}",
                     seg=segment_index,
                     step=step_index,
+                    accepted_y_bar_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
+                    accepted_y_bar_max=jnp.max(jnp.abs(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
                     lhs=lhs,
                     rhs=rhs,
                     err=jnp.abs(lhs - rhs),
