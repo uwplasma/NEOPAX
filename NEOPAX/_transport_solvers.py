@@ -6938,11 +6938,22 @@ def _radau_replay_realized_accepted_carry_pullback(
             def _print_step_window(_):
                 jax.debug.print(
                     "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
-                    "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e}",
+                    "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e} "
+                    "dt_bar={dt_bar:.6e} prev_dt_bar={prev_dt_bar:.6e} prev_theta_bar={prev_theta_bar:.6e} "
+                    "prev_stages_l2={prev_stages_l2:.6e} lagged_ref_l2={lagged_ref_l2:.6e}",
                     seg=segment_index,
                     step=step_index,
                     accepted_y_bar_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
                     accepted_y_bar_max=jnp.max(jnp.abs(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
+                    dt_bar=jnp.asarray(replay_state_cotangent.dt, dtype=dtype),
+                    prev_dt_bar=jnp.asarray(replay_state_cotangent.prev_dt, dtype=dtype),
+                    prev_theta_bar=jnp.asarray(replay_state_cotangent.prev_theta_final, dtype=dtype),
+                    prev_stages_l2=jnp.linalg.norm(
+                        jnp.ravel(jnp.asarray(replay_state_cotangent.prev_stages, dtype=dtype))
+                    ),
+                    lagged_ref_l2=jnp.linalg.norm(
+                        jnp.ravel(jnp.asarray(replay_state_cotangent.lagged_reference_y, dtype=dtype))
+                    ),
                     ordered=True,
                 )
                 return jnp.asarray(0, dtype=jnp.int32)

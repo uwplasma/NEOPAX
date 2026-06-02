@@ -5227,3 +5227,112 @@ Most important next steps
 9. Only after reuse-only correctness is fixed, return to rebuild OOM work.
    - rebuild branch is still the memory blocker for the full reverse path
    - but it is not the current correctness blocker
+## 2026-06-02 reverse AD latest state
+
+- Current narrowed reverse lab remains:
+  - `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y`
+  - `NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1`
+  - objective row `0`
+- Keep using `direct` NTX exact derivative mode for this debugging path.
+
+### Most important confirmed facts
+
+- Full reverse/rebuild path is still a separate memory problem; do not widen back out yet.
+- Local accepted-step `dy/dh` adjoint algebra is now correct in isolation.
+- Stage-solve transpose fix should stay.
+- Zeroing `lagged_response_cache_bar` in the reuse-only local reverse did **not** change the blow-up pattern.
+- Therefore the current leading suspect is **replay-state threading/mapping across steps**, not local accepted-`y` algebra and not lagged-cache cotangent.
+
+### Host-side local diagnostic that passed
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Result:
+
+- `segment_index: 1`
+- `step_index: 10`
+- `lhs: 3.060000e+02`
+- `rhs: 3.060000e+02`
+- `dy_ref_l2: 1.749286e+01`
+- `dy_manual_l2: 1.749286e+01`
+- `dy_diff_l2: 0.000000e+00`
+- `dh_ref: -5.817363e+05`
+- `dh_manual: -5.817363e+05`
+- `dh_diff: 0.000000e+00`
+- `stage_rhs_ref_l2: 0.000000e+00`
+- `stage_rhs_manual_l2: 0.000000e+00`
+- `stage_rhs_diff_l2: 0.000000e+00`
+- `lagged_ref_l2: 0.000000e+00`
+- `lagged_manual_l2: 0.000000e+00`
+- `lagged_diff_l2: 0.000000e+00`
+
+Interpretation:
+
+- The reduced local accepted-`y` adjoint is correct for the frozen-lagged host-side probe.
+
+### Cheap replay-step diagnostic result
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW=2 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Key output:
+
+- `seg=1 step=12 accepted_y_bar_l2=1.106325e+22 accepted_y_bar_max=4.609127e+21`
+- `seg=1 step=11 accepted_y_bar_l2=1.029448e+22 accepted_y_bar_max=4.608471e+21`
+- `seg=1 step=10 accepted_y_bar_l2=9.430782e+21 accepted_y_bar_max=4.604782e+21`
+- step check at `seg=1 step=10` still fails badly:
+  - `lhs=1.843063e+23`
+  - `rhs=1.577166e+22`
+  - `abs_err=1.685347e+23`
+- then sharp amplification:
+  - `seg=1 step=9 accepted_y_bar_l2=3.927721e+23 accepted_y_bar_max=2.069093e+23`
+  - `seg=1 step=8 accepted_y_bar_l2=6.889240e+23 accepted_y_bar_max=3.230642e+23`
+
+Interpretation:
+
+- The real replay-step cotangent is already enormous by steps `12..10`.
+- The first sharp growth inside segment `1` appears when pulling back through step `10 -> 9`.
+- Since the host local algebra is correct and lagged-cache ablation changed nothing, the likely remaining bug is now in **replay-state threading/mapping between steps**.
+
+### Lagged-cache ablation that did not help
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW=2 NEOPAX_TRANSPORT_REVERSE_ZERO_LAGGED_CACHE_BAR=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Result:
+
+- Step-window `accepted_y_bar` values were unchanged.
+- Reverse row remained absurd `~1e31`.
+
+Interpretation:
+
+- `lagged_response_cache_bar` is not the driver of the observed blow-up.
+
+### Current most likely bug site
+
+- Replay-state / carry mapping and threading between steps in the realized replay reverse:
+  - `carry_before_bar -> replay_state_before_bar`
+  - `_radau_replay_state_from_carry(...)`
+  - `_radau_replay_state_to_carry(...)`
+  - or equivalent leaf-selection / threading interactions around those.
+
+### Immediate next step for next session
+
+- Rerun the cheap step-window command with the newly-added replay-state leaf diagnostics:
+  - `dt_bar`
+  - `prev_dt_bar`
+  - `prev_theta_bar`
+  - `prev_stages_l2`
+  - `lagged_ref_l2`
+- Goal:
+  - determine whether a non-`y` replay-state leaf spikes first and then feeds the `accepted_y_bar` explosion from step `10 -> 9`.

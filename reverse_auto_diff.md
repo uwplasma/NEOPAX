@@ -404,3 +404,99 @@ Interpretation:
 9. Only after reuse-only correctness is fixed, return to rebuild OOM work.
    - rebuild branch is still the memory blocker for the full reverse path
    - but it is not the current correctness blocker
+## 2026-06-02 reverse AD latest state
+
+- Active debug mode:
+  - `NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y`
+  - `NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1`
+  - row `objective_index=0`
+- Do **not** widen out yet; rebuild/full reverse is still a separate memory issue.
+
+### Summary
+
+- Local accepted-step `dy/dh` adjoint math is correct in a host-side isolated check.
+- Stage-solve transpose fix is still valid and should remain.
+- Zeroing `lagged_response_cache_bar` had no effect on the blow-up.
+- Therefore the remaining issue is most likely in **replay-state threading/mapping across steps**, not in local accepted-`y` algebra.
+
+### Host-side isolated check
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Result:
+
+- `lhs = rhs = 3.060000e+02`
+- `dy_diff_l2 = 0`
+- `dh_diff = 0`
+- `stage_rhs_diff_l2 = 0`
+- lagged terms all zero in this probe
+
+Meaning:
+
+- The frozen-lagged reduced local accepted-`y` pullback is correct.
+
+### Cheap in-replay step-window diagnostic
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW=2 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Important output:
+
+- `seg=1 step=12 accepted_y_bar_l2=1.106325e+22`
+- `seg=1 step=11 accepted_y_bar_l2=1.029448e+22`
+- `seg=1 step=10 accepted_y_bar_l2=9.430782e+21`
+- step check still fails:
+  - `lhs=1.843063e+23`
+  - `rhs=1.577166e+22`
+  - `abs_err=1.685347e+23`
+- blow-up then jumps:
+  - `seg=1 step=9 accepted_y_bar_l2=3.927721e+23`
+  - `seg=1 step=8 accepted_y_bar_l2=6.889240e+23`
+
+Meaning:
+
+- Real replay cotangent is already huge before step `10`.
+- First sharp amplification within segment `1` occurs at step `10 -> 9`.
+
+### Lagged-cache ablation
+
+Command:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW=2 NEOPAX_TRANSPORT_REVERSE_ZERO_LAGGED_CACHE_BAR=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Result:
+
+- No meaningful change in the step-window cotangent growth.
+
+Meaning:
+
+- `lagged_response_cache_bar` is not the culprit.
+
+### Next session: immediate command to run
+
+Run the same cheap replay-step window command again, now that replay-state leaf norms were added:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_CHECK=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW=2 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Watch for:
+
+- `dt_bar`
+- `prev_dt_bar`
+- `prev_theta_bar`
+- `prev_stages_l2`
+- `lagged_ref_l2`
+
+Goal:
+
+- detect whether a non-`y` replay-state leaf spikes first and is then feeding back into `accepted_y_bar`.
