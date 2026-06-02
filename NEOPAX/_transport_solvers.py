@@ -2624,6 +2624,16 @@ def _radau_replay_step_pullback_check_step() -> int:
         return 10
 
 
+def _radau_replay_step_pullback_check_window() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_WINDOW")
+    if raw_value is None:
+        return 0
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 0
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -6915,6 +6925,35 @@ def _radau_replay_realized_accepted_carry_pullback(
                 lambda _: jnp.asarray(0, dtype=jnp.int32),
                 operand=None,
             )
+
+            def _print_step_window(_):
+                jax.debug.print(
+                    "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
+                    "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e}",
+                    seg=segment_index,
+                    step=step_index,
+                    accepted_y_bar_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
+                    accepted_y_bar_max=jnp.max(jnp.abs(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            step_window = _radau_replay_step_pullback_check_window()
+            if step_window > 0:
+                window_center = _radau_replay_step_pullback_check_step()
+                in_window = jnp.logical_and(
+                    segment_index == _radau_replay_step_pullback_check_segment(),
+                    jnp.logical_and(
+                        step_index >= (window_center - step_window),
+                        step_index <= (window_center + step_window),
+                    ),
+                )
+                jax.lax.cond(
+                    in_window,
+                    _print_step_window,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
 
         if replay_segment_detail_diagnostic:
             def _print_step_detail(_):
