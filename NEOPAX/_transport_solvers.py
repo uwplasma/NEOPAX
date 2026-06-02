@@ -2649,6 +2649,14 @@ def _radau_capture_step_y_bar_path() -> str | None:
     return value or None
 
 
+def _radau_capture_step_dy_bar_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_DY_BAR_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -6968,6 +6976,25 @@ def _radau_replay_realized_accepted_carry_pullback(
                 jax.lax.cond(
                     should_print_step_check,
                     _capture_step_y_bar,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+
+            capture_step_dy_bar_path = _radau_capture_step_dy_bar_path()
+            if capture_step_dy_bar_path:
+                def _capture_step_dy_bar(_):
+                    def _write_array(arr):
+                        np.save(capture_step_dy_bar_path, np.asarray(arr, dtype=float))
+                    jax.debug.callback(
+                        _write_array,
+                        carry_before_bar.y,
+                        ordered=True,
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_print_step_check,
+                    _capture_step_dy_bar,
                     lambda _: jnp.asarray(0, dtype=jnp.int32),
                     operand=None,
                 )
