@@ -2641,6 +2641,14 @@ def _radau_zero_lagged_cache_bar_diagnostic() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _radau_capture_step_y_bar_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_Y_BAR_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -6945,6 +6953,25 @@ def _radau_replay_realized_accepted_carry_pullback(
                 operand=None,
             )
 
+            capture_step_y_bar_path = _radau_capture_step_y_bar_path()
+            if capture_step_y_bar_path:
+                def _capture_step_y_bar(_):
+                    def _write_array(arr):
+                        np.save(capture_step_y_bar_path, np.asarray(arr, dtype=float))
+                    jax.debug.callback(
+                        _write_array,
+                        replay_state_cotangent.y,
+                        ordered=True,
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_print_step_check,
+                    _capture_step_y_bar,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+
             def _print_step_window(_):
                 jax.debug.print(
                     "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
@@ -7330,6 +7357,7 @@ def _radau_host_local_step_pullback_compare(
     stop_after_accepted_steps: int | None,
     segment_index: int = 1,
     step_index: int = 10,
+    accepted_y_bar_override=None,
 ):
     """Host-side comparison of reduced accepted-y pullback on one replay payload step.
 
@@ -7437,7 +7465,10 @@ def _radau_host_local_step_pullback_compare(
         carry_before,
         execution_context.attempt_context,
     )
-    accepted_y_bar = jnp.ones_like(carry_before.y)
+    if accepted_y_bar_override is None:
+        accepted_y_bar = jnp.ones_like(carry_before.y)
+    else:
+        accepted_y_bar = jnp.asarray(accepted_y_bar_override, dtype=carry_before.y.dtype)
     lagged_response, _, _ = _radau_prepare_lagged_response(
         execution_context.kernel_context,
         carry_before,
