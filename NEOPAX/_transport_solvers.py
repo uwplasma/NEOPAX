@@ -2657,6 +2657,14 @@ def _radau_capture_step_dy_bar_path() -> str | None:
     return value or None
 
 
+def _radau_capture_step_inputs_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_INPUTS_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -6999,6 +7007,32 @@ def _radau_replay_realized_accepted_carry_pullback(
                     operand=None,
                 )
 
+            capture_step_inputs_path = _radau_capture_step_inputs_path()
+            if capture_step_inputs_path:
+                def _capture_step_inputs(_):
+                    def _write_inputs(y_arr, t_arr, dt_arr):
+                        np.savez(
+                            capture_step_inputs_path,
+                            y=np.asarray(y_arr, dtype=float),
+                            t=np.asarray(t_arr, dtype=float),
+                            dt=np.asarray(dt_arr, dtype=float),
+                        )
+                    jax.debug.callback(
+                        _write_inputs,
+                        carry_before_for_check.y,
+                        carry_before_for_check.t,
+                        carry_before_for_check.dt,
+                        ordered=True,
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_print_step_check,
+                    _capture_step_inputs,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+
             def _print_step_window(_):
                 jax.debug.print(
                     "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
@@ -7386,6 +7420,7 @@ def _radau_host_local_step_pullback_compare(
     step_index: int = 10,
     accepted_y_bar_override=None,
     replay_dy_bar_override=None,
+    replay_inputs_override=None,
 ):
     """Host-side comparison of reduced accepted-y pullback on one replay payload step.
 
@@ -7639,6 +7674,18 @@ def _radau_host_local_step_pullback_compare(
                     jnp.max(jnp.abs(replay_dy_bar - dy_bar_manual)),
                     dtype=jnp.float64,
                 ),
+            }
+        )
+    if replay_inputs_override is not None:
+        replay_y = jnp.asarray(replay_inputs_override["y"], dtype=carry_before.y.dtype)
+        replay_t = jnp.asarray(replay_inputs_override["t"], dtype=carry_before.t.dtype)
+        replay_dt = jnp.asarray(replay_inputs_override["dt"], dtype=carry_before.dt.dtype)
+        result.update(
+            {
+                "replay_input_y_diff_l2": _radau_tree_l2_norm(replay_y - carry_before.y),
+                "replay_input_y_diff_max": jnp.asarray(jnp.max(jnp.abs(replay_y - carry_before.y)), dtype=jnp.float64),
+                "replay_input_t_diff": jnp.asarray(jnp.abs(replay_t - carry_before.t), dtype=jnp.float64),
+                "replay_input_dt_diff": jnp.asarray(jnp.abs(replay_dt - carry_before.dt), dtype=jnp.float64),
             }
         )
     return result

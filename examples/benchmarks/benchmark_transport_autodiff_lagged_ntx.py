@@ -769,6 +769,14 @@ def _host_step_pullback_replay_dy_bar_path() -> str | None:
     return value or None
 
 
+def _host_step_pullback_replay_inputs_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_INPUTS_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     parameter_values,
     *,
@@ -787,6 +795,10 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     replay_dy_bar_path = _host_step_pullback_replay_dy_bar_path()
     if replay_dy_bar_path is not None:
         replay_dy_bar_override = np.load(replay_dy_bar_path)
+    replay_inputs_override = None
+    replay_inputs_path = _host_step_pullback_replay_inputs_path()
+    if replay_inputs_path is not None:
+        replay_inputs_override = dict(np.load(replay_inputs_path))
     execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
         _prepare_realized_schedule_profile_vector_rollout_option_a(
             parameter_values,
@@ -807,6 +819,7 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
         step_index=_step_pullback_step_index(),
         accepted_y_bar_override=accepted_y_bar_override,
         replay_dy_bar_override=replay_dy_bar_override,
+        replay_inputs_override=replay_inputs_override,
     )
 
 
