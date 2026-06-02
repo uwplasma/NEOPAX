@@ -7019,9 +7019,9 @@ def _radau_replay_realized_accepted_carry_pullback(
                         )
                     jax.debug.callback(
                         _write_inputs,
-                        carry_before_for_check.y,
-                        carry_before_for_check.t,
-                        carry_before_for_check.dt,
+                        carry_before.y,
+                        carry_before.t,
+                        carry_before.dt,
                         ordered=True,
                     )
                     return jnp.asarray(0, dtype=jnp.int32)
