@@ -7465,26 +7465,45 @@ def _radau_host_local_step_pullback_compare(
 
     rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_check)(carry_before.t)
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_before.lagged_response_cache)
-    zero_tangent_inputs = _RadauAcceptedStepTangentInputs(
-        dy=jnp.zeros_like(carry_before.y),
-        dh=jnp.zeros_like(carry_before.dt),
-        dlagged_response_cache=zero_lagged_cache_tangent,
+    lagged_eval_zero = jnp.zeros(
+        (execution_context.kernel_context.num_stages, execution_context.kernel_context.state_dim),
+        dtype=execution_context.dtype,
     )
 
-    def _accepted_y_from_tangent_inputs(tangent_inputs):
-        _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+    def _accepted_y_from_dy_dh(dy_source, dh_source):
+        tangent_result = _radau_compute_approximate_attempt_tangent(
             execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_before,
-            tangent_inputs,
-            primal_attempt_result,
+            tangent_inputs=_RadauAcceptedStepTangentInputs(
+                dy=dy_source,
+                dh=dh_source,
+                dlagged_response_cache=zero_lagged_cache_tangent,
+            ),
+            jacobian_ref=primal_attempt_result.jacobian_out,
+            lagged_eval_tangent=lagged_eval_zero,
+            rhs_time_ref=rhs_time_ref,
+            trial_dt=primal_attempt_result.trial_dt,
+            stage_history=primal_attempt_result.stage_history,
+            real_lu_out=primal_attempt_result.real_lu_out,
+            real_piv_out=primal_attempt_result.real_piv_out,
+            complex_lu_out=primal_attempt_result.complex_lu_out,
+            complex_piv_out=primal_attempt_result.complex_piv_out,
             allow_zero_shortcut=False,
-            project_output=True,
+        )
+        if execution_context.physics_context.project_flat is None:
+            return tangent_result.dtrial_y
+        _, accepted_y_tangent = jax.jvp(
+            lambda flat_y: _project_flat_state_if_needed(flat_y, execution_context.physics_context.project_flat),
+            (primal_attempt_result.trial_y,),
+            (tangent_result.dtrial_y,),
         )
         return accepted_y_tangent
 
-    _, pullback_ref = jax.vjp(_accepted_y_from_tangent_inputs, zero_tangent_inputs)
-    (tangent_inputs_bar_ref,) = pullback_ref(accepted_y_bar)
+    _, pullback_ref = jax.vjp(
+        _accepted_y_from_dy_dh,
+        jnp.zeros_like(carry_before.y),
+        jnp.asarray(0.0, dtype=carry_before.dt.dtype),
+    )
+    dy_bar_ref, dh_bar_ref = pullback_ref(accepted_y_bar)
     dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual = _radau_accepted_step_y_pullback_linearized(
         execution_context.kernel_context,
         execution_context.physics_context,
@@ -7496,12 +7515,9 @@ def _radau_host_local_step_pullback_compare(
         zero_lagged_cache_tangent=zero_lagged_cache_tangent,
     )
 
-    local_forward_tangent = _accepted_y_from_tangent_inputs(
-        _RadauAcceptedStepTangentInputs(
-            dy=jnp.ones_like(carry_before.y),
-            dh=jnp.asarray(0.0, dtype=carry_before.dt.dtype),
-            dlagged_response_cache=zero_lagged_cache_tangent,
-        )
+    local_forward_tangent = _accepted_y_from_dy_dh(
+        jnp.ones_like(carry_before.y),
+        jnp.asarray(0.0, dtype=carry_before.dt.dtype),
     )
     lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(accepted_y_bar))
     rhs = (
@@ -7513,22 +7529,15 @@ def _radau_host_local_step_pullback_compare(
         "step_index": step_index,
         "lhs": jnp.asarray(lhs, dtype=jnp.float64),
         "rhs": jnp.asarray(rhs, dtype=jnp.float64),
-        "dy_ref_l2": _radau_tree_l2_norm(tangent_inputs_bar_ref.dy),
+        "dy_ref_l2": _radau_tree_l2_norm(dy_bar_ref),
         "dy_manual_l2": _radau_tree_l2_norm(dy_bar_manual),
-        "dy_diff_l2": _radau_tree_l2_norm(jnp.asarray(dy_bar_manual) - jnp.asarray(tangent_inputs_bar_ref.dy)),
-        "dh_ref": jnp.asarray(tangent_inputs_bar_ref.dh, dtype=jnp.float64),
+        "dy_diff_l2": _radau_tree_l2_norm(jnp.asarray(dy_bar_manual) - jnp.asarray(dy_bar_ref)),
+        "dh_ref": jnp.asarray(dh_bar_ref, dtype=jnp.float64),
         "dh_manual": jnp.asarray(dh_bar_manual, dtype=jnp.float64),
-        "dh_diff": jnp.asarray(jnp.abs(dh_bar_manual - tangent_inputs_bar_ref.dh), dtype=jnp.float64),
-        "lagged_ref_l2": _radau_tree_l2_norm(tangent_inputs_bar_ref.dlagged_response_cache),
+        "dh_diff": jnp.asarray(jnp.abs(dh_bar_manual - dh_bar_ref), dtype=jnp.float64),
+        "lagged_ref_l2": jnp.asarray(0.0, dtype=jnp.float64),
         "lagged_manual_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
-        "lagged_diff_l2": _radau_tree_l2_norm(
-            jax.tree_util.tree_map(
-                lambda a, b: None if a is None or b is None else jnp.asarray(a) - jnp.asarray(b),
-                lagged_cache_bar_manual,
-                tangent_inputs_bar_ref.dlagged_response_cache,
-                is_leaf=lambda x: x is None,
-            )
-        ),
+        "lagged_diff_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
     }
 
 
