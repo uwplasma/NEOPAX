@@ -2634,6 +2634,13 @@ def _radau_replay_step_pullback_check_window() -> int:
         return 0
 
 
+def _radau_zero_lagged_cache_bar_diagnostic() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_ZERO_LAGGED_CACHE_BAR")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -3899,6 +3906,8 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
             replay_state_bar.lagged_reference_y,
             dtype=kernel_context.dtype,
         )
+        if _radau_zero_lagged_cache_bar_diagnostic():
+            lagged_response_cache_bar = zero_lagged_cache_tangent
 
         carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
         carry_bar = dataclasses.replace(
