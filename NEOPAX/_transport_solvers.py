@@ -3379,6 +3379,7 @@ def _radau_accepted_step_y_pullback_linearized(
     rhs_time_ref,
     *,
     zero_lagged_cache_tangent,
+    return_stage_rhs_bar: bool = False,
 ):
     """Analytic pullback of the reduced accepted-step `accepted_y` tangent map.
 
@@ -3439,11 +3440,14 @@ def _radau_accepted_step_y_pullback_linearized(
     else:
         lagged_response_cache_bar = zero_lagged_cache_tangent
 
-    return (
+    outputs = (
         jnp.asarray(dy_bar, dtype=kernel_context.dtype),
         jnp.asarray(dh_bar, dtype=kernel_context.dtype),
         lagged_response_cache_bar,
     )
+    if return_stage_rhs_bar:
+        return outputs + (jnp.asarray(stage_rhs_bar, dtype=kernel_context.dtype),)
+    return outputs
 
 
 def _radau_stage_evals_from_shared_fluxes_factory(
@@ -7504,7 +7508,7 @@ def _radau_host_local_step_pullback_compare(
         jnp.asarray(0.0, dtype=carry_before.dt.dtype),
     )
     dy_bar_ref, dh_bar_ref = pullback_ref(accepted_y_bar)
-    dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual = _radau_accepted_step_y_pullback_linearized(
+    dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual, stage_rhs_bar_manual = _radau_accepted_step_y_pullback_linearized(
         execution_context.kernel_context,
         execution_context.physics_context,
         carry_before,
@@ -7513,7 +7517,42 @@ def _radau_host_local_step_pullback_compare(
         lagged_response,
         rhs_time_ref,
         zero_lagged_cache_tangent=zero_lagged_cache_tangent,
+        return_stage_rhs_bar=True,
     )
+
+    def _accepted_y_from_lagged_eval(lagged_eval_tangent):
+        tangent_result = _radau_compute_approximate_attempt_tangent(
+            execution_context.kernel_context,
+            tangent_inputs=_RadauAcceptedStepTangentInputs(
+                dy=jnp.zeros_like(carry_before.y),
+                dh=jnp.asarray(0.0, dtype=carry_before.dt.dtype),
+                dlagged_response_cache=zero_lagged_cache_tangent,
+            ),
+            jacobian_ref=primal_attempt_result.jacobian_out,
+            lagged_eval_tangent=lagged_eval_tangent,
+            rhs_time_ref=rhs_time_ref,
+            trial_dt=primal_attempt_result.trial_dt,
+            stage_history=primal_attempt_result.stage_history,
+            real_lu_out=primal_attempt_result.real_lu_out,
+            real_piv_out=primal_attempt_result.real_piv_out,
+            complex_lu_out=primal_attempt_result.complex_lu_out,
+            complex_piv_out=primal_attempt_result.complex_piv_out,
+            allow_zero_shortcut=False,
+        )
+        if execution_context.physics_context.project_flat is None:
+            return tangent_result.dtrial_y
+        _, accepted_y_tangent = jax.jvp(
+            lambda flat_y: _project_flat_state_if_needed(flat_y, execution_context.physics_context.project_flat),
+            (primal_attempt_result.trial_y,),
+            (tangent_result.dtrial_y,),
+        )
+        return accepted_y_tangent
+
+    _, pullback_lagged_eval_ref = jax.vjp(
+        _accepted_y_from_lagged_eval,
+        lagged_eval_zero,
+    )
+    (stage_rhs_bar_ref,) = pullback_lagged_eval_ref(accepted_y_bar)
 
     local_forward_tangent = _accepted_y_from_dy_dh(
         jnp.ones_like(carry_before.y),
@@ -7535,6 +7574,9 @@ def _radau_host_local_step_pullback_compare(
         "dh_ref": jnp.asarray(dh_bar_ref, dtype=jnp.float64),
         "dh_manual": jnp.asarray(dh_bar_manual, dtype=jnp.float64),
         "dh_diff": jnp.asarray(jnp.abs(dh_bar_manual - dh_bar_ref), dtype=jnp.float64),
+        "stage_rhs_ref_l2": _radau_tree_l2_norm(stage_rhs_bar_ref),
+        "stage_rhs_manual_l2": _radau_tree_l2_norm(stage_rhs_bar_manual),
+        "stage_rhs_diff_l2": _radau_tree_l2_norm(jnp.asarray(stage_rhs_bar_manual) - jnp.asarray(stage_rhs_bar_ref)),
         "lagged_ref_l2": jnp.asarray(0.0, dtype=jnp.float64),
         "lagged_manual_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
         "lagged_diff_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
