@@ -3441,6 +3441,7 @@ def _radau_accepted_step_y_pullback_linearized(
 
     dy_bar = trial_y_bar + jnp.sum(stage_rhs_bar @ jacobian_ref, axis=0)
     dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
+    dt_in_bar = jnp.sum(stage_rhs_bar * rhs_time_ref_arr[None, :])
 
     if lagged_response is not None:
         stage_eval_fn = _radau_stage_evals_from_lagged_factory(
@@ -3460,6 +3461,7 @@ def _radau_accepted_step_y_pullback_linearized(
     outputs = (
         jnp.asarray(dy_bar, dtype=kernel_context.dtype),
         jnp.asarray(dh_bar, dtype=kernel_context.dtype),
+        jnp.asarray(dt_in_bar, dtype=kernel_context.dtype),
         lagged_response_cache_bar,
     )
     if return_stage_rhs_bar:
@@ -3861,7 +3863,7 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
             return accepted_y_tangent, tangent_result.dz_stages
 
         if replay_output_mode == "y":
-            dy_bar_reuse, dh_bar_reuse, lagged_response_cache_bar = _radau_accepted_step_y_pullback_linearized(
+            dy_bar_reuse, dh_bar_reuse, dt_in_bar_reuse, lagged_response_cache_bar = _radau_accepted_step_y_pullback_linearized(
                 kernel_context,
                 physics_context,
                 carry_in,
@@ -3912,9 +3914,17 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
         carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, carry_in)
         carry_bar = dataclasses.replace(
             carry_bar,
-            t=jnp.asarray(replay_state_bar.t, dtype=kernel_context.dtype),
+            t=jnp.asarray(replay_state_bar.t, dtype=kernel_context.dtype) + (
+                jnp.asarray(dt_in_bar_reuse, dtype=kernel_context.dtype)
+                if replay_output_mode == "y"
+                else jnp.asarray(0.0, dtype=kernel_context.dtype)
+            ),
             y=jnp.asarray(dy_bar_reuse, dtype=kernel_context.dtype),
-            dt=jnp.asarray(dh_bar_reuse, dtype=kernel_context.dtype),
+            dt=(
+                jnp.asarray(0.0, dtype=kernel_context.dtype)
+                if replay_output_mode == "y"
+                else jnp.asarray(dh_bar_reuse, dtype=kernel_context.dtype)
+            ),
             lagged_response_cache=lagged_response_cache_bar,
             lagged_reference_y=lagged_reference_y_bar,
         )
@@ -7486,7 +7496,7 @@ def _radau_host_local_step_pullback_compare(
         jnp.asarray(0.0, dtype=carry_before.dt.dtype),
     )
     dy_bar_ref, dh_bar_ref = pullback_ref(accepted_y_bar)
-    dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual, stage_rhs_bar_manual = _radau_accepted_step_y_pullback_linearized(
+    dy_bar_manual, dh_bar_manual, dt_in_bar_manual, lagged_cache_bar_manual, stage_rhs_bar_manual = _radau_accepted_step_y_pullback_linearized(
         execution_context.kernel_context,
         execution_context.physics_context,
         carry_before,
@@ -7552,6 +7562,7 @@ def _radau_host_local_step_pullback_compare(
         "dh_ref": jnp.asarray(dh_bar_ref, dtype=jnp.float64),
         "dh_manual": jnp.asarray(dh_bar_manual, dtype=jnp.float64),
         "dh_diff": jnp.asarray(jnp.abs(dh_bar_manual - dh_bar_ref), dtype=jnp.float64),
+        "dt_in_manual": jnp.asarray(dt_in_bar_manual, dtype=jnp.float64),
         "stage_rhs_ref_l2": _radau_tree_l2_norm(stage_rhs_bar_ref),
         "stage_rhs_manual_l2": _radau_tree_l2_norm(stage_rhs_bar_manual),
         "stage_rhs_diff_l2": _radau_tree_l2_norm(jnp.asarray(stage_rhs_bar_manual) - jnp.asarray(stage_rhs_bar_ref)),
