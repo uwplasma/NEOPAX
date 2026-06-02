@@ -7385,6 +7385,7 @@ def _radau_host_local_step_pullback_compare(
     segment_index: int = 1,
     step_index: int = 10,
     accepted_y_bar_override=None,
+    replay_dy_bar_override=None,
 ):
     """Host-side comparison of reduced accepted-y pullback on one replay payload step.
 
@@ -7609,7 +7610,7 @@ def _radau_host_local_step_pullback_compare(
         jnp.vdot(jnp.ravel(jnp.ones_like(carry_before.y)), jnp.ravel(dy_bar_manual))
         + jnp.asarray(0.0, dtype=jnp.float64) * jnp.asarray(dh_bar_manual, dtype=jnp.float64)
     )
-    return {
+    result = {
         "segment_index": segment_index,
         "step_index": step_index,
         "lhs": jnp.asarray(lhs, dtype=jnp.float64),
@@ -7628,6 +7629,19 @@ def _radau_host_local_step_pullback_compare(
         "lagged_manual_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
         "lagged_diff_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
     }
+    if replay_dy_bar_override is not None:
+        replay_dy_bar = jnp.asarray(replay_dy_bar_override, dtype=carry_before.y.dtype)
+        result.update(
+            {
+                "replay_dy_bar_l2": _radau_tree_l2_norm(replay_dy_bar),
+                "replay_vs_host_dy_diff_l2": _radau_tree_l2_norm(replay_dy_bar - dy_bar_manual),
+                "replay_vs_host_dy_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_dy_bar - dy_bar_manual)),
+                    dtype=jnp.float64,
+                ),
+            }
+        )
+    return result
 
 
 def _radau_run_prepared_on_time_list(
