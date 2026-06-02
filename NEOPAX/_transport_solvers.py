@@ -7010,18 +7010,61 @@ def _radau_replay_realized_accepted_carry_pullback(
             capture_step_inputs_path = _radau_capture_step_inputs_path()
             if capture_step_inputs_path:
                 def _capture_step_inputs(_):
-                    def _write_inputs(y_arr, t_arr, dt_arr):
+                    def _write_inputs(
+                        y_arr,
+                        t_arr,
+                        dt_arr,
+                        prev_stages_arr,
+                        lagged_reference_y_arr,
+                        jacobian_arr,
+                        cache_valid_arr,
+                        cache_dt_arr,
+                        cache_age_arr,
+                        lagged_response_valid_arr,
+                        prev_theta_final_arr,
+                        prev_newton_iter_count_arr,
+                        real_lu_arr,
+                        real_piv_arr,
+                        complex_lu_arr,
+                        complex_piv_arr,
+                    ):
                         np.savez(
                             capture_step_inputs_path,
                             y=np.asarray(y_arr, dtype=float),
                             t=np.asarray(t_arr, dtype=float),
                             dt=np.asarray(dt_arr, dtype=float),
+                            prev_stages=np.asarray(prev_stages_arr, dtype=float),
+                            lagged_reference_y=np.asarray(lagged_reference_y_arr, dtype=float),
+                            jacobian=np.asarray(jacobian_arr, dtype=float),
+                            cache_valid=np.asarray(cache_valid_arr),
+                            cache_dt=np.asarray(cache_dt_arr, dtype=float),
+                            cache_age=np.asarray(cache_age_arr, dtype=float),
+                            lagged_response_valid=np.asarray(lagged_response_valid_arr),
+                            prev_theta_final=np.asarray(prev_theta_final_arr, dtype=float),
+                            prev_newton_iter_count=np.asarray(prev_newton_iter_count_arr),
+                            real_lu=np.asarray(real_lu_arr, dtype=float),
+                            real_piv=np.asarray(real_piv_arr),
+                            complex_lu=np.asarray(complex_lu_arr, dtype=float),
+                            complex_piv=np.asarray(complex_piv_arr),
                         )
                     jax.debug.callback(
                         _write_inputs,
                         carry_before.y,
                         carry_before.t,
                         carry_before.dt,
+                        carry_before.prev_stages,
+                        carry_before.lagged_reference_y,
+                        carry_before.jacobian,
+                        carry_before.cache_valid,
+                        carry_before.cache_dt,
+                        carry_before.cache_age,
+                        carry_before.lagged_response_valid,
+                        carry_before.prev_theta_final,
+                        carry_before.prev_newton_iter_count,
+                        carry_before.real_lu,
+                        carry_before.real_piv,
+                        carry_before.complex_lu,
+                        carry_before.complex_piv,
                         ordered=True,
                     )
                     return jnp.asarray(0, dtype=jnp.int32)
@@ -7688,6 +7731,118 @@ def _radau_host_local_step_pullback_compare(
                 "replay_input_dt_diff": jnp.asarray(jnp.abs(replay_dt - carry_before.dt), dtype=jnp.float64),
             }
         )
+        if "prev_stages" in replay_inputs_override:
+            replay_prev_stages = jnp.asarray(replay_inputs_override["prev_stages"], dtype=carry_before.prev_stages.dtype)
+            result.update(
+                {
+                    "replay_input_prev_stages_diff_l2": _radau_tree_l2_norm(replay_prev_stages - carry_before.prev_stages),
+                    "replay_input_prev_stages_diff_max": jnp.asarray(
+                        jnp.max(jnp.abs(replay_prev_stages - carry_before.prev_stages)),
+                        dtype=jnp.float64,
+                    ),
+                }
+            )
+        if "lagged_reference_y" in replay_inputs_override:
+            replay_lagged_ref = jnp.asarray(replay_inputs_override["lagged_reference_y"], dtype=carry_before.lagged_reference_y.dtype)
+            result.update(
+                {
+                    "replay_input_lagged_ref_diff_l2": _radau_tree_l2_norm(replay_lagged_ref - carry_before.lagged_reference_y),
+                    "replay_input_lagged_ref_diff_max": jnp.asarray(
+                        jnp.max(jnp.abs(replay_lagged_ref - carry_before.lagged_reference_y)),
+                        dtype=jnp.float64,
+                    ),
+                }
+            )
+        if "jacobian" in replay_inputs_override:
+            replay_jacobian = jnp.asarray(replay_inputs_override["jacobian"], dtype=carry_before.jacobian.dtype)
+            result.update(
+                {
+                    "replay_input_jacobian_diff_l2": _radau_tree_l2_norm(replay_jacobian - carry_before.jacobian),
+                    "replay_input_jacobian_diff_max": jnp.asarray(
+                        jnp.max(jnp.abs(replay_jacobian - carry_before.jacobian)),
+                        dtype=jnp.float64,
+                    ),
+                }
+            )
+        if "real_lu" in replay_inputs_override:
+            replay_real_lu = jnp.asarray(replay_inputs_override["real_lu"], dtype=carry_before.real_lu.dtype)
+            result.update(
+                {
+                    "replay_input_real_lu_diff_l2": _radau_tree_l2_norm(replay_real_lu - carry_before.real_lu),
+                    "replay_input_real_lu_diff_max": jnp.asarray(
+                        jnp.max(jnp.abs(replay_real_lu - carry_before.real_lu)),
+                        dtype=jnp.float64,
+                    ),
+                }
+            )
+        if "complex_lu" in replay_inputs_override:
+            replay_complex_lu = jnp.asarray(replay_inputs_override["complex_lu"], dtype=carry_before.complex_lu.dtype)
+            result.update(
+                {
+                    "replay_input_complex_lu_diff_l2": _radau_tree_l2_norm(replay_complex_lu - carry_before.complex_lu),
+                    "replay_input_complex_lu_diff_max": jnp.asarray(
+                        jnp.max(jnp.abs(replay_complex_lu - carry_before.complex_lu)),
+                        dtype=jnp.float64,
+                    ),
+                }
+            )
+        if "real_piv" in replay_inputs_override:
+            replay_real_piv = jnp.asarray(replay_inputs_override["real_piv"], dtype=carry_before.real_piv.dtype)
+            result["replay_input_real_piv_diff_max"] = jnp.asarray(
+                jnp.max(jnp.abs(replay_real_piv - carry_before.real_piv)),
+                dtype=jnp.float64,
+            )
+        if "complex_piv" in replay_inputs_override:
+            replay_complex_piv = jnp.asarray(replay_inputs_override["complex_piv"], dtype=carry_before.complex_piv.dtype)
+            result["replay_input_complex_piv_diff_max"] = jnp.asarray(
+                jnp.max(jnp.abs(replay_complex_piv - carry_before.complex_piv)),
+                dtype=jnp.float64,
+            )
+        if "cache_valid" in replay_inputs_override:
+            replay_cache_valid = jnp.asarray(replay_inputs_override["cache_valid"], dtype=carry_before.cache_valid.dtype)
+            result["replay_input_cache_valid_diff_max"] = jnp.asarray(
+                jnp.max(jnp.asarray(replay_cache_valid != carry_before.cache_valid, dtype=jnp.float64)),
+                dtype=jnp.float64,
+            )
+        if "cache_dt" in replay_inputs_override:
+            replay_cache_dt = jnp.asarray(replay_inputs_override["cache_dt"], dtype=carry_before.cache_dt.dtype)
+            result["replay_input_cache_dt_diff"] = jnp.asarray(
+                jnp.abs(replay_cache_dt - carry_before.cache_dt),
+                dtype=jnp.float64,
+            )
+        if "cache_age" in replay_inputs_override:
+            replay_cache_age = jnp.asarray(replay_inputs_override["cache_age"], dtype=carry_before.cache_age.dtype)
+            result["replay_input_cache_age_diff"] = jnp.asarray(
+                jnp.abs(replay_cache_age - carry_before.cache_age),
+                dtype=jnp.float64,
+            )
+        if "lagged_response_valid" in replay_inputs_override:
+            replay_lagged_valid = jnp.asarray(
+                replay_inputs_override["lagged_response_valid"],
+                dtype=carry_before.lagged_response_valid.dtype,
+            )
+            result["replay_input_lagged_valid_diff_max"] = jnp.asarray(
+                jnp.max(jnp.asarray(replay_lagged_valid != carry_before.lagged_response_valid, dtype=jnp.float64)),
+                dtype=jnp.float64,
+            )
+        if "prev_theta_final" in replay_inputs_override:
+            replay_prev_theta = jnp.asarray(
+                replay_inputs_override["prev_theta_final"],
+                dtype=carry_before.prev_theta_final.dtype,
+            )
+            result["replay_input_prev_theta_diff"] = jnp.asarray(
+                jnp.abs(replay_prev_theta - carry_before.prev_theta_final),
+                dtype=jnp.float64,
+            )
+        if "prev_newton_iter_count" in replay_inputs_override:
+            replay_prev_newton = jnp.asarray(
+                replay_inputs_override["prev_newton_iter_count"],
+                dtype=carry_before.prev_newton_iter_count.dtype,
+            )
+            result["replay_input_prev_newton_diff"] = jnp.asarray(
+                jnp.abs(replay_prev_newton - carry_before.prev_newton_iter_count),
+                dtype=jnp.float64,
+            )
     return result
 
 
