@@ -7330,6 +7330,208 @@ def _radau_replay_realized_checkpoint_carries(
     return checkpoint_carries
 
 
+def _radau_host_local_step_pullback_compare(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    segment_index: int = 1,
+    step_index: int = 10,
+):
+    """Host-side comparison of reduced accepted-y pullback on one replay payload step.
+
+    This avoids tracing the full reverse replay. It prepares the realized schedule,
+    extracts one payload step, and compares:
+    - reference `jax.vjp` of `_radau_accepted_step_y_tangent_from_primal_linearized`
+    - analytic `_radau_accepted_step_y_pullback_linearized`
+    """
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+
+    checkpoint_interval = _radau_checkpoint_interval()
+    (
+        segmented_active_mask,
+        segmented_attempted_dts,
+        segmented_next_dts,
+        segmented_next_recent_reject_count,
+        segmented_next_regrowth_cooldown,
+        segmented_next_easy_growth_streak,
+        segmented_next_lagged_response_valid,
+        n_segments,
+    ) = _radau_segmented_schedule_arrays(
+        active_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_length=checkpoint_interval,
+    )
+    if segment_index < 0 or segment_index >= int(n_segments):
+        raise ValueError(f"segment_index={segment_index} out of range for n_segments={int(n_segments)}")
+
+    checkpoint_carries = _radau_replay_realized_checkpoint_carries(
+        execution_context,
+        carry0,
+        segmented_active_mask,
+        segmented_attempted_dts,
+        segmented_next_dts,
+        segmented_next_recent_reject_count,
+        segmented_next_regrowth_cooldown,
+        segmented_next_easy_growth_streak,
+        segmented_next_lagged_response_valid,
+    )
+    segment_carry0 = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_carries)
+    _, payloads = _radau_replay_realized_segment_payloads(
+        execution_context,
+        segment_carry0,
+        segmented_active_mask[segment_index],
+        segmented_attempted_dts[segment_index],
+        segmented_next_dts[segment_index],
+        segmented_next_recent_reject_count[segment_index],
+        segmented_next_regrowth_cooldown[segment_index],
+        segmented_next_easy_growth_streak[segment_index],
+        segmented_next_lagged_response_valid[segment_index],
+    )
+    if step_index < 0 or step_index >= int(payloads.dt.shape[0]):
+        raise ValueError(f"step_index={step_index} out of range for segment length={int(payloads.dt.shape[0])}")
+
+    idx = int(step_index)
+    zero_prev_error = jnp.zeros_like(carry0.prev_error)
+    zero_recent_reject_count = jnp.zeros_like(carry0.recent_reject_count)
+    zero_regrowth_cooldown = jnp.zeros_like(carry0.regrowth_cooldown)
+    zero_easy_growth_streak = jnp.zeros_like(carry0.easy_growth_streak)
+    carry_before = _RadauAcceptedStepCarry(
+        t=payloads.t_start[idx],
+        y=payloads.y_start[idx],
+        dt=payloads.dt[idx],
+        prev_error=zero_prev_error,
+        prev_stages=payloads.prev_stages[idx],
+        prev_dt=payloads.prev_dt[idx],
+        recent_reject_count=zero_recent_reject_count,
+        regrowth_cooldown=zero_regrowth_cooldown,
+        easy_growth_streak=zero_easy_growth_streak,
+        lagged_response_cache=jax.tree_util.tree_map(lambda x: x[idx], payloads.lagged_response_cache),
+        lagged_response_valid=payloads.lagged_response_valid[idx],
+        lagged_reference_y=payloads.lagged_reference_y[idx],
+        jacobian=payloads.jacobian[idx],
+        cache_valid=payloads.cache_valid[idx],
+        cache_dt=payloads.cache_dt[idx],
+        cache_age=payloads.cache_age[idx],
+        real_lu=payloads.real_lu[idx],
+        real_piv=payloads.real_piv[idx],
+        complex_lu=payloads.complex_lu[idx],
+        complex_piv=payloads.complex_piv[idx],
+        prev_theta_final=payloads.prev_theta_final[idx],
+        prev_newton_iter_count=payloads.prev_newton_iter_count[idx],
+    )
+    carry_before = _radau_carry_with_forward_only_jvp_fields(carry_before)
+    primal_attempt_result = _execute_radau_accepted_step_attempt(
+        execution_context.kernel_context,
+        execution_context.physics_context,
+        carry_before,
+        execution_context.attempt_context,
+    )
+    accepted_y_bar = jnp.ones_like(carry_before.y)
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        execution_context.kernel_context,
+        carry_before,
+        execution_context.physics_context.unpack_flat,
+        execution_context.physics_context.project_flat,
+        execution_context.physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval_at_state_check(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_before.y,
+            lagged_response,
+            execution_context.physics_context.flat_rhs,
+            execution_context.physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_check)(carry_before.t)
+    zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_before.lagged_response_cache)
+    zero_tangent_inputs = _RadauAcceptedStepTangentInputs(
+        dy=jnp.zeros_like(carry_before.y),
+        dh=jnp.zeros_like(carry_before.dt),
+        dlagged_response_cache=zero_lagged_cache_tangent,
+    )
+
+    def _accepted_y_from_tangent_inputs(tangent_inputs):
+        _, accepted_y_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_before,
+            tangent_inputs,
+            primal_attempt_result,
+            allow_zero_shortcut=False,
+            project_output=True,
+        )
+        return accepted_y_tangent
+
+    _, pullback_ref = jax.vjp(_accepted_y_from_tangent_inputs, zero_tangent_inputs)
+    (tangent_inputs_bar_ref,) = pullback_ref(accepted_y_bar)
+    dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual = _radau_accepted_step_y_pullback_linearized(
+        execution_context.kernel_context,
+        execution_context.physics_context,
+        carry_before,
+        primal_attempt_result,
+        accepted_y_bar,
+        lagged_response,
+        rhs_time_ref,
+        zero_lagged_cache_tangent=zero_lagged_cache_tangent,
+    )
+
+    local_forward_tangent = _accepted_y_from_tangent_inputs(
+        _RadauAcceptedStepTangentInputs(
+            dy=jnp.ones_like(carry_before.y),
+            dh=jnp.asarray(0.0, dtype=carry_before.dt.dtype),
+            dlagged_response_cache=zero_lagged_cache_tangent,
+        )
+    )
+    lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(accepted_y_bar))
+    rhs = (
+        jnp.vdot(jnp.ravel(jnp.ones_like(carry_before.y)), jnp.ravel(dy_bar_manual))
+        + jnp.asarray(0.0, dtype=jnp.float64) * jnp.asarray(dh_bar_manual, dtype=jnp.float64)
+    )
+    return {
+        "segment_index": segment_index,
+        "step_index": step_index,
+        "lhs": jnp.asarray(lhs, dtype=jnp.float64),
+        "rhs": jnp.asarray(rhs, dtype=jnp.float64),
+        "dy_ref_l2": _radau_tree_l2_norm(tangent_inputs_bar_ref.dy),
+        "dy_manual_l2": _radau_tree_l2_norm(dy_bar_manual),
+        "dy_diff_l2": _radau_tree_l2_norm(jnp.asarray(dy_bar_manual) - jnp.asarray(tangent_inputs_bar_ref.dy)),
+        "dh_ref": jnp.asarray(tangent_inputs_bar_ref.dh, dtype=jnp.float64),
+        "dh_manual": jnp.asarray(dh_bar_manual, dtype=jnp.float64),
+        "dh_diff": jnp.asarray(jnp.abs(dh_bar_manual - tangent_inputs_bar_ref.dh), dtype=jnp.float64),
+        "lagged_ref_l2": _radau_tree_l2_norm(tangent_inputs_bar_ref.dlagged_response_cache),
+        "lagged_manual_l2": _radau_tree_l2_norm(lagged_cache_bar_manual),
+        "lagged_diff_l2": _radau_tree_l2_norm(
+            jax.tree_util.tree_map(
+                lambda a, b: None if a is None or b is None else jnp.asarray(a) - jnp.asarray(b),
+                lagged_cache_bar_manual,
+                tangent_inputs_bar_ref.dlagged_response_cache,
+                is_leaf=lambda x: x is None,
+            )
+        ),
+    }
+
+
 def _radau_run_prepared_on_time_list(
     prepared_rollout: _PreparedRadauAcceptedRollout,
     time_list,

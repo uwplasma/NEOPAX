@@ -78,6 +78,7 @@ from NEOPAX._transport_solvers import (
     _radau_controller_composed_rollout,
     _radau_controller_forward_only_rollout,
     _radau_prepare_stage_subsolve_inputs_from_carry,
+    _radau_host_local_step_pullback_compare,
     _radau_run_prepared_on_realized_trace,
     _radau_run_prepared_on_time_list,
     _radau_run_stage_subsolve_standalone_autodiff,
@@ -729,6 +730,58 @@ def _parameter_carry_diagnostic_enabled() -> bool:
     if raw_value is None:
         return False
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_step_pullback_diagnostic_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _step_pullback_segment_index() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
+    if raw_value is None:
+        return 1
+    return max(0, int(raw_value))
+
+
+def _step_pullback_step_index() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP")
+    if raw_value is None:
+        return 10
+    return max(0, int(raw_value))
+
+
+def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+    accepted_step_limit_override: int | None = None,
+):
+    execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
+        _prepare_realized_schedule_profile_vector_rollout_option_a(
+            parameter_values,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            accepted_step_limit_override=accepted_step_limit_override,
+        )
+    )
+    return _radau_host_local_step_pullback_compare(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+        segment_index=_step_pullback_segment_index(),
+        step_index=_step_pullback_step_index(),
+    )
 
 
 def _zero_optional_pytree(tree):

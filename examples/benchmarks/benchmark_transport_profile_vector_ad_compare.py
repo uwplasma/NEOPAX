@@ -22,6 +22,8 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _baseline_profile_cfg,
     _prepare_benchmark_config,
+    _host_step_pullback_diagnostic_enabled,
+    _run_host_local_step_pullback_diagnostic_for_parameter_vector,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 
@@ -136,6 +138,20 @@ def main() -> None:
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_vector = jnp.asarray([float(profile_cfg[name]) for name in parameter_names], dtype=jnp.float64)
+
+    if _host_step_pullback_diagnostic_enabled():
+        diagnostic = _run_host_local_step_pullback_diagnostic_for_parameter_vector(
+            baseline_vector,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+        )
+        print("[autodiff-gate] host-step-pullback-diagnostic", flush=True)
+        for key, value in diagnostic.items():
+            print(f"  {key}: {float(value):.6e}" if np.asarray(jax.device_get(value)).shape == () else f"  {key}: {np.asarray(jax.device_get(value)).tolist()}", flush=True)
+        return
 
     objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
         p,
