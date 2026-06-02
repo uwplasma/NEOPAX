@@ -6888,76 +6888,12 @@ def _radau_replay_realized_accepted_carry_pullback(
                     allow_zero_shortcut=False,
                     project_output=True,
                 )
-                lagged_response_check, _, _ = _radau_prepare_lagged_response(
-                    execution_context.kernel_context,
-                    carry_before_for_check,
-                    execution_context.physics_context.unpack_flat,
-                    execution_context.physics_context.project_flat,
-                    execution_context.physics_context.build_lagged_response,
-                )
-
-                def _rhs_eval_at_state_check(t_eval):
-                    return _radau_eval_rhs(
-                        t_eval,
-                        carry_before_for_check.y,
-                        lagged_response_check,
-                        execution_context.physics_context.flat_rhs,
-                        execution_context.physics_context.flat_rhs_with_lagged_response,
-                    )
-
-                rhs_time_ref_check = jax.jacfwd(_rhs_eval_at_state_check)(carry_before_for_check.t)
-                zero_lagged_cache_tangent_check = _radau_zero_cotangent_like(
-                    carry_before_for_check.lagged_response_cache
-                )
-
-                def _accepted_y_from_tangent_inputs_check(tangent_inputs):
-                    _, accepted_y_tangent_check = _radau_accepted_step_y_tangent_from_primal_linearized(
-                        execution_context.kernel_context,
-                        execution_context.physics_context,
-                        carry_before_for_check,
-                        tangent_inputs,
-                        primal_attempt_result,
-                        allow_zero_shortcut=False,
-                        project_output=True,
-                    )
-                    return accepted_y_tangent_check
-
-                zero_tangent_inputs_check = _RadauAcceptedStepTangentInputs(
-                    dy=jnp.zeros_like(carry_before_for_check.y),
-                    dh=jnp.zeros_like(carry_before_for_check.dt),
-                    dlagged_response_cache=zero_lagged_cache_tangent_check,
-                )
-                _, accepted_y_pullback_ref = jax.vjp(
-                    _accepted_y_from_tangent_inputs_check,
-                    zero_tangent_inputs_check,
-                )
-                (tangent_inputs_bar_ref,) = accepted_y_pullback_ref(
-                    replay_state_cotangent.y
-                )
-                dy_bar_ref = jnp.asarray(tangent_inputs_bar_ref.dy, dtype=dtype)
-                dh_bar_ref = jnp.asarray(tangent_inputs_bar_ref.dh, dtype=dtype)
-                lagged_cache_bar_ref = tangent_inputs_bar_ref.dlagged_response_cache
-
-                dy_bar_manual, dh_bar_manual, lagged_cache_bar_manual = _radau_accepted_step_y_pullback_linearized(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    carry_before_for_check,
-                    primal_attempt_result,
-                    replay_state_cotangent.y,
-                    lagged_response_check,
-                    rhs_time_ref_check,
-                    zero_lagged_cache_tangent=zero_lagged_cache_tangent_check,
-                )
-
                 lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(replay_state_cotangent.y))
                 rhs = _radau_tree_vdot(carry_tangent, carry_before_bar)
                 jax.debug.print(
                     "[autodiff-gate] step-pullback-check seg={seg} step={step} "
                     "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e} "
-                    "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e} "
-                    "dy_ref_l2={dy_ref_l2:.6e} dy_manual_l2={dy_manual_l2:.6e} dy_diff_l2={dy_diff_l2:.6e} "
-                    "dh_ref={dh_ref:.6e} dh_manual={dh_manual:.6e} dh_diff={dh_diff:.6e} "
-                    "lagged_ref_l2={lagged_ref_l2:.6e} lagged_manual_l2={lagged_manual_l2:.6e} lagged_diff_l2={lagged_diff_l2:.6e}",
+                    "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
                     seg=segment_index,
                     step=step_index,
                     accepted_y_bar_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
@@ -6965,26 +6901,6 @@ def _radau_replay_realized_accepted_carry_pullback(
                     lhs=lhs,
                     rhs=rhs,
                     err=jnp.abs(lhs - rhs),
-                    dy_ref_l2=jnp.linalg.norm(jnp.ravel(dy_bar_ref)),
-                    dy_manual_l2=jnp.linalg.norm(jnp.ravel(dy_bar_manual)),
-                    dy_diff_l2=jnp.linalg.norm(jnp.ravel(dy_bar_manual - dy_bar_ref)),
-                    dh_ref=dh_bar_ref,
-                    dh_manual=dh_bar_manual,
-                    dh_diff=jnp.abs(dh_bar_manual - dh_bar_ref),
-                    lagged_ref_l2=_radau_tree_l2_norm(lagged_cache_bar_ref),
-                    lagged_manual_l2=_radau_tree_l2_norm(lagged_cache_bar_manual),
-                    lagged_diff_l2=_radau_tree_l2_norm(
-                        jax.tree_util.tree_map(
-                            lambda a, b: (
-                                None
-                                if a is None or b is None
-                                else jnp.asarray(a) - jnp.asarray(b)
-                            ),
-                            lagged_cache_bar_manual,
-                            lagged_cache_bar_ref,
-                            is_leaf=lambda x: x is None,
-                        )
-                    ),
                     ordered=True,
                 )
                 return jnp.asarray(0, dtype=jnp.int32)
