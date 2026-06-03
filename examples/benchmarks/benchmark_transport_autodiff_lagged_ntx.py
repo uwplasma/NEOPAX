@@ -786,6 +786,14 @@ def _host_step_pullback_replay_lagged_cache_path() -> str | None:
     return value or None
 
 
+def _host_step_pullback_replay_primal_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_PRIMAL_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     parameter_values,
     *,
@@ -813,6 +821,10 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     if replay_lagged_cache_path is not None:
         with open(replay_lagged_cache_path, "rb") as f:
             replay_lagged_cache_override = pickle.load(f)
+    replay_primal_override = None
+    replay_primal_path = _host_step_pullback_replay_primal_path()
+    if replay_primal_path is not None:
+        replay_primal_override = dict(np.load(replay_primal_path))
     execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
         _prepare_realized_schedule_profile_vector_rollout_option_a(
             parameter_values,
@@ -835,6 +847,7 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
         replay_dy_bar_override=replay_dy_bar_override,
         replay_inputs_override=replay_inputs_override,
         replay_lagged_cache_override=replay_lagged_cache_override,
+        replay_primal_override=replay_primal_override,
     )
 
 

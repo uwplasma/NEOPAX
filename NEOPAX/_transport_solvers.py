@@ -2674,6 +2674,14 @@ def _radau_capture_step_lagged_cache_path() -> str | None:
     return value or None
 
 
+def _radau_capture_step_primal_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_PRIMAL_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _radau_select_replay_state_leaf(
     replay_state: _RadauReplayState,
     selected_leaf: str | None,
@@ -7154,6 +7162,60 @@ def _radau_replay_realized_accepted_carry_pullback(
                     operand=None,
                 )
 
+            capture_step_primal_path = _radau_capture_step_primal_path()
+            if capture_step_primal_path:
+                def _capture_step_primal(_):
+                    carry_before_for_capture = _carry_from_payload(step_xs)
+                    carry_before_for_capture = _radau_carry_with_forward_only_jvp_fields(carry_before_for_capture)
+                    primal_attempt_result_for_capture = _execute_radau_accepted_step_attempt(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        carry_before_for_capture,
+                        execution_context.attempt_context,
+                    )
+                    lagged_response_for_capture, _, _ = _radau_prepare_lagged_response(
+                        execution_context.kernel_context,
+                        carry_before_for_capture,
+                        execution_context.physics_context.unpack_flat,
+                        execution_context.physics_context.project_flat,
+                        execution_context.physics_context.build_lagged_response,
+                    )
+                    rhs_time_ref_for_capture = jax.jacfwd(
+                        lambda t_eval: _radau_eval_rhs(
+                            t_eval,
+                            carry_before_for_capture.y,
+                            lagged_response_for_capture,
+                            execution_context.physics_context.flat_rhs,
+                            execution_context.physics_context.flat_rhs_with_lagged_response,
+                        )
+                    )(carry_before_for_capture.t)
+
+                    def _write_primal(trial_dt_arr, stage_history_arr, jacobian_arr, rhs_time_ref_arr):
+                        np.savez(
+                            capture_step_primal_path,
+                            trial_dt=np.asarray(trial_dt_arr, dtype=float),
+                            stage_history=np.asarray(stage_history_arr, dtype=float),
+                            jacobian_out=np.asarray(jacobian_arr, dtype=float),
+                            rhs_time_ref=np.asarray(rhs_time_ref_arr, dtype=float),
+                        )
+
+                    jax.debug.callback(
+                        _write_primal,
+                        primal_attempt_result_for_capture.trial_dt,
+                        primal_attempt_result_for_capture.stage_history,
+                        primal_attempt_result_for_capture.jacobian_out,
+                        rhs_time_ref_for_capture,
+                        ordered=True,
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_print_step_check,
+                    _capture_step_primal,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+
             def _print_step_window(_):
                 jax.debug.print(
                     "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
@@ -7543,6 +7605,7 @@ def _radau_host_local_step_pullback_compare(
     replay_dy_bar_override=None,
     replay_inputs_override=None,
     replay_lagged_cache_override=None,
+    replay_primal_override=None,
 ):
     """Host-side comparison of reduced accepted-y pullback on one replay payload step.
 
@@ -7940,6 +8003,49 @@ def _radau_host_local_step_pullback_compare(
             is_leaf=lambda x: x is None,
         )
         result["replay_input_lagged_cache_diff_l2"] = _radau_tree_l2_norm(lagged_cache_diff)
+    if replay_primal_override is not None:
+        replay_trial_dt = jnp.asarray(replay_primal_override["trial_dt"], dtype=primal_attempt_result.trial_dt.dtype)
+        replay_stage_history = jnp.asarray(
+            replay_primal_override["stage_history"],
+            dtype=primal_attempt_result.stage_history.dtype,
+        )
+        replay_jacobian_out = jnp.asarray(
+            replay_primal_override["jacobian_out"],
+            dtype=primal_attempt_result.jacobian_out.dtype,
+        )
+        replay_rhs_time_ref = jnp.asarray(
+            replay_primal_override["rhs_time_ref"],
+            dtype=rhs_time_ref.dtype,
+        )
+        result.update(
+            {
+                "replay_primal_trial_dt_diff": jnp.asarray(
+                    jnp.abs(replay_trial_dt - primal_attempt_result.trial_dt),
+                    dtype=jnp.float64,
+                ),
+                "replay_primal_stage_history_diff_l2": _radau_tree_l2_norm(
+                    replay_stage_history - primal_attempt_result.stage_history
+                ),
+                "replay_primal_stage_history_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_stage_history - primal_attempt_result.stage_history)),
+                    dtype=jnp.float64,
+                ),
+                "replay_primal_jacobian_out_diff_l2": _radau_tree_l2_norm(
+                    replay_jacobian_out - primal_attempt_result.jacobian_out
+                ),
+                "replay_primal_jacobian_out_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_jacobian_out - primal_attempt_result.jacobian_out)),
+                    dtype=jnp.float64,
+                ),
+                "replay_primal_rhs_time_ref_diff_l2": _radau_tree_l2_norm(
+                    replay_rhs_time_ref - rhs_time_ref
+                ),
+                "replay_primal_rhs_time_ref_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_rhs_time_ref - rhs_time_ref)),
+                    dtype=jnp.float64,
+                ),
+            }
+        )
     return result
 
 
