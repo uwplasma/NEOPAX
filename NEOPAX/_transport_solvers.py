@@ -5182,6 +5182,42 @@ def _radau_replay_state_to_carry(
     )
 
 
+def _radau_pack_replay_state(replay_state: _RadauReplayState):
+    leaves = (
+        jnp.ravel(jnp.asarray(replay_state.t)),
+        jnp.ravel(jnp.asarray(replay_state.y)),
+        jnp.ravel(jnp.asarray(replay_state.dt)),
+        jnp.ravel(jnp.asarray(replay_state.prev_stages)),
+        jnp.ravel(jnp.asarray(replay_state.prev_dt)),
+        jnp.ravel(jnp.asarray(replay_state.lagged_reference_y)),
+        jnp.ravel(jnp.asarray(replay_state.prev_theta_final)),
+    )
+    return jnp.concatenate(leaves, axis=0)
+
+
+def _radau_unpack_replay_state(flat_replay_state, template: _RadauReplayState) -> _RadauReplayState:
+    flat_replay_state = jnp.asarray(flat_replay_state)
+    offset = 0
+
+    def _take_like(template_value):
+        nonlocal offset
+        template_arr = jnp.asarray(template_value)
+        size = int(template_arr.size)
+        piece = flat_replay_state[offset : offset + size]
+        offset += size
+        return jnp.reshape(piece, template_arr.shape).astype(template_arr.dtype)
+
+    return _RadauReplayState(
+        t=_take_like(template.t),
+        y=_take_like(template.y),
+        dt=_take_like(template.dt),
+        prev_stages=_take_like(template.prev_stages),
+        prev_dt=_take_like(template.prev_dt),
+        lagged_reference_y=_take_like(template.lagged_reference_y),
+        prev_theta_final=_take_like(template.prev_theta_final),
+    )
+
+
 def _radau_step_state_with_forward_only_controller_fields(
     step_state: _RadauStepState,
 ) -> _RadauStepState:
@@ -8981,12 +9017,13 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         ) = inputs
         if not use_reduced_replay_debug_path:
             checkpoint_replay_state = _radau_replay_state_from_carry(checkpoint_carry)
-            flat_checkpoint_replay_state, replay_state_unravel = jax.flatten_util.ravel_pytree(
-                checkpoint_replay_state
-            )
+            flat_checkpoint_replay_state = _radau_pack_replay_state(checkpoint_replay_state)
 
             def _segment_replay_state_flat(flat_replay_state_before):
-                replay_state_before = replay_state_unravel(flat_replay_state_before)
+                replay_state_before = _radau_unpack_replay_state(
+                    flat_replay_state_before,
+                    checkpoint_replay_state,
+                )
                 carry_before = _radau_replay_state_to_carry(
                     replay_state_before,
                     lagged_response_cache=jax.lax.stop_gradient(checkpoint_carry.lagged_response_cache),
@@ -9020,13 +9057,21 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 replay_state_after = _radau_replay_state_from_carry(
                     _radau_carry_with_forward_only_jvp_fields(final_carry)
                 )
-                flat_replay_state_after, _ = jax.flatten_util.ravel_pytree(replay_state_after)
-                return flat_replay_state_after
+                return _radau_pack_replay_state(replay_state_after)
 
-            flat_carry_bar, _ = jax.flatten_util.ravel_pytree(carry_bar)
-            _, pullback = jax.vjp(_segment_replay_state_flat, flat_checkpoint_replay_state)
-            (flat_replay_state_before_bar,) = pullback(flat_carry_bar)
-            replay_state_before_bar = replay_state_unravel(flat_replay_state_before_bar)
+            flat_carry_bar = _radau_pack_replay_state(carry_bar)
+            _, segment_linear = jax.linearize(
+                _segment_replay_state_flat,
+                flat_checkpoint_replay_state,
+            )
+            (flat_replay_state_before_bar,) = jax.linear_transpose(
+                segment_linear,
+                flat_checkpoint_replay_state,
+            )(flat_carry_bar)
+            replay_state_before_bar = _radau_unpack_replay_state(
+                flat_replay_state_before_bar,
+                checkpoint_replay_state,
+            )
             return replay_state_before_bar, None
 
         _, payloads = _radau_replay_realized_segment_payloads(
