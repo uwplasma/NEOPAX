@@ -8981,8 +8981,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         ) = inputs
         if not use_reduced_replay_debug_path:
             checkpoint_replay_state = _radau_replay_state_from_carry(checkpoint_carry)
+            flat_checkpoint_replay_state, replay_state_unravel = jax.flatten_util.ravel_pytree(
+                checkpoint_replay_state
+            )
 
-            def _segment_replay_state(replay_state_before):
+            def _segment_replay_state_flat(flat_replay_state_before):
+                replay_state_before = replay_state_unravel(flat_replay_state_before)
                 carry_before = _radau_replay_state_to_carry(
                     replay_state_before,
                     lagged_response_cache=jax.lax.stop_gradient(checkpoint_carry.lagged_response_cache),
@@ -9013,12 +9017,16 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     segment_next_easy_growth_streak,
                     segment_next_lagged_response_valid,
                 )
-                return _radau_replay_state_from_carry(
+                replay_state_after = _radau_replay_state_from_carry(
                     _radau_carry_with_forward_only_jvp_fields(final_carry)
                 )
+                flat_replay_state_after, _ = jax.flatten_util.ravel_pytree(replay_state_after)
+                return flat_replay_state_after
 
-            _, pullback = jax.vjp(_segment_replay_state, checkpoint_replay_state)
-            (replay_state_before_bar,) = pullback(carry_bar)
+            flat_carry_bar, _ = jax.flatten_util.ravel_pytree(carry_bar)
+            _, pullback = jax.vjp(_segment_replay_state_flat, flat_checkpoint_replay_state)
+            (flat_replay_state_before_bar,) = pullback(flat_carry_bar)
+            replay_state_before_bar = replay_state_unravel(flat_replay_state_before_bar)
             return replay_state_before_bar, None
 
         _, payloads = _radau_replay_realized_segment_payloads(
