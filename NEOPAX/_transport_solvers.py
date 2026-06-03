@@ -7643,6 +7643,7 @@ def _radau_host_local_step_pullback_compare(
         prev_theta_final=payloads.prev_theta_final[idx],
         prev_newton_iter_count=payloads.prev_newton_iter_count[idx],
     )
+    host_lagged_cache_before_override = carry_before.lagged_response_cache
     if replay_lagged_cache_override is not None:
         carry_before = dataclasses.replace(
             carry_before,
@@ -7935,7 +7936,7 @@ def _radau_host_local_step_pullback_compare(
                 else jnp.asarray(a, dtype=jnp.float64) - jnp.asarray(b, dtype=jnp.float64)
             ),
             replay_lagged_cache_override,
-            carry_before.lagged_response_cache,
+            host_lagged_cache_before_override,
             is_leaf=lambda x: x is None,
         )
         result["replay_input_lagged_cache_diff_l2"] = _radau_tree_l2_norm(lagged_cache_diff)
