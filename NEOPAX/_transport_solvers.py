@@ -8996,9 +8996,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     segment_next_lagged_response_valid,
                 )
 
-            # Prefer rematerialization over retaining large segment-level replay
-            # intermediates during the default full-history reverse pass.
-            _, pullback = jax.vjp(jax.checkpoint(_segment_replay), checkpoint_carry)
+            _, pullback = jax.vjp(_segment_replay, checkpoint_carry)
             (carry_before_bar,) = pullback(carry_bar)
             return carry_before_bar, None
 
