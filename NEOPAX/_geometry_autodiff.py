@@ -344,6 +344,15 @@ def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) 
     return None if match < 0 else match
 
 
+def _smooth_negative_part_penalty(values: jnp.ndarray, *, softness: float = 1.0e-3) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    if int(values.size) == 0:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    softness_value = jnp.asarray(float(max(softness, 1.0e-12)), dtype=jnp.float64)
+    deficit = -values
+    return jnp.mean(softness_value * jnp.logaddexp(jnp.asarray(0.0, dtype=jnp.float64), deficit / softness_value))
+
+
 def _vmec_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -361,6 +370,31 @@ def _vmec_scalar_observables_from_state(
         "equilibrium_aspect_ratio_from_state",
         submodule="profiles",
     )
+    magnetic_well_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "magnetic_well_from_state",
+        submodule="finite_beta",
+    )
+    mercier_terms_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "mercier_terms_from_state",
+        submodule="finite_beta",
+    )
+    b_cartesian_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "b_cartesian_from_state",
+        submodule="field",
+    )
+    smooth_reduce_max = _resolve_vmec_attr(
+        vmec_jax,
+        "_smooth_reduce_max",
+        submodule="quasi_isodynamic",
+    )
+    smooth_reduce_min = _resolve_vmec_attr(
+        vmec_jax,
+        "_smooth_reduce_min",
+        submodule="quasi_isodynamic",
+    )
 
     geom = eval_geom(state, context.static)
     _dvds, volume = volume_from_sqrtg(
@@ -377,10 +411,57 @@ def _vmec_scalar_observables_from_state(
         signgs=int(context.signgs),
     )
     iota_mean = jnp.mean(iotaf[1:]) if int(iotaf.size) > 1 else iotaf[0]
+    magnetic_well = magnetic_well_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    dmerc = jnp.asarray(
+        mercier_terms_from_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+        )["DMerc"],
+        dtype=jnp.float64,
+    )
+    dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
+    mirror_surface_indices = [int(np.argmin(np.abs(np.asarray(context.static.s, dtype=float) - float(surface)))) for surface in context.surface_s]
+    mirror_ratios = []
+    tiny = jnp.asarray(jnp.finfo(jnp.float64).tiny, dtype=jnp.float64)
+    for s_index in mirror_surface_indices:
+        bcart = jnp.asarray(
+            b_cartesian_from_state(
+                state,
+                context.static,
+                indata=context.indata,
+                signgs=int(context.signgs),
+                s_index=int(s_index),
+            ),
+            dtype=jnp.float64,
+        )
+        bmag = jnp.sqrt(jnp.maximum(jnp.sum(bcart * bcart, axis=-1), tiny))
+        bmax = smooth_reduce_max(bmag, axis=(0, 1), softness=2.0e-2)
+        bmin = smooth_reduce_min(bmag, axis=(0, 1), softness=2.0e-2)
+        bmin_positive = jnp.maximum(bmin, tiny)
+        denom = jnp.maximum(bmax + bmin_positive, tiny)
+        mirror_ratios.append((bmax - bmin_positive) / denom)
+    mirror_ratio = jnp.asarray(mirror_ratios, dtype=jnp.float64)
+    mirror_threshold = jnp.asarray(0.21, dtype=jnp.float64)
+    mirror_softness = jnp.asarray(2.0e-2, dtype=jnp.float64)
+    mirror_penalty = mirror_softness * jnp.logaddexp(
+        jnp.asarray(0.0, dtype=jnp.float64),
+        (mirror_ratio - mirror_threshold) / mirror_softness,
+    )
+    mirror_ratio_objective = jnp.mean(mirror_penalty * mirror_penalty)
     return {
         "aspect_ratio": jnp.asarray(equilibrium_aspect_ratio_from_state(state=state, static=context.static)),
         "volume_total": jnp.asarray(volume[-1]),
         "iota_mean": jnp.asarray(iota_mean),
+        "magnetic_well": jnp.asarray(magnetic_well, dtype=jnp.float64),
+        "dmerc_negative_penalty": _smooth_negative_part_penalty(dmerc_active),
+        "mirror_ratio_objective": jnp.asarray(mirror_ratio_objective, dtype=jnp.float64),
         "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
     }
 
@@ -440,6 +521,16 @@ def _vmec_booz_scalar_observables_from_state(
 ) -> dict[str, jnp.ndarray]:
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
+    magnetic_well_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "magnetic_well_from_state",
+        submodule="finite_beta",
+    )
+    mercier_terms_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "mercier_terms_from_state",
+        submodule="finite_beta",
+    )
 
     inputs = vmec_jax.booz_xform_inputs_from_state(
         state=state,
@@ -466,11 +557,29 @@ def _vmec_booz_scalar_observables_from_state(
     mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
+    magnetic_well = magnetic_well_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+    )
+    dmerc = jnp.asarray(
+        mercier_terms_from_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+        )["DMerc"],
+        dtype=jnp.float64,
+    )
+    dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
     reduced = {
         "iota_b_mean": jnp.mean(jnp.asarray(out["iota_b"])),
         "b00_mean": jnp.mean(b00),
         "buco_b_mean": jnp.mean(jnp.asarray(out["buco_b"])),
         "bvco_b_mean": jnp.mean(jnp.asarray(out["bvco_b"])),
+        "magnetic_well": jnp.asarray(magnetic_well, dtype=jnp.float64),
+        "dmerc_negative_penalty": _smooth_negative_part_penalty(dmerc_active),
         "aspect_proxy": jnp.asarray(state.Rcos[-1, mode00]),
     }
     if mode10 is not None:
@@ -846,7 +955,15 @@ def _observable_items_from_state(
 def _observable_names_for_kind(observable_kind: str) -> list[str]:
     kind = str(observable_kind).strip().lower()
     if kind == "vmec_scalar_observables":
-        return ["aspect_ratio", "volume_total", "iota_mean", "edge_r00"]
+        return [
+            "aspect_ratio",
+            "volume_total",
+            "iota_mean",
+            "magnetic_well",
+            "dmerc_negative_penalty",
+            "mirror_ratio_objective",
+            "edge_r00",
+        ]
     if kind == "vmec_iotaf_scalar_observables":
         return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
     if kind == "vmec_booz_scalar_observables":
@@ -855,6 +972,8 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "b00_mean",
             "buco_b_mean",
             "bvco_b_mean",
+            "magnetic_well",
+            "dmerc_negative_penalty",
             "aspect_proxy",
             "b10_over_b00_mean",
         ]
