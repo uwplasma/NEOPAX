@@ -353,6 +353,13 @@ def _smooth_negative_part_penalty(values: jnp.ndarray, *, softness: float = 1.0e
     return jnp.mean(softness_value * jnp.logaddexp(jnp.asarray(0.0, dtype=jnp.float64), deficit / softness_value))
 
 
+def _smooth_lower_bound_penalty(values: jnp.ndarray, *, minimum: float = 0.0, softness: float = 1.0e-3) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    softness_value = jnp.asarray(float(max(softness, 1.0e-12)), dtype=jnp.float64)
+    deficit = jnp.asarray(float(minimum), dtype=jnp.float64) - values
+    return softness_value * jnp.logaddexp(jnp.asarray(0.0, dtype=jnp.float64), deficit / softness_value)
+
+
 def _three_middle_profile_points(values: jnp.ndarray) -> jnp.ndarray:
     values = jnp.asarray(values, dtype=jnp.float64)
     npts = int(values.size)
@@ -364,6 +371,34 @@ def _three_middle_profile_points(values: jnp.ndarray) -> jnp.ndarray:
     if center >= npts - 1:
         return values[-3:]
     return values[center - 1 : center + 2]
+
+
+def _three_middle_profile_points_fixed(values: jnp.ndarray) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    npts = int(values.size)
+    if npts <= 0:
+        return jnp.zeros((3,), dtype=jnp.float64)
+    if npts == 1:
+        return jnp.repeat(values[:1], 3, axis=0)
+    if npts == 2:
+        return jnp.asarray([values[0], values[0], values[1]], dtype=jnp.float64)
+    return _three_middle_profile_points(values)
+
+
+def _mean_native_dmerc_objective(values: jnp.ndarray, *, minimum: float = 0.0, softness: float = 1.0e-3) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    active = values[1:-1] if int(values.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
+    penalties = _smooth_lower_bound_penalty(active, minimum=minimum, softness=softness)
+    if int(penalties.size) == 0:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    return jnp.mean(penalties)
+
+
+def _native_dmerc_objective_samples(values: jnp.ndarray, *, minimum: float = 0.0, softness: float = 1.0e-3) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    active = values[1:-1] if int(values.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
+    penalties = _smooth_lower_bound_penalty(active, minimum=minimum, softness=softness)
+    return _three_middle_profile_points_fixed(penalties)
 
 
 def _vmec_scalar_observables_from_state(
@@ -439,8 +474,11 @@ def _vmec_scalar_observables_from_state(
         )["DMerc"],
         dtype=jnp.float64,
     )
-    dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
-    dmerc_active = _three_middle_profile_points(dmerc_active)
+    dmerc_objective_samples = _native_dmerc_objective_samples(
+        dmerc,
+        minimum=0.0,
+        softness=1.0e-3,
+    )
     mirror_surface_indices = [int(np.argmin(np.abs(np.asarray(context.static.s, dtype=float) - float(surface)))) for surface in context.surface_s]
     mirror_ratios = []
     tiny = jnp.asarray(jnp.finfo(jnp.float64).tiny, dtype=jnp.float64)
@@ -469,12 +507,19 @@ def _vmec_scalar_observables_from_state(
         (mirror_ratio - mirror_threshold) / mirror_softness,
     )
     mirror_ratio_objective = jnp.mean(mirror_penalty * mirror_penalty)
+    magnetic_well_objective = _smooth_lower_bound_penalty(
+        magnetic_well,
+        minimum=0.0,
+        softness=1.0e-3,
+    ).reshape(())
     return {
         "aspect_ratio": jnp.asarray(equilibrium_aspect_ratio_from_state(state=state, static=context.static)),
         "volume_total": jnp.asarray(volume[-1]),
         "iota_mean": jnp.asarray(iota_mean),
-        "magnetic_well": jnp.asarray(magnetic_well, dtype=jnp.float64),
-        "dmerc_negative_penalty": _smooth_negative_part_penalty(dmerc_active),
+        "magnetic_well_objective": jnp.asarray(magnetic_well_objective, dtype=jnp.float64),
+        "dmerc_objective_lo": jnp.asarray(dmerc_objective_samples[0], dtype=jnp.float64),
+        "dmerc_objective_mid": jnp.asarray(dmerc_objective_samples[1], dtype=jnp.float64),
+        "dmerc_objective_hi": jnp.asarray(dmerc_objective_samples[2], dtype=jnp.float64),
         "mirror_ratio_objective": jnp.asarray(mirror_ratio_objective, dtype=jnp.float64),
         "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
     }
@@ -586,15 +631,25 @@ def _vmec_booz_scalar_observables_from_state(
         )["DMerc"],
         dtype=jnp.float64,
     )
-    dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
-    dmerc_active = _three_middle_profile_points(dmerc_active)
+    dmerc_objective_samples = _native_dmerc_objective_samples(
+        dmerc,
+        minimum=0.0,
+        softness=1.0e-3,
+    )
+    magnetic_well_objective = _smooth_lower_bound_penalty(
+        magnetic_well,
+        minimum=0.0,
+        softness=1.0e-3,
+    ).reshape(())
     reduced = {
         "iota_b_mean": jnp.mean(jnp.asarray(out["iota_b"])),
         "b00_mean": jnp.mean(b00),
         "buco_b_mean": jnp.mean(jnp.asarray(out["buco_b"])),
         "bvco_b_mean": jnp.mean(jnp.asarray(out["bvco_b"])),
-        "magnetic_well": jnp.asarray(magnetic_well, dtype=jnp.float64),
-        "dmerc_negative_penalty": _smooth_negative_part_penalty(dmerc_active),
+        "magnetic_well_objective": jnp.asarray(magnetic_well_objective, dtype=jnp.float64),
+        "dmerc_objective_lo": jnp.asarray(dmerc_objective_samples[0], dtype=jnp.float64),
+        "dmerc_objective_mid": jnp.asarray(dmerc_objective_samples[1], dtype=jnp.float64),
+        "dmerc_objective_hi": jnp.asarray(dmerc_objective_samples[2], dtype=jnp.float64),
         "aspect_proxy": jnp.asarray(state.Rcos[-1, mode00]),
     }
     if mode10 is not None:
@@ -974,8 +1029,10 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "aspect_ratio",
             "volume_total",
             "iota_mean",
-            "magnetic_well",
-            "dmerc_negative_penalty",
+            "magnetic_well_objective",
+            "dmerc_objective_lo",
+            "dmerc_objective_mid",
+            "dmerc_objective_hi",
             "mirror_ratio_objective",
             "edge_r00",
         ]
@@ -987,8 +1044,10 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "b00_mean",
             "buco_b_mean",
             "bvco_b_mean",
-            "magnetic_well",
-            "dmerc_negative_penalty",
+            "magnetic_well_objective",
+            "dmerc_objective_lo",
+            "dmerc_objective_mid",
+            "dmerc_objective_hi",
             "aspect_proxy",
             "b10_over_b00_mean",
         ]
