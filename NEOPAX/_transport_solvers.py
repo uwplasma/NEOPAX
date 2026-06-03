@@ -4292,15 +4292,9 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
             (dlagged_response_cache_out,),
         )
 
-    lagged_cache_tangent_active = jnp.asarray(False)
-    if dlagged_response_cache_out is not None:
-        lagged_cache_tangent_active = jnp.any(
-            jax.tree_util.tree_reduce(
-                lambda acc, x: jnp.logical_or(acc, jnp.any(jnp.asarray(x) != 0)),
-                dlagged_response_cache_out,
-                initializer=jnp.asarray(False),
-            )
-        )
+    use_exact_lagged_cache_tangent = jnp.asarray(
+        (lagged_response is not None) and (dlagged_response_cache_out is not None)
+    )
 
     def _approximate_tangent(_):
         return _radau_compute_approximate_attempt_tangent(
@@ -4383,7 +4377,7 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
         )
 
     tangent_result = jax.lax.cond(
-        jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
+        use_exact_lagged_cache_tangent,
         _exact_lagged_cache_tangent,
         _approximate_tangent,
         operand=None,
@@ -5058,11 +5052,6 @@ def _radau_approximate_accepted_step_tangent(
     dy_source = jnp.asarray(dy_source, dtype=kernel_context.dtype)
     dh_source = jnp.asarray(dh_source, dtype=kernel_context.dtype)
     lagged_eval_tangent = jnp.asarray(lagged_eval_tangent, dtype=kernel_context.dtype)
-    def _zero_tangent(_):
-        dz_zero = jnp.zeros((kernel_context.num_stages, kernel_context.state_dim), dtype=kernel_context.dtype)
-        dy_zero = jnp.zeros((kernel_context.state_dim,), dtype=kernel_context.dtype)
-        return dy_zero, dz_zero
-
     def _compute_tangent(_):
         stage_state_source = dy_source[None, :] + dh_source * (kernel_context.a @ stages_final)
         stage_rhs = (
@@ -5071,7 +5060,7 @@ def _radau_approximate_accepted_step_tangent(
             * jnp.asarray(rhs_time_ref, dtype=kernel_context.dtype)[None, :]
             + lagged_eval_tangent
         )
-        dz_flat = _radau_apply_stage_linear_solve(
+        dz_flat = _radau_apply_stage_linear_solve_no_shortcut(
             kernel_context,
             rhs=stage_rhs.reshape((-1,)),
             real_lu_out=real_lu_out,
@@ -5088,11 +5077,11 @@ def _radau_approximate_accepted_step_tangent(
         return dy_next, dz_stages
 
     if allow_zero_shortcut:
-        zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
-        zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
-        zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
-        zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
-        return jax.lax.cond(zero_input, _zero_tangent, _compute_tangent, operand=None)
+        # Keep the public flag for call-site compatibility, but never branch on
+        # tangent values here. Value-dependent tangent shortcuts make the custom
+        # JVP nonlinear in its tangent input, which breaks transposition in the
+        # replayed reverse path.
+        return _compute_tangent(None)
     return _compute_tangent(None)
 
 
@@ -8990,7 +8979,11 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
     replay_output_mode = _radau_replay_output_diagnostic_mode()
-    use_reduced_replay_debug_path = (replay_output_mode is not None) or _radau_replay_force_reuse_diagnostic()
+    # Benchmark contract: differentiate the accepted-step composition only,
+    # with the accepted schedule fixed by the primal forward pass. Rejected
+    # attempts may still supply nondifferentiated replay metadata, but they are
+    # not differentiated transitions in the reverse map here.
+    use_reduced_replay_debug_path = True
     checkpoint0 = jax.tree_util.tree_map(lambda x: x[0], checkpoint_carries)
     final_replay_state_bar = jax.tree_util.tree_map(
         _radau_zero_cotangent_like,
