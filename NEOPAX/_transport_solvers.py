@@ -11,6 +11,7 @@ import dataclasses
 from functools import partial
 import inspect
 import os
+import pickle
 import time
 import jax
 import jax.numpy as jnp
@@ -2659,6 +2660,14 @@ def _radau_capture_step_dy_bar_path() -> str | None:
 
 def _radau_capture_step_inputs_path() -> str | None:
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_INPUTS_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _radau_capture_step_lagged_cache_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CAPTURE_STEP_LAGGED_CACHE_PATH")
     if raw_value is None:
         return None
     value = raw_value.strip()
@@ -7120,6 +7129,31 @@ def _radau_replay_realized_accepted_carry_pullback(
                     operand=None,
                 )
 
+            capture_step_lagged_cache_path = _radau_capture_step_lagged_cache_path()
+            if capture_step_lagged_cache_path:
+                def _capture_step_lagged_cache(_):
+                    def _write_lagged_cache(cache_tree):
+                        serializable_tree = jax.tree_util.tree_map(
+                            lambda x: None if x is None else np.asarray(x),
+                            cache_tree,
+                            is_leaf=lambda x: x is None,
+                        )
+                        with open(capture_step_lagged_cache_path, "wb") as f:
+                            pickle.dump(serializable_tree, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    jax.debug.callback(
+                        _write_lagged_cache,
+                        carry_before.lagged_response_cache,
+                        ordered=True,
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_print_step_check,
+                    _capture_step_lagged_cache,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+
             def _print_step_window(_):
                 jax.debug.print(
                     "[autodiff-gate] step-cotangent-window seg={seg} step={step} "
@@ -7508,6 +7542,7 @@ def _radau_host_local_step_pullback_compare(
     accepted_y_bar_override=None,
     replay_dy_bar_override=None,
     replay_inputs_override=None,
+    replay_lagged_cache_override=None,
 ):
     """Host-side comparison of reduced accepted-y pullback on one replay payload step.
 
@@ -7608,6 +7643,11 @@ def _radau_host_local_step_pullback_compare(
         prev_theta_final=payloads.prev_theta_final[idx],
         prev_newton_iter_count=payloads.prev_newton_iter_count[idx],
     )
+    if replay_lagged_cache_override is not None:
+        carry_before = dataclasses.replace(
+            carry_before,
+            lagged_response_cache=replay_lagged_cache_override,
+        )
     carry_before = _radau_carry_with_forward_only_jvp_fields(carry_before)
     primal_attempt_result = _execute_radau_accepted_step_attempt(
         execution_context.kernel_context,
@@ -7887,6 +7927,18 @@ def _radau_host_local_step_pullback_compare(
                 jnp.abs(replay_prev_newton - carry_before.prev_newton_iter_count),
                 dtype=jnp.float64,
             )
+    if replay_lagged_cache_override is not None:
+        lagged_cache_diff = jax.tree_util.tree_map(
+            lambda a, b: (
+                jnp.asarray(0.0, dtype=jnp.float64)
+                if a is None and b is None
+                else jnp.asarray(a, dtype=jnp.float64) - jnp.asarray(b, dtype=jnp.float64)
+            ),
+            replay_lagged_cache_override,
+            carry_before.lagged_response_cache,
+            is_leaf=lambda x: x is None,
+        )
+        result["replay_input_lagged_cache_diff_l2"] = _radau_tree_l2_norm(lagged_cache_diff)
     return result
 
 

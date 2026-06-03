@@ -26,6 +26,7 @@ import csv
 import dataclasses
 import json
 import os
+import pickle
 import sys
 import time
 from functools import partial
@@ -777,6 +778,14 @@ def _host_step_pullback_replay_inputs_path() -> str | None:
     return value or None
 
 
+def _host_step_pullback_replay_lagged_cache_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_LAGGED_CACHE_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     parameter_values,
     *,
@@ -799,6 +808,11 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     replay_inputs_path = _host_step_pullback_replay_inputs_path()
     if replay_inputs_path is not None:
         replay_inputs_override = dict(np.load(replay_inputs_path))
+    replay_lagged_cache_override = None
+    replay_lagged_cache_path = _host_step_pullback_replay_lagged_cache_path()
+    if replay_lagged_cache_path is not None:
+        with open(replay_lagged_cache_path, "rb") as f:
+            replay_lagged_cache_override = pickle.load(f)
     execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
         _prepare_realized_schedule_profile_vector_rollout_option_a(
             parameter_values,
@@ -820,6 +834,7 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
         accepted_y_bar_override=accepted_y_bar_override,
         replay_dy_bar_override=replay_dy_bar_override,
         replay_inputs_override=replay_inputs_override,
+        replay_lagged_cache_override=replay_lagged_cache_override,
     )
 
 
