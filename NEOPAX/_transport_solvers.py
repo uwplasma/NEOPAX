@@ -7746,6 +7746,13 @@ def _radau_host_local_step_pullback_compare(
         (execution_context.kernel_context.num_stages, execution_context.kernel_context.state_dim),
         dtype=execution_context.dtype,
     )
+    if execution_context.physics_context.project_flat is None:
+        accepted_y_primal = primal_attempt_result.trial_y
+    else:
+        accepted_y_primal = _project_flat_state_if_needed(
+            primal_attempt_result.trial_y,
+            execution_context.physics_context.project_flat,
+        )
 
     def _accepted_y_from_dy_dh(dy_source, dh_source):
         tangent_result = _radau_compute_approximate_attempt_tangent(
@@ -8042,6 +8049,41 @@ def _radau_host_local_step_pullback_compare(
                 ),
                 "replay_primal_rhs_time_ref_diff_max": jnp.asarray(
                     jnp.max(jnp.abs(replay_rhs_time_ref - rhs_time_ref)),
+                    dtype=jnp.float64,
+                ),
+            }
+        )
+    if idx + 1 < int(payloads.dt.shape[0]):
+        forward_recorded_prev_stages = jnp.asarray(
+            payloads.prev_stages[idx + 1],
+            dtype=primal_attempt_result.stage_history.dtype,
+        )
+        forward_recorded_prev_dt = jnp.asarray(
+            payloads.prev_dt[idx + 1],
+            dtype=primal_attempt_result.trial_dt.dtype,
+        )
+        forward_recorded_y_start = jnp.asarray(
+            payloads.y_start[idx + 1],
+            dtype=accepted_y_primal.dtype,
+        )
+        result.update(
+            {
+                "forward_recorded_prev_stages_diff_l2": _radau_tree_l2_norm(
+                    forward_recorded_prev_stages - primal_attempt_result.stage_history
+                ),
+                "forward_recorded_prev_stages_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(forward_recorded_prev_stages - primal_attempt_result.stage_history)),
+                    dtype=jnp.float64,
+                ),
+                "forward_recorded_prev_dt_diff": jnp.asarray(
+                    jnp.abs(forward_recorded_prev_dt - primal_attempt_result.trial_dt),
+                    dtype=jnp.float64,
+                ),
+                "forward_recorded_next_y_diff_l2": _radau_tree_l2_norm(
+                    forward_recorded_y_start - accepted_y_primal
+                ),
+                "forward_recorded_next_y_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(forward_recorded_y_start - accepted_y_primal)),
                     dtype=jnp.float64,
                 ),
             }
