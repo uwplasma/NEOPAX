@@ -5336,3 +5336,102 @@ Interpretation:
   - `lagged_ref_l2`
 - Goal:
   - determine whether a non-`y` replay-state leaf spikes first and then feeds the `accepted_y_bar` explosion from step `10 -> 9`.
+
+## 2026-06-03 reverse-AD update: local adjoint cleared, forward-recorded primal mismatch remains
+
+### Current narrowed lab
+
+We are still debugging under:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1
+```
+
+with:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+### What is no longer the main suspect
+
+These have effectively been ruled out as the primary remaining bug:
+
+- local accepted-step `dy/dh` adjoint algebra
+- replay-branch post-processing after the local helper
+- replay carry inputs:
+  - `y`, `t`, `dt`
+  - `prev_stages`
+  - `lagged_reference_y`
+  - `jacobian`
+  - `real_lu`, `complex_lu`, pivots
+  - cache flags / cache age / cache dt
+  - `lagged_response_valid`
+  - `prev_theta_final`
+  - `prev_newton_iter_count`
+  - `lagged_response_cache`
+
+### Same-trace replay result
+
+At `seg=1 step=10`, the cheap replay check now shows:
+
+- `accepted_y_bar_l2 = 9.430782e+21`
+- `lhs = 1.843063e+23`
+- `rhs = 1.577166e+22`
+- `abs_err = 1.685347e+23`
+- `direct_dy_l2 = 3.927721e+23`
+- `replay_dy_l2 = 3.927721e+23`
+- `direct_vs_replay_dy_diff_l2 = 0`
+
+Meaning:
+
+- inside the same trace, the replay path and the direct local helper agree
+- so the large local `dy_bar` is coming from the local helper call context used in replay, not from later mutation
+
+### Host vs replay still disagree strongly
+
+Host-side local diagnostic with replay-captured context still gives:
+
+- `dy_manual_l2 = 9.430782e+21`
+- `replay_dy_bar_l2 = 3.927721e+23`
+- `replay_vs_host_dy_diff_l2 = 3.883529e+23`
+
+So the host-local reconstruction and replay-local reconstruction are still not using the same effective local primal step, even after matching all carried input fields we compared.
+
+### New critical clue
+
+The newly added replay-primal comparison shows:
+
+- `replay_primal_trial_dt_diff = 7.404452e-06`
+- `replay_primal_stage_history_diff_l2 = 4.228100e+07`
+- `replay_primal_stage_history_diff_max = 3.782329e+07`
+- `replay_primal_jacobian_out_diff_l2 = 0`
+- `replay_primal_rhs_time_ref_diff_l2 = 0`
+
+This is now the most important result.
+
+Interpretation:
+
+- the remaining mismatch is localized to the **recomputed local primal step**, especially:
+  - `trial_dt`
+  - `stage_history`
+- reverse appears to be differentiating through a local primal accepted-step reconstruction that does not exactly match the forward accepted step at this replay location
+
+### Exact next direction
+
+Use the host diagnostic with the replay captures:
+
+```bash
+NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT=1 NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP=10 NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_Y_BAR_PATH=outputs/autodiff_transport_lagged_ntx/profile_vector/step10_y_bar.npy NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_DY_BAR_PATH=outputs/autodiff_transport_lagged_ntx/profile_vector/step10_dy_bar_replay.npy NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_INPUTS_PATH=outputs/autodiff_transport_lagged_ntx/profile_vector/step10_inputs_replay.npz NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_LAGGED_CACHE_PATH=outputs/autodiff_transport_lagged_ntx/profile_vector/step10_lagged_cache_replay.pkl NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_PRIMAL_PATH=outputs/autodiff_transport_lagged_ntx/profile_vector/step10_primal_replay.npz python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
+```
+
+Then inspect the newly added forward-recorded checks:
+
+- `forward_recorded_prev_stages_diff_*`
+- `forward_recorded_prev_dt_diff`
+- `forward_recorded_next_y_diff_*`
+
+If these are large, the likely fix is:
+
+- do not rely on fresh recomputation of the local primal accepted step for this reverse path
+- instead use forward-recorded step data, or an exact reconstruction from stored forward payloads, for the reverse local pullback context

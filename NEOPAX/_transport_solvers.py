@@ -7190,10 +7190,17 @@ def _radau_replay_realized_accepted_carry_pullback(
                         )
                     )(carry_before_for_capture.t)
 
-                    def _write_primal(trial_dt_arr, stage_history_arr, jacobian_arr, rhs_time_ref_arr):
+                    accepted_y_for_capture = _project_flat_state_if_needed(
+                        primal_attempt_result_for_capture.trial_y,
+                        execution_context.physics_context.project_flat,
+                    )
+
+                    def _write_primal(trial_dt_arr, trial_y_arr, accepted_y_arr, stage_history_arr, jacobian_arr, rhs_time_ref_arr):
                         np.savez(
                             capture_step_primal_path,
                             trial_dt=np.asarray(trial_dt_arr, dtype=float),
+                            trial_y=np.asarray(trial_y_arr, dtype=float),
+                            accepted_y=np.asarray(accepted_y_arr, dtype=float),
                             stage_history=np.asarray(stage_history_arr, dtype=float),
                             jacobian_out=np.asarray(jacobian_arr, dtype=float),
                             rhs_time_ref=np.asarray(rhs_time_ref_arr, dtype=float),
@@ -7202,6 +7209,8 @@ def _radau_replay_realized_accepted_carry_pullback(
                     jax.debug.callback(
                         _write_primal,
                         primal_attempt_result_for_capture.trial_dt,
+                        primal_attempt_result_for_capture.trial_y,
+                        accepted_y_for_capture,
                         primal_attempt_result_for_capture.stage_history,
                         primal_attempt_result_for_capture.jacobian_out,
                         rhs_time_ref_for_capture,
@@ -8012,6 +8021,14 @@ def _radau_host_local_step_pullback_compare(
         result["replay_input_lagged_cache_diff_l2"] = _radau_tree_l2_norm(lagged_cache_diff)
     if replay_primal_override is not None:
         replay_trial_dt = jnp.asarray(replay_primal_override["trial_dt"], dtype=primal_attempt_result.trial_dt.dtype)
+        replay_trial_y = jnp.asarray(
+            replay_primal_override["trial_y"],
+            dtype=primal_attempt_result.trial_y.dtype,
+        )
+        replay_accepted_y = jnp.asarray(
+            replay_primal_override["accepted_y"],
+            dtype=accepted_y_primal.dtype,
+        )
         replay_stage_history = jnp.asarray(
             replay_primal_override["stage_history"],
             dtype=primal_attempt_result.stage_history.dtype,
@@ -8028,6 +8045,20 @@ def _radau_host_local_step_pullback_compare(
             {
                 "replay_primal_trial_dt_diff": jnp.asarray(
                     jnp.abs(replay_trial_dt - primal_attempt_result.trial_dt),
+                    dtype=jnp.float64,
+                ),
+                "replay_primal_trial_y_diff_l2": _radau_tree_l2_norm(
+                    replay_trial_y - primal_attempt_result.trial_y
+                ),
+                "replay_primal_trial_y_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_trial_y - primal_attempt_result.trial_y)),
+                    dtype=jnp.float64,
+                ),
+                "replay_primal_accepted_y_diff_l2": _radau_tree_l2_norm(
+                    replay_accepted_y - accepted_y_primal
+                ),
+                "replay_primal_accepted_y_diff_max": jnp.asarray(
+                    jnp.max(jnp.abs(replay_accepted_y - accepted_y_primal)),
                     dtype=jnp.float64,
                 ),
                 "replay_primal_stage_history_diff_l2": _radau_tree_l2_norm(
