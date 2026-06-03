@@ -6926,6 +6926,36 @@ def _radau_replay_realized_accepted_carry_pullback(
                     carry_before_for_check,
                     execution_context.attempt_context,
                 )
+                lagged_response_for_check, _, _ = _radau_prepare_lagged_response(
+                    execution_context.kernel_context,
+                    carry_before_for_check,
+                    execution_context.physics_context.unpack_flat,
+                    execution_context.physics_context.project_flat,
+                    execution_context.physics_context.build_lagged_response,
+                )
+                rhs_time_ref_for_check = jax.jacfwd(
+                    lambda t_eval: _radau_eval_rhs(
+                        t_eval,
+                        carry_before_for_check.y,
+                        lagged_response_for_check,
+                        execution_context.physics_context.flat_rhs,
+                        execution_context.physics_context.flat_rhs_with_lagged_response,
+                    )
+                )(carry_before_for_check.t)
+                direct_dy_bar_check, direct_dh_bar_check, direct_dt_in_bar_check, _direct_lagged_cache_bar_check = (
+                    _radau_accepted_step_y_pullback_linearized(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        carry_before_for_check,
+                        primal_attempt_result,
+                        replay_state_cotangent.y,
+                        lagged_response_for_check,
+                        rhs_time_ref_for_check,
+                        zero_lagged_cache_tangent=_radau_zero_cotangent_like(
+                            carry_before_for_check.lagged_response_cache
+                        ),
+                    )
+                )
                 carry_tangent = _radau_zero_optional_pytree(carry_before_for_check)
                 carry_tangent = dataclasses.replace(
                     carry_tangent,
@@ -6946,7 +6976,10 @@ def _radau_replay_realized_accepted_carry_pullback(
                 jax.debug.print(
                     "[autodiff-gate] step-pullback-check seg={seg} step={step} "
                     "accepted_y_bar_l2={accepted_y_bar_l2:.6e} accepted_y_bar_max={accepted_y_bar_max:.6e} "
-                    "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
+                    "lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e} "
+                    "direct_dy_l2={direct_dy_l2:.6e} replay_dy_l2={replay_dy_l2:.6e} "
+                    "direct_vs_replay_dy_diff_l2={direct_diff_l2:.6e} "
+                    "direct_dh={direct_dh:.6e} replay_t_bar={replay_t_bar:.6e} direct_dt_in={direct_dt_in:.6e}",
                     seg=segment_index,
                     step=step_index,
                     accepted_y_bar_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(replay_state_cotangent.y, dtype=dtype))),
@@ -6954,6 +6987,17 @@ def _radau_replay_realized_accepted_carry_pullback(
                     lhs=lhs,
                     rhs=rhs,
                     err=jnp.abs(lhs - rhs),
+                    direct_dy_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(direct_dy_bar_check, dtype=dtype))),
+                    replay_dy_l2=jnp.linalg.norm(jnp.ravel(jnp.asarray(carry_before_bar.y, dtype=dtype))),
+                    direct_diff_l2=jnp.linalg.norm(
+                        jnp.ravel(
+                            jnp.asarray(carry_before_bar.y, dtype=dtype)
+                            - jnp.asarray(direct_dy_bar_check, dtype=dtype)
+                        )
+                    ),
+                    direct_dh=jnp.asarray(direct_dh_bar_check, dtype=dtype),
+                    replay_t_bar=jnp.asarray(carry_before_bar.t, dtype=dtype),
+                    direct_dt_in=jnp.asarray(direct_dt_in_bar_check, dtype=dtype),
                     ordered=True,
                 )
                 return jnp.asarray(0, dtype=jnp.int32)
