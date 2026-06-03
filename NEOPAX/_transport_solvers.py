@@ -8956,8 +8956,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     replay_output_mode = _radau_replay_output_diagnostic_mode()
     use_reduced_replay_debug_path = (replay_output_mode is not None) or _radau_replay_force_reuse_diagnostic()
     checkpoint0 = jax.tree_util.tree_map(lambda x: x[0], checkpoint_carries)
-    final_carry_bar = jax.tree_util.tree_map(_radau_zero_cotangent_like, checkpoint0)
-    final_carry_bar = dataclasses.replace(final_carry_bar, y=final_y_bar)
     final_replay_state_bar = jax.tree_util.tree_map(
         _radau_zero_cotangent_like,
         _radau_replay_state_from_carry(checkpoint0),
@@ -8982,8 +8980,28 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_lagged_response_valid,
         ) = inputs
         if not use_reduced_replay_debug_path:
-            def _segment_replay(carry_before):
-                return _radau_replay_realized_attempt_final_carry(
+            checkpoint_replay_state = _radau_replay_state_from_carry(checkpoint_carry)
+
+            def _segment_replay_state(replay_state_before):
+                carry_before = _radau_replay_state_to_carry(
+                    replay_state_before,
+                    lagged_response_cache=jax.lax.stop_gradient(checkpoint_carry.lagged_response_cache),
+                    lagged_response_valid=jax.lax.stop_gradient(checkpoint_carry.lagged_response_valid),
+                    prev_newton_iter_count=jax.lax.stop_gradient(checkpoint_carry.prev_newton_iter_count),
+                    prev_error=jax.lax.stop_gradient(checkpoint_carry.prev_error),
+                    recent_reject_count=jax.lax.stop_gradient(checkpoint_carry.recent_reject_count),
+                    regrowth_cooldown=jax.lax.stop_gradient(checkpoint_carry.regrowth_cooldown),
+                    easy_growth_streak=jax.lax.stop_gradient(checkpoint_carry.easy_growth_streak),
+                    jacobian=jax.lax.stop_gradient(checkpoint_carry.jacobian),
+                    cache_valid=jax.lax.stop_gradient(checkpoint_carry.cache_valid),
+                    cache_dt=jax.lax.stop_gradient(checkpoint_carry.cache_dt),
+                    cache_age=jax.lax.stop_gradient(checkpoint_carry.cache_age),
+                    real_lu=jax.lax.stop_gradient(checkpoint_carry.real_lu),
+                    real_piv=jax.lax.stop_gradient(checkpoint_carry.real_piv),
+                    complex_lu=jax.lax.stop_gradient(checkpoint_carry.complex_lu),
+                    complex_piv=jax.lax.stop_gradient(checkpoint_carry.complex_piv),
+                )
+                final_carry = _radau_replay_realized_attempt_final_carry(
                     execution_context,
                     carry_before,
                     segment_full_active_mask,
@@ -8995,10 +9013,13 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     segment_next_easy_growth_streak,
                     segment_next_lagged_response_valid,
                 )
+                return _radau_replay_state_from_carry(
+                    _radau_carry_with_forward_only_jvp_fields(final_carry)
+                )
 
-            _, pullback = jax.vjp(_segment_replay, checkpoint_carry)
-            (carry_before_bar,) = pullback(carry_bar)
-            return carry_before_bar, None
+            _, pullback = jax.vjp(_segment_replay_state, checkpoint_replay_state)
+            (replay_state_before_bar,) = pullback(carry_bar)
+            return replay_state_before_bar, None
 
         _, payloads = _radau_replay_realized_segment_payloads(
             execution_context,
@@ -9152,11 +9173,29 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         )
         return (carry0_bar,)
 
-    carry0_bar = jax.lax.fori_loop(
+    replay_state0_bar = jax.lax.fori_loop(
         0,
         n_segments,
         _reverse_loop_body,
-        final_carry_bar,
+        final_replay_state_bar,
+    )
+    carry0_bar = _radau_replay_state_to_carry(
+        replay_state0_bar,
+        lagged_response_cache=_radau_zero_cotangent_like(checkpoint0.lagged_response_cache),
+        lagged_response_valid=_radau_zero_cotangent_like(checkpoint0.lagged_response_valid),
+        prev_newton_iter_count=_radau_zero_cotangent_like(checkpoint0.prev_newton_iter_count),
+        prev_error=_radau_zero_cotangent_like(checkpoint0.prev_error),
+        recent_reject_count=_radau_zero_cotangent_like(checkpoint0.recent_reject_count),
+        regrowth_cooldown=_radau_zero_cotangent_like(checkpoint0.regrowth_cooldown),
+        easy_growth_streak=_radau_zero_cotangent_like(checkpoint0.easy_growth_streak),
+        jacobian=_radau_zero_cotangent_like(checkpoint0.jacobian),
+        cache_valid=_radau_zero_cotangent_like(checkpoint0.cache_valid),
+        cache_dt=_radau_zero_cotangent_like(checkpoint0.cache_dt),
+        cache_age=_radau_zero_cotangent_like(checkpoint0.cache_age),
+        real_lu=_radau_zero_cotangent_like(checkpoint0.real_lu),
+        real_piv=_radau_zero_cotangent_like(checkpoint0.real_piv),
+        complex_lu=_radau_zero_cotangent_like(checkpoint0.complex_lu),
+        complex_piv=_radau_zero_cotangent_like(checkpoint0.complex_piv),
     )
     return (carry0_bar,)
 
