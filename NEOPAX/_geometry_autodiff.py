@@ -353,6 +353,19 @@ def _smooth_negative_part_penalty(values: jnp.ndarray, *, softness: float = 1.0e
     return jnp.mean(softness_value * jnp.logaddexp(jnp.asarray(0.0, dtype=jnp.float64), deficit / softness_value))
 
 
+def _three_middle_profile_points(values: jnp.ndarray) -> jnp.ndarray:
+    values = jnp.asarray(values, dtype=jnp.float64)
+    npts = int(values.size)
+    if npts <= 3:
+        return values
+    center = npts // 2
+    if center == 0:
+        return values[:3]
+    if center >= npts - 1:
+        return values[-3:]
+    return values[center - 1 : center + 2]
+
+
 def _vmec_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -427,6 +440,7 @@ def _vmec_scalar_observables_from_state(
         dtype=jnp.float64,
     )
     dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
+    dmerc_active = _three_middle_profile_points(dmerc_active)
     mirror_surface_indices = [int(np.argmin(np.abs(np.asarray(context.static.s, dtype=float) - float(surface)))) for surface in context.surface_s]
     mirror_ratios = []
     tiny = jnp.asarray(jnp.finfo(jnp.float64).tiny, dtype=jnp.float64)
@@ -573,6 +587,7 @@ def _vmec_booz_scalar_observables_from_state(
         dtype=jnp.float64,
     )
     dmerc_active = dmerc[1:-1] if int(dmerc.size) > 2 else jnp.zeros((0,), dtype=jnp.float64)
+    dmerc_active = _three_middle_profile_points(dmerc_active)
     reduced = {
         "iota_b_mean": jnp.mean(jnp.asarray(out["iota_b"])),
         "b00_mean": jnp.mean(b00),
