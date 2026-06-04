@@ -95,18 +95,19 @@ def _compute_one_step_metrics(
     physics_context = execution_context.physics_context
     attempt_context = execution_context.attempt_context
 
-    def _primitive_only_fn(carry_in):
-        primitive_result = _radau_accepted_step_primitive(
-            kernel_context,
-            physics_context,
-            carry_in,
-            attempt_context,
-        )
-        reduced_output_bar = _make_reduced_output_bar(carry_in, bar_mode)
+    primitive_result = _radau_accepted_step_primitive(
+        kernel_context,
+        physics_context,
+        initial_carry,
+        attempt_context,
+    )
+    reduced_output_bar = _make_reduced_output_bar(initial_carry, bar_mode)
+
+    def _primitive_only_fn():
         primitive_reduced_bar = _radau_accepted_step_primitive_pullback(
             kernel_context,
             physics_context,
-            carry_in,
+            initial_carry,
             attempt_context,
             primitive_result.reverse_payload,
             reduced_output_bar,
@@ -124,18 +125,18 @@ def _compute_one_step_metrics(
     if execution_mode == "jit":
         compare_fn = jax.jit(_primitive_only_fn)
         t0 = time.perf_counter()
-        first = compare_fn(initial_carry)
+        first = compare_fn()
         jax.block_until_ready(first["primitive_y_bar_max"])
         compile_plus_execute_s = time.perf_counter() - t0
 
         t1 = time.perf_counter()
-        second = compare_fn(initial_carry)
+        second = compare_fn()
         jax.block_until_ready(second["primitive_y_bar_max"])
         execute_s = time.perf_counter() - t1
     else:
         t0 = time.perf_counter()
         with jax.disable_jit():
-            second = _primitive_only_fn(initial_carry)
+            second = _primitive_only_fn()
         jax.block_until_ready(second["primitive_y_bar_max"])
         execute_s = time.perf_counter() - t0
         compile_plus_execute_s = execute_s
