@@ -530,7 +530,7 @@ def _make_solver_state_transform(
 
         density, pressure, er = packed_state_like
         density_bar_out, pressure_bar_out, er_bar_out = packed_bar_like
-        from ._state import safe_density, safe_temperature
+        from ._state import _broadcast_species_floor, safe_density
 
         density_arr = jnp.asarray(density)
         pressure_arr = jnp.asarray(pressure)
