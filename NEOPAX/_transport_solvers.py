@@ -2597,6 +2597,16 @@ def _radau_zero_cotangent_like(x):
     return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
 
+def _radau_zero_value_like(x):
+    if x is None:
+        return None
+    try:
+        arr = jnp.asarray(x)
+    except (TypeError, ValueError):
+        return jax.tree_util.tree_map(_radau_zero_value_like, x)
+    return jnp.zeros_like(arr)
+
+
 def _radau_replay_leaf_diagnostic_name() -> str | None:
     """Optional reverse diagnostic: keep only one replay-state cotangent leaf."""
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_REPLAY_LEAF")
@@ -6615,19 +6625,19 @@ def _radau_zero_reverse_payload_like(
     carry_template: _RadauAcceptedStepCarry,
 ) -> _RadauAcceptedStepReversePayload:
     return _RadauAcceptedStepReversePayload(
-        t_in=_radau_zero_cotangent_like(carry_template.t),
-        y_in=_radau_zero_cotangent_like(carry_template.y),
-        dt_in=_radau_zero_cotangent_like(carry_template.dt),
-        prev_stages_in=_radau_zero_cotangent_like(carry_template.prev_stages),
-        accepted_y=_radau_zero_cotangent_like(carry_template.y),
-        trial_y=_radau_zero_cotangent_like(carry_template.y),
-        trial_dt=_radau_zero_cotangent_like(carry_template.dt),
-        stage_history=_radau_zero_cotangent_like(carry_template.prev_stages),
-        prev_dt_in=_radau_zero_cotangent_like(carry_template.prev_dt),
-        prev_theta_final_in=_radau_zero_cotangent_like(carry_template.prev_theta_final),
-        prev_newton_iter_count_in=_radau_zero_cotangent_like(carry_template.prev_newton_iter_count),
-        lagged_response_valid_in=_radau_zero_cotangent_like(carry_template.lagged_response_valid),
-        lagged_reference_y_in=_radau_zero_cotangent_like(carry_template.lagged_reference_y),
+        t_in=_radau_zero_value_like(carry_template.t),
+        y_in=_radau_zero_value_like(carry_template.y),
+        dt_in=_radau_zero_value_like(carry_template.dt),
+        prev_stages_in=_radau_zero_value_like(carry_template.prev_stages),
+        accepted_y=_radau_zero_value_like(carry_template.y),
+        trial_y=_radau_zero_value_like(carry_template.y),
+        trial_dt=_radau_zero_value_like(carry_template.dt),
+        stage_history=_radau_zero_value_like(carry_template.prev_stages),
+        prev_dt_in=_radau_zero_value_like(carry_template.prev_dt),
+        prev_theta_final_in=_radau_zero_value_like(carry_template.prev_theta_final),
+        prev_newton_iter_count_in=_radau_zero_value_like(carry_template.prev_newton_iter_count),
+        lagged_response_valid_in=_radau_zero_value_like(carry_template.lagged_response_valid),
+        lagged_reference_y_in=_radau_zero_value_like(carry_template.lagged_reference_y),
     )
 
 
