@@ -2457,6 +2457,11 @@ class _RadauAcceptedStepReversePayload:
     prev_newton_iter_count_in: Any
     lagged_response_valid_in: Any
     lagged_reference_y_in: Any
+    jacobian_out: Any
+    real_lu_out: Any
+    real_piv_out: Any
+    complex_lu_out: Any
+    complex_piv_out: Any
 
 
 @jax.tree_util.register_dataclass
@@ -4667,6 +4672,11 @@ def _radau_accepted_step_reverse_payload_from_primal(
         prev_newton_iter_count_in=carry_in.prev_newton_iter_count,
         lagged_response_valid_in=carry_in.lagged_response_valid,
         lagged_reference_y_in=carry_in.lagged_reference_y,
+        jacobian_out=attempt_result.jacobian_out,
+        real_lu_out=attempt_result.real_lu_out,
+        real_piv_out=attempt_result.real_piv_out,
+        complex_lu_out=attempt_result.complex_lu_out,
+        complex_piv_out=attempt_result.complex_piv_out,
     )
 
 
@@ -4824,6 +4834,47 @@ def _radau_carry_from_reverse_payload(
     )
 
 
+def _radau_attempt_result_from_reverse_payload(
+    payload: _RadauAcceptedStepReversePayload,
+    template_carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepAttemptResult:
+    return _RadauAcceptedStepAttemptResult(
+        carry_after_attempt=None,
+        trial_dt=payload.trial_dt,
+        trial_y=payload.trial_y,
+        err_norm=jnp.zeros_like(template_carry.dt),
+        converged=jnp.asarray(True),
+        stage_history=payload.stage_history,
+        jacobian_out=payload.jacobian_out,
+        cache_valid_out=jnp.zeros_like(template_carry.cache_valid),
+        cache_dt_out=jnp.zeros_like(template_carry.cache_dt),
+        cache_age_out=jnp.zeros_like(template_carry.cache_age),
+        real_lu_out=payload.real_lu_out,
+        real_piv_out=payload.real_piv_out,
+        complex_lu_out=payload.complex_lu_out,
+        complex_piv_out=payload.complex_piv_out,
+        newton_shrink=jnp.zeros_like(template_carry.dt),
+        diverged_final=jnp.asarray(False),
+        nonfinite_stage_state=jnp.asarray(False),
+        nonfinite_stage_residual=jnp.asarray(False),
+        finite_f0=jnp.asarray(True),
+        finite_z0=jnp.asarray(True),
+        finite_initial_residual=jnp.asarray(True),
+        newton_iter_count=payload.prev_newton_iter_count_in,
+        final_residual_norm=jnp.zeros_like(template_carry.dt),
+        final_delta_norm=jnp.zeros_like(template_carry.dt),
+        theta_final=payload.prev_theta_final_in,
+        slow_contraction_final=jnp.asarray(False),
+        residual_blowup_final=jnp.asarray(False),
+        newton_nonfinite_final=jnp.asarray(False),
+        density_err_norm=jnp.zeros_like(template_carry.dt),
+        pressure_err_norm=jnp.zeros_like(template_carry.dt),
+        er_err_norm=jnp.zeros_like(template_carry.dt),
+        lagged_response_reused=payload.lagged_response_valid_in,
+        jacobian_reused=jnp.asarray(False),
+    )
+
+
 def _radau_accepted_step_primitive_pullback(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -4838,11 +4889,9 @@ def _radau_accepted_step_primitive_pullback(
         template_carry,
         physics_context,
     )
-    primal_result = _execute_radau_accepted_step_attempt(
-        kernel_context,
-        physics_context,
-        carry_in,
-        attempt_context,
+    primal_result = _radau_attempt_result_from_reverse_payload(
+        reverse_payload,
+        template_carry,
     )
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
 

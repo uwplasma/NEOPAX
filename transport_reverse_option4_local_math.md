@@ -150,6 +150,18 @@ Current reduced implementation target:
   - `ylag_bar_in += B_ref^T lag_bar` in the reuse branch
   - `y_bar_in += B_y^T lag_bar` in the rebuild branch
 
+The backward payload should also carry the exact frozen local linearization
+data needed by the accepted-`y` pullback:
+
+- `trial_y`
+- `trial_dt`
+- `stage_history`
+- `J`
+- transposed-stage-solve factors / pivots
+
+This lets reverse use the saved local accepted-step payload directly instead of
+rerunning the accepted-step primal attempt inside backward.
+
 This is better than differentiating the composed closure
 
 - `flat_y -> build_lagged_response(flat_y) -> stage_eval(lagged_response)`
@@ -172,11 +184,13 @@ The first reduction already implemented is:
 
 - explicit transpose for the output projection `P`
 
-The next reduction being implemented is:
+The next reductions implemented are:
 
 - separate builder pullback for lagged-response reconstruction, so the
   primitive rule consumes `lag_bar` directly instead of reopening the stage
   evaluation closure
+- saved local linearization payload for backward, so the primitive pullback no
+  longer reruns the accepted-step primal attempt
 
 So the current implementation is:
 
@@ -208,6 +222,9 @@ Priority:
 - explicit output projection transpose: implemented
 - lagged-response transpose split:
   - stage-eval transpose to `lag_bar`: implemented
-  - builder-only pullback from `lag_bar` to reduced input: in progress
-- remaining blocker: the one-step primitive rule still needs the builder split
-  to reduce the JIT graph further
+  - builder-only pullback from `lag_bar` to reduced input: implemented
+- backward payload now carries saved local linearization data, so the primitive
+  rule no longer reruns `_execute_radau_accepted_step_attempt(...)`
+- remaining blocker: the builder pullback still uses a generic fallback path in
+  the transport-equations layer, and that may still dominate the one-step JIT
+  graph
