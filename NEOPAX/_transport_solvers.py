@@ -7437,14 +7437,15 @@ def _radau_checkpoint_interval() -> int:
     """Fixed replay checkpoint interval for custom VJP reverse recomputation."""
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CHECKPOINT_INTERVAL")
     if raw_value is None:
-        # Use a small default segment size for the accepted-step replay
-        # backward. This keeps per-segment traces modest without creating an
-        # extreme number of checkpoints/replays in the no-flag path.
-        return 8
+        # With reduced checkpoint traces, the main tradeoff is now between
+        # checkpoint-trace size and per-segment replay work. A mid-sized default
+        # keeps the trace below the large scan-input regime without making
+        # accepted-step replay segments too long.
+        return 32
     try:
         parsed = int(raw_value)
     except ValueError:
-        return 8
+        return 32
     return max(parsed, 1)
 
 
