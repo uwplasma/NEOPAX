@@ -7360,15 +7360,14 @@ def _radau_checkpoint_interval() -> int:
     """Fixed replay checkpoint interval for custom VJP reverse recomputation."""
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CHECKPOINT_INTERVAL")
     if raw_value is None:
-        # The accepted-step reverse path now relies on compact replay traces and
-        # recomputation instead of a large payload tape. Keeping reverse
-        # segments very short by default is the safest no-flag setting for GPU
-        # memory, while the env var still allows larger intervals when desired.
-        return 1
+        # Use a small default segment size for the accepted-step replay
+        # backward. This keeps per-segment traces modest without creating an
+        # extreme number of checkpoints/replays in the no-flag path.
+        return 8
     try:
         parsed = int(raw_value)
     except ValueError:
-        return 1
+        return 8
     return max(parsed, 1)
 
 
@@ -7789,6 +7788,48 @@ def _radau_replay_realized_attempt_checkpoint_carries(
         ),
     )
     return checkpoint_carries
+
+
+def _radau_replay_realized_attempt_checkpoint_carry_at_segment(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    segmented_active_mask,
+    segmented_accepted_mask,
+    segmented_attempted_dts,
+    segmented_next_dts,
+    segmented_next_recent_reject_count,
+    segmented_next_regrowth_cooldown,
+    segmented_next_easy_growth_streak,
+    segmented_next_lagged_response_valid,
+    segment_index,
+):
+    """Recompute the carry at the start of one reverse segment on demand.
+
+    This avoids storing the full checkpoint-carry stack in the custom-VJP
+    residuals. The accepted-step reverse path is memory-first, so extra
+    recomputation here is preferable to materializing all segment checkpoints.
+    """
+
+    def _body(i, carry):
+        return _radau_replay_realized_attempt_final_carry(
+            execution_context,
+            carry,
+            segmented_active_mask[i],
+            segmented_accepted_mask[i],
+            segmented_attempted_dts[i],
+            segmented_next_dts[i],
+            segmented_next_recent_reject_count[i],
+            segmented_next_regrowth_cooldown[i],
+            segmented_next_easy_growth_streak[i],
+            segmented_next_lagged_response_valid[i],
+        )
+
+    return jax.lax.fori_loop(
+        0,
+        segment_index,
+        _body,
+        carry0,
+    )
 
 
 def _radau_host_local_step_pullback_compare(
@@ -8910,20 +8951,8 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         full_accepted_mask,
         segment_length=checkpoint_interval,
     )
-    checkpoint_carries = _radau_replay_realized_attempt_checkpoint_carries(
-        execution_context,
-        carry0,
-        segmented_full_active_mask,
-        segmented_full_accepted_mask,
-        segmented_attempted_dts,
-        segmented_next_dts,
-        segmented_next_recent_reject_count,
-        segmented_next_regrowth_cooldown,
-        segmented_next_easy_growth_streak,
-        segmented_next_lagged_response_valid,
-    )
     residuals = (
-        checkpoint_carries,
+        carry0,
         segmented_active_mask,
         segmented_full_active_mask,
         segmented_full_accepted_mask,
@@ -8945,7 +8974,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     final_y_bar,
 ):
     (
-        checkpoint_carries,
+        carry0,
         segmented_active_mask,
         segmented_full_active_mask,
         segmented_full_accepted_mask,
@@ -8959,7 +8988,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     reverse_device = _reverse_replay_device_from_env()
     if reverse_device is not None:
-        checkpoint_carries = jax.device_put(checkpoint_carries, reverse_device)
+        carry0 = jax.device_put(carry0, reverse_device)
         segmented_active_mask = jax.device_put(segmented_active_mask, reverse_device)
         segmented_full_active_mask = jax.device_put(segmented_full_active_mask, reverse_device)
         segmented_full_accepted_mask = jax.device_put(segmented_full_accepted_mask, reverse_device)
@@ -8977,7 +9006,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     # attempts may still supply nondifferentiated replay metadata, but they are
     # not differentiated transitions in the reverse map here.
     use_reduced_replay_debug_path = True
-    checkpoint0 = jax.tree_util.tree_map(lambda x: x[0], checkpoint_carries)
+    checkpoint0 = carry0
     final_replay_state_bar = jax.tree_util.tree_map(
         _radau_zero_cotangent_like,
         _radau_replay_state_from_carry(checkpoint0),
@@ -8990,7 +9019,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     def _reverse_segment(carry_bar, inputs):
         (
             segment_index,
-            checkpoint_carry,
             segment_active_mask,
             segment_full_active_mask,
             segment_full_accepted_mask,
@@ -9001,6 +9029,19 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         ) = inputs
+        checkpoint_carry = _radau_replay_realized_attempt_checkpoint_carry_at_segment(
+            execution_context,
+            carry0,
+            segmented_full_active_mask,
+            segmented_full_accepted_mask,
+            segmented_attempted_dts,
+            segmented_next_dts,
+            segmented_next_recent_reject_count,
+            segmented_next_regrowth_cooldown,
+            segmented_next_easy_growth_streak,
+            segmented_next_lagged_response_valid,
+            segment_index,
+        )
         _, carry_trace = _radau_replay_realized_accepted_carry_trace(
             execution_context,
             checkpoint_carry,
@@ -9123,7 +9164,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         carry_bar_y_before = jnp.asarray(carry_bar.y, dtype=execution_context.dtype)
         inputs = (
             idx,
-            jax.tree_util.tree_map(lambda x: x[idx], checkpoint_carries),
             segmented_active_mask[idx],
             segmented_full_active_mask[idx],
             segmented_full_accepted_mask[idx],
