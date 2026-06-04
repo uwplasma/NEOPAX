@@ -22,7 +22,6 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
-    _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _baseline_profile_cfg,
     _initial_carry_from_state_with_static_setup,
     _objective_vector_from_final_y,
@@ -35,6 +34,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_collect_realized_accepted_step_payloads,
     _radau_reduced_output_from_carry,
+    _radau_replay_realized_accepted_rollout,
     _radau_rollout_reverse_from_saved_payloads,
 )
 
@@ -127,7 +127,7 @@ def _tree_diff_metrics(lhs, rhs) -> dict[str, float]:
     }
 
 
-def _compute_forward_reference(
+def _prepare_prefix_context(
     baseline_vector,
     *,
     config,
@@ -137,41 +137,6 @@ def _compute_forward_reference(
     parameter_names: tuple[str, ...],
     accepted_step_limit: int,
     max_total_steps_multiplier: int,
-):
-    prefix_config = _prefix_transport_config(
-        config,
-        accepted_step_limit=accepted_step_limit,
-        max_total_steps_multiplier=max_total_steps_multiplier,
-    )
-    objective_fn = lambda params: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
-        params,
-        config=prefix_config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_names=parameter_names,
-        accepted_step_limit_override=accepted_step_limit,
-        derivative_mode="jvp",
-    )
-    t0 = time.perf_counter()
-    objective_values = objective_fn(baseline_vector)
-    jacobian = jax.jacfwd(objective_fn)(baseline_vector)
-    jax.block_until_ready(jacobian)
-    elapsed_s = time.perf_counter() - t0
-    return objective_values, jacobian, elapsed_s
-
-
-def _compute_reverse_candidate(
-    baseline_vector,
-    *,
-    config,
-    runtime,
-    baseline_state,
-    profile_cfg,
-    parameter_names: tuple[str, ...],
-    accepted_step_limit: int,
-    max_total_steps_multiplier: int,
-    execution_mode: str,
 ):
     prefix_config = _prefix_transport_config(
         config,
@@ -195,13 +160,106 @@ def _compute_reverse_candidate(
         parameter_names=parameter_names,
         accepted_step_limit_override=accepted_step_limit,
     )
+    return {
+        "prefix_config": prefix_config,
+        "execution_context": execution_context,
+        "prepared_rollout": prepared_rollout,
+        "initial_carry": initial_carry,
+        "max_total_steps": max_total_steps,
+        "stop_after_accepted_steps": stop_after_accepted_steps,
+        "solver": solver,
+        "solve_vector_field": solve_vector_field,
+    }
 
+
+def _compute_forward_reference(
+    baseline_vector,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg,
+    parameter_names: tuple[str, ...],
+    prefix_context: dict[str, object],
+):
+    execution_context = prefix_context["execution_context"]
+    prepared_rollout = prefix_context["prepared_rollout"]
+    initial_carry = prefix_context["initial_carry"]
+    solver = prefix_context["solver"]
+    solve_vector_field = prefix_context["solve_vector_field"]
     payload_rollout = _radau_collect_realized_accepted_step_payloads(
         execution_context,
         initial_carry,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
+        max_total_steps=prefix_context["max_total_steps"],
+        stop_after_accepted_steps=prefix_context["stop_after_accepted_steps"],
     )
+
+    accepted_active_mask = payload_rollout.accepted_mask
+    accepted_dts = payload_rollout.accepted_dts
+    next_dts = payload_rollout.reduced_outputs.dt_out
+    zero_i32 = jnp.zeros_like(accepted_active_mask, dtype=jnp.int32)
+    next_lagged_response_valid = jnp.full_like(
+        accepted_active_mask,
+        bool(execution_context.attempt_context.use_transport_lagged_response),
+        dtype=jnp.bool_,
+    )
+
+    def _objective_fn(params):
+        state0 = _parameterized_initial_state_multi(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_names=parameter_names,
+            parameter_values=params,
+        )
+        carry0 = _initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state0,
+            solve_vector_field=solve_vector_field,
+            species=runtime.species,
+            prepared_rollout_static=prepared_rollout,
+        )
+        replay = _radau_replay_realized_accepted_rollout(
+            execution_context,
+            carry0,
+            accepted_active_mask,
+            accepted_dts,
+            next_dts,
+            zero_i32,
+            zero_i32,
+            zero_i32,
+            next_lagged_response_valid,
+        )
+        return _objective_vector_from_final_y(
+            replay.final_y,
+            prepared_rollout=prepared_rollout,
+            runtime=runtime,
+        )
+
+    t0 = time.perf_counter()
+    objective_values = _objective_fn(baseline_vector)
+    jacobian = jax.jacfwd(_objective_fn)(baseline_vector)
+    jax.block_until_ready(jacobian)
+    elapsed_s = time.perf_counter() - t0
+    return objective_values, jacobian, elapsed_s, payload_rollout
+
+
+def _compute_reverse_candidate(
+    baseline_vector,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg,
+    parameter_names: tuple[str, ...],
+    prefix_context: dict[str, object],
+    payload_rollout,
+    execution_mode: str,
+):
+    execution_context = prefix_context["execution_context"]
+    prepared_rollout = prefix_context["prepared_rollout"]
+    initial_carry = prefix_context["initial_carry"]
+    solver = prefix_context["solver"]
+    solve_vector_field = prefix_context["solve_vector_field"]
 
     objective_values, final_y_pullback = jax.vjp(
         lambda final_y: _objective_vector_from_final_y(
@@ -354,7 +412,7 @@ def main() -> None:
 
     prefixes = []
     for accepted_step_limit in accepted_step_counts:
-        forward_objectives, forward_jacobian, forward_elapsed_s = _compute_forward_reference(
+        prefix_context = _prepare_prefix_context(
             baseline_vector,
             config=config,
             runtime=runtime,
@@ -364,15 +422,22 @@ def main() -> None:
             accepted_step_limit=accepted_step_limit,
             max_total_steps_multiplier=args.max_total_steps_multiplier,
         )
-        reverse_result = _compute_reverse_candidate(
+        forward_objectives, forward_jacobian, forward_elapsed_s, payload_rollout = _compute_forward_reference(
             baseline_vector,
-            config=config,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
-            accepted_step_limit=accepted_step_limit,
-            max_total_steps_multiplier=args.max_total_steps_multiplier,
+            prefix_context=prefix_context,
+        )
+        reverse_result = _compute_reverse_candidate(
+            baseline_vector,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            prefix_context=prefix_context,
+            payload_rollout=payload_rollout,
             execution_mode=args.reverse_execution_mode,
         )
 
