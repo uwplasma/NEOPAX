@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 import time
@@ -81,6 +82,22 @@ def _make_final_output_bar(
     )
 
 
+def _prefix_transport_config(
+    config: dict,
+    *,
+    accepted_step_limit: int,
+    max_total_steps_multiplier: int,
+) -> dict:
+    tuned = copy.deepcopy(config)
+    solver_cfg = tuned.setdefault("transport_solver", {})
+    solver_cfg["stop_after_accepted_steps"] = int(accepted_step_limit)
+    solver_cfg["max_steps"] = max(
+        int(accepted_step_limit),
+        int(accepted_step_limit) * int(max_total_steps_multiplier),
+    )
+    return tuned
+
+
 def _objective_basis(count: int, index: int, dtype) -> jax.Array:
     return jnp.asarray(np.eye(count, dtype=np.float64)[index], dtype=dtype)
 
@@ -119,10 +136,16 @@ def _compute_forward_reference(
     profile_cfg,
     parameter_names: tuple[str, ...],
     accepted_step_limit: int,
+    max_total_steps_multiplier: int,
 ):
+    prefix_config = _prefix_transport_config(
+        config,
+        accepted_step_limit=accepted_step_limit,
+        max_total_steps_multiplier=max_total_steps_multiplier,
+    )
     objective_fn = lambda params: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
         params,
-        config=config,
+        config=prefix_config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -147,8 +170,14 @@ def _compute_reverse_candidate(
     profile_cfg,
     parameter_names: tuple[str, ...],
     accepted_step_limit: int,
+    max_total_steps_multiplier: int,
     execution_mode: str,
 ):
+    prefix_config = _prefix_transport_config(
+        config,
+        accepted_step_limit=accepted_step_limit,
+        max_total_steps_multiplier=max_total_steps_multiplier,
+    )
     (
         execution_context,
         prepared_rollout,
@@ -159,7 +188,7 @@ def _compute_reverse_candidate(
         solve_vector_field,
     ) = _prepare_realized_schedule_profile_vector_rollout_option_a(
         baseline_vector,
-        config=config,
+        config=prefix_config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -304,6 +333,12 @@ def main() -> None:
         choices=("eager", "jit"),
         help="Run the new reverse composition eagerly or under JIT. Default: jit.",
     )
+    parser.add_argument(
+        "--max-total-steps-multiplier",
+        type=int,
+        default=8,
+        help="Cap solver max_steps for each accepted-step prefix to accepted_step_limit * multiplier. Default: 8.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -327,6 +362,7 @@ def main() -> None:
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
             accepted_step_limit=accepted_step_limit,
+            max_total_steps_multiplier=args.max_total_steps_multiplier,
         )
         reverse_result = _compute_reverse_candidate(
             baseline_vector,
@@ -336,6 +372,7 @@ def main() -> None:
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
             accepted_step_limit=accepted_step_limit,
+            max_total_steps_multiplier=args.max_total_steps_multiplier,
             execution_mode=args.reverse_execution_mode,
         )
 
@@ -376,6 +413,7 @@ def main() -> None:
         "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
         "accepted_step_counts": [int(x) for x in accepted_step_counts],
         "reverse_execution_mode": args.reverse_execution_mode,
+        "max_total_steps_multiplier": int(args.max_total_steps_multiplier),
         "prefixes": prefixes,
     }
 
@@ -386,7 +424,8 @@ def main() -> None:
     print(f"[autodiff-gate] parameters={list(parameter_names)}")
     print(
         f"[autodiff-gate] accepted_step_counts={list(accepted_step_counts)} "
-        f"reverse_execution_mode={args.reverse_execution_mode}"
+        f"reverse_execution_mode={args.reverse_execution_mode} "
+        f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)}"
     )
     for prefix in prefixes:
         print(
