@@ -1218,6 +1218,48 @@ def exact_scalar_observable_linear_operator(
     return optimizer.residual_linear_operator(np.zeros(1, dtype=float))
 
 
+def exact_vmec_dmerc_profile_linear_operator(
+    context: GeometryAutodiffContext,
+    *,
+    indices: tuple[int, ...] | None = None,
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = None,
+):
+    optimization = _import_vmec_jax_optimization()
+    resolved_max_iter = int(context.vmec_default_max_iter if max_iter is None else max_iter)
+    resolved_step_size = float(context.vmec_default_step_size if step_size is None else step_size)
+    base_spec = _single_param_boundary_spec(context)
+
+    indata_eff = deepcopy(context.indata)
+    try:
+        indata_eff.scalars["DELT"] = float(resolved_step_size)
+    except Exception:
+        pass
+
+    index_array = None if indices is None else jnp.asarray(indices, dtype=jnp.int32)
+
+    def residuals_from_state(state):
+        dmerc = _vmec_dmerc_profile_from_state(context, state)
+        if index_array is None:
+            return jnp.asarray(dmerc, dtype=jnp.float64)
+        return jnp.asarray(dmerc, dtype=jnp.float64)[index_array]
+
+    optimizer = optimization.FixedBoundaryExactOptimizer(
+        context.static,
+        indata_eff,
+        context.boundary,
+        [base_spec],
+        residuals_from_state,
+        inner_max_iter=resolved_max_iter,
+        inner_ftol=context.vmec_default_ftol,
+        trial_max_iter=resolved_max_iter,
+        trial_ftol=context.vmec_default_ftol,
+        solver_device=solver_device,
+    )
+    return optimizer.residual_linear_operator(np.zeros(1, dtype=float))
+
+
 def exact_forward_scalar_observable_derivatives_from_linear_operator(
     linear_op,
     *,

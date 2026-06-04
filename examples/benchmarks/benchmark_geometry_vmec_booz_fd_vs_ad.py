@@ -17,6 +17,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     exact_forward_scalar_observable_derivatives_from_linear_operator,
     exact_reverse_scalar_observable_derivatives_from_linear_operator,
     exact_scalar_observable_linear_operator,
+    exact_vmec_dmerc_profile_linear_operator,
     five_point_fd_single_param,
     rel_error,
     vmec_dmerc_profile_from_single_param,
@@ -89,18 +90,10 @@ def _print_dmerc_profile_probe(
     h: float,
     resolved_max_iter: int,
     resolved_step_size: float,
+    solver_device: str,
 ) -> None:
     if not probe_indices:
         return
-
-    def dmerc_ad(delta):
-        return vmec_dmerc_profile_from_single_param(
-            context,
-            delta,
-            lane="ad",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
 
     def dmerc_fd(delta):
         return vmec_dmerc_profile_from_single_param(
@@ -111,16 +104,36 @@ def _print_dmerc_profile_probe(
             step_size=resolved_step_size,
         )
 
-    ad_vec = jax.jvp(
-        dmerc_ad,
-        (jnp.asarray(0.0, dtype=jnp.float64),),
-        (jnp.asarray(1.0, dtype=jnp.float64),),
-    )[1]
-    fd_vec = (dmerc_fd(h) - dmerc_fd(-h)) / (2.0 * h)
+    baseline = jnp.asarray(dmerc_fd(0.0), dtype=jnp.float64)
+    size = int(baseline.size)
+    resolved_indices = []
+    for raw_idx in probe_indices:
+        idx = int(raw_idx)
+        if idx < 0:
+            idx = size + idx
+        resolved_indices.append(idx)
 
-    ad_np = jnp.asarray(ad_vec, dtype=jnp.float64)
+    valid_indices = tuple(idx for idx in resolved_indices if 0 <= idx < size)
+    ad_map: dict[int, jnp.ndarray] = {}
+    if valid_indices:
+        linear_op = exact_vmec_dmerc_profile_linear_operator(
+            context,
+            indices=valid_indices,
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+            solver_device=solver_device,
+        )
+        ad_selected = jnp.asarray(
+            linear_op.matvec(np.array([1.0], dtype=float)),
+            dtype=jnp.float64,
+        ).reshape(-1)
+        ad_map = {
+            idx: jnp.asarray(ad_selected[pos], dtype=jnp.float64)
+            for pos, idx in enumerate(valid_indices)
+        }
+
+    fd_vec = (dmerc_fd(h) - dmerc_fd(-h)) / (2.0 * h)
     fd_np = jnp.asarray(fd_vec, dtype=jnp.float64)
-    size = int(ad_np.size)
     print("[geometry-fd-ad] DMerc profile derivative probe:", flush=True)
     for raw_idx in probe_indices:
         idx = int(raw_idx)
@@ -132,7 +145,7 @@ def _print_dmerc_profile_probe(
                 flush=True,
             )
             continue
-        ad_value = jnp.asarray(ad_np[idx], dtype=jnp.float64)
+        ad_value = ad_map[idx]
         fd_value = jnp.asarray(fd_np[idx], dtype=jnp.float64)
         err = rel_error(ad_value, fd_value)
         print(
@@ -309,6 +322,7 @@ def main() -> None:
         h=h,
         resolved_max_iter=resolved_max_iter,
         resolved_step_size=resolved_step_size,
+        solver_device=args.exact_solver_device,
     )
 
     print("[geometry-fd-ad] observable errors:")
