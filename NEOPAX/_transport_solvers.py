@@ -7790,46 +7790,6 @@ def _radau_replay_realized_attempt_checkpoint_carries(
     return checkpoint_carries
 
 
-def _radau_replay_realized_attempt_checkpoint_carry_at_segment(
-    execution_context: _RadauSolveExecutionContext,
-    carry0: _RadauAcceptedStepCarry,
-    segmented_active_mask,
-    segmented_accepted_mask,
-    segmented_attempted_dts,
-    segmented_next_dts,
-    segmented_next_recent_reject_count,
-    segmented_next_regrowth_cooldown,
-    segmented_next_easy_growth_streak,
-    segmented_next_lagged_response_valid,
-    segment_index,
-):
-    """Recompute the carry at the start of one reverse segment on demand.
-
-    This avoids storing the full checkpoint-carry stack in the custom-VJP
-    residuals. The accepted-step reverse path is memory-first, so extra
-    recomputation here is preferable to materializing all segment checkpoints.
-    """
-
-    def _body(i, carry):
-        return _radau_replay_realized_attempt_final_carry(
-            execution_context,
-            carry,
-            segmented_active_mask[i],
-            segmented_accepted_mask[i],
-            segmented_attempted_dts[i],
-            segmented_next_dts[i],
-            segmented_next_recent_reject_count[i],
-            segmented_next_regrowth_cooldown[i],
-            segmented_next_easy_growth_streak[i],
-            segmented_next_lagged_response_valid[i],
-        )
-
-    return jax.lax.fori_loop(
-        0,
-        segment_index,
-        _body,
-        carry0,
-    )
 
 
 def _radau_host_local_step_pullback_compare(
@@ -9000,6 +8960,19 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_lagged_response_valid = jax.device_put(segmented_next_lagged_response_valid, reverse_device)
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
+    checkpoint_carries = _radau_replay_realized_attempt_checkpoint_carries(
+        execution_context,
+        carry0,
+        segmented_full_active_mask,
+        segmented_full_accepted_mask,
+        segmented_attempted_dts,
+        segmented_next_dts,
+        segmented_next_recent_reject_count,
+        segmented_next_regrowth_cooldown,
+        segmented_next_easy_growth_streak,
+        segmented_next_lagged_response_valid,
+    )
+
     replay_output_mode = _radau_replay_output_diagnostic_mode()
     # Benchmark contract: differentiate the accepted-step composition only,
     # with the accepted schedule fixed by the primal forward pass. Rejected
@@ -9029,19 +9002,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         ) = inputs
-        checkpoint_carry = _radau_replay_realized_attempt_checkpoint_carry_at_segment(
-            execution_context,
-            carry0,
-            segmented_full_active_mask,
-            segmented_full_accepted_mask,
-            segmented_attempted_dts,
-            segmented_next_dts,
-            segmented_next_recent_reject_count,
-            segmented_next_regrowth_cooldown,
-            segmented_next_easy_growth_streak,
-            segmented_next_lagged_response_valid,
-            segment_index,
-        )
+        checkpoint_carry = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_carries)
         _, carry_trace = _radau_replay_realized_accepted_carry_trace(
             execution_context,
             checkpoint_carry,
