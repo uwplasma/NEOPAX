@@ -401,6 +401,27 @@ def _native_dmerc_objective_samples(values: jnp.ndarray, *, minimum: float = 0.0
     return _three_middle_profile_points_fixed(penalties)
 
 
+def _vmec_dmerc_profile_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> jnp.ndarray:
+    vmec_jax = _import_vmec_jax()
+    mercier_terms_from_state = _resolve_vmec_attr(
+        vmec_jax,
+        "mercier_terms_from_state",
+        submodule="finite_beta",
+    )
+    return jnp.asarray(
+        mercier_terms_from_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+        )["DMerc"],
+        dtype=jnp.float64,
+    )
+
+
 def _vmec_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -465,15 +486,7 @@ def _vmec_scalar_observables_from_state(
         indata=context.indata,
         signgs=int(context.signgs),
     )
-    dmerc = jnp.asarray(
-        mercier_terms_from_state(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=int(context.signgs),
-        )["DMerc"],
-        dtype=jnp.float64,
-    )
+    dmerc = _vmec_dmerc_profile_from_state(context, state)
     dmerc_objective_samples = _native_dmerc_objective_samples(
         dmerc,
         minimum=0.0,
@@ -622,15 +635,7 @@ def _vmec_booz_scalar_observables_from_state(
         indata=context.indata,
         signgs=int(context.signgs),
     )
-    dmerc = jnp.asarray(
-        mercier_terms_from_state(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=int(context.signgs),
-        )["DMerc"],
-        dtype=jnp.float64,
-    )
+    dmerc = _vmec_dmerc_profile_from_state(context, state)
     dmerc_objective_samples = _native_dmerc_objective_samples(
         dmerc,
         minimum=0.0,
@@ -1294,6 +1299,26 @@ def solve_geometry_state_ad(
         max_iter=max_iter,
         step_size=step_size,
     )
+
+
+def vmec_dmerc_profile_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> jnp.ndarray:
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _vmec_dmerc_profile_from_state(context, state)
 
 
 def vmec_scalar_observables_from_single_param(

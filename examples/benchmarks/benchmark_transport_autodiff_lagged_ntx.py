@@ -72,6 +72,7 @@ from NEOPAX._transport_solvers import (
     _radau_prepare_lagged_response,
     _radau_replay_state_from_carry,
     _radau_stage_residual,
+    _radau_validate_saved_payload_rollout_reverse,
     _execute_radau_accepted_step_attempt,
     _execute_radau_accepted_step_attempt_autodiff,
     _build_prepared_radau_execution_context,
@@ -740,6 +741,13 @@ def _host_step_pullback_diagnostic_enabled() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _saved_payload_rollout_validation_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _step_pullback_segment_index() -> int:
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
     if raw_value is None:
@@ -848,6 +856,35 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
         replay_inputs_override=replay_inputs_override,
         replay_lagged_cache_override=replay_lagged_cache_override,
         replay_primal_override=replay_primal_override,
+    )
+
+
+def _run_saved_payload_rollout_validation_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+    accepted_step_limit_override: int | None = None,
+):
+    execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
+        _prepare_realized_schedule_profile_vector_rollout_option_a(
+            parameter_values,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            accepted_step_limit_override=accepted_step_limit_override,
+        )
+    )
+    return _radau_validate_saved_payload_rollout_reverse(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
     )
 
 
@@ -1099,6 +1136,23 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     derivative_mode: str = "jvp",
 ):
     parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
+    if _saved_payload_rollout_validation_enabled():
+        validation = _run_saved_payload_rollout_validation_for_parameter_vector(
+            parameter_values,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            accepted_step_limit_override=accepted_step_limit_override,
+        )
+        print("[autodiff-gate] saved-payload-rollout-validate")
+        print(
+            f"  diff_l2: {float(np.asarray(jax.device_get(validation['diff_l2']), dtype=float)):.6e}"
+        )
+        print(
+            f"  diff_max: {float(np.asarray(jax.device_get(validation['diff_max']), dtype=float)):.6e}"
+        )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "vjp":
         return _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(

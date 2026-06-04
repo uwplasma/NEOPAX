@@ -2307,6 +2307,18 @@ class _RadauReplayState:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepReducedOutput:
+    t_out: Any
+    y_out: Any
+    dt_out: Any
+    prev_stages_out: Any
+    prev_dt_out: Any
+    lagged_reference_y_out: Any
+    prev_theta_final_out: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepAttemptResult:
     carry_after_attempt: Any
     trial_dt: Any
@@ -2341,6 +2353,24 @@ class _RadauAcceptedStepAttemptResult:
     er_err_norm: Any
     lagged_response_reused: Any
     jacobian_reused: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepReversePayload:
+    t_in: Any
+    y_in: Any
+    dt_in: Any
+    prev_stages_in: Any
+    accepted_y: Any
+    trial_y: Any
+    trial_dt: Any
+    stage_history: Any
+    prev_dt_in: Any
+    prev_theta_final_in: Any
+    prev_newton_iter_count_in: Any
+    lagged_response_valid_in: Any
+    lagged_reference_y_in: Any
 
 
 @jax.tree_util.register_dataclass
@@ -2404,6 +2434,15 @@ class _RadauAcceptedStepAttemptContext:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepPrimitiveResult:
+    reduced_output: Any
+    reverse_payload: Any
+    next_carry: Any
+    attempt_result: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedRolloutResult:
     final_carry: Any
     final_y: Any
@@ -2411,6 +2450,16 @@ class _RadauAcceptedRolloutResult:
     err_norms: Any
     converged_mask: Any
     accepted_dts: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedPrimitivePayloadRollout:
+    final_carry: Any
+    accepted_mask: Any
+    accepted_dts: Any
+    reduced_outputs: Any
+    reverse_payloads: Any
 
 
 @jax.tree_util.register_dataclass
@@ -4479,18 +4528,51 @@ def _execute_radau_accepted_step_attempt(
     )
 
 
-def _radau_apply_accepted_step_map(
+def _radau_accepted_step_reduced_output_from_primal(
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_result: _RadauAcceptedStepAttemptResult,
+    accepted_y,
+) -> _RadauAcceptedStepReducedOutput:
+    return _RadauAcceptedStepReducedOutput(
+        t_out=carry_in.t + attempt_result.trial_dt,
+        y_out=accepted_y,
+        dt_out=attempt_result.trial_dt,
+        prev_stages_out=attempt_result.stage_history,
+        prev_dt_out=attempt_result.trial_dt,
+        lagged_reference_y_out=attempt_result.carry_after_attempt.lagged_reference_y,
+        prev_theta_final_out=attempt_result.theta_final,
+    )
+
+
+def _radau_accepted_step_reverse_payload_from_primal(
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_result: _RadauAcceptedStepAttemptResult,
+    accepted_y,
+) -> _RadauAcceptedStepReversePayload:
+    return _RadauAcceptedStepReversePayload(
+        t_in=carry_in.t,
+        y_in=carry_in.y,
+        dt_in=carry_in.dt,
+        prev_stages_in=carry_in.prev_stages,
+        accepted_y=accepted_y,
+        trial_y=attempt_result.trial_y,
+        trial_dt=attempt_result.trial_dt,
+        stage_history=attempt_result.stage_history,
+        prev_dt_in=carry_in.prev_dt,
+        prev_theta_final_in=carry_in.prev_theta_final,
+        prev_newton_iter_count_in=carry_in.prev_newton_iter_count,
+        lagged_response_valid_in=carry_in.lagged_response_valid,
+        lagged_reference_y_in=carry_in.lagged_reference_y,
+    )
+
+
+def _radau_accepted_step_primitive(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     attempt_context: _RadauAcceptedStepAttemptContext,
-) -> _RadauAcceptedStepMapResult:
-    """Apply one accepted-step composition map outside the adaptive loop.
-
-    This keeps the existing accepted-step primal math intact, but exposes the
-    accepted-step composition boundary as its own first-class object for future
-    AD-facing multi-step composition work.
-    """
+) -> _RadauAcceptedStepPrimitiveResult:
+    """Explicit accepted-step primitive boundary for the reverse refactor."""
     attempt_result = _execute_radau_accepted_step_attempt(
         kernel_context,
         physics_context,
@@ -4519,6 +4601,214 @@ def _radau_apply_accepted_step_map(
         complex_lu=attempt_result.complex_lu_out,
         complex_piv=attempt_result.complex_piv_out,
     )
+    return _RadauAcceptedStepPrimitiveResult(
+        reduced_output=_radau_accepted_step_reduced_output_from_primal(
+            carry_in,
+            attempt_result,
+            accepted_y,
+        ),
+        reverse_payload=_radau_accepted_step_reverse_payload_from_primal(
+            carry_in,
+            attempt_result,
+            accepted_y,
+        ),
+        next_carry=next_carry,
+        attempt_result=attempt_result,
+    )
+
+
+def _radau_replay_state_from_reduced_output(
+    reduced_output: _RadauAcceptedStepReducedOutput,
+) -> _RadauReplayState:
+    return _RadauReplayState(
+        t=reduced_output.t_out,
+        y=reduced_output.y_out,
+        dt=reduced_output.dt_out,
+        prev_stages=reduced_output.prev_stages_out,
+        prev_dt=reduced_output.prev_dt_out,
+        lagged_reference_y=reduced_output.lagged_reference_y_out,
+        prev_theta_final=reduced_output.prev_theta_final_out,
+    )
+
+
+def _radau_reduced_output_bar_to_replay_state_bar(
+    reduced_output_bar: _RadauAcceptedStepReducedOutput,
+) -> _RadauReplayState:
+    return _RadauReplayState(
+        t=reduced_output_bar.t_out,
+        y=reduced_output_bar.y_out,
+        dt=reduced_output_bar.dt_out,
+        prev_stages=reduced_output_bar.prev_stages_out,
+        prev_dt=reduced_output_bar.prev_dt_out,
+        lagged_reference_y=reduced_output_bar.lagged_reference_y_out,
+        prev_theta_final=reduced_output_bar.prev_theta_final_out,
+    )
+
+
+def _radau_reduced_output_from_replay_state_bar(
+    replay_state_bar: _RadauReplayState,
+) -> _RadauAcceptedStepReducedOutput:
+    return _RadauAcceptedStepReducedOutput(
+        t_out=replay_state_bar.t,
+        y_out=replay_state_bar.y,
+        dt_out=replay_state_bar.dt,
+        prev_stages_out=replay_state_bar.prev_stages,
+        prev_dt_out=replay_state_bar.prev_dt,
+        lagged_reference_y_out=replay_state_bar.lagged_reference_y,
+        prev_theta_final_out=replay_state_bar.prev_theta_final,
+    )
+
+
+def _radau_reduced_output_from_carry(
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepReducedOutput:
+    return _RadauAcceptedStepReducedOutput(
+        t_out=carry.t,
+        y_out=carry.y,
+        dt_out=carry.dt,
+        prev_stages_out=carry.prev_stages,
+        prev_dt_out=carry.prev_dt,
+        lagged_reference_y_out=carry.lagged_reference_y,
+        prev_theta_final_out=carry.prev_theta_final,
+    )
+
+
+def _radau_carry_from_reverse_payload(
+    payload: _RadauAcceptedStepReversePayload,
+    template_carry: _RadauAcceptedStepCarry,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+) -> _RadauAcceptedStepCarry:
+    if physics_context.build_lagged_response is None:
+        lagged_response_cache_value = template_carry.lagged_response_cache
+    else:
+        def _build_lagged_cache_from_flat(flat_y):
+            candidate_state = physics_context.unpack_flat(
+                _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+            )
+            return physics_context.build_lagged_response(candidate_state)
+
+        lagged_response_cache_value = jax.lax.cond(
+            payload.lagged_response_valid_in,
+            lambda _: _build_lagged_cache_from_flat(payload.lagged_reference_y_in),
+            lambda _: _build_lagged_cache_from_flat(payload.y_in),
+            operand=None,
+        )
+
+    return _RadauAcceptedStepCarry(
+        t=payload.t_in,
+        y=payload.y_in,
+        dt=payload.dt_in,
+        prev_error=jnp.zeros_like(template_carry.prev_error),
+        prev_stages=payload.prev_stages_in,
+        prev_dt=payload.prev_dt_in,
+        recent_reject_count=jnp.zeros_like(template_carry.recent_reject_count),
+        regrowth_cooldown=jnp.zeros_like(template_carry.regrowth_cooldown),
+        easy_growth_streak=jnp.zeros_like(template_carry.easy_growth_streak),
+        lagged_response_cache=lagged_response_cache_value,
+        lagged_response_valid=payload.lagged_response_valid_in,
+        lagged_reference_y=payload.lagged_reference_y_in,
+        jacobian=jnp.zeros_like(template_carry.jacobian),
+        cache_valid=jnp.zeros_like(template_carry.cache_valid),
+        cache_dt=jnp.zeros_like(template_carry.cache_dt),
+        cache_age=jnp.zeros_like(template_carry.cache_age),
+        real_lu=jnp.zeros_like(template_carry.real_lu),
+        real_piv=jnp.zeros_like(template_carry.real_piv),
+        complex_lu=jnp.zeros_like(template_carry.complex_lu),
+        complex_piv=jnp.zeros_like(template_carry.complex_piv),
+        prev_theta_final=payload.prev_theta_final_in,
+        prev_newton_iter_count=payload.prev_newton_iter_count_in,
+    )
+
+
+def _radau_accepted_step_primitive_pullback(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    template_carry: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+    reverse_payload: _RadauAcceptedStepReversePayload,
+    reduced_output_bar: _RadauAcceptedStepReducedOutput,
+) -> _RadauAcceptedStepReducedOutput:
+    """Temporary primitive-level reverse adapter.
+
+    This currently routes through the existing replay-state local pullback using
+    an explicit primitive payload. It preserves behavior while moving the new
+    reverse lane toward a payload-driven accepted-step primitive.
+    """
+    carry_in = _radau_carry_from_reverse_payload(
+        reverse_payload,
+        template_carry,
+        physics_context,
+    )
+    replay_state_bar = _radau_reduced_output_bar_to_replay_state_bar(reduced_output_bar)
+    carry_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
+        kernel_context,
+        physics_context,
+        carry_in,
+        attempt_context,
+        replay_state_bar,
+    )
+    replay_state_in_bar = _radau_replay_state_from_carry(carry_bar)
+    return _radau_reduced_output_from_replay_state_bar(replay_state_in_bar)
+
+
+def _radau_validate_accepted_step_primitive_pullback_adapter(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    template_carry: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+    primitive_result: _RadauAcceptedStepPrimitiveResult,
+    reduced_output_bar: _RadauAcceptedStepReducedOutput,
+):
+    """Compare the primitive pullback adapter with the legacy local pullback.
+
+    This is a bring-up helper for the refactor and is not yet wired into the
+    main benchmark path.
+    """
+    carry_in = _radau_carry_from_reverse_payload(
+        primitive_result.reverse_payload,
+        template_carry,
+        physics_context,
+    )
+    legacy_replay_state_bar = _radau_reduced_output_bar_to_replay_state_bar(reduced_output_bar)
+    legacy_carry_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
+        kernel_context,
+        physics_context,
+        carry_in,
+        attempt_context,
+        legacy_replay_state_bar,
+    )
+    adapter_reduced_bar = _radau_accepted_step_primitive_pullback(
+        kernel_context,
+        physics_context,
+        template_carry,
+        attempt_context,
+        primitive_result.reverse_payload,
+        reduced_output_bar,
+    )
+    return legacy_carry_bar, adapter_reduced_bar
+
+
+def _radau_apply_accepted_step_map(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepMapResult:
+    """Apply one accepted-step composition map outside the adaptive loop.
+
+    This keeps the existing accepted-step primal math intact, but exposes the
+    accepted-step composition boundary as its own first-class object for future
+    AD-facing multi-step composition work.
+    """
+    primitive_result = _radau_accepted_step_primitive(
+        kernel_context,
+        physics_context,
+        carry_in,
+        attempt_context,
+    )
+    attempt_result = primitive_result.attempt_result
+    accepted_y = primitive_result.reduced_output.y_out
+    next_carry = primitive_result.next_carry
     return _RadauAcceptedStepMapResult(
         next_carry=next_carry,
         accepted_y=accepted_y,
@@ -6305,6 +6595,230 @@ def _radau_replay_realized_accepted_rollout(
         converged_mask=converged_mask,
         accepted_dts=accepted_dts,
     )
+
+
+def _radau_zero_reduced_output_like(
+    carry_template: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepReducedOutput:
+    return _RadauAcceptedStepReducedOutput(
+        t_out=_radau_zero_cotangent_like(carry_template.t),
+        y_out=_radau_zero_cotangent_like(carry_template.y),
+        dt_out=_radau_zero_cotangent_like(carry_template.dt),
+        prev_stages_out=_radau_zero_cotangent_like(carry_template.prev_stages),
+        prev_dt_out=_radau_zero_cotangent_like(carry_template.prev_dt),
+        lagged_reference_y_out=_radau_zero_cotangent_like(carry_template.lagged_reference_y),
+        prev_theta_final_out=_radau_zero_cotangent_like(carry_template.prev_theta_final),
+    )
+
+
+def _radau_zero_reverse_payload_like(
+    carry_template: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepReversePayload:
+    return _RadauAcceptedStepReversePayload(
+        t_in=_radau_zero_cotangent_like(carry_template.t),
+        y_in=_radau_zero_cotangent_like(carry_template.y),
+        dt_in=_radau_zero_cotangent_like(carry_template.dt),
+        prev_stages_in=_radau_zero_cotangent_like(carry_template.prev_stages),
+        accepted_y=_radau_zero_cotangent_like(carry_template.y),
+        trial_y=_radau_zero_cotangent_like(carry_template.y),
+        trial_dt=_radau_zero_cotangent_like(carry_template.dt),
+        stage_history=_radau_zero_cotangent_like(carry_template.prev_stages),
+        prev_dt_in=_radau_zero_cotangent_like(carry_template.prev_dt),
+        prev_theta_final_in=_radau_zero_cotangent_like(carry_template.prev_theta_final),
+        prev_newton_iter_count_in=_radau_zero_cotangent_like(carry_template.prev_newton_iter_count),
+        lagged_response_valid_in=_radau_zero_cotangent_like(carry_template.lagged_response_valid),
+        lagged_reference_y_in=_radau_zero_cotangent_like(carry_template.lagged_reference_y),
+    )
+
+
+def _radau_collect_realized_accepted_step_payloads(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+) -> _RadauAcceptedPrimitivePayloadRollout:
+    """Collect accepted-step primitive payloads along the realized schedule.
+
+    This is the first rollout-level helper for the option-4 reverse refactor.
+    It follows the accepted-step-only contract and saves exact per-step
+    primitive payloads instead of rebuilding local primal context during
+    backward.
+    """
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    accepted_active_mask = jax.lax.stop_gradient(
+        jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)
+    )
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    zero_reduced_output = _radau_zero_reduced_output_like(carry0)
+    zero_reverse_payload = _radau_zero_reverse_payload_like(carry0)
+
+    def _scan_body(carry, xs):
+        accepted, dt_value = xs
+
+        def _do_step(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+            primitive_result = _radau_accepted_step_primitive(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_for_step,
+                execution_context.attempt_context,
+            )
+            next_carry = dataclasses.replace(
+                primitive_result.next_carry,
+                prev_error=jnp.maximum(
+                    primitive_result.attempt_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+                ),
+                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            )
+            scan_out = (
+                primitive_result.reduced_output,
+                primitive_result.reverse_payload,
+                dt_value,
+            )
+            return next_carry, scan_out
+
+        def _skip(_):
+            scan_out = (
+                zero_reduced_output,
+                zero_reverse_payload,
+                jnp.asarray(0.0, dtype=execution_context.dtype),
+            )
+            return carry, scan_out
+
+        return jax.lax.cond(accepted, _do_step, _skip, operand=None)
+
+    final_carry, scan_outputs = jax.lax.scan(
+        _scan_body,
+        carry0,
+        (accepted_active_mask, attempted_dts),
+    )
+    reduced_outputs, reverse_payloads, accepted_dts = scan_outputs
+    return _RadauAcceptedPrimitivePayloadRollout(
+        final_carry=final_carry,
+        accepted_mask=accepted_active_mask,
+        accepted_dts=accepted_dts,
+        reduced_outputs=reduced_outputs,
+        reverse_payloads=reverse_payloads,
+    )
+
+
+def _radau_rollout_reverse_from_saved_payloads(
+    execution_context: _RadauSolveExecutionContext,
+    initial_carry: _RadauAcceptedStepCarry,
+    payload_rollout: _RadauAcceptedPrimitivePayloadRollout,
+    final_output_bar: _RadauAcceptedStepReducedOutput,
+) -> _RadauAcceptedStepReducedOutput:
+    """Backward skeleton over saved accepted-step primitive payloads.
+
+    This intentionally stays separate from the active custom-VJP path until the
+    primitive reverse lane is validated against the current forward AD
+    reference.
+    """
+    rev_inputs = (
+        jnp.flip(payload_rollout.accepted_mask, axis=0),
+        jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), payload_rollout.reverse_payloads),
+    )
+
+    def _scan_body(carry_bar, xs):
+        accepted, reverse_payload = xs
+
+        def _do_step(_):
+            return _radau_accepted_step_primitive_pullback(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                initial_carry,
+                execution_context.attempt_context,
+                reverse_payload,
+                carry_bar,
+            )
+
+        def _skip(_):
+            return carry_bar
+
+        next_bar = jax.lax.cond(accepted, _do_step, _skip, operand=None)
+        return next_bar, None
+
+    reduced_input_bar, _ = jax.lax.scan(
+        _scan_body,
+        final_output_bar,
+        rev_inputs,
+    )
+    return reduced_input_bar
+
+
+def _radau_validate_saved_payload_rollout_reverse(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    final_output_bar: _RadauAcceptedStepReducedOutput | None = None,
+):
+    """Compare saved-payload rollout reverse with a direct accepted-rollout reference.
+
+    This is the first correctness harness for the option-4 rollout reverse
+    lane. It stays off the active benchmark path and is intended for small or
+    short-rollout bring-up checks.
+    """
+    payload_rollout = _radau_collect_realized_accepted_step_payloads(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    if final_output_bar is None:
+        final_output_bar = _RadauAcceptedStepReducedOutput(
+            t_out=jnp.asarray(0.0, dtype=execution_context.dtype),
+            y_out=jnp.ones_like(carry0.y),
+            dt_out=jnp.asarray(0.0, dtype=execution_context.dtype),
+            prev_stages_out=jnp.zeros_like(carry0.prev_stages),
+            prev_dt_out=jnp.asarray(0.0, dtype=execution_context.dtype),
+            lagged_reference_y_out=jnp.zeros_like(carry0.lagged_reference_y),
+            prev_theta_final_out=jnp.asarray(0.0, dtype=execution_context.dtype),
+        )
+
+    saved_payload_bar = _radau_rollout_reverse_from_saved_payloads(
+        execution_context,
+        carry0,
+        payload_rollout,
+        final_output_bar,
+    )
+
+    def _reference_final_reduced_output(carry_value):
+        rollout = _radau_replay_realized_accepted_rollout(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_value,
+            payload_rollout.accepted_mask,
+            payload_rollout.accepted_dts,
+        )
+        return _radau_reduced_output_from_carry(rollout.final_carry)
+
+    _, output_pullback = jax.vjp(_reference_final_reduced_output, carry0)
+    (reference_carry_bar,) = output_pullback(final_output_bar)
+    reference_reduced_bar = _radau_reduced_output_from_carry(reference_carry_bar)
+
+    diff = jax.tree_util.tree_map(
+        lambda a, b: jnp.asarray(a, dtype=execution_context.dtype) - jnp.asarray(b, dtype=execution_context.dtype),
+        saved_payload_bar,
+        reference_reduced_bar,
+    )
+    return {
+        "payload_rollout": payload_rollout,
+        "saved_payload_bar": saved_payload_bar,
+        "reference_reduced_bar": reference_reduced_bar,
+        "diff_l2": _radau_tree_l2_norm(diff),
+        "diff_max": _radau_tree_max_abs(diff),
+    }
 
 
 def _radau_replay_realized_attempt_rollout(

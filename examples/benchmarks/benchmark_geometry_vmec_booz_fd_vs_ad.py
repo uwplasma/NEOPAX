@@ -19,6 +19,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     exact_scalar_observable_linear_operator,
     five_point_fd_single_param,
     rel_error,
+    vmec_dmerc_profile_from_single_param,
     vmec_booz_scalar_observables_from_single_param,
     vmec_booz_qi_maxj_scalar_objectives_from_single_param,
     vmec_iotaf_scalar_observables_from_single_param,
@@ -34,6 +35,15 @@ def _parse_surface_s(text: str) -> tuple[float, ...]:
     if not values:
         raise ValueError("At least one flux surface must be provided.")
     return tuple(values)
+
+
+def _parse_optional_indices(text: str | None) -> tuple[int, ...]:
+    if text is None:
+        return ()
+    values = [item.strip() for item in str(text).split(",") if item.strip()]
+    if not values:
+        return ()
+    return tuple(int(item) for item in values)
 
 
 def _fd_step(base_value: float, *, fd_rel_step: float, fd_abs_step: float) -> float:
@@ -70,6 +80,67 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
     )
+
+
+def _print_dmerc_profile_probe(
+    context,
+    *,
+    probe_indices: tuple[int, ...],
+    h: float,
+    resolved_max_iter: int,
+    resolved_step_size: float,
+) -> None:
+    if not probe_indices:
+        return
+
+    def dmerc_ad(delta):
+        return vmec_dmerc_profile_from_single_param(
+            context,
+            delta,
+            lane="ad",
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+
+    def dmerc_fd(delta):
+        return vmec_dmerc_profile_from_single_param(
+            context,
+            delta,
+            lane="forward",
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+
+    ad_vec = jax.jvp(
+        dmerc_ad,
+        (jnp.asarray(0.0, dtype=jnp.float64),),
+        (jnp.asarray(1.0, dtype=jnp.float64),),
+    )[1]
+    fd_vec = (dmerc_fd(h) - dmerc_fd(-h)) / (2.0 * h)
+
+    ad_np = jnp.asarray(ad_vec, dtype=jnp.float64)
+    fd_np = jnp.asarray(fd_vec, dtype=jnp.float64)
+    size = int(ad_np.size)
+    print("[geometry-fd-ad] DMerc profile derivative probe:", flush=True)
+    for raw_idx in probe_indices:
+        idx = int(raw_idx)
+        if idx < 0:
+            idx = size + idx
+        if idx < 0 or idx >= size:
+            print(
+                f"  - idx={raw_idx}: out_of_range size={size}",
+                flush=True,
+            )
+            continue
+        ad_value = jnp.asarray(ad_np[idx], dtype=jnp.float64)
+        fd_value = jnp.asarray(fd_np[idx], dtype=jnp.float64)
+        err = rel_error(ad_value, fd_value)
+        print(
+            f"  - idx={idx}: ad={float(ad_value):.6e} "
+            f"fd_center={float(fd_value):.6e} "
+            f"ad_vs_fd_rel_err={err:.6e}",
+            flush=True,
+        )
 
 
 def main() -> None:
@@ -122,6 +193,12 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6, help="Relative FD step.")
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-8, help="Absolute FD step.")
     parser.add_argument(
+        "--print-dmerc-indices",
+        type=str,
+        default=None,
+        help="Optional comma-separated raw DMerc profile derivative indices to print as AD vs centered FD.",
+    )
+    parser.add_argument(
         "--skip-reverse-check",
         action="store_true",
         help="Skip exact reverse-mode observable derivative recovery against the exact forward path.",
@@ -149,6 +226,7 @@ def main() -> None:
         nboz=args.nboz,
         surface_s=_parse_surface_s(args.surface_s),
     )
+    dmerc_probe_indices = _parse_optional_indices(args.print_dmerc_indices)
     h = _fd_step(context.baseline_coefficient, fd_rel_step=args.fd_rel_step, fd_abs_step=args.fd_abs_step)
     resolved_max_iter = _resolved_max_iter(context, args.vmec_max_iter)
     resolved_step_size = _resolved_step_size(context, args.vmec_step_size)
@@ -224,6 +302,14 @@ def main() -> None:
             linear_op,
             observable_kind=observable_kind,
         )
+
+    _print_dmerc_profile_probe(
+        context,
+        probe_indices=dmerc_probe_indices,
+        h=h,
+        resolved_max_iter=resolved_max_iter,
+        resolved_step_size=resolved_step_size,
+    )
 
     print("[geometry-fd-ad] observable errors:")
     for name in ad:
