@@ -9732,75 +9732,25 @@ def build_report(
     small_step_scale: float,
     device: str | None,
 ) -> dict[str, Any]:
-    if parameter_name not in ALLOWED_PARAMETERS:
-        raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
-
     config = _prepare_benchmark_config(config_path, device=device)
     if one_step_diagnostic:
         config = _apply_one_step_diagnostic_config(config)
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[parameter_name])
+    accepted_step_limit = 1 if one_step_diagnostic else None
 
-    objective_fn = lambda p: _transport_objectives_for_parameter(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
+    report = build_realized_schedule_rollout_report(
+        config_path=config_path,
         parameter_name=parameter_name,
+        rel_fd_step=rel_fd_step,
+        abs_fd_step=abs_fd_step,
+        device=device,
+        include_nan_debug=False,
+        nan_debug_mode="minimal",
+        nan_debug_include_one_step_compare=False,
+        accepted_step_limit=accepted_step_limit,
     )
-
-    fd_step = _fd_step(baseline_value, rel_step=rel_fd_step, abs_step=abs_fd_step)
-    minus_value = baseline_value - fd_step
-    plus_value = baseline_value + fd_step
-    baseline_result = run_transport(
-        config,
-        runtime,
-        _parameterized_initial_state(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_name=parameter_name,
-            parameter_value=jnp.asarray(baseline_value),
-        ),
-    )
-    minus_result = run_transport(
-        config,
-        runtime,
-        _parameterized_initial_state(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_name=parameter_name,
-            parameter_value=jnp.asarray(minus_value),
-        ),
-    )
-    plus_result = run_transport(
-        config,
-        runtime,
-        _parameterized_initial_state(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_name=parameter_name,
-            parameter_value=jnp.asarray(plus_value),
-        ),
-    )
-
-    baseline_objectives = _objective_vector(baseline_result["final_state"], runtime)
-    objectives_minus = _objective_vector(minus_result["final_state"], runtime)
-    objectives_plus = _objective_vector(plus_result["final_state"], runtime)
-    gradient_ad = jax.jacfwd(objective_fn)(jnp.asarray(baseline_value))
-    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
-
-    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    abs_err = np.abs(grad_ad_np - grad_fd_np)
-    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
 
     if with_sweep:
         sweep_half_width = sweep_half_width_rel * max(abs(baseline_value), 1.0)
@@ -9810,6 +9760,16 @@ def build_report(
             int(sweep_points),
             dtype=float,
         )
+        objective_fn = lambda p: _adaptive_rollout_objectives_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            use_realized_schedule_jvp=True,
+            accepted_step_limit_override=accepted_step_limit,
+        )[0]
         sweep_objectives = np.stack(
             [
                 np.asarray(jax.device_get(objective_fn(jnp.asarray(value))), dtype=float)
@@ -9817,36 +9777,22 @@ def build_report(
             ],
             axis=0,
         )
-    else:
-        sweep_values = np.asarray([minus_value, baseline_value, plus_value], dtype=float)
-        sweep_objectives = np.stack(
-            [
-                np.asarray(jax.device_get(objectives_minus), dtype=float),
-                np.asarray(jax.device_get(baseline_objectives), dtype=float),
-                np.asarray(jax.device_get(objectives_plus), dtype=float),
-            ],
-            axis=0,
-        )
+        report["sweep_values"] = sweep_values.tolist()
+        report["sweep_objectives"] = sweep_objectives.tolist()
 
-    baseline_diag = _result_diagnostics(baseline_result)
-    minus_diag = _result_diagnostics(minus_result)
-    plus_diag = _result_diagnostics(plus_result)
-
-    fd_step_sweep = None
     if with_fd_step_sweep:
-        fd_step_sweep = _fd_step_sweep_report(
+        report["fd_step_sweep"] = _fd_step_sweep_report(
             runtime=runtime,
             config=config,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             baseline_value=baseline_value,
-            gradient_ad=gradient_ad,
-            fd_step=fd_step,
+            gradient_ad=jnp.asarray(report["gradient_autodiff"], dtype=jnp.float64),
+            fd_step=float(report["fd_step"]),
             step_multipliers=fd_step_sweep_multipliers,
         )
 
-    standalone_stage_subsolve = None
     if with_standalone_stage_subsolve_check:
         standalone_objective_fn = lambda p: _standalone_stage_subsolve_objectives_for_parameter(  # noqa: E731
             p,
@@ -9856,6 +9802,9 @@ def build_report(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
         )
+        fd_step = float(report["fd_step"])
+        minus_value = baseline_value - fd_step
+        plus_value = baseline_value + fd_step
         standalone_ad = jax.jacfwd(standalone_objective_fn)(jnp.asarray(baseline_value))
         standalone_minus = np.asarray(
             jax.device_get(standalone_objective_fn(jnp.asarray(minus_value))),
@@ -9869,7 +9818,7 @@ def build_report(
         standalone_ad_np = np.asarray(jax.device_get(standalone_ad), dtype=float)
         standalone_abs_err = np.abs(standalone_ad_np - standalone_fd)
         standalone_rel_err = standalone_abs_err / np.maximum(np.abs(standalone_fd), 1.0e-10)
-        standalone_stage_subsolve = {
+        report["standalone_stage_subsolve"] = {
             "labels": STANDALONE_SUBSOLVE_LABELS,
             "gradient_autodiff": standalone_ad_np.tolist(),
             "gradient_fd": standalone_fd.tolist(),
@@ -9878,79 +9827,34 @@ def build_report(
             "max_relative_error": float(np.max(standalone_rel_err)),
         }
 
-    small_step_composition = None
     if with_small_step_composition_check:
-        small_step_composition = _small_step_composition_report(
+        report["small_step_composition"] = _small_step_composition_report(
             config=config,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             baseline_value=baseline_value,
-            fd_step=fd_step,
+            fd_step=float(report["fd_step"]),
             small_step_counts=small_step_counts,
             small_step_scale=small_step_scale,
         )
 
-    controller_step_composition = None
     if with_controller_composition_check:
-        controller_step_composition = _controller_composition_report(
+        report["controller_step_composition"] = _controller_composition_report(
             config=config,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             baseline_value=baseline_value,
-            fd_step=fd_step,
+            fd_step=float(report["fd_step"]),
             small_step_counts=small_step_counts,
             small_step_scale=small_step_scale,
         )
 
-    report = {
-        "config_path": str(config_path),
-        "one_step_diagnostic": bool(one_step_diagnostic),
-        "parameter_name": parameter_name,
-        "baseline_value": baseline_value,
-        "fd_step": float(fd_step),
-        "baseline_objectives": np.asarray(jax.device_get(baseline_objectives), dtype=float).tolist(),
-        "gradient_autodiff": grad_ad_np.tolist(),
-        "gradient_fd": grad_fd_np.tolist(),
-        "gradient_absolute_error": abs_err.tolist(),
-        "gradient_relative_error": rel_err.tolist(),
-        "max_relative_error": float(np.max(rel_err)),
-        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
-        "objective_labels": OBJECTIVE_LABELS,
-        "autodiff_reuses_baseline_value_only": True,
-        "sweep_values": sweep_values.tolist(),
-        "sweep_objectives": sweep_objectives.tolist(),
-        "fd_step_sweep": fd_step_sweep,
-        "standalone_stage_subsolve": standalone_stage_subsolve,
-        "small_step_composition": small_step_composition,
-        "controller_step_composition": controller_step_composition,
-        "solver_path": {
-            "baseline": baseline_diag,
-            "fd_minus": minus_diag,
-            "fd_plus": plus_diag,
-            "accepted_mask_equal_minus_plus": (
-                baseline_diag["accepted_mask"] is not None
-                and minus_diag["accepted_mask"] is not None
-                and plus_diag["accepted_mask"] is not None
-                and minus_diag["accepted_mask"] == plus_diag["accepted_mask"]
-            ),
-            "saved_times_equal_minus_plus": _sequence_allclose(
-                minus_diag["saved_times"],
-                plus_diag["saved_times"],
-            ),
-            "saved_dts_equal_minus_plus": _sequence_allclose(
-                minus_diag["saved_step_sizes"],
-                plus_diag["saved_step_sizes"],
-            ),
-        },
-        "rho_grid": np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float).tolist(),
-        "baseline_final_Er": np.asarray(jax.device_get(baseline_result["final_state"].Er), dtype=float).tolist(),
-        "fd_minus_final_Er": np.asarray(jax.device_get(minus_result["final_state"].Er), dtype=float).tolist(),
-        "fd_plus_final_Er": np.asarray(jax.device_get(plus_result["final_state"].Er), dtype=float).tolist(),
-    }
+    report["one_step_diagnostic"] = bool(one_step_diagnostic)
+    report["autodiff_reuses_baseline_value_only"] = True
     return report
 
 
