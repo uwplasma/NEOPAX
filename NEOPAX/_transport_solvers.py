@@ -2455,8 +2455,11 @@ class _RadauAcceptedStepReversePayload:
     prev_dt_in: Any
     prev_theta_final_in: Any
     prev_newton_iter_count_in: Any
+    lagged_response_in: Any
+    lagged_response_cache_in: Any
     lagged_response_valid_in: Any
     lagged_reference_y_in: Any
+    rhs_time_ref: Any
     jacobian_out: Any
     real_lu_out: Any
     real_piv_out: Any
@@ -3677,10 +3680,50 @@ def _radau_accepted_step_y_pullback_linearized(
             carry_in,
             primal_result,
         )
+        stage_shared_fluxes_from_flux_response = _radau_stage_shared_fluxes_from_flux_response_factory(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+        )
+        stage_shared_fluxes_pullback = _radau_stage_shared_fluxes_pullback_factory(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+        )
+        stage_flux_response_pullback = _radau_stage_flux_response_pullback_factory(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+        )
+
+        if (
+            stage_shared_fluxes_from_flux_response is not None
+            and stage_shared_fluxes_pullback is not None
+            and stage_flux_response_pullback is not None
+        ):
+            def flux_response_pullback_fn(flux_response_value, stage_rhs_bar_value):
+                stage_shared_fluxes = stage_shared_fluxes_from_flux_response(
+                    flux_response_value
+                )
+                stage_shared_fluxes_bar = stage_shared_fluxes_pullback(
+                    stage_shared_fluxes,
+                    stage_rhs_bar_value,
+                )
+                return stage_flux_response_pullback(
+                    flux_response_value,
+                    stage_shared_fluxes_bar,
+                )
+        else:
+            flux_response_pullback_fn = None
+
         lagged_response_cache_bar = _radau_lagged_response_pullback_dispatch(
             stage_eval_fn,
             lagged_response,
             stage_rhs_bar,
+            flux_response_pullback_fn=flux_response_pullback_fn,
         )
     else:
         lagged_response_cache_bar = zero_lagged_cache_tangent
@@ -3888,6 +3931,7 @@ def _radau_lagged_response_pullback_dispatch(
     stage_rhs_bar,
     *,
     shared_flux_pullback_fn=None,
+    flux_response_pullback_fn=None,
 ):
     """Type-dispatched lagged-response pullback.
 
@@ -3909,7 +3953,12 @@ def _radau_lagged_response_pullback_dispatch(
         return None
 
     if isinstance(lagged_response, TransportLaggedResponse):
-        if shared_flux_pullback_fn is not None:
+        if flux_response_pullback_fn is not None:
+            flux_response_bar = flux_response_pullback_fn(
+                lagged_response.flux_response,
+                stage_rhs_bar,
+            )
+        elif shared_flux_pullback_fn is not None:
             _, flux_pullback = jax.vjp(
                 lambda flux_response: shared_flux_pullback_fn(
                     flux_response
@@ -4657,6 +4706,8 @@ def _radau_accepted_step_reverse_payload_from_primal(
     carry_in: _RadauAcceptedStepCarry,
     attempt_result: _RadauAcceptedStepAttemptResult,
     accepted_y,
+    lagged_response,
+    rhs_time_ref,
 ) -> _RadauAcceptedStepReversePayload:
     return _RadauAcceptedStepReversePayload(
         t_in=carry_in.t,
@@ -4670,8 +4721,11 @@ def _radau_accepted_step_reverse_payload_from_primal(
         prev_dt_in=carry_in.prev_dt,
         prev_theta_final_in=carry_in.prev_theta_final,
         prev_newton_iter_count_in=carry_in.prev_newton_iter_count,
+        lagged_response_in=lagged_response,
+        lagged_response_cache_in=carry_in.lagged_response_cache,
         lagged_response_valid_in=carry_in.lagged_response_valid,
         lagged_reference_y_in=carry_in.lagged_reference_y,
+        rhs_time_ref=rhs_time_ref,
         jacobian_out=attempt_result.jacobian_out,
         real_lu_out=attempt_result.real_lu_out,
         real_piv_out=attempt_result.real_piv_out,
@@ -4687,6 +4741,24 @@ def _radau_accepted_step_primitive(
     attempt_context: _RadauAcceptedStepAttemptContext,
 ) -> _RadauAcceptedStepPrimitiveResult:
     """Explicit accepted-step primitive boundary for the reverse refactor."""
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval_at_state(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_in.y,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
     attempt_result = _execute_radau_accepted_step_attempt(
         kernel_context,
         physics_context,
@@ -4725,6 +4797,8 @@ def _radau_accepted_step_primitive(
             carry_in,
             attempt_result,
             accepted_y,
+            lagged_response,
+            rhs_time_ref,
         ),
         next_carry=next_carry,
         attempt_result=attempt_result,
@@ -4792,22 +4866,6 @@ def _radau_carry_from_reverse_payload(
     template_carry: _RadauAcceptedStepCarry,
     physics_context: _RadauAcceptedStepPhysicsContext,
 ) -> _RadauAcceptedStepCarry:
-    if physics_context.build_lagged_response is None:
-        lagged_response_cache_value = template_carry.lagged_response_cache
-    else:
-        def _build_lagged_cache_from_flat(flat_y):
-            candidate_state = physics_context.unpack_flat(
-                _project_flat_state_if_needed(flat_y, physics_context.project_flat)
-            )
-            return physics_context.build_lagged_response(candidate_state)
-
-        lagged_response_cache_value = jax.lax.cond(
-            payload.lagged_response_valid_in,
-            lambda _: _build_lagged_cache_from_flat(payload.lagged_reference_y_in),
-            lambda _: _build_lagged_cache_from_flat(payload.y_in),
-            operand=None,
-        )
-
     return _RadauAcceptedStepCarry(
         t=payload.t_in,
         y=payload.y_in,
@@ -4818,7 +4876,7 @@ def _radau_carry_from_reverse_payload(
         recent_reject_count=jnp.zeros_like(template_carry.recent_reject_count),
         regrowth_cooldown=jnp.zeros_like(template_carry.regrowth_cooldown),
         easy_growth_streak=jnp.zeros_like(template_carry.easy_growth_streak),
-        lagged_response_cache=lagged_response_cache_value,
+        lagged_response_cache=payload.lagged_response_cache_in,
         lagged_response_valid=payload.lagged_response_valid_in,
         lagged_reference_y=payload.lagged_reference_y_in,
         jacobian=jnp.zeros_like(template_carry.jacobian),
@@ -4896,24 +4954,8 @@ def _radau_accepted_step_primitive_pullback(
     zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
 
     accepted_y_bar = jnp.asarray(reduced_output_bar.y_out, dtype=kernel_context.dtype)
-    lagged_response, _, _ = _radau_prepare_lagged_response(
-        kernel_context,
-        carry_in,
-        physics_context.unpack_flat,
-        physics_context.project_flat,
-        physics_context.build_lagged_response,
-    )
-
-    def _rhs_eval_at_state(t_eval):
-        return _radau_eval_rhs(
-            t_eval,
-            carry_in.y,
-            lagged_response,
-            physics_context.flat_rhs,
-            physics_context.flat_rhs_with_lagged_response,
-        )
-
-    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
+    lagged_response = reverse_payload.lagged_response_in
+    rhs_time_ref = reverse_payload.rhs_time_ref
     dy_bar, dh_bar, dt_in_bar, _lagged_response_cache_bar, stage_rhs_bar = _radau_accepted_step_y_pullback_linearized(
         kernel_context,
         physics_context,

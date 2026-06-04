@@ -153,9 +153,12 @@ Current reduced implementation target:
 The backward payload should also carry the exact frozen local linearization
 data needed by the accepted-`y` pullback:
 
+- `lagged_response_in`
 - `trial_y`
 - `trial_dt`
 - `stage_history`
+- `lagged_response_cache_in`
+- `rhs_time_ref`
 - `J`
 - transposed-stage-solve factors / pivots
 
@@ -191,6 +194,10 @@ The next reductions implemented are:
   evaluation closure
 - saved local linearization payload for backward, so the primitive pullback no
   longer reruns the accepted-step primal attempt
+- saved lagged-response cache and `rhs_time_ref`, so the primitive pullback no
+  longer rebuilds the lagged cache or recomputes the local time derivative
+- saved `lagged_response_in`, so the primitive pullback no longer calls
+  `_radau_prepare_lagged_response(...)` to rebuild the lagged response object
 
 So the current implementation is:
 
