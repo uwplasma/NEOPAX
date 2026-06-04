@@ -4087,93 +4087,44 @@ def _radau_apply_accepted_step_replay_state_pullback_linearized(
     )
     lagged_response_cache_bar = zero_lagged_cache_tangent
     if lagged_response is not None:
-        stage_eval_fn = _radau_stage_evals_from_lagged_factory(
+        stage_eval_from_lagged = _radau_stage_evals_from_lagged_factory(
             kernel_context,
             physics_context,
             carry_in,
             primal_result,
         )
-        lagged_response_bar = None
-        try:
-            from ._transport_equations import TransportLaggedResponse
-        except Exception:
-            TransportLaggedResponse = None
-        if TransportLaggedResponse is not None and isinstance(lagged_response, TransportLaggedResponse):
-            stage_eval_shared_fluxes_fn = _radau_stage_evals_from_shared_fluxes_factory(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
+
+        def _stage_evals_from_flat(flat_y_source):
+            if physics_context.build_lagged_response is None:
+                return jnp.zeros_like(stage_rhs_bar)
+            candidate_state = physics_context.unpack_flat(
+                _project_flat_state_if_needed(flat_y_source, physics_context.project_flat)
             )
-            stage_shared_fluxes_fn = _radau_stage_shared_fluxes_from_flux_response_factory(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
-            )
-            stage_flux_response_pullback_fn = _radau_stage_flux_response_pullback_factory(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
-            )
-            stage_shared_fluxes_pullback_fn = _radau_stage_shared_fluxes_pullback_factory(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
-            )
-            if (
-                stage_eval_shared_fluxes_fn is not None
-                and stage_shared_fluxes_fn is not None
-                and stage_shared_fluxes_pullback_fn is not None
-            ):
-                stage_shared_fluxes = stage_shared_fluxes_fn(lagged_response.flux_response)
-                stage_shared_fluxes_bar = stage_shared_fluxes_pullback_fn(
-                    stage_shared_fluxes,
-                    stage_rhs_bar,
-                )
-                if stage_flux_response_pullback_fn is not None:
-                    flux_response_bar = stage_flux_response_pullback_fn(
-                        lagged_response.flux_response,
-                        stage_shared_fluxes_bar,
-                    )
-                else:
-                    _, flux_response_pullback = jax.vjp(stage_shared_fluxes_fn, lagged_response.flux_response)
-                    (flux_response_bar,) = flux_response_pullback(stage_shared_fluxes_bar)
-                lagged_response_bar = TransportLaggedResponse(flux_response=flux_response_bar)
-        if lagged_response_bar is None:
-            lagged_response_bar = _radau_lagged_response_pullback_dispatch(
-                stage_eval_fn,
-                lagged_response,
-                stage_rhs_bar,
-            )
+            lagged_response_value = physics_context.build_lagged_response(candidate_state)
+            return stage_eval_from_lagged(lagged_response_value)
 
         def _reuse_case(_):
+            lagged_reference_y_extra_bar = _radau_zero_cotangent_like(carry_in.lagged_reference_y)
+            if physics_context.build_lagged_response is not None:
+                _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.lagged_reference_y)
+                (lagged_reference_y_extra_bar,) = source_pullback(stage_rhs_bar)
             return (
-                lagged_response_bar,
-                lagged_reference_y_bar,
+                lagged_reference_y_bar + lagged_reference_y_extra_bar,
                 jnp.zeros_like(carry_in.y),
             )
 
         def _rebuild_case(_):
             y_from_lagged_bar = jnp.zeros_like(carry_in.y)
             if physics_context.build_lagged_response is not None:
-                def _build_from_flat(flat_y):
-                    candidate_state = physics_context.unpack_flat(
-                        _project_flat_state_if_needed(flat_y, physics_context.project_flat)
-                    )
-                    return physics_context.build_lagged_response(candidate_state)
-
-                _, build_pullback = jax.vjp(_build_from_flat, carry_in.y)
-                (y_from_lagged_bar,) = build_pullback(lagged_response_bar)
+                _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.y)
+                (y_from_lagged_bar,) = source_pullback(stage_rhs_bar)
             dy_extra = y_from_lagged_bar + lagged_reference_y_bar
-            return zero_lagged_cache_tangent, _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
+            return _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
 
         if _radau_replay_force_reuse_diagnostic():
-            lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = _reuse_case(None)
+            lagged_reference_y_out_bar, dy_extra = _reuse_case(None)
         else:
-            lagged_response_cache_bar, lagged_reference_y_out_bar, dy_extra = jax.lax.cond(
+            lagged_reference_y_out_bar, dy_extra = jax.lax.cond(
                 carry_in.lagged_response_valid,
                 _reuse_case,
                 _rebuild_case,
@@ -7409,11 +7360,15 @@ def _radau_checkpoint_interval() -> int:
     """Fixed replay checkpoint interval for custom VJP reverse recomputation."""
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_CHECKPOINT_INTERVAL")
     if raw_value is None:
-        return 64
+        # The accepted-step reverse path now relies on compact replay traces and
+        # recomputation instead of a large payload tape. Keeping reverse
+        # segments very short by default is the safest no-flag setting for GPU
+        # memory, while the env var still allows larger intervals when desired.
+        return 1
     try:
         parsed = int(raw_value)
     except ValueError:
-        return 64
+        return 1
     return max(parsed, 1)
 
 
