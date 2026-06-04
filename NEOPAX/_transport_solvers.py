@@ -5213,6 +5213,27 @@ def _radau_rebuild_checkpoint_carry(
     )
 
 
+def _radau_rebuild_checkpoint_carries(
+    checkpoint_traces: _RadauAcceptedStepReplayCheckpointTrace,
+    template_carry: _RadauAcceptedStepCarry,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+):
+    segment_count = int(jnp.asarray(checkpoint_traces.t).shape[0])
+
+    def _rebuild_one(i):
+        checkpoint_trace = jax.tree_util.tree_map(lambda x: x[i], checkpoint_traces)
+        return _radau_rebuild_checkpoint_carry(
+            checkpoint_trace,
+            template_carry,
+            physics_context,
+        )
+
+    return jax.lax.map(
+        _rebuild_one,
+        jnp.arange(segment_count, dtype=jnp.int32),
+    )
+
+
 def _radau_pack_replay_state(replay_state: _RadauReplayState):
     leaves = (
         jnp.ravel(jnp.asarray(replay_state.t)),
@@ -9049,6 +9070,11 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_easy_growth_streak,
         segmented_next_lagged_response_valid,
     )
+    checkpoint_carries = _radau_rebuild_checkpoint_carries(
+        checkpoint_traces,
+        carry0,
+        execution_context.physics_context,
+    )
 
     replay_output_mode = _radau_replay_output_diagnostic_mode()
     # Benchmark contract: differentiate the accepted-step composition only,
@@ -9079,12 +9105,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         ) = inputs
-        checkpoint_trace = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_traces)
-        checkpoint_carry = _radau_rebuild_checkpoint_carry(
-            checkpoint_trace,
-            carry0,
-            execution_context.physics_context,
-        )
+        checkpoint_carry = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_carries)
         _, carry_trace = _radau_replay_realized_accepted_carry_trace(
             execution_context,
             checkpoint_carry,
