@@ -1155,23 +1155,6 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     derivative_mode: str = "jvp",
 ):
     parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
-    if _saved_payload_rollout_validation_enabled():
-        validation = _run_saved_payload_rollout_validation_for_parameter_vector(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-        print("[autodiff-gate] saved-payload-rollout-validate")
-        print(
-            f"  diff_l2: {float(np.asarray(jax.device_get(validation['diff_l2']), dtype=float)):.6e}"
-        )
-        print(
-            f"  diff_max: {float(np.asarray(jax.device_get(validation['diff_max']), dtype=float)):.6e}"
-        )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "vjp":
         return _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(

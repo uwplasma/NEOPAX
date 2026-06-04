@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+BENCHMARK_DIR = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
+
+from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
+    DEFAULT_CONFIG,
+    PROFILE_VECTOR_PARAMETERS,
+    _baseline_profile_cfg,
+    _prepare_benchmark_config,
+    _prepare_realized_schedule_profile_vector_rollout_option_a,
+)
+from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
+from NEOPAX._transport_solvers import (  # noqa: E402
+    _RadauAcceptedStepReducedOutput,
+    _radau_accepted_step_primitive,
+    _radau_reduced_output_from_carry,
+    _radau_validate_accepted_step_primitive_pullback_adapter,
+)
+
+
+def _report_path() -> Path:
+    outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "one_step_primitive"
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir / "transport_reverse_one_step_primitive_summary.json"
+
+
+def _parse_parameter_subset(text: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in str(text).split(",") if item.strip())
+    if not values:
+        raise ValueError("At least one profile-vector parameter must be provided.")
+    invalid = [name for name in values if name not in PROFILE_VECTOR_PARAMETERS]
+    if invalid:
+        raise ValueError(
+            f"Unsupported profile-vector parameter(s): {invalid}. "
+            f"Allowed values: {list(PROFILE_VECTOR_PARAMETERS)}"
+        )
+    return values
+
+
+def _tree_max_abs(tree) -> jax.Array:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    vals = [jnp.max(jnp.abs(jnp.asarray(leaf, dtype=jnp.float64))) for leaf in leaves]
+    return jnp.max(jnp.stack(vals))
+
+
+def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutput:
+    if mode == "y-only":
+        return _RadauAcceptedStepReducedOutput(
+            t_out=jnp.zeros_like(carry.t),
+            y_out=jnp.ones_like(carry.y),
+            dt_out=jnp.zeros_like(carry.dt),
+            prev_stages_out=jnp.zeros_like(carry.prev_stages),
+            prev_dt_out=jnp.zeros_like(carry.prev_dt),
+            lagged_reference_y_out=jnp.zeros_like(carry.lagged_reference_y),
+            prev_theta_final_out=jnp.zeros_like(carry.prev_theta_final),
+        )
+    if mode == "all-ones":
+        return _RadauAcceptedStepReducedOutput(
+            t_out=jnp.ones_like(carry.t),
+            y_out=jnp.ones_like(carry.y),
+            dt_out=jnp.ones_like(carry.dt),
+            prev_stages_out=jnp.ones_like(carry.prev_stages),
+            prev_dt_out=jnp.ones_like(carry.prev_dt),
+            lagged_reference_y_out=jnp.ones_like(carry.lagged_reference_y),
+            prev_theta_final_out=jnp.ones_like(carry.prev_theta_final),
+        )
+    raise ValueError(f"Unsupported bar mode: {mode}")
+
+
+def _compute_one_step_metrics(
+    execution_context,
+    initial_carry,
+    *,
+    bar_mode: str,
+):
+    kernel_context = execution_context.kernel_context
+    physics_context = execution_context.physics_context
+    attempt_context = execution_context.attempt_context
+
+    def _compare_fn(carry_in):
+        primitive_result = _radau_accepted_step_primitive(
+            kernel_context,
+            physics_context,
+            carry_in,
+            attempt_context,
+        )
+        reduced_output_bar = _make_reduced_output_bar(carry_in, bar_mode)
+        legacy_carry_bar, adapter_reduced_bar = _radau_validate_accepted_step_primitive_pullback_adapter(
+            kernel_context,
+            physics_context,
+            carry_in,
+            attempt_context,
+            primitive_result,
+            reduced_output_bar,
+        )
+        legacy_reduced_bar = _radau_reduced_output_from_carry(legacy_carry_bar)
+        diff = jax.tree_util.tree_map(
+            lambda a, b: jnp.asarray(a, dtype=kernel_context.dtype) - jnp.asarray(b, dtype=kernel_context.dtype),
+            adapter_reduced_bar,
+            legacy_reduced_bar,
+        )
+        return {
+            "converged": primitive_result.attempt_result.converged,
+            "err_norm": primitive_result.attempt_result.err_norm,
+            "trial_dt": primitive_result.attempt_result.trial_dt,
+            "newton_iter_count": primitive_result.attempt_result.newton_iter_count,
+            "diff_l2": jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(jnp.asarray(leaf, dtype=jnp.float64)))
+                    for leaf in jax.tree_util.tree_leaves(diff)
+                )
+            ),
+            "diff_max": _tree_max_abs(diff),
+            "y_diff_max": jnp.max(
+                jnp.abs(
+                    jnp.asarray(adapter_reduced_bar.y_out, dtype=jnp.float64)
+                    - jnp.asarray(legacy_reduced_bar.y_out, dtype=jnp.float64)
+                )
+            ),
+            "dt_diff_abs": jnp.max(
+                jnp.abs(
+                    jnp.asarray(adapter_reduced_bar.dt_out, dtype=jnp.float64)
+                    - jnp.asarray(legacy_reduced_bar.dt_out, dtype=jnp.float64)
+                )
+            ),
+            "prev_stages_diff_max": jnp.max(
+                jnp.abs(
+                    jnp.asarray(adapter_reduced_bar.prev_stages_out, dtype=jnp.float64)
+                    - jnp.asarray(legacy_reduced_bar.prev_stages_out, dtype=jnp.float64)
+                )
+            ),
+        }
+
+    compare_jit = jax.jit(_compare_fn)
+
+    t0 = time.perf_counter()
+    first = compare_jit(initial_carry)
+    jax.block_until_ready(first["diff_l2"])
+    compile_plus_execute_s = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    second = compare_jit(initial_carry)
+    jax.block_until_ready(second["diff_l2"])
+    execute_s = time.perf_counter() - t1
+
+    result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
+    result["compile_plus_execute_s"] = compile_plus_execute_s
+    result["execute_s"] = execute_s
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark the one-step accepted-step primitive reverse adapter against the legacy local pullback."
+    )
+    parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
+    parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")
+    parser.add_argument(
+        "--ntx-exact-derivative-mode",
+        default="direct",
+        choices=("direct", "custom_vjp"),
+        help="NTX exact-runtime derivative mode. Use direct for this benchmark.",
+    )
+    parser.add_argument(
+        "--parameters",
+        default=",".join(PROFILE_VECTOR_PARAMETERS),
+        help="Comma-separated subset of profile-vector parameters to include.",
+    )
+    parser.add_argument(
+        "--accepted-step-limit",
+        type=int,
+        default=1,
+        help="Accepted-step limit used only to prepare the baseline rollout context. Default: 1.",
+    )
+    parser.add_argument(
+        "--bar-mode",
+        default="y-only",
+        choices=("y-only", "all-ones"),
+        help="Cotangent pattern used for the local reduced-output pullback comparison.",
+    )
+    args = parser.parse_args()
+
+    parameter_names = _parse_parameter_subset(args.parameters)
+    config = _prepare_benchmark_config(
+        Path(args.config),
+        device=args.device,
+        ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+    )
+    runtime, baseline_state = build_runtime_context(config)
+    profile_cfg = _baseline_profile_cfg(config)
+    baseline_vector = jnp.asarray([float(profile_cfg[name]) for name in parameter_names], dtype=jnp.float64)
+
+    execution_context, _prepared_rollout, initial_carry, _max_total_steps, _stop_after_accepted_steps, _solver, _solve_vector_field = (
+        _prepare_realized_schedule_profile_vector_rollout_option_a(
+            baseline_vector,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            accepted_step_limit_override=args.accepted_step_limit,
+        )
+    )
+
+    result = _compute_one_step_metrics(
+        execution_context,
+        initial_carry,
+        bar_mode=args.bar_mode,
+    )
+
+    report = {
+        "config": str(args.config),
+        "device": args.device,
+        "ntx_exact_derivative_mode": args.ntx_exact_derivative_mode,
+        "parameter_names": list(parameter_names),
+        "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
+        "accepted_step_limit": int(args.accepted_step_limit),
+        "bar_mode": args.bar_mode,
+        "result": result,
+    }
+
+    outpath = _report_path()
+    outpath.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print("[autodiff-gate] mode=transport_reverse_one_step_primitive")
+    print(f"[autodiff-gate] parameters={list(parameter_names)}")
+    print(f"[autodiff-gate] bar_mode={args.bar_mode} accepted_step_limit={int(args.accepted_step_limit)}")
+    for key, value in result.items():
+        if isinstance(value, bool):
+            print(f"  - {key}: {value}")
+        elif "count" in key:
+            print(f"  - {key}: {int(value)}")
+        else:
+            print(f"  - {key}: {float(value):.6e}")
+    print(f"[autodiff-gate] wrote={outpath}")
+
+
+if __name__ == "__main__":
+    main()
