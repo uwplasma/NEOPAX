@@ -748,6 +748,20 @@ def _saved_payload_rollout_validation_enabled() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _saved_payload_rollout_validation_accepted_step_limit() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE_ACCEPTED_STEPS")
+    if raw_value is None:
+        return 1
+    return max(1, int(raw_value))
+
+
+def _saved_payload_rollout_validation_max_total_steps() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE_MAX_TOTAL_STEPS")
+    if raw_value is None:
+        return 8
+    return max(1, int(raw_value))
+
+
 def _step_pullback_segment_index() -> int:
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
     if raw_value is None:
@@ -841,7 +855,11 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
+            accepted_step_limit_override=(
+                accepted_step_limit_override
+                if accepted_step_limit_override is not None
+                else _saved_payload_rollout_validation_accepted_step_limit()
+            ),
         )
     )
     return _radau_host_local_step_pullback_compare(
@@ -880,6 +898,7 @@ def _run_saved_payload_rollout_validation_for_parameter_vector(
             accepted_step_limit_override=accepted_step_limit_override,
         )
     )
+    max_total_steps = min(max_total_steps, _saved_payload_rollout_validation_max_total_steps())
     return _radau_validate_saved_payload_rollout_reverse(
         execution_context,
         initial_carry,
