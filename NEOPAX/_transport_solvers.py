@@ -5213,27 +5213,6 @@ def _radau_rebuild_checkpoint_carry(
     )
 
 
-def _radau_rebuild_checkpoint_carries(
-    checkpoint_traces: _RadauAcceptedStepReplayCheckpointTrace,
-    template_carry: _RadauAcceptedStepCarry,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-):
-    segment_count = int(jnp.asarray(checkpoint_traces.t).shape[0])
-
-    def _rebuild_one(i):
-        checkpoint_trace = jax.tree_util.tree_map(lambda x: x[i], checkpoint_traces)
-        return _radau_rebuild_checkpoint_carry(
-            checkpoint_trace,
-            template_carry,
-            physics_context,
-        )
-
-    return jax.lax.map(
-        _rebuild_one,
-        jnp.arange(segment_count, dtype=jnp.int32),
-    )
-
-
 def _radau_pack_replay_state(replay_state: _RadauReplayState):
     leaves = (
         jnp.ravel(jnp.asarray(replay_state.t)),
@@ -9070,11 +9049,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_easy_growth_streak,
         segmented_next_lagged_response_valid,
     )
-    checkpoint_carries = _radau_rebuild_checkpoint_carries(
-        checkpoint_traces,
-        carry0,
-        execution_context.physics_context,
-    )
 
     replay_output_mode = _radau_replay_output_diagnostic_mode()
     # Benchmark contract: differentiate the accepted-step composition only,
@@ -9095,6 +9069,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     def _reverse_segment(carry_bar, inputs):
         (
             segment_index,
+            checkpoint_trace,
             segment_active_mask,
             segment_full_active_mask,
             segment_full_accepted_mask,
@@ -9105,7 +9080,11 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         ) = inputs
-        checkpoint_carry = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_carries)
+        checkpoint_carry = _radau_rebuild_checkpoint_carry(
+            checkpoint_trace,
+            carry0,
+            execution_context.physics_context,
+        )
         _, carry_trace = _radau_replay_realized_accepted_carry_trace(
             execution_context,
             checkpoint_carry,
@@ -9222,22 +9201,23 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         return carry_before_bar, None
 
     n_segments = int(segmented_active_mask.shape[0])
+    rev_inputs = (
+        jnp.arange(n_segments - 1, -1, -1, dtype=jnp.int32),
+        jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), checkpoint_traces),
+        jnp.flip(segmented_active_mask, axis=0),
+        jnp.flip(segmented_full_active_mask, axis=0),
+        jnp.flip(segmented_full_accepted_mask, axis=0),
+        jnp.flip(segmented_attempted_dts, axis=0),
+        jnp.flip(segmented_next_dts, axis=0),
+        jnp.flip(segmented_next_recent_reject_count, axis=0),
+        jnp.flip(segmented_next_regrowth_cooldown, axis=0),
+        jnp.flip(segmented_next_easy_growth_streak, axis=0),
+        jnp.flip(segmented_next_lagged_response_valid, axis=0),
+    )
 
-    def _reverse_loop_body(i, carry_bar):
-        idx = n_segments - 1 - i
+    def _reverse_scan_body(carry_bar, inputs):
+        idx = inputs[0]
         carry_bar_y_before = jnp.asarray(carry_bar.y, dtype=execution_context.dtype)
-        inputs = (
-            idx,
-            segmented_active_mask[idx],
-            segmented_full_active_mask[idx],
-            segmented_full_accepted_mask[idx],
-            segmented_attempted_dts[idx],
-            segmented_next_dts[idx],
-            segmented_next_recent_reject_count[idx],
-            segmented_next_regrowth_cooldown[idx],
-            segmented_next_easy_growth_streak[idx],
-            segmented_next_lagged_response_valid[idx],
-        )
         carry_before_bar, _ = _reverse_segment(carry_bar, inputs)
         if replay_segment_diagnostic:
             carry_bar_y_after = jnp.asarray(carry_before_bar.y, dtype=execution_context.dtype)
@@ -9262,14 +9242,13 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 lambda _: jnp.asarray(0, dtype=jnp.int32),
                 operand=None,
             )
-        return carry_before_bar
+        return carry_before_bar, None
 
     if use_reduced_replay_debug_path:
-        replay_state0_bar = jax.lax.fori_loop(
-            0,
-            n_segments,
-            _reverse_loop_body,
+        replay_state0_bar, _ = jax.lax.scan(
+            _reverse_scan_body,
             final_replay_state_bar,
+            rev_inputs,
         )
         carry0_bar = _radau_replay_state_to_carry(
             replay_state0_bar,
@@ -9291,11 +9270,10 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         )
         return (carry0_bar,)
 
-    replay_state0_bar = jax.lax.fori_loop(
-        0,
-        n_segments,
-        _reverse_loop_body,
+    replay_state0_bar, _ = jax.lax.scan(
+        _reverse_scan_body,
         final_replay_state_bar,
+        rev_inputs,
     )
     carry0_bar = _radau_replay_state_to_carry(
         replay_state0_bar,
