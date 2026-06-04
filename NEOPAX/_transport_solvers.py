@@ -2380,14 +2380,6 @@ class _RadauAcceptedStepReplayCarryTrace:
     lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
-    jacobian: Any
-    cache_valid: Any
-    cache_dt: Any
-    cache_age: Any
-    real_lu: Any
-    real_piv: Any
-    complex_lu: Any
-    complex_piv: Any
 
 
 @jax.tree_util.register_dataclass
@@ -6853,6 +6845,14 @@ def _radau_replay_realized_accepted_carry_pullback(
     use_primal_step_diagnostic = _radau_replay_use_primal_step_diagnostic()
     replay_segment_detail_diagnostic = _radau_replay_segment_detail_diagnostic()
     replay_segment_diagnostic_max_index = _radau_replay_segment_diagnostic_max_index()
+    zero_jacobian_template = jnp.zeros_like(carry0.jacobian)
+    zero_cache_valid_template = jnp.zeros_like(carry0.cache_valid)
+    zero_cache_dt_template = jnp.zeros_like(carry0.cache_dt)
+    zero_cache_age_template = jnp.zeros_like(carry0.cache_age)
+    zero_real_lu_template = jnp.zeros_like(carry0.real_lu)
+    zero_real_piv_template = jnp.zeros_like(carry0.real_piv)
+    zero_complex_lu_template = jnp.zeros_like(carry0.complex_lu)
+    zero_complex_piv_template = jnp.zeros_like(carry0.complex_piv)
     xs = (
         jnp.arange(accepted_active_mask.shape[0], dtype=jnp.int32),
         accepted_active_mask,
@@ -6950,14 +6950,14 @@ def _radau_replay_realized_accepted_carry_pullback(
             lagged_response_cache=jax.tree_util.tree_map(lambda x: x[step_index], carry_trace.lagged_response_cache),
             lagged_response_valid=carry_trace.lagged_response_valid[step_index],
             lagged_reference_y=carry_trace.lagged_reference_y[step_index],
-            jacobian=carry_trace.jacobian[step_index],
-            cache_valid=carry_trace.cache_valid[step_index],
-            cache_dt=carry_trace.cache_dt[step_index],
-            cache_age=carry_trace.cache_age[step_index],
-            real_lu=carry_trace.real_lu[step_index],
-            real_piv=carry_trace.real_piv[step_index],
-            complex_lu=carry_trace.complex_lu[step_index],
-            complex_piv=carry_trace.complex_piv[step_index],
+            jacobian=zero_jacobian_template,
+            cache_valid=zero_cache_valid_template,
+            cache_dt=zero_cache_dt_template,
+            cache_age=zero_cache_age_template,
+            real_lu=zero_real_lu_template,
+            real_piv=zero_real_piv_template,
+            complex_lu=zero_complex_lu_template,
+            complex_piv=zero_complex_piv_template,
             prev_theta_final=carry_trace.prev_theta_final[step_index],
             prev_newton_iter_count=carry_trace.prev_newton_iter_count[step_index],
         )
@@ -7672,14 +7672,6 @@ def _radau_replay_realized_accepted_carry_trace(
             lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=carry.lagged_response_valid,
             lagged_reference_y=carry.lagged_reference_y,
-            jacobian=carry.jacobian,
-            cache_valid=carry.cache_valid,
-            cache_dt=carry.cache_dt,
-            cache_age=carry.cache_age,
-            real_lu=carry.real_lu,
-            real_piv=carry.real_piv,
-            complex_lu=carry.complex_lu,
-            complex_piv=carry.complex_piv,
         )
 
     def _scan_body(carry, xs):
