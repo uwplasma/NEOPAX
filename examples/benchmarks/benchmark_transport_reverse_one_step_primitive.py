@@ -177,7 +177,7 @@ def _compute_one_step_metrics(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark the one-step accepted-step primitive reverse adapter against the legacy local pullback."
+        description="Benchmark the one-step accepted-step primitive reverse rule against the legacy local pullback."
     )
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
     parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")

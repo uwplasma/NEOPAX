@@ -519,7 +519,92 @@ def _make_solver_state_transform(
         flat_projected, _ = jax.flatten_util.ravel_pytree(projected_packed)
         return flat_projected
 
-    return flat_state0, unpack_flat, unpack_packed, pack_state, project_flat
+    def project_flat_pullback(flat_y, flat_bar):
+        if project_flat is None:
+            return flat_bar
+
+        packed_state_like = unravel_packed(flat_y)
+        packed_bar_like = unravel_packed(flat_bar)
+        if not (isinstance(packed_state_like, tuple) and len(packed_state_like) == 3):
+            return flat_bar
+
+        density, pressure, er = packed_state_like
+        density_bar_out, pressure_bar_out, er_bar_out = packed_bar_like
+        from ._state import safe_density, safe_temperature
+
+        density_arr = jnp.asarray(density)
+        pressure_arr = jnp.asarray(pressure)
+        density_bar = jnp.asarray(density_bar_out)
+        pressure_bar = jnp.asarray(pressure_bar_out)
+        er_bar = jnp.asarray(er_bar_out)
+
+        packed_density = safe_density(density_arr, density_floor)
+        eidx = _electron_density_index(species)
+        if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
+            full_shape = pressure_arr.shape[:-2] + (template_state.density.shape[0], pressure_arr.shape[-1])
+            full_density = jnp.zeros(full_shape, dtype=pressure_arr.dtype)
+            full_density = full_density.at[..., :eidx, :].set(packed_density[..., :eidx, :])
+            full_density = full_density.at[..., eidx + 1 :, :].set(packed_density[..., eidx:, :])
+            charge_qp = jnp.asarray(species.charge_qp, dtype=pressure_arr.dtype)
+            ion_indices = jnp.asarray(getattr(species, "ion_indices", ()), dtype=jnp.int32)
+            if ion_indices.size > 0:
+                Z_i = jnp.take(charge_qp, ion_indices, axis=0)
+                n_i = jnp.take(full_density, ion_indices, axis=-2)
+                n_e = -jnp.sum(Z_i[..., None] * n_i, axis=-2) / charge_qp[int(eidx)]
+                full_density = full_density.at[..., int(eidx), :].set(n_e)
+        else:
+            full_density = packed_density
+
+        floored_density = safe_density(full_density, density_floor)
+        projected_pressure_pre = pressure_arr
+
+        floored_density_bar = jnp.zeros_like(floored_density)
+        projected_pressure_pre_bar = pressure_bar
+        if temperature_floor is not None:
+            projected_temperature_pre = projected_pressure_pre / floored_density
+            temp_floor_arr = _broadcast_species_floor(projected_temperature_pre, temperature_floor)
+            active_temp_mask = projected_temperature_pre > temp_floor_arr
+            floored_density_bar = floored_density_bar + jnp.where(active_temp_mask, 0.0, pressure_bar * temp_floor_arr)
+            projected_pressure_pre_bar = jnp.where(active_temp_mask, pressure_bar, 0.0)
+
+        if temperature_active_mask is not None and fixed_temperature_profile is not None:
+            active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
+            fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure_arr.dtype)
+            active_mask = active_mask.reshape((1,) * (pressure_arr.ndim - 2) + (active_mask.shape[0], 1))
+            fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure_arr.shape)
+            floored_density_bar = floored_density_bar + jnp.where(active_mask, 0.0, projected_pressure_pre_bar * fixed_temperature)
+            pressure_in_bar = jnp.where(active_mask, projected_pressure_pre_bar, 0.0)
+        else:
+            pressure_in_bar = projected_pressure_pre_bar
+
+        full_floor_arr = _broadcast_species_floor(full_density, density_floor)
+        active_full_density_mask = full_density > full_floor_arr
+        full_density_bar = floored_density_bar * active_full_density_mask.astype(floored_density_bar.dtype)
+
+        if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
+            packed_density_bar_from_full = jnp.zeros_like(packed_density)
+            packed_density_bar_from_full = packed_density_bar_from_full.at[..., :eidx, :].add(full_density_bar[..., :eidx, :])
+            packed_density_bar_from_full = packed_density_bar_from_full.at[..., eidx:, :].add(full_density_bar[..., eidx + 1 :, :])
+            charge_qp = jnp.asarray(species.charge_qp, dtype=pressure_arr.dtype)
+            ion_indices = jnp.asarray(getattr(species, "ion_indices", ()), dtype=jnp.int32)
+            if ion_indices.size > 0:
+                Z_i = jnp.take(charge_qp, ion_indices, axis=0)
+                electron_bar = full_density_bar[..., int(eidx), :]
+                packed_density_bar_from_full = packed_density_bar_from_full.at[..., ion_indices, :].add(
+                    electron_bar[..., None, :] * (-Z_i[..., None] / charge_qp[int(eidx)])
+                )
+        else:
+            packed_density_bar_from_full = full_density_bar
+
+        packed_density_bar_total = density_bar + packed_density_bar_from_full
+        packed_floor_arr = _broadcast_species_floor(density_arr, density_floor)
+        active_packed_density_mask = density_arr > packed_floor_arr
+        density_in_bar = packed_density_bar_total * active_packed_density_mask.astype(packed_density_bar_total.dtype)
+
+        flat_in_bar, _ = jax.flatten_util.ravel_pytree((density_in_bar, pressure_in_bar, er_bar))
+        return flat_in_bar
+
+    return flat_state0, unpack_flat, unpack_packed, pack_state, project_flat, project_flat_pullback
 
 
 def _get_diffrax_integrator(name: str) -> Callable:
@@ -579,7 +664,7 @@ class DiffraxSolver(TransportSolver):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -842,12 +927,13 @@ def _flat_rhs_factory(unravel, vector_field, args, kwargs, project_flat=None):
 def _lagged_response_hooks(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
-        return None, None
+        return None, None, None
     build_fn = getattr(owner, "build_lagged_response", None)
     eval_fn = getattr(owner, "evaluate_with_lagged_response", None)
+    build_pullback_fn = getattr(owner, "pullback_build_lagged_response", None)
     if callable(build_fn) and callable(eval_fn):
-        return build_fn, eval_fn
-    return None, None
+        return build_fn, eval_fn, build_pullback_fn if callable(build_pullback_fn) else None
+    return None, None, None
 
 
 def _shared_fluxes_hook(vector_field: Callable):
@@ -872,7 +958,7 @@ def _shared_fluxes_pullback_hook(vector_field: Callable):
 
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
-    _, eval_fn = _lagged_response_hooks(vector_field)
+    _, eval_fn, _ = _lagged_response_hooks(vector_field)
 
     def _flat_rhs(t_value, flat_y, lagged_response):
         projected_flat_y = _project_flat_state_if_needed(
@@ -3048,7 +3134,9 @@ class _RadauAcceptedStepKernelContext:
 class _RadauAcceptedStepPhysicsContext:
     unpack_flat: Callable[[Any], Any]
     project_flat: Callable[[Any], Any] | None
+    project_flat_pullback: Callable[[Any, Any], Any] | None
     build_lagged_response: Callable[[Any], Any] | None
+    build_lagged_response_pullback: Callable[[Any, Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
     flat_rhs_with_shared_fluxes: Callable[[Any, Any, Any], Any] | None
@@ -3539,11 +3627,17 @@ def _radau_accepted_step_y_pullback_linearized(
     if physics_context.project_flat is None:
         trial_y_bar = accepted_y_bar
     else:
-        _, project_pullback = jax.vjp(
-            lambda flat_y: _project_flat_state_if_needed(flat_y, physics_context.project_flat),
-            primal_result.trial_y,
-        )
-        (trial_y_bar,) = project_pullback(accepted_y_bar)
+        if physics_context.project_flat_pullback is None:
+            _, project_pullback = jax.vjp(
+                lambda flat_y: _project_flat_state_if_needed(flat_y, physics_context.project_flat),
+                primal_result.trial_y,
+            )
+            (trial_y_bar,) = project_pullback(accepted_y_bar)
+        else:
+            trial_y_bar = physics_context.project_flat_pullback(
+                primal_result.trial_y,
+                accepted_y_bar,
+            )
 
     stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_weighted = kernel_context.b @ stages_final
@@ -4804,28 +4898,26 @@ def _radau_accepted_step_primitive_pullback(
         dtype=kernel_context.dtype,
     )
     if physics_context.build_lagged_response is not None:
-        stage_eval_from_lagged = _radau_stage_evals_from_lagged_factory(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-        )
-
-        def _stage_evals_from_flat(flat_y_source):
-            candidate_state = physics_context.unpack_flat(
-                _project_flat_state_if_needed(flat_y_source, physics_context.project_flat)
-            )
-            lagged_response_value = physics_context.build_lagged_response(candidate_state)
-            return stage_eval_from_lagged(lagged_response_value)
-
         def _reuse_case(_):
-            _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.lagged_reference_y)
-            (lagged_reference_y_extra_bar,) = source_pullback(stage_rhs_bar)
+            if physics_context.build_lagged_response_pullback is None:
+                lagged_reference_y_extra_bar = _radau_zero_cotangent_like(
+                    carry_in.lagged_reference_y
+                )
+            else:
+                lagged_reference_y_extra_bar = physics_context.build_lagged_response_pullback(
+                    carry_in.lagged_reference_y,
+                    _lagged_response_cache_bar,
+                )
             return lagged_reference_y_direct_bar + lagged_reference_y_extra_bar, jnp.zeros_like(carry_in.y)
 
         def _rebuild_case(_):
-            _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.y)
-            (y_from_lagged_bar,) = source_pullback(stage_rhs_bar)
+            if physics_context.build_lagged_response_pullback is None:
+                y_from_lagged_bar = jnp.zeros_like(carry_in.y)
+            else:
+                y_from_lagged_bar = physics_context.build_lagged_response_pullback(
+                    carry_in.y,
+                    _lagged_response_cache_bar,
+                )
             return _radau_zero_cotangent_like(carry_in.lagged_reference_y), y_from_lagged_bar + lagged_reference_y_direct_bar
 
         lagged_reference_y_in_bar, dy_extra = jax.lax.cond(
@@ -10403,7 +10495,7 @@ def _build_prepared_radau_accepted_rollout(
     kwargs: dict[str, Any] = {}
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
     density_floor, temperature_floor = _extract_state_regularization(vector_field)
-    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, project_flat_pullback = _make_solver_state_transform(
         state,
         species,
         temperature_active_mask=temperature_active_mask,
@@ -10467,7 +10559,7 @@ def _build_prepared_radau_accepted_rollout(
         error_scale_mode = "max"
 
     flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
-    build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+    build_lagged_response_raw, _, build_lagged_response_pullback_raw = _lagged_response_hooks(vector_field)
     flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -10491,6 +10583,41 @@ def _build_prepared_radau_accepted_rollout(
     build_lagged_response = build_lagged_response_raw
     flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
     flat_rhs_with_shared_fluxes = flat_rhs_with_shared_fluxes_raw
+
+    def _build_lagged_response_from_flat(flat_y_source):
+        candidate_state = unpack_flat(
+            _project_flat_state_if_needed(flat_y_source, project_flat)
+        )
+        return build_lagged_response(candidate_state)
+
+    if build_lagged_response is None:
+        build_lagged_response_pullback = None
+    else:
+        def build_lagged_response_pullback(flat_y_source, lagged_response_bar):
+            if build_lagged_response_pullback_raw is None:
+                _, source_pullback = jax.vjp(
+                    _build_lagged_response_from_flat,
+                    flat_y_source,
+                )
+                (flat_bar,) = source_pullback(lagged_response_bar)
+                return flat_bar
+
+            candidate_state = unpack_flat(
+                _project_flat_state_if_needed(flat_y_source, project_flat)
+            )
+            state_bar = build_lagged_response_pullback_raw(
+                candidate_state,
+                lagged_response_bar,
+            )
+            _, state_pullback = jax.vjp(
+                lambda flat_y_value: unpack_flat(
+                    _project_flat_state_if_needed(flat_y_value, project_flat)
+                ),
+                flat_y_source,
+            )
+            (flat_bar,) = state_pullback(state_bar)
+            return flat_bar
+
     initial_lagged_response = (
         build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
         if (use_transport_lagged_response and build_lagged_response is not None)
@@ -10618,7 +10745,9 @@ def _build_prepared_radau_accepted_rollout(
     physics_context = _RadauAcceptedStepPhysicsContext(
         unpack_flat=unpack_flat,
         project_flat=project_flat,
+        project_flat_pullback=project_flat_pullback,
         build_lagged_response=build_lagged_response,
+        build_lagged_response_pullback=build_lagged_response_pullback,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         flat_rhs_with_shared_fluxes=flat_rhs_with_shared_fluxes,
@@ -10692,7 +10821,7 @@ class RADAUSolver(_RadauSolverConfig):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -10743,7 +10872,7 @@ class RADAUSolver(_RadauSolverConfig):
             else "max"
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
-        build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+        build_lagged_response_raw, _, build_lagged_response_pullback_raw = _lagged_response_hooks(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
@@ -10772,6 +10901,36 @@ class RADAUSolver(_RadauSolverConfig):
                 "build_lagged_response(...) and evaluate_with_lagged_response(...)."
             )
         build_lagged_response = build_lagged_response_raw
+        if build_lagged_response is None:
+            build_lagged_response_pullback = None
+        else:
+            def build_lagged_response_pullback(flat_y_source, lagged_response_bar):
+                def _build_from_flat(flat_y_value):
+                    candidate_state = unpack_flat(
+                        _project_flat_state_if_needed(flat_y_value, project_flat)
+                    )
+                    return build_lagged_response(candidate_state)
+
+                if build_lagged_response_pullback_raw is None:
+                    _, source_pullback = jax.vjp(_build_from_flat, flat_y_source)
+                    (flat_bar,) = source_pullback(lagged_response_bar)
+                    return flat_bar
+
+                candidate_state = unpack_flat(
+                    _project_flat_state_if_needed(flat_y_source, project_flat)
+                )
+                state_bar = build_lagged_response_pullback_raw(
+                    candidate_state,
+                    lagged_response_bar,
+                )
+                _, state_pullback = jax.vjp(
+                    lambda flat_y_value: unpack_flat(
+                        _project_flat_state_if_needed(flat_y_value, project_flat)
+                    ),
+                    flat_y_source,
+                )
+                (flat_bar,) = state_pullback(state_bar)
+                return flat_bar
         flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
         flat_rhs_with_shared_fluxes = flat_rhs_with_shared_fluxes_raw
         initial_lagged_response = (
@@ -10915,7 +11074,9 @@ class RADAUSolver(_RadauSolverConfig):
         physics_context = _RadauAcceptedStepPhysicsContext(
             unpack_flat=unpack_flat,
             project_flat=project_flat,
+            project_flat_pullback=_project_flat_pullback,
             build_lagged_response=build_lagged_response,
+            build_lagged_response_pullback=build_lagged_response_pullback,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             flat_rhs_with_shared_fluxes=flat_rhs_with_shared_fluxes,
@@ -11839,7 +12000,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -11857,7 +12018,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
-        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        build_lagged_response, _, _build_lagged_response_pullback = _lagged_response_hooks(vector_field)
         flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
@@ -12214,7 +12375,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -12234,7 +12395,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
         state_dim = flat_state0.shape[0]
         identity_n = jnp.eye(state_dim, dtype=dtype)
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
-        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        build_lagged_response, _, _build_lagged_response_pullback = _lagged_response_hooks(vector_field)
         flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
             vector_field=vector_field,

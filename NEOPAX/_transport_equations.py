@@ -1305,6 +1305,11 @@ class ComposedEquationSystem:
             flux_response=flux_response,
         )
 
+    def pullback_build_lagged_response(self, state, lagged_response_bar):
+        _, pullback = jax.vjp(self.build_lagged_response, state)
+        (state_bar,) = pullback(lagged_response_bar)
+        return state_bar
+
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
