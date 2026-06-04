@@ -2383,6 +2383,20 @@ class _RadauAcceptedStepReplayCarryTrace:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepReplayCheckpointTrace:
+    t: Any
+    y: Any
+    dt: Any
+    prev_stages: Any
+    prev_dt: Any
+    prev_theta_final: Any
+    prev_newton_iter_count: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepAttemptContext:
     t_final: Any
     use_transport_lagged_response: Any
@@ -5136,6 +5150,69 @@ def _radau_replay_state_to_carry(
     )
 
 
+def _radau_checkpoint_trace_from_carry(
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepReplayCheckpointTrace:
+    return _RadauAcceptedStepReplayCheckpointTrace(
+        t=carry.t,
+        y=carry.y,
+        dt=carry.dt,
+        prev_stages=carry.prev_stages,
+        prev_dt=carry.prev_dt,
+        prev_theta_final=carry.prev_theta_final,
+        prev_newton_iter_count=carry.prev_newton_iter_count,
+        lagged_response_valid=carry.lagged_response_valid,
+        lagged_reference_y=carry.lagged_reference_y,
+    )
+
+
+def _radau_rebuild_checkpoint_carry(
+    checkpoint_trace: _RadauAcceptedStepReplayCheckpointTrace,
+    template_carry: _RadauAcceptedStepCarry,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+):
+    if physics_context.build_lagged_response is None:
+        lagged_response_cache_value = template_carry.lagged_response_cache
+    else:
+        def _build_lagged_cache_from_flat(flat_y):
+            candidate_state = physics_context.unpack_flat(
+                _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+            )
+            return physics_context.build_lagged_response(candidate_state)
+
+        lagged_response_cache_value = jax.lax.cond(
+            checkpoint_trace.lagged_response_valid,
+            lambda _: _build_lagged_cache_from_flat(checkpoint_trace.lagged_reference_y),
+            lambda _: _build_lagged_cache_from_flat(checkpoint_trace.y),
+            operand=None,
+        )
+
+    return _RadauAcceptedStepCarry(
+        t=checkpoint_trace.t,
+        y=checkpoint_trace.y,
+        dt=checkpoint_trace.dt,
+        prev_error=jnp.zeros_like(template_carry.prev_error),
+        prev_stages=checkpoint_trace.prev_stages,
+        prev_dt=checkpoint_trace.prev_dt,
+        recent_reject_count=jnp.zeros_like(template_carry.recent_reject_count),
+        regrowth_cooldown=jnp.zeros_like(template_carry.regrowth_cooldown),
+        easy_growth_streak=jnp.zeros_like(template_carry.easy_growth_streak),
+        lagged_response_cache=lagged_response_cache_value,
+        lagged_response_valid=checkpoint_trace.lagged_response_valid,
+        lagged_reference_y=checkpoint_trace.lagged_reference_y,
+        jacobian=jnp.zeros_like(template_carry.jacobian),
+        cache_valid=jnp.zeros_like(template_carry.cache_valid),
+        cache_dt=jnp.zeros_like(template_carry.cache_dt),
+        cache_age=jnp.zeros_like(template_carry.cache_age),
+        real_lu=jnp.zeros_like(template_carry.real_lu),
+        real_piv=jnp.zeros_like(template_carry.real_piv),
+        complex_lu=jnp.zeros_like(template_carry.complex_lu),
+        complex_piv=jnp.zeros_like(template_carry.complex_piv),
+        prev_theta_final=checkpoint_trace.prev_theta_final,
+        prev_newton_iter_count=checkpoint_trace.prev_newton_iter_count,
+    )
+
+
 def _radau_pack_replay_state(replay_state: _RadauReplayState):
     leaves = (
         jnp.ravel(jnp.asarray(replay_state.t)),
@@ -7765,15 +7842,15 @@ def _radau_replay_realized_attempt_checkpoint_carries(
     segmented_next_lagged_response_valid,
 ):
     def _segment_body(carry, segment_xs):
-        checkpoint_carry = carry
+        checkpoint_trace = _radau_checkpoint_trace_from_carry(carry)
         next_carry = _radau_replay_realized_attempt_final_carry(
             execution_context,
             carry,
             *segment_xs,
         )
-        return next_carry, checkpoint_carry
+        return next_carry, checkpoint_trace
 
-    _, checkpoint_carries = jax.lax.scan(
+    _, checkpoint_traces = jax.lax.scan(
         _segment_body,
         carry0,
         (
@@ -7787,7 +7864,7 @@ def _radau_replay_realized_attempt_checkpoint_carries(
             segmented_next_lagged_response_valid,
         ),
     )
-    return checkpoint_carries
+    return checkpoint_traces
 
 
 
@@ -8960,7 +9037,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         segmented_next_lagged_response_valid = jax.device_put(segmented_next_lagged_response_valid, reverse_device)
         final_y_bar = jax.device_put(final_y_bar, reverse_device)
 
-    checkpoint_carries = _radau_replay_realized_attempt_checkpoint_carries(
+    checkpoint_traces = _radau_replay_realized_attempt_checkpoint_carries(
         execution_context,
         carry0,
         segmented_full_active_mask,
@@ -9002,7 +9079,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_next_easy_growth_streak,
             segment_next_lagged_response_valid,
         ) = inputs
-        checkpoint_carry = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_carries)
+        checkpoint_trace = jax.tree_util.tree_map(lambda x: x[segment_index], checkpoint_traces)
+        checkpoint_carry = _radau_rebuild_checkpoint_carry(
+            checkpoint_trace,
+            carry0,
+            execution_context.physics_context,
+        )
         _, carry_trace = _radau_replay_realized_accepted_carry_trace(
             execution_context,
             checkpoint_carry,
