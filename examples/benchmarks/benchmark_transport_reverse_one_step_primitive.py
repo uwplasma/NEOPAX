@@ -90,6 +90,7 @@ def _compute_one_step_metrics(
     initial_carry,
     *,
     bar_mode: str,
+    execution_mode: str,
 ):
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
@@ -149,17 +150,24 @@ def _compute_one_step_metrics(
             ),
         }
 
-    compare_jit = jax.jit(_compare_fn)
+    if execution_mode == "jit":
+        compare_fn = jax.jit(_compare_fn)
+        t0 = time.perf_counter()
+        first = compare_fn(initial_carry)
+        jax.block_until_ready(first["diff_l2"])
+        compile_plus_execute_s = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
-    first = compare_jit(initial_carry)
-    jax.block_until_ready(first["diff_l2"])
-    compile_plus_execute_s = time.perf_counter() - t0
-
-    t1 = time.perf_counter()
-    second = compare_jit(initial_carry)
-    jax.block_until_ready(second["diff_l2"])
-    execute_s = time.perf_counter() - t1
+        t1 = time.perf_counter()
+        second = compare_fn(initial_carry)
+        jax.block_until_ready(second["diff_l2"])
+        execute_s = time.perf_counter() - t1
+    else:
+        t0 = time.perf_counter()
+        with jax.disable_jit():
+            second = _compare_fn(initial_carry)
+        jax.block_until_ready(second["diff_l2"])
+        execute_s = time.perf_counter() - t0
+        compile_plus_execute_s = execute_s
 
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
@@ -196,6 +204,12 @@ def main() -> None:
         choices=("y-only", "all-ones"),
         help="Cotangent pattern used for the local reduced-output pullback comparison.",
     )
+    parser.add_argument(
+        "--execution-mode",
+        default="eager",
+        choices=("eager", "jit"),
+        help="Run the one-step comparison eagerly or under JIT. Default: eager.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -224,6 +238,7 @@ def main() -> None:
         execution_context,
         initial_carry,
         bar_mode=args.bar_mode,
+        execution_mode=args.execution_mode,
     )
 
     report = {
@@ -234,6 +249,7 @@ def main() -> None:
         "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
         "accepted_step_limit": int(args.accepted_step_limit),
         "bar_mode": args.bar_mode,
+        "execution_mode": args.execution_mode,
         "result": result,
     }
 
@@ -242,7 +258,10 @@ def main() -> None:
 
     print("[autodiff-gate] mode=transport_reverse_one_step_primitive")
     print(f"[autodiff-gate] parameters={list(parameter_names)}")
-    print(f"[autodiff-gate] bar_mode={args.bar_mode} accepted_step_limit={int(args.accepted_step_limit)}")
+    print(
+        f"[autodiff-gate] bar_mode={args.bar_mode} "
+        f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode}"
+    )
     for key, value in result.items():
         if isinstance(value, bool):
             print(f"  - {key}: {value}")

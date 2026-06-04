@@ -4738,27 +4738,120 @@ def _radau_accepted_step_primitive_pullback(
     reverse_payload: _RadauAcceptedStepReversePayload,
     reduced_output_bar: _RadauAcceptedStepReducedOutput,
 ) -> _RadauAcceptedStepReducedOutput:
-    """Temporary primitive-level reverse adapter.
-
-    This currently routes through the existing replay-state local pullback using
-    an explicit primitive payload. It preserves behavior while moving the new
-    reverse lane toward a payload-driven accepted-step primitive.
-    """
+    """Primitive-level pullback for the accepted-step reduced-output map."""
     carry_in = _radau_carry_from_reverse_payload(
         reverse_payload,
         template_carry,
         physics_context,
     )
-    replay_state_bar = _radau_reduced_output_bar_to_replay_state_bar(reduced_output_bar)
-    carry_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
+    primal_result = _execute_radau_accepted_step_attempt(
         kernel_context,
         physics_context,
         carry_in,
         attempt_context,
-        replay_state_bar,
     )
-    replay_state_in_bar = _radau_replay_state_from_carry(carry_bar)
-    return _radau_reduced_output_from_replay_state_bar(replay_state_in_bar)
+    zero_lagged_cache_tangent = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
+
+    accepted_y_bar = jnp.asarray(reduced_output_bar.y_out, dtype=kernel_context.dtype)
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval_at_state(t_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            carry_in.y,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
+    dy_bar, dh_bar, dt_in_bar, _lagged_response_cache_bar, stage_rhs_bar = _radau_accepted_step_y_pullback_linearized(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        accepted_y_bar,
+        lagged_response,
+        rhs_time_ref,
+        zero_lagged_cache_tangent=zero_lagged_cache_tangent,
+        return_stage_rhs_bar=True,
+    )
+
+    t_in_bar = (
+        jnp.asarray(reduced_output_bar.t_out, dtype=kernel_context.dtype)
+        + jnp.asarray(dt_in_bar, dtype=kernel_context.dtype)
+    )
+    dt_total_bar = (
+        jnp.asarray(dh_bar, dtype=kernel_context.dtype)
+        + jnp.asarray(reduced_output_bar.dt_out, dtype=kernel_context.dtype)
+        + jnp.asarray(reduced_output_bar.prev_dt_out, dtype=kernel_context.dtype)
+    )
+
+    prev_stages_out_bar = jnp.asarray(
+        reduced_output_bar.prev_stages_out,
+        dtype=kernel_context.dtype,
+    ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_history_bar = stage_rhs_bar + prev_stages_out_bar
+
+    lagged_reference_y_direct_bar = jnp.asarray(
+        reduced_output_bar.lagged_reference_y_out,
+        dtype=kernel_context.dtype,
+    )
+    if physics_context.build_lagged_response is not None:
+        stage_eval_from_lagged = _radau_stage_evals_from_lagged_factory(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+        )
+
+        def _stage_evals_from_flat(flat_y_source):
+            candidate_state = physics_context.unpack_flat(
+                _project_flat_state_if_needed(flat_y_source, physics_context.project_flat)
+            )
+            lagged_response_value = physics_context.build_lagged_response(candidate_state)
+            return stage_eval_from_lagged(lagged_response_value)
+
+        def _reuse_case(_):
+            _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.lagged_reference_y)
+            (lagged_reference_y_extra_bar,) = source_pullback(stage_rhs_bar)
+            return lagged_reference_y_direct_bar + lagged_reference_y_extra_bar, jnp.zeros_like(carry_in.y)
+
+        def _rebuild_case(_):
+            _, source_pullback = jax.vjp(_stage_evals_from_flat, carry_in.y)
+            (y_from_lagged_bar,) = source_pullback(stage_rhs_bar)
+            return _radau_zero_cotangent_like(carry_in.lagged_reference_y), y_from_lagged_bar + lagged_reference_y_direct_bar
+
+        lagged_reference_y_in_bar, dy_extra = jax.lax.cond(
+            carry_in.lagged_response_valid,
+            _reuse_case,
+            _rebuild_case,
+            operand=None,
+        )
+        dy_bar = dy_bar + dy_extra
+    else:
+        lagged_reference_y_in_bar = lagged_reference_y_direct_bar
+
+    prev_theta_final_in_bar = jnp.asarray(
+        reduced_output_bar.prev_theta_final_out,
+        dtype=kernel_context.dtype,
+    )
+
+    return _RadauAcceptedStepReducedOutput(
+        t_out=t_in_bar,
+        y_out=jnp.asarray(dy_bar, dtype=kernel_context.dtype),
+        dt_out=jnp.asarray(dt_total_bar, dtype=kernel_context.dtype),
+        prev_stages_out=jnp.asarray(stage_history_bar.reshape((-1,)), dtype=kernel_context.dtype),
+        prev_dt_out=jnp.asarray(dt_total_bar, dtype=kernel_context.dtype),
+        lagged_reference_y_out=jnp.asarray(lagged_reference_y_in_bar, dtype=kernel_context.dtype),
+        prev_theta_final_out=prev_theta_final_in_bar,
+    )
 
 
 def _radau_validate_accepted_step_primitive_pullback_adapter(

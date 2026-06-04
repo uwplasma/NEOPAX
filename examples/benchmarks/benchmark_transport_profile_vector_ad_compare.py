@@ -89,7 +89,7 @@ def _print_summary(report: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare multi-parameter forward custom-JVP columns against a reverse custom-VJP Jacobian."
+        description="Compare multi-parameter forward custom-JVP columns against a reverse Jacobian."
     )
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
     parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")
@@ -103,7 +103,7 @@ def main() -> None:
         "--ad-mode",
         default="both",
         choices=("both", "forward", "reverse"),
-        help="Run forward columns, reverse rows, or both.",
+        help="Run forward columns, reverse rows, or both. Reverse is currently unavailable during the option-4 refactor.",
     )
     parser.add_argument(
         "--reverse-replay-device",
@@ -122,6 +122,12 @@ def main() -> None:
         help="Optional comma-separated subset of objective row indices to run in reverse mode.",
     )
     args = parser.parse_args()
+    if args.ad_mode in ("both", "reverse"):
+        raise NotImplementedError(
+            "Legacy reverse benchmark path has been removed. "
+            "The new option-4 accepted-step reverse is not wired into this CLI yet. "
+            "Use --ad-mode forward or the dedicated one-step primitive benchmark."
+        )
     os.environ["NEOPAX_TRANSPORT_REVERSE_REPLAY_DEVICE"] = str(args.reverse_replay_device)
     parameter_names = _parse_parameter_subset(args.parameters)
     objective_indices = (
@@ -162,16 +168,6 @@ def main() -> None:
         parameter_names=parameter_names,
         derivative_mode="jvp",
     )
-    objective_fn_vjp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_names=parameter_names,
-        derivative_mode="vjp",
-    )
-
     jac_fwd = None
     jac_rev = None
     n_params = len(parameter_names)
@@ -191,34 +187,6 @@ def main() -> None:
             tangent_arr = tangent_arr[np.asarray(objective_indices, dtype=int)]
             fwd_columns.append(tangent_arr)
         jac_fwd = np.stack(fwd_columns, axis=1)
-
-    if args.ad_mode in ("both", "reverse"):
-        print("[autodiff-gate] progress: running reverse custom-VJP Jacobian", flush=True)
-        print(
-            f"[autodiff-gate] progress: reverse replay device={args.reverse_replay_device}",
-            flush=True,
-        )
-        rev_rows = []
-        n_objectives = int(len(objective_indices))
-        for row_pos, idx in enumerate(objective_indices):
-            print(
-                f"[autodiff-gate] progress: running reverse custom-VJP row {row_pos + 1}/{n_objectives} (objective_index={idx})",
-                flush=True,
-            )
-
-            def scalar_objective(p, *, output_index=idx):
-                return _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
-                    p,
-                    config=config,
-                    runtime=runtime,
-                    baseline_state=baseline_state,
-                    profile_cfg=profile_cfg,
-                    parameter_names=parameter_names,
-                    derivative_mode="vjp",
-                )[output_index]
-
-            rev_rows.append(np.asarray(jax.device_get(jax.grad(scalar_objective)(baseline_vector)), dtype=float))
-        jac_rev = np.stack(rev_rows, axis=0)
 
     if jac_fwd is not None and jac_rev is not None:
         abs_err = np.abs(jac_fwd - jac_rev)

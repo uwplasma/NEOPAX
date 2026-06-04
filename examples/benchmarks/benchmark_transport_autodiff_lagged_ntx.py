@@ -58,10 +58,7 @@ from NEOPAX._transport_solvers import (
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
-    _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_apply_accepted_step_map,
-    _radau_apply_accepted_step_replay_state_pullback_linearized,
-    _radau_accepted_step_y_tangent_from_primal_linearized,
     _radau_carry_from_step_state,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
@@ -70,9 +67,7 @@ from NEOPAX._transport_solvers import (
     _radau_eval_rhs,
     _radau_extract_tangent_inputs_from_carry,
     _radau_prepare_lagged_response,
-    _radau_replay_state_from_carry,
     _radau_stage_residual,
-    _radau_validate_saved_payload_rollout_reverse,
     _execute_radau_accepted_step_attempt,
     _execute_radau_accepted_step_attempt_autodiff,
     _build_prepared_radau_execution_context,
@@ -508,11 +503,9 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
             initial_carry,
         )
     elif derivative_mode_key == "vjp":
-        final_y = _radau_adaptive_final_y_realized_schedule_vjp(
-            execution_context,
-            max_total_steps,
-            stop_after_accepted_steps,
-            initial_carry,
+        raise NotImplementedError(
+            "Legacy rollout reverse machinery has been removed from this benchmark path. "
+            "The new option-4 accepted-step reverse is not wired here yet."
         )
     else:
         raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
@@ -740,28 +733,6 @@ def _host_step_pullback_diagnostic_enabled() -> bool:
         return False
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
-
-def _saved_payload_rollout_validation_enabled() -> bool:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE")
-    if raw_value is None:
-        return False
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _saved_payload_rollout_validation_accepted_step_limit() -> int:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE_ACCEPTED_STEPS")
-    if raw_value is None:
-        return 1
-    return max(1, int(raw_value))
-
-
-def _saved_payload_rollout_validation_max_total_steps() -> int:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_SAVED_PAYLOAD_ROLLOUT_VALIDATE_MAX_TOTAL_STEPS")
-    if raw_value is None:
-        return 8
-    return max(1, int(raw_value))
-
-
 def _step_pullback_segment_index() -> int:
     raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
     if raw_value is None:
@@ -855,11 +826,7 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
-            accepted_step_limit_override=(
-                accepted_step_limit_override
-                if accepted_step_limit_override is not None
-                else _saved_payload_rollout_validation_accepted_step_limit()
-            ),
+            accepted_step_limit_override=accepted_step_limit_override,
         )
     )
     return _radau_host_local_step_pullback_compare(
@@ -876,273 +843,6 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
         replay_primal_override=replay_primal_override,
     )
 
-
-def _run_saved_payload_rollout_validation_for_parameter_vector(
-    parameter_values,
-    *,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
-    accepted_step_limit_override: int | None = None,
-):
-    execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
-        _prepare_realized_schedule_profile_vector_rollout_option_a(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-    )
-    max_total_steps = min(max_total_steps, _saved_payload_rollout_validation_max_total_steps())
-    return _radau_validate_saved_payload_rollout_reverse(
-        execution_context,
-        initial_carry,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
-    )
-
-
-def _zero_optional_pytree(tree):
-    if tree is None:
-        return None
-    return jax.tree_util.tree_map(
-        lambda x: None if x is None else jnp.zeros_like(x),
-        tree,
-        is_leaf=lambda x: x is None,
-    )
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
-def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(
-    parameter_values,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_names: tuple[str, ...],
-    accepted_step_limit_override: int | None,
-):
-    execution_context, prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
-        _prepare_realized_schedule_profile_vector_rollout_option_a(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-    )
-    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        initial_carry,
-    )
-    return _objective_vector_from_final_y(final_y, prepared_rollout=prepared_rollout, runtime=runtime)
-
-
-def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_fwd(
-    parameter_values,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_names: tuple[str, ...],
-    accepted_step_limit_override: int | None,
-):
-    execution_context, prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
-        _prepare_realized_schedule_profile_vector_rollout_option_a(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-    )
-    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        initial_carry,
-    )
-    objectives = _objective_vector_from_final_y(final_y, prepared_rollout=prepared_rollout, runtime=runtime)
-    return objectives, (jnp.asarray(parameter_values, dtype=jnp.float64), final_y)
-
-
-def _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd(
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_names: tuple[str, ...],
-    accepted_step_limit_override: int | None,
-    residuals,
-    objective_bar,
-):
-    parameter_values, final_y = residuals
-    execution_context, prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, solver, solve_vector_field = (
-        _prepare_realized_schedule_profile_vector_rollout_option_a(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-    )
-
-    def _objective_from_final_y(y_value):
-        return _objective_vector_from_final_y(y_value, prepared_rollout=prepared_rollout, runtime=runtime)
-
-    _, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
-    (final_y_bar,) = objective_pullback(objective_bar)
-
-    def _final_y_from_carry(carry_value):
-        return _radau_adaptive_final_y_realized_schedule_vjp(
-            execution_context,
-            max_total_steps,
-            stop_after_accepted_steps,
-            carry_value,
-        )
-
-    _, carry_pullback = jax.vjp(_final_y_from_carry, initial_carry)
-    (carry0_bar,) = carry_pullback(final_y_bar)
-    selected_carry_leaf = _initial_carry_vdot_leaf_filter()
-    carry0_bar_for_vdot = _select_initial_carry_leaf(carry0_bar, selected_carry_leaf)
-
-    if _local_adjoint_check_enabled():
-        carry_with_forward_only_fields = _radau_carry_with_forward_only_jvp_fields(initial_carry)
-        primal_attempt_result = _execute_radau_accepted_step_attempt(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_with_forward_only_fields,
-            execution_context.attempt_context,
-        )
-        zero_replay_bar = _zero_optional_pytree(_radau_replay_state_from_carry(initial_carry))
-        local_replay_bar = dataclasses.replace(
-            zero_replay_bar,
-            y=final_y_bar,
-        )
-        local_carry_bar = _radau_apply_accepted_step_replay_state_pullback_linearized(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_with_forward_only_fields,
-            execution_context.attempt_context,
-            local_replay_bar,
-        )
-        local_carry_tangent = _zero_optional_pytree(initial_carry)
-        local_carry_tangent = dataclasses.replace(
-            local_carry_tangent,
-            y=jnp.ones_like(initial_carry.y),
-            dt=jnp.asarray(0.0, dtype=initial_carry.dt.dtype),
-        )
-        _, local_forward_tangent = _radau_accepted_step_y_tangent_from_primal_linearized(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_with_forward_only_fields,
-            _radau_extract_tangent_inputs_from_carry(local_carry_tangent),
-            primal_attempt_result,
-            allow_zero_shortcut=False,
-            project_output=True,
-        )
-        lhs = jnp.vdot(jnp.ravel(local_forward_tangent), jnp.ravel(final_y_bar))
-        rhs = _tree_vdot(local_carry_tangent, local_carry_bar)
-        jax.debug.print(
-            "[autodiff-gate] local-adjoint-check lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
-            lhs=lhs,
-            rhs=rhs,
-            err=jnp.abs(lhs - rhs),
-        )
-
-    def _carry0_from_parameter_values(values):
-        state_values = _parameterized_initial_state_multi(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_names=parameter_names,
-            parameter_values=values,
-        )
-        replay_initial_carry = _initial_carry_from_state_with_static_setup(
-            solver=solver,
-            state=state_values,
-            solve_vector_field=solve_vector_field,
-            species=runtime.species,
-            prepared_rollout_static=prepared_rollout,
-        )
-        return replay_initial_carry
-
-    if _rollout_adjoint_check_enabled():
-        basis_index = min(_rollout_adjoint_check_basis_index(), int(parameter_values.size) - 1)
-        basis = jnp.zeros_like(parameter_values).at[basis_index].set(1.0)
-        _, carry0_tangent_for_rollout = jax.jvp(
-            _carry0_from_parameter_values,
-            (parameter_values,),
-            (basis,),
-        )
-        _, final_y_tangent = jax.jvp(
-            _final_y_from_carry,
-            (initial_carry,),
-            (carry0_tangent_for_rollout,),
-        )
-        rollout_lhs = jnp.vdot(jnp.ravel(final_y_tangent), jnp.ravel(final_y_bar))
-        rollout_rhs = _tree_vdot(carry0_tangent_for_rollout, carry0_bar)
-        jax.debug.print(
-            "[autodiff-gate] rollout-adjoint-check basis={basis} lhs={lhs:.6e} rhs={rhs:.6e} abs_err={err:.6e}",
-            basis=jnp.asarray(basis_index),
-            lhs=rollout_lhs,
-            rhs=rollout_rhs,
-            err=jnp.abs(rollout_lhs - rollout_rhs),
-        )
-
-    n_params = int(parameter_values.size)
-    grad_entries = []
-    carry0_bar_y = jnp.asarray(carry0_bar.y, dtype=jnp.float64)
-    carry0_bar_y_l2 = jnp.linalg.norm(jnp.ravel(carry0_bar_y))
-    carry0_bar_y_max = jnp.max(jnp.abs(carry0_bar_y))
-    for idx in range(n_params):
-        basis = jnp.zeros_like(parameter_values).at[idx].set(1.0)
-        _, carry0_tangent = jax.jvp(
-            _carry0_from_parameter_values,
-            (parameter_values,),
-            (basis,),
-        )
-        carry0_tangent_for_vdot = _select_initial_carry_leaf(carry0_tangent, selected_carry_leaf)
-        if _parameter_carry_diagnostic_enabled():
-            carry0_tangent_y = jnp.asarray(carry0_tangent.y, dtype=jnp.float64)
-            y_leaf_vdot = jnp.vdot(jnp.ravel(carry0_tangent_y), jnp.ravel(carry0_bar_y))
-            jax.debug.print(
-                "[autodiff-gate] parameter-carry-check basis={basis} "
-                "carry0_bar_y_l2={bar_l2:.6e} carry0_bar_y_max={bar_max:.6e} "
-                "carry0_tangent_y_l2={tan_l2:.6e} carry0_tangent_y_max={tan_max:.6e} "
-                "y_leaf_vdot={y_vdot:.6e}",
-                basis=jnp.asarray(idx),
-                bar_l2=carry0_bar_y_l2,
-                bar_max=carry0_bar_y_max,
-                tan_l2=jnp.linalg.norm(jnp.ravel(carry0_tangent_y)),
-                tan_max=jnp.max(jnp.abs(carry0_tangent_y)),
-                y_vdot=y_leaf_vdot,
-            )
-        grad_entries.append(_tree_vdot(carry0_tangent_for_vdot, carry0_bar_for_vdot))
-    parameter_bar = jnp.stack(grad_entries)
-    return (parameter_bar,)
-
-
-_adaptive_rollout_objective_vector_realized_schedule_option_a_vjp.defvjp(
-    _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_fwd,
-    _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp_bwd,
-)
-
-
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     parameter_values,
     *,
@@ -1157,14 +857,9 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "vjp":
-        return _adaptive_rollout_objective_vector_realized_schedule_option_a_vjp(
-            parameter_values,
-            config,
-            runtime,
-            baseline_state,
-            profile_cfg,
-            parameter_names,
-            accepted_step_limit_override,
+        raise NotImplementedError(
+            "Legacy rollout reverse machinery has been removed from this benchmark path. "
+            "The new option-4 accepted-step reverse is not wired here yet."
         )
     (
         execution_context,
