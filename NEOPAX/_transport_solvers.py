@@ -6912,8 +6912,16 @@ def _radau_zero_reverse_payload_like(
         prev_dt_in=_radau_zero_value_like(carry_template.prev_dt),
         prev_theta_final_in=_radau_zero_value_like(carry_template.prev_theta_final),
         prev_newton_iter_count_in=_radau_zero_value_like(carry_template.prev_newton_iter_count),
+        lagged_response_in=_radau_zero_value_like(carry_template.lagged_response_cache),
+        lagged_response_cache_in=_radau_zero_value_like(carry_template.lagged_response_cache),
         lagged_response_valid_in=_radau_zero_value_like(carry_template.lagged_response_valid),
         lagged_reference_y_in=_radau_zero_value_like(carry_template.lagged_reference_y),
+        rhs_time_ref=_radau_zero_value_like(carry_template.y),
+        jacobian_out=_radau_zero_value_like(carry_template.jacobian),
+        real_lu_out=_radau_zero_value_like(carry_template.real_lu),
+        real_piv_out=_radau_zero_value_like(carry_template.real_piv),
+        complex_lu_out=_radau_zero_value_like(carry_template.complex_lu),
+        complex_piv_out=_radau_zero_value_like(carry_template.complex_piv),
     )
 
 
