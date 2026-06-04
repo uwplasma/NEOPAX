@@ -2377,7 +2377,6 @@ class _RadauAcceptedStepReplayCarryTrace:
     prev_dt: Any
     prev_theta_final: Any
     prev_newton_iter_count: Any
-    lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
 
@@ -6937,6 +6936,24 @@ def _radau_replay_realized_accepted_carry_pullback(
             replay_state_cotangent,
             replay_leaf_diagnostic,
         )
+        if execution_context.physics_context.build_lagged_response is None:
+            lagged_response_cache_value = carry0.lagged_response_cache
+        else:
+            def _build_lagged_cache_from_flat(flat_y):
+                candidate_state = execution_context.physics_context.unpack_flat(
+                    _project_flat_state_if_needed(
+                        flat_y,
+                        execution_context.physics_context.project_flat,
+                    )
+                )
+                return execution_context.physics_context.build_lagged_response(candidate_state)
+
+            lagged_response_cache_value = jax.lax.cond(
+                carry_trace.lagged_response_valid[step_index],
+                lambda _: _build_lagged_cache_from_flat(carry_trace.lagged_reference_y[step_index]),
+                lambda _: _build_lagged_cache_from_flat(carry_trace.y[step_index]),
+                operand=None,
+            )
         carry_before_base = _RadauAcceptedStepCarry(
             t=carry_trace.t[step_index],
             y=carry_trace.y[step_index],
@@ -6947,7 +6964,7 @@ def _radau_replay_realized_accepted_carry_pullback(
             recent_reject_count=jnp.zeros_like(carry0.recent_reject_count),
             regrowth_cooldown=jnp.zeros_like(carry0.regrowth_cooldown),
             easy_growth_streak=jnp.zeros_like(carry0.easy_growth_streak),
-            lagged_response_cache=jax.tree_util.tree_map(lambda x: x[step_index], carry_trace.lagged_response_cache),
+            lagged_response_cache=lagged_response_cache_value,
             lagged_response_valid=carry_trace.lagged_response_valid[step_index],
             lagged_reference_y=carry_trace.lagged_reference_y[step_index],
             jacobian=zero_jacobian_template,
@@ -7669,7 +7686,6 @@ def _radau_replay_realized_accepted_carry_trace(
             prev_dt=carry.prev_dt,
             prev_theta_final=carry.prev_theta_final,
             prev_newton_iter_count=carry.prev_newton_iter_count,
-            lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=carry.lagged_response_valid,
             lagged_reference_y=carry.lagged_reference_y,
         )
