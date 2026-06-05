@@ -307,6 +307,10 @@ def _compute_one_step_metrics(
         rebuilt_payload = _rebuild_payload_from_dynamic_branch(dynamic_values)
         return _primitive_dynamic_fn(rebuilt_payload, reduced_output_bar)
 
+    def _primitive_dynamic_branch_specialized_with_bar_fn(dynamic_values, reduced_bar):
+        rebuilt_payload = _rebuild_payload_from_dynamic_branch(dynamic_values)
+        return _primitive_dynamic_fn(rebuilt_payload, reduced_bar)
+
     if execution_mode == "jit":
         if payload_mode == "closed-over":
             compare_fn = jax.jit(_primitive_only_fn)
@@ -325,6 +329,10 @@ def _compute_one_step_metrics(
             compare_fn = jax.jit(_primitive_dynamic_branch_specialized_fn)
             dynamic_values = tuple(getattr(reverse_payload, name) for name in branch_dynamic_leaf_names)
             call = lambda: compare_fn(dynamic_values)
+        elif payload_mode == "dynamic-branch-specialized-with-bar":
+            compare_fn = jax.jit(_primitive_dynamic_branch_specialized_with_bar_fn)
+            dynamic_values = tuple(getattr(reverse_payload, name) for name in branch_dynamic_leaf_names)
+            call = lambda: compare_fn(dynamic_values, reduced_output_bar)
         else:
             raise ValueError(f"Unsupported payload mode: {payload_mode}")
         t0 = time.perf_counter()
@@ -351,6 +359,9 @@ def _compute_one_step_metrics(
             elif payload_mode == "dynamic-branch-specialized":
                 dynamic_values = tuple(getattr(reverse_payload, name) for name in branch_dynamic_leaf_names)
                 second = _primitive_dynamic_branch_specialized_fn(dynamic_values)
+            elif payload_mode == "dynamic-branch-specialized-with-bar":
+                dynamic_values = tuple(getattr(reverse_payload, name) for name in branch_dynamic_leaf_names)
+                second = _primitive_dynamic_branch_specialized_with_bar_fn(dynamic_values, reduced_output_bar)
             else:
                 raise ValueError(f"Unsupported payload mode: {payload_mode}")
         jax.block_until_ready(second["primitive_y_bar_max"])
@@ -361,7 +372,11 @@ def _compute_one_step_metrics(
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
     payload_report = _payload_leaf_stats(reverse_payload)
-    report_leaf_names = branch_dynamic_leaf_names if payload_mode == "dynamic-branch-specialized" else dynamic_leaf_names
+    report_leaf_names = (
+        branch_dynamic_leaf_names
+        if payload_mode in {"dynamic-branch-specialized", "dynamic-branch-specialized-with-bar"}
+        else dynamic_leaf_names
+    )
     payload_report["dynamic_leaf_names"] = list(report_leaf_names)
     payload_report["dynamic_leaf_count"] = int(len(report_leaf_names))
     payload_report["branch_lagged_valid_value"] = lagged_valid_value
@@ -406,7 +421,14 @@ def main() -> None:
     parser.add_argument(
         "--payload-mode",
         default="closed-over",
-        choices=("closed-over", "dynamic", "dynamic-payload-only", "dynamic-selected", "dynamic-branch-specialized"),
+        choices=(
+            "closed-over",
+            "dynamic",
+            "dynamic-payload-only",
+            "dynamic-selected",
+            "dynamic-branch-specialized",
+            "dynamic-branch-specialized-with-bar",
+        ),
         help="How much of the one-step reverse contract is passed dynamically at runtime. Default: closed-over.",
     )
     parser.add_argument(
