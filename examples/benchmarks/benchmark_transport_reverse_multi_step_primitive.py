@@ -125,6 +125,7 @@ def _compute_multi_step_metrics(
     execution_mode: str,
     segment_length: int,
     checkpoint_count: int,
+    reverse_probe_mode: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -416,16 +417,49 @@ def _compute_multi_step_metrics(
                         next_bar = one_step_reverse_rebuild_fn(dynamic_values, next_bar)
         return next_bar
 
+    def _ensure_one_step_reverse_fns():
+        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn
+        if execution_mode == "jit":
+            if one_step_reverse_reuse_fn is None:
+                one_step_reverse_reuse_fn = jax.jit(_reverse_one_step_reuse)
+            if one_step_reverse_rebuild_fn is None:
+                one_step_reverse_rebuild_fn = jax.jit(_reverse_one_step_rebuild)
+        else:
+            one_step_reverse_reuse_fn = _reverse_one_step_reuse
+            one_step_reverse_rebuild_fn = _reverse_one_step_rebuild
+
     def _reverse_only_once():
+        _ensure_one_step_reverse_fns()
         carry_bar = final_output_bar
-        for start_idx, end_idx in reversed(segment_ranges):
+        reversed_ranges = list(reversed(segment_ranges))
+        for range_idx, (start_idx, end_idx) in enumerate(reversed_ranges):
             segment_start_carry = _segment_start_carry(start_idx)
             dt_segment = _accepted_dt_slice(start_idx, end_idx)
             payload_rollout = _collect_segment_payloads_compiled(segment_start_carry, dt_segment)
+            if reverse_probe_mode == "last-step-only":
+                last_idx = int(payload_rollout.accepted_dts.shape[0]) - 1
+                reverse_payload = jax.tree_util.tree_map(
+                    lambda x, idx=last_idx: x[idx],
+                    payload_rollout.reverse_payloads,
+                )
+                dynamic_values = _payload_to_dynamic_values(reverse_payload)
+                lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
+                if execution_mode == "jit":
+                    if lagged_valid_value:
+                        carry_bar = one_step_reverse_reuse_fn(dynamic_values, carry_bar)
+                    else:
+                        carry_bar = one_step_reverse_rebuild_fn(dynamic_values, carry_bar)
+                else:
+                    with jax.disable_jit():
+                        if lagged_valid_value:
+                            carry_bar = one_step_reverse_reuse_fn(dynamic_values, carry_bar)
+                        else:
+                            carry_bar = one_step_reverse_rebuild_fn(dynamic_values, carry_bar)
+                break
             carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
-            "segment_count": jnp.asarray(len(segment_ranges), dtype=jnp.int32),
+            "segment_count": jnp.asarray(1 if reverse_probe_mode == "last-step-only" else len(segment_ranges), dtype=jnp.int32),
             "checkpoint_count": jnp.asarray(len(checkpoint_starts), dtype=jnp.int32),
             "segment_length": jnp.asarray(segment_length, dtype=jnp.int32),
             "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
@@ -501,6 +535,12 @@ def main() -> None:
         default=0,
         help="Number of sparse accepted-step checkpoints to store. Use 0 for no stored checkpoints. Default: 0.",
     )
+    parser.add_argument(
+        "--reverse-probe-mode",
+        default="full",
+        choices=("full", "last-step-only"),
+        help="Run the full segmented reverse or only the very first reverse step at the end of the rollout. Default: full.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -547,6 +587,7 @@ def main() -> None:
             execution_mode=args.execution_mode,
             segment_length=args.segment_length,
             checkpoint_count=args.checkpoint_count,
+            reverse_probe_mode=args.reverse_probe_mode,
         )
         prefix_reports.append(
             {
@@ -568,6 +609,7 @@ def main() -> None:
         "execution_mode": args.execution_mode,
         "segment_length": int(args.segment_length),
         "checkpoint_count": int(args.checkpoint_count),
+        "reverse_probe_mode": args.reverse_probe_mode,
         "prefix_reports": prefix_reports,
     }
 
@@ -580,7 +622,8 @@ def main() -> None:
         f"[autodiff-gate] accepted_step_counts={list(accepted_step_counts)} "
         f"bar_mode={args.bar_mode} execution_mode={args.execution_mode} "
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
-        f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)}"
+        f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
+        f"reverse_probe_mode={args.reverse_probe_mode}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
