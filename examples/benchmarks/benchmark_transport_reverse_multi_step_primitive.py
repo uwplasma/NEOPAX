@@ -137,6 +137,23 @@ def _compute_multi_step_metrics(
     )
     attempted_dts_np = np.asarray(jax.device_get(schedule_rollout.trace.attempted_dts), dtype=float)
     accepted_dts_np = attempted_dts_np[accepted_mask_np]
+    next_dts_np = np.asarray(jax.device_get(schedule_rollout.trace.next_dts), dtype=float)[accepted_mask_np]
+    next_recent_reject_count_np = np.asarray(
+        jax.device_get(schedule_rollout.trace.next_recent_reject_count),
+        dtype=np.int32,
+    )[accepted_mask_np]
+    next_regrowth_cooldown_np = np.asarray(
+        jax.device_get(schedule_rollout.trace.next_regrowth_cooldown),
+        dtype=np.int32,
+    )[accepted_mask_np]
+    next_easy_growth_streak_np = np.asarray(
+        jax.device_get(schedule_rollout.trace.next_easy_growth_streak),
+        dtype=np.int32,
+    )[accepted_mask_np]
+    next_lagged_response_valid_np = np.asarray(
+        jax.device_get(schedule_rollout.trace.next_lagged_response_valid),
+        dtype=bool,
+    )[accepted_mask_np]
     accepted_count = int(accepted_dts_np.shape[0])
     final_output_bar = _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode)
     segment_length = max(1, int(segment_length))
@@ -161,19 +178,52 @@ def _compute_multi_step_metrics(
     ]
     segment_starts = [start_idx for start_idx, _ in segment_ranges]
     accepted_dts_host = tuple(float(x) for x in accepted_dts_np.tolist())
+    next_dts_host = tuple(float(x) for x in next_dts_np.tolist())
+    next_recent_reject_count_host = tuple(int(x) for x in next_recent_reject_count_np.tolist())
+    next_regrowth_cooldown_host = tuple(int(x) for x in next_regrowth_cooldown_np.tolist())
+    next_easy_growth_streak_host = tuple(int(x) for x in next_easy_growth_streak_np.tolist())
+    next_lagged_response_valid_host = tuple(bool(x) for x in next_lagged_response_valid_np.tolist())
     dtype = execution_context.dtype
     replay_cache = {}
 
     def _accepted_dt_slice(start_idx: int, end_idx: int):
         return jnp.asarray(accepted_dts_host[start_idx:end_idx], dtype=dtype)
 
-    def _replay_segment(carry_start, dt_slice):
+    def _accepted_next_dt_slice(start_idx: int, end_idx: int):
+        return jnp.asarray(next_dts_host[start_idx:end_idx], dtype=dtype)
+
+    def _accepted_recent_reject_slice(start_idx: int, end_idx: int):
+        return jnp.asarray(next_recent_reject_count_host[start_idx:end_idx], dtype=jnp.int32)
+
+    def _accepted_regrowth_slice(start_idx: int, end_idx: int):
+        return jnp.asarray(next_regrowth_cooldown_host[start_idx:end_idx], dtype=jnp.int32)
+
+    def _accepted_growth_streak_slice(start_idx: int, end_idx: int):
+        return jnp.asarray(next_easy_growth_streak_host[start_idx:end_idx], dtype=jnp.int32)
+
+    def _accepted_lagged_valid_slice(start_idx: int, end_idx: int):
+        return jnp.asarray(next_lagged_response_valid_host[start_idx:end_idx], dtype=jnp.bool_)
+
+    def _replay_segment(
+        carry_start,
+        accepted_active_mask,
+        dt_slice,
+        next_dt_slice,
+        recent_reject_slice,
+        regrowth_slice,
+        growth_streak_slice,
+        lagged_valid_slice,
+    ):
         replay = _radau_replay_realized_accepted_rollout(
-            execution_context.kernel_context,
-            execution_context.physics_context,
+            execution_context,
             carry_start,
-            jnp.ones((dt_slice.shape[0],), dtype=jnp.bool_),
+            accepted_active_mask,
             dt_slice,
+            next_dt_slice,
+            recent_reject_slice,
+            regrowth_slice,
+            growth_streak_slice,
+            lagged_valid_slice,
         )
         return replay.final_carry
 
@@ -187,9 +237,27 @@ def _compute_multi_step_metrics(
             if fn is None:
                 fn = jax.jit(_replay_segment)
                 replay_cache[length] = fn
-            return fn(carry_start, dt_slice)
+            return fn(
+                carry_start,
+                jnp.ones((dt_slice.shape[0],), dtype=jnp.bool_),
+                dt_slice,
+                _accepted_next_dt_slice(start_idx, end_idx),
+                _accepted_recent_reject_slice(start_idx, end_idx),
+                _accepted_regrowth_slice(start_idx, end_idx),
+                _accepted_growth_streak_slice(start_idx, end_idx),
+                _accepted_lagged_valid_slice(start_idx, end_idx),
+            )
         with jax.disable_jit():
-            return _replay_segment(carry_start, dt_slice)
+            return _replay_segment(
+                carry_start,
+                jnp.ones((dt_slice.shape[0],), dtype=jnp.bool_),
+                dt_slice,
+                _accepted_next_dt_slice(start_idx, end_idx),
+                _accepted_recent_reject_slice(start_idx, end_idx),
+                _accepted_regrowth_slice(start_idx, end_idx),
+                _accepted_growth_streak_slice(start_idx, end_idx),
+                _accepted_lagged_valid_slice(start_idx, end_idx),
+            )
 
     def _select_checkpoint_starts() -> tuple[int, ...]:
         if checkpoint_count <= 0 or len(segment_starts) <= 1:
