@@ -400,6 +400,7 @@ def _select_reverse_payload_from_rollout(
     payload_source: str,
     rollout_accepted_step_limit: int,
     max_total_steps: int,
+    rollout_max_total_steps_multiplier: int,
     bar_mode: str,
 ):
     if payload_source == "prepared-first":
@@ -408,10 +409,17 @@ def _select_reverse_payload_from_rollout(
     if payload_source != "last-from-rollout":
         raise ValueError(f"Unsupported payload source: {payload_source}")
 
+    capped_max_total_steps = min(
+        int(max_total_steps),
+        max(
+            int(rollout_accepted_step_limit),
+            int(rollout_accepted_step_limit) * int(rollout_max_total_steps_multiplier),
+        ),
+    )
     payload_rollout = _radau_collect_realized_accepted_step_payloads(
         execution_context,
         initial_carry,
-        max_total_steps=max_total_steps,
+        max_total_steps=capped_max_total_steps,
         stop_after_accepted_steps=rollout_accepted_step_limit,
     )
     accepted_mask_np = np.asarray(jax.device_get(payload_rollout.accepted_mask), dtype=bool)
@@ -428,7 +436,8 @@ def _select_reverse_payload_from_rollout(
         "selected_accepted_count": int(accepted_indices.size),
         "selected_trace_index": last_idx,
         "rollout_accepted_step_limit": int(rollout_accepted_step_limit),
-    }
+        "capped_max_total_steps": int(capped_max_total_steps),
+        }
     return selected_payload, selected_output_bar, None, info
 
 
@@ -515,6 +524,12 @@ def main() -> None:
         default=20000,
         help="When `--payload-source last-from-rollout`, cap the realized rollout at this many accepted steps. Default: 20000.",
     )
+    parser.add_argument(
+        "--rollout-max-total-steps-multiplier",
+        type=int,
+        default=4,
+        help="When `--payload-source last-from-rollout`, cap max_total_steps to accepted_step_limit * multiplier. Default: 4.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -545,6 +560,7 @@ def main() -> None:
         payload_source=args.payload_source,
         rollout_accepted_step_limit=args.rollout_accepted_step_limit,
         max_total_steps=_max_total_steps,
+        rollout_max_total_steps_multiplier=args.rollout_max_total_steps_multiplier,
         bar_mode=args.bar_mode,
     )
 
@@ -575,6 +591,7 @@ def main() -> None:
         "dynamic_structure": args.dynamic_structure,
         "payload_source": args.payload_source,
         "rollout_accepted_step_limit": int(args.rollout_accepted_step_limit),
+        "rollout_max_total_steps_multiplier": int(args.rollout_max_total_steps_multiplier),
         "payload_source_info": payload_source_info,
         "payload_report": payload_report,
         "result": result,
@@ -590,7 +607,8 @@ def main() -> None:
         f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode} "
         f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation} "
         f"dynamic_structure={args.dynamic_structure} payload_source={args.payload_source} "
-        f"rollout_accepted_step_limit={int(args.rollout_accepted_step_limit)}"
+        f"rollout_accepted_step_limit={int(args.rollout_accepted_step_limit)} "
+        f"rollout_max_total_steps_multiplier={int(args.rollout_max_total_steps_multiplier)}"
     )
     print(
         f"[autodiff-gate] payload_total_bytes={int(payload_report['total_bytes'])} "
