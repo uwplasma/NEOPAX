@@ -31,8 +31,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
     _radau_accepted_step_primitive_pullback,
-    _radau_adaptive_schedule_rollout,
-    _radau_carry_with_forward_only_jvp_fields,
+    _radau_collect_realized_accepted_step_payloads,
 )
 
 
@@ -409,55 +408,28 @@ def _select_reverse_payload_from_rollout(
     if payload_source != "last-from-rollout":
         raise ValueError(f"Unsupported payload source: {payload_source}")
 
-    rollout = _radau_adaptive_schedule_rollout(
+    payload_rollout = _radau_collect_realized_accepted_step_payloads(
         execution_context,
         initial_carry,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=rollout_accepted_step_limit,
     )
-    accepted_mask_np = np.asarray(
-        jax.device_get(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)),
-        dtype=bool,
-    )
-    attempted_dts_np = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
-    accepted_dts = attempted_dts_np[accepted_mask_np]
-    if accepted_dts.size == 0:
+    accepted_mask_np = np.asarray(jax.device_get(payload_rollout.accepted_mask), dtype=bool)
+    accepted_indices = np.flatnonzero(accepted_mask_np)
+    if accepted_indices.size == 0:
         raise ValueError("No accepted steps were available in the selected rollout payload source.")
 
-    carry = initial_carry
-    selected_payload = None
-    selected_result = None
-    for dt_value in accepted_dts.tolist():
-        carry_for_step = dataclasses.replace(carry, dt=jnp.asarray(float(dt_value), dtype=execution_context.dtype))
-        primitive_result = _radau_accepted_step_primitive(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-            execution_context.attempt_context,
-        )
-        selected_payload = primitive_result.reverse_payload
-        selected_result = primitive_result
-        carry = dataclasses.replace(
-            primitive_result.next_carry,
-            prev_error=jnp.maximum(
-                primitive_result.attempt_result.err_norm,
-                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
-            ),
-            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
-            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
-            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-        )
-
-    selected_output_bar = _make_reduced_output_bar(rollout.final_carry, bar_mode)
+    last_idx = int(accepted_indices[-1])
+    selected_payload = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reverse_payloads)
+    selected_output_bar = _make_reduced_output_bar(payload_rollout.final_carry, bar_mode)
     info = {
         "payload_source": payload_source,
-        "selected_accepted_index": int(accepted_dts.size - 1),
-        "selected_accepted_count": int(accepted_dts.size),
+        "selected_accepted_index": int(accepted_indices.size - 1),
+        "selected_accepted_count": int(accepted_indices.size),
+        "selected_trace_index": last_idx,
         "rollout_accepted_step_limit": int(rollout_accepted_step_limit),
-        "selected_converged": bool(np.asarray(jax.device_get(selected_result.attempt_result.converged)).item()),
-        "selected_trial_dt": float(np.asarray(jax.device_get(selected_result.attempt_result.trial_dt)).item()),
     }
-    return selected_payload, selected_output_bar, selected_result.attempt_result, info
+    return selected_payload, selected_output_bar, None, info
 
 
 def main() -> None:
