@@ -31,10 +31,10 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedPrimitivePayloadRollout,
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
+    _radau_accepted_step_primitive_pullback,
     _radau_adaptive_schedule_rollout,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_replay_realized_accepted_rollout,
-    _radau_rollout_reverse_from_saved_payloads,
 )
 
 
@@ -330,7 +330,7 @@ def _compute_multi_step_metrics(
         )
 
     payload_collect_cache = {}
-    reverse_cache = {}
+    one_step_reverse_fn = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
         length = int(dt_segment.shape[0])
@@ -343,28 +343,38 @@ def _compute_multi_step_metrics(
         with jax.disable_jit():
             return _collect_segment_payloads(carry_start, dt_segment)
 
+    def _reverse_one_step(carry_template, reverse_payload, carry_bar):
+        return _radau_accepted_step_primitive_pullback(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_template,
+            execution_context.attempt_context,
+            reverse_payload,
+            carry_bar,
+        )
+
     def _reverse_segment_compiled(carry_start, payload_rollout, carry_bar):
-        length = int(payload_rollout.accepted_dts.shape[0])
+        nonlocal one_step_reverse_fn
+        step_count = int(payload_rollout.accepted_dts.shape[0])
         if execution_mode == "jit":
-            fn = reverse_cache.get(length)
-            if fn is None:
-                fn = jax.jit(
-                    lambda carry_arg, payload_arg, bar_arg: _radau_rollout_reverse_from_saved_payloads(
-                        execution_context,
-                        carry_arg,
-                        payload_arg,
-                        bar_arg,
-                    )
-                )
-                reverse_cache[length] = fn
-            return fn(carry_start, payload_rollout, carry_bar)
-        with jax.disable_jit():
-            return _radau_rollout_reverse_from_saved_payloads(
-                execution_context,
-                carry_start,
-                payload_rollout,
-                carry_bar,
+            if one_step_reverse_fn is None:
+                one_step_reverse_fn = jax.jit(_reverse_one_step)
+            fn = one_step_reverse_fn
+        else:
+            fn = _reverse_one_step
+
+        next_bar = carry_bar
+        for step_idx in range(step_count - 1, -1, -1):
+            reverse_payload = jax.tree_util.tree_map(
+                lambda x, idx=step_idx: x[idx],
+                payload_rollout.reverse_payloads,
             )
+            if execution_mode == "jit":
+                next_bar = fn(carry_start, reverse_payload, next_bar)
+            else:
+                with jax.disable_jit():
+                    next_bar = fn(carry_start, reverse_payload, next_bar)
+        return next_bar
 
     def _reverse_only_once():
         carry_bar = final_output_bar
