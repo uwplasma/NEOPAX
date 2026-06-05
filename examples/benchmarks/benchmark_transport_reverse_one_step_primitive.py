@@ -31,6 +31,8 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
     _radau_accepted_step_primitive_pullback,
+    _radau_adaptive_schedule_rollout,
+    _radau_carry_with_forward_only_jvp_fields,
 )
 
 
@@ -221,6 +223,9 @@ def _compute_one_step_metrics(
     payload_mode: str,
     ablation_mode: str,
     dynamic_structure: str,
+    selected_reverse_payload=None,
+    selected_output_bar=None,
+    selected_attempt_result=None,
 ):
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
@@ -232,8 +237,14 @@ def _compute_one_step_metrics(
         initial_carry,
         attempt_context,
     )
-    reverse_payload = _ablate_reverse_payload(primitive_result.reverse_payload, ablation_mode)
-    reduced_output_bar = _make_reduced_output_bar(initial_carry, bar_mode)
+    attempt_result = primitive_result.attempt_result if selected_attempt_result is None else selected_attempt_result
+    base_reverse_payload = primitive_result.reverse_payload if selected_reverse_payload is None else selected_reverse_payload
+    reverse_payload = _ablate_reverse_payload(base_reverse_payload, ablation_mode)
+    reduced_output_bar = (
+        _make_reduced_output_bar(initial_carry, bar_mode)
+        if selected_output_bar is None
+        else selected_output_bar
+    )
     payload_field_names = tuple(field.name for field in dataclasses.fields(reverse_payload))
 
     def _primitive_only_fn():
@@ -246,10 +257,10 @@ def _compute_one_step_metrics(
             reduced_output_bar,
         )
         return {
-            "converged": primitive_result.attempt_result.converged,
-            "err_norm": primitive_result.attempt_result.err_norm,
-            "trial_dt": primitive_result.attempt_result.trial_dt,
-            "newton_iter_count": primitive_result.attempt_result.newton_iter_count,
+            "converged": attempt_result.converged,
+            "err_norm": attempt_result.err_norm,
+            "trial_dt": attempt_result.trial_dt,
+            "newton_iter_count": attempt_result.newton_iter_count,
             "primitive_y_bar_max": _tree_max_abs(primitive_reduced_bar.y_out),
             "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(primitive_reduced_bar.dt_out, dtype=jnp.float64))),
             "primitive_prev_stages_bar_max": _tree_max_abs(primitive_reduced_bar.prev_stages_out),
@@ -265,10 +276,10 @@ def _compute_one_step_metrics(
             reduced_bar,
         )
         return {
-            "converged": primitive_result.attempt_result.converged,
-            "err_norm": primitive_result.attempt_result.err_norm,
-            "trial_dt": primitive_result.attempt_result.trial_dt,
-            "newton_iter_count": primitive_result.attempt_result.newton_iter_count,
+            "converged": attempt_result.converged,
+            "err_norm": attempt_result.err_norm,
+            "trial_dt": attempt_result.trial_dt,
+            "newton_iter_count": attempt_result.newton_iter_count,
             "primitive_y_bar_max": _tree_max_abs(primitive_reduced_bar.y_out),
             "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(primitive_reduced_bar.dt_out, dtype=jnp.float64))),
             "primitive_prev_stages_bar_max": _tree_max_abs(primitive_reduced_bar.prev_stages_out),
@@ -383,6 +394,72 @@ def _compute_one_step_metrics(
     return result, payload_report
 
 
+def _select_reverse_payload_from_rollout(
+    execution_context,
+    initial_carry,
+    *,
+    payload_source: str,
+    rollout_accepted_step_limit: int,
+    max_total_steps: int,
+    bar_mode: str,
+):
+    if payload_source == "prepared-first":
+        return None, None, None, {}
+
+    if payload_source != "last-from-rollout":
+        raise ValueError(f"Unsupported payload source: {payload_source}")
+
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=rollout_accepted_step_limit,
+    )
+    accepted_mask_np = np.asarray(
+        jax.device_get(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)),
+        dtype=bool,
+    )
+    attempted_dts_np = np.asarray(jax.device_get(rollout.trace.attempted_dts), dtype=float)
+    accepted_dts = attempted_dts_np[accepted_mask_np]
+    if accepted_dts.size == 0:
+        raise ValueError("No accepted steps were available in the selected rollout payload source.")
+
+    carry = initial_carry
+    selected_payload = None
+    selected_result = None
+    for dt_value in accepted_dts.tolist():
+        carry_for_step = dataclasses.replace(carry, dt=jnp.asarray(float(dt_value), dtype=execution_context.dtype))
+        primitive_result = _radau_accepted_step_primitive(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        selected_payload = primitive_result.reverse_payload
+        selected_result = primitive_result
+        carry = dataclasses.replace(
+            primitive_result.next_carry,
+            prev_error=jnp.maximum(
+                primitive_result.attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=execution_context.dtype),
+            ),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    selected_output_bar = _make_reduced_output_bar(rollout.final_carry, bar_mode)
+    info = {
+        "payload_source": payload_source,
+        "selected_accepted_index": int(accepted_dts.size - 1),
+        "selected_accepted_count": int(accepted_dts.size),
+        "rollout_accepted_step_limit": int(rollout_accepted_step_limit),
+        "selected_converged": bool(np.asarray(jax.device_get(selected_result.attempt_result.converged)).item()),
+        "selected_trial_dt": float(np.asarray(jax.device_get(selected_result.attempt_result.trial_dt)).item()),
+    }
+    return selected_payload, selected_output_bar, selected_result.attempt_result, info
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark the one-step accepted-step primitive reverse rule."
@@ -454,6 +531,18 @@ def main() -> None:
         ),
         help="When using `dynamic-selected`, choose which payload leaves remain dynamic. Default: full.",
     )
+    parser.add_argument(
+        "--payload-source",
+        default="prepared-first",
+        choices=("prepared-first", "last-from-rollout"),
+        help="Use the prepared first accepted-step payload or the last accepted-step payload from a realized rollout. Default: prepared-first.",
+    )
+    parser.add_argument(
+        "--rollout-accepted-step-limit",
+        type=int,
+        default=20000,
+        help="When `--payload-source last-from-rollout`, cap the realized rollout at this many accepted steps. Default: 20000.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -478,6 +567,15 @@ def main() -> None:
         )
     )
 
+    selected_reverse_payload, selected_output_bar, selected_attempt_result, payload_source_info = _select_reverse_payload_from_rollout(
+        execution_context,
+        initial_carry,
+        payload_source=args.payload_source,
+        rollout_accepted_step_limit=args.rollout_accepted_step_limit,
+        max_total_steps=_max_total_steps,
+        bar_mode=args.bar_mode,
+    )
+
     result, payload_report = _compute_one_step_metrics(
         execution_context,
         initial_carry,
@@ -486,6 +584,9 @@ def main() -> None:
         payload_mode=args.payload_mode,
         ablation_mode=args.payload_ablation,
         dynamic_structure=args.dynamic_structure,
+        selected_reverse_payload=selected_reverse_payload,
+        selected_output_bar=selected_output_bar,
+        selected_attempt_result=selected_attempt_result,
     )
 
     report = {
@@ -500,6 +601,9 @@ def main() -> None:
         "payload_mode": args.payload_mode,
         "payload_ablation": args.payload_ablation,
         "dynamic_structure": args.dynamic_structure,
+        "payload_source": args.payload_source,
+        "rollout_accepted_step_limit": int(args.rollout_accepted_step_limit),
+        "payload_source_info": payload_source_info,
         "payload_report": payload_report,
         "result": result,
     }
@@ -513,7 +617,8 @@ def main() -> None:
         f"[autodiff-gate] bar_mode={args.bar_mode} "
         f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode} "
         f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation} "
-        f"dynamic_structure={args.dynamic_structure}"
+        f"dynamic_structure={args.dynamic_structure} payload_source={args.payload_source} "
+        f"rollout_accepted_step_limit={int(args.rollout_accepted_step_limit)}"
     )
     print(
         f"[autodiff-gate] payload_total_bytes={int(payload_report['total_bytes'])} "
