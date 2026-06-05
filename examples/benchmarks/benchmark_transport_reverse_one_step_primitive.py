@@ -138,8 +138,16 @@ def _structure_leaf_names(structure_mode: str) -> tuple[str, ...]:
         )
     if structure_mode == "trial_dt":
         return ("trial_dt",)
+    if structure_mode == "t_in":
+        return ("t_in",)
+    if structure_mode == "dt_in":
+        return ("dt_in",)
+    if structure_mode == "prev_dt":
+        return ("prev_dt_in",)
     if structure_mode == "lagged_valid":
         return ("lagged_response_valid_in",)
+    if structure_mode == "newton_count":
+        return ("prev_newton_iter_count_in",)
     if structure_mode == "prev_theta":
         return ("prev_theta_final_in",)
     if structure_mode == "stage":
@@ -387,7 +395,18 @@ def main() -> None:
     parser.add_argument(
         "--dynamic-structure",
         default="full",
-        choices=("full", "scalars", "trial_dt", "lagged_valid", "prev_theta", "stage"),
+        choices=(
+            "full",
+            "scalars",
+            "trial_dt",
+            "t_in",
+            "dt_in",
+            "prev_dt",
+            "lagged_valid",
+            "newton_count",
+            "prev_theta",
+            "stage",
+        ),
         help="When using `dynamic-selected`, choose which payload leaves remain dynamic. Default: full.",
     )
     args = parser.parse_args()
