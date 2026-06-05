@@ -599,3 +599,115 @@ If these are large, the likely fix is:
 
 - do not rely on fresh recomputation of the local primal accepted step for this reverse path
 - instead use forward-recorded step data, or an exact reconstruction from stored forward payloads, for the reverse local pullback context
+
+## 2026-06-05 option-4 reverse status
+
+### What is now working
+
+- The new one-step accepted-step custom reverse rule works under JIT when the
+  reverse payload is closed over as a residual-like constant.
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode closed-over
+```
+
+Observed result:
+
+- compile plus execute about `2.89e+01 s`
+- steady execute about `1.58e-03 s`
+- no OOM
+
+### What is now proven to fail
+
+The same one-step custom reverse rule OOMs under JIT when the reverse payload
+is passed as a dynamic runtime argument.
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic
+```
+
+Observed result:
+
+- OOM at about `49.1 GiB`
+
+### Main conclusion
+
+The current blocker is now sharply localized:
+
+- not checkpointing
+- not segmenting
+- not rollout composition by itself
+- not the one-step local reverse algebra in the residual/closed-over form
+
+The blocker is the **dynamic runtime reverse-payload contract** for the
+accepted-step custom reverse rule.
+
+### Multi-step benchmark conclusion
+
+The segmented reverse benchmark was refactored so it no longer stores a full
+accepted-step payload tape for the whole run. It now uses:
+
+- one lightweight adaptive schedule rollout
+- transient per-segment payload collection
+- optional sparse checkpoints
+
+However, the full run still fails because the first jitted one-step reverse
+call in the multi-step harness is exactly the dynamic-payload form above.
+
+So the next work is **not** another checkpoint tweak. It is reducing the
+runtime dynamic payload contract.
+
+### New targeted benchmark controls
+
+`examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py` now supports:
+
+- `--payload-mode closed-over`
+- `--payload-mode dynamic`
+- `--payload-ablation none|stage|lagged|jacobian|lu|pivots`
+
+and prints:
+
+- `payload_total_bytes`
+- grouped payload byte totals
+
+### Immediate next tests
+
+Run these in order:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation none
+```
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation stage
+```
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation lagged
+```
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation jacobian
+```
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation lu
+```
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic --payload-ablation pivots
+```
+
+### Next plan for reducing OOM
+
+1. Identify which dynamic payload family triggers the `~49 GiB` compile blowup.
+2. Treat that family as the main refactor target for the runtime reverse
+   contract.
+3. Reduce the dynamic payload so reverse mode follows the same narrowed active
+   contract philosophy as forward mode.
+4. Only after the one-step `dynamic` payload form works under JIT, return to
+   segmented multi-step rollout scaling.

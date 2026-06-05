@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -84,6 +85,77 @@ def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutpu
     raise ValueError(f"Unsupported bar mode: {mode}")
 
 
+def _zero_like_value(value):
+    arr = jnp.asarray(value)
+    if jnp.issubdtype(arr.dtype, jnp.bool_):
+        return jnp.zeros_like(arr, dtype=jnp.bool_)
+    return jnp.zeros_like(arr)
+
+
+def _ablate_reverse_payload(reverse_payload, ablation_mode: str):
+    if ablation_mode == "none":
+        return reverse_payload
+
+    fields = {}
+    for field in dataclasses.fields(reverse_payload):
+        name = field.name
+        value = getattr(reverse_payload, name)
+        zero = False
+        if ablation_mode == "stage" and name in {"stage_history"}:
+            zero = True
+        elif ablation_mode == "lagged" and name in {"lagged_response_in", "lagged_response_cache_in", "rhs_time_ref"}:
+            zero = True
+        elif ablation_mode == "jacobian" and name in {"jacobian_out"}:
+            zero = True
+        elif ablation_mode == "lu" and name in {"real_lu_out", "complex_lu_out"}:
+            zero = True
+        elif ablation_mode == "pivots" and name in {"real_piv_out", "complex_piv_out"}:
+            zero = True
+        fields[name] = _zero_like_value(value) if zero else value
+    return dataclasses.replace(reverse_payload, **fields)
+
+
+def _payload_leaf_stats(reverse_payload):
+    stats = []
+    total_bytes = 0
+    groups = {
+        "stage": {"stage_history"},
+        "lagged": {"lagged_response_in", "lagged_response_cache_in", "rhs_time_ref"},
+        "jacobian": {"jacobian_out"},
+        "lu": {"real_lu_out", "complex_lu_out"},
+        "pivots": {"real_piv_out", "complex_piv_out"},
+        "scalars_other": set(),
+    }
+    group_totals = {key: 0 for key in groups}
+    for field in dataclasses.fields(reverse_payload):
+        name = field.name
+        arr = np.asarray(jax.device_get(getattr(reverse_payload, name)))
+        bytes_used = int(arr.nbytes)
+        total_bytes += bytes_used
+        group_name = "scalars_other"
+        for candidate, members in groups.items():
+            if name in members:
+                group_name = candidate
+                break
+        group_totals[group_name] += bytes_used
+        stats.append(
+            {
+                "name": name,
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "elements": int(arr.size),
+                "bytes": bytes_used,
+                "group": group_name,
+            }
+        )
+    stats.sort(key=lambda item: item["bytes"], reverse=True)
+    return {
+        "total_bytes": total_bytes,
+        "group_totals": group_totals,
+        "leaves": stats,
+    }
+
+
 def _compute_one_step_metrics(
     execution_context,
     initial_carry,
@@ -91,6 +163,7 @@ def _compute_one_step_metrics(
     bar_mode: str,
     execution_mode: str,
     payload_mode: str,
+    ablation_mode: str,
 ):
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
@@ -102,6 +175,7 @@ def _compute_one_step_metrics(
         initial_carry,
         attempt_context,
     )
+    reverse_payload = _ablate_reverse_payload(primitive_result.reverse_payload, ablation_mode)
     reduced_output_bar = _make_reduced_output_bar(initial_carry, bar_mode)
 
     def _primitive_only_fn():
@@ -110,7 +184,7 @@ def _compute_one_step_metrics(
             physics_context,
             initial_carry,
             attempt_context,
-            primitive_result.reverse_payload,
+            reverse_payload,
             reduced_output_bar,
         )
         return {
@@ -148,7 +222,7 @@ def _compute_one_step_metrics(
             call = lambda: compare_fn()
         elif payload_mode == "dynamic":
             compare_fn = jax.jit(_primitive_dynamic_fn)
-            call = lambda: compare_fn(primitive_result.reverse_payload, reduced_output_bar)
+            call = lambda: compare_fn(reverse_payload, reduced_output_bar)
         else:
             raise ValueError(f"Unsupported payload mode: {payload_mode}")
         t0 = time.perf_counter()
@@ -166,7 +240,7 @@ def _compute_one_step_metrics(
             if payload_mode == "closed-over":
                 second = _primitive_only_fn()
             elif payload_mode == "dynamic":
-                second = _primitive_dynamic_fn(primitive_result.reverse_payload, reduced_output_bar)
+                second = _primitive_dynamic_fn(reverse_payload, reduced_output_bar)
             else:
                 raise ValueError(f"Unsupported payload mode: {payload_mode}")
         jax.block_until_ready(second["primitive_y_bar_max"])
@@ -176,7 +250,7 @@ def _compute_one_step_metrics(
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
-    return result
+    return result, _payload_leaf_stats(reverse_payload)
 
 
 def main() -> None:
@@ -220,6 +294,12 @@ def main() -> None:
         choices=("closed-over", "dynamic"),
         help="Whether the reverse payload is closed over like a residual or passed as a runtime argument. Default: closed-over.",
     )
+    parser.add_argument(
+        "--payload-ablation",
+        default="none",
+        choices=("none", "stage", "lagged", "jacobian", "lu", "pivots"),
+        help="Zero one payload family before running the reverse benchmark. Default: none.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -244,12 +324,13 @@ def main() -> None:
         )
     )
 
-    result = _compute_one_step_metrics(
+    result, payload_report = _compute_one_step_metrics(
         execution_context,
         initial_carry,
         bar_mode=args.bar_mode,
         execution_mode=args.execution_mode,
         payload_mode=args.payload_mode,
+        ablation_mode=args.payload_ablation,
     )
 
     report = {
@@ -262,6 +343,8 @@ def main() -> None:
         "bar_mode": args.bar_mode,
         "execution_mode": args.execution_mode,
         "payload_mode": args.payload_mode,
+        "payload_ablation": args.payload_ablation,
+        "payload_report": payload_report,
         "result": result,
     }
 
@@ -273,7 +356,11 @@ def main() -> None:
     print(
         f"[autodiff-gate] bar_mode={args.bar_mode} "
         f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode} "
-        f"payload_mode={args.payload_mode}"
+        f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation}"
+    )
+    print(
+        f"[autodiff-gate] payload_total_bytes={int(payload_report['total_bytes'])} "
+        f"group_totals={payload_report['group_totals']}"
     )
     for key, value in result.items():
         if isinstance(value, bool):

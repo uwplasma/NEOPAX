@@ -359,6 +359,61 @@ This refactor is done when all of the following are true:
   primal accepted-step internals during backward
 - the code expresses the accepted-step primitive and its reverse rule directly
 
+## 2026-06-05 Current Resume Point
+
+### Current best diagnosis
+
+- The local accepted-step custom reverse rule itself is viable under JIT when
+  the reverse payload is closed over as a residual-like constant.
+- The same rule OOMs under JIT when the reverse payload is passed as a dynamic
+  runtime argument.
+- Therefore the current blocker is the **dynamic runtime reverse-payload
+  contract**, not checkpointing or rollout composition by themselves.
+
+### What this means for the option-4 plan
+
+The next work should stay focused on the one-step primitive level:
+
+1. reduce the dynamic payload contract
+2. make the runtime reverse look more like the forward path in using a narrow
+   active contract
+3. only after dynamic one-step JIT works, resume segmented multi-step rollout
+   scaling
+
+### Current benchmark surfaces
+
+Working closed-over one-step:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode closed-over
+```
+
+Failing dynamic one-step:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode dynamic
+```
+
+Segmented multi-step benchmark now exists, but still inherits the dynamic
+payload blocker:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_multi_step_primitive.py --ntx-exact-derivative-mode direct --accepted-step-counts 20000 --execution-mode jit --max-total-steps-multiplier 1 --segment-length 8 --checkpoint-count 0
+```
+
+### Immediate next tests
+
+Use the one-step dynamic payload ablations first:
+
+- `--payload-ablation none`
+- `--payload-ablation stage`
+- `--payload-ablation lagged`
+- `--payload-ablation jacobian`
+- `--payload-ablation lu`
+- `--payload-ablation pivots`
+
+These are now the highest-value tests before any more rollout work.
+
 ## Function-by-Function Implementation Checklist
 
 This section maps the refactor onto the current code in:
