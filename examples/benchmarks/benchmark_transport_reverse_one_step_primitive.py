@@ -402,6 +402,7 @@ def _select_reverse_payload_from_rollout(
     max_total_steps: int,
     rollout_max_total_steps_multiplier: int,
     bar_mode: str,
+    payload_capture_device: str,
 ):
     if payload_source == "prepared-first":
         return None, None, None, {}
@@ -416,12 +417,27 @@ def _select_reverse_payload_from_rollout(
             int(rollout_accepted_step_limit) * int(rollout_max_total_steps_multiplier),
         ),
     )
-    payload_rollout = _radau_collect_realized_accepted_step_payloads(
-        execution_context,
-        initial_carry,
-        max_total_steps=capped_max_total_steps,
-        stop_after_accepted_steps=rollout_accepted_step_limit,
-    )
+    if payload_capture_device == "cpu":
+        capture_device = jax.devices("cpu")[0]
+        execution_context_capture = jax.device_put(execution_context, capture_device)
+        initial_carry_capture = jax.device_put(initial_carry, capture_device)
+        with jax.default_device(capture_device):
+            payload_rollout = _radau_collect_realized_accepted_step_payloads(
+                execution_context_capture,
+                initial_carry_capture,
+                max_total_steps=capped_max_total_steps,
+                stop_after_accepted_steps=rollout_accepted_step_limit,
+            )
+            jax.block_until_ready(payload_rollout.accepted_dts)
+    elif payload_capture_device == "default":
+        payload_rollout = _radau_collect_realized_accepted_step_payloads(
+            execution_context,
+            initial_carry,
+            max_total_steps=capped_max_total_steps,
+            stop_after_accepted_steps=rollout_accepted_step_limit,
+        )
+    else:
+        raise ValueError(f"Unsupported payload capture device: {payload_capture_device}")
     accepted_mask_np = np.asarray(jax.device_get(payload_rollout.accepted_mask), dtype=bool)
     accepted_indices = np.flatnonzero(accepted_mask_np)
     if accepted_indices.size == 0:
@@ -437,6 +453,7 @@ def _select_reverse_payload_from_rollout(
         "selected_trace_index": last_idx,
         "rollout_accepted_step_limit": int(rollout_accepted_step_limit),
         "capped_max_total_steps": int(capped_max_total_steps),
+        "payload_capture_device": payload_capture_device,
         }
     return selected_payload, selected_output_bar, None, info
 
@@ -530,6 +547,12 @@ def main() -> None:
         default=4,
         help="When `--payload-source last-from-rollout`, cap max_total_steps to accepted_step_limit * multiplier. Default: 4.",
     )
+    parser.add_argument(
+        "--payload-capture-device",
+        default="default",
+        choices=("default", "cpu"),
+        help="Device used only for `last-from-rollout` payload capture. Default: default.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -562,6 +585,7 @@ def main() -> None:
         max_total_steps=_max_total_steps,
         rollout_max_total_steps_multiplier=args.rollout_max_total_steps_multiplier,
         bar_mode=args.bar_mode,
+        payload_capture_device=args.payload_capture_device,
     )
 
     result, payload_report = _compute_one_step_metrics(
@@ -592,6 +616,7 @@ def main() -> None:
         "payload_source": args.payload_source,
         "rollout_accepted_step_limit": int(args.rollout_accepted_step_limit),
         "rollout_max_total_steps_multiplier": int(args.rollout_max_total_steps_multiplier),
+        "payload_capture_device": args.payload_capture_device,
         "payload_source_info": payload_source_info,
         "payload_report": payload_report,
         "result": result,
@@ -608,7 +633,8 @@ def main() -> None:
         f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation} "
         f"dynamic_structure={args.dynamic_structure} payload_source={args.payload_source} "
         f"rollout_accepted_step_limit={int(args.rollout_accepted_step_limit)} "
-        f"rollout_max_total_steps_multiplier={int(args.rollout_max_total_steps_multiplier)}"
+        f"rollout_max_total_steps_multiplier={int(args.rollout_max_total_steps_multiplier)} "
+        f"payload_capture_device={args.payload_capture_device}"
     )
     print(
         f"[autodiff-gate] payload_total_bytes={int(payload_report['total_bytes'])} "
