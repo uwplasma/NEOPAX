@@ -343,7 +343,9 @@ def _compute_multi_step_metrics(
         with jax.disable_jit():
             return _collect_segment_payloads(carry_start, dt_segment)
 
-    def _reverse_one_step(carry_template, reverse_payload, carry_bar):
+    carry_template = initial_carry
+
+    def _reverse_one_step(reverse_payload, carry_bar):
         return _radau_accepted_step_primitive_pullback(
             execution_context.kernel_context,
             execution_context.physics_context,
@@ -353,7 +355,7 @@ def _compute_multi_step_metrics(
             carry_bar,
         )
 
-    def _reverse_segment_compiled(carry_start, payload_rollout, carry_bar):
+    def _reverse_segment_compiled(payload_rollout, carry_bar):
         nonlocal one_step_reverse_fn
         step_count = int(payload_rollout.accepted_dts.shape[0])
         if execution_mode == "jit":
@@ -370,10 +372,10 @@ def _compute_multi_step_metrics(
                 payload_rollout.reverse_payloads,
             )
             if execution_mode == "jit":
-                next_bar = fn(carry_start, reverse_payload, next_bar)
+                next_bar = fn(reverse_payload, next_bar)
             else:
                 with jax.disable_jit():
-                    next_bar = fn(carry_start, reverse_payload, next_bar)
+                    next_bar = fn(reverse_payload, next_bar)
         return next_bar
 
     def _reverse_only_once():
@@ -382,7 +384,7 @@ def _compute_multi_step_metrics(
             segment_start_carry = _segment_start_carry(start_idx)
             dt_segment = _accepted_dt_slice(start_idx, end_idx)
             payload_rollout = _collect_segment_payloads_compiled(segment_start_carry, dt_segment)
-            carry_bar = _reverse_segment_compiled(segment_start_carry, payload_rollout, carry_bar)
+            carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
             "segment_count": jnp.asarray(len(segment_ranges), dtype=jnp.int32),
