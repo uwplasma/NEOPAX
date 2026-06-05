@@ -30,6 +30,7 @@ from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedPrimitivePayloadRollout,
     _RadauAcceptedStepReducedOutput,
+    _RadauAcceptedStepReversePayload,
     _radau_accepted_step_primitive,
     _radau_accepted_step_primitive_pullback,
     _radau_adaptive_schedule_rollout,
@@ -330,7 +331,8 @@ def _compute_multi_step_metrics(
         )
 
     payload_collect_cache = {}
-    one_step_reverse_fn = None
+    one_step_reverse_reuse_fn = None
+    one_step_reverse_rebuild_fn = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
         length = int(dt_segment.shape[0])
@@ -345,7 +347,33 @@ def _compute_multi_step_metrics(
 
     carry_template = initial_carry
 
-    def _reverse_one_step(reverse_payload, carry_bar):
+    payload_dynamic_field_names = tuple(
+        field.name
+        for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
+        if field.name != "lagged_response_valid_in"
+    )
+
+    def _payload_to_dynamic_values(reverse_payload):
+        return tuple(getattr(reverse_payload, name) for name in payload_dynamic_field_names)
+
+    def _payload_from_dynamic_values(dynamic_values, lagged_valid_value: bool):
+        payload_kwargs = {name: value for name, value in zip(payload_dynamic_field_names, dynamic_values)}
+        payload_kwargs["lagged_response_valid_in"] = jnp.asarray(lagged_valid_value, dtype=jnp.bool_)
+        return _RadauAcceptedStepReversePayload(**payload_kwargs)
+
+    def _reverse_one_step_reuse(dynamic_values, carry_bar):
+        reverse_payload = _payload_from_dynamic_values(dynamic_values, True)
+        return _radau_accepted_step_primitive_pullback(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_template,
+            execution_context.attempt_context,
+            reverse_payload,
+            carry_bar,
+        )
+
+    def _reverse_one_step_rebuild(dynamic_values, carry_bar):
+        reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
         return _radau_accepted_step_primitive_pullback(
             execution_context.kernel_context,
             execution_context.physics_context,
@@ -356,14 +384,16 @@ def _compute_multi_step_metrics(
         )
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
-        nonlocal one_step_reverse_fn
+        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn
         step_count = int(payload_rollout.accepted_dts.shape[0])
         if execution_mode == "jit":
-            if one_step_reverse_fn is None:
-                one_step_reverse_fn = jax.jit(_reverse_one_step)
-            fn = one_step_reverse_fn
+            if one_step_reverse_reuse_fn is None:
+                one_step_reverse_reuse_fn = jax.jit(_reverse_one_step_reuse)
+            if one_step_reverse_rebuild_fn is None:
+                one_step_reverse_rebuild_fn = jax.jit(_reverse_one_step_rebuild)
         else:
-            fn = _reverse_one_step
+            one_step_reverse_reuse_fn = _reverse_one_step_reuse
+            one_step_reverse_rebuild_fn = _reverse_one_step_rebuild
 
         next_bar = carry_bar
         for step_idx in range(step_count - 1, -1, -1):
@@ -371,11 +401,19 @@ def _compute_multi_step_metrics(
                 lambda x, idx=step_idx: x[idx],
                 payload_rollout.reverse_payloads,
             )
+            dynamic_values = _payload_to_dynamic_values(reverse_payload)
+            lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
             if execution_mode == "jit":
-                next_bar = fn(reverse_payload, next_bar)
+                if lagged_valid_value:
+                    next_bar = one_step_reverse_reuse_fn(dynamic_values, next_bar)
+                else:
+                    next_bar = one_step_reverse_rebuild_fn(dynamic_values, next_bar)
             else:
                 with jax.disable_jit():
-                    next_bar = fn(reverse_payload, next_bar)
+                    if lagged_valid_value:
+                        next_bar = one_step_reverse_reuse_fn(dynamic_values, next_bar)
+                    else:
+                        next_bar = one_step_reverse_rebuild_fn(dynamic_values, next_bar)
         return next_bar
 
     def _reverse_only_once():
