@@ -419,12 +419,10 @@ def _select_reverse_payload_from_rollout(
     )
     if payload_capture_device == "cpu":
         capture_device = jax.devices("cpu")[0]
-        execution_context_capture = jax.device_put(execution_context, capture_device)
-        initial_carry_capture = jax.device_put(initial_carry, capture_device)
         with jax.default_device(capture_device):
             payload_rollout = _radau_collect_realized_accepted_step_payloads(
-                execution_context_capture,
-                initial_carry_capture,
+                execution_context,
+                initial_carry,
                 max_total_steps=capped_max_total_steps,
                 stop_after_accepted_steps=rollout_accepted_step_limit,
             )
