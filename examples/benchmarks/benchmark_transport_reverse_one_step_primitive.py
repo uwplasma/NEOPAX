@@ -90,6 +90,7 @@ def _compute_one_step_metrics(
     *,
     bar_mode: str,
     execution_mode: str,
+    payload_mode: str,
 ):
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
@@ -122,21 +123,52 @@ def _compute_one_step_metrics(
             "primitive_prev_stages_bar_max": _tree_max_abs(primitive_reduced_bar.prev_stages_out),
         }
 
+    def _primitive_dynamic_fn(reverse_payload, reduced_bar):
+        primitive_reduced_bar = _radau_accepted_step_primitive_pullback(
+            kernel_context,
+            physics_context,
+            initial_carry,
+            attempt_context,
+            reverse_payload,
+            reduced_bar,
+        )
+        return {
+            "converged": primitive_result.attempt_result.converged,
+            "err_norm": primitive_result.attempt_result.err_norm,
+            "trial_dt": primitive_result.attempt_result.trial_dt,
+            "newton_iter_count": primitive_result.attempt_result.newton_iter_count,
+            "primitive_y_bar_max": _tree_max_abs(primitive_reduced_bar.y_out),
+            "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(primitive_reduced_bar.dt_out, dtype=jnp.float64))),
+            "primitive_prev_stages_bar_max": _tree_max_abs(primitive_reduced_bar.prev_stages_out),
+        }
+
     if execution_mode == "jit":
-        compare_fn = jax.jit(_primitive_only_fn)
+        if payload_mode == "closed-over":
+            compare_fn = jax.jit(_primitive_only_fn)
+            call = lambda: compare_fn()
+        elif payload_mode == "dynamic":
+            compare_fn = jax.jit(_primitive_dynamic_fn)
+            call = lambda: compare_fn(primitive_result.reverse_payload, reduced_output_bar)
+        else:
+            raise ValueError(f"Unsupported payload mode: {payload_mode}")
         t0 = time.perf_counter()
-        first = compare_fn()
+        first = call()
         jax.block_until_ready(first["primitive_y_bar_max"])
         compile_plus_execute_s = time.perf_counter() - t0
 
         t1 = time.perf_counter()
-        second = compare_fn()
+        second = call()
         jax.block_until_ready(second["primitive_y_bar_max"])
         execute_s = time.perf_counter() - t1
     else:
         t0 = time.perf_counter()
         with jax.disable_jit():
-            second = _primitive_only_fn()
+            if payload_mode == "closed-over":
+                second = _primitive_only_fn()
+            elif payload_mode == "dynamic":
+                second = _primitive_dynamic_fn(primitive_result.reverse_payload, reduced_output_bar)
+            else:
+                raise ValueError(f"Unsupported payload mode: {payload_mode}")
         jax.block_until_ready(second["primitive_y_bar_max"])
         execute_s = time.perf_counter() - t0
         compile_plus_execute_s = execute_s
@@ -182,6 +214,12 @@ def main() -> None:
         choices=("eager", "jit"),
         help="Run the one-step comparison eagerly or under JIT. Default: eager.",
     )
+    parser.add_argument(
+        "--payload-mode",
+        default="closed-over",
+        choices=("closed-over", "dynamic"),
+        help="Whether the reverse payload is closed over like a residual or passed as a runtime argument. Default: closed-over.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -211,6 +249,7 @@ def main() -> None:
         initial_carry,
         bar_mode=args.bar_mode,
         execution_mode=args.execution_mode,
+        payload_mode=args.payload_mode,
     )
 
     report = {
@@ -222,6 +261,7 @@ def main() -> None:
         "accepted_step_limit": int(args.accepted_step_limit),
         "bar_mode": args.bar_mode,
         "execution_mode": args.execution_mode,
+        "payload_mode": args.payload_mode,
         "result": result,
     }
 
@@ -232,7 +272,8 @@ def main() -> None:
     print(f"[autodiff-gate] parameters={list(parameter_names)}")
     print(
         f"[autodiff-gate] bar_mode={args.bar_mode} "
-        f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode}"
+        f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode} "
+        f"payload_mode={args.payload_mode}"
     )
     for key, value in result.items():
         if isinstance(value, bool):
