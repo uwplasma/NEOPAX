@@ -86,10 +86,18 @@ def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutpu
 
 
 def _zero_like_value(value):
-    arr = jnp.asarray(value)
-    if jnp.issubdtype(arr.dtype, jnp.bool_):
-        return jnp.zeros_like(arr, dtype=jnp.bool_)
-    return jnp.zeros_like(arr)
+    if value is None:
+        return None
+
+    def _zero_leaf(leaf):
+        if leaf is None:
+            return None
+        arr = jnp.asarray(leaf)
+        if jnp.issubdtype(arr.dtype, jnp.bool_):
+            return jnp.zeros_like(arr, dtype=jnp.bool_)
+        return jnp.zeros_like(arr)
+
+    return jax.tree_util.tree_map(_zero_leaf, value)
 
 
 def _ablate_reverse_payload(reverse_payload, ablation_mode: str):
@@ -129,8 +137,10 @@ def _payload_leaf_stats(reverse_payload):
     group_totals = {key: 0 for key in groups}
     for field in dataclasses.fields(reverse_payload):
         name = field.name
-        arr = np.asarray(jax.device_get(getattr(reverse_payload, name)))
-        bytes_used = int(arr.nbytes)
+        value = getattr(reverse_payload, name)
+        leaves = [leaf for leaf in jax.tree_util.tree_leaves(value) if leaf is not None]
+        arrays = [np.asarray(jax.device_get(leaf)) for leaf in leaves]
+        bytes_used = int(sum(arr.nbytes for arr in arrays))
         total_bytes += bytes_used
         group_name = "scalars_other"
         for candidate, members in groups.items():
@@ -138,12 +148,22 @@ def _payload_leaf_stats(reverse_payload):
                 group_name = candidate
                 break
         group_totals[group_name] += bytes_used
+        if arrays:
+            combined_elements = int(sum(arr.size for arr in arrays))
+            combined_dtype = ",".join(sorted({str(arr.dtype) for arr in arrays}))
+            shape_repr = [list(arr.shape) for arr in arrays[:3]]
+            if len(arrays) > 3:
+                shape_repr.append(["..."])
+        else:
+            combined_elements = 0
+            combined_dtype = "None"
+            shape_repr = []
         stats.append(
             {
                 "name": name,
-                "shape": list(arr.shape),
-                "dtype": str(arr.dtype),
-                "elements": int(arr.size),
+                "shape": shape_repr,
+                "dtype": combined_dtype,
+                "elements": combined_elements,
                 "bytes": bytes_used,
                 "group": group_name,
             }
