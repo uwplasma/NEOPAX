@@ -75,6 +75,74 @@ def _tree_max_abs(tree) -> jax.Array:
     return jnp.max(jnp.stack(vals))
 
 
+def _zero_like_value(value):
+    if value is None:
+        return None
+
+    def _zero_leaf(leaf):
+        if leaf is None:
+            return None
+        arr = jnp.asarray(leaf)
+        if jnp.issubdtype(arr.dtype, jnp.bool_):
+            return jnp.zeros_like(arr, dtype=jnp.bool_)
+        return jnp.zeros_like(arr)
+
+    return jax.tree_util.tree_map(_zero_leaf, value)
+
+
+def _ablate_reverse_payload(reverse_payload, ablation_mode: str):
+    if ablation_mode == "none":
+        return reverse_payload
+
+    fields = {}
+    for field in dataclasses.fields(reverse_payload):
+        name = field.name
+        value = getattr(reverse_payload, name)
+        zero = False
+        if ablation_mode == "stage" and name in {"stage_history"}:
+            zero = True
+        elif ablation_mode == "lagged" and name in {"lagged_response_in", "lagged_response_cache_in", "rhs_time_ref"}:
+            zero = True
+        elif ablation_mode == "jacobian" and name in {"jacobian_out"}:
+            zero = True
+        elif ablation_mode == "lu" and name in {"real_lu_out", "complex_lu_out"}:
+            zero = True
+        elif ablation_mode == "pivots" and name in {"real_piv_out", "complex_piv_out"}:
+            zero = True
+        fields[name] = _zero_like_value(value) if zero else value
+    return dataclasses.replace(reverse_payload, **fields)
+
+
+def _payload_leaf_stats(reverse_payload):
+    stats = []
+    total_bytes = 0
+    groups = {
+        "stage": {"stage_history"},
+        "lagged": {"lagged_response_in", "lagged_response_cache_in", "rhs_time_ref"},
+        "jacobian": {"jacobian_out"},
+        "lu": {"real_lu_out", "complex_lu_out"},
+        "pivots": {"real_piv_out", "complex_piv_out"},
+        "scalars_other": set(),
+    }
+    group_totals = {key: 0 for key in groups}
+    for field in dataclasses.fields(reverse_payload):
+        name = field.name
+        value = getattr(reverse_payload, name)
+        leaves = [leaf for leaf in jax.tree_util.tree_leaves(value) if leaf is not None]
+        arrays = [np.asarray(jax.device_get(leaf)) for leaf in leaves]
+        bytes_used = int(sum(arr.nbytes for arr in arrays))
+        total_bytes += bytes_used
+        group_name = "scalars_other"
+        for candidate, members in groups.items():
+            if name in members:
+                group_name = candidate
+                break
+        group_totals[group_name] += bytes_used
+        stats.append({"name": name, "bytes": bytes_used, "group": group_name})
+    stats.sort(key=lambda item: item["bytes"], reverse=True)
+    return {"total_bytes": total_bytes, "group_totals": group_totals, "leaves": stats}
+
+
 def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutput:
     if mode == "y-only":
         return _RadauAcceptedStepReducedOutput(
@@ -126,6 +194,7 @@ def _compute_multi_step_metrics(
     segment_length: int,
     checkpoint_count: int,
     reverse_probe_mode: str,
+    payload_ablation: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -334,6 +403,7 @@ def _compute_multi_step_metrics(
     payload_collect_cache = {}
     one_step_reverse_reuse_fn = None
     one_step_reverse_rebuild_fn = None
+    last_step_payload_report = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
         length = int(dt_segment.shape[0])
@@ -385,7 +455,7 @@ def _compute_multi_step_metrics(
         )
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
-        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn
+        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn, last_step_payload_report
         step_count = int(payload_rollout.accepted_dts.shape[0])
         if execution_mode == "jit":
             if one_step_reverse_reuse_fn is None:
@@ -402,6 +472,9 @@ def _compute_multi_step_metrics(
                 lambda x, idx=step_idx: x[idx],
                 payload_rollout.reverse_payloads,
             )
+            reverse_payload = _ablate_reverse_payload(reverse_payload, payload_ablation)
+            if last_step_payload_report is None:
+                last_step_payload_report = _payload_leaf_stats(reverse_payload)
             dynamic_values = _payload_to_dynamic_values(reverse_payload)
             lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
             if execution_mode == "jit":
@@ -429,6 +502,7 @@ def _compute_multi_step_metrics(
             one_step_reverse_rebuild_fn = _reverse_one_step_rebuild
 
     def _reverse_only_once():
+        nonlocal last_step_payload_report
         _ensure_one_step_reverse_fns()
         carry_bar = final_output_bar
         reversed_ranges = list(reversed(segment_ranges))
@@ -442,6 +516,9 @@ def _compute_multi_step_metrics(
                     lambda x, idx=last_idx: x[idx],
                     payload_rollout.reverse_payloads,
                 )
+                reverse_payload = _ablate_reverse_payload(reverse_payload, payload_ablation)
+                if last_step_payload_report is None:
+                    last_step_payload_report = _payload_leaf_stats(reverse_payload)
                 dynamic_values = _payload_to_dynamic_values(reverse_payload)
                 lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
                 if execution_mode == "jit":
@@ -480,6 +557,7 @@ def _compute_multi_step_metrics(
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
+    result["last_step_payload_report"] = last_step_payload_report
     return result
 
 
@@ -541,6 +619,12 @@ def main() -> None:
         choices=("full", "last-step-only"),
         help="Run the full segmented reverse or only the very first reverse step at the end of the rollout. Default: full.",
     )
+    parser.add_argument(
+        "--payload-ablation",
+        default="none",
+        choices=("none", "stage", "lagged", "jacobian", "lu", "pivots"),
+        help="Zero one reverse-payload family before the reverse probe. Default: none.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -588,6 +672,7 @@ def main() -> None:
             segment_length=args.segment_length,
             checkpoint_count=args.checkpoint_count,
             reverse_probe_mode=args.reverse_probe_mode,
+            payload_ablation=args.payload_ablation,
         )
         prefix_reports.append(
             {
@@ -610,6 +695,7 @@ def main() -> None:
         "segment_length": int(args.segment_length),
         "checkpoint_count": int(args.checkpoint_count),
         "reverse_probe_mode": args.reverse_probe_mode,
+        "payload_ablation": args.payload_ablation,
         "prefix_reports": prefix_reports,
     }
 
@@ -623,7 +709,7 @@ def main() -> None:
         f"bar_mode={args.bar_mode} execution_mode={args.execution_mode} "
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
         f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
-        f"reverse_probe_mode={args.reverse_probe_mode}"
+        f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
