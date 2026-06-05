@@ -711,3 +711,38 @@ python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py -
    contract philosophy as forward mode.
 4. Only after the one-step `dynamic` payload form works under JIT, return to
    segmented multi-step rollout scaling.
+
+### 2026-06-05 update: single-family payload ablations did not move the OOM
+
+The following one-step dynamic-payload ablations were tried:
+
+- `--payload-ablation stage`
+- `--payload-ablation jacobian`
+- `--payload-ablation lu`
+
+Observed result:
+
+- all still OOM at essentially the same `~49.1 GiB`
+
+Interpretation:
+
+- the dynamic-payload blowup is not dominated by one obvious payload family
+- it is more likely caused by the dynamic-payload calling convention or the
+  overall dynamic pytree contract itself
+
+### Revised immediate next tests
+
+Stop spending time on more single-family zero ablations first.
+
+Instead test dynamic-argument structure directly:
+
+1. dynamic `reverse_payload`, but closed-over `reduced_output_bar`
+2. partially dynamic payload:
+   - close over most payload leaves
+   - pass only one or a few small leaves dynamically
+3. single-leaf dynamic probes
+
+Purpose:
+
+- determine whether any dynamic payload pytree triggers the bad compile
+- or whether only large dynamic pytrees do

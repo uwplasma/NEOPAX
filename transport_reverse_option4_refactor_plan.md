@@ -414,6 +414,30 @@ Use the one-step dynamic payload ablations first:
 
 These are now the highest-value tests before any more rollout work.
 
+## 2026-06-05 revised next tests
+
+Current result:
+
+- `stage`, `jacobian`, and `lu` single-family dynamic-payload ablations still
+  OOM at the same `~49.1 GiB`
+
+Updated conclusion:
+
+- the next discriminator should be the **dynamic argument structure**, not more
+  single-family zeroing first
+
+Next recommended tests:
+
+1. dynamic `reverse_payload`, closed-over `reduced_output_bar`
+2. partially dynamic payload with most leaves closed over
+3. single-leaf dynamic payload probes
+
+Why:
+
+- we need to learn whether the problem is:
+  - any dynamic payload pytree at all, or
+  - only a large dynamic payload pytree
+
 ## Function-by-Function Implementation Checklist
 
 This section maps the refactor onto the current code in:

@@ -123,6 +123,34 @@ def _ablate_reverse_payload(reverse_payload, ablation_mode: str):
     return dataclasses.replace(reverse_payload, **fields)
 
 
+def _structure_leaf_names(structure_mode: str) -> tuple[str, ...]:
+    if structure_mode == "full":
+        return ()
+    if structure_mode == "scalars":
+        return (
+            "t_in",
+            "dt_in",
+            "trial_dt",
+            "prev_dt_in",
+            "prev_theta_final_in",
+            "prev_newton_iter_count_in",
+            "lagged_response_valid_in",
+        )
+    if structure_mode == "trial_dt":
+        return ("trial_dt",)
+    if structure_mode == "lagged_valid":
+        return ("lagged_response_valid_in",)
+    if structure_mode == "prev_theta":
+        return ("prev_theta_final_in",)
+    if structure_mode == "stage":
+        return ("stage_history",)
+    raise ValueError(f"Unsupported structure mode: {structure_mode}")
+
+
+def _payload_kwargs(reverse_payload) -> dict[str, Any]:
+    return {field.name: getattr(reverse_payload, field.name) for field in dataclasses.fields(reverse_payload)}
+
+
 def _payload_leaf_stats(reverse_payload):
     stats = []
     total_bytes = 0
@@ -184,6 +212,7 @@ def _compute_one_step_metrics(
     execution_mode: str,
     payload_mode: str,
     ablation_mode: str,
+    dynamic_structure: str,
 ):
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
@@ -197,6 +226,7 @@ def _compute_one_step_metrics(
     )
     reverse_payload = _ablate_reverse_payload(primitive_result.reverse_payload, ablation_mode)
     reduced_output_bar = _make_reduced_output_bar(initial_carry, bar_mode)
+    payload_field_names = tuple(field.name for field in dataclasses.fields(reverse_payload))
 
     def _primitive_only_fn():
         primitive_reduced_bar = _radau_accepted_step_primitive_pullback(
@@ -236,6 +266,25 @@ def _compute_one_step_metrics(
             "primitive_prev_stages_bar_max": _tree_max_abs(primitive_reduced_bar.prev_stages_out),
         }
 
+    if dynamic_structure == "full":
+        dynamic_leaf_names = payload_field_names
+    else:
+        dynamic_leaf_names = tuple(name for name in _structure_leaf_names(dynamic_structure) if name in payload_field_names)
+    payload_base_kwargs = _payload_kwargs(reverse_payload)
+
+    def _rebuild_payload_from_dynamic(dynamic_values):
+        updated = dict(payload_base_kwargs)
+        for name, value in zip(dynamic_leaf_names, dynamic_values):
+            updated[name] = value
+        return dataclasses.replace(reverse_payload, **updated)
+
+    def _primitive_dynamic_payload_only_fn(reverse_payload_dynamic):
+        return _primitive_dynamic_fn(reverse_payload_dynamic, reduced_output_bar)
+
+    def _primitive_dynamic_selected_fn(dynamic_values):
+        rebuilt_payload = _rebuild_payload_from_dynamic(dynamic_values)
+        return _primitive_dynamic_fn(rebuilt_payload, reduced_output_bar)
+
     if execution_mode == "jit":
         if payload_mode == "closed-over":
             compare_fn = jax.jit(_primitive_only_fn)
@@ -243,6 +292,13 @@ def _compute_one_step_metrics(
         elif payload_mode == "dynamic":
             compare_fn = jax.jit(_primitive_dynamic_fn)
             call = lambda: compare_fn(reverse_payload, reduced_output_bar)
+        elif payload_mode == "dynamic-payload-only":
+            compare_fn = jax.jit(_primitive_dynamic_payload_only_fn)
+            call = lambda: compare_fn(reverse_payload)
+        elif payload_mode == "dynamic-selected":
+            compare_fn = jax.jit(_primitive_dynamic_selected_fn)
+            dynamic_values = tuple(getattr(reverse_payload, name) for name in dynamic_leaf_names)
+            call = lambda: compare_fn(dynamic_values)
         else:
             raise ValueError(f"Unsupported payload mode: {payload_mode}")
         t0 = time.perf_counter()
@@ -261,6 +317,11 @@ def _compute_one_step_metrics(
                 second = _primitive_only_fn()
             elif payload_mode == "dynamic":
                 second = _primitive_dynamic_fn(reverse_payload, reduced_output_bar)
+            elif payload_mode == "dynamic-payload-only":
+                second = _primitive_dynamic_payload_only_fn(reverse_payload)
+            elif payload_mode == "dynamic-selected":
+                dynamic_values = tuple(getattr(reverse_payload, name) for name in dynamic_leaf_names)
+                second = _primitive_dynamic_selected_fn(dynamic_values)
             else:
                 raise ValueError(f"Unsupported payload mode: {payload_mode}")
         jax.block_until_ready(second["primitive_y_bar_max"])
@@ -270,7 +331,10 @@ def _compute_one_step_metrics(
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
-    return result, _payload_leaf_stats(reverse_payload)
+    payload_report = _payload_leaf_stats(reverse_payload)
+    payload_report["dynamic_leaf_names"] = list(dynamic_leaf_names)
+    payload_report["dynamic_leaf_count"] = int(len(dynamic_leaf_names))
+    return result, payload_report
 
 
 def main() -> None:
@@ -311,14 +375,20 @@ def main() -> None:
     parser.add_argument(
         "--payload-mode",
         default="closed-over",
-        choices=("closed-over", "dynamic"),
-        help="Whether the reverse payload is closed over like a residual or passed as a runtime argument. Default: closed-over.",
+        choices=("closed-over", "dynamic", "dynamic-payload-only", "dynamic-selected"),
+        help="How much of the one-step reverse contract is passed dynamically at runtime. Default: closed-over.",
     )
     parser.add_argument(
         "--payload-ablation",
         default="none",
         choices=("none", "stage", "lagged", "jacobian", "lu", "pivots"),
         help="Zero one payload family before running the reverse benchmark. Default: none.",
+    )
+    parser.add_argument(
+        "--dynamic-structure",
+        default="full",
+        choices=("full", "scalars", "trial_dt", "lagged_valid", "prev_theta", "stage"),
+        help="When using `dynamic-selected`, choose which payload leaves remain dynamic. Default: full.",
     )
     args = parser.parse_args()
 
@@ -351,6 +421,7 @@ def main() -> None:
         execution_mode=args.execution_mode,
         payload_mode=args.payload_mode,
         ablation_mode=args.payload_ablation,
+        dynamic_structure=args.dynamic_structure,
     )
 
     report = {
@@ -364,6 +435,7 @@ def main() -> None:
         "execution_mode": args.execution_mode,
         "payload_mode": args.payload_mode,
         "payload_ablation": args.payload_ablation,
+        "dynamic_structure": args.dynamic_structure,
         "payload_report": payload_report,
         "result": result,
     }
@@ -376,11 +448,13 @@ def main() -> None:
     print(
         f"[autodiff-gate] bar_mode={args.bar_mode} "
         f"accepted_step_limit={int(args.accepted_step_limit)} execution_mode={args.execution_mode} "
-        f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation}"
+        f"payload_mode={args.payload_mode} payload_ablation={args.payload_ablation} "
+        f"dynamic_structure={args.dynamic_structure}"
     )
     print(
         f"[autodiff-gate] payload_total_bytes={int(payload_report['total_bytes'])} "
-        f"group_totals={payload_report['group_totals']}"
+        f"group_totals={payload_report['group_totals']} "
+        f"dynamic_leaf_names={payload_report['dynamic_leaf_names']}"
     )
     for key, value in result.items():
         if isinstance(value, bool):
