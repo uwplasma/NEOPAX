@@ -30,6 +30,8 @@ from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
+    _radau_attempt_result_from_reverse_payload,
+    _radau_carry_from_reverse_payload,
     _radau_accepted_step_primitive_pullback,
     _radau_collect_realized_accepted_step_payloads,
 )
@@ -248,25 +250,36 @@ def _compute_one_step_metrics(
     payload_mode: str,
     ablation_mode: str,
     dynamic_structure: str,
+    selected_template_carry=None,
     selected_reverse_payload=None,
     selected_output_bar=None,
     selected_attempt_result=None,
 ):
+    carry_for_probe = initial_carry if selected_template_carry is None else selected_template_carry
     kernel_context = execution_context.kernel_context
     physics_context = execution_context.physics_context
     attempt_context = execution_context.attempt_context
 
-    primitive_result = _radau_accepted_step_primitive(
-        kernel_context,
-        physics_context,
-        initial_carry,
-        attempt_context,
-    )
-    attempt_result = primitive_result.attempt_result if selected_attempt_result is None else selected_attempt_result
-    base_reverse_payload = primitive_result.reverse_payload if selected_reverse_payload is None else selected_reverse_payload
+    if selected_reverse_payload is None:
+        primitive_result = _radau_accepted_step_primitive(
+            kernel_context,
+            physics_context,
+            carry_for_probe,
+            attempt_context,
+        )
+        base_reverse_payload = primitive_result.reverse_payload
+        attempt_result = primitive_result.attempt_result if selected_attempt_result is None else selected_attempt_result
+    else:
+        primitive_result = None
+        base_reverse_payload = selected_reverse_payload
+        attempt_result = (
+            _radau_attempt_result_from_reverse_payload(selected_reverse_payload, carry_for_probe)
+            if selected_attempt_result is None
+            else selected_attempt_result
+        )
     reverse_payload = _ablate_reverse_payload(base_reverse_payload, ablation_mode)
     reduced_output_bar = (
-        _make_reduced_output_bar(initial_carry, bar_mode)
+        _make_reduced_output_bar(carry_for_probe, bar_mode)
         if selected_output_bar is None
         else selected_output_bar
     )
@@ -276,7 +289,7 @@ def _compute_one_step_metrics(
         primitive_reduced_bar = _radau_accepted_step_primitive_pullback(
             kernel_context,
             physics_context,
-            initial_carry,
+            carry_for_probe,
             attempt_context,
             reverse_payload,
             reduced_output_bar,
@@ -295,7 +308,7 @@ def _compute_one_step_metrics(
         primitive_reduced_bar = _radau_accepted_step_primitive_pullback(
             kernel_context,
             physics_context,
-            initial_carry,
+            carry_for_probe,
             attempt_context,
             reverse_payload,
             reduced_bar,
@@ -431,7 +444,7 @@ def _select_reverse_payload_from_rollout(
     payload_capture_device: str,
 ):
     if payload_source == "prepared-first":
-        return None, None, None, {}
+        return None, None, None, None, {}
 
     if payload_source != "last-from-rollout":
         raise ValueError(f"Unsupported payload source: {payload_source}")
@@ -471,6 +484,11 @@ def _select_reverse_payload_from_rollout(
     selected_payload = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reverse_payloads)
     selected_output = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reduced_outputs)
     selected_output_bar = _make_reduced_output_bar_from_output(selected_output, bar_mode)
+    selected_template_carry = _radau_carry_from_reverse_payload(
+        selected_payload,
+        initial_carry,
+        execution_context.physics_context,
+    )
     info = {
         "payload_source": payload_source,
         "selected_accepted_index": int(accepted_indices.size - 1),
@@ -480,7 +498,7 @@ def _select_reverse_payload_from_rollout(
         "capped_max_total_steps": int(capped_max_total_steps),
         "payload_capture_device": payload_capture_device,
         }
-    return selected_payload, selected_output_bar, None, info
+    return selected_template_carry, selected_payload, selected_output_bar, None, info
 
 
 def main() -> None:
@@ -602,7 +620,7 @@ def main() -> None:
         )
     )
 
-    selected_reverse_payload, selected_output_bar, selected_attempt_result, payload_source_info = _select_reverse_payload_from_rollout(
+    selected_template_carry, selected_reverse_payload, selected_output_bar, selected_attempt_result, payload_source_info = _select_reverse_payload_from_rollout(
         execution_context,
         initial_carry,
         payload_source=args.payload_source,
@@ -621,6 +639,7 @@ def main() -> None:
         payload_mode=args.payload_mode,
         ablation_mode=args.payload_ablation,
         dynamic_structure=args.dynamic_structure,
+        selected_template_carry=selected_template_carry,
         selected_reverse_payload=selected_reverse_payload,
         selected_output_bar=selected_output_bar,
         selected_attempt_result=selected_attempt_result,
