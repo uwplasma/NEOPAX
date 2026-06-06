@@ -241,6 +241,43 @@ def _payload_leaf_stats(reverse_payload):
     }
 
 
+def _payload_finite_stats(reverse_payload):
+    leaf_reports = []
+    nonfinite_names = []
+    for field in dataclasses.fields(reverse_payload):
+        name = field.name
+        value = getattr(reverse_payload, name)
+        leaves = [leaf for leaf in jax.tree_util.tree_leaves(value) if leaf is not None]
+        if not leaves:
+            leaf_reports.append({"name": name, "all_finite": True, "nonfinite_leaves": 0})
+            continue
+        total_nonfinite = 0
+        all_finite = True
+        for leaf in leaves:
+            arr = np.asarray(jax.device_get(leaf))
+            if arr.dtype.kind in {"b", "i", "u"}:
+                continue
+            finite = np.isfinite(arr)
+            count_bad = int(arr.size - np.count_nonzero(finite))
+            total_nonfinite += count_bad
+            if count_bad:
+                all_finite = False
+        if not all_finite:
+            nonfinite_names.append(name)
+        leaf_reports.append(
+            {
+                "name": name,
+                "all_finite": bool(all_finite),
+                "nonfinite_leaves": int(total_nonfinite),
+            }
+        )
+    return {
+        "all_finite": bool(len(nonfinite_names) == 0),
+        "nonfinite_leaf_names": nonfinite_names,
+        "leaves": leaf_reports,
+    }
+
+
 def _compute_one_step_metrics(
     execution_context,
     initial_carry,
@@ -421,6 +458,7 @@ def _compute_one_step_metrics(
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
     payload_report = _payload_leaf_stats(reverse_payload)
+    payload_report["finite_stats"] = _payload_finite_stats(reverse_payload)
     report_leaf_names = (
         branch_dynamic_leaf_names
         if payload_mode in {"dynamic-branch-specialized", "dynamic-branch-specialized-with-bar"}
