@@ -86,6 +86,32 @@ def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutpu
     raise ValueError(f"Unsupported bar mode: {mode}")
 
 
+def _make_reduced_output_bar_from_output(
+    reduced_output: _RadauAcceptedStepReducedOutput, mode: str
+) -> _RadauAcceptedStepReducedOutput:
+    if mode == "y-only":
+        return _RadauAcceptedStepReducedOutput(
+            t_out=jnp.zeros_like(reduced_output.t_out),
+            y_out=jnp.ones_like(reduced_output.y_out),
+            dt_out=jnp.zeros_like(reduced_output.dt_out),
+            prev_stages_out=jnp.zeros_like(reduced_output.prev_stages_out),
+            prev_dt_out=jnp.zeros_like(reduced_output.prev_dt_out),
+            lagged_reference_y_out=jnp.zeros_like(reduced_output.lagged_reference_y_out),
+            prev_theta_final_out=jnp.zeros_like(reduced_output.prev_theta_final_out),
+        )
+    if mode == "all-ones":
+        return _RadauAcceptedStepReducedOutput(
+            t_out=jnp.ones_like(reduced_output.t_out),
+            y_out=jnp.ones_like(reduced_output.y_out),
+            dt_out=jnp.ones_like(reduced_output.dt_out),
+            prev_stages_out=jnp.ones_like(reduced_output.prev_stages_out),
+            prev_dt_out=jnp.ones_like(reduced_output.prev_dt_out),
+            lagged_reference_y_out=jnp.ones_like(reduced_output.lagged_reference_y_out),
+            prev_theta_final_out=jnp.ones_like(reduced_output.prev_theta_final_out),
+        )
+    raise ValueError(f"Unsupported bar mode: {mode}")
+
+
 def _zero_like_value(value):
     if value is None:
         return None
@@ -443,7 +469,8 @@ def _select_reverse_payload_from_rollout(
 
     last_idx = int(accepted_indices[-1])
     selected_payload = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reverse_payloads)
-    selected_output_bar = _make_reduced_output_bar(payload_rollout.final_carry, bar_mode)
+    selected_output = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reduced_outputs)
+    selected_output_bar = _make_reduced_output_bar_from_output(selected_output, bar_mode)
     info = {
         "payload_source": payload_source,
         "selected_accepted_index": int(accepted_indices.size - 1),
