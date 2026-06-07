@@ -278,6 +278,21 @@ def _payload_finite_stats(reverse_payload):
     }
 
 
+def _first_nonfinite_payload_step(payload_rollout, accepted_indices) -> dict[str, Any] | None:
+    accepted_dts_np = np.asarray(jax.device_get(payload_rollout.accepted_dts))
+    for accepted_rank, trace_idx in enumerate(accepted_indices.tolist()):
+        reverse_payload = jax.tree_util.tree_map(lambda x, idx=trace_idx: x[idx], payload_rollout.reverse_payloads)
+        finite_stats = _payload_finite_stats(reverse_payload)
+        if not finite_stats["all_finite"]:
+            return {
+                "accepted_index": int(accepted_rank),
+                "trace_index": int(trace_idx),
+                "dt": float(np.asarray(accepted_dts_np[trace_idx]).item()),
+                "nonfinite_leaf_names": list(finite_stats["nonfinite_leaf_names"]),
+            }
+    return None
+
+
 def _compute_one_step_metrics(
     execution_context,
     initial_carry,
@@ -518,6 +533,7 @@ def _select_reverse_payload_from_rollout(
     if accepted_indices.size == 0:
         raise ValueError("No accepted steps were available in the selected rollout payload source.")
 
+    first_nonfinite_payload_step = _first_nonfinite_payload_step(payload_rollout, accepted_indices)
     last_idx = int(accepted_indices[-1])
     selected_payload = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reverse_payloads)
     selected_output = jax.tree_util.tree_map(lambda x, idx=last_idx: x[idx], payload_rollout.reduced_outputs)
@@ -535,7 +551,8 @@ def _select_reverse_payload_from_rollout(
         "rollout_accepted_step_limit": int(rollout_accepted_step_limit),
         "capped_max_total_steps": int(capped_max_total_steps),
         "payload_capture_device": payload_capture_device,
-        }
+        "first_nonfinite_payload_step": first_nonfinite_payload_step,
+    }
     return selected_template_carry, selected_payload, selected_output_bar, None, info
 
 
