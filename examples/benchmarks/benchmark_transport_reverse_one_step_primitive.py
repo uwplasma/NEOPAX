@@ -28,6 +28,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
+    _RadauAcceptedStepCarry,
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
     _radau_attempt_result_from_reverse_payload,
@@ -63,6 +64,28 @@ def _tree_max_abs(tree) -> jax.Array:
         return jnp.asarray(0.0, dtype=jnp.float64)
     vals = [jnp.max(jnp.abs(jnp.asarray(leaf, dtype=jnp.float64))) for leaf in leaves]
     return jnp.max(jnp.stack(vals))
+
+
+def _tree_l2_norm(tree) -> float:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return 0.0
+    total = 0.0
+    for leaf in leaves:
+        arr = np.asarray(jax.device_get(leaf), dtype=float)
+        total += float(np.sum(np.square(arr.ravel())))
+    return float(np.sqrt(total))
+
+
+def _value_all_finite(value) -> bool:
+    leaves = [leaf for leaf in jax.tree_util.tree_leaves(value) if leaf is not None]
+    for leaf in leaves:
+        arr = np.asarray(jax.device_get(leaf))
+        if arr.dtype.kind in {"b", "i", "u"}:
+            continue
+        if not np.all(np.isfinite(arr)):
+            return False
+    return True
 
 
 def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutput:
@@ -333,6 +356,52 @@ def _attempt_window_diagnostics(trace, *, target_trace_index: int, radius: int =
             }
         )
     return out
+
+
+def _carry_from_trace_at_index(trace, initial_carry, idx: int) -> _RadauAcceptedStepCarry:
+    return _RadauAcceptedStepCarry(
+        t=trace.t_start[idx],
+        y=trace.y_start[idx],
+        dt=trace.dt[idx],
+        prev_error=jnp.zeros_like(initial_carry.prev_error),
+        prev_stages=trace.prev_stages[idx],
+        prev_dt=trace.prev_dt[idx],
+        recent_reject_count=jnp.zeros_like(initial_carry.recent_reject_count),
+        regrowth_cooldown=jnp.zeros_like(initial_carry.regrowth_cooldown),
+        easy_growth_streak=jnp.zeros_like(initial_carry.easy_growth_streak),
+        lagged_response_cache=jax.tree_util.tree_map(lambda x: x[idx], trace.lagged_response_cache),
+        lagged_response_valid=trace.lagged_response_valid[idx],
+        lagged_reference_y=trace.lagged_reference_y[idx],
+        jacobian=trace.jacobian[idx],
+        cache_valid=trace.cache_valid[idx],
+        cache_dt=trace.cache_dt[idx],
+        cache_age=trace.cache_age[idx],
+        real_lu=trace.real_lu[idx],
+        real_piv=trace.real_piv[idx],
+        complex_lu=trace.complex_lu[idx],
+        complex_piv=trace.complex_piv[idx],
+        prev_theta_final=trace.prev_theta_final[idx],
+        prev_newton_iter_count=trace.prev_newton_iter_count[idx],
+    )
+
+
+def _payload_field_compare(field_name: str, lhs, rhs) -> dict[str, Any]:
+    lhs_leaves = [leaf for leaf in jax.tree_util.tree_leaves(lhs) if leaf is not None]
+    rhs_leaves = [leaf for leaf in jax.tree_util.tree_leaves(rhs) if leaf is not None]
+    lhs_finite = _value_all_finite(lhs)
+    rhs_finite = _value_all_finite(rhs)
+    if not lhs_leaves and not rhs_leaves:
+        return {"field": field_name, "lhs_all_finite": True, "rhs_all_finite": True, "diff_l2": 0.0, "diff_max": 0.0}
+    diffs = jax.tree_util.tree_map(lambda a, b: jnp.asarray(a) - jnp.asarray(b), lhs, rhs)
+    diff_l2 = _tree_l2_norm(diffs)
+    diff_max = float(np.asarray(jax.device_get(_tree_max_abs(diffs)), dtype=float))
+    return {
+        "field": field_name,
+        "lhs_all_finite": bool(lhs_finite),
+        "rhs_all_finite": bool(rhs_finite),
+        "diff_l2": diff_l2,
+        "diff_max": diff_max,
+    }
 
 
 def _compute_one_step_metrics(
@@ -614,6 +683,34 @@ def _select_reverse_payload_from_rollout(
             target_trace_index=int(first_nonfinite_payload_step["trace_index"]),
             radius=1,
         )
+        trace_idx = int(first_nonfinite_payload_step["trace_index"])
+        trace_carry = _carry_from_trace_at_index(adaptive_rollout.trace, initial_carry, trace_idx)
+        trace_primitive = _radau_accepted_step_primitive(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            trace_carry,
+            execution_context.attempt_context,
+        )
+        replay_payload_at_first_bad = jax.tree_util.tree_map(
+            lambda x, idx=trace_idx: x[idx],
+            payload_rollout.reverse_payloads,
+        )
+        fields_to_compare = (
+            "accepted_y",
+            "trial_y",
+            "stage_history",
+            "jacobian_out",
+            "real_lu_out",
+            "complex_lu_out",
+        )
+        info["first_nonfinite_forward_vs_replay_payload_compare"] = [
+            _payload_field_compare(
+                field_name,
+                getattr(trace_primitive.reverse_payload, field_name),
+                getattr(replay_payload_at_first_bad, field_name),
+            )
+            for field_name in fields_to_compare
+        ]
     return selected_template_carry, selected_payload, selected_output_bar, None, info
 
 
