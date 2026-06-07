@@ -145,6 +145,137 @@ not:
 
 This is also the closest match to what forward mode is already doing.
 
+### Current Status: Later-Step Payload Probe
+
+The current one-step option-4 benchmark has now answered the main OOM question:
+
+- the earlier dynamic one-step JIT OOM was narrowed to passing
+  `lagged_response_valid_in` as a dynamic JIT argument
+- branch-specializing the reuse/rebuild choice outside JIT fixed that one-step
+  dynamic OOM
+- a later-step payload selected from a realized rollout now also runs without
+  the old JIT OOM when captured with:
+  - `--payload-source last-from-rollout`
+  - `--rollout-accepted-step-limit 128`
+  - `--rollout-max-total-steps-multiplier 4`
+  - `--payload-capture-device cpu`
+
+So the active issue is no longer the old one-step dynamic memory blowup.
+
+### Current Status: Later-Step Payload Still Produces `nan` Cotangents
+
+The later-step one-step benchmark still returns:
+
+- `primitive_dt_bar_abs: nan`
+- `primitive_prev_stages_bar_max: nan`
+- `primitive_y_bar_max: nan`
+
+This remains true even in `closed-over` payload mode, so the remaining problem
+is **not** the dynamic runtime payload contract anymore.
+
+Confirmed command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode closed-over --payload-source last-from-rollout --rollout-accepted-step-limit 128 --rollout-max-total-steps-multiplier 4 --payload-capture-device cpu
+```
+
+### Finite-Stats Result
+
+The selected later-step payload is already nonfinite before the reverse
+pullback runs.
+
+Payload finite stats:
+
+- `all_finite: False`
+- selected payload nonfinite leaves:
+  - `y_in`
+  - `prev_stages_in`
+  - `accepted_y`
+  - `trial_y`
+  - `stage_history`
+  - `jacobian_out`
+  - `real_lu_out`
+  - `complex_lu_out`
+
+This means the reverse rule is no longer the primary suspect for the current
+failure. The selected saved payload itself is already contaminated.
+
+### First Nonfinite Accepted-Step Payload
+
+The first accepted step whose saved reverse payload becomes nonfinite is:
+
+- `accepted_index = 91`
+- `trace_index = 149`
+- `dt = 4.343504268706003e-05`
+
+The first bad payload leaves are:
+
+- `accepted_y`
+- `trial_y`
+- `stage_history`
+- `jacobian_out`
+- `real_lu_out`
+- `complex_lu_out`
+
+The extra bad leaves seen in the final selected payload:
+
+- `y_in`
+- `prev_stages_in`
+
+are best interpreted as downstream contamination from earlier bad accepted
+steps.
+
+### Architectural Interpretation
+
+This creates an important tension with the forward-path contract:
+
+- the accepted-step path is supposed to be the same in spirit for:
+  - forward primal
+  - forward JVP
+  - reverse payload collection
+
+But the current evidence shows:
+
+- forward accepted-step / forward derivative mode is still operational
+- reverse payload collection becomes nonfinite around accepted step `91`
+
+The strongest current interpretation is:
+
+- reverse payload collection is still depending on fields outside the stable
+  forward-style reduced contract, or
+- the collector is saving a different / less stable intermediate than what
+  forward mode actually relies on
+
+This is consistent with the first bad leaves being:
+
+- `accepted_y`
+- `trial_y`
+- `stage_history`
+- `jacobian_out`
+- `real_lu_out`
+- `complex_lu_out`
+
+### Next Investigation Target
+
+The next useful investigation is no longer “does the reverse rule compile?”.
+
+It is:
+
+1. inspect primal accepted-step attempt diagnostics around accepted steps
+   `90-92`
+2. determine whether the first bad accepted step already had:
+   - nonfinite stage state
+   - nonfinite stage residual
+   - newton nonfinite
+   - linearization / LU failure or unstable reuse
+3. compare what the forward accepted-step tangent path actually uses there
+   against what reverse payload collection is saving
+
+The main hypothesis to test next is:
+
+- reverse still depends on unstable saved fields that forward mode does not
+  actually need
+
 ### Latest confirmed findings
 
 #### 1. Reuse-only narrowed reverse removes the giant OOM

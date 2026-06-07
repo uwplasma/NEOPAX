@@ -22,3 +22,28 @@
   - `checkpoint_count=0` meaning no stored checkpoints
 - The main current blocker is the dynamic runtime reverse-payload contract for
   the one-step custom rule, not the accepted-step local algebra itself.
+
+## Temporary Diagnostic Rule While The `nan` Bug Is Open
+
+- Using a large saved reverse payload and/or CPU-only payload capture is allowed
+  **only as a temporary diagnostic tool** until the current later-step payload
+  `nan` bug is understood and fixed.
+- Do not treat:
+  - full saved-payload collection
+  - large payload preservation
+  - CPU-only payload capture
+  as acceptable final architecture for the reverse rollout path.
+- The current later-step payload probe may use:
+  - `--payload-source last-from-rollout`
+  - `--rollout-accepted-step-limit 128`
+  - `--rollout-max-total-steps-multiplier 4`
+  - `--payload-capture-device cpu`
+  but this is diagnostic-only, not a solution path.
+- Until the `nan` bug is fixed, it is acceptable to temporarily keep the larger
+  payload and CPU capture path in benchmark probes if that is what is needed to
+  isolate the first bad accepted step and identify which saved fields go
+  nonfinite.
+- Once the `nan` bug is fixed, return immediately to the main design rules:
+  - reduce the reverse contract to match forward mode as closely as possible
+  - avoid saving broad per-step payloads
+  - avoid CPU-only rollout capture as a steady-state reverse strategy

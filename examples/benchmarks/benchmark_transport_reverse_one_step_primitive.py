@@ -31,6 +31,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
     _radau_attempt_result_from_reverse_payload,
+    _radau_adaptive_final_state_rollout,
     _radau_carry_from_reverse_payload,
     _radau_accepted_step_primitive_pullback,
     _radau_collect_realized_accepted_step_payloads,
@@ -293,6 +294,47 @@ def _first_nonfinite_payload_step(payload_rollout, accepted_indices) -> dict[str
     return None
 
 
+def _slice_all_finite(x, idx: int) -> bool:
+    arr = np.asarray(jax.device_get(x[idx]))
+    if arr.dtype.kind in {"b", "i", "u"}:
+        return True
+    return bool(np.all(np.isfinite(arr)))
+
+
+def _attempt_window_diagnostics(trace, *, target_trace_index: int, radius: int = 1) -> list[dict[str, Any]]:
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
+    err_norms = np.asarray(jax.device_get(trace.err_norms), dtype=float)
+    theta_finals = np.asarray(jax.device_get(trace.theta_finals), dtype=float)
+    newton_iter_counts = np.asarray(jax.device_get(trace.newton_iter_counts), dtype=int)
+    n = int(active_mask.shape[0])
+    out = []
+    lo = max(0, int(target_trace_index) - int(radius))
+    hi = min(n - 1, int(target_trace_index) + int(radius))
+    for idx in range(lo, hi + 1):
+        out.append(
+            {
+                "trace_index": int(idx),
+                "active": bool(active_mask[idx]),
+                "accepted": bool(accepted_mask[idx]),
+                "dt": float(attempted_dts[idx]),
+                "err_norm": float(err_norms[idx]),
+                "theta_final": float(theta_finals[idx]),
+                "newton_iter_count": int(newton_iter_counts[idx]),
+                "y_start_all_finite": _slice_all_finite(trace.y_start, idx),
+                "y_end_all_finite": _slice_all_finite(trace.y_end, idx),
+                "prev_stages_all_finite": _slice_all_finite(trace.prev_stages, idx),
+                "jacobian_all_finite": _slice_all_finite(trace.jacobian, idx),
+                "real_lu_all_finite": _slice_all_finite(trace.real_lu, idx),
+                "complex_lu_all_finite": _slice_all_finite(trace.complex_lu, idx),
+                "lagged_response_valid": bool(np.asarray(jax.device_get(trace.lagged_response_valid[idx])).item()),
+                "next_lagged_response_valid": bool(np.asarray(jax.device_get(trace.next_lagged_response_valid[idx])).item()),
+            }
+        )
+    return out
+
+
 def _compute_one_step_metrics(
     execution_context,
     initial_carry,
@@ -519,8 +561,21 @@ def _select_reverse_payload_from_rollout(
                 stop_after_accepted_steps=rollout_accepted_step_limit,
             )
             jax.block_until_ready(payload_rollout.accepted_dts)
+            adaptive_rollout = _radau_adaptive_final_state_rollout(
+                execution_context,
+                initial_carry,
+                max_total_steps=capped_max_total_steps,
+                stop_after_accepted_steps=rollout_accepted_step_limit,
+            )
+            jax.block_until_ready(adaptive_rollout.trace.accepted_mask)
     elif payload_capture_device == "default":
         payload_rollout = _radau_collect_realized_accepted_step_payloads(
+            execution_context,
+            initial_carry,
+            max_total_steps=capped_max_total_steps,
+            stop_after_accepted_steps=rollout_accepted_step_limit,
+        )
+        adaptive_rollout = _radau_adaptive_final_state_rollout(
             execution_context,
             initial_carry,
             max_total_steps=capped_max_total_steps,
@@ -553,6 +608,12 @@ def _select_reverse_payload_from_rollout(
         "payload_capture_device": payload_capture_device,
         "first_nonfinite_payload_step": first_nonfinite_payload_step,
     }
+    if first_nonfinite_payload_step is not None:
+        info["first_nonfinite_attempt_window"] = _attempt_window_diagnostics(
+            adaptive_rollout.trace,
+            target_trace_index=int(first_nonfinite_payload_step["trace_index"]),
+            radius=1,
+        )
     return selected_template_carry, selected_payload, selected_output_bar, None, info
 
 
