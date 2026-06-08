@@ -854,3 +854,71 @@ Purpose:
 
 - determine whether any dynamic payload pytree triggers the bad compile
 - or whether only large dynamic pytrees do
+
+### 2026-06-08 update: forward tangent vs reverse cotangent contract audit
+
+The current objective remains:
+
+- differentiate only accepted steps
+- keep reverse on the same accepted-step primal path as forward mode
+- make the reverse accepted-step contract as close as possible to the forward
+  accepted-step tangent contract
+- reduce reverse memory by shrinking the propagated cotangent state rather than
+  saving broader payloads
+
+#### Accepted-step contract table
+
+| Field / lane | Forward tangent status | Reverse cotangent status | Current mismatch | Refactor direction |
+| --- | --- | --- | --- | --- |
+| `y` / `y_out` | active through `dy` in `_radau_extract_tangent_inputs_from_carry(...)` | active as `y_out` in `_RadauAcceptedStepReducedOutput` | aligned | keep active |
+| `dt` / `dt_out` | active through `dh` in `_radau_extract_tangent_inputs_from_carry(...)` | active as `dt_out` and also mixed into `t_out` / `prev_dt_out` bars | reverse is broader | keep only one propagated time-step cotangent lane if possible |
+| `lagged_response_cache` | active through `dlagged_response_cache` in `_radau_extract_tangent_inputs_from_carry(...)` | not propagated as an outer replay-state cotangent; handled locally via payload and branch pullback | partially aligned | keep local branch pullback, avoid widening rollout state |
+| `t` / `t_out` | not a first-class extracted tangent input; effect is folded into local tangent algebra through `dh` and `rhs_time_ref` | propagated as explicit `t_out` cotangent | reverse is broader | candidate to fold into `dt`/local algebra instead of propagating |
+| `prev_stages` / `prev_stages_out` | not an extracted tangent input; forward carry-ablation/debug repeatedly audits whether this lane can be zeroed with limited effect | propagated as full `prev_stages_out` cotangent over the reverse rollout | reverse is broader and likely expensive | top candidate to contract or recompute locally |
+| `prev_dt` / `prev_dt_out` | not an extracted tangent input; forward debug explicitly zeroes `prev_dt` in later-step carry ablations | propagated as full `prev_dt_out` cotangent over the reverse rollout | reverse is broader | candidate to contract into the main `dt` lane |
+| `lagged_reference_y` / `lagged_reference_y_out` | not an extracted tangent input; forward debug repeatedly zeroes this lane and branch logic already compresses lagged handling into reuse vs rebuild | propagated as full `lagged_reference_y_out` cotangent over the reverse rollout | reverse is broader | top candidate to contract; prefer local branch handling |
+| `prev_theta_final` / `prev_theta_final_out` | not an extracted tangent input; forward debug explicitly zeroes this lane | propagated as full `prev_theta_final_out` cotangent over the reverse rollout | reverse is broader | top candidate to drop from propagated cotangent |
+| `prev_newton_iter_count` | not an extracted tangent input; forward debug explicitly zeroes this lane | not propagated as outer replay-state cotangent in reverse | aligned enough | keep local only |
+| controller bookkeeping (`prev_error`, reject counters, cooldowns, etc.) | explicitly `stop_gradient` in `_radau_carry_with_forward_only_jvp_fields(...)` | not propagated as outer reverse-state cotangents | aligned | keep masked |
+| Jacobian / LU / cache validity state | explicitly `stop_gradient` in `_radau_carry_with_forward_only_jvp_fields(...)` | not propagated as outer replay-state cotangents; used only as local payload for transpose solve | aligned | keep local only |
+
+#### Main conclusion from the audit
+
+The local reverse algebra is already reasonably close to the transpose of the
+forward tangent algebra:
+
+- both use the accepted-step linearization
+- both branch on lagged reuse vs rebuild
+- both avoid broad reverse AD through the raw Newton/LU internals
+
+The remaining gap is the **propagated rollout-level contract**:
+
+- forward extracts a very small tangent-input object:
+  - `dy`
+  - `dh`
+  - `dlagged_response_cache`
+- reverse still propagates a replay-state-shaped cotangent with seven lanes:
+  - `t_out`
+  - `y_out`
+  - `dt_out`
+  - `prev_stages_out`
+  - `prev_dt_out`
+  - `lagged_reference_y_out`
+  - `prev_theta_final_out`
+
+So the next refactor should target the reverse propagated cotangent state,
+not the accepted-step primal path and not more broad payload-family ablations.
+
+#### Refactor order implied by the audit
+
+1. Introduce an explicit reverse cotangent contraction helper.
+2. Add an experimental "forward-like" contraction mode that keeps only the
+   lanes closest to the forward tangent contract.
+3. Start by contracting:
+   - `prev_theta_final_out`
+   - `prev_dt_out`
+   - `lagged_reference_y_out`
+4. Then evaluate whether `prev_stages_out` can also be reduced or folded
+   locally.
+5. Keep the accepted-step-only reverse composition structure unchanged while
+   tightening the propagated cotangent boundary.

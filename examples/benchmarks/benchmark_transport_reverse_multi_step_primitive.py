@@ -29,12 +29,16 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedPrimitivePayloadRollout,
+    _RadauAcceptedStepForwardLikeCotangent,
     _RadauAcceptedStepReducedOutput,
     _RadauAcceptedStepReversePayload,
+    _radau_accepted_step_forward_like_pullback,
     _radau_accepted_step_primitive,
     _radau_accepted_step_primitive_pullback,
     _radau_adaptive_schedule_rollout,
     _radau_carry_with_forward_only_jvp_fields,
+    _radau_contract_reduced_output_bar,
+    _radau_forward_like_cotangent_from_reduced_output_bar,
     _radau_replay_realized_accepted_rollout,
 )
 
@@ -195,6 +199,14 @@ def _ablate_reduced_output_bar(
     return dataclasses.replace(reduced_output_bar, **replacements)
 
 
+def _forward_like_cotangent_metrics(cotangent: _RadauAcceptedStepForwardLikeCotangent) -> dict[str, jax.Array]:
+    return {
+        "primitive_y_bar_max": _tree_max_abs(cotangent.y),
+        "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(cotangent.dt, dtype=jnp.float64))),
+        "primitive_prev_stages_bar_max": _tree_max_abs(cotangent.prev_stages),
+    }
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -224,6 +236,7 @@ def _compute_multi_step_metrics(
     reverse_probe_mode: str,
     payload_ablation: str,
     bar_ablation: str,
+    cotangent_contract: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -255,10 +268,20 @@ def _compute_multi_step_metrics(
         dtype=bool,
     )[accepted_mask_np]
     accepted_count = int(accepted_dts_np.shape[0])
-    final_output_bar = _ablate_reduced_output_bar(
-        _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode),
+    base_final_output_bar = _ablate_reduced_output_bar(
+        _radau_contract_reduced_output_bar(
+            _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode),
+            cotangent_contract,
+        ),
         bar_ablation,
     )
+    if cotangent_contract == "forward-like-v1":
+        final_reverse_state = _radau_forward_like_cotangent_from_reduced_output_bar(
+            base_final_output_bar,
+            initial_carry,
+        )
+    else:
+        final_reverse_state = base_final_output_bar
     segment_length = max(1, int(segment_length))
     checkpoint_count = max(0, int(checkpoint_count))
 
@@ -480,6 +503,15 @@ def _compute_multi_step_metrics(
                 def _do_reuse(args):
                     dynamic_values, bar = args
                     reverse_payload = _payload_from_dynamic_values(dynamic_values, True)
+                    if cotangent_contract == "forward-like-v1":
+                        return _radau_accepted_step_forward_like_pullback(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            carry_template,
+                            execution_context.attempt_context,
+                            reverse_payload,
+                            bar,
+                        )
                     return _radau_accepted_step_primitive_pullback(
                         execution_context.kernel_context,
                         execution_context.physics_context,
@@ -492,6 +524,15 @@ def _compute_multi_step_metrics(
                 def _do_rebuild(args):
                     dynamic_values, bar = args
                     reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
+                    if cotangent_contract == "forward-like-v1":
+                        return _radau_accepted_step_forward_like_pullback(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            carry_template,
+                            execution_context.attempt_context,
+                            reverse_payload,
+                            bar,
+                        )
                     return _radau_accepted_step_primitive_pullback(
                         execution_context.kernel_context,
                         execution_context.physics_context,
@@ -538,7 +579,7 @@ def _compute_multi_step_metrics(
 
     def _reverse_only_once():
         nonlocal last_step_payload_report
-        carry_bar = final_output_bar
+        carry_bar = final_reverse_state
         reversed_ranges = list(reversed(segment_ranges))
         for range_idx, (start_idx, end_idx) in enumerate(reversed_ranges):
             segment_start_carry = _segment_start_carry(start_idx)
@@ -564,23 +605,28 @@ def _compute_multi_step_metrics(
                 )
                 one_step_fn = _build_reverse_segment_fn(payload_template, single_reverse_payloads)
                 if execution_mode == "jit":
-                    carry_bar = _ablate_reduced_output_bar(jax.jit(one_step_fn)(carry_bar), bar_ablation)
+                    carry_bar = jax.jit(one_step_fn)(carry_bar)
                 else:
                     with jax.disable_jit():
-                        carry_bar = _ablate_reduced_output_bar(one_step_fn(carry_bar), bar_ablation)
+                        carry_bar = one_step_fn(carry_bar)
                 break
-            carry_bar = _ablate_reduced_output_bar(
-                _reverse_segment_compiled(payload_rollout, carry_bar),
-                bar_ablation,
-            )
+            carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
+        if cotangent_contract == "forward-like-v1":
+            metric_values = _forward_like_cotangent_metrics(carry_bar)
+        else:
+            metric_values = {
+                "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
+                "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(carry_bar.dt_out, dtype=jnp.float64))),
+                "primitive_prev_stages_bar_max": _tree_max_abs(carry_bar.prev_stages_out),
+            }
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
             "segment_count": jnp.asarray(1 if reverse_probe_mode == "last-step-only" else len(segment_ranges), dtype=jnp.int32),
             "checkpoint_count": jnp.asarray(len(checkpoint_starts), dtype=jnp.int32),
             "segment_length": jnp.asarray(segment_length, dtype=jnp.int32),
-            "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
-            "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(carry_bar.dt_out, dtype=jnp.float64))),
-            "primitive_prev_stages_bar_max": _tree_max_abs(carry_bar.prev_stages_out),
+            "primitive_y_bar_max": metric_values["primitive_y_bar_max"],
+            "primitive_dt_bar_abs": metric_values["primitive_dt_bar_abs"],
+            "primitive_prev_stages_bar_max": metric_values["primitive_prev_stages_bar_max"],
         }
 
     t0 = time.perf_counter()
@@ -670,6 +716,12 @@ def main() -> None:
         choices=("none", "prev-stages", "lagged-reference-y", "step-meta", "non-y"),
         help="Zero one reduced-output-bar family after each reverse step. Default: none.",
     )
+    parser.add_argument(
+        "--cotangent-contract",
+        default="full",
+        choices=("full", "forward-like-v1"),
+        help="Propagated reverse cotangent contract. `forward-like-v1` zeros lanes that forward JVP does not treat as first-class tangent inputs. Default: full.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -719,6 +771,7 @@ def main() -> None:
             reverse_probe_mode=args.reverse_probe_mode,
             payload_ablation=args.payload_ablation,
             bar_ablation=args.bar_ablation,
+            cotangent_contract=args.cotangent_contract,
         )
         prefix_reports.append(
             {
@@ -743,6 +796,7 @@ def main() -> None:
         "reverse_probe_mode": args.reverse_probe_mode,
         "payload_ablation": args.payload_ablation,
         "bar_ablation": args.bar_ablation,
+        "cotangent_contract": args.cotangent_contract,
         "prefix_reports": prefix_reports,
     }
 
@@ -757,7 +811,7 @@ def main() -> None:
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
         f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
         f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation} "
-        f"bar_ablation={args.bar_ablation}"
+        f"bar_ablation={args.bar_ablation} cotangent_contract={args.cotangent_contract}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
