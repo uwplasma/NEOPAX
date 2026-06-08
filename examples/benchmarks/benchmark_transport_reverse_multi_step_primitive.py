@@ -247,6 +247,45 @@ def _slice_payload_value_at_step(value, step_idx: int):
     return jax.tree_util.tree_map(lambda x: x[step_idx], value)
 
 
+def _branch_diagnostics_from_trace(
+    *,
+    accepted_mask_np,
+    trace_lagged_valid_np,
+    accepted_dts_np,
+):
+    accepted_trace_indices = np.flatnonzero(np.asarray(accepted_mask_np, dtype=bool))
+    accepted_lagged_valid_np = np.asarray(trace_lagged_valid_np, dtype=bool)[accepted_mask_np]
+    accepted_dts_np = np.asarray(accepted_dts_np, dtype=float)
+    accepted_count = int(accepted_lagged_valid_np.shape[0])
+    rebuild_mask = np.logical_not(accepted_lagged_valid_np)
+    rebuild_indices = np.flatnonzero(rebuild_mask)
+    reuse_indices = np.flatnonzero(accepted_lagged_valid_np)
+
+    def _entry(idx: int):
+        return {
+            "accepted_index": int(idx),
+            "reverse_position": int(accepted_count - 1 - idx),
+            "trace_index": int(accepted_trace_indices[idx]),
+            "dt": float(accepted_dts_np[idx]),
+            "lagged_response_valid_in": bool(accepted_lagged_valid_np[idx]),
+        }
+
+    first_rebuild = None if rebuild_indices.size == 0 else _entry(int(rebuild_indices[0]))
+    last_rebuild = None if rebuild_indices.size == 0 else _entry(int(rebuild_indices[-1]))
+    first_reuse = None if reuse_indices.size == 0 else _entry(int(reuse_indices[0]))
+    last_reuse = None if reuse_indices.size == 0 else _entry(int(reuse_indices[-1]))
+    return {
+        "accepted_count": accepted_count,
+        "reuse_count": int(np.count_nonzero(accepted_lagged_valid_np)),
+        "rebuild_count": int(np.count_nonzero(rebuild_mask)),
+        "first_rebuild": first_rebuild,
+        "last_rebuild": last_rebuild,
+        "first_reuse": first_reuse,
+        "last_reuse": last_reuse,
+        "rebuild_examples": [_entry(int(idx)) for idx in rebuild_indices[:8].tolist()],
+    }
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -278,6 +317,7 @@ def _compute_multi_step_metrics(
     bar_ablation: str,
     cotangent_contract: str,
     reverse_compose_mode: str,
+    branch_diagnostics_only: bool,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -308,7 +348,16 @@ def _compute_multi_step_metrics(
         jax.device_get(schedule_rollout.trace.next_lagged_response_valid),
         dtype=bool,
     )[accepted_mask_np]
+    accepted_lagged_response_valid_np = np.asarray(
+        jax.device_get(schedule_rollout.trace.lagged_response_valid),
+        dtype=bool,
+    )
     accepted_count = int(accepted_dts_np.shape[0])
+    branch_diagnostics = _branch_diagnostics_from_trace(
+        accepted_mask_np=accepted_mask_np,
+        trace_lagged_valid_np=accepted_lagged_response_valid_np,
+        accepted_dts_np=accepted_dts_np,
+    )
     base_final_output_bar = _ablate_reduced_output_bar(
         _radau_contract_reduced_output_bar(
             _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode),
@@ -346,6 +395,24 @@ def _compute_multi_step_metrics(
             "primitive_prev_stages_bar_max": 0.0,
             "compile_plus_execute_s": 0.0,
             "execute_s": 0.0,
+            "branch_diagnostics": branch_diagnostics,
+        }
+
+    if branch_diagnostics_only:
+        return {
+            "accepted_count": int(accepted_count),
+            "segment_count": int(len([
+                (start_idx, min(start_idx + segment_length, accepted_count))
+                for start_idx in range(0, accepted_count, segment_length)
+            ])),
+            "checkpoint_count": int(checkpoint_count),
+            "segment_length": int(segment_length),
+            "primitive_y_bar_max": 0.0,
+            "primitive_dt_bar_abs": 0.0,
+            "primitive_prev_stages_bar_max": 0.0,
+            "compile_plus_execute_s": 0.0,
+            "execute_s": 0.0,
+            "branch_diagnostics": branch_diagnostics,
         }
 
     segment_ranges = [
@@ -810,6 +877,7 @@ def _compute_multi_step_metrics(
     result["compile_plus_execute_s"] = compile_plus_execute_s
     result["execute_s"] = execute_s
     result["last_step_payload_report"] = last_step_payload_report
+    result["branch_diagnostics"] = branch_diagnostics
     return result
 
 
@@ -895,6 +963,11 @@ def main() -> None:
         choices=("segment-scan", "step-loop"),
         help="How to compose accepted-step reverse calls within each segment. `segment-scan` uses one jitted scan kernel; `step-loop` reuses the one-step reverse kernel step-by-step. Default: segment-scan.",
     )
+    parser.add_argument(
+        "--branch-diagnostics-only",
+        action="store_true",
+        help="Only report accepted-step reuse versus rebuild branch diagnostics from the primal schedule, without running the reverse pullback.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -946,6 +1019,7 @@ def main() -> None:
             bar_ablation=args.bar_ablation,
             cotangent_contract=args.cotangent_contract,
             reverse_compose_mode=args.reverse_compose_mode,
+            branch_diagnostics_only=bool(args.branch_diagnostics_only),
         )
         prefix_reports.append(
             {
@@ -972,6 +1046,7 @@ def main() -> None:
         "bar_ablation": args.bar_ablation,
         "cotangent_contract": args.cotangent_contract,
         "reverse_compose_mode": args.reverse_compose_mode,
+        "branch_diagnostics_only": bool(args.branch_diagnostics_only),
         "prefix_reports": prefix_reports,
     }
 
@@ -987,7 +1062,8 @@ def main() -> None:
         f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
         f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation} "
         f"bar_ablation={args.bar_ablation} cotangent_contract={args.cotangent_contract} "
-        f"reverse_compose_mode={args.reverse_compose_mode}"
+        f"reverse_compose_mode={args.reverse_compose_mode} "
+        f"branch_diagnostics_only={bool(args.branch_diagnostics_only)}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
@@ -1003,6 +1079,20 @@ def main() -> None:
         print(f"    primitive_prev_stages_bar_max={float(result['primitive_prev_stages_bar_max']):.6e}")
         print(f"    compile_plus_execute_s={float(result['compile_plus_execute_s']):.6e}")
         print(f"    execute_s={float(result['execute_s']):.6e}")
+        branch = result.get("branch_diagnostics")
+        if branch is not None:
+            print(
+                f"    reuse_count={int(branch['reuse_count'])} "
+                f"rebuild_count={int(branch['rebuild_count'])}"
+            )
+            if branch.get("first_rebuild") is not None:
+                first_rebuild = branch["first_rebuild"]
+                print(
+                    f"    first_rebuild: accepted_index={int(first_rebuild['accepted_index'])} "
+                    f"reverse_position={int(first_rebuild['reverse_position'])} "
+                    f"trace_index={int(first_rebuild['trace_index'])} "
+                    f"dt={float(first_rebuild['dt']):.6e}"
+                )
     print(f"[autodiff-gate] wrote={outpath}")
 
 
