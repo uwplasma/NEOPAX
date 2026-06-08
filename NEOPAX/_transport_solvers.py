@@ -4908,6 +4908,14 @@ def _radau_contract_reduced_output_bar(
             lagged_reference_y_out=jnp.zeros_like(reduced_output_bar.lagged_reference_y_out),
             prev_theta_final_out=jnp.zeros_like(reduced_output_bar.prev_theta_final_out),
         )
+    if mode == "forward-like-v2-no-stage":
+        return dataclasses.replace(
+            reduced_output_bar,
+            prev_stages_out=jnp.zeros_like(reduced_output_bar.prev_stages_out),
+            prev_dt_out=jnp.zeros_like(reduced_output_bar.prev_dt_out),
+            lagged_reference_y_out=jnp.zeros_like(reduced_output_bar.lagged_reference_y_out),
+            prev_theta_final_out=jnp.zeros_like(reduced_output_bar.prev_theta_final_out),
+        )
     raise ValueError(f"Unsupported reduced-output cotangent contract mode: {mode}")
 
 
