@@ -30,15 +30,18 @@ from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedPrimitivePayloadRollout,
     _RadauAcceptedStepForwardLikeCotangent,
+    _RadauAcceptedStepForwardLikeNoStageCotangent,
     _RadauAcceptedStepReducedOutput,
     _RadauAcceptedStepReversePayload,
     _radau_accepted_step_forward_like_pullback,
+    _radau_accepted_step_forward_like_no_stage_pullback,
     _radau_accepted_step_primitive,
     _radau_accepted_step_primitive_pullback,
     _radau_adaptive_schedule_rollout,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_contract_reduced_output_bar,
     _radau_forward_like_cotangent_from_reduced_output_bar,
+    _radau_forward_like_no_stage_cotangent_from_reduced_output_bar,
     _radau_replay_realized_accepted_rollout,
 )
 
@@ -207,6 +210,16 @@ def _forward_like_cotangent_metrics(cotangent: _RadauAcceptedStepForwardLikeCota
     }
 
 
+def _forward_like_no_stage_cotangent_metrics(
+    cotangent: _RadauAcceptedStepForwardLikeNoStageCotangent,
+) -> dict[str, jax.Array]:
+    return {
+        "primitive_y_bar_max": _tree_max_abs(cotangent.y),
+        "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(cotangent.dt, dtype=jnp.float64))),
+        "primitive_prev_stages_bar_max": jnp.asarray(0.0, dtype=jnp.float64),
+    }
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -279,6 +292,10 @@ def _compute_multi_step_metrics(
         final_reverse_state = _radau_forward_like_cotangent_from_reduced_output_bar(
             base_final_output_bar,
             initial_carry,
+        )
+    elif cotangent_contract == "forward-like-v2-no-stage":
+        final_reverse_state = _radau_forward_like_no_stage_cotangent_from_reduced_output_bar(
+            base_final_output_bar,
         )
     else:
         final_reverse_state = base_final_output_bar
@@ -512,6 +529,15 @@ def _compute_multi_step_metrics(
                             reverse_payload,
                             bar,
                         )
+                    if cotangent_contract == "forward-like-v2-no-stage":
+                        return _radau_accepted_step_forward_like_no_stage_pullback(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            carry_template,
+                            execution_context.attempt_context,
+                            reverse_payload,
+                            bar,
+                        )
                     return _radau_accepted_step_primitive_pullback(
                         execution_context.kernel_context,
                         execution_context.physics_context,
@@ -526,6 +552,15 @@ def _compute_multi_step_metrics(
                     reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
                     if cotangent_contract == "forward-like-v1":
                         return _radau_accepted_step_forward_like_pullback(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            carry_template,
+                            execution_context.attempt_context,
+                            reverse_payload,
+                            bar,
+                        )
+                    if cotangent_contract == "forward-like-v2-no-stage":
+                        return _radau_accepted_step_forward_like_no_stage_pullback(
                             execution_context.kernel_context,
                             execution_context.physics_context,
                             carry_template,
@@ -613,6 +648,8 @@ def _compute_multi_step_metrics(
             carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
         if cotangent_contract == "forward-like-v1":
             metric_values = _forward_like_cotangent_metrics(carry_bar)
+        elif cotangent_contract == "forward-like-v2-no-stage":
+            metric_values = _forward_like_no_stage_cotangent_metrics(carry_bar)
         else:
             metric_values = {
                 "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
@@ -719,8 +756,8 @@ def main() -> None:
     parser.add_argument(
         "--cotangent-contract",
         default="full",
-        choices=("full", "forward-like-v1"),
-        help="Propagated reverse cotangent contract. `forward-like-v1` zeros lanes that forward JVP does not treat as first-class tangent inputs. Default: full.",
+        choices=("full", "forward-like-v1", "forward-like-v2-no-stage"),
+        help="Propagated reverse cotangent contract. `forward-like-v1` keeps a smaller forward-like state; `forward-like-v2-no-stage` also removes the propagated stage-history lane. Default: full.",
     )
     args = parser.parse_args()
 

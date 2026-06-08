@@ -3041,7 +3041,15 @@ class _RadauAcceptedStepForwardLikeCotangent:
     y: Any
     dt: Any
     prev_stages: Any
-    lagged_response_cache: Any
+    lagged_reference_y: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepForwardLikeNoStageCotangent:
+    """Smaller forward-like reverse state with no propagated stage-history lane."""
+    y: Any
+    dt: Any
     lagged_reference_y: Any
 
 
@@ -4912,7 +4920,6 @@ def _radau_forward_like_cotangent_from_reduced_output_bar(
         y=jnp.asarray(reduced_output_bar.y_out),
         dt=jnp.asarray(reduced_output_bar.dt_out) + jnp.asarray(reduced_output_bar.prev_dt_out),
         prev_stages=jnp.asarray(reduced_output_bar.prev_stages_out),
-        lagged_response_cache=_radau_zero_cotangent_like(template_carry.lagged_response_cache),
         lagged_reference_y=jnp.asarray(reduced_output_bar.lagged_reference_y_out),
     )
 
@@ -4927,6 +4934,31 @@ def _radau_forward_like_cotangent_to_reduced_output_bar(
         y_out=jnp.asarray(cotangent.y),
         dt_out=jnp.asarray(cotangent.dt),
         prev_stages_out=jnp.asarray(cotangent.prev_stages),
+        prev_dt_out=jnp.zeros_like(template_carry.prev_dt),
+        lagged_reference_y_out=jnp.asarray(cotangent.lagged_reference_y),
+        prev_theta_final_out=jnp.zeros_like(template_carry.prev_theta_final),
+    )
+
+
+def _radau_forward_like_no_stage_cotangent_from_reduced_output_bar(
+    reduced_output_bar: _RadauAcceptedStepReducedOutput,
+) -> _RadauAcceptedStepForwardLikeNoStageCotangent:
+    return _RadauAcceptedStepForwardLikeNoStageCotangent(
+        y=jnp.asarray(reduced_output_bar.y_out),
+        dt=jnp.asarray(reduced_output_bar.dt_out) + jnp.asarray(reduced_output_bar.prev_dt_out),
+        lagged_reference_y=jnp.asarray(reduced_output_bar.lagged_reference_y_out),
+    )
+
+
+def _radau_forward_like_no_stage_cotangent_to_reduced_output_bar(
+    cotangent: _RadauAcceptedStepForwardLikeNoStageCotangent,
+    template_carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepReducedOutput:
+    return _RadauAcceptedStepReducedOutput(
+        t_out=jnp.zeros_like(template_carry.t),
+        y_out=jnp.asarray(cotangent.y),
+        dt_out=jnp.asarray(cotangent.dt),
+        prev_stages_out=jnp.zeros_like(template_carry.prev_stages),
         prev_dt_out=jnp.zeros_like(template_carry.prev_dt),
         lagged_reference_y_out=jnp.asarray(cotangent.lagged_reference_y),
         prev_theta_final_out=jnp.zeros_like(template_carry.prev_theta_final),
@@ -5164,29 +5196,14 @@ def _radau_accepted_step_forward_like_pullback(
         cotangent.lagged_reference_y,
         dtype=kernel_context.dtype,
     )
-    lagged_response_cache_direct_bar = cotangent.lagged_response_cache
-
     if not kernel_context.use_transport_lagged_response or physics_context.build_lagged_response is None:
         dy_bar = dy_bar + lagged_reference_y_direct_bar
         lagged_response_cache_in_bar = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
         lagged_reference_y_in_bar = _radau_zero_cotangent_like(carry_in.lagged_reference_y)
     else:
-        total_lagged_response_cache_bar = jax.tree_util.tree_map(
-            lambda a, b: (
-                b
-                if a is None
-                else a
-                if b is None
-                else jnp.asarray(a) + jnp.asarray(b)
-            ),
-            lagged_response_cache_bar,
-            lagged_response_cache_direct_bar,
-            is_leaf=lambda x: x is None,
-        )
-
         def _reuse_case(_):
             return (
-                total_lagged_response_cache_bar,
+                lagged_response_cache_bar,
                 lagged_reference_y_direct_bar,
                 jnp.zeros_like(carry_in.y),
             )
@@ -5197,7 +5214,7 @@ def _radau_accepted_step_forward_like_pullback(
             else:
                 dy_extra = lagged_reference_y_direct_bar + physics_context.build_lagged_response_pullback(
                     carry_in.y,
-                    total_lagged_response_cache_bar,
+                    lagged_response_cache_bar,
                 )
             return (
                 _radau_zero_cotangent_like(carry_in.lagged_response_cache),
@@ -5217,7 +5234,77 @@ def _radau_accepted_step_forward_like_pullback(
         y=jnp.asarray(dy_bar, dtype=kernel_context.dtype),
         dt=jnp.asarray(dt_in_bar, dtype=kernel_context.dtype),
         prev_stages=jnp.asarray(prev_stages_in_bar.reshape((-1,)), dtype=kernel_context.dtype),
-        lagged_response_cache=lagged_response_cache_in_bar,
+        lagged_reference_y=jnp.asarray(lagged_reference_y_in_bar, dtype=kernel_context.dtype),
+    )
+
+
+def _radau_accepted_step_forward_like_no_stage_pullback(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    template_carry: _RadauAcceptedStepCarry,
+    attempt_context: _RadauAcceptedStepAttemptContext,
+    reverse_payload: _RadauAcceptedStepReversePayload,
+    cotangent: _RadauAcceptedStepForwardLikeNoStageCotangent,
+) -> _RadauAcceptedStepForwardLikeNoStageCotangent:
+    """Forward-like reverse helper with no propagated stage-history cotangent lane."""
+    carry_in = _radau_carry_from_reverse_payload(
+        reverse_payload,
+        template_carry,
+        physics_context,
+    )
+    primal_result = _radau_attempt_result_from_reverse_payload(
+        reverse_payload,
+        template_carry,
+    )
+    lagged_response = reverse_payload.lagged_response_in
+    rhs_time_ref = reverse_payload.rhs_time_ref
+
+    accepted_y_bar = jnp.asarray(cotangent.y, dtype=kernel_context.dtype)
+    dy_bar, dh_bar, _dt_in_bar, lagged_response_cache_bar, _stage_rhs_bar = _radau_accepted_step_y_pullback_linearized(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        accepted_y_bar,
+        lagged_response,
+        rhs_time_ref,
+        zero_lagged_cache_tangent=_radau_zero_cotangent_like(carry_in.lagged_response_cache),
+        return_stage_rhs_bar=True,
+    )
+    dt_in_bar = jnp.asarray(dh_bar, dtype=kernel_context.dtype) + jnp.asarray(cotangent.dt, dtype=kernel_context.dtype)
+
+    lagged_reference_y_direct_bar = jnp.asarray(
+        cotangent.lagged_reference_y,
+        dtype=kernel_context.dtype,
+    )
+    if not kernel_context.use_transport_lagged_response or physics_context.build_lagged_response is None:
+        dy_bar = dy_bar + lagged_reference_y_direct_bar
+        lagged_reference_y_in_bar = _radau_zero_cotangent_like(carry_in.lagged_reference_y)
+    else:
+        def _reuse_case(_):
+            return lagged_reference_y_direct_bar, jnp.zeros_like(carry_in.y)
+
+        def _rebuild_case(_):
+            if physics_context.build_lagged_response_pullback is None:
+                dy_extra = lagged_reference_y_direct_bar
+            else:
+                dy_extra = lagged_reference_y_direct_bar + physics_context.build_lagged_response_pullback(
+                    carry_in.y,
+                    lagged_response_cache_bar,
+                )
+            return _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
+
+        lagged_reference_y_in_bar, dy_extra = jax.lax.cond(
+            carry_in.lagged_response_valid,
+            _reuse_case,
+            _rebuild_case,
+            operand=None,
+        )
+        dy_bar = dy_bar + dy_extra
+
+    return _RadauAcceptedStepForwardLikeNoStageCotangent(
+        y=jnp.asarray(dy_bar, dtype=kernel_context.dtype),
+        dt=jnp.asarray(dt_in_bar, dtype=kernel_context.dtype),
         lagged_reference_y=jnp.asarray(lagged_reference_y_in_bar, dtype=kernel_context.dtype),
     )
 
