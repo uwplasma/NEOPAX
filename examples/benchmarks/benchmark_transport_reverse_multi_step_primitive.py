@@ -167,6 +167,34 @@ def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutpu
     raise ValueError(f"Unsupported bar mode: {mode}")
 
 
+def _ablate_reduced_output_bar(
+    reduced_output_bar: _RadauAcceptedStepReducedOutput,
+    ablation_mode: str,
+) -> _RadauAcceptedStepReducedOutput:
+    if ablation_mode == "none":
+        return reduced_output_bar
+
+    replacements = {}
+    if ablation_mode == "prev-stages":
+        replacements["prev_stages_out"] = jnp.zeros_like(reduced_output_bar.prev_stages_out)
+    elif ablation_mode == "lagged-reference-y":
+        replacements["lagged_reference_y_out"] = jnp.zeros_like(reduced_output_bar.lagged_reference_y_out)
+    elif ablation_mode == "step-meta":
+        replacements["dt_out"] = jnp.zeros_like(reduced_output_bar.dt_out)
+        replacements["prev_dt_out"] = jnp.zeros_like(reduced_output_bar.prev_dt_out)
+        replacements["prev_theta_final_out"] = jnp.zeros_like(reduced_output_bar.prev_theta_final_out)
+    elif ablation_mode == "non-y":
+        replacements["t_out"] = jnp.zeros_like(reduced_output_bar.t_out)
+        replacements["dt_out"] = jnp.zeros_like(reduced_output_bar.dt_out)
+        replacements["prev_stages_out"] = jnp.zeros_like(reduced_output_bar.prev_stages_out)
+        replacements["prev_dt_out"] = jnp.zeros_like(reduced_output_bar.prev_dt_out)
+        replacements["lagged_reference_y_out"] = jnp.zeros_like(reduced_output_bar.lagged_reference_y_out)
+        replacements["prev_theta_final_out"] = jnp.zeros_like(reduced_output_bar.prev_theta_final_out)
+    else:
+        raise ValueError(f"Unsupported bar ablation mode: {ablation_mode}")
+    return dataclasses.replace(reduced_output_bar, **replacements)
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -195,6 +223,7 @@ def _compute_multi_step_metrics(
     checkpoint_count: int,
     reverse_probe_mode: str,
     payload_ablation: str,
+    bar_ablation: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -226,7 +255,10 @@ def _compute_multi_step_metrics(
         dtype=bool,
     )[accepted_mask_np]
     accepted_count = int(accepted_dts_np.shape[0])
-    final_output_bar = _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode)
+    final_output_bar = _ablate_reduced_output_bar(
+        _make_reduced_output_bar(schedule_rollout.final_carry, bar_mode),
+        bar_ablation,
+    )
     segment_length = max(1, int(segment_length))
     checkpoint_count = max(0, int(checkpoint_count))
 
@@ -532,12 +564,15 @@ def _compute_multi_step_metrics(
                 )
                 one_step_fn = _build_reverse_segment_fn(payload_template, single_reverse_payloads)
                 if execution_mode == "jit":
-                    carry_bar = jax.jit(one_step_fn)(carry_bar)
+                    carry_bar = _ablate_reduced_output_bar(jax.jit(one_step_fn)(carry_bar), bar_ablation)
                 else:
                     with jax.disable_jit():
-                        carry_bar = one_step_fn(carry_bar)
+                        carry_bar = _ablate_reduced_output_bar(one_step_fn(carry_bar), bar_ablation)
                 break
-            carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
+            carry_bar = _ablate_reduced_output_bar(
+                _reverse_segment_compiled(payload_rollout, carry_bar),
+                bar_ablation,
+            )
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
             "segment_count": jnp.asarray(1 if reverse_probe_mode == "last-step-only" else len(segment_ranges), dtype=jnp.int32),
@@ -629,6 +664,12 @@ def main() -> None:
         choices=("none", "stage", "lagged", "jacobian", "lu", "pivots"),
         help="Zero one reverse-payload family before the reverse probe. Default: none.",
     )
+    parser.add_argument(
+        "--bar-ablation",
+        default="none",
+        choices=("none", "prev-stages", "lagged-reference-y", "step-meta", "non-y"),
+        help="Zero one reduced-output-bar family after each reverse step. Default: none.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -677,6 +718,7 @@ def main() -> None:
             checkpoint_count=args.checkpoint_count,
             reverse_probe_mode=args.reverse_probe_mode,
             payload_ablation=args.payload_ablation,
+            bar_ablation=args.bar_ablation,
         )
         prefix_reports.append(
             {
@@ -700,6 +742,7 @@ def main() -> None:
         "checkpoint_count": int(args.checkpoint_count),
         "reverse_probe_mode": args.reverse_probe_mode,
         "payload_ablation": args.payload_ablation,
+        "bar_ablation": args.bar_ablation,
         "prefix_reports": prefix_reports,
     }
 
@@ -713,7 +756,8 @@ def main() -> None:
         f"bar_mode={args.bar_mode} execution_mode={args.execution_mode} "
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
         f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
-        f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation}"
+        f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation} "
+        f"bar_ablation={args.bar_ablation}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
