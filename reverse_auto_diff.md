@@ -145,70 +145,66 @@ not:
 
 This is also the closest match to what forward mode is already doing.
 
-### Current Status: Later-Step Payload Probe
+### Current Status: Later-Step Payload `nan` Bug Is Fixed
 
-The current one-step option-4 benchmark has now answered the main OOM question:
+The later-step diagnostic established two things:
 
-- the earlier dynamic one-step JIT OOM was narrowed to passing
-  `lagged_response_valid_in` as a dynamic JIT argument
-- branch-specializing the reuse/rebuild choice outside JIT fixed that one-step
-  dynamic OOM
-- a later-step payload selected from a realized rollout now also runs without
-  the old JIT OOM when captured with:
-  - `--payload-source last-from-rollout`
-  - `--rollout-accepted-step-limit 128`
-  - `--rollout-max-total-steps-multiplier 4`
-  - `--payload-capture-device cpu`
+1. the earlier one-step dynamic JIT OOM was narrowed to passing
+   `lagged_response_valid_in` as a dynamic JIT argument
+2. the later-step `nan` bug came from the old payload collector design, not
+   from the accepted-step reverse rule itself
 
-So the active issue is no longer the old one-step dynamic memory blowup.
+The old collector did:
 
-### Current Status: Later-Step Payload Still Produces `nan` Cotangents
+- adaptive schedule rollout first
+- then separate accepted-only replay to rebuild payloads
 
-The later-step one-step benchmark still returns:
+That replay path produced corrupted payloads even though the true adaptive
+forward trace at the same accepted step stayed finite.
 
-- `primitive_dt_bar_abs: nan`
-- `primitive_prev_stages_bar_max: nan`
-- `primitive_y_bar_max: nan`
+The fix was to rewrite:
 
-This remains true even in `closed-over` payload mode, so the remaining problem
-is **not** the dynamic runtime payload contract anymore.
+- `_radau_collect_realized_accepted_step_payloads(...)`
 
-Confirmed command:
+so it now walks the **real adaptive attempt loop** and records accepted-step
+primitive payloads directly from the exact attempt context used by forward
+mode, instead of reconstructing them in a second accepted-only replay.
+
+### What Is Now Confirmed
+
+The diagnostic command:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_one_step_primitive.py --ntx-exact-derivative-mode direct --execution-mode jit --payload-mode closed-over --payload-source last-from-rollout --rollout-accepted-step-limit 128 --rollout-max-total-steps-multiplier 4 --payload-capture-device cpu
 ```
 
-### Finite-Stats Result
+now returns finite values for the later-step one-step pullback, for example:
 
-The selected later-step payload is already nonfinite before the reverse
-pullback runs.
+- `primitive_dt_bar_abs = 2.401439e+03`
+- `primitive_prev_stages_bar_max = 1.311968e-02`
+- `primitive_y_bar_max = 1.385477e+02`
 
-Payload finite stats:
+and the saved payload is now finite:
 
-- `all_finite: False`
-- selected payload nonfinite leaves:
-  - `y_in`
-  - `prev_stages_in`
-  - `accepted_y`
-  - `trial_y`
-  - `stage_history`
-  - `jacobian_out`
-  - `real_lu_out`
-  - `complex_lu_out`
+- `first_nonfinite_payload_step = None`
+- `selected_payload_nonfinite_leaves = []`
 
-This means the reverse rule is no longer the primary suspect for the current
-failure. The selected saved payload itself is already contaminated.
+So the later-step payload `nan` bug is fixed.
 
-### First Nonfinite Accepted-Step Payload
+### Root Cause That Was Confirmed
 
-The first accepted step whose saved reverse payload becomes nonfinite is:
+At the previously first bad accepted step:
 
 - `accepted_index = 91`
 - `trace_index = 149`
 - `dt = 4.343504268706003e-05`
 
-The first bad payload leaves are:
+the comparison showed:
+
+- payload rebuilt from the **true adaptive forward trace carry** was finite
+- payload produced by the **old replay collector** was nonfinite
+
+for the unstable fields:
 
 - `accepted_y`
 - `trial_y`
@@ -217,64 +213,45 @@ The first bad payload leaves are:
 - `real_lu_out`
 - `complex_lu_out`
 
-The extra bad leaves seen in the final selected payload:
+This confirmed that the bug was the replay-collector context mismatch, not the
+forward/primal accepted-step map itself.
 
-- `y_in`
-- `prev_stages_in`
+### Current State Of The Refactor
 
-are best interpreted as downstream contamination from earlier bad accepted
-steps.
+Resolved enough:
 
-### Architectural Interpretation
+- one-step dynamic JIT OOM is reduced by branch-specializing
+  `lagged_response_valid_in`
+- later-step payload `nan` bug is fixed by collecting payloads from the true
+  adaptive attempt path
 
-This creates an important tension with the forward-path contract:
+Still open:
 
-- the accepted-step path is supposed to be the same in spirit for:
-  - forward primal
-  - forward JVP
-  - reverse payload collection
+- the full many-step reverse memory/composition problem
+- final GPU-feasible rollout reverse architecture
 
-But the current evidence shows:
+### Next Steps
 
-- forward accepted-step / forward derivative mode is still operational
-- reverse payload collection becomes nonfinite around accepted step `91`
+The CPU-heavy `last-from-rollout` probe has done its job and should no longer be
+the main test path.
 
-The strongest current interpretation is:
+From here, the next tests should be GPU-only rollout-composition checks, for
+example:
 
-- reverse payload collection is still depending on fields outside the stable
-  forward-style reduced contract, or
-- the collector is saving a different / less stable intermediate than what
-  forward mode actually relies on
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_multi_step_primitive.py --ntx-exact-derivative-mode direct --accepted-step-counts 8,16,32,64 --execution-mode jit --max-total-steps-multiplier 1 --segment-length 8 --checkpoint-count 0
+```
 
-This is consistent with the first bad leaves being:
+Then, if scaling looks sane:
 
-- `accepted_y`
-- `trial_y`
-- `stage_history`
-- `jacobian_out`
-- `real_lu_out`
-- `complex_lu_out`
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_multi_step_primitive.py --ntx-exact-derivative-mode direct --accepted-step-counts 128 --execution-mode jit --max-total-steps-multiplier 1 --segment-length 8 --checkpoint-count 0
+```
 
-### Next Investigation Target
+The active question again is now:
 
-The next useful investigation is no longer “does the reverse rule compile?”.
-
-It is:
-
-1. inspect primal accepted-step attempt diagnostics around accepted steps
-   `90-92`
-2. determine whether the first bad accepted step already had:
-   - nonfinite stage state
-   - nonfinite stage residual
-   - newton nonfinite
-   - linearization / LU failure or unstable reuse
-3. compare what the forward accepted-step tangent path actually uses there
-   against what reverse payload collection is saving
-
-The main hypothesis to test next is:
-
-- reverse still depends on unstable saved fields that forward mode does not
-  actually need
+- does the corrected payload path compose over many accepted steps without
+  reopening the rollout-level OOM?
 
 ### Latest confirmed findings
 
