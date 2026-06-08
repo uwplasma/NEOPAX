@@ -401,8 +401,7 @@ def _compute_multi_step_metrics(
         )
 
     payload_collect_cache = {}
-    one_step_reverse_reuse_fn = None
-    one_step_reverse_rebuild_fn = None
+    reverse_segment_cache = {}
     last_step_payload_report = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
@@ -424,86 +423,94 @@ def _compute_multi_step_metrics(
         if field.name != "lagged_response_valid_in"
     )
 
-    def _payload_to_dynamic_values(reverse_payload):
-        return tuple(getattr(reverse_payload, name) for name in payload_dynamic_field_names)
+    def _build_reverse_segment_fn(payload_template):
+        payload_base_kwargs = {
+            field.name: getattr(payload_template, field.name)
+            for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
+        }
 
-    def _payload_from_dynamic_values(dynamic_values, lagged_valid_value: bool):
-        payload_kwargs = {name: value for name, value in zip(payload_dynamic_field_names, dynamic_values)}
-        payload_kwargs["lagged_response_valid_in"] = jnp.asarray(lagged_valid_value, dtype=jnp.bool_)
-        return _RadauAcceptedStepReversePayload(**payload_kwargs)
+        def _payload_from_dynamic_values(dynamic_values, lagged_valid_value: bool):
+            updated = dict(payload_base_kwargs)
+            updated["lagged_response_valid_in"] = jnp.asarray(lagged_valid_value, dtype=jnp.bool_)
+            for name, value in zip(payload_dynamic_field_names, dynamic_values):
+                updated[name] = value
+            return dataclasses.replace(payload_template, **updated)
 
-    def _reverse_one_step_reuse(dynamic_values, carry_bar):
-        reverse_payload = _payload_from_dynamic_values(dynamic_values, True)
-        return _radau_accepted_step_primitive_pullback(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_template,
-            execution_context.attempt_context,
-            reverse_payload,
-            carry_bar,
-        )
+        def _segment_reverse_impl(payload_rollout, carry_bar):
+            reversed_payloads = jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), payload_rollout.reverse_payloads)
+            lagged_valids = reversed_payloads.lagged_response_valid_in
+            reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
 
-    def _reverse_one_step_rebuild(dynamic_values, carry_bar):
-        reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
-        return _radau_accepted_step_primitive_pullback(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_template,
-            execution_context.attempt_context,
-            reverse_payload,
-            carry_bar,
-        )
+            def _scan_body(next_bar, xs):
+                lagged_valid_value, dynamic_step_values = xs
+
+                def _do_reuse(args):
+                    dynamic_values, bar = args
+                    reverse_payload = _payload_from_dynamic_values(dynamic_values, True)
+                    return _radau_accepted_step_primitive_pullback(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        carry_template,
+                        execution_context.attempt_context,
+                        reverse_payload,
+                        bar,
+                    )
+
+                def _do_rebuild(args):
+                    dynamic_values, bar = args
+                    reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
+                    return _radau_accepted_step_primitive_pullback(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        carry_template,
+                        execution_context.attempt_context,
+                        reverse_payload,
+                        bar,
+                    )
+
+                next_bar = jax.lax.cond(
+                    lagged_valid_value,
+                    _do_reuse,
+                    _do_rebuild,
+                    operand=(dynamic_step_values, next_bar),
+                )
+                return next_bar, None
+
+            final_bar, _ = jax.lax.scan(
+                _scan_body,
+                carry_bar,
+                (lagged_valids, reversed_dynamic_values),
+            )
+            return final_bar
+
+        return _segment_reverse_impl
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
-        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn, last_step_payload_report
+        nonlocal last_step_payload_report
+        if last_step_payload_report is None:
+            last_payload = jax.tree_util.tree_map(lambda x: x[-1], payload_rollout.reverse_payloads)
+            last_step_payload_report = _payload_leaf_stats(_ablate_reverse_payload(last_payload, payload_ablation))
+
+        payload_rollout = dataclasses.replace(
+            payload_rollout,
+            reverse_payloads=_ablate_reverse_payload(payload_rollout.reverse_payloads, payload_ablation),
+        )
         step_count = int(payload_rollout.accepted_dts.shape[0])
+        if step_count <= 0:
+            return carry_bar
         if execution_mode == "jit":
-            if one_step_reverse_reuse_fn is None:
-                one_step_reverse_reuse_fn = jax.jit(_reverse_one_step_reuse)
-            if one_step_reverse_rebuild_fn is None:
-                one_step_reverse_rebuild_fn = jax.jit(_reverse_one_step_rebuild)
-        else:
-            one_step_reverse_reuse_fn = _reverse_one_step_reuse
-            one_step_reverse_rebuild_fn = _reverse_one_step_rebuild
-
-        next_bar = carry_bar
-        for step_idx in range(step_count - 1, -1, -1):
-            reverse_payload = jax.tree_util.tree_map(
-                lambda x, idx=step_idx: x[idx],
-                payload_rollout.reverse_payloads,
-            )
-            reverse_payload = _ablate_reverse_payload(reverse_payload, payload_ablation)
-            if last_step_payload_report is None:
-                last_step_payload_report = _payload_leaf_stats(reverse_payload)
-            dynamic_values = _payload_to_dynamic_values(reverse_payload)
-            lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
-            if execution_mode == "jit":
-                if lagged_valid_value:
-                    next_bar = one_step_reverse_reuse_fn(dynamic_values, next_bar)
-                else:
-                    next_bar = one_step_reverse_rebuild_fn(dynamic_values, next_bar)
-            else:
-                with jax.disable_jit():
-                    if lagged_valid_value:
-                        next_bar = one_step_reverse_reuse_fn(dynamic_values, next_bar)
-                    else:
-                        next_bar = one_step_reverse_rebuild_fn(dynamic_values, next_bar)
-        return next_bar
-
-    def _ensure_one_step_reverse_fns():
-        nonlocal one_step_reverse_reuse_fn, one_step_reverse_rebuild_fn
-        if execution_mode == "jit":
-            if one_step_reverse_reuse_fn is None:
-                one_step_reverse_reuse_fn = jax.jit(_reverse_one_step_reuse)
-            if one_step_reverse_rebuild_fn is None:
-                one_step_reverse_rebuild_fn = jax.jit(_reverse_one_step_rebuild)
-        else:
-            one_step_reverse_reuse_fn = _reverse_one_step_reuse
-            one_step_reverse_rebuild_fn = _reverse_one_step_rebuild
+            fn = reverse_segment_cache.get(step_count)
+            if fn is None:
+                payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
+                fn = jax.jit(_build_reverse_segment_fn(payload_template))
+                reverse_segment_cache[step_count] = fn
+            return fn(payload_rollout, carry_bar)
+        payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
+        with jax.disable_jit():
+            return _build_reverse_segment_fn(payload_template)(payload_rollout, carry_bar)
 
     def _reverse_only_once():
         nonlocal last_step_payload_report
-        _ensure_one_step_reverse_fns()
         carry_bar = final_output_bar
         reversed_ranges = list(reversed(segment_ranges))
         for range_idx, (start_idx, end_idx) in enumerate(reversed_ranges):
@@ -519,19 +526,31 @@ def _compute_multi_step_metrics(
                 reverse_payload = _ablate_reverse_payload(reverse_payload, payload_ablation)
                 if last_step_payload_report is None:
                     last_step_payload_report = _payload_leaf_stats(reverse_payload)
-                dynamic_values = _payload_to_dynamic_values(reverse_payload)
-                lagged_valid_value = bool(np.asarray(jax.device_get(reverse_payload.lagged_response_valid_in)).item())
+                payload_template = reverse_payload
+                one_step_fn = _build_reverse_segment_fn(payload_template)
+                ablated_reverse_payloads = _ablate_reverse_payload(payload_rollout.reverse_payloads, payload_ablation)
+                single_payload_rollout = _RadauAcceptedPrimitivePayloadRollout(
+                    final_carry=payload_rollout.final_carry,
+                    accepted_mask=jnp.ones((1,), dtype=jnp.bool_),
+                    accepted_dts=payload_rollout.accepted_dts[last_idx : last_idx + 1],
+                    reduced_outputs=jax.tree_util.tree_map(lambda x: x[last_idx : last_idx + 1], payload_rollout.reduced_outputs),
+                    reverse_payloads=dataclasses.replace(
+                        ablated_reverse_payloads,
+                        **{
+                            name: getattr(ablated_reverse_payloads, name)[last_idx : last_idx + 1]
+                            for name in payload_dynamic_field_names + ("lagged_response_valid_in",)
+                        },
+                    ),
+                )
                 if execution_mode == "jit":
-                    if lagged_valid_value:
-                        carry_bar = one_step_reverse_reuse_fn(dynamic_values, carry_bar)
-                    else:
-                        carry_bar = one_step_reverse_rebuild_fn(dynamic_values, carry_bar)
+                    fn = reverse_segment_cache.get(-1)
+                    if fn is None:
+                        fn = jax.jit(one_step_fn)
+                        reverse_segment_cache[-1] = fn
+                    carry_bar = fn(single_payload_rollout, carry_bar)
                 else:
                     with jax.disable_jit():
-                        if lagged_valid_value:
-                            carry_bar = one_step_reverse_reuse_fn(dynamic_values, carry_bar)
-                        else:
-                            carry_bar = one_step_reverse_rebuild_fn(dynamic_values, carry_bar)
+                        carry_bar = one_step_fn(single_payload_rollout, carry_bar)
                 break
             carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
         return {
