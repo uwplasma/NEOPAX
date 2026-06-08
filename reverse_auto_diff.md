@@ -258,6 +258,43 @@ The active question again is now:
 #### 1. Reuse-only narrowed reverse removes the giant OOM
 Command:
 
+### Contract refinement after the first forward-like reverse passes
+
+The first two forward-like reverse contracts were useful, but they still kept
+one important mismatch with the forward accepted-step tangent rule:
+
+- forward tangent input contract is driven by:
+  - `dy`
+  - `dh`
+  - `dlagged_response_cache`
+- while the reduced reverse contracts still propagated:
+  - `lagged_reference_y`
+
+That is not the cleanest transpose of the reduced accepted-step map. It keeps
+the reverse path tied to `build_lagged_response_pullback(...)` and
+`lagged_reference_y` propagation more than forward mode does.
+
+The next contraction pass is therefore:
+
+- `forward-like-v3-cache-no-stage`
+
+with propagated reverse state:
+
+- `y`
+- `dt`
+- `lagged_response_cache`
+
+and no propagated stage-history lane.
+
+This is closer to the forward accepted-step boundary because rebuild
+contributions from lagged response stay local to the step where they happen,
+while reuse contributions propagate through the compressed lagged-cache lane
+instead of through `lagged_reference_y`.
+
+This does **not** yet prove the multi-step JIT OOM is solved, but it is the
+correct next structural pass because it removes a remaining contract mismatch
+instead of adding another diagnostic workaround.
+
 ```bash
 NEOPAX_TRANSPORT_REVERSE_REPLAY_OUTPUT=y NEOPAX_TRANSPORT_REVERSE_REUSE_ONLY=1 python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode reverse --objective-indices 0
 ```
