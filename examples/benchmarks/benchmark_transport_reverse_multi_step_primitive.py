@@ -233,6 +233,14 @@ def _forward_like_cache_no_stage_cotangent_metrics(
     }
 
 
+def _payload_field_names_without_lagged_valid() -> tuple[str, ...]:
+    return tuple(
+        field.name
+        for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
+        if field.name != "lagged_response_valid_in"
+    )
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -263,6 +271,7 @@ def _compute_multi_step_metrics(
     payload_ablation: str,
     bar_ablation: str,
     cotangent_contract: str,
+    reverse_compose_mode: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -506,11 +515,7 @@ def _compute_multi_step_metrics(
 
     carry_template = initial_carry
 
-    payload_dynamic_field_names = tuple(
-        field.name
-        for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
-        if field.name != "lagged_response_valid_in"
-    )
+    payload_dynamic_field_names = _payload_field_names_without_lagged_valid()
 
     def _build_reverse_segment_fn(payload_template, reverse_payloads_static):
         payload_base_kwargs = {
@@ -630,6 +635,68 @@ def _compute_multi_step_metrics(
 
         return _segment_reverse_impl
 
+    def _apply_one_step_pullback(reverse_payload, bar):
+        if cotangent_contract == "forward-like-v1":
+            return _radau_accepted_step_forward_like_pullback(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_template,
+                execution_context.attempt_context,
+                reverse_payload,
+                bar,
+            )
+        if cotangent_contract == "forward-like-v2-no-stage":
+            return _radau_accepted_step_forward_like_no_stage_pullback(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_template,
+                execution_context.attempt_context,
+                reverse_payload,
+                bar,
+            )
+        if cotangent_contract == "forward-like-v3-cache-no-stage":
+            return _radau_accepted_step_forward_like_cache_no_stage_pullback(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_template,
+                execution_context.attempt_context,
+                reverse_payload,
+                bar,
+            )
+        return _radau_accepted_step_primitive_pullback(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_template,
+            execution_context.attempt_context,
+            reverse_payload,
+            bar,
+        )
+
+    def _build_step_loop_reverse_fns(payload_template):
+        payload_base_kwargs = {
+            field.name: getattr(payload_template, field.name)
+            for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
+        }
+
+        def _payload_from_dynamic_values(dynamic_values, lagged_valid_value: bool):
+            updated = dict(payload_base_kwargs)
+            updated["lagged_response_valid_in"] = jnp.asarray(lagged_valid_value, dtype=jnp.bool_)
+            for name, value in zip(payload_dynamic_field_names, dynamic_values):
+                updated[name] = value
+            return dataclasses.replace(payload_template, **updated)
+
+        def _reuse_impl(dynamic_values, bar):
+            reverse_payload = _payload_from_dynamic_values(dynamic_values, True)
+            return _apply_one_step_pullback(reverse_payload, bar)
+
+        def _rebuild_impl(dynamic_values, bar):
+            reverse_payload = _payload_from_dynamic_values(dynamic_values, False)
+            return _apply_one_step_pullback(reverse_payload, bar)
+
+        if execution_mode == "jit":
+            return jax.jit(_reuse_impl), jax.jit(_rebuild_impl)
+        return _reuse_impl, _rebuild_impl
+
     def _reverse_segment_compiled(payload_rollout, carry_bar):
         nonlocal last_step_payload_report
         if last_step_payload_report is None:
@@ -641,6 +708,22 @@ def _compute_multi_step_metrics(
         if step_count <= 0:
             return carry_bar
         payload_template = jax.tree_util.tree_map(lambda x: x[0], reverse_payloads)
+        if reverse_compose_mode == "step-loop":
+            reuse_fn, rebuild_fn = _build_step_loop_reverse_fns(payload_template)
+            reversed_payloads = jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), reverse_payloads)
+            lagged_valids = np.asarray(
+                jax.device_get(reversed_payloads.lagged_response_valid_in),
+                dtype=bool,
+            ).tolist()
+            reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
+            for step_idx, lagged_valid in enumerate(lagged_valids):
+                dynamic_values = tuple(value[step_idx] for value in reversed_dynamic_values)
+                if execution_mode == "jit":
+                    carry_bar = reuse_fn(dynamic_values, carry_bar) if lagged_valid else rebuild_fn(dynamic_values, carry_bar)
+                else:
+                    with jax.disable_jit():
+                        carry_bar = reuse_fn(dynamic_values, carry_bar) if lagged_valid else rebuild_fn(dynamic_values, carry_bar)
+            return carry_bar
         fn = _build_reverse_segment_fn(payload_template, reverse_payloads)
         if execution_mode == "jit":
             fn = jax.jit(fn)
@@ -797,6 +880,12 @@ def main() -> None:
         choices=("full", "forward-like-v1", "forward-like-v2-no-stage", "forward-like-v3-cache-no-stage"),
         help="Propagated reverse cotangent contract. `forward-like-v1` keeps a smaller forward-like state; `forward-like-v2-no-stage` also removes the propagated stage-history lane; `forward-like-v3-cache-no-stage` follows the forward lagged-cache boundary more closely. Default: full.",
     )
+    parser.add_argument(
+        "--reverse-compose-mode",
+        default="segment-scan",
+        choices=("segment-scan", "step-loop"),
+        help="How to compose accepted-step reverse calls within each segment. `segment-scan` uses one jitted scan kernel; `step-loop` reuses the one-step reverse kernel step-by-step. Default: segment-scan.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -847,6 +936,7 @@ def main() -> None:
             payload_ablation=args.payload_ablation,
             bar_ablation=args.bar_ablation,
             cotangent_contract=args.cotangent_contract,
+            reverse_compose_mode=args.reverse_compose_mode,
         )
         prefix_reports.append(
             {
@@ -872,6 +962,7 @@ def main() -> None:
         "payload_ablation": args.payload_ablation,
         "bar_ablation": args.bar_ablation,
         "cotangent_contract": args.cotangent_contract,
+        "reverse_compose_mode": args.reverse_compose_mode,
         "prefix_reports": prefix_reports,
     }
 
@@ -886,7 +977,8 @@ def main() -> None:
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
         f"segment_length={int(args.segment_length)} checkpoint_count={int(args.checkpoint_count)} "
         f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation} "
-        f"bar_ablation={args.bar_ablation} cotangent_contract={args.cotangent_contract}"
+        f"bar_ablation={args.bar_ablation} cotangent_contract={args.cotangent_contract} "
+        f"reverse_compose_mode={args.reverse_compose_mode}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
