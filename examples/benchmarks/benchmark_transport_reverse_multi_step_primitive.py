@@ -436,8 +436,8 @@ def _compute_multi_step_metrics(
                 updated[name] = value
             return dataclasses.replace(payload_template, **updated)
 
-        def _segment_reverse_impl(payload_rollout, carry_bar):
-            reversed_payloads = jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), payload_rollout.reverse_payloads)
+        def _segment_reverse_impl(reverse_payloads, carry_bar):
+            reversed_payloads = jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), reverse_payloads)
             lagged_valids = reversed_payloads.lagged_response_valid_in
             reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
 
@@ -491,23 +491,20 @@ def _compute_multi_step_metrics(
             last_payload = jax.tree_util.tree_map(lambda x: x[-1], payload_rollout.reverse_payloads)
             last_step_payload_report = _payload_leaf_stats(_ablate_reverse_payload(last_payload, payload_ablation))
 
-        payload_rollout = dataclasses.replace(
-            payload_rollout,
-            reverse_payloads=_ablate_reverse_payload(payload_rollout.reverse_payloads, payload_ablation),
-        )
+        reverse_payloads = _ablate_reverse_payload(payload_rollout.reverse_payloads, payload_ablation)
         step_count = int(payload_rollout.accepted_dts.shape[0])
         if step_count <= 0:
             return carry_bar
         if execution_mode == "jit":
             fn = reverse_segment_cache.get(step_count)
             if fn is None:
-                payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
+                payload_template = jax.tree_util.tree_map(lambda x: x[0], reverse_payloads)
                 fn = jax.jit(_build_reverse_segment_fn(payload_template))
                 reverse_segment_cache[step_count] = fn
-            return fn(payload_rollout, carry_bar)
-        payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
+            return fn(reverse_payloads, carry_bar)
+        payload_template = jax.tree_util.tree_map(lambda x: x[0], reverse_payloads)
         with jax.disable_jit():
-            return _build_reverse_segment_fn(payload_template)(payload_rollout, carry_bar)
+            return _build_reverse_segment_fn(payload_template)(reverse_payloads, carry_bar)
 
     def _reverse_only_once():
         nonlocal last_step_payload_report
@@ -529,28 +526,22 @@ def _compute_multi_step_metrics(
                 payload_template = reverse_payload
                 one_step_fn = _build_reverse_segment_fn(payload_template)
                 ablated_reverse_payloads = _ablate_reverse_payload(payload_rollout.reverse_payloads, payload_ablation)
-                single_payload_rollout = _RadauAcceptedPrimitivePayloadRollout(
-                    final_carry=payload_rollout.final_carry,
-                    accepted_mask=jnp.ones((1,), dtype=jnp.bool_),
-                    accepted_dts=payload_rollout.accepted_dts[last_idx : last_idx + 1],
-                    reduced_outputs=jax.tree_util.tree_map(lambda x: x[last_idx : last_idx + 1], payload_rollout.reduced_outputs),
-                    reverse_payloads=dataclasses.replace(
-                        ablated_reverse_payloads,
-                        **{
-                            name: getattr(ablated_reverse_payloads, name)[last_idx : last_idx + 1]
-                            for name in payload_dynamic_field_names + ("lagged_response_valid_in",)
-                        },
-                    ),
+                single_reverse_payloads = dataclasses.replace(
+                    ablated_reverse_payloads,
+                    **{
+                        name: getattr(ablated_reverse_payloads, name)[last_idx : last_idx + 1]
+                        for name in payload_dynamic_field_names + ("lagged_response_valid_in",)
+                    },
                 )
                 if execution_mode == "jit":
                     fn = reverse_segment_cache.get(-1)
                     if fn is None:
                         fn = jax.jit(one_step_fn)
                         reverse_segment_cache[-1] = fn
-                    carry_bar = fn(single_payload_rollout, carry_bar)
+                    carry_bar = fn(single_reverse_payloads, carry_bar)
                 else:
                     with jax.disable_jit():
-                        carry_bar = one_step_fn(single_payload_rollout, carry_bar)
+                        carry_bar = one_step_fn(single_reverse_payloads, carry_bar)
                 break
             carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
         return {
