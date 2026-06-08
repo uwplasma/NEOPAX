@@ -241,6 +241,12 @@ def _payload_field_names_without_lagged_valid() -> tuple[str, ...]:
     )
 
 
+def _slice_payload_value_at_step(value, step_idx: int):
+    if value is None:
+        return None
+    return jax.tree_util.tree_map(lambda x: x[step_idx], value)
+
+
 def _prefix_transport_config(
     config: dict,
     *,
@@ -717,7 +723,10 @@ def _compute_multi_step_metrics(
             ).tolist()
             reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
             for step_idx, lagged_valid in enumerate(lagged_valids):
-                dynamic_values = tuple(value[step_idx] for value in reversed_dynamic_values)
+                dynamic_values = tuple(
+                    _slice_payload_value_at_step(value, step_idx)
+                    for value in reversed_dynamic_values
+                )
                 if execution_mode == "jit":
                     carry_bar = reuse_fn(dynamic_values, carry_bar) if lagged_valid else rebuild_fn(dynamic_values, carry_bar)
                 else:
