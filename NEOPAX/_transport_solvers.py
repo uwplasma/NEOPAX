@@ -6932,73 +6932,158 @@ def _radau_collect_realized_accepted_step_payloads(
     max_total_steps: int,
     stop_after_accepted_steps: int | None,
 ) -> _RadauAcceptedPrimitivePayloadRollout:
-    """Collect accepted-step primitive payloads along the realized schedule.
+    """Collect accepted-step primitive payloads from the true adaptive attempt path.
 
-    This is the first rollout-level helper for the option-4 reverse refactor.
-    It follows the accepted-step-only contract and saves exact per-step
-    primitive payloads instead of rebuilding local primal context during
-    backward.
+    This intentionally follows the real adaptive loop, recording accepted-step
+    primitive payloads from the exact attempt context that forward mode used,
+    instead of reconstructing that context in a second accepted-only replay.
     """
-    rollout = _radau_adaptive_schedule_rollout(
-        execution_context,
+    dtype = execution_context.dtype
+    step_state0 = _radau_step_state_from_carry(
         carry0,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
     )
-    accepted_active_mask = jax.lax.stop_gradient(
-        jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)
-    )
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
     zero_reduced_output = _radau_zero_reduced_output_like(carry0)
     zero_reverse_payload = _radau_zero_reverse_payload_like(carry0)
 
-    def _scan_body(carry, xs):
-        accepted, dt_value = xs
+    def _inactive_step_info(step_state: _RadauStepState):
+        failed = step_state.status[0] != 0
+        fail_code = step_state.status[1]
+        return _RadauStepInfo(
+            y=step_state.y,
+            t=step_state.t,
+            dt=jnp.asarray(0.0, dtype=dtype),
+            next_dt=step_state.dt,
+            growth=jnp.asarray(1.0, dtype=dtype),
+            lagged_reused=jnp.asarray(False),
+            jacobian_reused=jnp.asarray(False),
+            accepted=jnp.asarray(False),
+            failed=failed,
+            fail_code=fail_code,
+            converged=jnp.asarray(False),
+            err_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            diverged=jnp.asarray(False),
+            nonfinite_stage_state=jnp.asarray(False),
+            nonfinite_stage_residual=jnp.asarray(False),
+            finite_f0=jnp.asarray(True),
+            finite_z0=jnp.asarray(True),
+            finite_initial_residual=jnp.asarray(True),
+            newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            final_residual_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            final_delta_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            theta_final=jnp.asarray(0.0, dtype=dtype),
+            slow_contraction=jnp.asarray(False),
+            residual_blowup=jnp.asarray(False),
+            newton_nonfinite=jnp.asarray(False),
+        )
 
-        def _do_step(_):
-            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+    xs = jnp.arange(int(max_total_steps), dtype=jnp.int32)
+
+    def _scan_body(step_state, step_idx):
+        active = jnp.logical_and(
+            _custom_loop_active(
+                step_state,
+                execution_context.attempt_context.t_final,
+                step_idx,
+                max_total_steps,
+            ),
+            jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)),
+        )
+
+        def _run(_):
+            carry_in = _radau_carry_from_step_state(step_state)
             primitive_result = _radau_accepted_step_primitive(
                 execution_context.kernel_context,
                 execution_context.physics_context,
-                carry_for_step,
+                carry_in,
                 execution_context.attempt_context,
             )
-            next_carry = dataclasses.replace(
-                primitive_result.next_carry,
-                prev_error=jnp.maximum(
-                    primitive_result.attempt_result.err_norm,
-                    jnp.asarray(1.0e-12, dtype=execution_context.dtype),
-                ),
-                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
-                regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
-                easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            attempt_result = primitive_result.attempt_result
+            step_state_attempt = _radau_step_state_from_carry(
+                attempt_result.carry_after_attempt,
+                status=step_state.status,
             )
-            scan_out = (
+            next_step_state, step_info = _apply_radau_lean_timestep_controller(
+                step_state=step_state_attempt,
+                trial_dt=attempt_result.trial_dt,
+                trial_y=attempt_result.trial_y,
+                err_norm=attempt_result.err_norm,
+                density_err_norm=attempt_result.density_err_norm,
+                pressure_err_norm=attempt_result.pressure_err_norm,
+                er_err_norm=attempt_result.er_err_norm,
+                converged=attempt_result.converged,
+                stage_history=attempt_result.stage_history,
+                jacobian_out=attempt_result.jacobian_out,
+                cache_valid_out=attempt_result.cache_valid_out,
+                cache_dt_out=attempt_result.cache_dt_out,
+                cache_age_out=attempt_result.cache_age_out,
+                real_lu_out=attempt_result.real_lu_out,
+                real_piv_out=attempt_result.real_piv_out,
+                complex_lu_out=attempt_result.complex_lu_out,
+                complex_piv_out=attempt_result.complex_piv_out,
+                newton_shrink=attempt_result.newton_shrink,
+                diverged_final=attempt_result.diverged_final,
+                nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+                nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+                finite_f0=attempt_result.finite_f0,
+                finite_z0=attempt_result.finite_z0,
+                finite_initial_residual=attempt_result.finite_initial_residual,
+                newton_iter_count=attempt_result.newton_iter_count,
+                final_residual_norm=attempt_result.final_residual_norm,
+                final_delta_norm=attempt_result.final_delta_norm,
+                theta_final=attempt_result.theta_final,
+                slow_contraction=attempt_result.slow_contraction_final,
+                residual_blowup=attempt_result.residual_blowup_final,
+                newton_nonfinite=attempt_result.newton_nonfinite_final,
+                lagged_reused=attempt_result.lagged_response_reused,
+                jacobian_reused=attempt_result.jacobian_reused,
+                fail_code=step_state.status[1],
+                n_accepted=step_state.status[2],
+                dtype=execution_context.dtype,
+                dt_min=execution_context.dt_min,
+                dt_max=execution_context.dt_max,
+                safety_factor=execution_context.safety_factor,
+                controller_alpha=execution_context.controller_alpha,
+                min_step_factor=execution_context.min_step_factor,
+                max_step_factor=execution_context.max_step_factor,
+                controller_mode=execution_context.controller_mode,
+                use_transport_lagged_response=execution_context.use_transport_lagged_response,
+                lagged_response_reuse_mode=execution_context.lagged_response_reuse_mode,
+                lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
+                lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
+                project_flat=execution_context.project_flat,
+            )
+
+            accepted = jnp.asarray(step_info.accepted)
+            reduced_output = jax.tree_util.tree_map(
+                lambda accepted_value, zero_value: jnp.where(accepted, accepted_value, zero_value),
                 primitive_result.reduced_output,
-                primitive_result.reverse_payload,
-                dt_value,
+                zero_reduced_output,
             )
-            return next_carry, scan_out
+            reverse_payload = jax.tree_util.tree_map(
+                lambda accepted_value, zero_value: jnp.where(accepted, accepted_value, zero_value),
+                primitive_result.reverse_payload,
+                zero_reverse_payload,
+            )
+            accepted_dt = jnp.where(accepted, attempt_result.trial_dt, jnp.asarray(0.0, dtype=dtype))
+            return next_step_state, (accepted, reduced_output, reverse_payload, accepted_dt)
 
         def _skip(_):
-            scan_out = (
+            return step_state, (
+                jnp.asarray(False),
                 zero_reduced_output,
                 zero_reverse_payload,
-                jnp.asarray(0.0, dtype=execution_context.dtype),
+                jnp.asarray(0.0, dtype=dtype),
             )
-            return carry, scan_out
 
-        return jax.lax.cond(accepted, _do_step, _skip, operand=None)
+        return jax.lax.cond(active, _run, _skip, operand=None)
 
-    final_carry, scan_outputs = jax.lax.scan(
-        _scan_body,
-        carry0,
-        (accepted_active_mask, attempted_dts),
-    )
-    reduced_outputs, reverse_payloads, accepted_dts = scan_outputs
+    final_step_state, scan_outputs = jax.lax.scan(_scan_body, step_state0, xs)
+    accepted_mask, reduced_outputs, reverse_payloads, accepted_dts = scan_outputs
+    final_carry = _radau_carry_from_step_state(final_step_state)
     return _RadauAcceptedPrimitivePayloadRollout(
         final_carry=final_carry,
-        accepted_mask=accepted_active_mask,
+        accepted_mask=accepted_mask,
         accepted_dts=accepted_dts,
         reduced_outputs=reduced_outputs,
         reverse_payloads=reverse_payloads,
