@@ -249,25 +249,31 @@ def _slice_payload_value_at_step(value, step_idx: int):
 
 def _branch_diagnostics_from_trace(
     *,
-    accepted_mask_np,
-    trace_lagged_valid_np,
+    initial_lagged_response_valid,
+    accepted_next_lagged_valid_np,
     accepted_dts_np,
 ):
-    accepted_trace_indices = np.flatnonzero(np.asarray(accepted_mask_np, dtype=bool))
-    accepted_lagged_valid_np = np.asarray(trace_lagged_valid_np, dtype=bool)[accepted_mask_np]
+    accepted_next_lagged_valid_np = np.asarray(accepted_next_lagged_valid_np, dtype=bool)
     accepted_dts_np = np.asarray(accepted_dts_np, dtype=float)
-    accepted_count = int(accepted_lagged_valid_np.shape[0])
-    rebuild_mask = np.logical_not(accepted_lagged_valid_np)
+    accepted_count = int(accepted_next_lagged_valid_np.shape[0])
+    if accepted_count == 0:
+        accepted_lagged_valid_in_np = np.asarray([], dtype=bool)
+    else:
+        accepted_lagged_valid_in_np = np.empty((accepted_count,), dtype=bool)
+        accepted_lagged_valid_in_np[0] = bool(np.asarray(initial_lagged_response_valid).item())
+        if accepted_count > 1:
+            accepted_lagged_valid_in_np[1:] = accepted_next_lagged_valid_np[:-1]
+    rebuild_mask = np.logical_not(accepted_lagged_valid_in_np)
     rebuild_indices = np.flatnonzero(rebuild_mask)
-    reuse_indices = np.flatnonzero(accepted_lagged_valid_np)
+    reuse_indices = np.flatnonzero(accepted_lagged_valid_in_np)
 
     def _entry(idx: int):
         return {
             "accepted_index": int(idx),
             "reverse_position": int(accepted_count - 1 - idx),
-            "trace_index": int(accepted_trace_indices[idx]),
             "dt": float(accepted_dts_np[idx]),
-            "lagged_response_valid_in": bool(accepted_lagged_valid_np[idx]),
+            "lagged_response_valid_in": bool(accepted_lagged_valid_in_np[idx]),
+            "next_lagged_response_valid": bool(accepted_next_lagged_valid_np[idx]),
         }
 
     first_rebuild = None if rebuild_indices.size == 0 else _entry(int(rebuild_indices[0]))
@@ -276,7 +282,7 @@ def _branch_diagnostics_from_trace(
     last_reuse = None if reuse_indices.size == 0 else _entry(int(reuse_indices[-1]))
     return {
         "accepted_count": accepted_count,
-        "reuse_count": int(np.count_nonzero(accepted_lagged_valid_np)),
+        "reuse_count": int(np.count_nonzero(accepted_lagged_valid_in_np)),
         "rebuild_count": int(np.count_nonzero(rebuild_mask)),
         "first_rebuild": first_rebuild,
         "last_rebuild": last_rebuild,
@@ -348,14 +354,10 @@ def _compute_multi_step_metrics(
         jax.device_get(schedule_rollout.trace.next_lagged_response_valid),
         dtype=bool,
     )[accepted_mask_np]
-    accepted_lagged_response_valid_np = np.asarray(
-        jax.device_get(schedule_rollout.trace.lagged_response_valid),
-        dtype=bool,
-    )
     accepted_count = int(accepted_dts_np.shape[0])
     branch_diagnostics = _branch_diagnostics_from_trace(
-        accepted_mask_np=accepted_mask_np,
-        trace_lagged_valid_np=accepted_lagged_response_valid_np,
+        initial_lagged_response_valid=np.asarray(jax.device_get(initial_carry.lagged_response_valid), dtype=bool),
+        accepted_next_lagged_valid_np=next_lagged_response_valid_np,
         accepted_dts_np=accepted_dts_np,
     )
     base_final_output_bar = _ablate_reduced_output_bar(
@@ -1090,7 +1092,6 @@ def main() -> None:
                 print(
                     f"    first_rebuild: accepted_index={int(first_rebuild['accepted_index'])} "
                     f"reverse_position={int(first_rebuild['reverse_position'])} "
-                    f"trace_index={int(first_rebuild['trace_index'])} "
                     f"dt={float(first_rebuild['dt']):.6e}"
                 )
     print(f"[autodiff-gate] wrote={outpath}")
