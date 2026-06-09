@@ -575,6 +575,7 @@ def _compute_multi_step_metrics(
         )
 
     payload_collect_cache = {}
+    step_loop_reverse_fn_cache = {}
     last_step_payload_report = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
@@ -748,6 +749,15 @@ def _compute_multi_step_metrics(
         )
 
     def _build_step_loop_reverse_fns(payload_template):
+        cache_key = (
+            cotangent_contract,
+            execution_mode,
+            tuple(payload_dynamic_field_names),
+        )
+        cached = step_loop_reverse_fn_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         payload_base_kwargs = {
             field.name: getattr(payload_template, field.name)
             for field in dataclasses.fields(_RadauAcceptedStepReversePayload)
@@ -769,8 +779,11 @@ def _compute_multi_step_metrics(
             return _apply_one_step_pullback(reverse_payload, bar)
 
         if execution_mode == "jit":
-            return jax.jit(_reuse_impl), jax.jit(_rebuild_impl)
-        return _reuse_impl, _rebuild_impl
+            built = (jax.jit(_reuse_impl), jax.jit(_rebuild_impl))
+        else:
+            built = (_reuse_impl, _rebuild_impl)
+        step_loop_reverse_fn_cache[cache_key] = built
+        return built
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
         nonlocal last_step_payload_report
