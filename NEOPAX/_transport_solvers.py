@@ -41,6 +41,13 @@ def _reverse_replay_device_from_env():
     return None
 
 
+def _lagged_eval_pullback_ablation_mode():
+    raw = str(os.environ.get("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION", "")).strip().lower()
+    if raw in ("", "none", "off", "default"):
+        return "none"
+    return raw
+
+
 def _build_real_block_transform(a: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Return real-valued stage transform data for an odd-stage Radau tableau."""
     eigvals, eigvecs = np.linalg.eig(a)
@@ -3808,13 +3815,25 @@ def _radau_accepted_step_y_pullback_linearized(
             and stage_flux_response_pullback is not None
         ):
             def flux_response_pullback_fn(flux_response_value, stage_rhs_bar_value):
+                ablation_mode = _lagged_eval_pullback_ablation_mode()
                 stage_shared_fluxes = stage_shared_fluxes_from_flux_response(
                     flux_response_value
                 )
-                stage_shared_fluxes_bar = stage_shared_fluxes_pullback(
-                    stage_shared_fluxes,
-                    stage_rhs_bar_value,
-                )
+                if ablation_mode == "zero-shared-flux-pullback":
+                    stage_shared_fluxes_bar = jax.tree_util.tree_map(
+                        _radau_zero_cotangent_like,
+                        stage_shared_fluxes,
+                    )
+                else:
+                    stage_shared_fluxes_bar = stage_shared_fluxes_pullback(
+                        stage_shared_fluxes,
+                        stage_rhs_bar_value,
+                    )
+                if ablation_mode == "zero-flux-response-pullback":
+                    return jax.tree_util.tree_map(
+                        _radau_zero_cotangent_like,
+                        flux_response_value,
+                    )
                 return stage_flux_response_pullback(
                     flux_response_value,
                     stage_shared_fluxes_bar,

@@ -4,6 +4,7 @@ import argparse
 import copy
 import dataclasses
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -390,6 +391,7 @@ def _compute_multi_step_metrics(
     capture_next_step_after_limit: bool,
     execute_captured_next_step: bool,
     rebuild_pullback_ablation: str,
+    lagged_eval_pullback_ablation: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -985,15 +987,26 @@ def _compute_multi_step_metrics(
             "primitive_prev_stages_bar_max": metric_values["primitive_prev_stages_bar_max"],
         }
 
-    t0 = time.perf_counter()
-    first = _reverse_only_once()
-    jax.block_until_ready(first["primitive_y_bar_max"])
-    compile_plus_execute_s = time.perf_counter() - t0
+    previous_lagged_eval_ablation = os.environ.get("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION")
+    if lagged_eval_pullback_ablation == "none":
+        os.environ.pop("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION", None)
+    else:
+        os.environ["NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION"] = str(lagged_eval_pullback_ablation)
+    try:
+        t0 = time.perf_counter()
+        first = _reverse_only_once()
+        jax.block_until_ready(first["primitive_y_bar_max"])
+        compile_plus_execute_s = time.perf_counter() - t0
 
-    t1 = time.perf_counter()
-    second = _reverse_only_once()
-    jax.block_until_ready(second["primitive_y_bar_max"])
-    execute_s = time.perf_counter() - t1
+        t1 = time.perf_counter()
+        second = _reverse_only_once()
+        jax.block_until_ready(second["primitive_y_bar_max"])
+        execute_s = time.perf_counter() - t1
+    finally:
+        if previous_lagged_eval_ablation is None:
+            os.environ.pop("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION", None)
+        else:
+            os.environ["NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION"] = previous_lagged_eval_ablation
 
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
@@ -1154,6 +1167,12 @@ def main() -> None:
         choices=("none", "zero-build-lagged"),
         help="Temporary rebuild-branch ablation. `zero-build-lagged` disables build_lagged_response_pullback only for reverse benchmarking.",
     )
+    parser.add_argument(
+        "--lagged-eval-pullback-ablation",
+        default="none",
+        choices=("none", "zero-shared-flux-pullback", "zero-flux-response-pullback"),
+        help="Temporary lagged-evaluation reverse ablation. `zero-shared-flux-pullback` zeros the shared-flux pullback inside the lagged-eval reverse; `zero-flux-response-pullback` zeros the flux-response pullback after shared-flux cotangents are formed.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -1211,6 +1230,7 @@ def main() -> None:
             capture_next_step_after_limit=bool(args.capture_next_step_after_limit),
             execute_captured_next_step=bool(args.execute_captured_next_step),
             rebuild_pullback_ablation=args.rebuild_pullback_ablation,
+            lagged_eval_pullback_ablation=args.lagged_eval_pullback_ablation,
         )
         prefix_reports.append(
             {
@@ -1243,6 +1263,7 @@ def main() -> None:
         "capture_next_step_after_limit": bool(args.capture_next_step_after_limit),
         "execute_captured_next_step": bool(args.execute_captured_next_step),
         "rebuild_pullback_ablation": args.rebuild_pullback_ablation,
+        "lagged_eval_pullback_ablation": args.lagged_eval_pullback_ablation,
         "prefix_reports": prefix_reports,
     }
 
@@ -1264,7 +1285,8 @@ def main() -> None:
         f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment} "
         f"capture_next_step_after_limit={bool(args.capture_next_step_after_limit)} "
         f"execute_captured_next_step={bool(args.execute_captured_next_step)} "
-        f"rebuild_pullback_ablation={args.rebuild_pullback_ablation}"
+        f"rebuild_pullback_ablation={args.rebuild_pullback_ablation} "
+        f"lagged_eval_pullback_ablation={args.lagged_eval_pullback_ablation}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
