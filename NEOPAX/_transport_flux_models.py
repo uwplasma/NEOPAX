@@ -2276,6 +2276,81 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if center_response_bar is None:
             return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        if isinstance(center_response_bar, NTXPreparedCoefficientResponse):
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+            def _build_center_response_from_primitives(density_value, pressure_value, er_value):
+                density_safe = safe_density(density_value)
+                temperature_value = pressure_value / density_safe
+                vthermal_value = get_v_thermal(self.species.mass, temperature_value)
+
+                def _per_radius(radius_index):
+                    prepared = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        support.center_prepared,
+                    )
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        support.center_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        temperature_value,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(
+                        density_safe,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        vthermal_value,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    return jax.vmap(
+                        lambda species_index: self._build_coefficient_response_local(
+                            prepared,
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_local,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )
+                    )(species_indices)
+
+                return self._map_radius_axis_regularized_at_axis0(
+                    _per_radius,
+                    radius_indices,
+                    self.geometry.r_grid,
+                )
+
+            _, pullback = jax.vjp(
+                _build_center_response_from_primitives,
+                state.density,
+                state.pressure,
+                state.Er,
+            )
+            density_bar, pressure_bar, er_bar = pullback(center_response_bar)
+            return dataclasses.replace(
+                state,
+                density=density_bar,
+                pressure=pressure_bar,
+                Er=er_bar,
+            )
+
         _, pullback = jax.vjp(
             lambda state_value: self.build_lagged_response(state_value).center_response,
             state,
