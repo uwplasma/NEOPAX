@@ -2277,68 +2277,174 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if center_response_bar is None:
             return jax.tree_util.tree_map(jnp.zeros_like, state)
 
-        if isinstance(center_response_bar, NTXPreparedCoefficientResponse):
+        def _build_coefficient_center_response_from_primitives(density_value, pressure_value, er_value):
+            density_safe = safe_density(density_value)
+            temperature_value = pressure_value / density_safe
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
+            vthermal_value = get_v_thermal(self.species.mass, temperature_value)
             species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
-            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+            radius_indices = jnp.arange(er_value.shape[0], dtype=jnp.int32)
 
-            def _build_center_response_from_primitives(density_value, pressure_value, er_value):
-                density_safe = safe_density(density_value)
-                temperature_value = pressure_value / density_safe
-                vthermal_value = get_v_thermal(self.species.mass, temperature_value)
-
-                def _per_radius(radius_index):
-                    prepared = jax.tree_util.tree_map(
-                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                        support.center_prepared,
-                    )
-                    drds_value = jax.lax.dynamic_index_in_dim(
-                        support.center_channels.drds,
-                        radius_index,
-                        axis=0,
-                        keepdims=False,
-                    )
-                    er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
-                    temperature_local = jax.lax.dynamic_index_in_dim(
-                        temperature_value,
-                        radius_index,
-                        axis=1,
-                        keepdims=False,
-                    )
-                    density_local = jax.lax.dynamic_index_in_dim(
-                        density_safe,
-                        radius_index,
-                        axis=1,
-                        keepdims=False,
-                    )
-                    vthermal_local = jax.lax.dynamic_index_in_dim(
-                        vthermal_value,
-                        radius_index,
-                        axis=1,
-                        keepdims=False,
-                    )
-                    return jax.vmap(
-                        lambda species_index: self._build_coefficient_response_local(
-                            prepared,
-                            drds_value=drds_value,
-                            species_index=species_index,
-                            er_value=er_local,
-                            temperature_local=temperature_local,
-                            density_local=density_local,
-                            vthermal_local=vthermal_local,
-                            collisionality_kind=collisionality_kind,
-                        )
-                    )(species_indices)
-
-                return self._map_radius_axis_regularized_at_axis0(
-                    _per_radius,
-                    radius_indices,
-                    self.geometry.r_grid,
+            def _per_radius(radius_index):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.center_prepared,
                 )
+                drds_value = jax.lax.dynamic_index_in_dim(
+                    support.center_channels.drds,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(
+                    temperature_value,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                density_local = jax.lax.dynamic_index_in_dim(
+                    density_safe,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                vthermal_local = jax.lax.dynamic_index_in_dim(
+                    vthermal_value,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                return jax.vmap(
+                    lambda species_index: self._build_coefficient_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_local,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
 
+            return self._map_radius_axis_regularized_at_axis0(
+                _per_radius,
+                radius_indices,
+                self.geometry.r_grid,
+            )
+
+        def _build_interpolated_center_response_from_primitives(density_value, pressure_value, er_value):
+            density_safe = safe_density(density_value)
+            temperature_value = pressure_value / density_safe
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            vthermal_value = get_v_thermal(self.species.mass, temperature_value)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            n_radius = int(er_value.shape[0])
+            radius_indices = jnp.arange(n_radius, dtype=jnp.int32)
+            anchor_indices = self._response_anchor_indices(n_radius)
+            target_rho = jnp.asarray(support.center_channels.rho, dtype=jnp.float64)
+
+            def _per_anchor(radius_index):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.center_prepared,
+                )
+                drds_value = jax.lax.dynamic_index_in_dim(
+                    support.center_channels.drds,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(
+                    temperature_value,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                density_local = jax.lax.dynamic_index_in_dim(
+                    density_safe,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                vthermal_local = jax.lax.dynamic_index_in_dim(
+                    vthermal_value,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_local,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            anchor_response = self._map_radius_axis_regularized_at_axis0(
+                _per_anchor,
+                anchor_indices,
+                jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices],
+            )
+            anchor_reference_log_nu_star = anchor_response[0]
+            anchor_reference_transport_moments = anchor_response[1]
+            anchor_dtransport_moments_d_er = anchor_response[2]
+            anchor_dtransport_moments_d_log_nu_star = anchor_response[3]
+            reference_log_nu_star = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_reference_log_nu_star,
+                target_rho,
+            )
+            reference_transport_moments = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_reference_transport_moments,
+                target_rho,
+            )
+            dtransport_moments_d_er = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_dtransport_moments_d_er,
+                target_rho,
+            )
+            dtransport_moments_d_log_nu_star = self._interpolate_anchor_values(
+                anchor_indices,
+                anchor_dtransport_moments_d_log_nu_star,
+                target_rho,
+            )
+            return NTXInterpolatedMomentResponse(
+                reference_er=er_value,
+                reference_log_nu_star=jnp.swapaxes(reference_log_nu_star, 0, 1),
+                reference_transport_moments=jnp.swapaxes(reference_transport_moments, 0, 1),
+                dtransport_moments_d_er=jnp.swapaxes(dtransport_moments_d_er, 0, 1),
+                dtransport_moments_d_log_nu_star=jnp.swapaxes(dtransport_moments_d_log_nu_star, 0, 1),
+            )
+
+        if isinstance(center_response_bar, NTXInterpolatedMomentResponse):
             _, pullback = jax.vjp(
-                _build_center_response_from_primitives,
+                _build_interpolated_center_response_from_primitives,
+                state.density,
+                state.pressure,
+                state.Er,
+            )
+            density_bar, pressure_bar, er_bar = pullback(center_response_bar)
+            return dataclasses.replace(
+                state,
+                density=density_bar,
+                pressure=pressure_bar,
+                Er=er_bar,
+            )
+
+        if isinstance(center_response_bar, NTXPreparedCoefficientResponse):
+            _, pullback = jax.vjp(
+                _build_coefficient_center_response_from_primitives,
                 state.density,
                 state.pressure,
                 state.Er,
