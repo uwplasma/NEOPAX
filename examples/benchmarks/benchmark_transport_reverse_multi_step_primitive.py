@@ -324,6 +324,8 @@ def _compute_multi_step_metrics(
     cotangent_contract: str,
     reverse_compose_mode: str,
     branch_diagnostics_only: bool,
+    max_reverse_segments: int | None,
+    max_reverse_steps_per_segment: int | None,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -804,7 +806,8 @@ def _compute_multi_step_metrics(
                 dtype=bool,
             ).tolist()
             reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
-            for step_idx, lagged_valid in enumerate(lagged_valids):
+            step_limit = len(lagged_valids) if max_reverse_steps_per_segment is None else min(len(lagged_valids), int(max_reverse_steps_per_segment))
+            for step_idx, lagged_valid in enumerate(lagged_valids[:step_limit]):
                 dynamic_values = tuple(
                     _slice_payload_value_at_step(value, step_idx)
                     for value in reversed_dynamic_values
@@ -826,7 +829,8 @@ def _compute_multi_step_metrics(
         nonlocal last_step_payload_report
         carry_bar = final_reverse_state
         reversed_ranges = list(reversed(segment_ranges))
-        for range_idx, (start_idx, end_idx) in enumerate(reversed_ranges):
+        segment_limit = len(reversed_ranges) if max_reverse_segments is None else min(len(reversed_ranges), int(max_reverse_segments))
+        for range_idx, (start_idx, end_idx) in enumerate(reversed_ranges[:segment_limit]):
             segment_start_carry = _segment_start_carry(start_idx)
             dt_segment = _accepted_dt_slice(start_idx, end_idx)
             payload_rollout = _collect_segment_payloads_compiled(segment_start_carry, dt_segment)
@@ -870,7 +874,10 @@ def _compute_multi_step_metrics(
             }
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
-            "segment_count": jnp.asarray(1 if reverse_probe_mode == "last-step-only" else len(segment_ranges), dtype=jnp.int32),
+            "segment_count": jnp.asarray(
+                1 if reverse_probe_mode == "last-step-only" else segment_limit,
+                dtype=jnp.int32,
+            ),
             "checkpoint_count": jnp.asarray(len(checkpoint_starts), dtype=jnp.int32),
             "segment_length": jnp.asarray(segment_length, dtype=jnp.int32),
             "primitive_y_bar_max": metric_values["primitive_y_bar_max"],
@@ -983,6 +990,18 @@ def main() -> None:
         action="store_true",
         help="Only report accepted-step reuse versus rebuild branch diagnostics from the primal schedule, without running the reverse pullback.",
     )
+    parser.add_argument(
+        "--max-reverse-segments",
+        type=int,
+        default=None,
+        help="Optional cap on how many reverse segments to execute, starting from the final segment.",
+    )
+    parser.add_argument(
+        "--max-reverse-steps-per-segment",
+        type=int,
+        default=None,
+        help="Optional cap on how many reverse steps to execute inside each segment, starting from the segment end.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -1035,6 +1054,8 @@ def main() -> None:
             cotangent_contract=args.cotangent_contract,
             reverse_compose_mode=args.reverse_compose_mode,
             branch_diagnostics_only=bool(args.branch_diagnostics_only),
+            max_reverse_segments=args.max_reverse_segments,
+            max_reverse_steps_per_segment=args.max_reverse_steps_per_segment,
         )
         prefix_reports.append(
             {
@@ -1062,6 +1083,8 @@ def main() -> None:
         "cotangent_contract": args.cotangent_contract,
         "reverse_compose_mode": args.reverse_compose_mode,
         "branch_diagnostics_only": bool(args.branch_diagnostics_only),
+        "max_reverse_segments": args.max_reverse_segments,
+        "max_reverse_steps_per_segment": args.max_reverse_steps_per_segment,
         "prefix_reports": prefix_reports,
     }
 
@@ -1078,7 +1101,9 @@ def main() -> None:
         f"reverse_probe_mode={args.reverse_probe_mode} payload_ablation={args.payload_ablation} "
         f"bar_ablation={args.bar_ablation} cotangent_contract={args.cotangent_contract} "
         f"reverse_compose_mode={args.reverse_compose_mode} "
-        f"branch_diagnostics_only={bool(args.branch_diagnostics_only)}"
+        f"branch_diagnostics_only={bool(args.branch_diagnostics_only)} "
+        f"max_reverse_segments={args.max_reverse_segments} "
+        f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
