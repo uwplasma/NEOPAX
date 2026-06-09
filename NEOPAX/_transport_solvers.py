@@ -48,6 +48,13 @@ def _lagged_eval_pullback_ablation_mode():
     return raw
 
 
+def _rebuild_pullback_ablation_mode():
+    raw = str(os.environ.get("NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION", "")).strip().lower()
+    if raw in ("", "none", "off", "default"):
+        return "none"
+    return raw
+
+
 def _build_real_block_transform(a: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Return real-valued stage transform data for an odd-stage Radau tableau."""
     eigvals, eigvecs = np.linalg.eig(a)
@@ -5515,6 +5522,13 @@ def _radau_accepted_step_forward_like_cache_no_stage_pullback(
     if not kernel_context.use_transport_lagged_response or physics_context.build_lagged_response is None:
         lagged_response_cache_in_bar = _radau_zero_cotangent_like(carry_in.lagged_response_cache)
     else:
+        rebuild_ablation_mode = _rebuild_pullback_ablation_mode()
+        carried_cache_bar = cotangent.lagged_response_cache
+        local_cache_bar = lagged_response_cache_bar
+        if rebuild_ablation_mode == "zero-incoming-cache-bar":
+            carried_cache_bar = _radau_zero_cotangent_like(cotangent.lagged_response_cache)
+        elif rebuild_ablation_mode == "zero-local-cache-bar":
+            local_cache_bar = _radau_zero_cotangent_like(lagged_response_cache_bar)
         combined_cache_bar = jax.tree_util.tree_map(
             lambda local_bar, carried_bar: (
                 carried_bar
@@ -5523,9 +5537,11 @@ def _radau_accepted_step_forward_like_cache_no_stage_pullback(
                 if carried_bar is None
                 else jnp.asarray(local_bar) + jnp.asarray(carried_bar)
             ),
-            lagged_response_cache_bar,
-            cotangent.lagged_response_cache,
+            local_cache_bar,
+            carried_cache_bar,
         )
+        if rebuild_ablation_mode == "zero-combined-cache-bar":
+            combined_cache_bar = _radau_zero_cotangent_like(combined_cache_bar)
 
         def _reuse_case(_):
             return combined_cache_bar, jnp.zeros_like(carry_in.y)

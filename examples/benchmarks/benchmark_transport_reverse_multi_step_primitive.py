@@ -988,10 +988,18 @@ def _compute_multi_step_metrics(
         }
 
     previous_lagged_eval_ablation = os.environ.get("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION")
+    previous_rebuild_ablation = os.environ.get("NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION")
     if lagged_eval_pullback_ablation == "none":
         os.environ.pop("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION", None)
     else:
         os.environ["NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION"] = str(lagged_eval_pullback_ablation)
+    env_rebuild_ablation = "none"
+    if rebuild_pullback_ablation in {"zero-incoming-cache-bar", "zero-local-cache-bar", "zero-combined-cache-bar"}:
+        env_rebuild_ablation = rebuild_pullback_ablation
+    if env_rebuild_ablation == "none":
+        os.environ.pop("NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION", None)
+    else:
+        os.environ["NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION"] = env_rebuild_ablation
     try:
         t0 = time.perf_counter()
         first = _reverse_only_once()
@@ -1007,6 +1015,10 @@ def _compute_multi_step_metrics(
             os.environ.pop("NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION", None)
         else:
             os.environ["NEOPAX_TRANSPORT_LAGGED_EVAL_PULLBACK_ABLATION"] = previous_lagged_eval_ablation
+        if previous_rebuild_ablation is None:
+            os.environ.pop("NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION", None)
+        else:
+            os.environ["NEOPAX_TRANSPORT_REBUILD_PULLBACK_ABLATION"] = previous_rebuild_ablation
 
     result = {key: np.asarray(jax.device_get(value)).item() for key, value in second.items()}
     result["compile_plus_execute_s"] = compile_plus_execute_s
@@ -1164,8 +1176,8 @@ def main() -> None:
     parser.add_argument(
         "--rebuild-pullback-ablation",
         default="none",
-        choices=("none", "zero-build-lagged"),
-        help="Temporary rebuild-branch ablation. `zero-build-lagged` disables build_lagged_response_pullback only for reverse benchmarking.",
+        choices=("none", "zero-build-lagged", "zero-incoming-cache-bar", "zero-local-cache-bar", "zero-combined-cache-bar"),
+        help="Temporary rebuild-branch ablation. `zero-build-lagged` disables build_lagged_response_pullback entirely; `zero-incoming-cache-bar` zeros the carried lagged-cache cotangent before the rebuild merge; `zero-local-cache-bar` zeros the local lagged-cache cotangent from accepted_y pullback; `zero-combined-cache-bar` zeros the merged cache cotangent right before build_lagged_response_pullback.",
     )
     parser.add_argument(
         "--lagged-eval-pullback-ablation",
