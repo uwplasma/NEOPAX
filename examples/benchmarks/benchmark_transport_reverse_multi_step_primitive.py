@@ -1170,8 +1170,8 @@ def main() -> None:
     parser.add_argument(
         "--lagged-eval-pullback-ablation",
         default="none",
-        choices=("none", "zero-shared-flux-pullback", "zero-flux-response-pullback"),
-        help="Temporary lagged-evaluation reverse ablation. `zero-shared-flux-pullback` zeros the shared-flux pullback inside the lagged-eval reverse; `zero-flux-response-pullback` zeros the flux-response pullback after shared-flux cotangents are formed.",
+        choices=("none", "zero-shared-flux-pullback", "zero-flux-response-pullback", "zero-lagged-dispatch"),
+        help="Temporary lagged-evaluation reverse ablation. `zero-shared-flux-pullback` zeros the shared-flux pullback inside the lagged-eval reverse; `zero-flux-response-pullback` zeros the flux-response pullback after shared-flux cotangents are formed; `zero-lagged-dispatch` skips the lagged-response cache pullback entirely at the accepted-step reverse boundary.",
     )
     args = parser.parse_args()
 

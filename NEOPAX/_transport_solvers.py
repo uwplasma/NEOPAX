@@ -3783,7 +3783,8 @@ def _radau_accepted_step_y_pullback_linearized(
     dh_bar = jnp.vdot(trial_y_bar, stage_weighted) + jnp.sum(stage_rhs_bar * stage_dh_source)
     dt_in_bar = jnp.sum(stage_rhs_bar * rhs_time_ref_arr[None, :])
 
-    if lagged_response is not None:
+    lagged_eval_ablation_mode = _lagged_eval_pullback_ablation_mode()
+    if lagged_response is not None and lagged_eval_ablation_mode != "zero-lagged-dispatch":
         stage_eval_fn = _radau_stage_evals_from_lagged_factory(
             kernel_context,
             physics_context,
