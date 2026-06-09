@@ -2790,6 +2790,42 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )
 
+        if isinstance(center_response, NTXPreparedCoefficientResponse):
+            def _reduced_response(
+                reference_transport_moments,
+                reference_nu_hat,
+                reference_epsi_hat,
+            ):
+                return self.evaluate_with_lagged_response(
+                    state,
+                    NTXExactLijLaggedResponse(
+                        center_response=NTXPreparedCoefficientResponse(
+                            reference_transport_moments=reference_transport_moments,
+                            reference_nu_hat=reference_nu_hat,
+                            reference_epsi_hat=reference_epsi_hat,
+                        )
+                    ),
+                )
+
+            _, pb = jax.vjp(
+                _reduced_response,
+                center_response.reference_transport_moments,
+                center_response.reference_nu_hat,
+                center_response.reference_epsi_hat,
+            )
+            (
+                reference_transport_moments_bar,
+                reference_nu_hat_bar,
+                reference_epsi_hat_bar,
+            ) = pb(flux_bar)
+            return NTXExactLijLaggedResponse(
+                center_response=NTXPreparedCoefficientResponse(
+                    reference_transport_moments=reference_transport_moments_bar,
+                    reference_nu_hat=reference_nu_hat_bar,
+                    reference_epsi_hat=reference_epsi_hat_bar,
+                )
+            )
+
         _, pb = jax.vjp(
             lambda response_value: self.evaluate_with_lagged_response(
                 state,

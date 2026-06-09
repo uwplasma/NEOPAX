@@ -4012,6 +4012,46 @@ def _radau_lagged_response_pullback_ntx_interpolated(
     )
 
 
+def _radau_lagged_response_pullback_ntx_prepared(
+    stage_eval_fn,
+    response,
+    stage_rhs_bar,
+):
+    """Reduced pullback for `NTXPreparedCoefficientResponse`."""
+    def _reduced_response(
+        reference_transport_moments,
+        reference_nu_hat,
+        reference_epsi_hat,
+    ):
+        from ._transport_flux_models import NTXPreparedCoefficientResponse
+
+        return stage_eval_fn(
+            NTXPreparedCoefficientResponse(
+                reference_transport_moments=reference_transport_moments,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+            )
+        )
+
+    _, pullback = jax.vjp(
+        _reduced_response,
+        response.reference_transport_moments,
+        response.reference_nu_hat,
+        response.reference_epsi_hat,
+    )
+    (
+        reference_transport_moments_bar,
+        reference_nu_hat_bar,
+        reference_epsi_hat_bar,
+    ) = pullback(stage_rhs_bar)
+    return dataclasses.replace(
+        jax.tree_util.tree_map(_radau_zero_cotangent_like, response),
+        reference_transport_moments=reference_transport_moments_bar,
+        reference_nu_hat=reference_nu_hat_bar,
+        reference_epsi_hat=reference_epsi_hat_bar,
+    )
+
+
 def _radau_lagged_response_pullback_single_field(
     stage_eval_fn,
     response,
@@ -4125,7 +4165,11 @@ def _radau_lagged_response_pullback_dispatch(
         )
 
     if isinstance(lagged_response, NTXPreparedCoefficientResponse):
-        return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
+        return _radau_lagged_response_pullback_ntx_prepared(
+            stage_eval_fn,
+            lagged_response,
+            stage_rhs_bar,
+        )
 
     if isinstance(lagged_response, JVPTransportFluxResponse):
         return _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stage_rhs_bar)
