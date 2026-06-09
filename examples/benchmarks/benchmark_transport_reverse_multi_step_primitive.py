@@ -233,6 +233,20 @@ def _forward_like_cache_no_stage_cotangent_metrics(
     }
 
 
+def _cotangent_metrics_for_mode(cotangent_contract: str, carry_bar):
+    if cotangent_contract == "forward-like-v1":
+        return _forward_like_cotangent_metrics(carry_bar)
+    if cotangent_contract == "forward-like-v2-no-stage":
+        return _forward_like_no_stage_cotangent_metrics(carry_bar)
+    if cotangent_contract == "forward-like-v3-cache-no-stage":
+        return _forward_like_cache_no_stage_cotangent_metrics(carry_bar)
+    return {
+        "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
+        "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(carry_bar.dt_out, dtype=jnp.float64))),
+        "primitive_prev_stages_bar_max": _tree_max_abs(carry_bar.prev_stages_out),
+    }
+
+
 def _payload_field_names_without_lagged_valid() -> tuple[str, ...]:
     return tuple(
         field.name
@@ -326,6 +340,7 @@ def _compute_multi_step_metrics(
     branch_diagnostics_only: bool,
     max_reverse_segments: int | None,
     max_reverse_steps_per_segment: int | None,
+    capture_next_step_after_limit: bool,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -579,6 +594,7 @@ def _compute_multi_step_metrics(
     payload_collect_cache = {}
     step_loop_reverse_fn_cache = {}
     last_step_payload_report = None
+    next_step_capture = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
         length = int(dt_segment.shape[0])
@@ -788,7 +804,7 @@ def _compute_multi_step_metrics(
         return built
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
-        nonlocal last_step_payload_report
+        nonlocal last_step_payload_report, next_step_capture
         if last_step_payload_report is None:
             last_payload = jax.tree_util.tree_map(lambda x: x[-1], payload_rollout.reverse_payloads)
             last_step_payload_report = _payload_leaf_stats(_ablate_reverse_payload(last_payload, payload_ablation))
@@ -817,6 +833,37 @@ def _compute_multi_step_metrics(
                 else:
                     with jax.disable_jit():
                         carry_bar = reuse_fn(dynamic_values, carry_bar) if lagged_valid else rebuild_fn(dynamic_values, carry_bar)
+            if (
+                capture_next_step_after_limit
+                and next_step_capture is None
+                and step_limit < len(lagged_valids)
+            ):
+                next_step_idx = int(step_limit)
+                next_dynamic_values = tuple(
+                    _slice_payload_value_at_step(value, next_step_idx)
+                    for value in reversed_dynamic_values
+                )
+                next_reverse_payload = dataclasses.replace(
+                    payload_template,
+                    **{
+                        "lagged_response_valid_in": jnp.asarray(lagged_valids[next_step_idx], dtype=jnp.bool_),
+                        **{
+                            name: value
+                            for name, value in zip(payload_dynamic_field_names, next_dynamic_values)
+                        },
+                    },
+                )
+                cotangent_metrics = _cotangent_metrics_for_mode(cotangent_contract, carry_bar)
+                next_step_capture = {
+                    "step_index_within_segment": next_step_idx,
+                    "lagged_response_valid_in": bool(lagged_valids[next_step_idx]),
+                    "dt_in": float(np.asarray(jax.device_get(next_reverse_payload.dt_in), dtype=float).item()),
+                    "trial_dt": float(np.asarray(jax.device_get(next_reverse_payload.trial_dt), dtype=float).item()),
+                    "incoming_bar_y_max": float(np.asarray(jax.device_get(cotangent_metrics["primitive_y_bar_max"]), dtype=float).item()),
+                    "incoming_bar_dt_abs": float(np.asarray(jax.device_get(cotangent_metrics["primitive_dt_bar_abs"]), dtype=float).item()),
+                    "incoming_bar_prev_stages_max": float(np.asarray(jax.device_get(cotangent_metrics["primitive_prev_stages_bar_max"]), dtype=float).item()),
+                    "payload_report": _payload_leaf_stats(next_reverse_payload),
+                }
             return carry_bar
         fn = _build_reverse_segment_fn(payload_template, reverse_payloads)
         if execution_mode == "jit":
@@ -860,18 +907,7 @@ def _compute_multi_step_metrics(
                         carry_bar = one_step_fn(carry_bar)
                 break
             carry_bar = _reverse_segment_compiled(payload_rollout, carry_bar)
-        if cotangent_contract == "forward-like-v1":
-            metric_values = _forward_like_cotangent_metrics(carry_bar)
-        elif cotangent_contract == "forward-like-v2-no-stage":
-            metric_values = _forward_like_no_stage_cotangent_metrics(carry_bar)
-        elif cotangent_contract == "forward-like-v3-cache-no-stage":
-            metric_values = _forward_like_cache_no_stage_cotangent_metrics(carry_bar)
-        else:
-            metric_values = {
-                "primitive_y_bar_max": _tree_max_abs(carry_bar.y_out),
-                "primitive_dt_bar_abs": jnp.max(jnp.abs(jnp.asarray(carry_bar.dt_out, dtype=jnp.float64))),
-                "primitive_prev_stages_bar_max": _tree_max_abs(carry_bar.prev_stages_out),
-            }
+        metric_values = _cotangent_metrics_for_mode(cotangent_contract, carry_bar)
         return {
             "accepted_count": jnp.asarray(accepted_count, dtype=jnp.int32),
             "segment_count": jnp.asarray(
@@ -900,6 +936,7 @@ def _compute_multi_step_metrics(
     result["execute_s"] = execute_s
     result["last_step_payload_report"] = last_step_payload_report
     result["branch_diagnostics"] = branch_diagnostics
+    result["next_step_capture"] = next_step_capture
     return result
 
 
@@ -1002,6 +1039,11 @@ def main() -> None:
         default=None,
         help="Optional cap on how many reverse steps to execute inside each segment, starting from the segment end.",
     )
+    parser.add_argument(
+        "--capture-next-step-after-limit",
+        action="store_true",
+        help="When a reverse-step limit is active, capture metadata for the next step that would run after the limit.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -1056,6 +1098,7 @@ def main() -> None:
             branch_diagnostics_only=bool(args.branch_diagnostics_only),
             max_reverse_segments=args.max_reverse_segments,
             max_reverse_steps_per_segment=args.max_reverse_steps_per_segment,
+            capture_next_step_after_limit=bool(args.capture_next_step_after_limit),
         )
         prefix_reports.append(
             {
@@ -1085,6 +1128,7 @@ def main() -> None:
         "branch_diagnostics_only": bool(args.branch_diagnostics_only),
         "max_reverse_segments": args.max_reverse_segments,
         "max_reverse_steps_per_segment": args.max_reverse_steps_per_segment,
+        "capture_next_step_after_limit": bool(args.capture_next_step_after_limit),
         "prefix_reports": prefix_reports,
     }
 
@@ -1103,7 +1147,8 @@ def main() -> None:
         f"reverse_compose_mode={args.reverse_compose_mode} "
         f"branch_diagnostics_only={bool(args.branch_diagnostics_only)} "
         f"max_reverse_segments={args.max_reverse_segments} "
-        f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment}"
+        f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment} "
+        f"capture_next_step_after_limit={bool(args.capture_next_step_after_limit)}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
@@ -1132,6 +1177,19 @@ def main() -> None:
                     f"reverse_position={int(first_rebuild['reverse_position'])} "
                     f"dt={float(first_rebuild['dt']):.6e}"
                 )
+        next_step_capture = result.get("next_step_capture")
+        if next_step_capture is not None:
+            print(
+                f"    next_step_capture: step_index_within_segment={int(next_step_capture['step_index_within_segment'])} "
+                f"lagged_valid_in={bool(next_step_capture['lagged_response_valid_in'])} "
+                f"dt_in={float(next_step_capture['dt_in']):.6e} "
+                f"trial_dt={float(next_step_capture['trial_dt']):.6e}"
+            )
+            print(
+                f"      incoming_bar_y_max={float(next_step_capture['incoming_bar_y_max']):.6e} "
+                f"incoming_bar_dt_abs={float(next_step_capture['incoming_bar_dt_abs']):.6e} "
+                f"incoming_bar_prev_stages_max={float(next_step_capture['incoming_bar_prev_stages_max']):.6e}"
+            )
     print(f"[autodiff-gate] wrote={outpath}")
 
 
