@@ -414,7 +414,7 @@ def _print_initial_finiteness_probe(config: dict) -> None:
                 density_floor=density_floor,
                 temperature_floor=temperature_floor,
             )
-            flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback, _unpack_flat_pullback = _make_solver_state_transform(
                 solver_state0,
                 runtime.species,
                 temperature_active_mask=temperature_active_mask_solver,

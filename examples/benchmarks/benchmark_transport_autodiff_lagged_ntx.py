@@ -523,7 +523,7 @@ def _initial_carry_from_state_with_static_setup(
 ):
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
     density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
-    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback = _make_solver_state_transform(
+    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback, _unpack_flat_pullback = _make_solver_state_transform(
         state,
         species,
         temperature_active_mask=temperature_active_mask,
@@ -8859,7 +8859,7 @@ def build_realized_trace_checkpoint_frozen_fd_report(
     next_lagged_response_valid = np.asarray(jax.device_get(baseline_rollout.trace.next_lagged_response_valid))
     step_ts = np.asarray(jax.device_get(baseline_rollout.trace.step_ts), dtype=float)
     unpack_flat = prepared_rollout_static.physics_context.unpack_flat
-    _flat_state0, _unpack_flat_tmp, _unpack_packed_tmp, pack_state, _project_flat_tmp, _project_flat_pullback_tmp = _make_solver_state_transform(
+    _flat_state0, _unpack_flat_tmp, _unpack_packed_tmp, pack_state, _project_flat_tmp, _project_flat_pullback_tmp, _unpack_flat_pullback_tmp = _make_solver_state_transform(
         baseline_state,
         runtime.species,
     )
