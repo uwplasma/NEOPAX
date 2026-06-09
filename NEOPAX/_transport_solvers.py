@@ -3651,6 +3651,43 @@ def _radau_accepted_step_y_tangent_from_primal_linearized(
     return accepted_y, accepted_y_tangent
 
 
+def _radau_build_lagged_response_transpose_from_forward_linearization(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    flat_y_source,
+    lagged_response_bar,
+):
+    """Transpose the same local builder linearization used by forward JVP.
+
+    Forward rebuilds the lagged response through a JVP of
+    `flat_y -> build_lagged_response(unpack(project(flat_y)))`.
+    For option 4 we want reverse to consume the cotangent through the transpose
+    of that exact reduced linearized map, rather than through a broader
+    reverse-only builder pullback path.
+    """
+    if physics_context.build_lagged_response is None or lagged_response_bar is None:
+        return jnp.zeros_like(flat_y_source)
+
+    def _build_from_flat(flat_y):
+        candidate_state = physics_context.unpack_flat(
+            _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+        )
+        return physics_context.build_lagged_response(candidate_state)
+
+    def _forward_linearized_builder(dflat_y):
+        _, dlagged_response = jax.jvp(
+            _build_from_flat,
+            (flat_y_source,),
+            (dflat_y,),
+        )
+        return dlagged_response
+
+    (flat_y_bar,) = jax.linear_transpose(
+        _forward_linearized_builder,
+        jnp.zeros_like(flat_y_source),
+    )(lagged_response_bar)
+    return jnp.asarray(flat_y_bar, dtype=jnp.asarray(flat_y_source).dtype)
+
+
 def _radau_replay_state_tangent_from_primal_linearized_reuse_only(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3727,6 +3764,38 @@ def _radau_lagged_response_pullback_generic(stage_eval_fn, lagged_response, stag
     return lagged_response_bar
 
 
+def _radau_lagged_response_transpose_from_forward_linearization(
+    stage_eval_fn,
+    lagged_response,
+    stage_rhs_bar,
+):
+    """Transpose the same lagged-response stage map that forward JVP uses.
+
+    Forward mode only needs the linearized map
+    `dlag -> d(stage_evals_from_lagged)` at the accepted-step primal point.
+    To keep reverse compile structure as close as possible to forward, consume
+    the cotangent through the transpose of that exact linearized map rather
+    than through a richer reverse-only decomposition.
+    """
+    if lagged_response is None:
+        return None
+
+    def _forward_linearized_stage_eval(dlagged_response):
+        _, dstage_eval = jax.jvp(
+            stage_eval_fn,
+            (lagged_response,),
+            (dlagged_response,),
+        )
+        return dstage_eval
+
+    zero_tangent = jax.tree_util.tree_map(_radau_zero_cotangent_like, lagged_response)
+    (lagged_response_bar,) = jax.linear_transpose(
+        _forward_linearized_stage_eval,
+        zero_tangent,
+    )(stage_rhs_bar)
+    return lagged_response_bar
+
+
 def _radau_accepted_step_y_pullback_linearized(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -3798,62 +3867,10 @@ def _radau_accepted_step_y_pullback_linearized(
             carry_in,
             primal_result,
         )
-        stage_shared_fluxes_from_flux_response = _radau_stage_shared_fluxes_from_flux_response_factory(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-        )
-        stage_shared_fluxes_pullback = _radau_stage_shared_fluxes_pullback_factory(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-        )
-        stage_flux_response_pullback = _radau_stage_flux_response_pullback_factory(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-        )
-
-        if (
-            stage_shared_fluxes_from_flux_response is not None
-            and stage_shared_fluxes_pullback is not None
-            and stage_flux_response_pullback is not None
-        ):
-            def flux_response_pullback_fn(flux_response_value, stage_rhs_bar_value):
-                ablation_mode = _lagged_eval_pullback_ablation_mode()
-                stage_shared_fluxes = stage_shared_fluxes_from_flux_response(
-                    flux_response_value
-                )
-                if ablation_mode == "zero-shared-flux-pullback":
-                    stage_shared_fluxes_bar = jax.tree_util.tree_map(
-                        _radau_zero_cotangent_like,
-                        stage_shared_fluxes,
-                    )
-                else:
-                    stage_shared_fluxes_bar = stage_shared_fluxes_pullback(
-                        stage_shared_fluxes,
-                        stage_rhs_bar_value,
-                    )
-                if ablation_mode == "zero-flux-response-pullback":
-                    return jax.tree_util.tree_map(
-                        _radau_zero_cotangent_like,
-                        flux_response_value,
-                    )
-                return stage_flux_response_pullback(
-                    flux_response_value,
-                    stage_shared_fluxes_bar,
-                )
-        else:
-            flux_response_pullback_fn = None
-
-        lagged_response_cache_bar = _radau_lagged_response_pullback_dispatch(
+        lagged_response_cache_bar = _radau_lagged_response_transpose_from_forward_linearization(
             stage_eval_fn,
             lagged_response,
             stage_rhs_bar,
-            flux_response_pullback_fn=flux_response_pullback_fn,
         )
     else:
         lagged_response_cache_bar = zero_lagged_cache_tangent
@@ -5268,25 +5285,19 @@ def _radau_accepted_step_primitive_pullback(
     )
     if physics_context.build_lagged_response is not None:
         def _reuse_case(_):
-            if physics_context.build_lagged_response_pullback is None:
-                lagged_reference_y_extra_bar = _radau_zero_cotangent_like(
-                    carry_in.lagged_reference_y
-                )
-            else:
-                lagged_reference_y_extra_bar = physics_context.build_lagged_response_pullback(
-                    carry_in.lagged_reference_y,
-                    _lagged_response_cache_bar,
-                )
+            lagged_reference_y_extra_bar = _radau_build_lagged_response_transpose_from_forward_linearization(
+                physics_context,
+                carry_in.lagged_reference_y,
+                _lagged_response_cache_bar,
+            )
             return lagged_reference_y_direct_bar + lagged_reference_y_extra_bar, jnp.zeros_like(carry_in.y)
 
         def _rebuild_case(_):
-            if physics_context.build_lagged_response_pullback is None:
-                y_from_lagged_bar = jnp.zeros_like(carry_in.y)
-            else:
-                y_from_lagged_bar = physics_context.build_lagged_response_pullback(
-                    carry_in.y,
-                    _lagged_response_cache_bar,
-                )
+            y_from_lagged_bar = _radau_build_lagged_response_transpose_from_forward_linearization(
+                physics_context,
+                carry_in.y,
+                _lagged_response_cache_bar,
+            )
             return _radau_zero_cotangent_like(carry_in.lagged_reference_y), y_from_lagged_bar + lagged_reference_y_direct_bar
 
         lagged_reference_y_in_bar, dy_extra = jax.lax.cond(
@@ -5383,13 +5394,11 @@ def _radau_accepted_step_forward_like_pullback(
             )
 
         def _rebuild_case(_):
-            if physics_context.build_lagged_response_pullback is None:
-                dy_extra = lagged_reference_y_direct_bar
-            else:
-                dy_extra = lagged_reference_y_direct_bar + physics_context.build_lagged_response_pullback(
-                    carry_in.y,
-                    lagged_response_cache_bar,
-                )
+            dy_extra = lagged_reference_y_direct_bar + _radau_build_lagged_response_transpose_from_forward_linearization(
+                physics_context,
+                carry_in.y,
+                lagged_response_cache_bar,
+            )
             return (
                 _radau_zero_cotangent_like(carry_in.lagged_response_cache),
                 _radau_zero_cotangent_like(carry_in.lagged_reference_y),
@@ -5459,13 +5468,11 @@ def _radau_accepted_step_forward_like_no_stage_pullback(
             return lagged_reference_y_direct_bar, jnp.zeros_like(carry_in.y)
 
         def _rebuild_case(_):
-            if physics_context.build_lagged_response_pullback is None:
-                dy_extra = lagged_reference_y_direct_bar
-            else:
-                dy_extra = lagged_reference_y_direct_bar + physics_context.build_lagged_response_pullback(
-                    carry_in.y,
-                    lagged_response_cache_bar,
-                )
+            dy_extra = lagged_reference_y_direct_bar + _radau_build_lagged_response_transpose_from_forward_linearization(
+                physics_context,
+                carry_in.y,
+                lagged_response_cache_bar,
+            )
             return _radau_zero_cotangent_like(carry_in.lagged_reference_y), dy_extra
 
         lagged_reference_y_in_bar, dy_extra = jax.lax.cond(
@@ -5547,13 +5554,11 @@ def _radau_accepted_step_forward_like_cache_no_stage_pullback(
             return combined_cache_bar, jnp.zeros_like(carry_in.y)
 
         def _rebuild_case(_):
-            if physics_context.build_lagged_response_pullback is None:
-                dy_extra = jnp.zeros_like(carry_in.y)
-            else:
-                dy_extra = physics_context.build_lagged_response_pullback(
-                    carry_in.y,
-                    combined_cache_bar,
-                )
+            dy_extra = _radau_build_lagged_response_transpose_from_forward_linearization(
+                physics_context,
+                carry_in.y,
+                combined_cache_bar,
+            )
             return _radau_zero_cotangent_like(carry_in.lagged_response_cache), dy_extra
 
         lagged_response_cache_in_bar, dy_extra = jax.lax.cond(

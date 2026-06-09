@@ -303,6 +303,20 @@ def _payload_field_names_without_lagged_valid() -> tuple[str, ...]:
     )
 
 
+def _payload_field_names_for_contract(cotangent_contract: str) -> tuple[str, ...]:
+    names = _payload_field_names_without_lagged_valid()
+    if cotangent_contract == "forward-like-v3-cache-no-stage":
+        # Keep only the leaves the active local pullback actually consumes.
+        excluded = {
+            "accepted_y",
+            "prev_dt_in",
+            "prev_theta_final_in",
+            "prev_newton_iter_count_in",
+        }
+        return tuple(name for name in names if name not in excluded)
+    return names
+
+
 def _slice_payload_value_at_step(value, step_idx: int):
     if value is None:
         return None
@@ -668,7 +682,7 @@ def _compute_multi_step_metrics(
 
     carry_template = initial_carry
 
-    payload_dynamic_field_names = _payload_field_names_without_lagged_valid()
+    payload_dynamic_field_names = _payload_field_names_for_contract(cotangent_contract)
 
     def _build_reverse_segment_fn(payload_template, reverse_payloads_static):
         payload_base_kwargs = {
