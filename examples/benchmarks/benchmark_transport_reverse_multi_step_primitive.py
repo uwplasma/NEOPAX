@@ -341,6 +341,7 @@ def _compute_multi_step_metrics(
     max_reverse_segments: int | None,
     max_reverse_steps_per_segment: int | None,
     capture_next_step_after_limit: bool,
+    execute_captured_next_step: bool,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -595,6 +596,8 @@ def _compute_multi_step_metrics(
     step_loop_reverse_fn_cache = {}
     last_step_payload_report = None
     next_step_capture = None
+    captured_next_reverse_payload = None
+    captured_next_incoming_bar = None
 
     def _collect_segment_payloads_compiled(carry_start, dt_segment):
         length = int(dt_segment.shape[0])
@@ -804,7 +807,7 @@ def _compute_multi_step_metrics(
         return built
 
     def _reverse_segment_compiled(payload_rollout, carry_bar):
-        nonlocal last_step_payload_report, next_step_capture
+        nonlocal last_step_payload_report, next_step_capture, captured_next_reverse_payload, captured_next_incoming_bar
         if last_step_payload_report is None:
             last_payload = jax.tree_util.tree_map(lambda x: x[-1], payload_rollout.reverse_payloads)
             last_step_payload_report = _payload_leaf_stats(_ablate_reverse_payload(last_payload, payload_ablation))
@@ -864,6 +867,8 @@ def _compute_multi_step_metrics(
                     "incoming_bar_prev_stages_max": float(np.asarray(jax.device_get(cotangent_metrics["primitive_prev_stages_bar_max"]), dtype=float).item()),
                     "payload_report": _payload_leaf_stats(next_reverse_payload),
                 }
+                captured_next_reverse_payload = next_reverse_payload
+                captured_next_incoming_bar = carry_bar
             return carry_bar
         fn = _build_reverse_segment_fn(payload_template, reverse_payloads)
         if execution_mode == "jit":
@@ -937,6 +942,41 @@ def _compute_multi_step_metrics(
     result["last_step_payload_report"] = last_step_payload_report
     result["branch_diagnostics"] = branch_diagnostics
     result["next_step_capture"] = next_step_capture
+    if execute_captured_next_step and captured_next_reverse_payload is not None and captured_next_incoming_bar is not None:
+        def _isolated_next_step_fn(incoming_bar):
+            return _apply_one_step_pullback(captured_next_reverse_payload, incoming_bar)
+
+        if execution_mode == "jit":
+            isolated_fn = jax.jit(_isolated_next_step_fn)
+            t_iso0 = time.perf_counter()
+            isolated_first = isolated_fn(captured_next_incoming_bar)
+            jax.block_until_ready(_cotangent_metrics_for_mode(cotangent_contract, isolated_first)["primitive_y_bar_max"])
+            isolated_compile_plus_execute_s = time.perf_counter() - t_iso0
+
+            t_iso1 = time.perf_counter()
+            isolated_second = isolated_fn(captured_next_incoming_bar)
+            jax.block_until_ready(_cotangent_metrics_for_mode(cotangent_contract, isolated_second)["primitive_y_bar_max"])
+            isolated_execute_s = time.perf_counter() - t_iso1
+            isolated_out = isolated_second
+        else:
+            t_iso0 = time.perf_counter()
+            with jax.disable_jit():
+                isolated_out = _isolated_next_step_fn(captured_next_incoming_bar)
+            jax.block_until_ready(_cotangent_metrics_for_mode(cotangent_contract, isolated_out)["primitive_y_bar_max"])
+            isolated_execute_s = time.perf_counter() - t_iso0
+            isolated_compile_plus_execute_s = isolated_execute_s
+
+        isolated_metrics = _cotangent_metrics_for_mode(cotangent_contract, isolated_out)
+        result["isolated_captured_next_step"] = {
+            "primitive_y_bar_max": float(np.asarray(jax.device_get(isolated_metrics["primitive_y_bar_max"]), dtype=float).item()),
+            "primitive_dt_bar_abs": float(np.asarray(jax.device_get(isolated_metrics["primitive_dt_bar_abs"]), dtype=float).item()),
+            "primitive_prev_stages_bar_max": float(np.asarray(jax.device_get(isolated_metrics["primitive_prev_stages_bar_max"]), dtype=float).item()),
+            "compile_plus_execute_s": isolated_compile_plus_execute_s,
+            "execute_s": isolated_execute_s,
+            "lagged_response_valid_in": bool(np.asarray(jax.device_get(captured_next_reverse_payload.lagged_response_valid_in)).item()),
+            "dt_in": float(np.asarray(jax.device_get(captured_next_reverse_payload.dt_in), dtype=float).item()),
+            "trial_dt": float(np.asarray(jax.device_get(captured_next_reverse_payload.trial_dt), dtype=float).item()),
+        }
     return result
 
 
@@ -1044,6 +1084,11 @@ def main() -> None:
         action="store_true",
         help="When a reverse-step limit is active, capture metadata for the next step that would run after the limit.",
     )
+    parser.add_argument(
+        "--execute-captured-next-step",
+        action="store_true",
+        help="After capturing the next step beyond the reverse-step limit, execute that exact single step in isolation using the captured incoming cotangent.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -1099,6 +1144,7 @@ def main() -> None:
             max_reverse_segments=args.max_reverse_segments,
             max_reverse_steps_per_segment=args.max_reverse_steps_per_segment,
             capture_next_step_after_limit=bool(args.capture_next_step_after_limit),
+            execute_captured_next_step=bool(args.execute_captured_next_step),
         )
         prefix_reports.append(
             {
@@ -1129,6 +1175,7 @@ def main() -> None:
         "max_reverse_segments": args.max_reverse_segments,
         "max_reverse_steps_per_segment": args.max_reverse_steps_per_segment,
         "capture_next_step_after_limit": bool(args.capture_next_step_after_limit),
+        "execute_captured_next_step": bool(args.execute_captured_next_step),
         "prefix_reports": prefix_reports,
     }
 
@@ -1148,7 +1195,8 @@ def main() -> None:
         f"branch_diagnostics_only={bool(args.branch_diagnostics_only)} "
         f"max_reverse_segments={args.max_reverse_segments} "
         f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment} "
-        f"capture_next_step_after_limit={bool(args.capture_next_step_after_limit)}"
+        f"capture_next_step_after_limit={bool(args.capture_next_step_after_limit)} "
+        f"execute_captured_next_step={bool(args.execute_captured_next_step)}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
@@ -1189,6 +1237,22 @@ def main() -> None:
                 f"      incoming_bar_y_max={float(next_step_capture['incoming_bar_y_max']):.6e} "
                 f"incoming_bar_dt_abs={float(next_step_capture['incoming_bar_dt_abs']):.6e} "
                 f"incoming_bar_prev_stages_max={float(next_step_capture['incoming_bar_prev_stages_max']):.6e}"
+            )
+        isolated_capture = result.get("isolated_captured_next_step")
+        if isolated_capture is not None:
+            print(
+                f"    isolated_captured_next_step: lagged_valid_in={bool(isolated_capture['lagged_response_valid_in'])} "
+                f"dt_in={float(isolated_capture['dt_in']):.6e} "
+                f"trial_dt={float(isolated_capture['trial_dt']):.6e}"
+            )
+            print(
+                f"      primitive_y_bar_max={float(isolated_capture['primitive_y_bar_max']):.6e} "
+                f"primitive_dt_bar_abs={float(isolated_capture['primitive_dt_bar_abs']):.6e} "
+                f"primitive_prev_stages_bar_max={float(isolated_capture['primitive_prev_stages_bar_max']):.6e}"
+            )
+            print(
+                f"      compile_plus_execute_s={float(isolated_capture['compile_plus_execute_s']):.6e} "
+                f"execute_s={float(isolated_capture['execute_s']):.6e}"
             )
     print(f"[autodiff-gate] wrote={outpath}")
 
