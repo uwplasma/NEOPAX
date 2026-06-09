@@ -959,3 +959,101 @@ not the accepted-step primal path and not more broad payload-family ablations.
    locally.
 5. Keep the accepted-step-only reverse composition structure unchanged while
    tightening the propagated cotangent boundary.
+
+### 2026-06-09 update: giant-graph OOM separated from local rebuild-pullback OOM
+
+The latest benchmark passes isolated two distinct issues:
+
+1. the old `segment-scan` reverse composition built a giant monolithic JIT
+   graph and OOMed around `141 GiB`
+2. after switching to the non-giant-graph `step-loop` composition, the
+   remaining failure is a local later-step rebuild pullback that still OOMs
+   around `49 GiB`
+
+This means the outer composition diagnosis is complete enough for now. The
+remaining hotspot is inside the local rebuild reverse rule.
+
+#### What is now confirmed
+
+- `step-loop` removes the catastrophic `141 GiB` scan-composition blowup
+- the failing later reverse step can be isolated to the final segment of the
+  `accepted_step_count=16` rollout
+- the exact failing step is:
+  - `step_index_within_segment = 7`
+  - `lagged_valid_in = False`
+  - `dt_in = trial_dt = 1.404447e-05`
+- the incoming lagged-cache cotangent tree for the failing step is not much
+  broader than the nearby passing step:
+  - passing captured step `6`:
+    - `lagged_valid_in = True`
+    - `total_bytes = 30192`
+    - `leaf_count = 12`
+    - `non_none_leaf_count = 11`
+    - `max_abs = 4.721807e+03`
+  - failing captured step `7`:
+    - `lagged_valid_in = False`
+    - `total_bytes = 30192`
+    - `leaf_count = 12`
+    - `non_none_leaf_count = 11`
+    - `max_abs = 5.675512e+03`
+
+So the failure is not explained by a sudden broadening of the incoming
+lagged-cache cotangent tree.
+
+#### Strongest current proof
+
+Using the temporary benchmark flag:
+
+- `--rebuild-pullback-ablation zero-build-lagged`
+
+the previously failing isolated captured next step now runs successfully, with:
+
+- `compile_plus_execute_s = 2.881095e+00`
+- `execute_s = 1.679732e-03`
+
+This is strong evidence that the local hotspot is specifically the rebuild
+contribution through:
+
+- `physics_context.build_lagged_response_pullback(carry_in.y, combined_cache_bar)`
+
+inside:
+
+- `_radau_accepted_step_forward_like_cache_no_stage_pullback(...)`
+
+in `NEOPAX/_transport_solvers.py`.
+
+### Next implementation steps
+
+The next work should stop focusing on benchmark plumbing and instead refactor
+the rebuild branch itself.
+
+1. Add a durable local debug split in the rebuild branch so the benchmark can
+   separately report:
+   - accepted-step transpose cost without rebuild pullback
+   - rebuild pullback cost alone
+2. Refactor `_radau_accepted_step_forward_like_cache_no_stage_pullback(...)`
+   so the rebuild branch no longer calls the generic whole-object
+   `build_lagged_response_pullback(...)` directly for the full lagged response.
+3. Introduce a model-aware rebuild-adjoint hook for lagged-response building,
+   analogous to the existing model-aware lagged-response reuse pullback
+   direction.
+4. Implement the first specialized rebuild rule for the transport lagged
+   response types actually active in this benchmark.
+5. Keep `forward-like-v3-cache-no-stage` as the active reverse contract while
+   doing this, so contract changes and rebuild-adjoint changes remain separated.
+6. Validate in this order:
+   - isolated captured failing step
+   - full final segment of the `accepted_step_count=16` rollout
+   - full `accepted_step_count=16` step-loop run
+   - only then resume larger-scale rollout composition experiments
+
+### Architectural conclusion after this round
+
+The remaining design target is:
+
+- keep the narrowed accepted-step reverse contract
+- keep the non-giant-graph reverse composition direction
+- replace the generic rebuild lagged-response pullback with a compressed,
+  model-aware rebuild adjoint
+
+That is now the real blocker for the reverse accepted-step path.

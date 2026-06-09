@@ -223,6 +223,14 @@ class TransportFluxModelBase(abc.ABC):
                         tangent_flux,
                 )
 
+        def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+                _, pullback = jax.vjp(
+                        lambda state_value: self.build_lagged_response(state_value, **kwargs),
+                        state,
+                )
+                (state_bar,) = pullback(lagged_response_bar)
+                return state_bar
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -625,6 +633,43 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
             classical_response=self.classical_model.build_lagged_response(state, **kwargs),
         )
+
+    def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        def _submodel_pullback(model, response_bar):
+            if response_bar is None:
+                return None
+            pullback_fn = getattr(model, "pullback_build_lagged_response", None)
+            if callable(pullback_fn):
+                return pullback_fn(state, response_bar, **kwargs)
+            _, pb = jax.vjp(
+                lambda state_value: model.build_lagged_response(state_value, **kwargs),
+                state,
+            )
+            (state_bar,) = pb(response_bar)
+            return state_bar
+
+        neo_bar = _submodel_pullback(
+            self.neoclassical_model,
+            lagged_response_bar.neoclassical_response,
+        )
+        turb_bar = _submodel_pullback(
+            self.turbulent_model,
+            lagged_response_bar.turbulent_response,
+        )
+        classical_bar = _submodel_pullback(
+            self.classical_model,
+            lagged_response_bar.classical_response,
+        )
+
+        def _zero_like_state():
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        state_bar = _zero_like_state()
+        for part in (neo_bar, turb_bar, classical_bar):
+            if part is None:
+                continue
+            state_bar = jax.tree_util.tree_map(lambda a, b: a + b, state_bar, part)
+        return state_bar
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         neo = (
@@ -2225,6 +2270,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
         return NTXExactLijLaggedResponse(center_response=response_by_radius)
+
+    def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        del kwargs
+        center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
+        if center_response_bar is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+        _, pullback = jax.vjp(
+            lambda state_value: self.build_lagged_response(state_value).center_response,
+            state,
+        )
+        (state_bar,) = pullback(center_response_bar)
+        return state_bar
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
