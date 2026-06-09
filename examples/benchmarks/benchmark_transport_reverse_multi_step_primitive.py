@@ -153,6 +153,53 @@ def _payload_leaf_stats(reverse_payload):
     return {"total_bytes": total_bytes, "group_totals": group_totals, "leaves": stats}
 
 
+def _value_leaf_stats(value):
+    if value is None:
+        return {
+            "total_bytes": 0,
+            "leaf_count": 0,
+            "non_none_leaf_count": 0,
+            "max_abs": 0.0,
+            "leaves": [],
+        }
+    leaves = jax.tree_util.tree_leaves(value, is_leaf=lambda x: x is None)
+    stats = []
+    total_bytes = 0
+    max_abs = 0.0
+    non_none_leaf_count = 0
+    for idx, leaf in enumerate(leaves):
+        if leaf is None:
+            stats.append({"leaf_index": int(idx), "is_none": True, "bytes": 0, "max_abs": 0.0})
+            continue
+        non_none_leaf_count += 1
+        arr = np.asarray(jax.device_get(leaf))
+        bytes_used = int(arr.nbytes)
+        total_bytes += bytes_used
+        if arr.dtype.kind in {"b", "i", "u"}:
+            leaf_max_abs = float(np.max(np.abs(arr.astype(np.float64)))) if arr.size else 0.0
+        else:
+            leaf_max_abs = float(np.max(np.abs(arr))) if arr.size else 0.0
+        max_abs = max(max_abs, leaf_max_abs)
+        stats.append(
+            {
+                "leaf_index": int(idx),
+                "is_none": False,
+                "bytes": bytes_used,
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "max_abs": leaf_max_abs,
+            }
+        )
+    stats.sort(key=lambda item: item["bytes"], reverse=True)
+    return {
+        "total_bytes": total_bytes,
+        "leaf_count": int(len(leaves)),
+        "non_none_leaf_count": int(non_none_leaf_count),
+        "max_abs": float(max_abs),
+        "leaves": stats,
+    }
+
+
 def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutput:
     if mode == "y-only":
         return _RadauAcceptedStepReducedOutput(
@@ -865,6 +912,11 @@ def _compute_multi_step_metrics(
                     "incoming_bar_y_max": float(np.asarray(jax.device_get(cotangent_metrics["primitive_y_bar_max"]), dtype=float).item()),
                     "incoming_bar_dt_abs": float(np.asarray(jax.device_get(cotangent_metrics["primitive_dt_bar_abs"]), dtype=float).item()),
                     "incoming_bar_prev_stages_max": float(np.asarray(jax.device_get(cotangent_metrics["primitive_prev_stages_bar_max"]), dtype=float).item()),
+                    "incoming_lagged_cache_bar_report": (
+                        _value_leaf_stats(carry_bar.lagged_response_cache)
+                        if hasattr(carry_bar, "lagged_response_cache")
+                        else None
+                    ),
                     "payload_report": _payload_leaf_stats(next_reverse_payload),
                 }
                 captured_next_reverse_payload = next_reverse_payload
@@ -1238,6 +1290,14 @@ def main() -> None:
                 f"incoming_bar_dt_abs={float(next_step_capture['incoming_bar_dt_abs']):.6e} "
                 f"incoming_bar_prev_stages_max={float(next_step_capture['incoming_bar_prev_stages_max']):.6e}"
             )
+            lagged_cache_report = next_step_capture.get("incoming_lagged_cache_bar_report")
+            if lagged_cache_report is not None:
+                print(
+                    f"      incoming_lagged_cache_bar: total_bytes={int(lagged_cache_report['total_bytes'])} "
+                    f"leaf_count={int(lagged_cache_report['leaf_count'])} "
+                    f"non_none_leaf_count={int(lagged_cache_report['non_none_leaf_count'])} "
+                    f"max_abs={float(lagged_cache_report['max_abs']):.6e}"
+                )
         isolated_capture = result.get("isolated_captured_next_step")
         if isolated_capture is not None:
             print(
