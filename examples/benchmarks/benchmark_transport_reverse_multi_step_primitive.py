@@ -389,6 +389,7 @@ def _compute_multi_step_metrics(
     max_reverse_steps_per_segment: int | None,
     capture_next_step_after_limit: bool,
     execute_captured_next_step: bool,
+    rebuild_pullback_ablation: str,
 ):
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -448,6 +449,12 @@ def _compute_multi_step_metrics(
         )
     else:
         final_reverse_state = base_final_output_bar
+    reverse_physics_context = execution_context.physics_context
+    if rebuild_pullback_ablation == "zero-build-lagged":
+        reverse_physics_context = dataclasses.replace(
+            execution_context.physics_context,
+            build_lagged_response_pullback=None,
+        )
     segment_length = max(1, int(segment_length))
     checkpoint_count = max(0, int(checkpoint_count))
 
@@ -783,7 +790,7 @@ def _compute_multi_step_metrics(
         if cotangent_contract == "forward-like-v1":
             return _radau_accepted_step_forward_like_pullback(
                 execution_context.kernel_context,
-                execution_context.physics_context,
+                reverse_physics_context,
                 carry_template,
                 execution_context.attempt_context,
                 reverse_payload,
@@ -792,7 +799,7 @@ def _compute_multi_step_metrics(
         if cotangent_contract == "forward-like-v2-no-stage":
             return _radau_accepted_step_forward_like_no_stage_pullback(
                 execution_context.kernel_context,
-                execution_context.physics_context,
+                reverse_physics_context,
                 carry_template,
                 execution_context.attempt_context,
                 reverse_payload,
@@ -801,7 +808,7 @@ def _compute_multi_step_metrics(
         if cotangent_contract == "forward-like-v3-cache-no-stage":
             return _radau_accepted_step_forward_like_cache_no_stage_pullback(
                 execution_context.kernel_context,
-                execution_context.physics_context,
+                reverse_physics_context,
                 carry_template,
                 execution_context.attempt_context,
                 reverse_payload,
@@ -809,7 +816,7 @@ def _compute_multi_step_metrics(
             )
         return _radau_accepted_step_primitive_pullback(
             execution_context.kernel_context,
-            execution_context.physics_context,
+            reverse_physics_context,
             carry_template,
             execution_context.attempt_context,
             reverse_payload,
@@ -1141,6 +1148,12 @@ def main() -> None:
         action="store_true",
         help="After capturing the next step beyond the reverse-step limit, execute that exact single step in isolation using the captured incoming cotangent.",
     )
+    parser.add_argument(
+        "--rebuild-pullback-ablation",
+        default="none",
+        choices=("none", "zero-build-lagged"),
+        help="Temporary rebuild-branch ablation. `zero-build-lagged` disables build_lagged_response_pullback only for reverse benchmarking.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -1197,6 +1210,7 @@ def main() -> None:
             max_reverse_steps_per_segment=args.max_reverse_steps_per_segment,
             capture_next_step_after_limit=bool(args.capture_next_step_after_limit),
             execute_captured_next_step=bool(args.execute_captured_next_step),
+            rebuild_pullback_ablation=args.rebuild_pullback_ablation,
         )
         prefix_reports.append(
             {
@@ -1228,6 +1242,7 @@ def main() -> None:
         "max_reverse_steps_per_segment": args.max_reverse_steps_per_segment,
         "capture_next_step_after_limit": bool(args.capture_next_step_after_limit),
         "execute_captured_next_step": bool(args.execute_captured_next_step),
+        "rebuild_pullback_ablation": args.rebuild_pullback_ablation,
         "prefix_reports": prefix_reports,
     }
 
@@ -1248,7 +1263,8 @@ def main() -> None:
         f"max_reverse_segments={args.max_reverse_segments} "
         f"max_reverse_steps_per_segment={args.max_reverse_steps_per_segment} "
         f"capture_next_step_after_limit={bool(args.capture_next_step_after_limit)} "
-        f"execute_captured_next_step={bool(args.execute_captured_next_step)}"
+        f"execute_captured_next_step={bool(args.execute_captured_next_step)} "
+        f"rebuild_pullback_ablation={args.rebuild_pullback_ablation}"
     )
     for prefix in prefix_reports:
         result = prefix["result"]
