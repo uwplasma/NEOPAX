@@ -201,6 +201,45 @@ def _value_leaf_stats(value):
     }
 
 
+def _type_name_or_none(value) -> str | None:
+    return None if value is None else type(value).__name__
+
+
+def _lagged_response_route_diagnostics(physics_context, lagged_response) -> dict[str, object]:
+    top_type = _type_name_or_none(lagged_response)
+    flux_response = getattr(lagged_response, "flux_response", None) if lagged_response is not None else None
+    flux_response_type = _type_name_or_none(flux_response)
+    neo_response = getattr(flux_response, "neoclassical_response", None) if flux_response is not None else None
+    neo_response_type = _type_name_or_none(neo_response)
+    center_response = getattr(neo_response, "center_response", None) if neo_response is not None else None
+    center_response_type = _type_name_or_none(center_response)
+    has_build_pullback = callable(getattr(physics_context, "build_lagged_response_pullback", None))
+    reduced_center_types = {"NTXInterpolatedMomentResponse", "NTXPreparedCoefficientResponse"}
+
+    if not has_build_pullback:
+        predicted_route = "solver_flat_builder_fallback_vjp"
+    elif center_response_type in reduced_center_types:
+        predicted_route = f"reduced_ntx_center_response:{center_response_type}"
+    elif center_response_type is not None:
+        predicted_route = f"generic_ntx_center_response_fallback:{center_response_type}"
+    elif neo_response_type is not None:
+        predicted_route = f"generic_neoclassical_response_fallback:{neo_response_type}"
+    elif flux_response_type is not None:
+        predicted_route = f"generic_flux_response_fallback:{flux_response_type}"
+    else:
+        predicted_route = f"generic_lagged_response_fallback:{top_type}"
+
+    return {
+        "has_build_lagged_response_pullback": bool(has_build_pullback),
+        "lagged_response_type": top_type,
+        "flux_response_type": flux_response_type,
+        "neoclassical_response_type": neo_response_type,
+        "center_response_type": center_response_type,
+        "center_response_is_reduced_ntx_case": bool(center_response_type in reduced_center_types),
+        "predicted_build_pullback_route": predicted_route,
+    }
+
+
 def _make_reduced_output_bar(carry, mode: str) -> _RadauAcceptedStepReducedOutput:
     if mode == "y-only":
         return _RadauAcceptedStepReducedOutput(
@@ -941,6 +980,10 @@ def _compute_multi_step_metrics(
                         else None
                     ),
                     "payload_report": _payload_leaf_stats(next_reverse_payload),
+                    "lagged_response_route_diagnostics": _lagged_response_route_diagnostics(
+                        reverse_physics_context,
+                        next_reverse_payload.lagged_response_in,
+                    ),
                 }
                 captured_next_reverse_payload = next_reverse_payload
                 captured_next_incoming_bar = carry_bar
@@ -1074,6 +1117,10 @@ def _compute_multi_step_metrics(
             "lagged_response_valid_in": bool(np.asarray(jax.device_get(captured_next_reverse_payload.lagged_response_valid_in)).item()),
             "dt_in": float(np.asarray(jax.device_get(captured_next_reverse_payload.dt_in), dtype=float).item()),
             "trial_dt": float(np.asarray(jax.device_get(captured_next_reverse_payload.trial_dt), dtype=float).item()),
+            "lagged_response_route_diagnostics": _lagged_response_route_diagnostics(
+                reverse_physics_context,
+                captured_next_reverse_payload.lagged_response_in,
+            ),
         }
     return result
 
@@ -1362,6 +1409,16 @@ def main() -> None:
                     f"non_none_leaf_count={int(lagged_cache_report['non_none_leaf_count'])} "
                     f"max_abs={float(lagged_cache_report['max_abs']):.6e}"
                 )
+            route_diag = next_step_capture.get("lagged_response_route_diagnostics")
+            if route_diag is not None:
+                print(
+                    f"      lagged_route: predicted={route_diag['predicted_build_pullback_route']} "
+                    f"build_pullback={bool(route_diag['has_build_lagged_response_pullback'])} "
+                    f"top={route_diag['lagged_response_type']} "
+                    f"flux={route_diag['flux_response_type']} "
+                    f"neo={route_diag['neoclassical_response_type']} "
+                    f"center={route_diag['center_response_type']}"
+                )
         isolated_capture = result.get("isolated_captured_next_step")
         if isolated_capture is not None:
             print(
@@ -1378,6 +1435,16 @@ def main() -> None:
                 f"      compile_plus_execute_s={float(isolated_capture['compile_plus_execute_s']):.6e} "
                 f"execute_s={float(isolated_capture['execute_s']):.6e}"
             )
+            route_diag = isolated_capture.get("lagged_response_route_diagnostics")
+            if route_diag is not None:
+                print(
+                    f"      lagged_route: predicted={route_diag['predicted_build_pullback_route']} "
+                    f"build_pullback={bool(route_diag['has_build_lagged_response_pullback'])} "
+                    f"top={route_diag['lagged_response_type']} "
+                    f"flux={route_diag['flux_response_type']} "
+                    f"neo={route_diag['neoclassical_response_type']} "
+                    f"center={route_diag['center_response_type']}"
+                )
     print(f"[autodiff-gate] wrote={outpath}")
 
 

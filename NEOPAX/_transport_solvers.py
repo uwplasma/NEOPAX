@@ -3667,6 +3667,15 @@ def _radau_build_lagged_response_transpose_from_forward_linearization(
     if physics_context.build_lagged_response is None or lagged_response_bar is None:
         return jnp.zeros_like(flat_y_source)
 
+    if physics_context.build_lagged_response_pullback is not None:
+        return jnp.asarray(
+            physics_context.build_lagged_response_pullback(
+                flat_y_source,
+                lagged_response_bar,
+            ),
+            dtype=jnp.asarray(flat_y_source).dtype,
+        )
+
     def _build_from_flat(flat_y):
         candidate_state = physics_context.unpack_flat(
             _project_flat_state_if_needed(flat_y, physics_context.project_flat)

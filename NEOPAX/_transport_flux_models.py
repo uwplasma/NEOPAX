@@ -2277,6 +2277,30 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if center_response_bar is None:
             return jax.tree_util.tree_map(jnp.zeros_like, state)
 
+        def _transpose_primitives_from_builder(builder_fn, response_bar_value):
+            density0 = state.density
+            pressure0 = state.pressure
+            er0 = state.Er
+
+            def _forward_linearized_builder(ddensity, dpressure, der):
+                _, dresponse = jax.jvp(
+                    builder_fn,
+                    (density0, pressure0, er0),
+                    (ddensity, dpressure, der),
+                )
+                return dresponse
+
+            zeros = (
+                jnp.zeros_like(density0),
+                jnp.zeros_like(pressure0),
+                jnp.zeros_like(er0),
+            )
+            density_bar, pressure_bar, er_bar = jax.linear_transpose(
+                _forward_linearized_builder,
+                *zeros,
+            )(response_bar_value)
+            return density_bar, pressure_bar, er_bar
+
         def _build_coefficient_center_response_from_primitives(density_value, pressure_value, er_value):
             density_safe = safe_density(density_value)
             temperature_value = pressure_value / density_safe
@@ -2428,13 +2452,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
 
         if isinstance(center_response_bar, NTXInterpolatedMomentResponse):
-            _, pullback = jax.vjp(
+            density_bar, pressure_bar, er_bar = _transpose_primitives_from_builder(
                 _build_interpolated_center_response_from_primitives,
-                state.density,
-                state.pressure,
-                state.Er,
+                center_response_bar,
             )
-            density_bar, pressure_bar, er_bar = pullback(center_response_bar)
             return dataclasses.replace(
                 state,
                 density=density_bar,
@@ -2443,13 +2464,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
 
         if isinstance(center_response_bar, NTXPreparedCoefficientResponse):
-            _, pullback = jax.vjp(
+            density_bar, pressure_bar, er_bar = _transpose_primitives_from_builder(
                 _build_coefficient_center_response_from_primitives,
-                state.density,
-                state.pressure,
-                state.Er,
+                center_response_bar,
             )
-            density_bar, pressure_bar, er_bar = pullback(center_response_bar)
             return dataclasses.replace(
                 state,
                 density=density_bar,
