@@ -4400,6 +4400,36 @@ Adaptive custom AD vs frozen central FD, parameter `T0`,
   - `abs_err = 1.510863e-05`
   - `rel_err = 2.092480e-04`
 
+#### Compact formatted tables for `n_0` and `T_0`
+
+These are the same saved values above, rewritten in compact table form for
+quick visual comparison. The metric label `$E_r^{\pm}$` is used here as a short
+display alias for the saved `smooth_root_proxy` row.
+
+##### `$n_0$` with `$h = 1.263000 \times 10^{-7}$`
+
+| Metric | Custom AD | FD | `$|\Delta|$` | Rel. Error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | `4.086843e+01` | `4.087382e+01` | `5.390000e-03` | `1.318693e-04` |
+| `$E_r^{\pm}$` | `-8.501898e-05` | `-8.500619e-05` | `1.279000e-08` | `1.504596e-04` |
+| `Er2_volume_average` | `9.661756e+01` | `9.662527e+01` | `7.710000e-03` | `7.979279e-05` |
+| `Er_volume_average` | `-4.321700e+00` | `-4.321650e+00` | `5.000000e-05` | `1.156966e-05` |
+| `electron_temperature_volume_average_keV` | `1.300916e-02` | `1.300917e-02` | `1.000000e-08` | `7.686885e-07` |
+| `total_pressure_volume_average` | `7.942294e+00` | `7.942294e+00` | `0.000000e+00` | `0.000000e+00` |
+| `alpha_power_volume_average_mw_m3` | `2.845732e-01` | `2.845785e-01` | `5.300000e-06` | `1.862404e-05` |
+
+##### `$T_0$` with `$h = 5.340000 \times 10^{-7}$`
+
+| Metric | Custom AD | FD | `$|\Delta|$` | Rel. Error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | `-2.160399e+01` | `-2.161529e+01` | `1.129999e-02` | `5.227777e-04` |
+| `$E_r^{\pm}$` | `2.070900e-05` | `2.073464e-05` | `2.563682e-08` | `1.236424e-03` |
+| `Er2_volume_average` | `-2.765750e+01` | `-2.767012e+01` | `1.262507e-02` | `4.562707e-04` |
+| `Er_volume_average` | `2.291385e+00` | `2.291084e+00` | `3.007156e-04` | `1.312547e-04` |
+| `electron_temperature_volume_average_keV` | `3.571291e-01` | `3.571291e-01` | `5.455578e-08` | `1.527621e-07` |
+| `total_pressure_volume_average` | `1.835267e+00` | `1.835267e+00` | `2.165264e-07` | `1.179809e-07` |
+| `alpha_power_volume_average_mw_m3` | `7.221955e-02` | `7.220444e-02` | `1.510863e-05` | `2.092480e-04` |
+
 VMEC/JAX AD-path notes for next session
 
 - The promoted `vmec_jax` optimization derivative path is the accepted-point
