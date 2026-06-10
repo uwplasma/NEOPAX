@@ -2713,7 +2713,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             raw_anchor_response_bar = jax.linear_transpose(
                 _forward_interpolated_fields_from_anchor_fields,
                 *anchor_response_templates,
-            )(*full_response_bar_fields)
+            )(full_response_bar_fields)
 
             density_bar = jnp.zeros_like(density0)
             pressure_bar = jnp.zeros_like(pressure0)
