@@ -2358,8 +2358,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
-        def _per_energy(args):
-            energy_index, nu_hat_value, epsi_hat_value, vth_a_value = args
+        def _per_energy(energy_index):
+            nu_hat_value = reference_nu_hat[energy_index]
+            epsi_hat_value = reference_epsi_hat[energy_index]
+            vth_a_value = vth_a[energy_index]
 
             def _single_energy_dtransport(nu_value, epsi_value, vth_value):
                 epsi_hat_tangent_value = jnp.asarray(1.0e3, dtype=epsi_value.dtype) / (
@@ -2393,7 +2395,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         nu_hat_bar, epsi_hat_bar, vth_a_bar = jax.lax.map(
             _per_energy,
-            (energy_indices, reference_nu_hat, reference_epsi_hat, vth_a),
+            energy_indices,
         )
         return nu_hat_bar, epsi_hat_bar, vth_a_bar
 
@@ -2408,8 +2410,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
-        def _per_energy(args):
-            energy_index, nu_hat_value, epsi_hat_value = args
+        def _per_energy(energy_index):
+            nu_hat_value = reference_nu_hat[energy_index]
+            epsi_hat_value = reference_epsi_hat[energy_index]
 
             def _single_energy_dtransport(nu_value, epsi_value):
                 return jax.jvp(
@@ -2438,7 +2441,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         nu_hat_bar, epsi_hat_bar = jax.lax.map(
             _per_energy,
-            (energy_indices, reference_nu_hat, reference_epsi_hat),
+            energy_indices,
         )
         return nu_hat_bar, epsi_hat_bar
 
