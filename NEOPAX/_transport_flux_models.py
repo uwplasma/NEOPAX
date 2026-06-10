@@ -2124,12 +2124,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 zero_nu_hat,
                 zero_epsi_hat,
                 zero_vth_a,
-            )(
-                tuple(
-                    species_field_bars[field_name]
-                    for field_name in _INTERPOLATED_RESPONSE_FIELD_NAMES
-                )
-            )
+            )(species_field_bars)
 
             def _scan_inputs_from_local_primitives(
                 er_local,
@@ -2523,16 +2518,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )(response_bar_value)
             return density_bar, pressure_bar, er_bar
 
-        def _transpose_interpolation(anchor_indices, anchor_values_template, full_values_bar, target_rho):
-            def _interpolate_only(anchor_values):
-                return self._interpolate_anchor_values(anchor_indices, anchor_values, target_rho)
-
-            (anchor_values_bar,) = jax.linear_transpose(
-                _interpolate_only,
-                jnp.zeros_like(anchor_values_template),
-            )(full_values_bar)
-            return anchor_values_bar
-
         def _build_coefficient_center_response_from_primitives(density_value, pressure_value, er_value):
             density_safe = safe_density(density_value)
             temperature_value = pressure_value / density_safe
@@ -2694,48 +2679,41 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             anchor_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices]
             n_anchor = int(anchor_indices.shape[0])
             collisionality_kind = _collisionality_kind(self.collisionality_model)
-            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
-            full_response_bar_fields = {
-                "reference_log_nu_star": jnp.swapaxes(center_response_bar.reference_log_nu_star, 0, 1),
-                "reference_transport_moments": jnp.swapaxes(center_response_bar.reference_transport_moments, 0, 1),
-                "dtransport_moments_d_er": jnp.swapaxes(center_response_bar.dtransport_moments_d_er, 0, 1),
-                "dtransport_moments_d_log_nu_star": jnp.swapaxes(center_response_bar.dtransport_moments_d_log_nu_star, 0, 1),
-            }
-            anchor_response_bar_fields = {
-                field_name: _transpose_interpolation(
-                    anchor_indices,
-                    jnp.zeros(
-                        (n_anchor,) + full_response_bar_fields[field_name].shape[1:],
-                        dtype=full_response_bar_fields[field_name].dtype,
-                    ),
-                    full_response_bar_fields[field_name],
-                    target_rho,
+            full_response_bar_fields = (
+                jnp.swapaxes(center_response_bar.reference_log_nu_star, 0, 1),
+                jnp.swapaxes(center_response_bar.reference_transport_moments, 0, 1),
+                jnp.swapaxes(center_response_bar.dtransport_moments_d_er, 0, 1),
+                jnp.swapaxes(center_response_bar.dtransport_moments_d_log_nu_star, 0, 1),
+            )
+            anchor_response_templates = tuple(
+                jnp.zeros(
+                    (n_anchor,) + field_bar.shape[1:],
+                    dtype=field_bar.dtype,
                 )
-                for field_name in _INTERPOLATED_RESPONSE_FIELD_NAMES
-            }
+                for field_bar in full_response_bar_fields
+            )
             er_bar_direct = jnp.asarray(center_response_bar.reference_er)
 
-            if n_anchor >= 4:
-                zero_anchor_response = jax.tree_util.tree_map(jnp.zeros_like, anchor_response_bar_fields)
-
-                def _regularize_anchor_response_only(raw_anchor_response):
-                    return self._regularize_axis_radius0(raw_anchor_response, anchor_rho)
-
-                def _transpose_regularized(_):
-                    return jax.linear_transpose(
-                        _regularize_anchor_response_only,
-                        zero_anchor_response,
-                    )(anchor_response_bar_fields)[0]
-
-                raw_anchor_response_bar = jax.lax.cond(
-                    jnp.isclose(anchor_rho[0], 0.0),
-                    _transpose_regularized,
-                    lambda _: anchor_response_bar_fields,
-                    operand=None,
+            def _forward_interpolated_fields_from_anchor_fields(*raw_anchor_response_fields):
+                anchor_response_fields = jax.lax.cond(
+                    jnp.logical_and(
+                        jnp.asarray(n_anchor >= 4),
+                        jnp.isclose(anchor_rho[0], 0.0),
+                    ),
+                    lambda values: self._regularize_axis_radius0(values, anchor_rho),
+                    lambda values: values,
+                    raw_anchor_response_fields,
                 )
-            else:
-                raw_anchor_response_bar = anchor_response_bar_fields
+                return tuple(
+                    self._interpolate_anchor_values(anchor_indices, anchor_response_fields[field_index], target_rho)
+                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+                )
+
+            raw_anchor_response_bar = jax.linear_transpose(
+                _forward_interpolated_fields_from_anchor_fields,
+                *anchor_response_templates,
+            )(*full_response_bar_fields)
 
             density_bar = jnp.zeros_like(density0)
             pressure_bar = jnp.zeros_like(pressure0)
@@ -2745,22 +2723,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 density_safe_local = safe_density(density_local)
                 return density_safe_local, pressure_local / density_safe_local
 
-            for anchor_pos in range(n_anchor):
+            anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
+
+            def _pullback_one_anchor(anchor_pos):
                 radius_index = jax.lax.dynamic_index_in_dim(
                     anchor_indices,
                     anchor_pos,
                     axis=0,
                     keepdims=False,
                 )
-                local_field_bars = {
-                    field_name: jax.lax.dynamic_index_in_dim(
-                        raw_anchor_response_bar[field_name],
+                local_field_bars = tuple(
+                    jax.lax.dynamic_index_in_dim(
+                        raw_anchor_response_bar[field_index],
                         anchor_pos,
                         axis=0,
                         keepdims=False,
                     )
-                    for field_name in _INTERPOLATED_RESPONSE_FIELD_NAMES
-                }
+                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+                )
                 density_local0 = jax.lax.dynamic_index_in_dim(
                     density0,
                     radius_index,
@@ -2829,9 +2809,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                 )
 
-                density_bar = density_bar.at[:, radius_index].add(density_local_bar)
-                pressure_bar = pressure_bar.at[:, radius_index].add(pressure_local_bar)
-                er_bar = er_bar.at[radius_index].add(er_local_bar)
+                return (
+                    radius_index,
+                    density_local_bar,
+                    pressure_local_bar,
+                    er_local_bar,
+                )
+
+            (
+                anchor_radius_indices,
+                density_anchor_bars,
+                pressure_anchor_bars,
+                er_anchor_bars,
+            ) = jax.vmap(_pullback_one_anchor)(anchor_positions)
+            density_bar = density_bar.at[:, anchor_radius_indices].add(
+                jnp.swapaxes(density_anchor_bars, 0, 1)
+            )
+            pressure_bar = pressure_bar.at[:, anchor_radius_indices].add(
+                jnp.swapaxes(pressure_anchor_bars, 0, 1)
+            )
+            er_bar = er_bar.at[anchor_radius_indices].add(er_anchor_bars)
             return dataclasses.replace(
                 state,
                 density=density_bar,
