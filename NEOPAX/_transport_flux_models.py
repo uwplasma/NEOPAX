@@ -274,7 +274,7 @@ class _NTXInterpolatedMomentResponseFieldBars:
 
 
 def _interpolated_response_field_bar_tuple(
-    field_bars: _NTXInterpolatedMomentResponseFieldBars,
+    field_bars: _NTXInterpolatedMomentResponseFieldBars | tuple[jax.Array, jax.Array, jax.Array, jax.Array],
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if isinstance(field_bars, _NTXInterpolatedMomentResponseFieldBars):
         return dataclasses.astuple(field_bars)
@@ -2110,6 +2110,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             (nu_hat_a, jnp.zeros_like(epsi_hat_a)),
         )[1]
 
+    def _pullback_log_nu_star_from_nu_hat(
+        self,
+        reference_nu_hat,
+        reference_log_nu_star_bar,
+    ):
+        weights = jnp.asarray(self.energy_grid.xWeights, dtype=jnp.float64)
+        weights = weights / jnp.maximum(jnp.sum(weights), 1.0e-30)
+        nu_hat = jnp.asarray(reference_nu_hat, dtype=jnp.float64)
+        safe_nu_hat = jnp.maximum(nu_hat, 1.0e-30)
+        # Match the forward primitive exactly: below the floor, the active branch
+        # is constant and contributes zero tangent/cotangent.
+        active_mask = jnp.asarray(nu_hat >= 1.0e-30, dtype=jnp.float64)
+        return jnp.asarray(
+            active_mask * weights * reference_log_nu_star_bar / safe_nu_hat,
+            dtype=reference_nu_hat.dtype,
+        )
+
     def _pullback_interpolated_moment_reduced_local_outputs(
         self,
         prepared,
@@ -2123,14 +2140,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         zero_nu_hat = jnp.zeros_like(reference_nu_hat)
         zero_epsi_hat = jnp.zeros_like(reference_epsi_hat)
         zero_vth_a = jnp.zeros_like(vth_a)
-        reduced_output_bar = _interpolated_response_field_bar_tuple(field_bars)
+        (
+            reference_log_nu_star_bar,
+            reference_transport_moments_bar,
+            dtransport_moments_d_er_bar,
+            dtransport_moments_d_log_nu_star_bar,
+        ) = _interpolated_response_field_bar_tuple(field_bars)
 
-        def _reduced_outputs_from_primitives(
+        log_nu_star_nu_hat_bar = self._pullback_log_nu_star_from_nu_hat(
+            reference_nu_hat,
+            reference_log_nu_star_bar,
+        )
+
+        def _transport_moments_from_primitives(
+            nu_hat_value,
+            epsi_hat_value,
+        ):
+            return self._transport_moments_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                nu_hat_a=nu_hat_value,
+                epsi_hat_a=epsi_hat_value,
+            )
+
+        _, transport_moments_linearized = jax.linearize(
+            _transport_moments_from_primitives,
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        transport_moments_nu_hat_bar, transport_moments_epsi_hat_bar = jax.linear_transpose(
+            transport_moments_linearized,
+            zero_nu_hat,
+            zero_epsi_hat,
+        )(reference_transport_moments_bar)
+
+        def _dtransport_moments_d_er_from_primitives(
             nu_hat_value,
             epsi_hat_value,
             vth_a_value,
         ):
-            return self._interpolated_moment_reduced_local_outputs_from_primitives(
+            return self._dtransport_moments_d_er_from_scan_primitives(
                 prepared,
                 drds_value=drds_value,
                 nu_hat_a=nu_hat_value,
@@ -2138,20 +2187,53 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 vth_a=vth_a_value,
             )
 
-        # Transpose the same reduced local map used by the forward lane,
-        # instead of composing four separate transpose-of-JVP subgraphs.
-        _, reduced_outputs_linearized = jax.linearize(
-            _reduced_outputs_from_primitives,
+        _, dtransport_d_er_linearized = jax.linearize(
+            _dtransport_moments_d_er_from_primitives,
             reference_nu_hat,
             reference_epsi_hat,
             vth_a,
         )
-        nu_hat_bar, epsi_hat_bar, vth_a_bar = jax.linear_transpose(
-            reduced_outputs_linearized,
+        dtransport_d_er_nu_hat_bar, dtransport_d_er_epsi_hat_bar, dtransport_d_er_vth_a_bar = jax.linear_transpose(
+            dtransport_d_er_linearized,
             zero_nu_hat,
             zero_epsi_hat,
             zero_vth_a,
-        )(reduced_output_bar)
+        )(dtransport_moments_d_er_bar)
+
+        def _dtransport_moments_d_log_nu_star_from_primitives(
+            nu_hat_value,
+            epsi_hat_value,
+        ):
+            return self._dtransport_moments_d_log_nu_star_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                nu_hat_a=nu_hat_value,
+                epsi_hat_a=epsi_hat_value,
+            )
+
+        _, dtransport_d_log_nu_star_linearized = jax.linearize(
+            _dtransport_moments_d_log_nu_star_from_primitives,
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        dtransport_d_log_nu_star_nu_hat_bar, dtransport_d_log_nu_star_epsi_hat_bar = jax.linear_transpose(
+            dtransport_d_log_nu_star_linearized,
+            zero_nu_hat,
+            zero_epsi_hat,
+        )(dtransport_moments_d_log_nu_star_bar)
+
+        nu_hat_bar = (
+            log_nu_star_nu_hat_bar
+            + transport_moments_nu_hat_bar
+            + dtransport_d_er_nu_hat_bar
+            + dtransport_d_log_nu_star_nu_hat_bar
+        )
+        epsi_hat_bar = (
+            transport_moments_epsi_hat_bar
+            + dtransport_d_er_epsi_hat_bar
+            + dtransport_d_log_nu_star_epsi_hat_bar
+        )
+        vth_a_bar = dtransport_d_er_vth_a_bar
 
         return (
             jnp.asarray(nu_hat_bar, dtype=reference_nu_hat.dtype),
