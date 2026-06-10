@@ -69,13 +69,20 @@ def _parse_parameter_subset(text: str) -> tuple[str, ...]:
     return values
 
 
-def _parse_step_counts(text: str) -> tuple[int, ...]:
-    values = tuple(int(item.strip()) for item in str(text).split(",") if item.strip())
-    if not values:
-        raise ValueError("At least one accepted-step count must be provided.")
-    if any(value <= 0 for value in values):
-        raise ValueError("Accepted-step counts must be positive integers.")
-    return values
+def _parse_step_counts(text: str) -> tuple[int | None, ...]:
+    raw_items = tuple(item.strip() for item in str(text).split(",") if item.strip())
+    if not raw_items:
+        raise ValueError("At least one accepted-step count or `full` must be provided.")
+    values: list[int | None] = []
+    for item in raw_items:
+        if item.lower() in {"full", "uncapped", "none"}:
+            values.append(None)
+            continue
+        value = int(item)
+        if value <= 0:
+            raise ValueError("Accepted-step counts must be positive integers.")
+        values.append(value)
+    return tuple(values)
 
 
 def _tree_max_abs(tree) -> jax.Array:
@@ -410,16 +417,19 @@ def _branch_diagnostics_from_trace(
 def _prefix_transport_config(
     config: dict,
     *,
-    accepted_step_limit: int,
+    accepted_step_limit: int | None,
     max_total_steps_multiplier: int,
 ) -> dict:
     tuned = copy.deepcopy(config)
     solver_cfg = tuned.setdefault("transport_solver", {})
-    solver_cfg["stop_after_accepted_steps"] = int(accepted_step_limit)
-    solver_cfg["max_steps"] = max(
-        int(accepted_step_limit),
-        int(accepted_step_limit) * int(max_total_steps_multiplier),
-    )
+    if accepted_step_limit is None:
+        solver_cfg.pop("stop_after_accepted_steps", None)
+    else:
+        solver_cfg["stop_after_accepted_steps"] = int(accepted_step_limit)
+        solver_cfg["max_steps"] = max(
+            int(accepted_step_limit),
+            int(accepted_step_limit) * int(max_total_steps_multiplier),
+        )
     return tuned
 
 
@@ -1145,7 +1155,7 @@ def main() -> None:
     parser.add_argument(
         "--accepted-step-counts",
         default="1,2,4",
-        help="Comma-separated accepted-step counts to benchmark.",
+        help="Comma-separated accepted-step counts to benchmark. Use `full` to run with the solver's natural rollout to t_final.",
     )
     parser.add_argument(
         "--max-total-steps-multiplier",
@@ -1307,7 +1317,9 @@ def main() -> None:
         )
         prefix_reports.append(
             {
-                "accepted_step_count": int(accepted_step_count),
+                "accepted_step_count": (
+                    None if accepted_step_count is None else int(accepted_step_count)
+                ),
                 "max_total_steps": int(max_total_steps),
                 "result": result,
             }
@@ -1319,7 +1331,9 @@ def main() -> None:
         "ntx_exact_derivative_mode": args.ntx_exact_derivative_mode,
         "parameter_names": list(parameter_names),
         "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
-        "accepted_step_counts": [int(x) for x in accepted_step_counts],
+        "accepted_step_counts": [
+            None if x is None else int(x) for x in accepted_step_counts
+        ],
         "max_total_steps_multiplier": int(args.max_total_steps_multiplier),
         "bar_mode": args.bar_mode,
         "execution_mode": args.execution_mode,
@@ -1364,7 +1378,7 @@ def main() -> None:
     for prefix in prefix_reports:
         result = prefix["result"]
         print(
-            f"  - accepted_step_count={int(prefix['accepted_step_count'])} "
+            f"  - accepted_step_count={prefix['accepted_step_count']} "
             f"accepted_count={int(result['accepted_count'])} "
             f"max_total_steps={int(prefix['max_total_steps'])} "
             f"segment_count={int(result['segment_count'])} "
