@@ -58,13 +58,20 @@ def _parse_parameter_subset(text: str) -> tuple[str, ...]:
     return values
 
 
-def _parse_step_counts(text: str) -> tuple[int, ...]:
-    values = tuple(int(item.strip()) for item in str(text).split(",") if item.strip())
-    if not values:
-        raise ValueError("At least one accepted-step prefix must be provided.")
-    if any(value <= 0 for value in values):
-        raise ValueError("Accepted-step prefixes must be positive integers.")
-    return values
+def _parse_step_counts(text: str) -> tuple[int | None, ...]:
+    raw_items = tuple(item.strip() for item in str(text).split(",") if item.strip())
+    if not raw_items:
+        raise ValueError("At least one accepted-step prefix or `full` must be provided.")
+    values: list[int | None] = []
+    for item in raw_items:
+        if item.lower() in {"full", "uncapped", "none"}:
+            values.append(None)
+            continue
+        value = int(item)
+        if value <= 0:
+            raise ValueError("Accepted-step prefixes must be positive integers.")
+        values.append(value)
+    return tuple(values)
 
 
 def _make_final_output_bar(
@@ -85,16 +92,19 @@ def _make_final_output_bar(
 def _prefix_transport_config(
     config: dict,
     *,
-    accepted_step_limit: int,
+    accepted_step_limit: int | None,
     max_total_steps_multiplier: int,
 ) -> dict:
     tuned = copy.deepcopy(config)
     solver_cfg = tuned.setdefault("transport_solver", {})
-    solver_cfg["stop_after_accepted_steps"] = int(accepted_step_limit)
-    solver_cfg["max_steps"] = max(
-        int(accepted_step_limit),
-        int(accepted_step_limit) * int(max_total_steps_multiplier),
-    )
+    if accepted_step_limit is None:
+        solver_cfg.pop("stop_after_accepted_steps", None)
+    else:
+        solver_cfg["stop_after_accepted_steps"] = int(accepted_step_limit)
+        solver_cfg["max_steps"] = max(
+            int(accepted_step_limit),
+            int(accepted_step_limit) * int(max_total_steps_multiplier),
+        )
     return tuned
 
 
@@ -135,7 +145,7 @@ def _prepare_prefix_context(
     baseline_state,
     profile_cfg,
     parameter_names: tuple[str, ...],
-    accepted_step_limit: int,
+    accepted_step_limit: int | None,
     max_total_steps_multiplier: int,
 ):
     prefix_config = _prefix_transport_config(
@@ -180,6 +190,7 @@ def _compute_forward_reference(
     profile_cfg,
     parameter_names: tuple[str, ...],
     prefix_context: dict[str, object],
+    compute_jacobian: bool,
 ):
     execution_context = prefix_context["execution_context"]
     prepared_rollout = prefix_context["prepared_rollout"]
@@ -238,8 +249,12 @@ def _compute_forward_reference(
 
     t0 = time.perf_counter()
     objective_values = _objective_fn(baseline_vector)
-    jacobian = jax.jacfwd(_objective_fn)(baseline_vector)
-    jax.block_until_ready(jacobian)
+    jacobian = None
+    if compute_jacobian:
+        jacobian = jax.jacfwd(_objective_fn)(baseline_vector)
+        jax.block_until_ready(jacobian)
+    else:
+        jax.block_until_ready(objective_values)
     elapsed_s = time.perf_counter() - t0
     return objective_values, jacobian, elapsed_s, payload_rollout
 
@@ -365,7 +380,7 @@ def _per_objective_gradient_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare short-prefix accepted-step reverse gradients against the trusted forward AD path."
+        description="Print accepted-step reverse gradients, with optional comparison against the trusted forward AD path."
     )
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
     parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")
@@ -383,7 +398,13 @@ def main() -> None:
     parser.add_argument(
         "--accepted-step-counts",
         default="1,2,4",
-        help="Comma-separated accepted-step prefixes to compare.",
+        help="Comma-separated accepted-step prefixes to compare. Use `full` to run the solver's natural realized rollout.",
+    )
+    parser.add_argument(
+        "--comparison-mode",
+        default="reverse-only",
+        choices=("reverse-only", "both"),
+        help="Run reverse gradients alone or compare reverse against the forward accepted-step reference. Default: reverse-only.",
     )
     parser.add_argument(
         "--reverse-execution-mode",
@@ -429,6 +450,7 @@ def main() -> None:
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
             prefix_context=prefix_context,
+            compute_jacobian=bool(args.comparison_mode == "both"),
         )
         reverse_result = _compute_reverse_candidate(
             baseline_vector,
@@ -441,29 +463,39 @@ def main() -> None:
             execution_mode=args.reverse_execution_mode,
         )
 
-        forward_objectives_np = np.asarray(jax.device_get(forward_objectives), dtype=float)
         reverse_objectives_np = np.asarray(jax.device_get(reverse_result["objective_values"]), dtype=float)
-        forward_jacobian_np = np.asarray(jax.device_get(forward_jacobian), dtype=float)
         reverse_jacobian_np = np.asarray(jax.device_get(reverse_result["jacobian"]), dtype=float)
-        objective_metrics = _tree_diff_metrics(reverse_objectives_np, forward_objectives_np)
-        gradient_metrics = _tree_diff_metrics(reverse_jacobian_np, forward_jacobian_np)
-        gradient_rows = _per_objective_gradient_report(
-            OBJECTIVE_LABELS[: int(forward_jacobian_np.shape[0])],
-            parameter_names,
-            forward_jacobian_np,
-            reverse_jacobian_np,
-        )
+        accepted_count = int(np.asarray(jax.device_get(payload_rollout.accepted_count)))
+        forward_objectives_np = None
+        forward_jacobian_np = None
+        objective_metrics = None
+        gradient_metrics = None
+        gradient_rows = None
+        if args.comparison_mode == "both":
+            forward_objectives_np = np.asarray(jax.device_get(forward_objectives), dtype=float)
+            forward_jacobian_np = np.asarray(jax.device_get(forward_jacobian), dtype=float)
+            objective_metrics = _tree_diff_metrics(reverse_objectives_np, forward_objectives_np)
+            gradient_metrics = _tree_diff_metrics(reverse_jacobian_np, forward_jacobian_np)
+            gradient_rows = _per_objective_gradient_report(
+                OBJECTIVE_LABELS[: int(forward_jacobian_np.shape[0])],
+                parameter_names,
+                forward_jacobian_np,
+                reverse_jacobian_np,
+            )
 
         prefixes.append(
             {
-                "accepted_step_limit": int(accepted_step_limit),
+                "accepted_step_limit": (
+                    None if accepted_step_limit is None else int(accepted_step_limit)
+                ),
+                "accepted_count": accepted_count,
                 "forward_elapsed_s": float(forward_elapsed_s),
                 "reverse_compile_plus_execute_s": float(reverse_result["compile_plus_execute_s"]),
                 "reverse_total_s": float(reverse_result["total_reverse_s"]),
-                "objective_values_forward": forward_objectives_np.tolist(),
+                "objective_values_forward": None if forward_objectives_np is None else forward_objectives_np.tolist(),
                 "objective_values_reverse": reverse_objectives_np.tolist(),
                 "objective_diff": objective_metrics,
-                "forward_jacobian": forward_jacobian_np.tolist(),
+                "forward_jacobian": None if forward_jacobian_np is None else forward_jacobian_np.tolist(),
                 "reverse_jacobian": reverse_jacobian_np.tolist(),
                 "gradient_diff": gradient_metrics,
                 "per_objective_gradients": gradient_rows,
@@ -476,7 +508,8 @@ def main() -> None:
         "ntx_exact_derivative_mode": args.ntx_exact_derivative_mode,
         "parameter_names": list(parameter_names),
         "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
-        "accepted_step_counts": [int(x) for x in accepted_step_counts],
+        "accepted_step_counts": [None if x is None else int(x) for x in accepted_step_counts],
+        "comparison_mode": args.comparison_mode,
         "reverse_execution_mode": args.reverse_execution_mode,
         "max_total_steps_multiplier": int(args.max_total_steps_multiplier),
         "prefixes": prefixes,
@@ -489,16 +522,31 @@ def main() -> None:
     print(f"[autodiff-gate] parameters={list(parameter_names)}")
     print(
         f"[autodiff-gate] accepted_step_counts={list(accepted_step_counts)} "
+        f"comparison_mode={args.comparison_mode} "
         f"reverse_execution_mode={args.reverse_execution_mode} "
         f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)}"
     )
     for prefix in prefixes:
         print(
-            f"  - accepted_step_limit={int(prefix['accepted_step_limit'])} "
-            f"objective_abs_max={float(prefix['objective_diff']['abs_max']):.6e} "
-            f"gradient_abs_max={float(prefix['gradient_diff']['abs_max']):.6e} "
-            f"gradient_rel_max={float(prefix['gradient_diff']['rel_max']):.6e}"
+            f"  - accepted_step_limit={prefix['accepted_step_limit']} "
+            f"accepted_count={int(prefix['accepted_count'])} "
+            f"reverse_compile_plus_execute_s={float(prefix['reverse_compile_plus_execute_s']):.6e} "
+            f"reverse_total_s={float(prefix['reverse_total_s']):.6e}"
         )
+        reverse_jacobian = np.asarray(prefix["reverse_jacobian"], dtype=float)
+        for objective_index, objective_label in enumerate(OBJECTIVE_LABELS[: int(reverse_jacobian.shape[0])]):
+            row = reverse_jacobian[objective_index]
+            row_text = " ".join(
+                f"{parameter_names[param_index]}={float(row[param_index]):.6e}"
+                for param_index in range(len(parameter_names))
+            )
+            print(f"    reverse_gradient[{objective_label}] {row_text}")
+        if prefix["objective_diff"] is not None and prefix["gradient_diff"] is not None:
+            print(
+                f"    objective_abs_max={float(prefix['objective_diff']['abs_max']):.6e} "
+                f"gradient_abs_max={float(prefix['gradient_diff']['abs_max']):.6e} "
+                f"gradient_rel_max={float(prefix['gradient_diff']['rel_max']):.6e}"
+            )
     print(f"[autodiff-gate] wrote={outpath}")
 
 

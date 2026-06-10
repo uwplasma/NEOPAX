@@ -727,3 +727,168 @@ Do not spend refactor time on:
 - forward-path performance changes
 
 These can all wait until the primitive reverse exists and matches forward AD.
+
+## 2026-06-10 current status
+
+### What changed in this session
+
+- The hot rebuild path in `NEOPAX/_transport_flux_models.py` was refactored to
+  be much closer to the forward accepted-step structure.
+- The `NTXInterpolatedMomentResponse` rebuild pullback no longer uses the older
+  fragmented reverse chain with:
+  - four separate interpolation transposes
+  - a separate regularization transpose
+  - a Python anchor loop feeding per-field reverse calls
+- The rebuild path now uses:
+  - one transpose for the whole anchor-to-full-response map
+  - a vmapped per-anchor local pullback
+  - tuple-structured local field bars instead of the older dict/per-field
+    reverse structure
+
+### Main benchmark result
+
+For:
+
+- `benchmark_transport_reverse_multi_step_primitive.py`
+- `--ntx-exact-derivative-mode direct`
+- `--execution-mode jit`
+- `--segment-length 8`
+- `--checkpoint-count 0`
+- `--cotangent-contract forward-like-v3-cache-no-stage`
+- `--bar-ablation none`
+- `--reverse-compose-mode step-loop`
+- `--max-reverse-segments 1`
+- `--max-reverse-steps-per-segment 7`
+
+the rebuild-path flattening produced a real compile win.
+
+Before the flattening:
+
+- compile plus execute for the `16`-accepted-step case was about `329 s`
+
+After the flattening:
+
+- compile plus execute for the `16`-accepted-step case dropped to about `116 s`
+
+This is the first strong evidence that the main remaining problem was compile
+graph structure in the rebuild branch, not the numerical cost of the reverse
+math itself.
+
+### Scaling status after the rebuild refactor
+
+Observed results:
+
+- `16` requested accepted steps:
+  - `accepted_count=16`
+  - `compile_plus_execute_s ~= 113.7`
+  - `execute_s ~= 29.1`
+- `32` requested accepted steps:
+  - `accepted_count=32`
+  - `compile_plus_execute_s ~= 136.5`
+  - `execute_s ~= 58.2`
+- `64` requested accepted steps:
+  - `accepted_count=64`
+  - `compile_plus_execute_s ~= 191.1`
+  - `execute_s ~= 112.0`
+- `128` requested accepted steps under the prefix harness:
+  - realized `accepted_count=115`
+  - `compile_plus_execute_s ~= 263.7`
+  - `execute_s ~= 178.0`
+
+Conclusion:
+
+- the reverse map is now scaling in a structurally sane way
+- compile time is no longer exploding catastrophically with accepted-step count
+- execute time is growing in the expected direction with more reverse steps
+
+### Full-rollout status
+
+The benchmark script now supports:
+
+- `--accepted-step-counts full`
+
+Meaning:
+
+- do not override `stop_after_accepted_steps`
+- do not replace solver `max_steps` with `accepted_step_count * multiplier`
+- use the solver's natural rollout configuration
+
+Observed result for:
+
+- `--accepted-step-counts full`
+
+was:
+
+- `accepted_count=115`
+- `max_total_steps=20000`
+
+Important interpretation:
+
+- this does **not** mean the `20000` ceiling was hit
+- instead, the rollout finished naturally after `115` accepted steps under the
+  current solver configuration
+
+So, for this configuration, the current reverse `full` run is already following
+the natural realized rollout to its configured end.
+
+### What is now believed to be true
+
+- The new option-4-like reverse path is now running on the real multi-step
+  accepted-step reverse composition, not on a fake isolated workaround.
+- The main rebuild branch
+  `TransportLaggedResponse -> CombinedTransportLaggedResponse -> NTXExactLijLaggedResponse -> NTXInterpolatedMomentResponse`
+  is no longer the catastrophic compile bottleneck it was before.
+- The no-stage forward-like cotangent contract remains consistent:
+  - `primitive_prev_stages_bar_max` stays `0`
+- The next milestone is no longer "make reverse execute at all".
+  It is now:
+  - verify the forward realized accepted-step count for the same configuration
+  - compare reverse gradients against the accepted-step forward reference
+
+### What is still missing
+
+- We do **not** yet have a single benchmark CLI that compares:
+  - full accepted-step forward reference gradients
+  - against the new full option-4 reverse path
+- The older forward-vs-reverse gradient scripts are still prefix-oriented or
+  wired to older paths.
+- We do **not** yet have the forward realized accepted-step count saved in the
+  md notes for this exact full configuration.
+
+## 2026-06-10 next steps for the next session
+
+1. Confirm the forward realized accepted-step count for the same configuration.
+   The goal is to verify explicitly that forward and reverse are following the
+   same realized accepted-step path for this case.
+
+2. Wire a dedicated forward-vs-reverse gradient comparison using:
+   - the accepted-step forward reference
+   - the new option-4 reverse path
+   - the profile-vector parameters:
+     - `n0`
+     - `T0`
+     - `density_shape_power`
+     - `temperature_shape_power`
+
+3. Save both of these in the benchmark output:
+   - forward realized accepted-step count
+   - reverse realized accepted-step count
+
+4. Compare reverse gradients against forward gradients before returning to more
+   structural refactors.
+
+5. Only if the gradient comparison exposes another mismatch:
+   - inspect whether there is still any remaining generic reverse-only structure
+     in the local rebuild pullback that forward mode does not use
+
+### Recommended first task next session
+
+Do **not** start with another performance refactor immediately.
+
+Start with:
+
+1. obtaining the forward realized accepted-step count for this exact full case
+2. wiring the gradient comparison report
+
+because the reverse execution path is finally good enough that correctness
+comparison against forward is now the highest-value next check.
