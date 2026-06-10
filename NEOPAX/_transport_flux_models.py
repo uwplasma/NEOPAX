@@ -2070,6 +2070,91 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             derivative_mode_override="direct",
         )
 
+    def _pullback_transport_moments_from_coefficient_scan(
+        self,
+        coeff_scan,
+        *,
+        drds_value,
+        transport_moments_bar,
+    ):
+        coeff_scan_bar = jnp.zeros_like(coeff_scan)
+        weighted_l11 = self.energy_grid.L11_weight * self.energy_grid.xWeights
+        weighted_l12 = self.energy_grid.L12_weight * self.energy_grid.xWeights
+        weighted_l22 = self.energy_grid.L22_weight * self.energy_grid.xWeights
+        weighted_l13 = self.energy_grid.L13_weight * self.energy_grid.xWeights
+        weighted_l23 = self.energy_grid.L23_weight * self.energy_grid.xWeights
+        weighted_l33 = self.energy_grid.L33_weight * self.energy_grid.xWeights
+
+        d11_a_bar = (
+            weighted_l11 * transport_moments_bar[0]
+            + weighted_l12 * transport_moments_bar[1]
+            + weighted_l22 * transport_moments_bar[2]
+        )
+        d13_a_bar = (
+            weighted_l13 * transport_moments_bar[3]
+            + weighted_l23 * transport_moments_bar[4]
+        )
+        d33_a_bar = weighted_l33 * transport_moments_bar[5]
+
+        d11_physical = jnp.asarray(coeff_scan[:, 0], dtype=jnp.float64) * drds_value**2
+        d11_active = jnp.asarray(
+            d11_physical >= jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64),
+            dtype=jnp.float64,
+        )
+        coeff_scan_bar = coeff_scan_bar.at[:, 0].add(
+            jnp.asarray(-drds_value**2 * d11_active * d11_a_bar, dtype=coeff_scan.dtype)
+        )
+        coeff_scan_bar = coeff_scan_bar.at[:, 2].add(
+            jnp.asarray(-drds_value * d13_a_bar, dtype=coeff_scan.dtype)
+        )
+        coeff_scan_bar = coeff_scan_bar.at[:, 3].add(
+            jnp.asarray(-d33_a_bar, dtype=coeff_scan.dtype)
+        )
+        return coeff_scan_bar
+
+    def _pullback_transport_moments_from_scan_primitives(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        reference_transport_moments_bar,
+    ):
+        coeff_scan = self._coefficient_scan_from_inputs(
+            prepared,
+            reference_nu_hat,
+            reference_epsi_hat,
+            derivative_mode_override="direct",
+        )
+        coeff_scan_bar = self._pullback_transport_moments_from_coefficient_scan(
+            coeff_scan,
+            drds_value=drds_value,
+            transport_moments_bar=reference_transport_moments_bar,
+        )
+
+        def _coefficient_scan_from_primitives(
+            nu_hat_value,
+            epsi_hat_value,
+        ):
+            return self._coefficient_scan_from_inputs(
+                prepared,
+                nu_hat_value,
+                epsi_hat_value,
+                derivative_mode_override="direct",
+            )
+
+        _, coefficient_scan_linearized = jax.linearize(
+            _coefficient_scan_from_primitives,
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        return jax.linear_transpose(
+            coefficient_scan_linearized,
+            jnp.zeros_like(reference_nu_hat),
+            jnp.zeros_like(reference_epsi_hat),
+        )(coeff_scan_bar)
+
     def _dtransport_moments_d_er_from_scan_primitives(
         self,
         prepared,
@@ -2151,28 +2236,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_nu_hat,
             reference_log_nu_star_bar,
         )
-
-        def _transport_moments_from_primitives(
-            nu_hat_value,
-            epsi_hat_value,
-        ):
-            return self._transport_moments_from_scan_primitives(
-                prepared,
-                drds_value=drds_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
-            )
-
-        _, transport_moments_linearized = jax.linearize(
-            _transport_moments_from_primitives,
-            reference_nu_hat,
-            reference_epsi_hat,
+        transport_moments_nu_hat_bar, transport_moments_epsi_hat_bar = self._pullback_transport_moments_from_scan_primitives(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            reference_transport_moments_bar=reference_transport_moments_bar,
         )
-        transport_moments_nu_hat_bar, transport_moments_epsi_hat_bar = jax.linear_transpose(
-            transport_moments_linearized,
-            zero_nu_hat,
-            zero_epsi_hat,
-        )(reference_transport_moments_bar)
 
         def _dtransport_moments_d_er_from_primitives(
             nu_hat_value,
