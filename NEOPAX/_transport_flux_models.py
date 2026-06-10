@@ -2112,20 +2112,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return coeff_scan_bar
 
-    def _pullback_transport_moments_from_single_coefficient_vector(
-        self,
-        coefficient_vector,
-        *,
-        drds_value,
-        transport_moments_bar,
-    ):
-        coefficient_scan_bar = self._pullback_transport_moments_from_coefficient_scan(
-            coefficient_vector[jnp.newaxis, :],
-            drds_value=drds_value,
-            transport_moments_bar=transport_moments_bar,
-        )
-        return coefficient_scan_bar[0]
-
     def _pullback_transport_moments_from_scan_primitives(
         self,
         prepared,
@@ -2145,27 +2131,42 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         from ntx._solver_context import _operator_context
         from ntx._solver_factorization import _solve_factorized_adjoint
-        transport_moments_bar_by_energy = jnp.moveaxis(reference_transport_moments_bar, 1, 0)
 
-        def _one_case_pullback(nu_hat_value, epsi_hat_value, transport_moments_bar_value):
-            (
-                coefficients,
-                f1_full,
-                f3_full,
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-            ) = _prepared_implicit_vjp_primal(
+        (
+            coefficients,
+            f1_full,
+            f3_full,
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+        ) = jax.vmap(
+            lambda nu_hat_value, epsi_hat_value: _prepared_implicit_vjp_primal(
                 prepared,
                 nu_hat_value,
                 epsi_hat_value,
             )
-            coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
-                coefficients,
-                drds_value=drds_value,
-                transport_moments_bar=transport_moments_bar_value,
-            )
+        )(
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        coeff_scan_bar = self._pullback_transport_moments_from_coefficient_scan(
+            coefficients,
+            drds_value=drds_value,
+            transport_moments_bar=reference_transport_moments_bar,
+        )
+
+        def _one_case_pullback(
+            nu_hat_value,
+            epsi_hat_value,
+            f1_full_value,
+            f3_full_value,
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            coefficient_bar,
+        ):
             ctx = _operator_context(
                 prepared.surface,
                 prepared.geometry,
@@ -2175,32 +2176,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
                 prepared.geometry,
-                f1_full[:3],
-                f3_full[:3],
+                f1_full_value[:3],
+                f3_full_value[:3],
                 ctx.nu_hat,
                 coefficient_bar,
             )
-            g1 = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low)
-            g3 = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low)
+            g1 = jnp.zeros_like(f1_full_value).at[:3].set(f1_bar_low)
+            g3 = jnp.zeros_like(f3_full_value).at[:3].set(f3_bar_low)
             lambda1 = _solve_factorized_adjoint(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
+                saved_lu_value,
+                saved_piv_value,
+                saved_lower_value,
+                saved_upper_value,
                 g1,
             )
             lambda3 = _solve_factorized_adjoint(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
+                saved_lu_value,
+                saved_piv_value,
+                saved_lower_value,
+                saved_upper_value,
                 g3,
             )
             nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
                 prepared,
                 ctx,
-                f1_full,
-                f3_full,
+                f1_full_value,
+                f3_full_value,
                 lambda1,
                 lambda3,
             )
@@ -2209,7 +2210,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         nu_hat_bar, epsi_hat_bar = jax.vmap(_one_case_pullback)(
             reference_nu_hat,
             reference_epsi_hat,
-            transport_moments_bar_by_energy,
+            f1_full,
+            f3_full,
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+            coeff_scan_bar,
         )
         return nu_hat_bar, epsi_hat_bar
 
