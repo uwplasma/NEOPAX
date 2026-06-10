@@ -266,6 +266,21 @@ class NTXInterpolatedMomentResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _NTXInterpolatedMomentResponseFieldBars:
+    reference_log_nu_star: jax.Array
+    reference_transport_moments: jax.Array
+    dtransport_moments_d_er: jax.Array
+    dtransport_moments_d_log_nu_star: jax.Array
+
+
+def _interpolated_response_field_bar_tuple(
+    field_bars: _NTXInterpolatedMomentResponseFieldBars,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    return dataclasses.astuple(field_bars)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class NTXExactLijLaggedResponse:
         center_response: Any
 
@@ -2167,6 +2182,58 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local_bar,
         )
 
+    def _interpolated_response_field_bars(
+        self,
+        center_response_bar: NTXInterpolatedMomentResponse,
+    ) -> _NTXInterpolatedMomentResponseFieldBars:
+        """Extract the rebuild-only interpolated field-bar contract."""
+        return _NTXInterpolatedMomentResponseFieldBars(
+            reference_log_nu_star=jnp.swapaxes(center_response_bar.reference_log_nu_star, 0, 1),
+            reference_transport_moments=jnp.swapaxes(center_response_bar.reference_transport_moments, 0, 1),
+            dtransport_moments_d_er=jnp.swapaxes(center_response_bar.dtransport_moments_d_er, 0, 1),
+            dtransport_moments_d_log_nu_star=jnp.swapaxes(center_response_bar.dtransport_moments_d_log_nu_star, 0, 1),
+        )
+
+    def _pullback_interpolated_anchor_response_fields(
+        self,
+        *,
+        anchor_indices,
+        anchor_rho,
+        target_rho,
+        field_bars: _NTXInterpolatedMomentResponseFieldBars,
+    ) -> _NTXInterpolatedMomentResponseFieldBars:
+        """Transpose interpolation using only the reduced rebuild field bars."""
+        response_field_bars = _interpolated_response_field_bar_tuple(field_bars)
+        n_anchor = int(anchor_indices.shape[0])
+        anchor_response_templates = tuple(
+            jnp.zeros(
+                (n_anchor,) + field_bar.shape[1:],
+                dtype=field_bar.dtype,
+            )
+            for field_bar in response_field_bars
+        )
+
+        def _forward_interpolated_fields_from_anchor_fields(*raw_anchor_response_fields):
+            anchor_response_fields = jax.lax.cond(
+                jnp.logical_and(
+                    jnp.asarray(n_anchor >= 4),
+                    jnp.isclose(anchor_rho[0], 0.0),
+                ),
+                lambda values: self._regularize_axis_radius0(values, anchor_rho),
+                lambda values: values,
+                raw_anchor_response_fields,
+            )
+            return tuple(
+                self._interpolate_anchor_values(anchor_indices, anchor_response_fields[field_index], target_rho)
+                for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+            )
+
+        raw_anchor_response_bar = jax.linear_transpose(
+            _forward_interpolated_fields_from_anchor_fields,
+            *anchor_response_templates,
+        )(response_field_bars)
+        return _NTXInterpolatedMomentResponseFieldBars(*raw_anchor_response_bar)
+
     def _pullback_interpolated_moment_response_local_fields(
         self,
         prepared,
@@ -2691,41 +2758,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             anchor_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices]
             n_anchor = int(anchor_indices.shape[0])
             collisionality_kind = _collisionality_kind(self.collisionality_model)
-
-            full_response_bar_fields = (
-                jnp.swapaxes(center_response_bar.reference_log_nu_star, 0, 1),
-                jnp.swapaxes(center_response_bar.reference_transport_moments, 0, 1),
-                jnp.swapaxes(center_response_bar.dtransport_moments_d_er, 0, 1),
-                jnp.swapaxes(center_response_bar.dtransport_moments_d_log_nu_star, 0, 1),
-            )
-            anchor_response_templates = tuple(
-                jnp.zeros(
-                    (n_anchor,) + field_bar.shape[1:],
-                    dtype=field_bar.dtype,
-                )
-                for field_bar in full_response_bar_fields
-            )
+            response_field_bars = self._interpolated_response_field_bars(center_response_bar)
             er_bar_direct = jnp.asarray(center_response_bar.reference_er)
-
-            def _forward_interpolated_fields_from_anchor_fields(*raw_anchor_response_fields):
-                anchor_response_fields = jax.lax.cond(
-                    jnp.logical_and(
-                        jnp.asarray(n_anchor >= 4),
-                        jnp.isclose(anchor_rho[0], 0.0),
-                    ),
-                    lambda values: self._regularize_axis_radius0(values, anchor_rho),
-                    lambda values: values,
-                    raw_anchor_response_fields,
-                )
-                return tuple(
-                    self._interpolate_anchor_values(anchor_indices, anchor_response_fields[field_index], target_rho)
-                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
-                )
-
-            raw_anchor_response_bar = jax.linear_transpose(
-                _forward_interpolated_fields_from_anchor_fields,
-                *anchor_response_templates,
-            )(full_response_bar_fields)
+            raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices,
+                anchor_rho=anchor_rho,
+                target_rho=target_rho,
+                field_bars=response_field_bars,
+            )
+            raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
 
             density_bar = jnp.zeros_like(density0)
             pressure_bar = jnp.zeros_like(pressure0)
@@ -2746,12 +2787,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
                 local_field_bars = tuple(
                     jax.lax.dynamic_index_in_dim(
-                        raw_anchor_response_bar[field_index],
+                        field_bar,
                         anchor_pos,
                         axis=0,
                         keepdims=False,
                     )
-                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+                    for field_bar in raw_anchor_response_fields
                 )
                 density_local0 = jax.lax.dynamic_index_in_dim(
                     density0,
