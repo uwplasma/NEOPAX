@@ -2112,6 +2112,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return coeff_scan_bar
 
+    def _pullback_transport_moments_from_single_coefficient_vector(
+        self,
+        coefficient_vector,
+        *,
+        drds_value,
+        transport_moments_bar,
+    ):
+        coefficient_scan_bar = self._pullback_transport_moments_from_coefficient_scan(
+            coefficient_vector[jnp.newaxis, :],
+            drds_value=drds_value,
+            transport_moments_bar=transport_moments_bar,
+        )
+        return coefficient_scan_bar[0]
+
     def _pullback_transport_moments_from_scan_primitives(
         self,
         prepared,
@@ -2121,35 +2135,83 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         reference_transport_moments_bar,
     ):
-        coeff_scan = self._coefficient_scan_from_inputs(
-            prepared,
-            reference_nu_hat,
-            reference_epsi_hat,
-            derivative_mode_override="direct",
+        # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
+        # stays on the NEOPAX side and never pushes a traced `prepared` through
+        # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.
+        from ntx._solver_adjoint import (
+            _coefficient_mode_pullback,
+            _parameter_gradient_from_adjoint,
+            _prepared_implicit_vjp_primal,
         )
-        coeff_scan_bar = self._pullback_transport_moments_from_coefficient_scan(
-            coeff_scan,
-            drds_value=drds_value,
-            transport_moments_bar=reference_transport_moments_bar,
-        )
+        from ntx._solver_context import _operator_context
+        from ntx._solver_factorization import _solve_factorized_adjoint
+        transport_moments_bar_by_energy = jnp.moveaxis(reference_transport_moments_bar, 1, 0)
 
-        def _coefficient_scan_from_primitives(
-            nu_hat_value,
-            epsi_hat_value,
-        ):
-            return self._coefficient_scan_from_inputs(
+        def _one_case_pullback(nu_hat_value, epsi_hat_value, transport_moments_bar_value):
+            (
+                coefficients,
+                f1_full,
+                f3_full,
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+            ) = _prepared_implicit_vjp_primal(
                 prepared,
                 nu_hat_value,
                 epsi_hat_value,
-                derivative_mode_override="custom_vjp",
             )
+            coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                coefficients,
+                drds_value=drds_value,
+                transport_moments_bar=transport_moments_bar_value,
+            )
+            ctx = _operator_context(
+                prepared.surface,
+                prepared.geometry,
+                prepared.grid,
+                nu_hat_value,
+                epsi_hat_value,
+            )
+            f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
+                prepared.geometry,
+                f1_full[:3],
+                f3_full[:3],
+                ctx.nu_hat,
+                coefficient_bar,
+            )
+            g1 = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low)
+            g3 = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low)
+            lambda1 = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                g1,
+            )
+            lambda3 = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                g3,
+            )
+            nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
+                prepared,
+                ctx,
+                f1_full,
+                f3_full,
+                lambda1,
+                lambda3,
+            )
+            return nu_bar_direct + nu_bar_implicit, epsi_bar
 
-        _, coefficient_scan_pullback = jax.vjp(
-            _coefficient_scan_from_primitives,
+        nu_hat_bar, epsi_hat_bar = jax.vmap(_one_case_pullback)(
             reference_nu_hat,
             reference_epsi_hat,
+            transport_moments_bar_by_energy,
         )
-        return coefficient_scan_pullback(coeff_scan_bar)
+        return nu_hat_bar, epsi_hat_bar
 
     def _dtransport_moments_d_er_from_scan_primitives(
         self,
