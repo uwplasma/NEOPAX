@@ -2141,19 +2141,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 prepared,
                 nu_hat_value,
                 epsi_hat_value,
-                derivative_mode_override="direct",
+                derivative_mode_override="custom_vjp",
             )
 
-        _, coefficient_scan_linearized = jax.linearize(
+        _, coefficient_scan_pullback = jax.vjp(
             _coefficient_scan_from_primitives,
             reference_nu_hat,
             reference_epsi_hat,
         )
-        return jax.linear_transpose(
-            coefficient_scan_linearized,
-            jnp.zeros_like(reference_nu_hat),
-            jnp.zeros_like(reference_epsi_hat),
-        )(coeff_scan_bar)
+        return coefficient_scan_pullback(coeff_scan_bar)
 
     def _dtransport_moments_d_er_from_scan_primitives(
         self,
