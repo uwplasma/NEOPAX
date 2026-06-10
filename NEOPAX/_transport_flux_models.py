@@ -1737,6 +1737,66 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             axis=0,
         )
 
+    def _transport_moments_from_single_coefficient_vector(
+        self,
+        coefficient_vector,
+        *,
+        drds_value,
+        energy_index,
+    ):
+        d11_physical = jnp.asarray(coefficient_vector[0], dtype=jnp.float64) * drds_value**2
+        d11_physical = jnp.maximum(d11_physical, jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64))
+        d11_a = -d11_physical
+        d13_a = -(jnp.asarray(coefficient_vector[2], dtype=jnp.float64) * drds_value)
+        d33_a = -jnp.asarray(coefficient_vector[3], dtype=jnp.float64)
+        idx = jnp.asarray(energy_index, dtype=jnp.int32)
+        weighted_l11 = self.energy_grid.L11_weight[idx] * self.energy_grid.xWeights[idx]
+        weighted_l12 = self.energy_grid.L12_weight[idx] * self.energy_grid.xWeights[idx]
+        weighted_l22 = self.energy_grid.L22_weight[idx] * self.energy_grid.xWeights[idx]
+        weighted_l13 = self.energy_grid.L13_weight[idx] * self.energy_grid.xWeights[idx]
+        weighted_l23 = self.energy_grid.L23_weight[idx] * self.energy_grid.xWeights[idx]
+        weighted_l33 = self.energy_grid.L33_weight[idx] * self.energy_grid.xWeights[idx]
+        return jnp.stack(
+            [
+                weighted_l11 * d11_a,
+                weighted_l12 * d11_a,
+                weighted_l22 * d11_a,
+                weighted_l13 * d13_a,
+                weighted_l23 * d13_a,
+                weighted_l33 * d33_a,
+            ],
+            axis=0,
+        )
+
+    def _single_coefficient_vector_from_inputs(
+        self,
+        prepared,
+        nu_hat_value,
+        epsi_hat_value,
+    ):
+        ntx = _import_ntx()
+        case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
+        return ntx.solve_prepared_coefficient_vector(prepared, case)
+
+    def _single_energy_transport_moment_from_inputs(
+        self,
+        prepared,
+        nu_hat_value,
+        epsi_hat_value,
+        *,
+        drds_value,
+        energy_index,
+    ):
+        return self._transport_moments_from_single_coefficient_vector(
+            self._single_coefficient_vector_from_inputs(
+                prepared,
+                nu_hat_value,
+                epsi_hat_value,
+            ),
+            drds_value=drds_value,
+            energy_index=energy_index,
+        )
+
     def _transport_moments_from_inputs_impl(
         self,
         prepared,
@@ -2230,16 +2290,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a,
     ):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (self.energy_grid.v_norm * vth_a)
-        return jax.jvp(
-            lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_scan_primitives(
-                prepared,
-                drds_value=drds_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
+        energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value, epsi_hat_tangent_value = args
+            return jax.jvp(
+                lambda nu_value, epsi_value: self._single_energy_transport_moment_from_inputs(
+                    prepared,
+                    nu_value,
+                    epsi_value,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                ),
+                (nu_hat_value, epsi_hat_value),
+                (jnp.asarray(0.0, dtype=nu_hat_value.dtype), epsi_hat_tangent_value),
+            )[1]
+
+        return jnp.sum(
+            jax.lax.map(
+                _per_energy,
+                (energy_indices, nu_hat_a, epsi_hat_a, epsi_hat_tangent),
             ),
-            (nu_hat_a, epsi_hat_a),
-            (jnp.zeros_like(nu_hat_a), epsi_hat_tangent),
-        )[1]
+            axis=0,
+        )
 
     def _dtransport_moments_d_log_nu_star_from_scan_primitives(
         self,
@@ -2249,16 +2322,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         nu_hat_a,
         epsi_hat_a,
     ):
-        return jax.jvp(
-            lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_scan_primitives(
-                prepared,
-                drds_value=drds_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
+        energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value = args
+            return jax.jvp(
+                lambda nu_value, epsi_value: self._single_energy_transport_moment_from_inputs(
+                    prepared,
+                    nu_value,
+                    epsi_value,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                ),
+                (nu_hat_value, epsi_hat_value),
+                (nu_hat_value, jnp.asarray(0.0, dtype=epsi_hat_value.dtype)),
+            )[1]
+
+        return jnp.sum(
+            jax.lax.map(
+                _per_energy,
+                (energy_indices, nu_hat_a, epsi_hat_a),
             ),
-            (nu_hat_a, epsi_hat_a),
-            (nu_hat_a, jnp.zeros_like(epsi_hat_a)),
-        )[1]
+            axis=0,
+        )
 
     def _pullback_log_nu_star_from_nu_hat(
         self,
