@@ -2346,6 +2346,102 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             axis=0,
         )
 
+    def _pullback_dtransport_moments_d_er_from_scan_primitives(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        dtransport_moments_d_er_bar,
+    ):
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value, vth_a_value = args
+
+            def _single_energy_dtransport(nu_value, epsi_value, vth_value):
+                epsi_hat_tangent_value = jnp.asarray(1.0e3, dtype=epsi_value.dtype) / (
+                    self.energy_grid.v_norm[energy_index] * vth_value
+                )
+                return jax.jvp(
+                    lambda nu_inner, epsi_inner: self._single_energy_transport_moment_from_inputs(
+                        prepared,
+                        nu_inner,
+                        epsi_inner,
+                        drds_value=drds_value,
+                        energy_index=energy_index,
+                    ),
+                    (nu_value, epsi_value),
+                    (jnp.asarray(0.0, dtype=nu_value.dtype), epsi_hat_tangent_value),
+                )[1]
+
+            _, linearized = jax.linearize(
+                _single_energy_dtransport,
+                nu_hat_value,
+                epsi_hat_value,
+                vth_a_value,
+            )
+            nu_bar_value, epsi_bar_value, vth_bar_value = jax.linear_transpose(
+                linearized,
+                jnp.asarray(0.0, dtype=nu_hat_value.dtype),
+                jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
+                jnp.asarray(0.0, dtype=vth_a_value.dtype),
+            )(dtransport_moments_d_er_bar)
+            return nu_bar_value, epsi_bar_value, vth_bar_value
+
+        nu_hat_bar, epsi_hat_bar, vth_a_bar = jax.lax.map(
+            _per_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat, vth_a),
+        )
+        return nu_hat_bar, epsi_hat_bar, vth_a_bar
+
+    def _pullback_dtransport_moments_d_log_nu_star_from_scan_primitives(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        dtransport_moments_d_log_nu_star_bar,
+    ):
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value = args
+
+            def _single_energy_dtransport(nu_value, epsi_value):
+                return jax.jvp(
+                    lambda nu_inner, epsi_inner: self._single_energy_transport_moment_from_inputs(
+                        prepared,
+                        nu_inner,
+                        epsi_inner,
+                        drds_value=drds_value,
+                        energy_index=energy_index,
+                    ),
+                    (nu_value, epsi_value),
+                    (nu_value, jnp.asarray(0.0, dtype=epsi_value.dtype)),
+                )[1]
+
+            _, linearized = jax.linearize(
+                _single_energy_dtransport,
+                nu_hat_value,
+                epsi_hat_value,
+            )
+            nu_bar_value, epsi_bar_value = jax.linear_transpose(
+                linearized,
+                jnp.asarray(0.0, dtype=nu_hat_value.dtype),
+                jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
+            )(dtransport_moments_d_log_nu_star_bar)
+            return nu_bar_value, epsi_bar_value
+
+        nu_hat_bar, epsi_hat_bar = jax.lax.map(
+            _per_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat),
+        )
+        return nu_hat_bar, epsi_hat_bar
+
     def _pullback_log_nu_star_from_nu_hat(
         self,
         reference_nu_hat,
@@ -2394,54 +2490,28 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_epsi_hat=reference_epsi_hat,
             reference_transport_moments_bar=reference_transport_moments_bar,
         )
-
-        def _dtransport_moments_d_er_from_primitives(
-            nu_hat_value,
-            epsi_hat_value,
-            vth_a_value,
-        ):
-            return self._dtransport_moments_d_er_from_scan_primitives(
-                prepared,
-                drds_value=drds_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
-                vth_a=vth_a_value,
-            )
-
-        _, dtransport_d_er_linearized = jax.linearize(
-            _dtransport_moments_d_er_from_primitives,
-            reference_nu_hat,
-            reference_epsi_hat,
-            vth_a,
+        (
+            dtransport_d_er_nu_hat_bar,
+            dtransport_d_er_epsi_hat_bar,
+            dtransport_d_er_vth_a_bar,
+        ) = self._pullback_dtransport_moments_d_er_from_scan_primitives(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            dtransport_moments_d_er_bar=dtransport_moments_d_er_bar,
         )
-        dtransport_d_er_nu_hat_bar, dtransport_d_er_epsi_hat_bar, dtransport_d_er_vth_a_bar = jax.linear_transpose(
-            dtransport_d_er_linearized,
-            zero_nu_hat,
-            zero_epsi_hat,
-            zero_vth_a,
-        )(dtransport_moments_d_er_bar)
-
-        def _dtransport_moments_d_log_nu_star_from_primitives(
-            nu_hat_value,
-            epsi_hat_value,
-        ):
-            return self._dtransport_moments_d_log_nu_star_from_scan_primitives(
-                prepared,
-                drds_value=drds_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
-            )
-
-        _, dtransport_d_log_nu_star_linearized = jax.linearize(
-            _dtransport_moments_d_log_nu_star_from_primitives,
-            reference_nu_hat,
-            reference_epsi_hat,
+        (
+            dtransport_d_log_nu_star_nu_hat_bar,
+            dtransport_d_log_nu_star_epsi_hat_bar,
+        ) = self._pullback_dtransport_moments_d_log_nu_star_from_scan_primitives(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            dtransport_moments_d_log_nu_star_bar=dtransport_moments_d_log_nu_star_bar,
         )
-        dtransport_d_log_nu_star_nu_hat_bar, dtransport_d_log_nu_star_epsi_hat_bar = jax.linear_transpose(
-            dtransport_d_log_nu_star_linearized,
-            zero_nu_hat,
-            zero_epsi_hat,
-        )(dtransport_moments_d_log_nu_star_bar)
 
         nu_hat_bar = (
             log_nu_star_nu_hat_bar
