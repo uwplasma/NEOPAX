@@ -892,3 +892,41 @@ Start with:
 
 because the reverse execution path is finally good enough that correctness
 comparison against forward is now the highest-value next check.
+
+### Additional note from the first reverse-gradient attempt
+
+The first attempt to print reverse gradients with:
+
+- `benchmark_transport_reverse_prefix_gradients.py`
+- `--accepted-step-counts full`
+- `--comparison-mode reverse-only`
+
+still OOMed, but **not** because the new reverse pullback regressed.
+
+The failure site was:
+
+- `_radau_collect_realized_accepted_step_payloads(...)`
+
+inside the gradient script's old payload-collection path.
+
+Meaning:
+
+- the old gradient script is still trying to collect the full accepted-step
+  payload rollout as one giant GPU object
+- this happens before the new segmented option-4 reverse composition runs
+
+So the correct next implementation is:
+
+1. do **not** debug the new rebuild pullback again here
+2. replace the gradient script's old full-payload collection path with the same
+   segmented payload-collection / step-loop reverse structure already used by
+   `benchmark_transport_reverse_multi_step_primitive.py`
+
+This distinction matters:
+
+- reverse multi-step benchmark:
+  - now uses the improved segmented path
+  - scales much better
+- reverse-prefix gradient benchmark:
+  - still uses the legacy full-payload collector
+  - can still OOM even though the new reverse path itself is much healthier
