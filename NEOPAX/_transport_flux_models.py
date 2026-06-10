@@ -2042,7 +2042,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             dtransport_moments_d_log_nu_star,
         )
 
-    def _pullback_interpolated_moment_response_local_field(
+    def _pullback_interpolated_moment_response_local_fields(
         self,
         prepared,
         *,
@@ -2051,19 +2051,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         temperature_local,
         density_local,
         collisionality_kind,
-        field_name: str,
-        field_bar,
+        field_bars,
     ):
         vthermal_local = get_v_thermal(self.species.mass, temperature_local)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
-        def _per_species_pullback(species_index, species_field_bar):
+        def _per_species_pullback(species_index, species_field_bars):
             (
                 reference_nu_hat,
                 reference_epsi_hat,
                 vth_a,
-                reference_transport_moments,
-                transport_moment_pushforward,
+                _reference_transport_moments,
+                _transport_moment_pushforward,
             ) = self._build_interpolated_moment_response_local_primitives(
                 prepared,
                 drds_value=drds_value,
@@ -2079,140 +2078,58 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             zero_epsi_hat = jnp.zeros_like(reference_epsi_hat)
             zero_vth_a = jnp.zeros_like(vth_a)
 
-            def _pullback_reference_log_nu_star_bar(log_nu_star_bar):
-                def _forward_linearized_reference_log_nu_star(dnu_hat, depsi_hat, dvth_a):
-                    del depsi_hat, dvth_a
-                    _, dfield = jax.jvp(
-                        self._log_nu_star_from_nu_hat,
-                        (reference_nu_hat,),
-                        (dnu_hat,),
-                    )
-                    return dfield
-
-                (
-                    reference_nu_hat_bar,
-                    _reference_epsi_hat_bar,
-                    _vth_a_bar,
-                ) = jax.linear_transpose(
-                    _forward_linearized_reference_log_nu_star,
-                    zero_nu_hat,
-                    zero_epsi_hat,
-                    zero_vth_a,
-                )(log_nu_star_bar)
-                return reference_nu_hat_bar, zero_epsi_hat, zero_vth_a
-
-            def _pullback_transport_moments_bar(transport_moments_bar):
-                reference_nu_hat_bar, reference_epsi_hat_bar = jax.linear_transpose(
-                    lambda dnu_hat, depsi_hat: jax.jvp(
-                        lambda nu_hat_a, epsi_hat_a: self._transport_moments_from_inputs(
-                            prepared,
-                            nu_hat_a,
-                            epsi_hat_a,
-                            drds_value=drds_value,
-                            derivative_mode_override="direct",
-                        ),
-                        (reference_nu_hat, reference_epsi_hat),
-                        (dnu_hat, depsi_hat),
-                    )[1],
-                    zero_nu_hat,
-                    zero_epsi_hat,
-                )(transport_moments_bar)
-                return reference_nu_hat_bar, reference_epsi_hat_bar, zero_vth_a
-
-            def _pullback_dtransport_moments_d_er_bar(dtransport_moments_d_er_bar):
-                def _forward_linearized_dtransport_moments_d_er(
-                    dnu_hat,
-                    depsi_hat,
-                    dvth_a,
-                ):
-                    def _field_from_reduced_primitives(
+            def _reduced_local_outputs_from_primitives(nu_hat_a, epsi_hat_a, vth_a_value):
+                reference_transport_moments_local, transport_moment_pushforward_local = jax.linearize(
+                    lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_inputs(
+                        prepared,
+                        nu_hat_value,
+                        epsi_hat_value,
+                        drds_value=drds_value,
+                        derivative_mode_override="direct",
+                    ),
+                    nu_hat_a,
+                    epsi_hat_a,
+                )
+                epsi_hat_tangent_local = jnp.asarray(
+                    1.0e3,
+                    dtype=epsi_hat_a.dtype,
+                ) / (self.energy_grid.v_norm * vth_a_value)
+                return (
+                    self._log_nu_star_from_nu_hat(nu_hat_a),
+                    reference_transport_moments_local,
+                    transport_moment_pushforward_local(
+                        jnp.zeros_like(nu_hat_a),
+                        epsi_hat_tangent_local,
+                    ),
+                    transport_moment_pushforward_local(
                         nu_hat_a,
-                        epsi_hat_a,
-                        vth_a_value,
-                    ):
-                        _reference_transport_moments_local, transport_moment_pushforward_local = jax.linearize(
-                            lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_inputs(
-                                prepared,
-                                nu_hat_value,
-                                epsi_hat_value,
-                                drds_value=drds_value,
-                                derivative_mode_override="direct",
-                            ),
-                            nu_hat_a,
-                            epsi_hat_a,
-                        )
-                        epsi_hat_tangent_local = jnp.asarray(
-                            1.0e3,
-                            dtype=epsi_hat_a.dtype,
-                        ) / (self.energy_grid.v_norm * vth_a_value)
-                        return transport_moment_pushforward_local(
-                            jnp.zeros_like(nu_hat_a),
-                            epsi_hat_tangent_local,
-                        )
-
-                    _, dfield = jax.jvp(
-                        _field_from_reduced_primitives,
-                        (reference_nu_hat, reference_epsi_hat, vth_a),
-                        (dnu_hat, depsi_hat, dvth_a),
-                    )
-                    return dfield
-
-                return jax.linear_transpose(
-                    _forward_linearized_dtransport_moments_d_er,
-                    zero_nu_hat,
-                    zero_epsi_hat,
-                    zero_vth_a,
-                )(dtransport_moments_d_er_bar)
-
-            def _pullback_dtransport_moments_d_log_nu_star_bar(
-                dtransport_moments_d_log_nu_star_bar,
-            ):
-                def _forward_linearized_dtransport_moments_d_log_nu_star(
-                    dnu_hat,
-                    depsi_hat,
-                    dvth_a,
-                ):
-                    del dvth_a
-                    _, dfield = jax.jvp(
-                        lambda nu_hat_a, epsi_hat_a: transport_moment_pushforward(
-                            nu_hat_a,
-                            jnp.zeros_like(epsi_hat_a),
-                        ),
-                        (reference_nu_hat, reference_epsi_hat),
-                        (dnu_hat, depsi_hat),
-                    )
-                    return dfield
-
-                (
-                    reference_nu_hat_bar,
-                    reference_epsi_hat_bar,
-                    _vth_a_bar,
-                ) = jax.linear_transpose(
-                    _forward_linearized_dtransport_moments_d_log_nu_star,
-                    zero_nu_hat,
-                    zero_epsi_hat,
-                    zero_vth_a,
-                )(dtransport_moments_d_log_nu_star_bar)
-                return reference_nu_hat_bar, reference_epsi_hat_bar, zero_vth_a
-
-            if field_name == "reference_log_nu_star":
-                reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar = (
-                    _pullback_reference_log_nu_star_bar(species_field_bar)
+                        jnp.zeros_like(epsi_hat_a),
+                    ),
                 )
-            elif field_name == "reference_transport_moments":
-                reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar = (
-                    _pullback_transport_moments_bar(species_field_bar)
+
+            def _forward_linearized_reduced_outputs(dnu_hat, depsi_hat, dvth_a):
+                _, doutputs = jax.jvp(
+                    _reduced_local_outputs_from_primitives,
+                    (reference_nu_hat, reference_epsi_hat, vth_a),
+                    (dnu_hat, depsi_hat, dvth_a),
                 )
-            elif field_name == "dtransport_moments_d_er":
-                reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar = (
-                    _pullback_dtransport_moments_d_er_bar(species_field_bar)
+                return doutputs
+
+            (
+                reference_nu_hat_bar,
+                reference_epsi_hat_bar,
+                vth_a_bar,
+            ) = jax.linear_transpose(
+                _forward_linearized_reduced_outputs,
+                zero_nu_hat,
+                zero_epsi_hat,
+                zero_vth_a,
+            )(
+                tuple(
+                    species_field_bars[field_name]
+                    for field_name in _INTERPOLATED_RESPONSE_FIELD_NAMES
                 )
-            elif field_name == "dtransport_moments_d_log_nu_star":
-                reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar = (
-                    _pullback_dtransport_moments_d_log_nu_star_bar(species_field_bar)
-                )
-            else:
-                raise ValueError(f"Unsupported interpolated-moment response field: {field_name}")
+            )
 
             def _scan_inputs_from_local_primitives(
                 er_local,
@@ -2297,7 +2214,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         er_species_bar, temperature_species_bar, density_species_bar = jax.vmap(
             _per_species_pullback,
             in_axes=(0, 0),
-        )(species_indices, field_bar)
+        )(species_indices, field_bars)
         return (
             jnp.sum(er_species_bar, axis=0),
             jnp.sum(temperature_species_bar, axis=0),
@@ -2865,12 +2782,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     keepdims=False,
                 )
 
-                er_zero = jnp.zeros_like(er_local0)
-                temperature_zero = jnp.zeros_like(temperature_local0)
-                density_safe_zero = jnp.zeros_like(density_safe_local)
-                er_local_bar = er_zero
-                temperature_local_bar = temperature_zero
-                density_safe_local_bar = density_safe_zero
                 prepared_local = jax.tree_util.tree_map(
                     lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
                     support.center_prepared,
@@ -2882,25 +2793,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     keepdims=False,
                 )
 
-                for field_name in _INTERPOLATED_RESPONSE_FIELD_NAMES:
-                    field_bar = local_field_bars[field_name]
-                    (
-                        er_field_bar,
-                        temperature_field_bar,
-                        density_safe_field_bar,
-                    ) = self._pullback_interpolated_moment_response_local_field(
-                        prepared_local,
-                        drds_value=drds_value_local,
-                        er_value=er_local0,
-                        temperature_local=temperature_local0,
-                        density_local=density_safe_local,
-                        collisionality_kind=collisionality_kind,
-                        field_name=field_name,
-                        field_bar=field_bar,
-                    )
-                    er_local_bar = er_local_bar + er_field_bar
-                    temperature_local_bar = temperature_local_bar + temperature_field_bar
-                    density_safe_local_bar = density_safe_local_bar + density_safe_field_bar
+                (
+                    er_local_bar,
+                    temperature_local_bar,
+                    density_safe_local_bar,
+                ) = self._pullback_interpolated_moment_response_local_fields(
+                    prepared_local,
+                    drds_value=drds_value_local,
+                    er_value=er_local0,
+                    temperature_local=temperature_local0,
+                    density_local=density_safe_local,
+                    collisionality_kind=collisionality_kind,
+                    field_bars=local_field_bars,
+                )
 
                 def _forward_linearized_density_pressure(
                     ddensity_local,
