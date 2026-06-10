@@ -2010,8 +2010,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_nu_hat,
             reference_epsi_hat,
             vth_a,
-            reference_transport_moments,
-            transport_moment_pushforward,
+            _reference_transport_moments,
+            _transport_moment_pushforward,
         ) = self._build_interpolated_moment_response_local_primitives(
             prepared,
             drds_value=drds_value,
@@ -2022,24 +2022,175 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vthermal_local=vthermal_local,
             collisionality_kind=collisionality_kind,
         )
-        reference_log_nu_star = self._log_nu_star_from_nu_hat(reference_nu_hat)
-        v_new_a = self.energy_grid.v_norm * vth_a
-        zero_nu_tangent = jnp.zeros_like(reference_nu_hat)
-        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a
-        zero_epsi_tangent = jnp.zeros_like(reference_epsi_hat)
-        dtransport_moments_d_er = transport_moment_pushforward(
-            zero_nu_tangent,
-            epsi_hat_tangent,
+        return self._interpolated_moment_reduced_local_outputs_from_primitives(
+            prepared,
+            drds_value=drds_value,
+            nu_hat_a=reference_nu_hat,
+            epsi_hat_a=reference_epsi_hat,
+            vth_a=vth_a,
         )
-        dtransport_moments_d_log_nu_star = transport_moment_pushforward(
-            reference_nu_hat,
-            zero_epsi_tangent,
+
+    def _interpolated_moment_reduced_local_outputs_from_primitives(
+        self,
+        prepared,
+        *,
+        drds_value,
+        nu_hat_a,
+        epsi_hat_a,
+        vth_a,
+    ):
+        reference_transport_moments, transport_moment_pushforward = jax.linearize(
+            lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_inputs(
+                prepared,
+                nu_hat_value,
+                epsi_hat_value,
+                drds_value=drds_value,
+                derivative_mode_override="direct",
+            ),
+            nu_hat_a,
+            epsi_hat_a,
         )
+        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (self.energy_grid.v_norm * vth_a)
         return (
-            reference_log_nu_star,
+            self._log_nu_star_from_nu_hat(nu_hat_a),
             reference_transport_moments,
-            dtransport_moments_d_er,
-            dtransport_moments_d_log_nu_star,
+            transport_moment_pushforward(
+                jnp.zeros_like(nu_hat_a),
+                epsi_hat_tangent,
+            ),
+            transport_moment_pushforward(
+                nu_hat_a,
+                jnp.zeros_like(epsi_hat_a),
+            ),
+        )
+
+    def _pullback_interpolated_moment_reduced_local_outputs(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+    ):
+        zero_nu_hat = jnp.zeros_like(reference_nu_hat)
+        zero_epsi_hat = jnp.zeros_like(reference_epsi_hat)
+        zero_vth_a = jnp.zeros_like(vth_a)
+
+        def _forward_linearized_reduced_outputs(dnu_hat, depsi_hat, dvth_a):
+            _, doutputs = jax.jvp(
+                lambda nu_hat_a, epsi_hat_a, vth_a_value: self._interpolated_moment_reduced_local_outputs_from_primitives(
+                    prepared,
+                    drds_value=drds_value,
+                    nu_hat_a=nu_hat_a,
+                    epsi_hat_a=epsi_hat_a,
+                    vth_a=vth_a_value,
+                ),
+                (reference_nu_hat, reference_epsi_hat, vth_a),
+                (dnu_hat, depsi_hat, dvth_a),
+            )
+            return doutputs
+
+        return jax.linear_transpose(
+            _forward_linearized_reduced_outputs,
+            zero_nu_hat,
+            zero_epsi_hat,
+            zero_vth_a,
+        )(field_bars)
+
+    def _pullback_local_scan_inputs_from_primitives(
+        self,
+        *,
+        drds_value,
+        species_index: int,
+        er_value,
+        temperature_local,
+        density_local,
+        vthermal_local,
+        collisionality_kind,
+        reference_nu_hat_bar,
+        reference_epsi_hat_bar,
+        vth_a_bar,
+    ):
+        def _scan_inputs_from_local_primitives(
+            er_local,
+            temperature_local_value,
+            density_local_value,
+            vthermal_local_value,
+        ):
+            return self._local_scan_inputs(
+                drds_value=drds_value,
+                species_index=species_index,
+                er_value=er_local,
+                temperature_local=temperature_local_value,
+                density_local=density_local_value,
+                vthermal_local=vthermal_local_value,
+                collisionality_kind=collisionality_kind,
+            )
+
+        def _forward_linearized_scan_inputs(
+            der_local,
+            dtemperature_local,
+            ddensity_local,
+            dvthermal_local,
+        ):
+            _, doutputs = jax.jvp(
+                _scan_inputs_from_local_primitives,
+                (
+                    er_value,
+                    temperature_local,
+                    density_local,
+                    vthermal_local,
+                ),
+                (
+                    der_local,
+                    dtemperature_local,
+                    ddensity_local,
+                    dvthermal_local,
+                ),
+            )
+            return doutputs
+
+        (
+            er_local_bar,
+            temperature_local_scan_bar,
+            density_local_bar,
+            vthermal_local_bar,
+        ) = jax.linear_transpose(
+            _forward_linearized_scan_inputs,
+            jnp.zeros_like(er_value),
+            jnp.zeros_like(temperature_local),
+            jnp.zeros_like(density_local),
+            jnp.zeros_like(vthermal_local),
+        )(
+            (
+                reference_nu_hat_bar,
+                reference_epsi_hat_bar,
+                vth_a_bar,
+            )
+        )
+
+        def _forward_linearized_vthermal(dtemperature_local):
+            _, dvthermal = jax.jvp(
+                lambda temperature_local_value: get_v_thermal(
+                    self.species.mass,
+                    temperature_local_value,
+                ),
+                (temperature_local,),
+                (dtemperature_local,),
+            )
+            return dvthermal
+
+        (temperature_local_vthermal_bar,) = jax.linear_transpose(
+            _forward_linearized_vthermal,
+            jnp.zeros_like(temperature_local),
+        )(vthermal_local_bar)
+
+        return (
+            er_local_bar,
+            temperature_local_scan_bar + temperature_local_vthermal_bar,
+            density_local_bar,
         )
 
     def _pullback_interpolated_moment_response_local_fields(
@@ -2074,136 +2225,30 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 collisionality_kind=collisionality_kind,
             )
 
-            zero_nu_hat = jnp.zeros_like(reference_nu_hat)
-            zero_epsi_hat = jnp.zeros_like(reference_epsi_hat)
-            zero_vth_a = jnp.zeros_like(vth_a)
-
-            def _reduced_local_outputs_from_primitives(nu_hat_a, epsi_hat_a, vth_a_value):
-                reference_transport_moments_local, transport_moment_pushforward_local = jax.linearize(
-                    lambda nu_hat_value, epsi_hat_value: self._transport_moments_from_inputs(
-                        prepared,
-                        nu_hat_value,
-                        epsi_hat_value,
-                        drds_value=drds_value,
-                        derivative_mode_override="direct",
-                    ),
-                    nu_hat_a,
-                    epsi_hat_a,
-                )
-                epsi_hat_tangent_local = jnp.asarray(
-                    1.0e3,
-                    dtype=epsi_hat_a.dtype,
-                ) / (self.energy_grid.v_norm * vth_a_value)
-                return (
-                    self._log_nu_star_from_nu_hat(nu_hat_a),
-                    reference_transport_moments_local,
-                    transport_moment_pushforward_local(
-                        jnp.zeros_like(nu_hat_a),
-                        epsi_hat_tangent_local,
-                    ),
-                    transport_moment_pushforward_local(
-                        nu_hat_a,
-                        jnp.zeros_like(epsi_hat_a),
-                    ),
-                )
-
-            def _forward_linearized_reduced_outputs(dnu_hat, depsi_hat, dvth_a):
-                _, doutputs = jax.jvp(
-                    _reduced_local_outputs_from_primitives,
-                    (reference_nu_hat, reference_epsi_hat, vth_a),
-                    (dnu_hat, depsi_hat, dvth_a),
-                )
-                return doutputs
-
             (
                 reference_nu_hat_bar,
                 reference_epsi_hat_bar,
                 vth_a_bar,
-            ) = jax.linear_transpose(
-                _forward_linearized_reduced_outputs,
-                zero_nu_hat,
-                zero_epsi_hat,
-                zero_vth_a,
-            )(species_field_bars)
-
-            def _scan_inputs_from_local_primitives(
-                er_local,
-                temperature_local_value,
-                density_local_value,
-                vthermal_local_value,
-            ):
-                return self._local_scan_inputs(
-                    drds_value=drds_value,
-                    species_index=species_index,
-                    er_value=er_local,
-                    temperature_local=temperature_local_value,
-                    density_local=density_local_value,
-                    vthermal_local=vthermal_local_value,
-                    collisionality_kind=collisionality_kind,
-                )
-
-            def _forward_linearized_scan_inputs(
-                der_local,
-                dtemperature_local,
-                ddensity_local,
-                dvthermal_local,
-            ):
-                _, doutputs = jax.jvp(
-                    _scan_inputs_from_local_primitives,
-                    (
-                        er_value,
-                        temperature_local,
-                        density_local,
-                        vthermal_local,
-                    ),
-                    (
-                        der_local,
-                        dtemperature_local,
-                        ddensity_local,
-                        dvthermal_local,
-                    ),
-                )
-                return doutputs
-
-            (
-                er_local_bar,
-                temperature_local_scan_bar,
-                density_local_bar,
-                vthermal_local_bar,
-            ) = jax.linear_transpose(
-                _forward_linearized_scan_inputs,
-                jnp.zeros_like(er_value),
-                jnp.zeros_like(temperature_local),
-                jnp.zeros_like(density_local),
-                jnp.zeros_like(vthermal_local),
-            )(
-                (
-                    reference_nu_hat_bar,
-                    reference_epsi_hat_bar,
-                    vth_a_bar,
-                )
+            ) = self._pullback_interpolated_moment_reduced_local_outputs(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+                vth_a=vth_a,
+                field_bars=species_field_bars,
             )
 
-            def _forward_linearized_vthermal(dtemperature_local):
-                _, dvthermal = jax.jvp(
-                    lambda temperature_local_value: get_v_thermal(
-                        self.species.mass,
-                        temperature_local_value,
-                    ),
-                    (temperature_local,),
-                    (dtemperature_local,),
-                )
-                return dvthermal
-
-            (temperature_local_vthermal_bar,) = jax.linear_transpose(
-                _forward_linearized_vthermal,
-                jnp.zeros_like(temperature_local),
-            )(vthermal_local_bar)
-
-            return (
-                er_local_bar,
-                temperature_local_scan_bar + temperature_local_vthermal_bar,
-                density_local_bar,
+            return self._pullback_local_scan_inputs_from_primitives(
+                drds_value=drds_value,
+                species_index=species_index,
+                er_value=er_value,
+                temperature_local=temperature_local,
+                density_local=density_local,
+                vthermal_local=vthermal_local,
+                collisionality_kind=collisionality_kind,
+                reference_nu_hat_bar=reference_nu_hat_bar,
+                reference_epsi_hat_bar=reference_epsi_hat_bar,
+                vth_a_bar=vth_a_bar,
             )
 
         er_species_bar, temperature_species_bar, density_species_bar = jax.vmap(

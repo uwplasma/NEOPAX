@@ -930,3 +930,19 @@ This distinction matters:
 - reverse-prefix gradient benchmark:
   - still uses the legacy full-payload collector
   - can still OOM even though the new reverse path itself is much healthier
+
+### Clarification for the initialization refactor
+
+When specializing the reverse initialization pullback, keep the reduced active
+contract aligned with the forward-mode philosophy for now:
+
+- `y_bar`
+- `dt_bar`
+- `lagged_response_cache_bar`
+
+In particular:
+
+- do **not** drop `dt_bar` yet
+- keep it active in the specialized reverse initialization contract
+- only remove it later if we confirm with explicit evidence that the profile
+  parameters do not contribute through the initial `dt` lane

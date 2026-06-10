@@ -24,6 +24,8 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
     _baseline_profile_cfg,
+    _extract_fixed_temperature_projection,
+    _extract_state_regularization,
     _initial_carry_from_state_with_static_setup,
     _objective_vector_from_final_y,
     _parameterized_initial_state_multi,
@@ -45,6 +47,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_forward_like_cache_no_stage_cotangent_from_reduced_output_bar,
     _radau_reduced_output_from_carry,
     _radau_replay_realized_accepted_rollout,
+    _make_solver_state_transform,
 )
 
 
@@ -121,6 +124,31 @@ def _objective_basis(count: int, index: int, dtype) -> jax.Array:
     return jnp.asarray(np.eye(count, dtype=np.float64)[index], dtype=dtype)
 
 
+def _tree_vdot(lhs, rhs):
+    def _leaf_vdot(a, b):
+        a_arr = jnp.asarray(a)
+        b_arr = jnp.asarray(b)
+        if not jnp.issubdtype(a_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        if not jnp.issubdtype(b_arr.dtype, jnp.inexact):
+            return jnp.asarray(0.0, dtype=jnp.float64)
+        return jnp.asarray(
+            jnp.vdot(jnp.ravel(a_arr), jnp.ravel(b_arr)),
+            dtype=jnp.float64,
+        )
+
+    leaves = jax.tree_util.tree_map(
+        _leaf_vdot,
+        lhs,
+        rhs,
+    )
+    return jax.tree_util.tree_reduce(
+        lambda acc, x: acc + x,
+        leaves,
+        initializer=jnp.asarray(0.0, dtype=jnp.float64),
+    )
+
+
 def _inexact_leaf_arrays(tree) -> list[jax.Array]:
     arrays: list[jax.Array] = []
     for leaf in jax.tree_util.tree_leaves(tree):
@@ -191,16 +219,14 @@ def _prepare_prefix_context(
     }
 
 
-def _initial_forward_like_cache_no_stage_from_params(
+def _initial_flat_state_from_params(
     params,
     *,
     runtime,
     baseline_state,
     profile_cfg,
     parameter_names: tuple[str, ...],
-    solver,
     solve_vector_field,
-    prepared_rollout_static,
 ):
     state0 = _parameterized_initial_state_multi(
         baseline_state=baseline_state,
@@ -210,18 +236,40 @@ def _initial_forward_like_cache_no_stage_from_params(
         parameter_names=parameter_names,
         parameter_values=params,
     )
-    carry0 = _initial_carry_from_state_with_static_setup(
-        solver=solver,
-        state=state0,
-        solve_vector_field=solve_vector_field,
-        species=runtime.species,
-        prepared_rollout_static=prepared_rollout_static,
+    temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(
+        solve_vector_field
     )
-    return _RadauAcceptedStepForwardLikeCacheNoStageCotangent(
-        y=carry0.y,
-        dt=carry0.dt,
-        lagged_response_cache=carry0.lagged_response_cache,
+    density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
+    flat_state0, _unpack_flat, _unpack_packed, _pack_state, _project_flat, _project_flat_pullback, _unpack_flat_pullback = _make_solver_state_transform(
+        state0,
+        runtime.species,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
     )
+    return flat_state0
+
+
+def _initial_forward_like_cache_no_stage_cotangent_to_flat_state(
+    cotangent: _RadauAcceptedStepForwardLikeCacheNoStageCotangent,
+    *,
+    execution_context,
+    initial_carry,
+):
+    # Keep dt_bar in the reduced initialization contract to match the forward-like
+    # active lanes, even though the current prepared initial dt is solver-static
+    # and does not feed back to the profile parameters here.
+    dt_bar = jnp.asarray(cotangent.dt)
+    flat_state_bar = jnp.asarray(cotangent.y)
+    lagged_cache_bar = cotangent.lagged_response_cache
+    build_pullback = execution_context.physics_context.build_lagged_response_pullback
+    if (lagged_cache_bar is not None) and callable(build_pullback):
+        flat_state_bar = flat_state_bar + build_pullback(
+            initial_carry.y,
+            lagged_cache_bar,
+        )
+    return flat_state_bar, dt_bar
 
 
 def _payload_field_names_for_contract() -> tuple[str, ...]:
@@ -330,7 +378,6 @@ def _compute_reverse_candidate(
     execution_context = prefix_context["execution_context"]
     prepared_rollout = prefix_context["prepared_rollout"]
     initial_carry = prefix_context["initial_carry"]
-    solver = prefix_context["solver"]
     solve_vector_field = prefix_context["solve_vector_field"]
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
@@ -346,17 +393,14 @@ def _compute_reverse_candidate(
         ),
         schedule_rollout.final_carry.y,
     )
-
-    _, initial_param_pullback = jax.vjp(
-        lambda params: _initial_forward_like_cache_no_stage_from_params(
+    _, initial_flat_state_pullback = jax.vjp(
+        lambda params: _initial_flat_state_from_params(
             params,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_names=parameter_names,
-            solver=solver,
             solve_vector_field=solve_vector_field,
-            prepared_rollout_static=prepared_rollout,
         ),
         baseline_vector,
     )
@@ -605,7 +649,16 @@ def _compute_reverse_candidate(
         call_elapsed_s = time.perf_counter() - call_start_s
         if compile_plus_execute_s is None:
             compile_plus_execute_s = call_elapsed_s
-        (parameter_bar,) = initial_param_pullback(carry_bar)
+        flat_state_bar, dt_bar = _initial_forward_like_cache_no_stage_cotangent_to_flat_state(
+            carry_bar,
+            execution_context=execution_context,
+            initial_carry=initial_carry,
+        )
+        # Match the current forward initialization philosophy: keep dt in the
+        # reduced contract, but do not force a parameter pullback lane for it
+        # until initial dt becomes parameter-sensitive in the same way.
+        del dt_bar
+        (parameter_bar,) = initial_flat_state_pullback(flat_state_bar)
         jacobian_rows.append(parameter_bar)
     total_reverse_s = time.perf_counter() - reverse_start_s
     jacobian = jnp.stack(jacobian_rows, axis=0)
