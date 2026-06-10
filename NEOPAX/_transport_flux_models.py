@@ -2571,16 +2571,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     anchor_indices,
                 )
 
-            if n_anchor >= 4 and bool(np.isclose(float(np.asarray(anchor_rho[0])), 0.0)):
+            if n_anchor >= 4:
                 zero_anchor_response = jax.tree_util.tree_map(jnp.zeros_like, anchor_response_bar)
 
                 def _regularize_anchor_response_only(raw_anchor_response):
                     return self._regularize_axis_radius0(raw_anchor_response, anchor_rho)
 
-                (raw_anchor_response_bar,) = jax.linear_transpose(
-                    _regularize_anchor_response_only,
-                    zero_anchor_response,
-                )(anchor_response_bar)
+                def _transpose_regularized(_):
+                    return jax.linear_transpose(
+                        _regularize_anchor_response_only,
+                        zero_anchor_response,
+                    )(anchor_response_bar)[0]
+
+                raw_anchor_response_bar = jax.lax.cond(
+                    jnp.isclose(anchor_rho[0], 0.0),
+                    _transpose_regularized,
+                    lambda _: anchor_response_bar,
+                    operand=None,
+                )
             else:
                 raw_anchor_response_bar = anchor_response_bar
 
