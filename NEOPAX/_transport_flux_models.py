@@ -2361,7 +2361,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         def _per_energy(energy_index):
             nu_hat_value = reference_nu_hat[energy_index]
             epsi_hat_value = reference_epsi_hat[energy_index]
-            vth_a_value = vth_a[energy_index]
+            vth_a_value = vth_a
 
             def _single_energy_dtransport(nu_value, epsi_value, vth_value):
                 epsi_hat_tangent_value = jnp.asarray(1.0e3, dtype=epsi_value.dtype) / (
@@ -2397,7 +2397,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _per_energy,
             energy_indices,
         )
-        return nu_hat_bar, epsi_hat_bar, vth_a_bar
+        return nu_hat_bar, epsi_hat_bar, jnp.sum(vth_a_bar, axis=0)
 
     def _pullback_dtransport_moments_d_log_nu_star_from_scan_primitives(
         self,
