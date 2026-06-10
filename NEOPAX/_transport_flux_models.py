@@ -1954,9 +1954,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_epsi_hat=ref_epsi_hat,
         )
 
-    def _build_interpolated_moment_response_local_primitives(
+    def _interpolated_moment_local_scan_primitives(
         self,
-        prepared,
         *,
         drds_value,
         species_index: int,
@@ -1966,7 +1965,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vthermal_local,
         collisionality_kind,
     ):
-        reference_nu_hat, reference_epsi_hat, vth_a = self._local_scan_inputs(
+        return self._local_scan_inputs(
             drds_value=drds_value,
             species_index=species_index,
             er_value=er_value,
@@ -1974,24 +1973,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local=density_local,
             vthermal_local=vthermal_local,
             collisionality_kind=collisionality_kind,
-        )
-        reference_transport_moments, transport_moment_pushforward = jax.linearize(
-            lambda nu_hat_a, epsi_hat_a: self._transport_moments_from_inputs(
-                prepared,
-                nu_hat_a,
-                epsi_hat_a,
-                drds_value=drds_value,
-                derivative_mode_override="direct",
-            ),
-            reference_nu_hat,
-            reference_epsi_hat,
-        )
-        return (
-            reference_nu_hat,
-            reference_epsi_hat,
-            vth_a,
-            reference_transport_moments,
-            transport_moment_pushforward,
         )
 
     def _build_interpolated_moment_response_local(
@@ -2006,14 +1987,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vthermal_local,
         collisionality_kind,
     ):
-        (
-            reference_nu_hat,
-            reference_epsi_hat,
-            vth_a,
-            _reference_transport_moments,
-            _transport_moment_pushforward,
-        ) = self._build_interpolated_moment_response_local_primitives(
-            prepared,
+        reference_nu_hat, reference_epsi_hat, vth_a = self._interpolated_moment_local_scan_primitives(
             drds_value=drds_value,
             species_index=species_index,
             er_value=er_value,
@@ -2208,14 +2182,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
         def _per_species_pullback(species_index, species_field_bars):
-            (
-                reference_nu_hat,
-                reference_epsi_hat,
-                vth_a,
-                _reference_transport_moments,
-                _transport_moment_pushforward,
-            ) = self._build_interpolated_moment_response_local_primitives(
-                prepared,
+            reference_nu_hat, reference_epsi_hat, vth_a = self._interpolated_moment_local_scan_primitives(
                 drds_value=drds_value,
                 species_index=species_index,
                 er_value=er_value,
