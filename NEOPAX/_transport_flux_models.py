@@ -276,7 +276,9 @@ class _NTXInterpolatedMomentResponseFieldBars:
 def _interpolated_response_field_bar_tuple(
     field_bars: _NTXInterpolatedMomentResponseFieldBars,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    return dataclasses.astuple(field_bars)
+    if isinstance(field_bars, _NTXInterpolatedMomentResponseFieldBars):
+        return dataclasses.astuple(field_bars)
+    return tuple(field_bars)
 
 
 @jax.tree_util.register_dataclass
