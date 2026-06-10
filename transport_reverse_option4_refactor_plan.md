@@ -219,6 +219,43 @@ Once correctness is achieved:
 
 Do not try to prematurely minimize payload before correctness is stable.
 
+## Current Rebuild Refactor Plan
+
+The remaining blocker is the rebuild adjoint for
+`NTXInterpolatedMomentResponse`. The corrected refactor order is:
+
+1. Refactor the local interpolated-response reverse from tuple/object-level to
+   field-level bars.
+   This means the local rebuild adjoint should no longer treat the bundled
+   interpolated-response outputs as one reverse object. Instead it should carry
+   separate cotangents for:
+   - `reference_log_nu_star`
+   - `reference_transport_moments`
+   - `dtransport_moments_d_er`
+   - `dtransport_moments_d_log_nu_star`
+
+2. Introduce an explicit local reverse core at the `nu_hat` / `epsi_hat` level.
+   The rebuild adjoint should first pull bars back to the reduced NTX local
+   variables, and only later map them to primitive transport-state quantities.
+
+3. Rebuild the local `(Er, temperature, density)` adjoint from that reduced
+   core.
+   Reverse should mirror the same local decomposition used by forward mode:
+   local scan inputs, local transport moments, then local primitive-state bars.
+
+4. Separate the rebuild contract from the reuse contract at the inner reverse
+   API boundary.
+   The rebuild hot path should only depend on the reduced quantities actually
+   needed by the rebuild adjoint and should not see reuse-only structure.
+
+5. Flatten the rebuild hot path into array-level helper functions.
+   The inner rebuild cotangent implementation should minimize dataclass/object
+   traffic and prefer small array/scalar helper interfaces.
+
+This order matters because it removes broad reverse structure layer by layer:
+bundled local outputs first, then composed local builders, then shared
+rebuild/reuse structure, and only after that the remaining object-heavy glue.
+
 ## Existing Reverse Path: What Can Be Removed
 
 If this refactor succeeds, it should allow removal or retirement of most of the
