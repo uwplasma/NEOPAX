@@ -2626,14 +2626,36 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return density_safe_local, pressure_local / density_safe_local
 
             for anchor_pos in range(n_anchor):
-                radius_index = int(np.asarray(anchor_indices[anchor_pos]))
+                radius_index = jax.lax.dynamic_index_in_dim(
+                    anchor_indices,
+                    anchor_pos,
+                    axis=0,
+                    keepdims=False,
+                )
                 local_bar = tuple(
                     jax.lax.dynamic_index_in_dim(component_bar, anchor_pos, axis=0, keepdims=False)
                     for component_bar in raw_anchor_response_bar
                 )
-                density_safe_local = safe_density(density0[:, radius_index])
-                temperature_local0 = pressure0[:, radius_index] / density_safe_local
-                er_local0 = er0[radius_index]
+                density_local0 = jax.lax.dynamic_index_in_dim(
+                    density0,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                pressure_local0 = jax.lax.dynamic_index_in_dim(
+                    pressure0,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                density_safe_local = safe_density(density_local0)
+                temperature_local0 = pressure_local0 / density_safe_local
+                er_local0 = jax.lax.dynamic_index_in_dim(
+                    er0,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
 
                 def _forward_linearized_local_builder(
                     der_local,
@@ -2665,9 +2687,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     temperature_zero,
                     density_safe_zero,
                 )(local_bar)
-
-                density_local0 = density0[:, radius_index]
-                pressure_local0 = pressure0[:, radius_index]
 
                 def _forward_linearized_density_pressure(
                     ddensity_local,
