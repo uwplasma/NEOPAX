@@ -8,6 +8,7 @@ import h5py
 import jax
 import jax.numpy as jnp
 import interpax
+import numpy as np
 import sys
 from pathlib import Path
 from ._cell_variable import (
