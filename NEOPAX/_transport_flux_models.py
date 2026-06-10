@@ -2462,14 +2462,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
 
         if isinstance(center_response_bar, NTXInterpolatedMomentResponse):
+            support = self._static_support()
             density0 = state.density
             pressure0 = state.pressure
             er0 = state.Er
-            support = self._static_support()
             n_radius = int(er0.shape[0])
             anchor_indices = self._response_anchor_indices(n_radius)
             target_rho = jnp.asarray(support.center_channels.rho, dtype=jnp.float64)
+            anchor_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices]
             n_anchor = int(anchor_indices.shape[0])
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
             ref_log_bar_full = jnp.swapaxes(center_response_bar.reference_log_nu_star, 0, 1)
             ref_transport_bar_full = jnp.swapaxes(center_response_bar.reference_transport_moments, 0, 1)
@@ -2514,12 +2517,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             er_bar_direct = jnp.asarray(center_response_bar.reference_er)
 
-            def _build_anchor_response_from_primitives(density_value, pressure_value, er_value):
+            def _build_anchor_response_raw_from_primitives(density_value, pressure_value, er_value):
                 density_safe = safe_density(density_value)
                 temperature_value = pressure_value / density_safe
-                collisionality_kind = _collisionality_kind(self.collisionality_model)
                 vthermal_value = get_v_thermal(self.species.mass, temperature_value)
-                species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
                 def _per_anchor(radius_index):
                     prepared = jax.tree_util.tree_map(
@@ -2564,19 +2565,126 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         )
                     )(species_indices)
 
-                return self._map_radius_axis_regularized_at_axis0(
+                return self._map_radius_axis(
                     _per_anchor,
                     anchor_indices,
-                    jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices],
                 )
 
-            density_bar_anchor, pressure_bar_anchor, er_bar_anchor = _transpose_primitives_from_builder(
-                _build_anchor_response_from_primitives,
-                anchor_response_bar,
-            )
-            density_bar = density_bar_anchor
-            pressure_bar = pressure_bar_anchor
-            er_bar = er_bar_anchor + er_bar_direct
+            if n_anchor >= 4 and bool(np.isclose(float(np.asarray(anchor_rho[0])), 0.0)):
+                zero_anchor_response = jax.tree_util.tree_map(jnp.zeros_like, anchor_response_bar)
+
+                def _regularize_anchor_response_only(raw_anchor_response):
+                    return self._regularize_axis_radius0(raw_anchor_response, anchor_rho)
+
+                (raw_anchor_response_bar,) = jax.linear_transpose(
+                    _regularize_anchor_response_only,
+                    zero_anchor_response,
+                )(anchor_response_bar)
+            else:
+                raw_anchor_response_bar = anchor_response_bar
+
+            density_bar = jnp.zeros_like(density0)
+            pressure_bar = jnp.zeros_like(pressure0)
+            er_bar = jnp.asarray(er_bar_direct)
+
+            def _per_anchor_local_builder(radius_index, er_local, temperature_local, density_local):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.center_prepared,
+                )
+                drds_value = jax.lax.dynamic_index_in_dim(
+                    support.center_channels.drds,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                vthermal_local = get_v_thermal(self.species.mass, temperature_local)
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_local,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            def _local_density_pressure_map(density_local, pressure_local):
+                density_safe_local = safe_density(density_local)
+                return density_safe_local, pressure_local / density_safe_local
+
+            for anchor_pos in range(n_anchor):
+                radius_index = int(np.asarray(anchor_indices[anchor_pos]))
+                local_bar = tuple(
+                    jax.lax.dynamic_index_in_dim(component_bar, anchor_pos, axis=0, keepdims=False)
+                    for component_bar in raw_anchor_response_bar
+                )
+                density_safe_local = safe_density(density0[:, radius_index])
+                temperature_local0 = pressure0[:, radius_index] / density_safe_local
+                er_local0 = er0[radius_index]
+
+                def _forward_linearized_local_builder(
+                    der_local,
+                    dtemperature_local,
+                    ddensity_local,
+                ):
+                    _, dlocal_response = jax.jvp(
+                        lambda er_local, temperature_local, density_local: _per_anchor_local_builder(
+                            radius_index,
+                            er_local,
+                            temperature_local,
+                            density_local,
+                        ),
+                        (er_local0, temperature_local0, density_safe_local),
+                        (der_local, dtemperature_local, ddensity_local),
+                    )
+                    return dlocal_response
+
+                er_zero = jnp.zeros_like(er_local0)
+                temperature_zero = jnp.zeros_like(temperature_local0)
+                density_safe_zero = jnp.zeros_like(density_safe_local)
+                (
+                    er_local_bar,
+                    temperature_local_bar,
+                    density_safe_local_bar,
+                ) = jax.linear_transpose(
+                    _forward_linearized_local_builder,
+                    er_zero,
+                    temperature_zero,
+                    density_safe_zero,
+                )(local_bar)
+
+                density_local0 = density0[:, radius_index]
+                pressure_local0 = pressure0[:, radius_index]
+
+                def _forward_linearized_density_pressure(
+                    ddensity_local,
+                    dpressure_local,
+                ):
+                    _, doutputs = jax.jvp(
+                        _local_density_pressure_map,
+                        (density_local0, pressure_local0),
+                        (ddensity_local, dpressure_local),
+                    )
+                    return doutputs
+
+                density_local_bar, pressure_local_bar = jax.linear_transpose(
+                    _forward_linearized_density_pressure,
+                    jnp.zeros_like(density_local0),
+                    jnp.zeros_like(pressure_local0),
+                )(
+                    (
+                        density_safe_local_bar,
+                        temperature_local_bar,
+                    )
+                )
+
+                density_bar = density_bar.at[:, radius_index].add(density_local_bar)
+                pressure_bar = pressure_bar.at[:, radius_index].add(pressure_local_bar)
+                er_bar = er_bar.at[radius_index].add(er_local_bar)
             return dataclasses.replace(
                 state,
                 density=density_bar,
