@@ -86,6 +86,30 @@ def _parse_step_counts(text: str) -> tuple[int | None, ...]:
     return tuple(values)
 
 
+def _parse_objective_subset(text: str) -> tuple[int, ...] | None:
+    raw = str(text).strip()
+    if raw.lower() in {"all", "*", ""}:
+        return None
+    values: list[int] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if token in OBJECTIVE_LABELS:
+            values.append(OBJECTIVE_LABELS.index(token))
+            continue
+        index = int(token)
+        if not (0 <= index < len(OBJECTIVE_LABELS)):
+            raise ValueError(
+                f"Objective index out of range: {index}. "
+                f"Allowed range: 0..{len(OBJECTIVE_LABELS) - 1}"
+            )
+        values.append(index)
+    if not values:
+        raise ValueError("At least one objective index or label must be provided.")
+    return tuple(values)
+
+
 def _make_final_output_bar(
     final_carry,
     final_y_bar,
@@ -306,6 +330,20 @@ def _payload_field_names_for_contract() -> tuple[str, ...]:
     )
 
 
+def _select_objectives(values, objective_indices: tuple[int, ...] | None):
+    if objective_indices is None:
+        return values
+    return values[jnp.asarray(objective_indices, dtype=jnp.int32)]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedReverseSegment:
+    reversed_dynamic_values: tuple[object, ...]
+    lagged_valids: tuple[bool, ...]
+    reuse_fn: object
+    rebuild_fn: object
+
+
 def _compute_forward_reference(
     baseline_vector,
     *,
@@ -315,6 +353,7 @@ def _compute_forward_reference(
     parameter_names: tuple[str, ...],
     prefix_context: dict[str, object],
     compute_jacobian: bool,
+    objective_indices: tuple[int, ...] | None,
 ):
     execution_context = prefix_context["execution_context"]
     prepared_rollout = prefix_context["prepared_rollout"]
@@ -365,10 +404,13 @@ def _compute_forward_reference(
             zero_i32,
             next_lagged_response_valid,
         )
-        return _objective_vector_from_final_y(
-            replay.final_y,
-            prepared_rollout=prepared_rollout,
-            runtime=runtime,
+        return _select_objectives(
+            _objective_vector_from_final_y(
+                replay.final_y,
+                prepared_rollout=prepared_rollout,
+                runtime=runtime,
+            ),
+            objective_indices,
         )
 
     t0 = time.perf_counter()
@@ -393,11 +435,17 @@ def _compute_reverse_candidate(
     prefix_context: dict[str, object],
     execution_mode: str,
     segment_length: int,
+    objective_indices: tuple[int, ...] | None,
 ):
     execution_context = prefix_context["execution_context"]
     prepared_rollout = prefix_context["prepared_rollout"]
     initial_carry = prefix_context["initial_carry"]
     solve_vector_field = prefix_context["solve_vector_field"]
+    selected_objective_labels = (
+        OBJECTIVE_LABELS
+        if objective_indices is None
+        else [OBJECTIVE_LABELS[index] for index in objective_indices]
+    )
     schedule_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         initial_carry,
@@ -405,10 +453,13 @@ def _compute_reverse_candidate(
         stop_after_accepted_steps=prefix_context["stop_after_accepted_steps"],
     )
     objective_values, final_y_pullback = jax.vjp(
-        lambda final_y: _objective_vector_from_final_y(
-            final_y,
-            prepared_rollout=prepared_rollout,
-            runtime=runtime,
+        lambda final_y: _select_objectives(
+            _objective_vector_from_final_y(
+                final_y,
+                prepared_rollout=prepared_rollout,
+                runtime=runtime,
+            ),
+            objective_indices,
         ),
         schedule_rollout.final_carry.y,
     )
@@ -430,23 +481,6 @@ def _compute_reverse_candidate(
     )
     attempted_dts_np = np.asarray(jax.device_get(schedule_rollout.trace.attempted_dts), dtype=float)
     accepted_dts_np = attempted_dts_np[accepted_mask_np]
-    next_dts_np = np.asarray(jax.device_get(schedule_rollout.trace.next_dts), dtype=float)[accepted_mask_np]
-    next_recent_reject_count_np = np.asarray(
-        jax.device_get(schedule_rollout.trace.next_recent_reject_count),
-        dtype=np.int32,
-    )[accepted_mask_np]
-    next_regrowth_cooldown_np = np.asarray(
-        jax.device_get(schedule_rollout.trace.next_regrowth_cooldown),
-        dtype=np.int32,
-    )[accepted_mask_np]
-    next_easy_growth_streak_np = np.asarray(
-        jax.device_get(schedule_rollout.trace.next_easy_growth_streak),
-        dtype=np.int32,
-    )[accepted_mask_np]
-    next_lagged_response_valid_np = np.asarray(
-        jax.device_get(schedule_rollout.trace.next_lagged_response_valid),
-        dtype=bool,
-    )[accepted_mask_np]
     accepted_count = int(accepted_dts_np.shape[0])
     segment_length = max(1, int(segment_length))
     segment_ranges = [
@@ -454,93 +488,12 @@ def _compute_reverse_candidate(
         for start_idx in range(0, accepted_count, segment_length)
     ]
     accepted_dts_host = tuple(float(x) for x in accepted_dts_np.tolist())
-    next_dts_host = tuple(float(x) for x in next_dts_np.tolist())
-    next_recent_reject_count_host = tuple(int(x) for x in next_recent_reject_count_np.tolist())
-    next_regrowth_cooldown_host = tuple(int(x) for x in next_regrowth_cooldown_np.tolist())
-    next_easy_growth_streak_host = tuple(int(x) for x in next_easy_growth_streak_np.tolist())
-    next_lagged_response_valid_host = tuple(bool(x) for x in next_lagged_response_valid_np.tolist())
     dtype = execution_context.dtype
-    replay_cache = {}
     payload_collect_cache = {}
     payload_dynamic_field_names = _payload_field_names_for_contract()
 
     def _accepted_dt_slice(start_idx: int, end_idx: int):
         return jnp.asarray(accepted_dts_host[start_idx:end_idx], dtype=dtype)
-
-    def _accepted_next_dt_slice(start_idx: int, end_idx: int):
-        return jnp.asarray(next_dts_host[start_idx:end_idx], dtype=dtype)
-
-    def _accepted_recent_reject_slice(start_idx: int, end_idx: int):
-        return jnp.asarray(next_recent_reject_count_host[start_idx:end_idx], dtype=jnp.int32)
-
-    def _accepted_regrowth_slice(start_idx: int, end_idx: int):
-        return jnp.asarray(next_regrowth_cooldown_host[start_idx:end_idx], dtype=jnp.int32)
-
-    def _accepted_growth_streak_slice(start_idx: int, end_idx: int):
-        return jnp.asarray(next_easy_growth_streak_host[start_idx:end_idx], dtype=jnp.int32)
-
-    def _accepted_lagged_valid_slice(start_idx: int, end_idx: int):
-        return jnp.asarray(next_lagged_response_valid_host[start_idx:end_idx], dtype=jnp.bool_)
-
-    def _replay_segment(
-        carry_start,
-        accepted_active_mask,
-        dt_slice,
-        next_dt_slice,
-        recent_reject_slice,
-        regrowth_slice,
-        growth_streak_slice,
-        lagged_valid_slice,
-    ):
-        replay = _radau_replay_realized_accepted_rollout(
-            execution_context,
-            carry_start,
-            accepted_active_mask,
-            dt_slice,
-            next_dt_slice,
-            recent_reject_slice,
-            regrowth_slice,
-            growth_streak_slice,
-            lagged_valid_slice,
-        )
-        return replay.final_carry
-
-    def _replay_from_carry(carry_start, start_idx: int, end_idx: int):
-        dt_slice = _accepted_dt_slice(start_idx, end_idx)
-        if dt_slice.shape[0] == 0:
-            return carry_start
-        if execution_mode == "jit":
-            length = int(dt_slice.shape[0])
-            fn = replay_cache.get(length)
-            if fn is None:
-                fn = jax.jit(_replay_segment)
-                replay_cache[length] = fn
-            return fn(
-                carry_start,
-                jnp.ones((dt_slice.shape[0],), dtype=jnp.bool_),
-                dt_slice,
-                _accepted_next_dt_slice(start_idx, end_idx),
-                _accepted_recent_reject_slice(start_idx, end_idx),
-                _accepted_regrowth_slice(start_idx, end_idx),
-                _accepted_growth_streak_slice(start_idx, end_idx),
-                _accepted_lagged_valid_slice(start_idx, end_idx),
-            )
-        with jax.disable_jit():
-            return _replay_segment(
-                carry_start,
-                jnp.ones((dt_slice.shape[0],), dtype=jnp.bool_),
-                dt_slice,
-                _accepted_next_dt_slice(start_idx, end_idx),
-                _accepted_recent_reject_slice(start_idx, end_idx),
-                _accepted_regrowth_slice(start_idx, end_idx),
-                _accepted_growth_streak_slice(start_idx, end_idx),
-                _accepted_lagged_valid_slice(start_idx, end_idx),
-            )
-
-    def _segment_start_carry(segment_start: int):
-        if segment_start == 0:
-            return initial_carry
-        return _replay_from_carry(initial_carry, 0, segment_start)
 
     def _collect_segment_payloads(carry_start, dt_segment):
         def _scan_body(carry, dt_value):
@@ -628,6 +581,40 @@ def _compute_reverse_candidate(
             return jax.jit(_reuse_impl), jax.jit(_rebuild_impl)
         return _reuse_impl, _rebuild_impl
 
+    prepared_segments: list[_PreparedReverseSegment] = []
+    current_segment_start_carry = initial_carry
+    for start_idx, end_idx in segment_ranges:
+        payload_rollout = _collect_segment_payloads_compiled(
+            current_segment_start_carry,
+            _accepted_dt_slice(start_idx, end_idx),
+        )
+        payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
+        reuse_fn, rebuild_fn = _build_step_loop_reverse_fns(payload_template)
+        reversed_payloads = jax.tree_util.tree_map(
+            lambda x: jnp.flip(x, axis=0),
+            payload_rollout.reverse_payloads,
+        )
+        lagged_valids = tuple(
+            bool(x)
+            for x in np.asarray(
+                jax.device_get(reversed_payloads.lagged_response_valid_in),
+                dtype=bool,
+            ).tolist()
+        )
+        reversed_dynamic_values = tuple(
+            getattr(reversed_payloads, name)
+            for name in payload_dynamic_field_names
+        )
+        prepared_segments.append(
+            _PreparedReverseSegment(
+                reversed_dynamic_values=reversed_dynamic_values,
+                lagged_valids=lagged_valids,
+                reuse_fn=reuse_fn,
+                rebuild_fn=rebuild_fn,
+            )
+        )
+        current_segment_start_carry = payload_rollout.final_carry
+
     jacobian_rows = []
     compile_plus_execute_s = None
     reverse_start_s = time.perf_counter()
@@ -645,26 +632,17 @@ def _compute_reverse_candidate(
             final_output_bar,
             initial_carry,
         )
-        for start_idx, end_idx in reversed(segment_ranges):
-            segment_start_carry = _segment_start_carry(start_idx)
-            payload_rollout = _collect_segment_payloads_compiled(
-                segment_start_carry,
-                _accepted_dt_slice(start_idx, end_idx),
-            )
-            payload_template = jax.tree_util.tree_map(lambda x: x[0], payload_rollout.reverse_payloads)
-            reuse_fn, rebuild_fn = _build_step_loop_reverse_fns(payload_template)
-            reversed_payloads = jax.tree_util.tree_map(lambda x: jnp.flip(x, axis=0), payload_rollout.reverse_payloads)
-            lagged_valids = np.asarray(
-                jax.device_get(reversed_payloads.lagged_response_valid_in),
-                dtype=bool,
-            ).tolist()
-            reversed_dynamic_values = tuple(getattr(reversed_payloads, name) for name in payload_dynamic_field_names)
-            for step_idx, lagged_valid in enumerate(lagged_valids):
+        for prepared_segment in reversed(prepared_segments):
+            for step_idx, lagged_valid in enumerate(prepared_segment.lagged_valids):
                 dynamic_values = tuple(
                     jax.tree_util.tree_map(lambda x, idx=step_idx: x[idx], value)
-                    for value in reversed_dynamic_values
+                    for value in prepared_segment.reversed_dynamic_values
                 )
-                carry_bar = reuse_fn(dynamic_values, carry_bar) if lagged_valid else rebuild_fn(dynamic_values, carry_bar)
+                carry_bar = (
+                    prepared_segment.reuse_fn(dynamic_values, carry_bar)
+                    if lagged_valid
+                    else prepared_segment.rebuild_fn(dynamic_values, carry_bar)
+                )
         jax.block_until_ready(carry_bar.y)
         call_elapsed_s = time.perf_counter() - call_start_s
         if compile_plus_execute_s is None:
@@ -690,7 +668,7 @@ def _compute_reverse_candidate(
             ):
                 first_nonfinite_debug = {
                     "objective_index": int(objective_index),
-                    "objective_label": OBJECTIVE_LABELS[objective_index],
+                    "objective_label": selected_objective_labels[objective_index],
                     "carry_bar_stats": carry_bar_stats,
                     "flat_state_bar_stats": flat_state_bar_stats,
                     "parameter_bar_stats": parameter_bar_stats,
@@ -769,6 +747,11 @@ def main() -> None:
         help="Comma-separated accepted-step prefixes to compare. Use `full` to run the solver's natural realized rollout.",
     )
     parser.add_argument(
+        "--objectives",
+        default="all",
+        help="Comma-separated objective labels or indices to run. Default: all.",
+    )
+    parser.add_argument(
         "--comparison-mode",
         default="reverse-only",
         choices=("reverse-only", "both"),
@@ -796,6 +779,12 @@ def main() -> None:
 
     parameter_names = _parse_parameter_subset(args.parameters)
     accepted_step_counts = _parse_step_counts(args.accepted_step_counts)
+    objective_indices = _parse_objective_subset(args.objectives)
+    objective_labels = (
+        list(OBJECTIVE_LABELS)
+        if objective_indices is None
+        else [OBJECTIVE_LABELS[index] for index in objective_indices]
+    )
     config = _prepare_benchmark_config(
         Path(args.config),
         device=args.device,
@@ -829,6 +818,7 @@ def main() -> None:
                 parameter_names=parameter_names,
                 prefix_context=prefix_context,
                 compute_jacobian=True,
+                objective_indices=objective_indices,
             )
         reverse_result = _compute_reverse_candidate(
             baseline_vector,
@@ -839,6 +829,7 @@ def main() -> None:
             prefix_context=prefix_context,
             execution_mode=args.reverse_execution_mode,
             segment_length=args.segment_length,
+            objective_indices=objective_indices,
         )
 
         reverse_objectives_np = np.asarray(jax.device_get(reverse_result["objective_values"]), dtype=float)
@@ -855,7 +846,7 @@ def main() -> None:
             objective_metrics = _tree_diff_metrics(reverse_objectives_np, forward_objectives_np)
             gradient_metrics = _tree_diff_metrics(reverse_jacobian_np, forward_jacobian_np)
             gradient_rows = _per_objective_gradient_report(
-                OBJECTIVE_LABELS[: int(forward_jacobian_np.shape[0])],
+                objective_labels[: int(forward_jacobian_np.shape[0])],
                 parameter_names,
                 forward_jacobian_np,
                 reverse_jacobian_np,
@@ -891,6 +882,8 @@ def main() -> None:
         "parameter_names": list(parameter_names),
         "parameter_values": [float(x) for x in np.asarray(jax.device_get(baseline_vector), dtype=float)],
         "accepted_step_counts": [None if x is None else int(x) for x in accepted_step_counts],
+        "objective_indices": None if objective_indices is None else [int(x) for x in objective_indices],
+        "objective_labels": objective_labels,
         "comparison_mode": args.comparison_mode,
         "reverse_execution_mode": args.reverse_execution_mode,
         "segment_length": int(args.segment_length),
@@ -903,6 +896,7 @@ def main() -> None:
 
     print("[autodiff-gate] mode=transport_reverse_prefix_gradients")
     print(f"[autodiff-gate] parameters={list(parameter_names)}")
+    print(f"[autodiff-gate] objectives={objective_labels}")
     print(
         f"[autodiff-gate] accepted_step_counts={list(accepted_step_counts)} "
         f"comparison_mode={args.comparison_mode} "
@@ -933,7 +927,7 @@ def main() -> None:
                 f"parameter_all_finite={first_nonfinite_debug.get('parameter_bar_stats', {}).get('all_finite')}"
             )
         reverse_jacobian = np.asarray(prefix["reverse_jacobian"], dtype=float)
-        for objective_index, objective_label in enumerate(OBJECTIVE_LABELS[: int(reverse_jacobian.shape[0])]):
+        for objective_index, objective_label in enumerate(objective_labels[: int(reverse_jacobian.shape[0])]):
             row = reverse_jacobian[objective_index]
             row_text = " ".join(
                 f"{parameter_names[param_index]}={float(row[param_index]):.6e}"
