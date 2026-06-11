@@ -19,7 +19,6 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
-    _adaptive_rollout_diagnostics,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _baseline_profile_cfg,
     _prepare_realized_schedule_profile_vector_rollout_option_a,
@@ -28,7 +27,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
-from NEOPAX._transport_solvers import _radau_adaptive_final_state_rollout  # noqa: E402
+from NEOPAX._transport_solvers import _radau_adaptive_schedule_rollout  # noqa: E402
 
 
 def _report_path() -> Path:
@@ -167,13 +166,19 @@ def main() -> None:
             parameter_names=parameter_names,
         )
     )
-    baseline_rollout = _radau_adaptive_final_state_rollout(
+    baseline_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         initial_carry,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+    baseline_diag = {
+        "attempt_count": int(np.asarray(jax.device_get(baseline_rollout.attempt_count))),
+        "accepted_count": int(np.asarray(jax.device_get(baseline_rollout.accepted_count))),
+        "completed": bool(np.asarray(jax.device_get(baseline_rollout.completed))),
+        "failed": bool(np.asarray(jax.device_get(baseline_rollout.failed))),
+        "fail_code": int(np.asarray(jax.device_get(baseline_rollout.fail_code))),
+    }
 
     if _host_step_pullback_diagnostic_enabled():
         diagnostic = _run_host_local_step_pullback_diagnostic_for_parameter_vector(
