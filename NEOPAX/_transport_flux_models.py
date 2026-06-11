@@ -2740,9 +2740,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Transpose interpolation using only the reduced rebuild field bars."""
         response_field_bars = _interpolated_response_field_bar_tuple(field_bars)
         n_anchor = int(anchor_indices.shape[0])
-        axis_regularized = bool(n_anchor >= 4 and np.isclose(float(np.asarray(anchor_rho[0])), 0.0))
-
-        if axis_regularized:
+        if n_anchor >= 4:
             non_axis_templates = tuple(
                 jnp.zeros(
                     (n_anchor - 1,) + field_bar.shape[1:],
@@ -2762,19 +2760,48 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
                 )
 
-            non_axis_anchor_response_bar = jax.linear_transpose(
-                _forward_interpolated_fields_from_non_axis_anchor_fields,
-                *non_axis_templates,
-            )(response_field_bars)
-            raw_anchor_response_bar = tuple(
-                jnp.concatenate(
-                    [
-                        jnp.zeros_like(values[:1]),
-                        values,
-                    ],
-                    axis=0,
+            def _regularized_case(_):
+                non_axis_anchor_response_bar = jax.linear_transpose(
+                    _forward_interpolated_fields_from_non_axis_anchor_fields,
+                    *non_axis_templates,
+                )(response_field_bars)
+                raw_anchor_response_bar = tuple(
+                    jnp.concatenate(
+                        [
+                            jnp.zeros_like(values[:1]),
+                            values,
+                        ],
+                        axis=0,
+                    )
+                    for values in non_axis_anchor_response_bar
                 )
-                for values in non_axis_anchor_response_bar
+                return raw_anchor_response_bar
+
+            anchor_response_templates = tuple(
+                jnp.zeros(
+                    (n_anchor,) + field_bar.shape[1:],
+                    dtype=field_bar.dtype,
+                )
+                for field_bar in response_field_bars
+            )
+
+            def _forward_interpolated_fields_from_anchor_fields(*raw_anchor_response_fields):
+                return tuple(
+                    self._interpolate_anchor_values(anchor_indices, raw_anchor_response_fields[field_index], target_rho)
+                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+                )
+
+            def _direct_case(_):
+                return jax.linear_transpose(
+                    _forward_interpolated_fields_from_anchor_fields,
+                    *anchor_response_templates,
+                )(response_field_bars)
+
+            raw_anchor_response_bar = jax.lax.cond(
+                jnp.isclose(anchor_rho[0], 0.0),
+                _regularized_case,
+                _direct_case,
+                operand=None,
             )
             return _NTXInterpolatedMomentResponseFieldBars(*raw_anchor_response_bar)
 
