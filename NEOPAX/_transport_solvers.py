@@ -2699,8 +2699,10 @@ class _RadauAdaptiveRolloutTrace:
 class _RadauAdaptiveScheduleTrace:
     accepted_mask: Any
     active_mask: Any
+    err_norms: Any
     attempted_dts: Any
     next_dts: Any
+    step_ts: Any
     next_recent_reject_count: Any
     next_regrowth_cooldown: Any
     next_easy_growth_streak: Any
@@ -2725,7 +2727,7 @@ class _RadauAdaptiveScheduleRolloutResult:
 class _RadauAdaptiveRolloutResult:
     final_step_state: Any
     final_carry: Any
-    trace: _RadauAdaptiveRolloutTrace
+    trace: Any
     attempt_count: Any
     accepted_count: Any
     completed: Any
@@ -10002,20 +10004,14 @@ def _radau_controller_forward_only_rollout(
     )
 
 
-def _radau_adaptive_final_state_rollout(
+def _radau_adaptive_payload_trace_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
     *,
     max_total_steps: int,
     stop_after_accepted_steps: int | None = None,
 ) -> _RadauAdaptiveRolloutResult:
-    """Run the real adaptive Radau rollout and record a minimal per-attempt trace.
-
-    This is the intended solve-level AD boundary for future custom rollout JVP
-    work. Forward behavior follows the production adaptive controller/acceptance
-    logic; the extra output is only the compact trace needed to define that
-    boundary explicitly.
-    """
+    """Run the real adaptive rollout and record the full reverse payload trace."""
 
     dtype = execution_context.dtype
     step_state0 = _radau_step_state_from_carry(
@@ -10254,8 +10250,10 @@ def _radau_adaptive_schedule_rollout(
         scan_out = (
             active,
             jnp.asarray(step_info.accepted),
+            jnp.asarray(step_info.err_norm, dtype=dtype),
             jnp.asarray(step_info.dt, dtype=dtype),
             jnp.asarray(step_info.next_dt, dtype=dtype),
+            jnp.asarray(step_info.t, dtype=dtype),
             next_step_state.recent_reject_count,
             next_step_state.regrowth_cooldown,
             next_step_state.easy_growth_streak,
@@ -10267,8 +10265,10 @@ def _radau_adaptive_schedule_rollout(
     (
         active_mask,
         accepted_mask,
+        err_norms,
         attempted_dts,
         next_dts,
+        step_ts,
         next_recent_reject_count,
         next_regrowth_cooldown,
         next_easy_growth_streak,
@@ -10278,8 +10278,10 @@ def _radau_adaptive_schedule_rollout(
     trace = _RadauAdaptiveScheduleTrace(
         accepted_mask=accepted_mask,
         active_mask=active_mask,
+        err_norms=err_norms,
         attempted_dts=attempted_dts,
         next_dts=next_dts,
+        step_ts=step_ts,
         next_recent_reject_count=next_recent_reject_count,
         next_regrowth_cooldown=next_regrowth_cooldown,
         next_easy_growth_streak=next_easy_growth_streak,
@@ -10300,6 +10302,38 @@ def _radau_adaptive_schedule_rollout(
         completed=completed,
         failed=failed,
         fail_code=fail_code,
+    )
+
+
+def _radau_adaptive_final_state_rollout(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None = None,
+) -> _RadauAdaptiveRolloutResult:
+    """Run the real adaptive rollout on the compact forward-facing trace path.
+
+    Forward benchmarks and generic adaptive-rollout helpers should stay on this
+    lighter schedule/controller trace. Reverse replay and payload diagnostics
+    must opt into `_radau_adaptive_payload_trace_rollout(...)` explicitly.
+    """
+
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return _RadauAdaptiveRolloutResult(
+        final_step_state=rollout.final_step_state,
+        final_carry=rollout.final_carry,
+        trace=rollout.trace,
+        attempt_count=rollout.attempt_count,
+        accepted_count=rollout.accepted_count,
+        completed=rollout.completed,
+        failed=rollout.failed,
+        fail_code=rollout.fail_code,
     )
 
 

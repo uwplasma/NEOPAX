@@ -145,6 +145,7 @@ def main() -> None:
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
         use_realized_schedule_jvp=False,
+        use_schedule_trace_only=True,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     replay_trace = _truncate_rollout_trace_by_accepted_steps(

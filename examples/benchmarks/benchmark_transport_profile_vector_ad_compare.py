@@ -21,6 +21,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     PROFILE_VECTOR_PARAMETERS,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
+    _adaptive_rollout_objectives_for_parameter_vector_forward,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _host_step_pullback_diagnostic_enabled,
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
@@ -159,21 +160,20 @@ def main() -> None:
             print(f"  {key}: {float(value):.6e}" if np.asarray(jax.device_get(value)).shape == () else f"  {key}: {np.asarray(jax.device_get(value)).tolist()}", flush=True)
         return
 
-    objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
+    objective_fn_jvp = lambda p: _adaptive_rollout_objectives_for_parameter_vector_forward(  # noqa: E731
         p,
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_names=parameter_names,
-        derivative_mode="jvp",
     )
     jac_fwd = None
     jac_rev = None
     n_params = len(parameter_names)
 
     if args.ad_mode in ("both", "forward"):
-        print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
+        print("[autodiff-gate] progress: running forward adaptive-JVP columns", flush=True)
         fwd_columns = []
         for idx in range(n_params):
             basis = np.zeros(n_params, dtype=float)

@@ -32,7 +32,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedOutput,
     _radau_accepted_step_primitive,
     _radau_attempt_result_from_reverse_payload,
-    _radau_adaptive_final_state_rollout,
+    _radau_adaptive_payload_trace_rollout,
     _radau_carry_from_reverse_payload,
     _radau_accepted_step_primitive_pullback,
     _radau_collect_realized_accepted_step_payloads,
@@ -630,7 +630,7 @@ def _select_reverse_payload_from_rollout(
                 stop_after_accepted_steps=rollout_accepted_step_limit,
             )
             jax.block_until_ready(payload_rollout.accepted_dts)
-            adaptive_rollout = _radau_adaptive_final_state_rollout(
+            adaptive_rollout = _radau_adaptive_payload_trace_rollout(
                 execution_context,
                 initial_carry,
                 max_total_steps=capped_max_total_steps,
@@ -644,7 +644,7 @@ def _select_reverse_payload_from_rollout(
             max_total_steps=capped_max_total_steps,
             stop_after_accepted_steps=rollout_accepted_step_limit,
         )
-        adaptive_rollout = _radau_adaptive_final_state_rollout(
+        adaptive_rollout = _radau_adaptive_payload_trace_rollout(
             execution_context,
             initial_carry,
             max_total_steps=capped_max_total_steps,

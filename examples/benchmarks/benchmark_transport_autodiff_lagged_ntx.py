@@ -57,6 +57,8 @@ from NEOPAX._transport_solvers import (
     _make_solver_state_transform,
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
+    _radau_adaptive_payload_trace_rollout,
+    _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
@@ -329,6 +331,8 @@ def _adaptive_rollout_final_state_for_parameter(
     parameter_name: str,
     use_realized_schedule_jvp: bool = False,
     accepted_step_limit_override: int | None = None,
+    use_schedule_trace_only: bool = False,
+    use_payload_trace: bool = False,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -381,12 +385,27 @@ def _adaptive_rollout_final_state_for_parameter(
             prepared_rollout.initial_carry,
         )
         final_state = prepared_rollout.physics_context.unpack_flat(final_y)
-        rollout = _radau_adaptive_final_state_rollout(
-            execution_context,
-            prepared_rollout.initial_carry,
-            max_total_steps=max_total_steps,
-            stop_after_accepted_steps=stop_after_accepted_steps,
-        )
+        if use_payload_trace:
+            rollout = _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        elif use_schedule_trace_only:
+            rollout = _radau_adaptive_schedule_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        else:
+            rollout = _radau_adaptive_final_state_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
     else:
         prepared_components = prepare_transport_solver_components(config, runtime, state0)
         solver = prepared_components["solver"]
@@ -407,11 +426,27 @@ def _adaptive_rollout_final_state_for_parameter(
             if accepted_step_limit_override is not None
             else getattr(solver, "stop_after_accepted_steps", None)
         )
-        rollout = _radau_adaptive_final_state_rollout(
-            execution_context,
-            prepared_rollout.initial_carry,
-            max_total_steps=max_total_steps,
-            stop_after_accepted_steps=stop_after_accepted_steps,
+        rollout = (
+            _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_payload_trace
+            else _radau_adaptive_schedule_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_schedule_trace_only
+            else _radau_adaptive_final_state_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
         )
         final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return final_state, rollout
@@ -888,6 +923,49 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     else:
         raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
     final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
+def _adaptive_rollout_objectives_for_parameter_vector_forward(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+):
+    parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
+    state0 = _parameterized_initial_state_multi(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_names=parameter_names,
+        parameter_values=parameter_values,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return _objective_vector(final_state, runtime)
 
 
@@ -2270,7 +2348,7 @@ def _adaptive_rollout_nan_debug_for_parameter(
     )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_payload_trace_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
@@ -9329,6 +9407,7 @@ def build_realized_trace_checkpoint_interpolated_fd_report(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             use_realized_schedule_jvp=False,
+            use_payload_trace=True,
         )
         accepted_mask = np.asarray(jax.device_get(rollout.trace.accepted_mask), dtype=bool)
         active_mask = np.asarray(jax.device_get(rollout.trace.active_mask), dtype=bool)
