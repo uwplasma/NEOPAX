@@ -1859,16 +1859,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         d33_a_bar = weighted_l33 * transport_moments_bar[5]
 
-        d11_physical = jnp.asarray(coefficient_vector[0], dtype=jnp.float64) * drds_value**2
+        drds_is_finite = jnp.isfinite(drds_value)
+        safe_drds = jnp.where(
+            drds_is_finite,
+            jnp.asarray(drds_value, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+        safe_drds_sq = safe_drds**2
+
+        d11_physical = jnp.asarray(coefficient_vector[0], dtype=jnp.float64) * safe_drds_sq
         d11_active = jnp.asarray(
             d11_physical >= jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64),
             dtype=jnp.float64,
         )
         coeff_bar = coeff_bar.at[0].add(
-            jnp.asarray(-drds_value**2 * d11_active * d11_a_bar, dtype=coefficient_vector.dtype)
+            jnp.asarray(-safe_drds_sq * d11_active * d11_a_bar, dtype=coefficient_vector.dtype)
         )
         coeff_bar = coeff_bar.at[2].add(
-            jnp.asarray(-drds_value * d13_a_bar, dtype=coefficient_vector.dtype)
+            jnp.asarray(-safe_drds * d13_a_bar, dtype=coefficient_vector.dtype)
         )
         coeff_bar = coeff_bar.at[3].add(
             jnp.asarray(-d33_a_bar, dtype=coefficient_vector.dtype)
@@ -2263,16 +2271,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         d33_a_bar = weighted_l33 * transport_moments_bar[5]
 
-        d11_physical = jnp.asarray(coeff_scan[:, 0], dtype=jnp.float64) * drds_value**2
+        drds_is_finite = jnp.isfinite(drds_value)
+        safe_drds = jnp.where(
+            drds_is_finite,
+            jnp.asarray(drds_value, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+        safe_drds_sq = safe_drds**2
+
+        d11_physical = jnp.asarray(coeff_scan[:, 0], dtype=jnp.float64) * safe_drds_sq
         d11_active = jnp.asarray(
             d11_physical >= jnp.asarray(D11_POSITIVE_FLOOR, dtype=jnp.float64),
             dtype=jnp.float64,
         )
         coeff_scan_bar = coeff_scan_bar.at[:, 0].add(
-            jnp.asarray(-drds_value**2 * d11_active * d11_a_bar, dtype=coeff_scan.dtype)
+            jnp.asarray(-safe_drds_sq * d11_active * d11_a_bar, dtype=coeff_scan.dtype)
         )
         coeff_scan_bar = coeff_scan_bar.at[:, 2].add(
-            jnp.asarray(-drds_value * d13_a_bar, dtype=coeff_scan.dtype)
+            jnp.asarray(-safe_drds * d13_a_bar, dtype=coeff_scan.dtype)
         )
         coeff_scan_bar = coeff_scan_bar.at[:, 3].add(
             jnp.asarray(-d33_a_bar, dtype=coeff_scan.dtype)
