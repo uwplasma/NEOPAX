@@ -10365,40 +10365,22 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    # The forward custom-JVP only needs the realized accepted-step schedule and
-    # controller metadata. Using the full-state rollout here unnecessarily
-    # materializes the much larger per-attempt payload trace, which can blow up
-    # memory after reverse-mode payload expansions. Keep the JVP on the lighter
-    # schedule-only primitive and replay the realized accepted path from that.
-    rollout = _radau_adaptive_schedule_rollout(
-        execution_context,
-        carry0,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
-    )
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
-
-    def _replay(carry_value):
-        replay = _radau_replay_realized_accepted_rollout(
+    # Keep the forward custom-JVP fused with the adaptive primal rollout. The
+    # forward benchmarked path historically differentiated through the compact
+    # adaptive rollout directly rather than staging a separate schedule-discovery
+    # pass plus replay-JVP pass. Reverse-only payload growth is kept out by
+    # routing this through `_radau_adaptive_final_state_rollout(...)`, which is
+    # now the compact forward-facing rollout helper.
+    primal_out, tangent_out = jax.jvp(
+        lambda c: _radau_adaptive_final_state_rollout(
             execution_context,
-            carry_value,
-            active_mask,
-            attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
-        )
-        return replay.final_carry.y
-
-    primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
+            c,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        ).final_carry.y,
+        (carry0,),
+        (carry0_dot,),
+    )
     return primal_out, tangent_out
 
 
