@@ -2304,7 +2304,52 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 lambda1,
                 lambda3,
             )
-            return nu_bar_direct + nu_bar_implicit, epsi_bar
+            nu_bar_total = nu_bar_direct + nu_bar_implicit
+            if _ntx_local_pullback_finite_debug_enabled():
+                def _tm_case_debug_callback(
+                    energy_idx,
+                    nu_value,
+                    epsi_value,
+                    coeff_bar_value,
+                    nu_direct_value,
+                    nu_implicit_value,
+                    nu_total_value,
+                    epsi_bar_value,
+                ):
+                    entries = [
+                        ("nu_hat_value", nu_value),
+                        ("epsi_hat_value", epsi_value),
+                        ("coefficient_bar", coeff_bar_value),
+                        ("nu_bar_direct", nu_direct_value),
+                        ("nu_bar_implicit", nu_implicit_value),
+                        ("nu_bar_total", nu_total_value),
+                        ("epsi_bar", epsi_bar_value),
+                    ]
+                    for name, value in entries:
+                        arr = np.asarray(value)
+                        if not np.issubdtype(arr.dtype, np.inexact):
+                            continue
+                        if not np.all(np.isfinite(arr)):
+                            print(
+                                "[autodiff-gate] ntx-transport-pullback-nonfinite "
+                                f"energy_index={int(np.asarray(energy_idx))} "
+                                f"name={name} shape={arr.shape}"
+                            )
+                            break
+
+                jax.debug.callback(
+                    _tm_case_debug_callback,
+                    energy_index,
+                    nu_hat_value,
+                    epsi_hat_value,
+                    coefficient_bar,
+                    nu_bar_direct,
+                    nu_bar_implicit,
+                    nu_bar_total,
+                    epsi_bar,
+                    ordered=True,
+                )
+            return nu_bar_total, epsi_bar
 
         nu_hat_bar, epsi_hat_bar = jax.lax.map(
             _one_case_pullback,
