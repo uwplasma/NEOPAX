@@ -44,6 +44,18 @@ Additional structural guideline after debugging:
 - temporary host-driven reverse orchestration is acceptable for debugging and
   localization only; it is not the desired end-state architecture
 
+Additional post-validation architecture note:
+
+- after reverse gradients benchmark cleanly against the correct forward custom
+  adaptive AD reference, we should replace the current two-phase reverse
+  schedule/replay style with a replay-checkpoint reverse path
+- in other words, reverse should not permanently remain in a "discover saved
+  schedule metadata, then run a separate replay phase" structure if a tighter
+  checkpointed reverse composition can preserve the same accepted-step map
+- this is a follow-on optimization and architecture cleanup step, not a reason
+  to relax the immediate correctness gate against the forward custom-AD
+  benchmark
+
 ## Why This Refactor Is Needed
 
 The current reverse path is still hybrid:

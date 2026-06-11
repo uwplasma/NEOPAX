@@ -21,6 +21,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     PROFILE_VECTOR_PARAMETERS,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
+    _adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _host_step_pullback_diagnostic_enabled,
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
@@ -159,15 +160,27 @@ def main() -> None:
             print(f"  {key}: {float(value):.6e}" if np.asarray(jax.device_get(value)).shape == () else f"  {key}: {np.asarray(jax.device_get(value)).tolist()}", flush=True)
         return
 
-    objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_names=parameter_names,
-        derivative_mode="jvp",
-    )
+    if len(parameter_names) == 1:
+        parameter_name_single = parameter_names[0]
+        objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name_single,
+            derivative_mode="jvp",
+        )
+    else:
+        objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+            derivative_mode="jvp",
+        )
     jac_fwd = None
     jac_rev = None
     n_params = len(parameter_names)
@@ -176,13 +189,20 @@ def main() -> None:
         print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
         fwd_columns = []
         for idx in range(n_params):
-            basis = np.zeros(n_params, dtype=float)
-            basis[idx] = 1.0
-            _, tangent = jax.jvp(
-                objective_fn_jvp,
-                (baseline_vector,),
-                (jnp.asarray(basis, dtype=jnp.float64),),
-            )
+            if len(parameter_names) == 1:
+                _, tangent = jax.jvp(
+                    objective_fn_jvp,
+                    (jnp.asarray(float(baseline_vector[0]), dtype=jnp.float64),),
+                    (jnp.asarray(1.0, dtype=jnp.float64),),
+                )
+            else:
+                basis = np.zeros(n_params, dtype=float)
+                basis[idx] = 1.0
+                _, tangent = jax.jvp(
+                    objective_fn_jvp,
+                    (baseline_vector,),
+                    (jnp.asarray(basis, dtype=jnp.float64),),
+                )
             tangent_arr = np.asarray(jax.device_get(tangent), dtype=float)
             tangent_arr = tangent_arr[np.asarray(objective_indices, dtype=int)]
             fwd_columns.append(tangent_arr)
