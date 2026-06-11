@@ -1679,7 +1679,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         v_new_a = self.energy_grid.v_norm * vth_a
         # Feed the exact NTX runtime with the same field convention used by the
         # file/database benchmarks: epsi_hat = Es / v_new, with Es = Er * dr/ds.
-        epsi_hat_a = er_value * drds_value * 1.0e3 / v_new_a
+        # Preserve the physical zero-field limit at the magnetic axis: some
+        # geometries expose `drds = inf` there, and the forward accepted-step
+        # contract regularizes the axis instead of relying on the raw local
+        # product. Reverse may still touch this local primitive while
+        # reconstructing reduced payloads, so explicitly map `Er = 0` to
+        # `Es = 0` rather than letting `0 * inf` produce NaNs.
+        er_times_drds = jnp.where(
+            jnp.asarray(er_value == 0.0, dtype=jnp.bool_),
+            jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+            jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+        )
+        epsi_hat_a = er_times_drds * 1.0e3 / v_new_a
         if self.er_v_floor is not None:
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
             sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
