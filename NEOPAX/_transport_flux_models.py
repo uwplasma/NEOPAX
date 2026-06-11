@@ -2740,6 +2740,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Transpose interpolation using only the reduced rebuild field bars."""
         response_field_bars = _interpolated_response_field_bar_tuple(field_bars)
         n_anchor = int(anchor_indices.shape[0])
+        axis_regularized = bool(n_anchor >= 4 and np.isclose(float(np.asarray(anchor_rho[0])), 0.0))
+
+        if axis_regularized:
+            non_axis_templates = tuple(
+                jnp.zeros(
+                    (n_anchor - 1,) + field_bar.shape[1:],
+                    dtype=field_bar.dtype,
+                )
+                for field_bar in response_field_bars
+            )
+
+            def _forward_interpolated_fields_from_non_axis_anchor_fields(*non_axis_anchor_response_fields):
+                anchor_response_fields = tuple(
+                    jnp.concatenate([values[:1], values], axis=0)
+                    for values in non_axis_anchor_response_fields
+                )
+                anchor_response_fields = self._regularize_axis_radius0(anchor_response_fields, anchor_rho)
+                return tuple(
+                    self._interpolate_anchor_values(anchor_indices, anchor_response_fields[field_index], target_rho)
+                    for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
+                )
+
+            non_axis_anchor_response_bar = jax.linear_transpose(
+                _forward_interpolated_fields_from_non_axis_anchor_fields,
+                *non_axis_templates,
+            )(response_field_bars)
+            raw_anchor_response_bar = tuple(
+                jnp.concatenate(
+                    [
+                        jnp.zeros_like(values[:1]),
+                        values,
+                    ],
+                    axis=0,
+                )
+                for values in non_axis_anchor_response_bar
+            )
+            return _NTXInterpolatedMomentResponseFieldBars(*raw_anchor_response_bar)
+
         anchor_response_templates = tuple(
             jnp.zeros(
                 (n_anchor,) + field_bar.shape[1:],
@@ -2749,17 +2787,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
         def _forward_interpolated_fields_from_anchor_fields(*raw_anchor_response_fields):
-            anchor_response_fields = jax.lax.cond(
-                jnp.logical_and(
-                    jnp.asarray(n_anchor >= 4),
-                    jnp.isclose(anchor_rho[0], 0.0),
-                ),
-                lambda values: self._regularize_axis_radius0(values, anchor_rho),
-                lambda values: values,
-                raw_anchor_response_fields,
-            )
             return tuple(
-                self._interpolate_anchor_values(anchor_indices, anchor_response_fields[field_index], target_rho)
+                self._interpolate_anchor_values(anchor_indices, raw_anchor_response_fields[field_index], target_rho)
                 for field_index in range(len(_INTERPOLATED_RESPONSE_FIELD_NAMES))
             )
 
@@ -3320,88 +3349,130 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     axis=0,
                     keepdims=False,
                 )
-                local_field_bars = tuple(
-                    jax.lax.dynamic_index_in_dim(
-                        field_bar,
-                        anchor_pos,
+                is_axis_anchor = jnp.logical_and(
+                    jnp.asarray(n_anchor >= 4),
+                    jnp.logical_and(
+                        jnp.asarray(anchor_pos == 0, dtype=jnp.bool_),
+                        jnp.isclose(jax.lax.dynamic_index_in_dim(anchor_rho, 0, axis=0, keepdims=False), 0.0),
+                    ),
+                )
+
+                def _axis_anchor_zero_pullback(_):
+                    density_local0 = jax.lax.dynamic_index_in_dim(
+                        density0,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    pressure_local0 = jax.lax.dynamic_index_in_dim(
+                        pressure0,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    er_local0 = jax.lax.dynamic_index_in_dim(
+                        er0,
+                        radius_index,
                         axis=0,
                         keepdims=False,
                     )
-                    for field_bar in raw_anchor_response_fields
-                )
-                density_local0 = jax.lax.dynamic_index_in_dim(
-                    density0,
-                    radius_index,
-                    axis=1,
-                    keepdims=False,
-                )
-                pressure_local0 = jax.lax.dynamic_index_in_dim(
-                    pressure0,
-                    radius_index,
-                    axis=1,
-                    keepdims=False,
-                )
-                density_safe_local = safe_density(density_local0)
-                temperature_local0 = pressure_local0 / density_safe_local
-                er_local0 = jax.lax.dynamic_index_in_dim(
-                    er0,
-                    radius_index,
-                    axis=0,
-                    keepdims=False,
-                )
-
-                prepared_local = jax.tree_util.tree_map(
-                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                    support.center_prepared,
-                )
-                drds_value_local = jax.lax.dynamic_index_in_dim(
-                    support.center_channels.drds,
-                    radius_index,
-                    axis=0,
-                    keepdims=False,
-                )
-
-                (
-                    er_local_bar,
-                    temperature_local_bar,
-                    density_safe_local_bar,
-                ) = self._pullback_interpolated_moment_response_local_fields(
-                    prepared_local,
-                    drds_value=drds_value_local,
-                    er_value=er_local0,
-                    temperature_local=temperature_local0,
-                    density_local=density_safe_local,
-                    collisionality_kind=collisionality_kind,
-                    field_bars=local_field_bars,
-                )
-
-                def _forward_linearized_density_pressure(
-                    ddensity_local,
-                    dpressure_local,
-                ):
-                    _, doutputs = jax.jvp(
-                        _local_density_pressure_map,
-                        (density_local0, pressure_local0),
-                        (ddensity_local, dpressure_local),
+                    return (
+                        radius_index,
+                        jnp.zeros_like(density_local0),
+                        jnp.zeros_like(pressure_local0),
+                        jnp.zeros_like(er_local0),
                     )
-                    return doutputs
 
-                density_local_bar, pressure_local_bar = jax.linear_transpose(
-                    _forward_linearized_density_pressure,
-                    jnp.zeros_like(density_local0),
-                    jnp.zeros_like(pressure_local0),
-                )(
+                def _non_axis_anchor_pullback(_):
+                    local_field_bars = tuple(
+                        jax.lax.dynamic_index_in_dim(
+                            field_bar,
+                            anchor_pos,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        for field_bar in raw_anchor_response_fields
+                    )
+                    density_local0 = jax.lax.dynamic_index_in_dim(
+                        density0,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    pressure_local0 = jax.lax.dynamic_index_in_dim(
+                        pressure0,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_safe_local = safe_density(density_local0)
+                    temperature_local0 = pressure_local0 / density_safe_local
+                    er_local0 = jax.lax.dynamic_index_in_dim(
+                        er0,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+
+                    prepared_local = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        support.center_prepared,
+                    )
+                    drds_value_local = jax.lax.dynamic_index_in_dim(
+                        support.center_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+
                     (
-                        density_safe_local_bar,
+                        er_local_bar,
                         temperature_local_bar,
+                        density_safe_local_bar,
+                    ) = self._pullback_interpolated_moment_response_local_fields(
+                        prepared_local,
+                        drds_value=drds_value_local,
+                        er_value=er_local0,
+                        temperature_local=temperature_local0,
+                        density_local=density_safe_local,
+                        collisionality_kind=collisionality_kind,
+                        field_bars=local_field_bars,
                     )
-                )
 
-                return (
-                    radius_index,
-                    density_local_bar,
-                    pressure_local_bar,
-                    er_local_bar,
+                    def _forward_linearized_density_pressure(
+                        ddensity_local,
+                        dpressure_local,
+                    ):
+                        _, doutputs = jax.jvp(
+                            _local_density_pressure_map,
+                            (density_local0, pressure_local0),
+                            (ddensity_local, dpressure_local),
+                        )
+                        return doutputs
+
+                    density_local_bar, pressure_local_bar = jax.linear_transpose(
+                        _forward_linearized_density_pressure,
+                        jnp.zeros_like(density_local0),
+                        jnp.zeros_like(pressure_local0),
+                    )(
+                        (
+                            density_safe_local_bar,
+                            temperature_local_bar,
+                        )
+                    )
+
+                    return (
+                        radius_index,
+                        density_local_bar,
+                        pressure_local_bar,
+                        er_local_bar,
+                    )
+
+                return jax.lax.cond(
+                    is_axis_anchor,
+                    _axis_anchor_zero_pullback,
+                    _non_axis_anchor_pullback,
+                    operand=None,
                 )
 
             (
