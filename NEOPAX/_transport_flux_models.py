@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import os
 from typing import Any, Callable
 import abc
 import dataclasses
@@ -65,6 +66,11 @@ _INTERPOLATED_RESPONSE_FIELD_NAMES = (
     "dtransport_moments_d_log_nu_star",
 )
 from ._turbulence import get_Turbulent_Fluxes_Analytical, get_Turbulent_Fluxes_PowerOverN
+
+
+def _ntx_local_pullback_finite_debug_enabled() -> bool:
+    raw = str(os.environ.get("NEOPAX_TRANSPORT_NTX_LOCAL_PULLBACK_FINITE_DEBUG", "")).strip().lower()
+    return raw not in {"", "0", "false", "no", "off"}
 
 
 def compute_total_power_mw(state, species, pressure_source_model, geometry, fallback_mw=3.0):
@@ -2511,6 +2517,60 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             + dtransport_d_log_nu_star_epsi_hat_bar
         )
         vth_a_bar = dtransport_d_er_vth_a_bar
+
+        if _ntx_local_pullback_finite_debug_enabled():
+            def _finite_debug_callback(
+                log_nu_hat_bar,
+                tm_nu_hat_bar,
+                tm_epsi_hat_bar,
+                der_nu_hat_bar,
+                der_epsi_hat_bar,
+                der_vth_bar,
+                dlog_nu_hat_bar,
+                dlog_epsi_hat_bar,
+                total_nu_hat_bar,
+                total_epsi_hat_bar,
+                total_vth_bar,
+            ):
+                entries = [
+                    ("log_nu_star_nu_hat_bar", log_nu_hat_bar),
+                    ("transport_moments_nu_hat_bar", tm_nu_hat_bar),
+                    ("transport_moments_epsi_hat_bar", tm_epsi_hat_bar),
+                    ("dtransport_d_er_nu_hat_bar", der_nu_hat_bar),
+                    ("dtransport_d_er_epsi_hat_bar", der_epsi_hat_bar),
+                    ("dtransport_d_er_vth_a_bar", der_vth_bar),
+                    ("dtransport_d_log_nu_star_nu_hat_bar", dlog_nu_hat_bar),
+                    ("dtransport_d_log_nu_star_epsi_hat_bar", dlog_epsi_hat_bar),
+                    ("nu_hat_bar_total", total_nu_hat_bar),
+                    ("epsi_hat_bar_total", total_epsi_hat_bar),
+                    ("vth_a_bar_total", total_vth_bar),
+                ]
+                for name, value in entries:
+                    arr = np.asarray(value)
+                    if not np.issubdtype(arr.dtype, np.inexact):
+                        continue
+                    if not np.all(np.isfinite(arr)):
+                        print(
+                            "[autodiff-gate] ntx-local-pullback-nonfinite "
+                            f"name={name} shape={arr.shape}"
+                        )
+                        break
+
+            jax.debug.callback(
+                _finite_debug_callback,
+                log_nu_star_nu_hat_bar,
+                transport_moments_nu_hat_bar,
+                transport_moments_epsi_hat_bar,
+                dtransport_d_er_nu_hat_bar,
+                dtransport_d_er_epsi_hat_bar,
+                dtransport_d_er_vth_a_bar,
+                dtransport_d_log_nu_star_nu_hat_bar,
+                dtransport_d_log_nu_star_epsi_hat_bar,
+                nu_hat_bar,
+                epsi_hat_bar,
+                vth_a_bar,
+                ordered=True,
+            )
 
         return (
             jnp.asarray(nu_hat_bar, dtype=reference_nu_hat.dtype),

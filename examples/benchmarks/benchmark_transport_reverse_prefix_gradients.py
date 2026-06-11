@@ -174,6 +174,25 @@ def _tree_diff_metrics(lhs, rhs) -> dict[str, float]:
     }
 
 
+def _tree_finite_stats(tree) -> dict[str, object]:
+    nonfinite_leaf_names: list[str] = []
+    max_abs = 0.0
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        arr = jnp.asarray(leaf)
+        if not jnp.issubdtype(arr.dtype, jnp.inexact):
+            continue
+        if not bool(jax.device_get(jnp.all(jnp.isfinite(arr)))):
+            nonfinite_leaf_names.append("/".join(str(entry) for entry in path))
+            continue
+        if arr.size:
+            max_abs = max(max_abs, float(jax.device_get(jnp.max(jnp.abs(arr)))))
+    return {
+        "all_finite": len(nonfinite_leaf_names) == 0,
+        "nonfinite_leaf_names": nonfinite_leaf_names,
+        "max_abs": max_abs,
+    }
+
+
 def _prepare_prefix_context(
     baseline_vector,
     *,
@@ -613,6 +632,7 @@ def _compute_reverse_candidate(
     compile_plus_execute_s = None
     reverse_start_s = time.perf_counter()
     objective_count = int(objective_values.shape[0])
+    first_nonfinite_debug = None
     for objective_index in range(objective_count):
         basis = _objective_basis(objective_count, objective_index, objective_values.dtype)
         (final_y_bar,) = final_y_pullback(basis)
@@ -659,6 +679,22 @@ def _compute_reverse_candidate(
         # until initial dt becomes parameter-sensitive in the same way.
         del dt_bar
         (parameter_bar,) = initial_flat_state_pullback(flat_state_bar)
+        if first_nonfinite_debug is None:
+            carry_bar_stats = _tree_finite_stats(carry_bar)
+            flat_state_bar_stats = _tree_finite_stats(flat_state_bar)
+            parameter_bar_stats = _tree_finite_stats(parameter_bar)
+            if not (
+                carry_bar_stats["all_finite"]
+                and flat_state_bar_stats["all_finite"]
+                and parameter_bar_stats["all_finite"]
+            ):
+                first_nonfinite_debug = {
+                    "objective_index": int(objective_index),
+                    "objective_label": OBJECTIVE_LABELS[objective_index],
+                    "carry_bar_stats": carry_bar_stats,
+                    "flat_state_bar_stats": flat_state_bar_stats,
+                    "parameter_bar_stats": parameter_bar_stats,
+                }
         jacobian_rows.append(parameter_bar)
     total_reverse_s = time.perf_counter() - reverse_start_s
     jacobian = jnp.stack(jacobian_rows, axis=0)
@@ -669,6 +705,8 @@ def _compute_reverse_candidate(
         "compile_plus_execute_s": float(compile_plus_execute_s or 0.0),
         "total_reverse_s": float(total_reverse_s),
         "accepted_count": accepted_count,
+        "jacobian_finite_stats": _tree_finite_stats(jacobian),
+        "first_nonfinite_debug": first_nonfinite_debug,
     }
 
 
@@ -834,6 +872,8 @@ def main() -> None:
                 ),
                 "reverse_compile_plus_execute_s": float(reverse_result["compile_plus_execute_s"]),
                 "reverse_total_s": float(reverse_result["total_reverse_s"]),
+                "reverse_jacobian_finite_stats": reverse_result["jacobian_finite_stats"],
+                "reverse_first_nonfinite_debug": reverse_result["first_nonfinite_debug"],
                 "objective_values_forward": None if forward_objectives_np is None else forward_objectives_np.tolist(),
                 "objective_values_reverse": reverse_objectives_np.tolist(),
                 "objective_diff": objective_metrics,
@@ -877,6 +917,21 @@ def main() -> None:
             f"reverse_compile_plus_execute_s={float(prefix['reverse_compile_plus_execute_s']):.6e} "
             f"reverse_total_s={float(prefix['reverse_total_s']):.6e}"
         )
+        finite_stats = prefix.get("reverse_jacobian_finite_stats")
+        if isinstance(finite_stats, dict) and not bool(finite_stats.get("all_finite", True)):
+            print(
+                "    reverse_jacobian_nonfinite_leaves="
+                f"{finite_stats.get('nonfinite_leaf_names', [])}"
+            )
+        first_nonfinite_debug = prefix.get("reverse_first_nonfinite_debug")
+        if isinstance(first_nonfinite_debug, dict) and first_nonfinite_debug:
+            print(
+                "    first_nonfinite_debug "
+                f"objective={first_nonfinite_debug.get('objective_label')} "
+                f"carry_all_finite={first_nonfinite_debug.get('carry_bar_stats', {}).get('all_finite')} "
+                f"flat_state_all_finite={first_nonfinite_debug.get('flat_state_bar_stats', {}).get('all_finite')} "
+                f"parameter_all_finite={first_nonfinite_debug.get('parameter_bar_stats', {}).get('all_finite')}"
+            )
         reverse_jacobian = np.asarray(prefix["reverse_jacobian"], dtype=float)
         for objective_index, objective_label in enumerate(OBJECTIVE_LABELS[: int(reverse_jacobian.shape[0])]):
             row = reverse_jacobian[objective_index]
