@@ -10331,7 +10331,12 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    rollout = _radau_adaptive_final_state_rollout(
+    # The forward custom-JVP only needs the realized accepted-step schedule and
+    # controller metadata. Using the full-state rollout here unnecessarily
+    # materializes the much larger per-attempt payload trace, which can blow up
+    # memory after reverse-mode payload expansions. Keep the JVP on the lighter
+    # schedule-only primitive and replay the realized accepted path from that.
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
