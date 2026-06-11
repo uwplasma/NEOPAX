@@ -2387,10 +2387,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         if not np.issubdtype(arr.dtype, np.inexact):
                             continue
                         if not np.all(np.isfinite(arr)):
+                            finite_mask = np.isfinite(arr)
+                            if arr.ndim == 0:
+                                value_summary = f"value={arr!r}"
+                            else:
+                                value_summary = (
+                                    f"value={arr} "
+                                    f"finite_mask={finite_mask}"
+                                )
                             print(
                                 "[autodiff-gate] ntx-transport-pullback-nonfinite "
                                 f"energy_index={int(np.asarray(energy_idx))} "
-                                f"name={name} shape={arr.shape}"
+                                f"name={name} shape={arr.shape} {value_summary}"
                             )
                             break
 
