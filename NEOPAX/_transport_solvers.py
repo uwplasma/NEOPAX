@@ -2727,12 +2727,24 @@ class _RadauAdaptiveScheduleRolloutResult:
 class _RadauAdaptiveRolloutResult:
     final_step_state: Any
     final_carry: Any
-    trace: Any
+    trace: _RadauAdaptiveRolloutTrace
     attempt_count: Any
     accepted_count: Any
     completed: Any
     failed: Any
     fail_code: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauRealizedAcceptedSchedule:
+    active_mask: Any
+    attempted_dts: Any
+    next_dts: Any
+    next_recent_reject_count: Any
+    next_regrowth_cooldown: Any
+    next_easy_growth_streak: Any
+    next_lagged_response_valid: Any
 
 
 @jax.tree_util.register_dataclass
@@ -10311,7 +10323,7 @@ def _radau_adaptive_final_state_rollout(
     *,
     max_total_steps: int,
     stop_after_accepted_steps: int | None = None,
-) -> _RadauAdaptiveRolloutResult:
+) -> _RadauAdaptiveScheduleRolloutResult:
     """Run the real adaptive rollout on the compact forward-facing trace path.
 
     Forward benchmarks and generic adaptive-rollout helpers should stay on this
@@ -10319,21 +10331,27 @@ def _radau_adaptive_final_state_rollout(
     must opt into `_radau_adaptive_payload_trace_rollout(...)` explicitly.
     """
 
-    rollout = _radau_adaptive_schedule_rollout(
+    return _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    return _RadauAdaptiveRolloutResult(
-        final_step_state=rollout.final_step_state,
-        final_carry=rollout.final_carry,
-        trace=rollout.trace,
-        attempt_count=rollout.attempt_count,
-        accepted_count=rollout.accepted_count,
-        completed=rollout.completed,
-        failed=rollout.failed,
-        fail_code=rollout.fail_code,
+
+
+def _radau_realized_accepted_schedule_from_trace(
+    trace: _RadauAdaptiveScheduleTrace,
+) -> _RadauRealizedAcceptedSchedule:
+    """Extract the compact accepted-step replay schedule used by forward-mode AD."""
+
+    return _RadauRealizedAcceptedSchedule(
+        active_mask=jax.lax.stop_gradient(jnp.logical_and(trace.active_mask, trace.accepted_mask)),
+        attempted_dts=jax.lax.stop_gradient(trace.attempted_dts),
+        next_dts=jax.lax.stop_gradient(trace.next_dts),
+        next_recent_reject_count=jax.lax.stop_gradient(trace.next_recent_reject_count),
+        next_regrowth_cooldown=jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+        next_easy_growth_streak=jax.lax.stop_gradient(trace.next_easy_growth_streak),
+        next_lagged_response_valid=jax.lax.stop_gradient(trace.next_lagged_response_valid),
     )
 
 
@@ -10370,31 +10388,25 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
     # This is the numerically trusted custom-AD contract used by the benchmark
     # comparisons; do not replace it with direct AD through the adaptive control
     # flow, which changes the differentiated map.
-    rollout = _radau_adaptive_schedule_rollout(
+    rollout = _radau_adaptive_final_state_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    realized_schedule = _radau_realized_accepted_schedule_from_trace(rollout.trace)
 
     def _replay(carry_value):
         replay = _radau_replay_realized_accepted_rollout(
             execution_context,
             carry_value,
-            active_mask,
-            attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
+            realized_schedule.active_mask,
+            realized_schedule.attempted_dts,
+            realized_schedule.next_dts,
+            realized_schedule.next_recent_reject_count,
+            realized_schedule.next_regrowth_cooldown,
+            realized_schedule.next_easy_growth_streak,
+            realized_schedule.next_lagged_response_valid,
         )
         return replay.final_carry.y
 
@@ -10411,7 +10423,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp(
 ):
     """Final adaptive state with a solve-level VJP over the realized accepted schedule."""
 
-    rollout = _radau_adaptive_schedule_rollout(
+    rollout = _radau_adaptive_final_state_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
@@ -10434,13 +10446,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     )
     full_active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
     full_accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    realized_schedule = _radau_realized_accepted_schedule_from_trace(rollout.trace)
     checkpoint_interval = _radau_checkpoint_interval()
     (
         segmented_active_mask,
@@ -10452,13 +10458,13 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         segmented_next_lagged_response_valid,
         _n_segments,
     ) = _radau_segmented_schedule_arrays(
-        active_mask,
-        attempted_dts,
-        next_dts,
-        next_recent_reject_count,
-        next_regrowth_cooldown,
-        next_easy_growth_streak,
-        next_lagged_response_valid,
+        realized_schedule.active_mask,
+        realized_schedule.attempted_dts,
+        realized_schedule.next_dts,
+        realized_schedule.next_recent_reject_count,
+        realized_schedule.next_regrowth_cooldown,
+        realized_schedule.next_easy_growth_streak,
+        realized_schedule.next_lagged_response_valid,
         segment_length=checkpoint_interval,
     )
     segmented_full_active_mask, _ = _radau_segment_schedule_array(
