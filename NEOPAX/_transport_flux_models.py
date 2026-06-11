@@ -1684,6 +1684,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
             sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
             epsi_hat_a = sign * jnp.maximum(jnp.abs(jnp.asarray(epsi_hat_a, dtype=jnp.float64)), er_v_floor)
+        if _ntx_local_pullback_finite_debug_enabled():
+            def _local_scan_debug_callback(
+                species_index_value,
+                drds_value_in,
+                er_value_in,
+                temperature_local_in,
+                density_local_in,
+                vthermal_local_in,
+                vth_a_in,
+                v_new_a_in,
+                epsi_hat_a_in,
+            ):
+                epsi_arr = np.asarray(epsi_hat_a_in)
+                if np.issubdtype(epsi_arr.dtype, np.inexact) and not np.all(np.isfinite(epsi_arr)):
+                    print(
+                        "[autodiff-gate] ntx-local-scan-nonfinite "
+                        f"species_index={int(np.asarray(species_index_value))} "
+                        f"drds={np.asarray(drds_value_in)} "
+                        f"er={np.asarray(er_value_in)} "
+                        f"temperature_local={np.asarray(temperature_local_in)} "
+                        f"density_local={np.asarray(density_local_in)} "
+                        f"vthermal_local={np.asarray(vthermal_local_in)} "
+                        f"vth_a={np.asarray(vth_a_in)} "
+                        f"v_new_a={np.asarray(v_new_a_in)} "
+                        f"epsi_hat={epsi_arr}"
+                    )
+
+            jax.debug.callback(
+                _local_scan_debug_callback,
+                jnp.asarray(species_index, dtype=jnp.int32),
+                drds_value,
+                er_value,
+                temperature_local,
+                density_local,
+                vthermal_local,
+                vth_a,
+                v_new_a,
+                epsi_hat_a,
+                ordered=True,
+            )
         nu_hat_a = _nu_over_vnew_local(
             self.species,
             species_index,
