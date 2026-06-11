@@ -1679,22 +1679,28 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         v_new_a = self.energy_grid.v_norm * vth_a
         # Feed the exact NTX runtime with the same field convention used by the
         # file/database benchmarks: epsi_hat = Es / v_new, with Es = Er * dr/ds.
-        # Preserve the physical zero-field limit at the magnetic axis: some
-        # geometries expose `drds = inf` there, and the forward accepted-step
-        # contract regularizes the axis instead of relying on the raw local
-        # product. Reverse may still touch this local primitive while
-        # reconstructing reduced payloads, so explicitly map `Er = 0` to
-        # `Es = 0` rather than letting `0 * inf` produce NaNs.
+        # Preserve the forward regularized-axis philosophy here as well:
+        # raw centerline `drds` entries may be singular (`inf`), but forward
+        # regularizes the axis from neighboring radii instead of treating this
+        # singular local primitive as a physical NTX input. Reverse/replay can
+        # still touch the local primitive transiently, so force the raw
+        # singular lane to contribute zero Es instead of injecting `nan/inf`
+        # into `epsi_hat`.
+        drds_is_finite = jnp.isfinite(drds_value)
         er_times_drds = jnp.where(
-            jnp.asarray(er_value == 0.0, dtype=jnp.bool_),
-            jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+            drds_is_finite,
             jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+            jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
         )
         epsi_hat_a = er_times_drds * 1.0e3 / v_new_a
         if self.er_v_floor is not None:
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
             sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
-            epsi_hat_a = sign * jnp.maximum(jnp.abs(jnp.asarray(epsi_hat_a, dtype=jnp.float64)), er_v_floor)
+            epsi_hat_a = jnp.where(
+                drds_is_finite,
+                sign * jnp.maximum(jnp.abs(jnp.asarray(epsi_hat_a, dtype=jnp.float64)), er_v_floor),
+                jnp.asarray(0.0, dtype=jnp.float64),
+            )
         if _ntx_local_pullback_finite_debug_enabled():
             def _local_scan_debug_callback(
                 species_index_value,
