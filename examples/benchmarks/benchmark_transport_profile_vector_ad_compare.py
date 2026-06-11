@@ -19,13 +19,16 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
+    _adaptive_rollout_diagnostics,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _baseline_profile_cfg,
+    _prepare_realized_schedule_profile_vector_rollout_option_a,
     _prepare_benchmark_config,
     _host_step_pullback_diagnostic_enabled,
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
+from NEOPAX._transport_solvers import _radau_adaptive_final_state_rollout  # noqa: E402
 
 
 def _report_path() -> Path:
@@ -70,6 +73,16 @@ def _print_summary(report: dict[str, Any]) -> None:
         "[autodiff-gate] "
         f"mode=profile_vector_ad_compare parameters={list(report['parameter_names'])}"
     )
+    rollout_diag = report.get("adaptive_rollout_baseline")
+    if isinstance(rollout_diag, dict):
+        print(
+            "[autodiff-gate] rollout baseline: "
+            f"attempt_count={rollout_diag.get('attempt_count')} "
+            f"accepted_count={rollout_diag.get('accepted_count')} "
+            f"completed={rollout_diag.get('completed')} "
+            f"failed={rollout_diag.get('failed')} "
+            f"fail_code={rollout_diag.get('fail_code')}"
+        )
     print("[autodiff-gate] max relative error by parameter:")
     for name, value in zip(report["parameter_names"], report["parameter_max_relative_error"]):
         print(f"  - {name}: max_rel_err={float(value):.6e}")
@@ -144,6 +157,23 @@ def main() -> None:
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_vector = jnp.asarray([float(profile_cfg[name]) for name in parameter_names], dtype=jnp.float64)
+    execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
+        _prepare_realized_schedule_profile_vector_rollout_option_a(
+            baseline_vector,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=parameter_names,
+        )
+    )
+    baseline_rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
 
     if _host_step_pullback_diagnostic_enabled():
         diagnostic = _run_host_local_step_pullback_diagnostic_for_parameter_vector(
@@ -210,6 +240,7 @@ def main() -> None:
         "ad_mode": str(args.ad_mode),
         "parameter_names": list(parameter_names),
         "baseline_values": np.asarray(jax.device_get(baseline_vector), dtype=float).tolist(),
+        "adaptive_rollout_baseline": baseline_diag,
         "objective_indices": list(objective_indices),
         "objective_labels": [OBJECTIVE_LABELS[i] for i in objective_indices],
         "jacobian_forward": None if jac_fwd is None else jac_fwd.tolist(),

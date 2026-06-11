@@ -33,6 +33,17 @@ Additional temporary rule for this refactor:
 - do not change the current forward AD path unless explicitly approved later
 - use forward AD as the numerical reference that reverse must match
 
+Additional structural guideline after debugging:
+
+- once reverse gradients are numerically correct against the current custom
+  adaptive forward AD reference, the reverse chain itself should be made JAX
+  native
+- in particular, the final reverse rollout/controller should not remain a
+  Python-host step-by-step dispatcher if the equivalent forward accepted-step
+  composition is already expressed as JAX-native control flow
+- temporary host-driven reverse orchestration is acceptable for debugging and
+  localization only; it is not the desired end-state architecture
+
 ## Why This Refactor Is Needed
 
 The current reverse path is still hybrid:
