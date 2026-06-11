@@ -338,6 +338,8 @@ def _select_objectives(values, objective_indices: tuple[int, ...] | None):
 
 @dataclasses.dataclass(frozen=True)
 class _PreparedReverseSegment:
+    start_idx: int
+    end_idx: int
     reversed_dynamic_values: tuple[object, ...]
     lagged_valids: tuple[bool, ...]
     reuse_fn: object
@@ -436,6 +438,7 @@ def _compute_reverse_candidate(
     execution_mode: str,
     segment_length: int,
     objective_indices: tuple[int, ...] | None,
+    stop_on_first_nonfinite: bool,
 ):
     execution_context = prefix_context["execution_context"]
     prepared_rollout = prefix_context["prepared_rollout"]
@@ -607,6 +610,8 @@ def _compute_reverse_candidate(
         )
         prepared_segments.append(
             _PreparedReverseSegment(
+                start_idx=start_idx,
+                end_idx=end_idx,
                 reversed_dynamic_values=reversed_dynamic_values,
                 lagged_valids=lagged_valids,
                 reuse_fn=reuse_fn,
@@ -620,6 +625,7 @@ def _compute_reverse_candidate(
     reverse_start_s = time.perf_counter()
     objective_count = int(objective_values.shape[0])
     first_nonfinite_debug = None
+    stop_triggered = False
     for objective_index in range(objective_count):
         basis = _objective_basis(objective_count, objective_index, objective_values.dtype)
         (final_y_bar,) = final_y_pullback(basis)
@@ -632,17 +638,47 @@ def _compute_reverse_candidate(
             final_output_bar,
             initial_carry,
         )
-        for prepared_segment in reversed(prepared_segments):
+        active_objective_label = selected_objective_labels[objective_index]
+        for reverse_segment_index, prepared_segment in enumerate(reversed(prepared_segments)):
             for step_idx, lagged_valid in enumerate(prepared_segment.lagged_valids):
                 dynamic_values = tuple(
                     jax.tree_util.tree_map(lambda x, idx=step_idx: x[idx], value)
                     for value in prepared_segment.reversed_dynamic_values
                 )
-                carry_bar = (
+                branch_name = "reuse" if lagged_valid else "rebuild"
+                next_carry_bar = (
                     prepared_segment.reuse_fn(dynamic_values, carry_bar)
                     if lagged_valid
                     else prepared_segment.rebuild_fn(dynamic_values, carry_bar)
                 )
+                if stop_on_first_nonfinite and first_nonfinite_debug is None:
+                    next_carry_bar_stats = _tree_finite_stats(next_carry_bar)
+                    if not next_carry_bar_stats["all_finite"]:
+                        global_accepted_index = prepared_segment.end_idx - 1 - step_idx
+                        first_nonfinite_debug = {
+                            "objective_index": int(objective_index),
+                            "objective_label": active_objective_label,
+                            "reverse_segment_index": int(reverse_segment_index),
+                            "segment_start_idx": int(prepared_segment.start_idx),
+                            "segment_end_idx": int(prepared_segment.end_idx),
+                            "step_index_within_reversed_segment": int(step_idx),
+                            "global_accepted_index": int(global_accepted_index),
+                            "branch": branch_name,
+                            "incoming_carry_bar_stats": _tree_finite_stats(carry_bar),
+                            "next_carry_bar_stats": next_carry_bar_stats,
+                        }
+                        carry_bar = next_carry_bar
+                        stop_triggered = True
+                        break
+                carry_bar = next_carry_bar
+            if stop_triggered:
+                break
+        if stop_triggered:
+            call_elapsed_s = time.perf_counter() - call_start_s
+            if compile_plus_execute_s is None:
+                compile_plus_execute_s = call_elapsed_s
+            jacobian_rows.append(jnp.full_like(baseline_vector, jnp.nan))
+            break
         jax.block_until_ready(carry_bar.y)
         call_elapsed_s = time.perf_counter() - call_start_s
         if compile_plus_execute_s is None:
@@ -674,6 +710,8 @@ def _compute_reverse_candidate(
                     "parameter_bar_stats": parameter_bar_stats,
                 }
         jacobian_rows.append(parameter_bar)
+    while len(jacobian_rows) < objective_count:
+        jacobian_rows.append(jnp.full_like(baseline_vector, jnp.nan))
     total_reverse_s = time.perf_counter() - reverse_start_s
     jacobian = jnp.stack(jacobian_rows, axis=0)
     jax.block_until_ready(jacobian)
@@ -775,6 +813,11 @@ def main() -> None:
         default=8,
         help="Cap solver max_steps for each accepted-step prefix to accepted_step_limit * multiplier. Default: 8.",
     )
+    parser.add_argument(
+        "--stop-on-first-nonfinite",
+        action="store_true",
+        help="Debug mode: stop the reverse sweep when a nonfinite carry appears and report the first failing reverse step.",
+    )
     args = parser.parse_args()
 
     parameter_names = _parse_parameter_subset(args.parameters)
@@ -830,6 +873,7 @@ def main() -> None:
             execution_mode=args.reverse_execution_mode,
             segment_length=args.segment_length,
             objective_indices=objective_indices,
+            stop_on_first_nonfinite=bool(args.stop_on_first_nonfinite),
         )
 
         reverse_objectives_np = np.asarray(jax.device_get(reverse_result["objective_values"]), dtype=float)
@@ -888,6 +932,7 @@ def main() -> None:
         "reverse_execution_mode": args.reverse_execution_mode,
         "segment_length": int(args.segment_length),
         "max_total_steps_multiplier": int(args.max_total_steps_multiplier),
+        "stop_on_first_nonfinite": bool(args.stop_on_first_nonfinite),
         "prefixes": prefixes,
     }
 
@@ -902,7 +947,8 @@ def main() -> None:
         f"comparison_mode={args.comparison_mode} "
         f"reverse_execution_mode={args.reverse_execution_mode} "
         f"segment_length={int(args.segment_length)} "
-        f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)}"
+        f"max_total_steps_multiplier={int(args.max_total_steps_multiplier)} "
+        f"stop_on_first_nonfinite={bool(args.stop_on_first_nonfinite)}"
     )
     for prefix in prefixes:
         print(
@@ -922,10 +968,22 @@ def main() -> None:
             print(
                 "    first_nonfinite_debug "
                 f"objective={first_nonfinite_debug.get('objective_label')} "
-                f"carry_all_finite={first_nonfinite_debug.get('carry_bar_stats', {}).get('all_finite')} "
+                f"carry_all_finite={first_nonfinite_debug.get('carry_bar_stats', {}).get('all_finite', first_nonfinite_debug.get('incoming_carry_bar_stats', {}).get('all_finite'))} "
                 f"flat_state_all_finite={first_nonfinite_debug.get('flat_state_bar_stats', {}).get('all_finite')} "
                 f"parameter_all_finite={first_nonfinite_debug.get('parameter_bar_stats', {}).get('all_finite')}"
             )
+            if "global_accepted_index" in first_nonfinite_debug:
+                print(
+                    "    first_nonfinite_step "
+                    f"global_accepted_index={first_nonfinite_debug.get('global_accepted_index')} "
+                    f"reverse_segment_index={first_nonfinite_debug.get('reverse_segment_index')} "
+                    f"segment_start_idx={first_nonfinite_debug.get('segment_start_idx')} "
+                    f"segment_end_idx={first_nonfinite_debug.get('segment_end_idx')} "
+                    f"step_index_within_reversed_segment={first_nonfinite_debug.get('step_index_within_reversed_segment')} "
+                    f"branch={first_nonfinite_debug.get('branch')} "
+                    f"incoming_all_finite={first_nonfinite_debug.get('incoming_carry_bar_stats', {}).get('all_finite')} "
+                    f"next_all_finite={first_nonfinite_debug.get('next_carry_bar_stats', {}).get('all_finite')}"
+                )
         reverse_jacobian = np.asarray(prefix["reverse_jacobian"], dtype=float)
         for objective_index, objective_label in enumerate(objective_labels[: int(reverse_jacobian.shape[0])]):
             row = reverse_jacobian[objective_index]
