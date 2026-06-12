@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BENCHMARK_VERSION_TAG = "profile_vector_ad_compare_v2026_06_12_forward_rollout_diag"
+BENCHMARK_VERSION_TAG = "profile_vector_ad_compare_v2026_06_12_vector_only_forward"
 
 from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
@@ -23,8 +23,6 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     PROFILE_VECTOR_PARAMETERS,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
-    _adaptive_rollout_final_state_for_parameter,
-    _adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _host_step_pullback_diagnostic_enabled,
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
@@ -163,38 +161,15 @@ def main() -> None:
             print(f"  {key}: {float(value):.6e}" if np.asarray(jax.device_get(value)).shape == () else f"  {key}: {np.asarray(jax.device_get(value)).tolist()}", flush=True)
         return
 
-    if len(parameter_names) == 1:
-        parameter_name_single = parameter_names[0]
-        baseline_parameter_value = jnp.asarray(float(baseline_vector[0]), dtype=jnp.float64)
-        objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name_single,
-            derivative_mode="jvp",
-        )
-        _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
-            baseline_parameter_value,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name_single,
-            use_realized_schedule_jvp=True,
-        )
-    else:
-        objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            derivative_mode="jvp",
-        )
-        baseline_rollout = None
+    objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_names=parameter_names,
+        derivative_mode="jvp",
+    )
     jac_fwd = None
     jac_rev = None
     n_params = len(parameter_names)
@@ -203,20 +178,13 @@ def main() -> None:
         print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
         fwd_columns = []
         for idx in range(n_params):
-            if len(parameter_names) == 1:
-                _, tangent = jax.jvp(
-                    objective_fn_jvp,
-                    (jnp.asarray(float(baseline_vector[0]), dtype=jnp.float64),),
-                    (jnp.asarray(1.0, dtype=jnp.float64),),
-                )
-            else:
-                basis = np.zeros(n_params, dtype=float)
-                basis[idx] = 1.0
-                _, tangent = jax.jvp(
-                    objective_fn_jvp,
-                    (baseline_vector,),
-                    (jnp.asarray(basis, dtype=jnp.float64),),
-                )
+            basis = np.zeros(n_params, dtype=float)
+            basis[idx] = 1.0
+            _, tangent = jax.jvp(
+                objective_fn_jvp,
+                (baseline_vector,),
+                (jnp.asarray(basis, dtype=jnp.float64),),
+            )
             tangent_arr = np.asarray(jax.device_get(tangent), dtype=float)
             tangent_arr = tangent_arr[np.asarray(objective_indices, dtype=int)]
             fwd_columns.append(tangent_arr)
@@ -270,14 +238,6 @@ def main() -> None:
     elif jac_fwd is not None:
         print("[autodiff-gate] mode=profile_vector_ad_compare forward-only", flush=True)
         print(f"[autodiff-gate] benchmark_version={BENCHMARK_VERSION_TAG}", flush=True)
-        if baseline_rollout is not None:
-            print(
-                "[autodiff-gate] "
-                f"rollout attempt_count={int(np.asarray(jax.device_get(baseline_rollout.attempt_count)))} "
-                f"accepted_count={int(np.asarray(jax.device_get(baseline_rollout.accepted_count)))} "
-                f"max_total_steps={int(np.asarray(jax.device_get(baseline_rollout.trace.active_mask)).shape[0])}",
-                flush=True,
-            )
         print("[autodiff-gate] forward Jacobian columns:")
         for metric_index, label in enumerate(report["objective_labels"]):
             print(f"  - {label}:")
