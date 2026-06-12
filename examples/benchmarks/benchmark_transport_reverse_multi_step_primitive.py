@@ -46,7 +46,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_forward_like_cache_no_stage_cotangent_from_reduced_output_bar,
     _radau_forward_like_cotangent_from_reduced_output_bar,
     _radau_forward_like_no_stage_cotangent_from_reduced_output_bar,
-    _radau_replay_realized_accepted_rollout,
+    _radau_replay_realized_accepted_attempt_rollout,
 )
 
 
@@ -596,7 +596,7 @@ def _compute_multi_step_metrics(
         growth_streak_slice,
         lagged_valid_slice,
     ):
-        replay = _radau_replay_realized_accepted_rollout(
+        replay = _radau_replay_realized_accepted_attempt_rollout(
             execution_context,
             carry_start,
             accepted_active_mask,

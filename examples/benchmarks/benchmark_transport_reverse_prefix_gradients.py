@@ -46,7 +46,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_contract_reduced_output_bar,
     _radau_forward_like_cache_no_stage_cotangent_from_reduced_output_bar,
     _radau_reduced_output_from_carry,
-    _radau_replay_realized_accepted_rollout,
+    _radau_replay_realized_accepted_attempt_rollout,
     _make_solver_state_transform,
 )
 
@@ -395,7 +395,7 @@ def _compute_forward_reference(
             species=runtime.species,
             prepared_rollout_static=prepared_rollout,
         )
-        replay = _radau_replay_realized_accepted_rollout(
+        replay = _radau_replay_realized_accepted_attempt_rollout(
             execution_context,
             carry0,
             accepted_active_mask,

@@ -8041,7 +8041,7 @@ def _radau_replay_realized_attempt_final_carry(
     return final_carry
 
 
-def _radau_replay_realized_accepted_rollout(
+def _radau_replay_realized_accepted_attempt_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
     accepted_active_mask,
@@ -10542,15 +10542,11 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
 
     def _replay(carry_value):
         replay = _radau_replay_realized_accepted_rollout(
-            execution_context,
+            execution_context.kernel_context,
+            execution_context.physics_context,
             carry_value,
             realized_schedule.active_mask,
             realized_schedule.attempted_dts,
-            realized_schedule.next_dts,
-            realized_schedule.next_recent_reject_count,
-            realized_schedule.next_regrowth_cooldown,
-            realized_schedule.next_easy_growth_streak,
-            realized_schedule.next_lagged_response_valid,
         )
         return replay.final_carry.y
 
