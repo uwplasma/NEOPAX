@@ -23,7 +23,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     PROFILE_VECTOR_PARAMETERS,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
-    _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
+    _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
     _host_step_pullback_diagnostic_enabled,
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
 )
@@ -161,7 +161,7 @@ def main() -> None:
             print(f"  {key}: {float(value):.6e}" if np.asarray(jax.device_get(value)).shape == () else f"  {key}: {np.asarray(jax.device_get(value)).tolist()}", flush=True)
         return
 
-    objective_fn_jvp = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
+    objective_fn_jvp = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(  # noqa: E731
         p,
         config=config,
         runtime=runtime,

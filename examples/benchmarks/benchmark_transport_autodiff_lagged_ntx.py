@@ -60,6 +60,8 @@ from NEOPAX._transport_solvers import (
     _radau_adaptive_payload_trace_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
+    _radau_forward_adaptive_final_state_rollout,
+    _radau_forward_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
     _radau_carry_with_forward_only_jvp_fields,
@@ -452,6 +454,143 @@ def _adaptive_rollout_final_state_for_parameter(
     return final_state, rollout
 
 
+def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    use_realized_schedule_jvp: bool = False,
+    accepted_step_limit_override: int | None = None,
+    use_schedule_trace_only: bool = False,
+    use_payload_trace: bool = False,
+):
+    """Forward-benchmark-owned adaptive rollout helper.
+
+    Keep the forward benchmark lane structurally independent from reverse
+    benchmark plumbing, even where the current implementation details happen to
+    match.
+    """
+
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    if use_realized_schedule_jvp:
+        state0_static = _parameterized_initial_state(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_name=parameter_name,
+            parameter_value=jax.lax.stop_gradient(parameter_value),
+        )
+        prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+        solver = prepared_components_static["solver"]
+        solve_vector_field_static = prepared_components_static["solve_vector_field"]
+        prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0_static,
+            vector_field=solve_vector_field_static,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout_static,
+        )
+        initial_carry = _initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state0,
+            solve_vector_field=solve_vector_field_static,
+            species=runtime.species,
+            prepared_rollout_static=prepared_rollout_static,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
+        final_y = _radau_forward_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+        final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
+        if use_payload_trace:
+            rollout = _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        elif use_schedule_trace_only:
+            rollout = _radau_adaptive_schedule_rollout(
+                execution_context,
+                initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        else:
+            rollout = _radau_forward_adaptive_final_state_rollout(
+                execution_context,
+                initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+    else:
+        prepared_components = prepare_transport_solver_components(config, runtime, state0)
+        solver = prepared_components["solver"]
+        solve_vector_field = prepared_components["solve_vector_field"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0,
+            vector_field=solve_vector_field,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
+        rollout = (
+            _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_payload_trace
+            else _radau_adaptive_schedule_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_schedule_trace_only
+            else _radau_forward_adaptive_final_state_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return final_state, rollout
+
+
 def _adaptive_rollout_objectives_for_parameter(
     parameter_value,
     *,
@@ -531,7 +670,81 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
     )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
-        final_y = _radau_adaptive_final_y_realized_schedule(
+        final_y = _radau_forward_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    elif derivative_mode_key == "vjp":
+        final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    else:
+        raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
+    final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
+def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+    derivative_mode: str = "jvp",
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(parameter_value),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    initial_carry = _initial_carry_from_state_with_static_setup(
+        solver=solver,
+        state=state0,
+        solve_vector_field=solve_vector_field_static,
+        species=runtime.species,
+        prepared_rollout_static=prepared_rollout_static,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    derivative_mode_key = str(derivative_mode).strip().lower()
+    if derivative_mode_key == "jvp":
+        final_y = _radau_forward_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
@@ -648,6 +861,70 @@ def _prepare_realized_schedule_profile_vector_rollout_option_a(
         state=state0,
         solver=solver,
         solve_vector_field=solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=prepared_rollout_static,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    return (
+        execution_context,
+        prepared_rollout_static,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        solver,
+        solve_vector_field_static,
+    )
+
+
+def _forward_benchmark_prepare_realized_schedule_profile_vector_rollout(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+    accepted_step_limit_override: int | None = None,
+):
+    parameter_values = jnp.asarray(parameter_values, dtype=jnp.float64)
+    state0 = _parameterized_initial_state_multi(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_names=parameter_names,
+        parameter_values=parameter_values,
+    )
+    state0_static = _parameterized_initial_state_multi(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_names=parameter_names,
+        parameter_values=jax.lax.stop_gradient(parameter_values),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    initial_carry = _initial_carry_from_state_with_static_setup(
+        state=state0,
+        solver=solver,
+        solve_vector_field=solve_vector_field_static,
         species=runtime.species,
         prepared_rollout_static=prepared_rollout_static,
     )
@@ -927,7 +1204,56 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
-        final_y = _radau_adaptive_final_y_realized_schedule(
+        final_y = _radau_forward_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    elif derivative_mode_key == "vjp":
+        final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    else:
+        raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
+def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
+    accepted_step_limit_override: int | None = None,
+    derivative_mode: str = "jvp",
+):
+    (
+        execution_context,
+        prepared_rollout,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        _solver,
+        _solve_vector_field,
+    ) = _forward_benchmark_prepare_realized_schedule_profile_vector_rollout(
+        parameter_values,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_names=parameter_names,
+        accepted_step_limit_override=accepted_step_limit_override,
+    )
+    derivative_mode_key = str(derivative_mode).strip().lower()
+    if derivative_mode_key == "jvp":
+        final_y = _radau_forward_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
@@ -979,7 +1305,7 @@ def _adaptive_rollout_objectives_for_parameter_vector_forward(
     )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_forward_adaptive_final_state_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
@@ -990,6 +1316,47 @@ def _adaptive_rollout_objectives_for_parameter_vector_forward(
 
 
 def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    frozen_trace,
+    replay_mode: str = "attempt",
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    replay = _radau_run_prepared_on_realized_trace(
+        prepared_rollout,
+        execution_context,
+        frozen_trace,
+        replay_mode=replay_mode,
+    )
+    return _objective_vector(replay["final_state"], runtime), replay
+
+
+def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     parameter_value,
     *,
     config: dict[str, Any],

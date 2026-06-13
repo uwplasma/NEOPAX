@@ -4780,6 +4780,32 @@ Latest transport reverse status for next session
   - the next move should be instrumentation of the remaining replay-state
     leaves, not another broad structural rewrite
 
+Forward/reverse lane separation guideline
+
+- The transport forward benchmark lane and the transport reverse lane should be
+  treated as **independent implementations**.
+- If keeping them independent requires duplicating replay or carry-construction
+  helpers, that is preferred over sharing one helper that can silently change
+  the benchmarked forward behavior.
+- In particular:
+  - forward benchmark helpers should preserve the historical forward contract
+  - reverse helpers may evolve independently for memory/debugging needs
+  - reverse-lane edits should not modify the forward benchmark lane unless the
+    forward benchmark is explicitly being revalidated and updated
+
+History boundary identified for the forward lane
+
+- On branch `en/auto_diff`, commit
+  `e888c02ba85b6ad790730d6c4e66d0bbd77f1cee` is the last checked commit where
+  `NEOPAX/_transport_solvers.py` did not yet contain the reverse markers used
+  in the current debugging work.
+- Commit `412dfae7f552bd5ee51357acbb51d8506cd26ea1` is the first checked commit
+  where the reverse replay helper marker
+  `_radau_replay_realized_attempt_rollout` appears.
+- So when restoring or auditing the forward benchmark lane, use the code state
+  at or before `e888c02ba85b6ad790730d6c4e66d0bbd77f1cee` as the clean
+  pre-reverse reference point.
+
 Latest follow-up: Boozer-based QI / Maximum-J gate
 
 - A new geometry benchmark mode has been added:

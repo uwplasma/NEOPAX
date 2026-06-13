@@ -19,11 +19,11 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     _adaptive_rollout_diagnostics,
-    _adaptive_rollout_final_state_for_parameter,
-    _adaptive_rollout_objectives_for_parameter_on_frozen_trace,
-    _adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _baseline_profile_cfg,
     _fd_step,
+    _forward_benchmark_adaptive_rollout_final_state_for_parameter,
+    _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace,
+    _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _prepare_benchmark_config,
     _truncate_rollout_trace_by_accepted_steps,
 )
@@ -101,9 +101,9 @@ def main() -> None:
     parser.add_argument(
         "--replay-mode",
         type=str,
-        default="accepted",
+        default="attempt",
         choices=("attempt", "accepted"),
-        help="Frozen replay mode used for FD. 'accepted' matches the forward custom-JVP contract.",
+        help="Frozen replay mode used for FD. 'attempt' matches the legacy forward benchmark contract.",
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")
     parser.add_argument(
@@ -135,15 +135,15 @@ def main() -> None:
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
-    if str(args.adaptive_derivative_mode).strip().lower() == "jvp" and str(args.replay_mode).strip().lower() != "accepted":
+    if str(args.adaptive_derivative_mode).strip().lower() == "jvp" and str(args.replay_mode).strip().lower() != "attempt":
         print(
-            "[autodiff-gate] warning: forward custom-JVP differentiates the realized accepted-step map; "
-            f"replay_mode={args.replay_mode} is not the matching frozen-FD contract",
+            "[autodiff-gate] warning: legacy forward custom-JVP replays accepted attempts with controller/cache metadata; "
+            f"replay_mode={args.replay_mode} is not the historical matching frozen-FD contract",
             flush=True,
         )
 
     print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
-    _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
+    _, baseline_rollout = _forward_benchmark_adaptive_rollout_final_state_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
@@ -159,7 +159,7 @@ def main() -> None:
         args.accepted_step_limit,
     )
 
-    objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+    objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
         p,
         config=config,
         runtime=runtime,
@@ -183,7 +183,7 @@ def main() -> None:
     plus_value = baseline_value + fd_step
 
     print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
-    objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+    objectives_minus, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         jnp.asarray(minus_value),
         config=config,
         runtime=runtime,
@@ -194,7 +194,7 @@ def main() -> None:
         replay_mode=args.replay_mode,
     )
     print(f"[autodiff-gate] progress: running frozen fd_plus replay ({args.replay_mode})", flush=True)
-    objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+    objectives_plus, plus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         jnp.asarray(plus_value),
         config=config,
         runtime=runtime,
