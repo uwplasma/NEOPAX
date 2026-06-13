@@ -516,13 +516,12 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
+    initial_carry = _initial_carry_from_state_with_static_setup(
         solver=solver,
         state=state0,
-        vector_field=solve_vector_field,
+        solve_vector_field=solve_vector_field_static,
         species=runtime.species,
+        prepared_rollout_static=prepared_rollout_static,
     )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = (
@@ -536,18 +535,18 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     elif derivative_mode_key == "vjp":
         final_y = _radau_adaptive_final_y_realized_schedule_vjp(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     else:
         raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
-    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 
 
@@ -909,32 +908,22 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
         parameter_names=parameter_names,
         parameter_values=jax.lax.stop_gradient(parameter_values),
     )
-    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
-    solver = prepared_components_static["solver"]
-    solve_vector_field_static = prepared_components_static["solve_vector_field"]
-    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
-        solver=solver,
-        state=state0_static,
-        vector_field=solve_vector_field_static,
-        species=runtime.species,
-    )
-    execution_context = _build_prepared_radau_execution_context(
-        solver=solver,
-        prepared_rollout=prepared_rollout_static,
-    )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
-        solver=solver,
-        state=state0,
-        vector_field=solve_vector_field,
-        species=runtime.species,
-    )
-    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-    stop_after_accepted_steps = (
-        int(accepted_step_limit_override)
-        if accepted_step_limit_override is not None
-        else getattr(solver, "stop_after_accepted_steps", None)
+    (
+        execution_context,
+        prepared_rollout,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        _solver,
+        _solve_vector_field,
+    ) = _prepare_realized_schedule_profile_vector_rollout_option_a(
+        parameter_values,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_names=parameter_names,
+        accepted_step_limit_override=accepted_step_limit_override,
     )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
@@ -942,14 +931,14 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     elif derivative_mode_key == "vjp":
         final_y = _radau_adaptive_final_y_realized_schedule_vjp(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     else:
         raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")

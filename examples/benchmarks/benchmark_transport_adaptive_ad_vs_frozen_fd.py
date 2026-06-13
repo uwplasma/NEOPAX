@@ -101,9 +101,9 @@ def main() -> None:
     parser.add_argument(
         "--replay-mode",
         type=str,
-        default="attempt",
+        default="accepted",
         choices=("attempt", "accepted"),
-        help="Frozen replay mode used for FD.",
+        help="Frozen replay mode used for FD. 'accepted' matches the forward custom-JVP contract.",
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override passed to config preparation.")
     parser.add_argument(
@@ -135,6 +135,12 @@ def main() -> None:
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+    if str(args.adaptive_derivative_mode).strip().lower() == "jvp" and str(args.replay_mode).strip().lower() != "accepted":
+        print(
+            "[autodiff-gate] warning: forward custom-JVP differentiates the realized accepted-step map; "
+            f"replay_mode={args.replay_mode} is not the matching frozen-FD contract",
+            flush=True,
+        )
 
     print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
     _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
