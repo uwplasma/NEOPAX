@@ -2739,7 +2739,7 @@ def _adaptive_rollout_nan_debug_for_parameter(
     )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = getattr(solver, "stop_after_accepted_steps", None)
-    rollout = _radau_adaptive_payload_trace_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
