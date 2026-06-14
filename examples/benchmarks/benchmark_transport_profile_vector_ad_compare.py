@@ -22,6 +22,10 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
     _adaptive_rollout_nan_debug_for_parameter,
+    _build_prepared_radau_accepted_rollout,
+    _build_prepared_radau_execution_context,
+    _forward_benchmark_prepare_realized_schedule_profile_vector_rollout,
+    _objective_vector,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
@@ -29,6 +33,8 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _run_host_local_step_pullback_diagnostic_for_parameter_vector,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
+from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
+from NEOPAX._transport_solvers import _radau_forward_adaptive_final_y_realized_schedule  # noqa: E402
 
 
 def _report_path() -> Path:
@@ -90,6 +96,91 @@ def _print_summary(report: dict[str, Any]) -> None:
             )
 
 
+def _tree_all_finite(tree) -> bool:
+    for leaf in jax.tree_util.tree_leaves(tree):
+        arr = np.asarray(jax.device_get(leaf))
+        if np.issubdtype(arr.dtype, np.inexact) and not np.all(np.isfinite(arr)):
+            return False
+    return True
+
+
+def _forward_objective_stage_debug(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+) -> dict[str, Any]:
+    parameter_values = jnp.asarray([parameter_value], dtype=jnp.float64)
+    (
+        execution_context,
+        prepared_rollout,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        _solver,
+        _solve_vector_field,
+    ) = _forward_benchmark_prepare_realized_schedule_profile_vector_rollout(
+        parameter_values,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_names=(parameter_name,),
+    )
+
+    def _final_y_from_param_vector(pvec):
+        (
+            exec_ctx,
+            prepared_rollout_local,
+            initial_carry_local,
+            max_steps_local,
+            stop_after_local,
+            _solver_local,
+            _svf_local,
+        ) = _forward_benchmark_prepare_realized_schedule_profile_vector_rollout(
+            pvec,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_names=(parameter_name,),
+        )
+        return _radau_forward_adaptive_final_y_realized_schedule(
+            exec_ctx,
+            max_steps_local,
+            stop_after_local,
+            initial_carry_local,
+        )
+
+    baseline_vec = parameter_values
+    basis = jnp.asarray([1.0], dtype=jnp.float64)
+    final_y, final_y_dot = jax.jvp(_final_y_from_param_vector, (baseline_vec,), (basis,))
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    final_state_dot = jax.jvp(
+        prepared_rollout.physics_context.unpack_flat,
+        (final_y,),
+        (final_y_dot,),
+    )[1]
+    objective_primal, objective_tangent = jax.jvp(
+        lambda flat_y: _objective_vector(prepared_rollout.physics_context.unpack_flat(flat_y), runtime),
+        (final_y,),
+        (final_y_dot,),
+    )
+    return {
+        "final_y_all_finite": _tree_all_finite(final_y),
+        "final_y_dot_all_finite": _tree_all_finite(final_y_dot),
+        "final_state_all_finite": _tree_all_finite(final_state),
+        "final_state_dot_all_finite": _tree_all_finite(final_state_dot),
+        "objective_primal_all_finite": bool(np.all(np.isfinite(np.asarray(jax.device_get(objective_primal), dtype=float)))),
+        "objective_tangent_all_finite": bool(np.all(np.isfinite(np.asarray(jax.device_get(objective_tangent), dtype=float)))),
+        "objective_primal": np.asarray(jax.device_get(objective_primal), dtype=float).tolist(),
+        "objective_tangent": np.asarray(jax.device_get(objective_tangent), dtype=float).tolist(),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare multi-parameter forward custom-JVP columns against a reverse Jacobian."
@@ -128,6 +219,11 @@ def main() -> None:
         "--forward-nan-debug",
         action="store_true",
         help="If the forward Jacobian column is nonfinite, run accepted-step NaN localization for single-parameter runs.",
+    )
+    parser.add_argument(
+        "--forward-stage-debug",
+        action="store_true",
+        help="If the forward Jacobian column is nonfinite, report whether nonfinites appear in final_y, unpacked state, or objective mapping.",
     )
     args = parser.parse_args()
     if args.ad_mode in ("both", "reverse"):
@@ -184,6 +280,7 @@ def main() -> None:
         print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
         fwd_columns = []
         forward_nan_debug = {}
+        forward_stage_debug = {}
         for idx in range(n_params):
             basis = np.zeros(n_params, dtype=float)
             basis[idx] = 1.0
@@ -214,6 +311,25 @@ def main() -> None:
                     parameter_name=parameter_name,
                     debug_mode="minimal",
                     include_one_step_compare=False,
+                )
+            if (
+                args.forward_stage_debug
+                and not np.all(np.isfinite(tangent_arr))
+                and n_params == 1
+            ):
+                parameter_name = parameter_names[idx]
+                print(
+                    "[autodiff-gate] forward-stage-debug progress: checking final_y/state/objective finiteness "
+                    f"for parameter={parameter_name}",
+                    flush=True,
+                )
+                forward_stage_debug[parameter_name] = _forward_objective_stage_debug(
+                    baseline_vector[idx],
+                    config=config,
+                    runtime=runtime,
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    parameter_name=parameter_name,
                 )
             fwd_columns.append(tangent_arr)
         jac_fwd = np.stack(fwd_columns, axis=1)
@@ -251,6 +367,7 @@ def main() -> None:
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "reverse_replay_device": str(args.reverse_replay_device),
         "forward_nan_debug": forward_nan_debug if jac_fwd is not None else None,
+        "forward_stage_debug": forward_stage_debug if jac_fwd is not None else None,
         "passed": passed,
     }
 
@@ -281,6 +398,18 @@ def main() -> None:
                     f"first_bad_was_accepted={debug.get('first_bad_was_accepted')} "
                     f"first_bad_dt={debug.get('first_bad_dt')} "
                     f"final_tangent_finite={debug.get('final_tangent_finite')}",
+                    flush=True,
+                )
+        if report.get("forward_stage_debug"):
+            for name, debug in report["forward_stage_debug"].items():
+                print(
+                    "[autodiff-gate] forward-stage-debug "
+                    f"parameter={name} final_y_all_finite={debug.get('final_y_all_finite')} "
+                    f"final_y_dot_all_finite={debug.get('final_y_dot_all_finite')} "
+                    f"final_state_all_finite={debug.get('final_state_all_finite')} "
+                    f"final_state_dot_all_finite={debug.get('final_state_dot_all_finite')} "
+                    f"objective_primal_all_finite={debug.get('objective_primal_all_finite')} "
+                    f"objective_tangent_all_finite={debug.get('objective_tangent_all_finite')}",
                     flush=True,
                 )
     outpath = _report_path()
