@@ -5491,3 +5491,127 @@ If these are large, the likely fix is:
 
 - do not rely on fresh recomputation of the local primal accepted step for this reverse path
 - instead use forward-recorded step data, or an exact reconstruction from stored forward payloads, for the reverse local pullback context
+
+## Next-session handoff: forward-lane restoration and NaN localization
+
+This section records the current forward-lane recovery status after reverse-mode
+work leaked into the historical forward benchmark path.
+
+### User guideline to preserve
+
+- The transport forward benchmark lane and the transport reverse lane should be
+  kept independent, even if that requires duplicating helpers.
+- Reverse-lane changes should not alter forward benchmark behavior.
+- The forward lane should be restored to the pre-reverse benchmark contract.
+
+### Reconfirmed history boundary
+
+- Pre-reverse reference commit on branch `en/auto_diff`:
+  `e888c02ba85b6ad790730d6c4e66d0bbd77f1cee`
+- First checked reverse-era commit:
+  `412dfae7f552bd5ee51357acbb51d8506cd26ea1`
+
+### Important historical forward-lane facts rechecked from git objects
+
+- In `e888c02...`, the forward custom-JVP path used the lightweight
+  accepted-step replay contract:
+  - `accepted_mask`
+  - `attempted_dts`
+  - `_radau_replay_realized_accepted_rollout(...)`
+- In `e888c02...`, the scalar benchmark helper differentiated through
+  `prepared_rollout.initial_carry` directly.
+- It did not rebuild the carry via
+  `_initial_carry_from_state_with_static_setup(...)` for that path.
+
+### What was restored in the current checkout
+
+- `_radau_forward_adaptive_final_y_realized_schedule_jvp(...)` in
+  `NEOPAX/_transport_solvers.py` was moved back toward the pre-reverse forward
+  contract:
+  - it now uses `accepted_mask`
+  - it now uses `attempted_dts`
+  - it now replays with `_radau_replay_realized_accepted_rollout(...)`
+- Forward-owned scalar helpers in
+  `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py` were moved
+  back to using differentiated `prepared_rollout.initial_carry`.
+- Forward NaN debug was changed to use
+  `_radau_adaptive_schedule_rollout(...)` instead of the giant payload-trace
+  rollout, avoiding the ~180 GiB OOM during debug.
+
+### Current forward-lane state
+
+- The forward benchmark command
+
+```bash
+python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode forward --parameters n0
+```
+
+  still sometimes returns all-`nan` forward Jacobian entries.
+
+- The accepted-step NaN localization command
+
+```bash
+python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode forward --parameters n0 --forward-nan-debug
+```
+
+  reported:
+  - `first_bad_index=-1`
+  - `first_bad_was_accepted=False`
+  - `first_bad_dt=nan`
+  - `final_tangent_finite=True`
+
+Interpretation:
+
+- the accepted-step replay tangent itself appears finite
+- the remaining NaN is likely introduced later, after replay, in one of:
+  - `final_y`
+  - `physics_context.unpack_flat(final_y)`
+  - `_objective_vector(final_state, runtime)`
+
+### New forward-stage debug path added
+
+`examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py` now has:
+
+- `--forward-nan-debug`
+- `--forward-stage-debug`
+
+The stage debug checks finiteness of:
+
+- `final_y`
+- tangent of `final_y`
+- unpacked `final_state`
+- tangent of `final_state`
+- objective primal
+- objective tangent
+
+### Exact next command
+
+Run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --ntx-exact-derivative-mode direct --ad-mode forward --parameters n0 --forward-nan-debug --forward-stage-debug
+```
+
+### How to interpret the next command
+
+- If `final_y_dot_all_finite=False`:
+  - bug is still inside the forward replay/JVP lane.
+- If `final_y_dot_all_finite=True` but `final_state_dot_all_finite=False`:
+  - bug is in `physics_context.unpack_flat(...)`.
+- If state tangent is finite but objective tangent is nonfinite:
+  - bug is inside `_objective_vector(...)` or a downstream objective helper.
+
+### Related reverse-lane status to remember
+
+- Reverse accepted-step prefix-gradient debugging already passed the earlier
+  initialization OOM region after specializing the initialization pullback path.
+- Reverse debugging then exposed nonfinite/CPU-heavy behavior further along the
+  chain, but the immediate blocker for the next session is the forward-lane
+  restoration above.
+
+### Files most relevant next session
+
+- `NEOPAX/_transport_solvers.py`
+- `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py`
+- `examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py`
+- `examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py`

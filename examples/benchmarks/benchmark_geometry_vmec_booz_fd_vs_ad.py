@@ -6,7 +6,6 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -15,17 +14,11 @@ if str(ROOT) not in sys.path:
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     central_fd_single_param,
-    exact_forward_scalar_observable_derivatives_from_linear_operator,
-    exact_reverse_scalar_observable_derivatives_from_linear_operator,
-    exact_scalar_observable_linear_operator,
-    exact_vmec_dmerc_profile_linear_operator,
+    exact_forward_scalar_observable_derivatives,
+    exact_reverse_scalar_observable_derivatives,
     five_point_fd_single_param,
     rel_error,
-    vmec_dmerc_profile_from_single_param,
     vmec_booz_scalar_observables_from_single_param,
-    vmec_booz_qi_maxj_scalar_objectives_from_single_param,
-    vmec_iotaf_scalar_observables_from_single_param,
-    vmec_qi_maxj_scalar_objectives_from_single_param,
     vmec_scalar_observables_from_single_param,
 )
 
@@ -35,17 +28,8 @@ DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hir
 def _parse_surface_s(text: str) -> tuple[float, ...]:
     values = [float(item.strip()) for item in str(text).split(",") if item.strip()]
     if not values:
-        raise ValueError("At least one flux surface must be provided.")
+        raise ValueError("At least one Boozer surface must be provided.")
     return tuple(values)
-
-
-def _parse_optional_indices(text: str | None) -> tuple[int, ...]:
-    if text is None:
-        return ()
-    values = [item.strip() for item in str(text).split(",") if item.strip()]
-    if not values:
-        return ()
-    return tuple(int(item) for item in values)
 
 
 def _fd_step(base_value: float, *, fd_rel_step: float, fd_abs_step: float) -> float:
@@ -76,103 +60,23 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     print(
         "[geometry-fd-ad] "
         f"vmec forward_lane=run_fixed_boundary/exact accepted-point matrix-free Jv/J^T w max_iter={resolved_max_iter} "
-        f"step_size={resolved_step_size:.6e} fd_forward_device={jax.default_backend()} "
-        f"exact_operator_device={args.exact_solver_device} "
+        f"step_size={resolved_step_size:.6e} exact_solver_device={args.exact_solver_device} "
         f"mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
     )
 
 
-def _print_dmerc_profile_probe(
-    context,
-    *,
-    probe_indices: tuple[int, ...],
-    h: float,
-    resolved_max_iter: int,
-    resolved_step_size: float,
-    solver_device: str,
-) -> None:
-    if not probe_indices:
-        return
-
-    def dmerc_fd(delta):
-        return vmec_dmerc_profile_from_single_param(
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-
-    baseline = jnp.asarray(dmerc_fd(0.0), dtype=jnp.float64)
-    size = int(baseline.size)
-    resolved_indices = []
-    for raw_idx in probe_indices:
-        idx = int(raw_idx)
-        if idx < 0:
-            idx = size + idx
-        resolved_indices.append(idx)
-
-    valid_indices = tuple(idx for idx in resolved_indices if 0 <= idx < size)
-    ad_map: dict[int, jnp.ndarray] = {}
-    if valid_indices:
-        linear_op = exact_vmec_dmerc_profile_linear_operator(
-            context,
-            indices=valid_indices,
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-            solver_device=solver_device,
-        )
-        ad_selected = jnp.asarray(
-            linear_op.matvec(np.array([1.0], dtype=float)),
-            dtype=jnp.float64,
-        ).reshape(-1)
-        ad_map = {
-            idx: jnp.asarray(ad_selected[pos], dtype=jnp.float64)
-            for pos, idx in enumerate(valid_indices)
-        }
-
-    fd_vec = (dmerc_fd(h) - dmerc_fd(-h)) / (2.0 * h)
-    fd_np = jnp.asarray(fd_vec, dtype=jnp.float64)
-    print("[geometry-fd-ad] DMerc profile derivative probe:", flush=True)
-    for raw_idx in probe_indices:
-        idx = int(raw_idx)
-        if idx < 0:
-            idx = size + idx
-        if idx < 0 or idx >= size:
-            print(
-                f"  - idx={raw_idx}: out_of_range size={size}",
-                flush=True,
-            )
-            continue
-        ad_value = ad_map[idx]
-        fd_value = jnp.asarray(fd_np[idx], dtype=jnp.float64)
-        err = rel_error(ad_value, fd_value)
-        print(
-            f"  - idx={idx}: ad={float(ad_value):.6e} "
-            f"fd_center={float(fd_value):.6e} "
-            f"ad_vs_fd_rel_err={err:.6e}",
-            flush=True,
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare VMEC scalar-objective derivatives between the NEOPAX AD lane and forward-lane finite differences."
+        description="Compare VMEC/Boozer scalar observable derivatives between the NEOPAX AD lane and forward-lane finite differences."
     )
     parser.add_argument(
         "--mode",
         type=str,
         default="vmec_booz_scalar_observables",
-        choices=(
-            "vmec_scalar_observables",
-            "vmec_iotaf_scalar_observables",
-            "vmec_booz_scalar_observables",
-            "vmec_booz_qi_maxj_scalar_objectives",
-            "vmec_qi_maxj_scalar_objectives",
-        ),
-        help="Run the VMEC-only scalar gate, focused VMEC iotaf profile probes, the VMEC -> Boozer scalar gate, the Boozer-based QI/Max-J scalar-objective gate, or the shared VMEC-line QI/Max-J scalar-objective gate.",
+        choices=("vmec_scalar_observables", "vmec_booz_scalar_observables"),
+        help="Run the VMEC-only scalar gate or the VMEC -> Boozer scalar gate.",
     )
     parser.add_argument(
         "--vmec-input",
@@ -193,7 +97,7 @@ def main() -> None:
         "--surface-s",
         type=str,
         default="0.25,0.5,0.75",
-        help="Comma-separated normalized toroidal-flux surfaces.",
+        help="Comma-separated Boozer surfaces in normalized toroidal flux s.",
     )
     parser.add_argument("--mboz", type=int, default=12, help="Boozer mboz.")
     parser.add_argument("--nboz", type=int, default=12, help="Boozer nboz.")
@@ -207,12 +111,6 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6, help="Relative FD step.")
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-8, help="Absolute FD step.")
     parser.add_argument(
-        "--print-dmerc-indices",
-        type=str,
-        default=None,
-        help="Optional comma-separated raw DMerc profile derivative indices to print as AD vs centered FD.",
-    )
-    parser.add_argument(
         "--skip-reverse-check",
         action="store_true",
         help="Skip exact reverse-mode observable derivative recovery against the exact forward path.",
@@ -220,9 +118,9 @@ def main() -> None:
     parser.add_argument(
         "--exact-solver-device",
         type=str,
-        default="gpu",
+        default="cpu",
         choices=("cpu", "gpu", "auto", "default"),
-        help="Device used by the exact accepted-point forward/reverse callbacks. Default: gpu.",
+        help="Device used by the exact accepted-point forward/reverse callbacks. Default: cpu.",
     )
     parser.add_argument(
         "--with-five-point",
@@ -240,7 +138,6 @@ def main() -> None:
         nboz=args.nboz,
         surface_s=_parse_surface_s(args.surface_s),
     )
-    dmerc_probe_indices = _parse_optional_indices(args.print_dmerc_indices)
     h = _fd_step(context.baseline_coefficient, fd_rel_step=args.fd_rel_step, fd_abs_step=args.fd_abs_step)
     resolved_max_iter = _resolved_max_iter(context, args.vmec_max_iter)
     resolved_step_size = _resolved_step_size(context, args.vmec_step_size)
@@ -255,15 +152,7 @@ def main() -> None:
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
         )
-    elif args.mode == "vmec_iotaf_scalar_observables":
-        fd_func = lambda delta: vmec_iotaf_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-    elif args.mode == "vmec_booz_scalar_observables":
+    else:
         fd_func = lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
             context,
             delta,
@@ -271,35 +160,14 @@ def main() -> None:
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
         )
-    elif args.mode == "vmec_booz_qi_maxj_scalar_objectives":
-        fd_func = lambda delta: vmec_booz_qi_maxj_scalar_objectives_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-    else:
-        fd_func = lambda delta: vmec_qi_maxj_scalar_objectives_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
 
-    print("[geometry-fd-ad] progress: building shared exact accepted-point matrix-free operator", flush=True)
-    linear_op = exact_scalar_observable_linear_operator(
+    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
+    ad = exact_forward_scalar_observable_derivatives(
         context,
         observable_kind=observable_kind,
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
         solver_device=args.exact_solver_device,
-    )
-    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
-    ad = exact_forward_scalar_observable_derivatives_from_linear_operator(
-        linear_op,
-        observable_kind=observable_kind,
     )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
@@ -312,19 +180,13 @@ def main() -> None:
     reverse = None
     if not args.skip_reverse_check:
         print("[geometry-fd-ad] progress: running exact accepted-point matrix-free reverse J^T w recovery", flush=True)
-        reverse = exact_reverse_scalar_observable_derivatives_from_linear_operator(
-            linear_op,
+        reverse = exact_reverse_scalar_observable_derivatives(
+            context,
             observable_kind=observable_kind,
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+            solver_device=args.exact_solver_device,
         )
-
-    _print_dmerc_profile_probe(
-        context,
-        probe_indices=dmerc_probe_indices,
-        h=h,
-        resolved_max_iter=resolved_max_iter,
-        resolved_step_size=resolved_step_size,
-        solver_device=args.exact_solver_device,
-    )
 
     print("[geometry-fd-ad] observable errors:")
     for name in ad:
