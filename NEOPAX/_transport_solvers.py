@@ -10726,25 +10726,16 @@ def _radau_forward_adaptive_final_y_realized_schedule_jvp(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
+    accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
     attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
 
     def _replay(carry_value):
-        replay = _radau_forward_replay_realized_accepted_attempt_rollout(
-            execution_context,
+        replay = _radau_replay_realized_accepted_rollout(
+            execution_context.kernel_context,
+            execution_context.physics_context,
             carry_value,
-            active_mask,
+            accepted_mask,
             attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
         )
         return replay.final_carry.y
 
