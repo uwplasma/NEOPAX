@@ -48,11 +48,16 @@ from NEOPAX._profiles import AnalyticalProfileModel
 from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
+    _extract_fixed_temperature_projection,
+    _extract_state_regularization,
     _make_solver_state_transform,
+    _make_radau_initial_step_state,
+    _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_apply_accepted_step_map,
+    _radau_carry_from_step_state,
     _radau_carry_with_forward_only_jvp_fields,
     _radau_debug_compare_zero_tangent_one_step,
     _radau_debug_realized_attempt_replay,
