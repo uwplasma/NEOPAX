@@ -21,6 +21,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     PROFILE_VECTOR_PARAMETERS,
+    _adaptive_rollout_nan_debug_for_parameter,
     _prepare_benchmark_config,
     _baseline_profile_cfg,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector,
@@ -123,6 +124,11 @@ def main() -> None:
         default=None,
         help="Optional comma-separated subset of objective row indices to run in reverse mode.",
     )
+    parser.add_argument(
+        "--forward-nan-debug",
+        action="store_true",
+        help="If the forward Jacobian column is nonfinite, run accepted-step NaN localization for single-parameter runs.",
+    )
     args = parser.parse_args()
     if args.ad_mode in ("both", "reverse"):
         raise NotImplementedError(
@@ -177,6 +183,7 @@ def main() -> None:
     if args.ad_mode in ("both", "forward"):
         print("[autodiff-gate] progress: running forward custom-JVP columns", flush=True)
         fwd_columns = []
+        forward_nan_debug = {}
         for idx in range(n_params):
             basis = np.zeros(n_params, dtype=float)
             basis[idx] = 1.0
@@ -187,6 +194,27 @@ def main() -> None:
             )
             tangent_arr = np.asarray(jax.device_get(tangent), dtype=float)
             tangent_arr = tangent_arr[np.asarray(objective_indices, dtype=int)]
+            if (
+                args.forward_nan_debug
+                and not np.all(np.isfinite(tangent_arr))
+                and n_params == 1
+            ):
+                parameter_name = parameter_names[idx]
+                print(
+                    "[autodiff-gate] forward-nan-debug progress: running accepted-step NaN localization "
+                    f"for parameter={parameter_name}",
+                    flush=True,
+                )
+                forward_nan_debug[parameter_name] = _adaptive_rollout_nan_debug_for_parameter(
+                    baseline_vector[idx],
+                    config=config,
+                    runtime=runtime,
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    parameter_name=parameter_name,
+                    debug_mode="minimal",
+                    include_one_step_compare=False,
+                )
             fwd_columns.append(tangent_arr)
         jac_fwd = np.stack(fwd_columns, axis=1)
 
@@ -222,6 +250,7 @@ def main() -> None:
         "max_relative_error": max_rel_error,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "reverse_replay_device": str(args.reverse_replay_device),
+        "forward_nan_debug": forward_nan_debug if jac_fwd is not None else None,
         "passed": passed,
     }
 
@@ -244,6 +273,16 @@ def main() -> None:
             for param_index, name in enumerate(report["parameter_names"]):
                 fwd = report["jacobian_forward"][metric_index][param_index]
                 print(f"    {name}: fwd={float(fwd):.6e}")
+        if report.get("forward_nan_debug"):
+            for name, debug in report["forward_nan_debug"].items():
+                print(
+                    "[autodiff-gate] forward-nan-debug "
+                    f"parameter={name} first_bad_index={debug.get('first_bad_index')} "
+                    f"first_bad_was_accepted={debug.get('first_bad_was_accepted')} "
+                    f"first_bad_dt={debug.get('first_bad_dt')} "
+                    f"final_tangent_finite={debug.get('final_tangent_finite')}",
+                    flush=True,
+                )
     outpath = _report_path()
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
