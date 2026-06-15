@@ -1550,6 +1550,12 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
     frozen_trace,
     replay_mode: str = "attempt",
 ):
+    replay_mode_key = str(replay_mode).strip().lower()
+    prepare_fn = (
+        _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane
+        if replay_mode_key == "accepted"
+        else _forward_benchmark_prepare_realized_schedule_scalar_rollout
+    )
     (
         execution_context,
         prepared_rollout,
@@ -1558,7 +1564,7 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
         _stop_after_accepted_steps,
         _solver,
         _solve_vector_field,
-    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout(
+    ) = prepare_fn(
         parameter_value,
         config=config,
         runtime=runtime,
@@ -1570,7 +1576,7 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
         prepared_rollout,
         execution_context,
         frozen_trace,
-        replay_mode=replay_mode,
+        replay_mode=replay_mode_key,
         carry0=initial_carry,
     )
     return _objective_vector(replay["final_state"], runtime), replay
