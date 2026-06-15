@@ -23,6 +23,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _baseline_profile_cfg,
     _fd_step,
     _forward_benchmark_adaptive_rollout_final_state_for_parameter,
+    _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp,
     _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter,
@@ -99,6 +100,27 @@ def _ad_lane_local_nan_diagnostics(
         "final_state_finite": _tree_all_finite(final_state),
         "rollout": _adaptive_rollout_diagnostics(rollout),
     }
+
+
+def _ad_lane_stage_debug(
+    *,
+    baseline_value: float,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit: int | None,
+) -> dict[str, Any]:
+    return _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        accepted_step_limit_override=accepted_step_limit,
+    )
 
 
 def _print_summary(report: dict[str, Any]) -> None:
@@ -219,6 +241,11 @@ def main() -> None:
         help="When AD returns nonfinite values, run lane-local primal/final-state diagnostics in this benchmark entrypoint.",
     )
     parser.add_argument(
+        "--ad-stage-debug",
+        action="store_true",
+        help="When AD returns nonfinite values, localize whether the forward scalar JVP first breaks in final_y_dot, unpacked state dot, or objective tangent.",
+    )
+    parser.add_argument(
         "--ntx-local-pullback-finite-debug",
         action="store_true",
         help="Enable NTX local pullback finite debug prints via NEOPAX_TRANSPORT_NTX_LOCAL_PULLBACK_FINITE_DEBUG=1.",
@@ -321,6 +348,26 @@ def main() -> None:
                     f"fail_code={rollout_diag.get('fail_code')}",
                     flush=True,
                 )
+                if args.ad_stage_debug and str(args.adaptive_derivative_mode).strip().lower() == "jvp":
+                    stage_debug = _ad_lane_stage_debug(
+                        baseline_value=baseline_value,
+                        config=config,
+                        runtime=runtime,
+                        baseline_state=baseline_state,
+                        profile_cfg=profile_cfg,
+                        parameter_name=args.parameter,
+                        accepted_step_limit=args.accepted_step_limit,
+                    )
+                    print(
+                        "[autodiff-gate] ad stage debug: "
+                        f"final_y_all_finite={stage_debug['final_y_all_finite']} "
+                        f"final_y_dot_all_finite={stage_debug['final_y_dot_all_finite']} "
+                        f"final_state_all_finite={stage_debug['final_state_all_finite']} "
+                        f"final_state_dot_all_finite={stage_debug['final_state_dot_all_finite']} "
+                        f"objective_primal_all_finite={stage_debug['objective_primal_all_finite']} "
+                        f"objective_tangent_all_finite={stage_debug['objective_tangent_all_finite']}",
+                        flush=True,
+                    )
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step

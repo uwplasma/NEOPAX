@@ -814,6 +814,91 @@ def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_pa
     )
 
 
+def _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    """Forward scalar JVP stage-local finiteness debug."""
+
+    (
+        execution_context,
+        prepared_rollout,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        _solver,
+        _solve_vector_field,
+    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
+        parameter_value,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        accepted_step_limit_override=accepted_step_limit_override,
+    )
+
+    def _final_y_from_parameter(pval):
+        (
+            exec_ctx,
+            _prepared_rollout_local,
+            initial_carry_local,
+            max_total_steps_local,
+            stop_after_accepted_steps_local,
+            _solver_local,
+            _solve_vector_field_local,
+        ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
+            pval,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            accepted_step_limit_override=accepted_step_limit_override,
+        )
+        return _forward_benchmark_adaptive_final_y_realized_schedule(
+            exec_ctx,
+            max_total_steps_local,
+            stop_after_accepted_steps_local,
+            initial_carry_local,
+        )
+
+    primal_value = jnp.asarray(parameter_value, dtype=jnp.float64)
+    tangent_value = jnp.asarray(1.0, dtype=jnp.float64)
+    final_y, final_y_dot = jax.jvp(
+        _final_y_from_parameter,
+        (primal_value,),
+        (tangent_value,),
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    final_state_dot = jax.jvp(
+        prepared_rollout.physics_context.unpack_flat,
+        (final_y,),
+        (final_y_dot,),
+    )[1]
+    objective_primal, objective_tangent = jax.jvp(
+        lambda flat_y: _objective_vector(prepared_rollout.physics_context.unpack_flat(flat_y), runtime),
+        (final_y,),
+        (final_y_dot,),
+    )
+    return {
+        "final_y_all_finite": _tree_all_finite(final_y),
+        "final_y_dot_all_finite": _tree_all_finite(final_y_dot),
+        "final_state_all_finite": _tree_all_finite(final_state),
+        "final_state_dot_all_finite": _tree_all_finite(final_state_dot),
+        "objective_primal_all_finite": bool(np.all(np.isfinite(np.asarray(jax.device_get(objective_primal), dtype=float)))),
+        "objective_tangent_all_finite": bool(np.all(np.isfinite(np.asarray(jax.device_get(objective_tangent), dtype=float)))),
+        "objective_primal": np.asarray(jax.device_get(objective_primal), dtype=float).tolist(),
+        "objective_tangent": np.asarray(jax.device_get(objective_tangent), dtype=float).tolist(),
+    }
+
+
 def _initial_carry_from_state_with_static_setup(
     *,
     solver,
