@@ -464,6 +464,11 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
     match.
     """
 
+    prepare_fn = (
+        _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane
+        if use_realized_schedule_jvp
+        else _forward_benchmark_prepare_realized_schedule_scalar_rollout
+    )
     (
         execution_context,
         prepared_rollout,
@@ -472,7 +477,7 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
         stop_after_accepted_steps,
         _solver,
         _solve_vector_field,
-    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout(
+    ) = prepare_fn(
         parameter_value,
         config=config,
         runtime=runtime,
@@ -482,7 +487,7 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
         accepted_step_limit_override=accepted_step_limit_override,
     )
     if use_realized_schedule_jvp:
-        final_y = _radau_adaptive_final_y_realized_schedule(
+        final_y = _forward_benchmark_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
@@ -535,6 +540,105 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
         )
         final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return final_state, rollout
+
+
+def _forward_benchmark_replay_realized_accepted_final_y(
+    execution_context,
+    carry0,
+    accepted_mask,
+    dt_sequence,
+):
+    """Forward-owned lightweight accepted-step replay for the scalar AD lane."""
+
+    kernel_context = execution_context.kernel_context
+    physics_context = execution_context.physics_context
+    dtype = kernel_context.dtype
+
+    def _scan_body(carry, xs):
+        accepted, dt_value = xs
+
+        def _do_step(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+            attempt_context = _RadauAcceptedStepAttemptContext(
+                t_final=carry.t + dt_value,
+                use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
+            )
+            step_map_result = _radau_apply_accepted_step_map(
+                kernel_context,
+                physics_context,
+                carry_for_step,
+                attempt_context,
+            )
+            next_carry = dataclasses.replace(
+                step_map_result.next_carry,
+                prev_error=jnp.maximum(
+                    step_map_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=dtype),
+                ),
+                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            )
+            return next_carry, step_map_result.accepted_y
+
+        def _skip(_):
+            return carry, carry.y
+
+        return jax.lax.cond(accepted, _do_step, _skip, operand=None)
+
+    final_carry, _ = jax.lax.scan(_scan_body, carry0, (accepted_mask, dt_sequence))
+    return final_carry.y
+
+
+@jax.custom_jvp
+def _forward_benchmark_adaptive_final_y_realized_schedule(
+    execution_context,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    carry0,
+):
+    """Forward-owned custom-JVP final-y helper for the scalar accepted-step lane."""
+
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return rollout.final_carry.y
+
+
+@_forward_benchmark_adaptive_final_y_realized_schedule.defjvp
+def _forward_benchmark_adaptive_final_y_realized_schedule_jvp(
+    execution_context,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    primals,
+    tangents,
+):
+    (carry0,) = primals
+    (carry0_dot,) = tangents
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    accepted_mask = jax.lax.stop_gradient(
+        jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)
+    )
+    accepted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+
+    def _replay(carry_value):
+        return _forward_benchmark_replay_realized_accepted_final_y(
+            execution_context,
+            carry_value,
+            accepted_mask,
+            accepted_dts,
+        )
+
+    primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
+    return primal_out, tangent_out
 
 
 def _adaptive_rollout_objectives_for_parameter(
@@ -655,7 +759,7 @@ def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_pa
         stop_after_accepted_steps,
         _solver,
         _solve_vector_field,
-    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout(
+    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
         parameter_value,
         config=config,
         runtime=runtime,
@@ -666,7 +770,7 @@ def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_pa
     )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
-        final_y = _radau_adaptive_final_y_realized_schedule(
+        final_y = _forward_benchmark_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
@@ -683,6 +787,30 @@ def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_pa
         raise ValueError("derivative_mode must be one of {'jvp', 'vjp'}.")
     final_state = prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
+
+
+def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    """Dedicated forward custom-JVP objective helper for the scalar benchmark lane."""
+
+    return _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(
+        parameter_value,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        accepted_step_limit_override=accepted_step_limit_override,
+        derivative_mode="jvp",
+    )
 
 
 def _initial_carry_from_state_with_static_setup(
@@ -798,6 +926,72 @@ def _forward_benchmark_prepare_realized_schedule_scalar_rollout(
         stop_after_accepted_steps,
         solver,
         solve_vector_field_static,
+    )
+
+
+def _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    """Forward-owned scalar AD prepare helper using the prepared initial carry directly."""
+
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    state0_static = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=jax.lax.stop_gradient(parameter_value),
+    )
+    prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    return (
+        execution_context,
+        prepared_rollout,
+        prepared_rollout.initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        solver,
+        solve_vector_field,
     )
 
 

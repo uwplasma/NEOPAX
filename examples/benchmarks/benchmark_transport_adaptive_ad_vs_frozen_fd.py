@@ -22,6 +22,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _baseline_profile_cfg,
     _fd_step,
     _forward_benchmark_adaptive_rollout_final_state_for_parameter,
+    _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp,
     _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _prepare_benchmark_config,
@@ -208,15 +209,27 @@ def main() -> None:
             args.accepted_step_limit,
         )
 
-    objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=args.parameter,
-        derivative_mode=args.adaptive_derivative_mode,
-    )
+    if str(args.adaptive_derivative_mode).strip().lower() == "jvp":
+        objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            accepted_step_limit_override=args.accepted_step_limit,
+        )
+    else:
+        objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            accepted_step_limit_override=args.accepted_step_limit,
+            derivative_mode=args.adaptive_derivative_mode,
+        )
 
     gradient_ad = None
     if args.run_mode in ("both", "ad"):

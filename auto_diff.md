@@ -5615,3 +5615,185 @@ python ./examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py --
 - `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py`
 - `examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py`
 - `examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py`
+
+### 2026-06-15 update: scalar forward benchmark restoration
+
+The scalar benchmark lane was repaired enough to run again after a sequence of
+restore fixes in:
+
+- `examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py`
+- `examples/benchmarks/benchmark_transport_profile_vector_ad_compare.py`
+- `examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py`
+
+Key cleanup completed:
+
+- removed unresolved merge-conflict markers from the benchmark files
+- restored the forward-benchmark-owned scalar helper path
+- rewired `benchmark_transport_adaptive_ad_vs_frozen_fd.py` to use:
+  - `_forward_benchmark_adaptive_rollout_final_state_for_parameter(...)`
+  - `_forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(...)`
+  - `_forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(...)`
+- aligned the restored scalar helpers to the current solver API:
+  - imported missing solver utilities
+  - updated `_make_solver_state_transform(...)` unpacking from stale 7-value usage
+    to the current 5-value contract
+  - replaced stale nonexistent forward-only helper names with the current
+    `_radau_adaptive_final_state_rollout(...)` and
+    `_radau_adaptive_final_y_realized_schedule(...)`
+
+### New scalar benchmark control
+
+`examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py` now
+supports:
+
+- `--run-mode both`
+- `--run-mode ad`
+- `--run-mode fd`
+
+Important behavior:
+
+- `--run-mode ad` is now truly AD-only
+  - it no longer runs the baseline rollout
+  - it no longer builds a frozen replay trace
+  - it no longer runs FD minus/plus replays
+- `--run-mode fd` runs:
+  - baseline adaptive rollout
+  - frozen trace construction
+  - frozen FD minus/plus replays
+
+The script also now prints frozen replay diagnostics:
+
+- `objectives_finite`
+- `final_state_finite`
+- `final_carry_finite`
+
+for both `fd_minus` and `fd_plus`.
+
+### Exact scalar AD path in the current script
+
+For:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode ad
+```
+
+the path is:
+
+- benchmark TOML:
+  - `examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml`
+- `ntx_exact_derivative_mode = direct`
+- outer AD = `jax.jvp`
+- solve-level adaptive derivative path =
+  `_radau_adaptive_final_y_realized_schedule(...)`
+- that function is solver-native custom JVP over the realized accepted-step
+  schedule
+
+So the AD lane is using:
+
+- the intended benchmark TOML
+- direct NTX derivatives
+- the accepted-step realized-schedule forward AD path
+
+### Current scalar `T0` observations
+
+#### FD-only test with smaller perturbation
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode fd --fd-rel-step 1.0e-7 --fd-abs-step 1.0e-10
+```
+
+Output summary:
+
+- baseline rollout:
+  - `attempt_count=193`
+  - `accepted_count=120`
+  - `completed=True`
+  - `failed=False`
+  - `fail_code=0`
+- frozen replay diagnostics:
+  - minus:
+    - `objectives_finite=True`
+    - `final_state_finite=True`
+    - `final_carry_finite=True`
+  - plus:
+    - `objectives_finite=True`
+    - `final_state_finite=True`
+    - `final_carry_finite=True`
+
+FD values from that run:
+
+- `softmax_Er = 8.052370e+02`
+- `smooth_root_proxy = 5.523795e-05`
+- `Er2_volume_average = 2.105133e+03`
+- `Er_volume_average = -1.207926e+02`
+- `electron_temperature_volume_average_keV = 3.634290e-01`
+- `total_pressure_volume_average = 1.827560e+00`
+- `alpha_power_volume_average_mw_m3 = 3.628999e-01`
+
+Interpretation:
+
+- earlier `fd = nan` results for `T0` were at least partly due to too-large
+  frozen perturbations forcing a schedule that the perturbed state no longer
+  tolerated well
+- with smaller `h`, the frozen replay remains finite
+- however, these FD values still do **not** yet match the old trusted benchmark
+  values saved elsewhere in this file, so the benchmark still needs further
+  investigation
+
+#### AD-vs-FD status before the smaller-FD test
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --fd-rel-step 1.0e-6 --fd-abs-step 1.0e-10
+```
+
+produced:
+
+- finite AD values
+- `fd = nan` for every reported objective
+
+The finite AD values from that run were:
+
+- `softmax_Er = -9.292053e+01`
+- `smooth_root_proxy = 1.516500e-05`
+- `Er2_volume_average = -9.616183e+01`
+- `Er_volume_average = -1.450319e+02`
+- `electron_temperature_volume_average_keV = 3.857869e-01`
+- `total_pressure_volume_average = 1.817543e+00`
+- `alpha_power_volume_average_mw_m3 = -2.656870e-02`
+
+These values are still not yet trusted against the old benchmark table.
+
+### Trusted old scalar FD-step settings from this note
+
+The saved compact scalar table values for both `n0` and `T0` correspond to:
+
+- `--fd-rel-step 3e-8`
+- `--fd-abs-step 1e-10`
+
+effective steps:
+
+- `n0 = 4.21`:
+  - `h = 1.263000e-07`
+- `T0 = 17.8`:
+  - `h = 5.340000e-07`
+
+### Immediate next-session commands
+
+1. Pure AD-only scalar check for `T0`:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode ad --fd-rel-step 3.0e-8 --fd-abs-step 1.0e-10
+```
+
+2. FD-only scalar check for `T0` at the old nominal benchmark scale:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode fd --fd-rel-step 3.0e-8 --fd-abs-step 1.0e-10
+```
+
+3. Compare those results against the trusted saved `T0` values in the compact
+   table above, not only against each other.
