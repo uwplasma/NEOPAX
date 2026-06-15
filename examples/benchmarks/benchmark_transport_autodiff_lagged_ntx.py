@@ -482,7 +482,7 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
         accepted_step_limit_override=accepted_step_limit_override,
     )
     if use_realized_schedule_jvp:
-        final_y = _radau_forward_adaptive_final_y_realized_schedule(
+        final_y = _radau_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
@@ -666,7 +666,7 @@ def _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_pa
     )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
-        final_y = _radau_forward_adaptive_final_y_realized_schedule(
+        final_y = _radau_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
