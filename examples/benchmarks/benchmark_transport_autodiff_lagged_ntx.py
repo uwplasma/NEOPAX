@@ -1608,6 +1608,17 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
     replay_mode: str = "attempt",
 ):
     replay_mode_key = str(replay_mode).strip().lower()
+    if replay_mode_key == "accepted":
+        accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
+        return _adaptive_rollout_objectives_for_parameter_on_time_list(
+            parameter_value,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            time_list=accepted_time_list,
+        )
     prepare_fn = (
         _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane
         if replay_mode_key == "accepted"
@@ -3383,6 +3394,17 @@ def _accepted_time_list_until_attempt_index(trace, inclusive_attempt_index: int)
         if active_mask[idx] and accepted_mask[idx]
     ]
     return accepted_times
+
+
+def _accepted_time_list_from_trace(trace) -> list[float]:
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+    return [
+        float(step_ts[idx])
+        for idx in range(len(active_mask))
+        if active_mask[idx] and accepted_mask[idx]
+    ]
 
 
 def _slice_rollout_trace_by_accepted_window(
