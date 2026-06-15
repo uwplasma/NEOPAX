@@ -567,7 +567,7 @@ def _forward_benchmark_replay_realized_accepted_final_y(
             step_map_result = _radau_apply_accepted_step_map(
                 kernel_context,
                 physics_context,
-                carry_for_step,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
                 attempt_context,
             )
             next_carry = dataclasses.replace(
