@@ -27,6 +27,7 @@ import dataclasses
 import json
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -590,7 +591,7 @@ def _forward_benchmark_replay_realized_accepted_final_y(
     return final_carry.y
 
 
-@jax.custom_jvp
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2))
 def _forward_benchmark_adaptive_final_y_realized_schedule(
     execution_context,
     max_total_steps: int,
