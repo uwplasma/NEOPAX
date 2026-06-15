@@ -899,6 +899,63 @@ def _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter(
     }
 
 
+def _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    """Localize nonfinite behavior in the forward custom-JVP primal replay lane."""
+
+    (
+        execution_context,
+        prepared_rollout,
+        initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        _solver,
+        _solve_vector_field,
+    ) = _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
+        parameter_value,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        accepted_step_limit_override=accepted_step_limit_override,
+    )
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    replay_trace = dataclasses.replace(
+        rollout.trace,
+        active_mask=jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask),
+    )
+    replay_result = _radau_run_prepared_on_realized_trace(
+        prepared_rollout,
+        execution_context,
+        replay_trace,
+        replay_mode="accepted",
+        carry0=initial_carry,
+    )
+    objectives = _objective_vector(replay_result["final_state"], runtime)
+    debug = _frozen_replay_nonfinite_debug(
+        replay_result,
+        replay_trace,
+        objectives_np=np.asarray(jax.device_get(objectives), dtype=float),
+    )
+    debug["attempt_count"] = int(np.asarray(jax.device_get(rollout.attempt_count)))
+    debug["accepted_count"] = int(np.asarray(jax.device_get(rollout.accepted_count)))
+    return debug
+
+
 def _initial_carry_from_state_with_static_setup(
     *,
     solver,

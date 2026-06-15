@@ -23,6 +23,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _baseline_profile_cfg,
     _fd_step,
     _forward_benchmark_adaptive_rollout_final_state_for_parameter,
+    _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter,
     _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter,
     _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp,
     _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace,
@@ -368,6 +369,42 @@ def main() -> None:
                         f"objective_tangent_all_finite={stage_debug['objective_tangent_all_finite']}",
                         flush=True,
                     )
+                    if not bool(stage_debug["final_y_all_finite"]):
+                        replay_primal_debug = _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter(
+                            jnp.asarray(baseline_value),
+                            config=config,
+                            runtime=runtime,
+                            baseline_state=baseline_state,
+                            profile_cfg=profile_cfg,
+                            parameter_name=args.parameter,
+                            accepted_step_limit_override=args.accepted_step_limit,
+                        )
+                        print(
+                            "[autodiff-gate] ad replay primal debug: "
+                            f"attempt_count={replay_primal_debug.get('attempt_count')} "
+                            f"accepted_count={replay_primal_debug.get('accepted_count')} "
+                            f"first_bad_index={replay_primal_debug.get('first_bad_index')} "
+                            f"first_bad_was_accepted={replay_primal_debug.get('first_bad_was_accepted')} "
+                            f"first_bad_dt={replay_primal_debug.get('first_bad_dt')} "
+                            f"final_state_finite={replay_primal_debug.get('final_state_finite')} "
+                            f"objectives_finite={replay_primal_debug.get('objectives_finite')}",
+                            flush=True,
+                        )
+                        local_window = replay_primal_debug.get("local_attempt_window") or []
+                        if local_window:
+                            print("[autodiff-gate] ad replay primal local window:", flush=True)
+                            for entry in local_window:
+                                print(
+                                    "  "
+                                    f"index={entry.get('index')} "
+                                    f"accepted={entry.get('accepted')} "
+                                    f"attempted_dt={entry.get('attempted_dt')} "
+                                    f"next_dt={entry.get('next_dt')} "
+                                    f"time={entry.get('time')} "
+                                    f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                                    f"replay_state_finite={entry.get('replay_state_finite')}",
+                                    flush=True,
+                                )
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
