@@ -4714,14 +4714,14 @@ def _radau_fixed_dt_accepted_rollout(
     )
 
 
-def _radau_replay_realized_accepted_rollout(
+def _radau_replay_realized_accepted_step_map_rollout(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry0: _RadauAcceptedStepCarry,
     accepted_mask,
     dt_sequence,
 ) -> _RadauAcceptedRolloutResult:
-    """Replay only the realized accepted steps along a fixed forward schedule."""
+    """Replay only the realized accepted-step physical map along a fixed schedule."""
 
     dtype = kernel_context.dtype
 
@@ -5127,16 +5127,12 @@ def _radau_run_prepared_on_realized_trace(
             jax.lax.stop_gradient(trace.next_lagged_response_valid),
         )
     elif replay_mode_normalized == "accepted":
-        rollout = _radau_replay_realized_accepted_rollout(
-            execution_context,
+        rollout = _radau_replay_realized_accepted_step_map_rollout(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
             carry_start,
             jax.lax.stop_gradient(jnp.logical_and(trace.active_mask, trace.accepted_mask)),
             jax.lax.stop_gradient(trace.attempted_dts),
-            jax.lax.stop_gradient(trace.next_dts),
-            jax.lax.stop_gradient(trace.next_recent_reject_count),
-            jax.lax.stop_gradient(trace.next_regrowth_cooldown),
-            jax.lax.stop_gradient(trace.next_easy_growth_streak),
-            jax.lax.stop_gradient(trace.next_lagged_response_valid),
         )
     else:
         raise ValueError(
