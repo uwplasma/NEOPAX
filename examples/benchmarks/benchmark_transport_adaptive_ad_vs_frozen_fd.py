@@ -22,6 +22,7 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _adaptive_rollout_diagnostics,
     _baseline_profile_cfg,
     _fd_step,
+    _frozen_replay_nonfinite_debug,
     _forward_benchmark_adaptive_rollout_final_state_for_parameter,
     _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter,
     _forward_benchmark_adaptive_realized_schedule_jvp_stage_debug_for_parameter,
@@ -183,6 +184,48 @@ def _print_summary(report: dict[str, Any]) -> None:
             f"final_carry_finite={plus.get('final_carry_finite')} "
             f"completed={plus.get('completed')} failed={plus.get('failed')} fail_code={plus.get('fail_code')}"
         )
+        minus_nf = minus.get("nonfinite_debug")
+        if minus_nf is not None:
+            print(
+                "[autodiff-gate] frozen replay minus nonfinite debug: "
+                f"first_bad_index={minus_nf.get('first_bad_index')} "
+                f"first_bad_was_accepted={minus_nf.get('first_bad_was_accepted')} "
+                f"first_bad_dt={minus_nf.get('first_bad_dt')} "
+                f"final_state_finite={minus_nf.get('final_state_finite')} "
+                f"objectives_finite={minus_nf.get('objectives_finite')}"
+            )
+            for entry in (minus_nf.get("local_attempt_window") or []):
+                print(
+                    "  "
+                    f"index={entry.get('index')} "
+                    f"accepted={entry.get('accepted')} "
+                    f"attempted_dt={entry.get('attempted_dt')} "
+                    f"next_dt={entry.get('next_dt')} "
+                    f"time={entry.get('time')} "
+                    f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                    f"replay_state_finite={entry.get('replay_state_finite')}"
+                )
+        plus_nf = plus.get("nonfinite_debug")
+        if plus_nf is not None:
+            print(
+                "[autodiff-gate] frozen replay plus nonfinite debug: "
+                f"first_bad_index={plus_nf.get('first_bad_index')} "
+                f"first_bad_was_accepted={plus_nf.get('first_bad_was_accepted')} "
+                f"first_bad_dt={plus_nf.get('first_bad_dt')} "
+                f"final_state_finite={plus_nf.get('final_state_finite')} "
+                f"objectives_finite={plus_nf.get('objectives_finite')}"
+            )
+            for entry in (plus_nf.get("local_attempt_window") or []):
+                print(
+                    "  "
+                    f"index={entry.get('index')} "
+                    f"accepted={entry.get('accepted')} "
+                    f"attempted_dt={entry.get('attempted_dt')} "
+                    f"next_dt={entry.get('next_dt')} "
+                    f"time={entry.get('time')} "
+                    f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                    f"replay_state_finite={entry.get('replay_state_finite')}"
+                )
 
 
 def main() -> None:
@@ -369,42 +412,41 @@ def main() -> None:
                         f"objective_tangent_all_finite={stage_debug['objective_tangent_all_finite']}",
                         flush=True,
                     )
-                    if not bool(stage_debug["final_y_all_finite"]):
-                        replay_primal_debug = _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter(
-                            jnp.asarray(baseline_value),
-                            config=config,
-                            runtime=runtime,
-                            baseline_state=baseline_state,
-                            profile_cfg=profile_cfg,
-                            parameter_name=args.parameter,
-                            accepted_step_limit_override=args.accepted_step_limit,
-                        )
-                        print(
-                            "[autodiff-gate] ad replay primal debug: "
-                            f"attempt_count={replay_primal_debug.get('attempt_count')} "
-                            f"accepted_count={replay_primal_debug.get('accepted_count')} "
-                            f"first_bad_index={replay_primal_debug.get('first_bad_index')} "
-                            f"first_bad_was_accepted={replay_primal_debug.get('first_bad_was_accepted')} "
-                            f"first_bad_dt={replay_primal_debug.get('first_bad_dt')} "
-                            f"final_state_finite={replay_primal_debug.get('final_state_finite')} "
-                            f"objectives_finite={replay_primal_debug.get('objectives_finite')}",
-                            flush=True,
-                        )
-                        local_window = replay_primal_debug.get("local_attempt_window") or []
-                        if local_window:
-                            print("[autodiff-gate] ad replay primal local window:", flush=True)
-                            for entry in local_window:
-                                print(
-                                    "  "
-                                    f"index={entry.get('index')} "
-                                    f"accepted={entry.get('accepted')} "
-                                    f"attempted_dt={entry.get('attempted_dt')} "
-                                    f"next_dt={entry.get('next_dt')} "
-                                    f"time={entry.get('time')} "
-                                    f"baseline_err_norm={entry.get('baseline_err_norm')} "
-                                    f"replay_state_finite={entry.get('replay_state_finite')}",
-                                    flush=True,
-                                )
+                    replay_primal_debug = _forward_benchmark_adaptive_realized_schedule_replay_primal_debug_for_parameter(
+                        jnp.asarray(baseline_value),
+                        config=config,
+                        runtime=runtime,
+                        baseline_state=baseline_state,
+                        profile_cfg=profile_cfg,
+                        parameter_name=args.parameter,
+                        accepted_step_limit_override=args.accepted_step_limit,
+                    )
+                    print(
+                        "[autodiff-gate] ad replay primal debug: "
+                        f"attempt_count={replay_primal_debug.get('attempt_count')} "
+                        f"accepted_count={replay_primal_debug.get('accepted_count')} "
+                        f"first_bad_index={replay_primal_debug.get('first_bad_index')} "
+                        f"first_bad_was_accepted={replay_primal_debug.get('first_bad_was_accepted')} "
+                        f"first_bad_dt={replay_primal_debug.get('first_bad_dt')} "
+                        f"final_state_finite={replay_primal_debug.get('final_state_finite')} "
+                        f"objectives_finite={replay_primal_debug.get('objectives_finite')}",
+                        flush=True,
+                    )
+                    local_window = replay_primal_debug.get("local_attempt_window") or []
+                    if local_window:
+                        print("[autodiff-gate] ad replay primal local window:", flush=True)
+                        for entry in local_window:
+                            print(
+                                "  "
+                                f"index={entry.get('index')} "
+                                f"accepted={entry.get('accepted')} "
+                                f"attempted_dt={entry.get('attempted_dt')} "
+                                f"next_dt={entry.get('next_dt')} "
+                                f"time={entry.get('time')} "
+                                f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                                f"replay_state_finite={entry.get('replay_state_finite')}",
+                                flush=True,
+                            )
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
@@ -414,6 +456,8 @@ def main() -> None:
     minus_replay = None
     plus_replay = None
     gradient_fd = None
+    minus_nonfinite_debug = None
+    plus_nonfinite_debug = None
     if args.run_mode in ("both", "fd"):
         print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
         objectives_minus, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
@@ -438,6 +482,20 @@ def main() -> None:
             replay_mode=args.replay_mode,
         )
         gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
+        minus_diag_local = _replay_diagnostics(minus_replay, objectives_minus)
+        plus_diag_local = _replay_diagnostics(plus_replay, objectives_plus)
+        if not minus_diag_local["final_state_finite"] or not minus_diag_local["objectives_finite"]:
+            minus_nonfinite_debug = _frozen_replay_nonfinite_debug(
+                minus_replay,
+                replay_trace,
+                objectives_np=np.asarray(jax.device_get(objectives_minus), dtype=float),
+            )
+        if not plus_diag_local["final_state_finite"] or not plus_diag_local["objectives_finite"]:
+            plus_nonfinite_debug = _frozen_replay_nonfinite_debug(
+                plus_replay,
+                replay_trace,
+                objectives_np=np.asarray(jax.device_get(objectives_plus), dtype=float),
+            )
 
     grad_ad_np = None if gradient_ad is None else np.asarray(jax.device_get(gradient_ad), dtype=float)
     grad_fd_np = None if gradient_fd is None else np.asarray(jax.device_get(gradient_fd), dtype=float)
@@ -484,8 +542,8 @@ def main() -> None:
             "frozen_fd_plus_state_finite": None if plus_replay is None else _tree_all_finite(plus_replay["final_state"]),
         },
         "frozen_replay": None if minus_replay is None or plus_replay is None else {
-            "minus": _replay_diagnostics(minus_replay, objectives_minus),
-            "plus": _replay_diagnostics(plus_replay, objectives_plus),
+            "minus": _replay_diagnostics(minus_replay, objectives_minus) | {"nonfinite_debug": minus_nonfinite_debug},
+            "plus": _replay_diagnostics(plus_replay, objectives_plus) | {"nonfinite_debug": plus_nonfinite_debug},
         },
     }
 
