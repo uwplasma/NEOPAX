@@ -504,7 +504,7 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
                 stop_after_accepted_steps=stop_after_accepted_steps,
             )
         else:
-            rollout = _radau_forward_adaptive_final_state_rollout(
+            rollout = _radau_adaptive_final_state_rollout(
                 execution_context,
                 initial_carry,
                 max_total_steps=max_total_steps,
@@ -526,7 +526,7 @@ def _forward_benchmark_adaptive_rollout_final_state_for_parameter(
                 stop_after_accepted_steps=stop_after_accepted_steps,
             )
             if use_schedule_trace_only
-            else _radau_forward_adaptive_final_state_rollout(
+            else _radau_adaptive_final_state_rollout(
                 execution_context,
                 initial_carry,
                 max_total_steps=max_total_steps,
