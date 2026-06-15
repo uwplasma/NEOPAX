@@ -48,6 +48,22 @@ def _to_float_list(values) -> list[float]:
     return np.asarray(jax.device_get(values), dtype=float).tolist()
 
 
+def _replay_diagnostics(replay: dict[str, Any], objectives) -> dict[str, Any]:
+    rollout = replay.get("rollout")
+    diag = {
+        "replay_mode": replay.get("replay_mode"),
+        "final_state_finite": _tree_all_finite(replay.get("final_state")),
+        "final_carry_finite": _tree_all_finite(replay.get("final_carry")),
+        "objectives_finite": bool(np.all(np.isfinite(np.asarray(jax.device_get(objectives), dtype=float)))),
+    }
+    if rollout is not None:
+        for key in ("attempt_count", "accepted_count", "completed", "failed", "fail_code"):
+            if hasattr(rollout, key):
+                value = getattr(rollout, key)
+                diag[key] = np.asarray(jax.device_get(value)).item()
+    return diag
+
+
 def _print_summary(report: dict[str, Any]) -> None:
     print(
         f"[autodiff-gate] mode=adaptive_ad_vs_frozen_fd "
@@ -76,6 +92,24 @@ def _print_summary(report: dict[str, Any]) -> None:
         print(
             f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
             f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+        )
+    frozen_diag = report.get("frozen_replay", {})
+    if frozen_diag:
+        minus = frozen_diag.get("minus", {})
+        plus = frozen_diag.get("plus", {})
+        print(
+            "[autodiff-gate] frozen replay minus: "
+            f"objectives_finite={minus.get('objectives_finite')} "
+            f"final_state_finite={minus.get('final_state_finite')} "
+            f"final_carry_finite={minus.get('final_carry_finite')} "
+            f"completed={minus.get('completed')} failed={minus.get('failed')} fail_code={minus.get('fail_code')}"
+        )
+        print(
+            "[autodiff-gate] frozen replay plus: "
+            f"objectives_finite={plus.get('objectives_finite')} "
+            f"final_state_finite={plus.get('final_state_finite')} "
+            f"final_carry_finite={plus.get('final_carry_finite')} "
+            f"completed={plus.get('completed')} failed={plus.get('failed')} fail_code={plus.get('fail_code')}"
         )
 
 
@@ -226,6 +260,10 @@ def main() -> None:
             "baseline": baseline_diag,
             "frozen_fd_minus_state_finite": _tree_all_finite(minus_replay["final_state"]),
             "frozen_fd_plus_state_finite": _tree_all_finite(plus_replay["final_state"]),
+        },
+        "frozen_replay": {
+            "minus": _replay_diagnostics(minus_replay, objectives_minus),
+            "plus": _replay_diagnostics(plus_replay, objectives_plus),
         },
     }
 
