@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,41 @@ def _replay_diagnostics(replay: dict[str, Any], objectives) -> dict[str, Any]:
                 value = getattr(rollout, key)
                 diag[key] = np.asarray(jax.device_get(value)).item()
     return diag
+
+
+def _scalar_objectives_finite(values) -> bool:
+    arr = np.asarray(jax.device_get(values), dtype=float)
+    return bool(np.all(np.isfinite(arr)))
+
+
+def _ad_lane_local_nan_diagnostics(
+    *,
+    baseline_value: float,
+    objective_fn,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit: int | None,
+) -> dict[str, Any]:
+    primal_objectives = objective_fn(jnp.asarray(baseline_value))
+    final_state, rollout = _forward_benchmark_adaptive_rollout_final_state_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+        accepted_step_limit_override=accepted_step_limit,
+    )
+    return {
+        "primal_objectives": _to_float_list(primal_objectives),
+        "primal_objectives_finite": _scalar_objectives_finite(primal_objectives),
+        "final_state_finite": _tree_all_finite(final_state),
+        "rollout": _adaptive_rollout_diagnostics(rollout),
+    }
 
 
 def _print_summary(report: dict[str, Any]) -> None:
@@ -177,7 +213,20 @@ def main() -> None:
         choices=("both", "ad", "fd"),
         help="Run adaptive AD only, frozen FD only, or both.",
     )
+    parser.add_argument(
+        "--ad-local-nan-debug",
+        action="store_true",
+        help="When AD returns nonfinite values, run lane-local primal/final-state diagnostics in this benchmark entrypoint.",
+    )
+    parser.add_argument(
+        "--ntx-local-pullback-finite-debug",
+        action="store_true",
+        help="Enable NTX local pullback finite debug prints via NEOPAX_TRANSPORT_NTX_LOCAL_PULLBACK_FINITE_DEBUG=1.",
+    )
     args = parser.parse_args()
+
+    if args.ntx_local_pullback_finite_debug:
+        os.environ["NEOPAX_TRANSPORT_NTX_LOCAL_PULLBACK_FINITE_DEBUG"] = "1"
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -232,6 +281,7 @@ def main() -> None:
         )
 
     gradient_ad = None
+    ad_local_nan_debug = None
     if args.run_mode in ("both", "ad"):
         print(f"[autodiff-gate] progress: running adaptive custom AD ({args.adaptive_derivative_mode})", flush=True)
         if str(args.adaptive_derivative_mode).strip().lower() == "jvp":
@@ -242,6 +292,35 @@ def main() -> None:
             )
         else:
             gradient_ad = jax.jacrev(objective_fn)(jnp.asarray(baseline_value))
+        if args.ad_local_nan_debug:
+            grad_ad_np_local = np.asarray(jax.device_get(gradient_ad), dtype=float)
+            if not np.all(np.isfinite(grad_ad_np_local)):
+                print(
+                    "[autodiff-gate] progress: AD produced nonfinite values; running lane-local diagnostics",
+                    flush=True,
+                )
+                ad_local_nan_debug = _ad_lane_local_nan_diagnostics(
+                    baseline_value=baseline_value,
+                    objective_fn=objective_fn,
+                    config=config,
+                    runtime=runtime,
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    parameter_name=args.parameter,
+                    accepted_step_limit=args.accepted_step_limit,
+                )
+                rollout_diag = ad_local_nan_debug["rollout"]
+                print(
+                    "[autodiff-gate] ad local debug: "
+                    f"primal_objectives_finite={ad_local_nan_debug['primal_objectives_finite']} "
+                    f"final_state_finite={ad_local_nan_debug['final_state_finite']} "
+                    f"attempt_count={rollout_diag.get('attempt_count')} "
+                    f"accepted_count={rollout_diag.get('accepted_count')} "
+                    f"completed={rollout_diag.get('completed')} "
+                    f"failed={rollout_diag.get('failed')} "
+                    f"fail_code={rollout_diag.get('fail_code')}",
+                    flush=True,
+                )
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
@@ -310,6 +389,7 @@ def main() -> None:
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_autodiff": None if grad_ad_np is None else grad_ad_np.tolist(),
         "gradient_fd": None if grad_fd_np is None else grad_fd_np.tolist(),
+        "ad_local_nan_debug": ad_local_nan_debug,
         "gradient_absolute_error": None if abs_err is None else abs_err.tolist(),
         "gradient_relative_error": None if rel_err is None else rel_err.tolist(),
         "max_relative_error": max_rel_error,
