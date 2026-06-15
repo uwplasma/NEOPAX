@@ -72,15 +72,16 @@ def _print_summary(report: dict[str, Any]) -> None:
         f"fd_step={report['fd_step']:.6e} "
         f"replay_mode={report['replay_mode']}"
     )
-    diag = report["rollout_path"]["baseline"]
-    print(
-        f"[autodiff-gate] rollout baseline: "
-        f"attempt_count={diag.get('attempt_count')} "
-        f"accepted_count={diag.get('accepted_count')} "
-        f"completed={diag.get('completed')} "
-        f"failed={diag.get('failed')} "
-        f"fail_code={diag.get('fail_code')}"
-    )
+    diag = report["rollout_path"].get("baseline")
+    if diag is not None:
+        print(
+            f"[autodiff-gate] rollout baseline: "
+            f"attempt_count={diag.get('attempt_count')} "
+            f"accepted_count={diag.get('accepted_count')} "
+            f"completed={diag.get('completed')} "
+            f"failed={diag.get('failed')} "
+            f"fail_code={diag.get('fail_code')}"
+        )
     grad_ad = report.get("gradient_autodiff")
     grad_fd = report.get("gradient_fd")
     grad_abs = report.get("gradient_absolute_error")
@@ -187,21 +188,25 @@ def main() -> None:
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
 
-    print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
-    _, baseline_rollout = _forward_benchmark_adaptive_rollout_final_state_for_parameter(
-        jnp.asarray(baseline_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=args.parameter,
-        use_realized_schedule_jvp=False,
-    )
-    baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
-    replay_trace = _truncate_rollout_trace_by_accepted_steps(
-        baseline_rollout.trace,
-        args.accepted_step_limit,
-    )
+    baseline_rollout = None
+    baseline_diag = None
+    replay_trace = None
+    if args.run_mode in ("both", "fd"):
+        print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
+        _, baseline_rollout = _forward_benchmark_adaptive_rollout_final_state_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            use_realized_schedule_jvp=False,
+        )
+        baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+        replay_trace = _truncate_rollout_trace_by_accepted_steps(
+            baseline_rollout.trace,
+            args.accepted_step_limit,
+        )
 
     objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
         p,
