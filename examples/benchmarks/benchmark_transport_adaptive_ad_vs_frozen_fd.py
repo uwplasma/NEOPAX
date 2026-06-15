@@ -81,18 +81,29 @@ def _print_summary(report: dict[str, Any]) -> None:
         f"failed={diag.get('failed')} "
         f"fail_code={diag.get('fail_code')}"
     )
+    grad_ad = report.get("gradient_autodiff")
+    grad_fd = report.get("gradient_fd")
+    grad_abs = report.get("gradient_absolute_error")
+    grad_rel = report.get("gradient_relative_error")
     print("[autodiff-gate] objective errors:")
-    for label, ad, fd, ae, re in zip(
-        report["objective_labels"],
-        report["gradient_autodiff"],
-        report["gradient_fd"],
-        report["gradient_absolute_error"],
-        report["gradient_relative_error"],
-    ):
-        print(
-            f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
-            f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
-        )
+    if grad_ad is not None and grad_fd is not None:
+        for label, ad, fd, ae, re in zip(
+            report["objective_labels"],
+            grad_ad,
+            grad_fd,
+            grad_abs,
+            grad_rel,
+        ):
+            print(
+                f"  - {label}: ad={float(ad):.6e} fd={float(fd):.6e} "
+                f"abs_err={float(ae):.6e} rel_err={float(re):.6e}"
+            )
+    elif grad_ad is not None:
+        for label, ad in zip(report["objective_labels"], grad_ad):
+            print(f"  - {label}: ad={float(ad):.6e}")
+    elif grad_fd is not None:
+        for label, fd in zip(report["objective_labels"], grad_fd):
+            print(f"  - {label}: fd={float(fd):.6e}")
     frozen_diag = report.get("frozen_replay", {})
     if frozen_diag:
         minus = frozen_diag.get("minus", {})
@@ -158,6 +169,12 @@ def main() -> None:
         choices=("jvp", "vjp"),
         help="Adaptive realized-schedule derivative mode: forward custom JVP or reverse custom VJP.",
     )
+    parser.add_argument(
+        "--run-mode",
+        default="both",
+        choices=("both", "ad", "fd"),
+        help="Run adaptive AD only, frozen FD only, or both.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -196,48 +213,70 @@ def main() -> None:
         derivative_mode=args.adaptive_derivative_mode,
     )
 
-    print(f"[autodiff-gate] progress: running adaptive custom AD ({args.adaptive_derivative_mode})", flush=True)
-    if str(args.adaptive_derivative_mode).strip().lower() == "jvp":
-        _, gradient_ad = jax.jvp(
-            objective_fn,
-            (jnp.asarray(baseline_value),),
-            (jnp.asarray(1.0),),
-        )
-    else:
-        gradient_ad = jax.jacrev(objective_fn)(jnp.asarray(baseline_value))
+    gradient_ad = None
+    if args.run_mode in ("both", "ad"):
+        print(f"[autodiff-gate] progress: running adaptive custom AD ({args.adaptive_derivative_mode})", flush=True)
+        if str(args.adaptive_derivative_mode).strip().lower() == "jvp":
+            _, gradient_ad = jax.jvp(
+                objective_fn,
+                (jnp.asarray(baseline_value),),
+                (jnp.asarray(1.0),),
+            )
+        else:
+            gradient_ad = jax.jacrev(objective_fn)(jnp.asarray(baseline_value))
 
     minus_value = baseline_value - fd_step
     plus_value = baseline_value + fd_step
 
-    print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
-    objectives_minus, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-        jnp.asarray(minus_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=args.parameter,
-        frozen_trace=replay_trace,
-        replay_mode=args.replay_mode,
-    )
-    print(f"[autodiff-gate] progress: running frozen fd_plus replay ({args.replay_mode})", flush=True)
-    objectives_plus, plus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-        jnp.asarray(plus_value),
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=args.parameter,
-        frozen_trace=replay_trace,
-        replay_mode=args.replay_mode,
-    )
+    objectives_minus = None
+    objectives_plus = None
+    minus_replay = None
+    plus_replay = None
+    gradient_fd = None
+    if args.run_mode in ("both", "fd"):
+        print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
+        objectives_minus, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+            jnp.asarray(minus_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            frozen_trace=replay_trace,
+            replay_mode=args.replay_mode,
+        )
+        print(f"[autodiff-gate] progress: running frozen fd_plus replay ({args.replay_mode})", flush=True)
+        objectives_plus, plus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+            jnp.asarray(plus_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            frozen_trace=replay_trace,
+            replay_mode=args.replay_mode,
+        )
+        gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
 
-    gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
-
-    grad_ad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
-    grad_fd_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
-    abs_err = np.abs(grad_ad_np - grad_fd_np)
-    rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+    grad_ad_np = None if gradient_ad is None else np.asarray(jax.device_get(gradient_ad), dtype=float)
+    grad_fd_np = None if gradient_fd is None else np.asarray(jax.device_get(gradient_fd), dtype=float)
+    if grad_ad_np is not None and grad_fd_np is not None:
+        abs_err = np.abs(grad_ad_np - grad_fd_np)
+        rel_err = abs_err / np.maximum(np.abs(grad_fd_np), 1.0e-10)
+        max_rel_error = float(np.max(rel_err))
+        passed = bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2)
+    elif grad_ad_np is not None:
+        abs_err = None
+        rel_err = None
+        max_rel_error = float("nan")
+        passed = bool(np.all(np.isfinite(grad_ad_np)))
+    elif grad_fd_np is not None:
+        abs_err = None
+        rel_err = None
+        max_rel_error = float("nan")
+        passed = bool(np.all(np.isfinite(grad_fd_np)))
+    else:
+        raise ValueError("run_mode must execute at least one lane.")
 
     report = {
         "adaptive_ad_vs_frozen_fd_check": True,
@@ -247,21 +286,22 @@ def main() -> None:
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
         "adaptive_derivative_mode": str(args.adaptive_derivative_mode),
+        "run_mode": str(args.run_mode),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "objective_labels": OBJECTIVE_LABELS,
-        "gradient_autodiff": grad_ad_np.tolist(),
-        "gradient_fd": grad_fd_np.tolist(),
-        "gradient_absolute_error": abs_err.tolist(),
-        "gradient_relative_error": rel_err.tolist(),
-        "max_relative_error": float(np.max(rel_err)),
-        "passed": bool(np.all(np.isfinite(rel_err)) and np.max(rel_err) <= 5.0e-2),
+        "gradient_autodiff": None if grad_ad_np is None else grad_ad_np.tolist(),
+        "gradient_fd": None if grad_fd_np is None else grad_fd_np.tolist(),
+        "gradient_absolute_error": None if abs_err is None else abs_err.tolist(),
+        "gradient_relative_error": None if rel_err is None else rel_err.tolist(),
+        "max_relative_error": max_rel_error,
+        "passed": passed,
         "rollout_path": {
             "baseline": baseline_diag,
-            "frozen_fd_minus_state_finite": _tree_all_finite(minus_replay["final_state"]),
-            "frozen_fd_plus_state_finite": _tree_all_finite(plus_replay["final_state"]),
+            "frozen_fd_minus_state_finite": None if minus_replay is None else _tree_all_finite(minus_replay["final_state"]),
+            "frozen_fd_plus_state_finite": None if plus_replay is None else _tree_all_finite(plus_replay["final_state"]),
         },
-        "frozen_replay": {
+        "frozen_replay": None if minus_replay is None or plus_replay is None else {
             "minus": _replay_diagnostics(minus_replay, objectives_minus),
             "plus": _replay_diagnostics(plus_replay, objectives_plus),
         },
