@@ -19,7 +19,9 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     ALLOWED_PARAMETERS,
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
+    _accepted_time_list_from_trace,
     _adaptive_rollout_diagnostics,
+    _adaptive_rollout_objectives_for_parameter_on_time_list,
     _baseline_profile_cfg,
     _fd_step,
     _frozen_replay_nonfinite_debug,
@@ -180,6 +182,14 @@ def _print_summary(report: dict[str, Any]) -> None:
             print(f"  - {label}: fd={float(fd):.6e}")
     frozen_diag = report.get("frozen_replay", {})
     if frozen_diag:
+        baseline_fixed = frozen_diag.get("baseline_fixed_dt", {})
+        if baseline_fixed:
+            print(
+                "[autodiff-gate] frozen replay baseline fixed-dt: "
+                f"objectives_finite={baseline_fixed.get('objectives_finite')} "
+                f"final_state_finite={baseline_fixed.get('final_state_finite')} "
+                f"final_carry_finite={baseline_fixed.get('final_carry_finite')}"
+            )
         minus = frozen_diag.get("minus", {})
         plus = frozen_diag.get("plus", {})
         print(
@@ -498,10 +508,23 @@ def main() -> None:
     objectives_plus = None
     minus_replay = None
     plus_replay = None
+    baseline_fixed_dt_replay = None
+    baseline_fixed_dt_objectives = None
     gradient_fd = None
     minus_nonfinite_debug = None
     plus_nonfinite_debug = None
     if args.run_mode in ("both", "fd"):
+        if str(args.replay_mode).strip().lower() == "accepted":
+            accepted_time_list = _accepted_time_list_from_trace(replay_trace)
+            baseline_fixed_dt_objectives, baseline_fixed_dt_replay = _adaptive_rollout_objectives_for_parameter_on_time_list(
+                jnp.asarray(baseline_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                time_list=accepted_time_list,
+            )
         print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
         objectives_minus, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             jnp.asarray(minus_value),
@@ -594,6 +617,11 @@ def main() -> None:
             "frozen_fd_plus_state_finite": None if plus_replay is None else _tree_all_finite(plus_replay["final_state"]),
         },
         "frozen_replay": None if minus_replay is None or plus_replay is None else {
+            "baseline_fixed_dt": (
+                {}
+                if baseline_fixed_dt_replay is None
+                else _replay_diagnostics(baseline_fixed_dt_replay, baseline_fixed_dt_objectives)
+            ),
             "minus": _replay_diagnostics(minus_replay, objectives_minus) | {"nonfinite_debug": minus_nonfinite_debug},
             "plus": _replay_diagnostics(plus_replay, objectives_plus) | {"nonfinite_debug": plus_nonfinite_debug},
         },
