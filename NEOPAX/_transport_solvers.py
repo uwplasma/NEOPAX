@@ -2289,6 +2289,14 @@ class _RadauAcceptedStepBackwardPayloadCandidate:
     lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    real_lu: Any
+    real_piv: Any
+    complex_lu: Any
+    complex_piv: Any
     y_end: Any
 
 
@@ -2337,6 +2345,14 @@ class _RadauAdaptiveRolloutTrace:
     lagged_response_cache: Any
     lagged_response_valid: Any
     lagged_reference_y: Any
+    jacobian: Any
+    cache_valid: Any
+    cache_dt: Any
+    cache_age: Any
+    real_lu: Any
+    real_piv: Any
+    complex_lu: Any
+    complex_piv: Any
     y_end: Any
     err_norms: Any
     theta_finals: Any
@@ -4995,6 +5011,14 @@ def _radau_adaptive_payload_trace_rollout(
             lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=carry.lagged_response_valid,
             lagged_reference_y=carry.lagged_reference_y,
+            jacobian=carry.jacobian,
+            cache_valid=carry.cache_valid,
+            cache_dt=carry.cache_dt,
+            cache_age=carry.cache_age,
+            real_lu=carry.real_lu,
+            real_piv=carry.real_piv,
+            complex_lu=carry.complex_lu,
+            complex_piv=carry.complex_piv,
             y_end=carry.y,
         )
 
