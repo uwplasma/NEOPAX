@@ -221,6 +221,14 @@ def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | 
     )
 
 
+def _accepted_time_list_from_trace(trace) -> list[float]:
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+    keep = np.logical_and(active_mask, accepted_mask)
+    return step_ts[keep].tolist()
+
+
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
     return {
         "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
@@ -492,6 +500,19 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     frozen_trace,
     replay_mode: str = "attempt",
 ):
+    replay_mode_normalized = str(replay_mode).strip().lower()
+    if replay_mode_normalized == "accepted":
+        accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
+        return _adaptive_rollout_objectives_for_parameter_on_time_list(
+            parameter_value,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=parameter_name,
+            time_list=accepted_time_list,
+        )
+
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -517,7 +538,7 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         prepared_rollout,
         execution_context,
         frozen_trace,
-        replay_mode=replay_mode,
+        replay_mode=replay_mode_normalized,
     )
     return _objective_vector(replay["final_state"], runtime), replay
 
