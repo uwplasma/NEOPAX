@@ -4852,6 +4852,8 @@ def _radau_forward_fd_fixed_dt_accepted_rollout(
 ) -> _RadauAcceptedRolloutResult:
     """Forward/FD benchmark accepted-rollout helper with scratch semantics."""
 
+    dtype = kernel_context.dtype
+
     def _scan_body(carry, dt_value):
         carry_for_step = dataclasses.replace(carry, dt=dt_value)
         attempt_context = _RadauAcceptedStepAttemptContext(
@@ -4868,11 +4870,13 @@ def _radau_forward_fd_fixed_dt_accepted_rollout(
             step_map_result.next_carry,
             prev_error=jnp.maximum(
                 step_map_result.err_norm,
-                jnp.asarray(1.0e-12, dtype=kernel_context.dtype),
+                jnp.asarray(1.0e-12, dtype=dtype),
             ),
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_valid=jnp.asarray(False),
+            lagged_reference_y=step_map_result.accepted_y,
         )
         scan_out = (
             step_map_result.accepted_y,
@@ -4929,6 +4933,8 @@ def _radau_forward_fd_replay_realized_accepted_rollout(
                 recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
                 regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
                 easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                lagged_response_valid=jnp.asarray(False),
+                lagged_reference_y=step_map_result.accepted_y,
             )
             scan_out = (
                 step_map_result.accepted_y,
