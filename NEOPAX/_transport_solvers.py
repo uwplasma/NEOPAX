@@ -4662,15 +4662,167 @@ def _radau_fixed_dt_accepted_rollout(
     carry0: _RadauAcceptedStepCarry,
     dt_sequence,
 ) -> _RadauAcceptedRolloutResult:
-    """AD-facing accepted-rollout helper over an explicit fixed `dt` sequence.
+    """Reverse-lane accepted-rollout helper over an explicit fixed `dt` sequence.
 
-    This helper is intentionally separate from the production adaptive loop.
-    It advances the accepted-step carry by replaying a caller-provided `dt`
-    sequence and updating the solver carry as if each step were accepted.
-
-    The purpose is to provide a cleaner differentiable map than the raw
-    adaptive production trace, without changing production forward behavior.
+    Forward AD and frozen-FD benchmark lanes keep their own scratch-compatible
+    replay helpers so that reverse-only replay experiments can evolve without
+    silently changing the forward benchmark contract.
     """
+
+    def _scan_body(carry, dt_value):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=carry.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
+        )
+        step_map_result = _radau_apply_accepted_step_map(
+            kernel_context,
+            physics_context,
+            carry_for_step,
+            attempt_context,
+        )
+        keep_lagged_response = jnp.asarray(False)
+        if kernel_context.use_transport_lagged_response:
+            lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+            lagged_reuse_metric = _lagged_response_global_reuse_metric(
+                step_map_result.accepted_y,
+                carry.lagged_reference_y,
+                atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=kernel_context.dtype),
+                rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=kernel_context.dtype),
+            )
+            keep_lagged_response = jnp.logical_and(
+                jnp.asarray(True),
+                jnp.logical_and(
+                    jnp.asarray(lagged_reuse_global),
+                    lagged_reuse_metric <= jnp.asarray(1.0, dtype=kernel_context.dtype),
+                ),
+            )
+        next_carry = dataclasses.replace(
+            step_map_result.next_carry,
+            prev_error=jnp.maximum(
+                step_map_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=kernel_context.dtype),
+            ),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_cache=carry.lagged_response_cache,
+            lagged_response_valid=keep_lagged_response,
+            lagged_reference_y=carry.lagged_reference_y,
+        )
+        scan_out = (
+            step_map_result.accepted_y,
+            step_map_result.err_norm,
+            step_map_result.converged,
+            step_map_result.accepted_dt,
+        )
+        return next_carry, scan_out
+
+    final_carry, scan_outputs = jax.lax.scan(_scan_body, carry0, dt_sequence)
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    return _RadauAcceptedRolloutResult(
+        final_carry=final_carry,
+        final_y=final_carry.y,
+        trial_ys=trial_ys,
+        err_norms=err_norms,
+        converged_mask=converged_mask,
+        accepted_dts=accepted_dts,
+    )
+
+
+def _radau_replay_realized_accepted_step_map_rollout(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry0: _RadauAcceptedStepCarry,
+    accepted_mask,
+    dt_sequence,
+) -> _RadauAcceptedRolloutResult:
+    """Reverse-lane replay of the realized accepted-step physical map."""
+
+    dtype = kernel_context.dtype
+
+    def _scan_body(carry, xs):
+        accepted, dt_value = xs
+
+        def _do_step(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+            attempt_context = _RadauAcceptedStepAttemptContext(
+                t_final=carry.t + dt_value,
+                use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
+            )
+            step_map_result = _radau_apply_accepted_step_map(
+                kernel_context,
+                physics_context,
+                carry_for_step,
+                attempt_context,
+            )
+            keep_lagged_response = jnp.asarray(False)
+            if kernel_context.use_transport_lagged_response:
+                lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+                lagged_reuse_metric = _lagged_response_global_reuse_metric(
+                    step_map_result.accepted_y,
+                    carry.lagged_reference_y,
+                    atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
+                    rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+                )
+                keep_lagged_response = jnp.logical_and(
+                    jnp.asarray(True),
+                    jnp.logical_and(
+                        jnp.asarray(lagged_reuse_global),
+                        lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
+                    ),
+                )
+            next_carry = dataclasses.replace(
+                step_map_result.next_carry,
+                prev_error=jnp.maximum(
+                    step_map_result.err_norm,
+                    jnp.asarray(1.0e-12, dtype=dtype),
+                ),
+                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                lagged_response_cache=carry.lagged_response_cache,
+                lagged_response_valid=keep_lagged_response,
+                lagged_reference_y=carry.lagged_reference_y,
+            )
+            scan_out = (
+                step_map_result.accepted_y,
+                step_map_result.err_norm,
+                step_map_result.converged,
+                dt_value,
+            )
+            return next_carry, scan_out
+
+        def _skip(_):
+            scan_out = (
+                carry.y,
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(False),
+                jnp.asarray(0.0, dtype=dtype),
+            )
+            return carry, scan_out
+
+        return jax.lax.cond(accepted, _do_step, _skip, operand=None)
+
+    final_carry, scan_outputs = jax.lax.scan(_scan_body, carry0, (accepted_mask, dt_sequence))
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    return _RadauAcceptedRolloutResult(
+        final_carry=final_carry,
+        final_y=final_carry.y,
+        trial_ys=trial_ys,
+        err_norms=err_norms,
+        converged_mask=converged_mask,
+        accepted_dts=accepted_dts,
+    )
+
+
+def _radau_forward_fd_fixed_dt_accepted_rollout(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry0: _RadauAcceptedStepCarry,
+    dt_sequence,
+) -> _RadauAcceptedRolloutResult:
+    """Forward/FD benchmark accepted-rollout helper with scratch semantics."""
 
     def _scan_body(carry, dt_value):
         carry_for_step = dataclasses.replace(carry, dt=dt_value)
@@ -4714,14 +4866,14 @@ def _radau_fixed_dt_accepted_rollout(
     )
 
 
-def _radau_replay_realized_accepted_step_map_rollout(
+def _radau_forward_fd_replay_realized_accepted_rollout(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry0: _RadauAcceptedStepCarry,
     accepted_mask,
     dt_sequence,
 ) -> _RadauAcceptedRolloutResult:
-    """Replay only the realized accepted-step physical map along a fixed schedule."""
+    """Forward/FD benchmark replay of realized accepted steps with scratch semantics."""
 
     dtype = kernel_context.dtype
 
@@ -5101,6 +5253,40 @@ def _radau_run_prepared_on_time_list(
     }
 
 
+def _radau_forward_fd_run_prepared_on_time_list(
+    prepared_rollout: _PreparedRadauAcceptedRollout,
+    time_list,
+) -> dict[str, Any]:
+    """Forward/FD benchmark replay on an absolute accepted-time list.
+
+    This keeps the pre-reverse scratch semantics for forward AD and frozen FD
+    benchmarks independent from the reverse replay lane.
+    """
+
+    t0 = prepared_rollout.initial_carry.t
+    dt_sequence = _radau_dt_sequence_from_time_list(
+        time_list,
+        t0=t0,
+        dtype=prepared_rollout.kernel_context.dtype,
+    )
+    rollout = _radau_forward_fd_fixed_dt_accepted_rollout(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        prepared_rollout.initial_carry,
+        dt_sequence,
+    )
+    saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(rollout.trial_ys)
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return {
+        "time_list": jnp.asarray(time_list, dtype=prepared_rollout.kernel_context.dtype),
+        "dt_sequence": dt_sequence,
+        "saved_states": saved_states,
+        "final_state": final_state,
+        "final_carry": rollout.final_carry,
+        "rollout": rollout,
+    }
+
+
 def _radau_run_prepared_on_realized_trace(
     prepared_rollout: _PreparedRadauAcceptedRollout,
     execution_context: _RadauSolveExecutionContext,
@@ -5132,6 +5318,58 @@ def _radau_run_prepared_on_realized_trace(
             prepared_rollout.physics_context,
             carry_start,
             jax.lax.stop_gradient(jnp.logical_and(trace.active_mask, trace.accepted_mask)),
+            jax.lax.stop_gradient(trace.attempted_dts),
+        )
+    else:
+        raise ValueError(
+            "replay_mode must be one of {'attempt', 'accepted'} "
+            f"but got {replay_mode!r}."
+        )
+
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return {
+        "final_state": final_state,
+        "final_carry": rollout.final_carry,
+        "rollout": rollout,
+        "replay_mode": replay_mode_normalized,
+    }
+
+
+def _radau_forward_fd_run_prepared_on_realized_trace(
+    prepared_rollout: _PreparedRadauAcceptedRollout,
+    execution_context: _RadauSolveExecutionContext,
+    trace: _RadauAdaptiveRolloutTrace,
+    *,
+    replay_mode: str = "attempt",
+    carry0: _RadauAcceptedStepCarry | None = None,
+) -> dict[str, Any]:
+    """Forward/FD benchmark replay on a frozen adaptive trace.
+
+    This is the scratch-compatible forward/FD benchmark contract. Reverse
+    benchmarks intentionally use their own replay helpers.
+    """
+
+    replay_mode_normalized = str(replay_mode).strip().lower()
+    carry_start = prepared_rollout.initial_carry if carry0 is None else carry0
+    if replay_mode_normalized == "attempt":
+        rollout = _radau_replay_realized_attempt_rollout(
+            execution_context,
+            carry_start,
+            jax.lax.stop_gradient(trace.active_mask),
+            jax.lax.stop_gradient(trace.accepted_mask),
+            jax.lax.stop_gradient(trace.attempted_dts),
+            jax.lax.stop_gradient(trace.next_dts),
+            jax.lax.stop_gradient(trace.next_recent_reject_count),
+            jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+            jax.lax.stop_gradient(trace.next_easy_growth_streak),
+            jax.lax.stop_gradient(trace.next_lagged_response_valid),
+        )
+    elif replay_mode_normalized == "accepted":
+        rollout = _radau_forward_fd_replay_realized_accepted_rollout(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            carry_start,
+            jax.lax.stop_gradient(trace.accepted_mask),
             jax.lax.stop_gradient(trace.attempted_dts),
         )
     else:

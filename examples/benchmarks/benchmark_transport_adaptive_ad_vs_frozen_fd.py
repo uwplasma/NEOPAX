@@ -147,6 +147,15 @@ def _print_summary(report: dict[str, Any]) -> None:
             f"t_final={solver_settings.get('t_final')} "
             f"dt={solver_settings.get('dt')}"
         )
+    geometry_settings = report.get("geometry_settings")
+    if geometry_settings is not None:
+        print(
+            "[autodiff-gate] geometry settings: "
+            f"backend={geometry_settings.get('backend')} "
+            f"vmec_file={geometry_settings.get('vmec_file')} "
+            f"boozer_file={geometry_settings.get('boozer_file')} "
+            f"ntx_exact_surface_backend={geometry_settings.get('ntx_exact_surface_backend')}"
+        )
     diag = report["rollout_path"].get("baseline")
     if diag is not None:
         print(
@@ -361,6 +370,8 @@ def main() -> None:
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
     solver_cfg = dict(config.get("transport_solver", {}))
+    geometry_cfg = dict(config.get("geometry", {}))
+    neoclassical_cfg = dict(config.get("neoclassical", {}))
 
     baseline_rollout = None
     baseline_diag = None
@@ -602,6 +613,12 @@ def main() -> None:
             "t0": solver_cfg.get("t0"),
             "t_final": solver_cfg.get("t_final"),
             "dt": solver_cfg.get("dt"),
+        },
+        "geometry_settings": {
+            "backend": geometry_cfg.get("backend"),
+            "vmec_file": geometry_cfg.get("vmec_file"),
+            "boozer_file": geometry_cfg.get("boozer_file"),
+            "ntx_exact_surface_backend": neoclassical_cfg.get("ntx_exact_surface_backend"),
         },
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_autodiff": None if grad_ad_np is None else grad_ad_np.tolist(),

@@ -326,6 +326,8 @@ def _adaptive_rollout_final_state_for_parameter(
     parameter_name: str,
     use_realized_schedule_jvp: bool = False,
     accepted_step_limit_override: int | None = None,
+    use_schedule_trace_only: bool = False,
+    use_payload_trace: bool = False,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,

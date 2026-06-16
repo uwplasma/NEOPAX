@@ -430,3 +430,126 @@ It is:
 - compare against the trusted `T0` table
 - only then decide whether further scalar cleanup is still needed before moving
   into vector-lane restoration
+
+## Current State: accepted-step FD lane diagnosis
+
+This section records the latest scalar frozen-FD investigation state for the
+`T0` lane so the next session can resume from the current narrowed diagnosis.
+
+### Current command under investigation
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode fd --fd-rel-step 3e-8 --fd-abs-step 1e-10 --replay-mode accepted
+```
+
+### Confirmed runtime path
+
+The benchmark now prints solver settings directly. The current run confirms the
+forward/frozen-FD lane is using:
+
+- `backend=radau`
+- `integrator=radau`
+- `radau_rhs_mode=lagged_response`
+- `radau_num_stages=7`
+- `t0=0.0`
+- `t_final=0.01`
+- `dt=1e-05`
+
+### Key accepted-FD finding
+
+The important ambiguity is now resolved:
+
+- the accepted-step FD lane is still wrong **before perturbing `T0`**
+- the unperturbed baseline fixed-dt replay is already nonfinite
+
+Observed line:
+
+- `frozen replay baseline fixed-dt: objectives_finite=False final_state_finite=False final_carry_finite=False`
+
+So this is **not** currently a finite-difference step-size issue.
+
+### Localized failure location
+
+For baseline fixed accepted-step replay and for both `fd_minus` / `fd_plus`,
+the first bad accepted step is:
+
+- `first_bad_index=147`
+- `first_bad_was_accepted=True`
+- `first_bad_accepted_ordinal=90`
+- `first_bad_dt=2.0831628433823396e-05`
+
+accepted-window around the first bad accepted step:
+
+- accepted ordinal `88`, trace index `144`, finite
+- accepted ordinal `89`, trace index `145`, finite
+- accepted ordinal `90`, trace index `147`, nonfinite
+- accepted ordinal `91`, trace index `150`, nonfinite
+- accepted ordinal `92`, trace index `152`, nonfinite
+
+This means the accepted-step replay diverges starting at accepted step 90 of
+the baseline chronology.
+
+### Important structural conclusion
+
+Because the baseline fixed accepted-step replay already fails:
+
+- the accepted-step FD bug is currently in the frozen accepted-step replay
+  contract itself
+- it is **not** yet a perturbation-size issue
+- it is **not** evidence that rejected steps are still being replayed
+
+### Latest implementation fix applied
+
+The latest identified mismatch was in
+`NEOPAX/_transport_solvers.py`:
+
+- `_radau_fixed_dt_accepted_rollout(...)`
+- `_radau_replay_realized_accepted_step_map_rollout(...)`
+
+These helpers had been carrying `step_map_result.next_carry` too literally,
+while the real adaptive accepted branch preserves the lagged-response
+cache/reference fields differently after acceptance.
+
+They were updated to make the fixed accepted-step replay mirror the adaptive
+accepted branch's lagged-cache carry semantics more closely:
+
+- preserve `lagged_response_cache` from the incoming carry
+- preserve `lagged_reference_y` from the incoming carry
+- recompute `lagged_response_valid` using the same
+  `global_state_drift` reuse criterion structure used by the adaptive accepted
+  branch
+
+This is the latest patch that still needs rerun validation.
+
+### Latest benchmark-script diagnostics added
+
+The scalar benchmark script now also records:
+
+- solver settings in the summary
+- baseline fixed-dt replay finiteness for `--replay-mode accepted`
+- first bad accepted-step ordinal
+- accepted-step local window around the first bad accepted step
+
+So the same scalar FD command above is now the correct probe to validate the
+accepted-step frozen replay contract.
+
+### Exact next-session first command
+
+Rerun exactly:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --ntx-exact-derivative-mode direct --parameter T0 --adaptive-derivative-mode jvp --run-mode fd --fd-rel-step 3e-8 --fd-abs-step 1e-10 --replay-mode accepted
+```
+
+Primary success criterion for that rerun:
+
+- `frozen replay baseline fixed-dt: objectives_finite=True final_state_finite=True final_carry_finite=True`
+
+If that becomes finite, then:
+
+- the accepted-step frozen replay contract is much closer to correct
+- only after that should `fd_minus` / `fd_plus` values be interpreted again
+
+If baseline fixed-dt is still nonfinite, the next debugging target should stay
+inside the accepted-step fixed replay semantics rather than revisiting FD step
+size or AD comparisons.
