@@ -133,6 +133,18 @@ def _print_summary(report: dict[str, Any]) -> None:
         f"fd_step={report['fd_step']:.6e} "
         f"replay_mode={report['replay_mode']}"
     )
+    solver_settings = report.get("solver_settings")
+    if solver_settings is not None:
+        print(
+            "[autodiff-gate] solver settings: "
+            f"backend={solver_settings.get('backend')} "
+            f"integrator={solver_settings.get('integrator')} "
+            f"radau_rhs_mode={solver_settings.get('radau_rhs_mode')} "
+            f"radau_num_stages={solver_settings.get('radau_num_stages')} "
+            f"t0={solver_settings.get('t0')} "
+            f"t_final={solver_settings.get('t_final')} "
+            f"dt={solver_settings.get('dt')}"
+        )
     diag = report["rollout_path"].get("baseline")
     if diag is not None:
         print(
@@ -308,6 +320,7 @@ def main() -> None:
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+    solver_cfg = dict(config.get("transport_solver", {}))
 
     baseline_rollout = None
     baseline_diag = None
@@ -528,6 +541,15 @@ def main() -> None:
         "run_mode": str(args.run_mode),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "solver_settings": {
+            "backend": solver_cfg.get("transport_solver_backend"),
+            "integrator": solver_cfg.get("integrator"),
+            "radau_rhs_mode": solver_cfg.get("radau_rhs_mode"),
+            "radau_num_stages": solver_cfg.get("radau_num_stages"),
+            "t0": solver_cfg.get("t0"),
+            "t_final": solver_cfg.get("t_final"),
+            "dt": solver_cfg.get("dt"),
+        },
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_autodiff": None if grad_ad_np is None else grad_ad_np.tolist(),
         "gradient_fd": None if grad_fd_np is None else grad_fd_np.tolist(),
