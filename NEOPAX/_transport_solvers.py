@@ -2750,12 +2750,7 @@ def _radau_backward_payload_candidate(
     carry_in: _RadauAcceptedStepCarry,
     attempt_result: _RadauAcceptedStepAttemptResult,
 ) -> _RadauAcceptedStepBackwardPayloadCandidate:
-    """Candidate minimal payload for future accepted-step backward rules.
-
-    This is intentionally conservative: it keeps predictor and lagged-response
-    context, but excludes controller bookkeeping and recomputable Jacobian/LU
-    caches.
-    """
+    """Candidate payload for accepted-step replay and backward rules."""
     return _RadauAcceptedStepBackwardPayloadCandidate(
         t_start=carry_in.t,
         y_start=carry_in.y,
@@ -2767,6 +2762,14 @@ def _radau_backward_payload_candidate(
         lagged_response_cache=carry_in.lagged_response_cache,
         lagged_response_valid=carry_in.lagged_response_valid,
         lagged_reference_y=carry_in.lagged_reference_y,
+        jacobian=carry_in.jacobian,
+        cache_valid=carry_in.cache_valid,
+        cache_dt=carry_in.cache_dt,
+        cache_age=carry_in.cache_age,
+        real_lu=carry_in.real_lu,
+        real_piv=carry_in.real_piv,
+        complex_lu=carry_in.complex_lu,
+        complex_piv=carry_in.complex_piv,
         y_end=attempt_result.trial_y,
     )
 
