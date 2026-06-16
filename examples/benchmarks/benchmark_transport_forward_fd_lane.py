@@ -206,20 +206,19 @@ def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> floa
 def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | None):
     if accepted_step_limit is None:
         return trace
-    accepted_limit = int(max(0, accepted_step_limit))
-    accepted_mask_np = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
-    active_mask_np = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
-    accepted_seen = 0
-    keep = np.zeros_like(active_mask_np, dtype=bool)
-    for idx, (active, accepted) in enumerate(zip(active_mask_np, accepted_mask_np, strict=False)):
-        if not active:
-            continue
-        if accepted_seen >= accepted_limit:
-            break
-        keep[idx] = True
-        if accepted:
-            accepted_seen += 1
-    return jax.tree_util.tree_map(lambda x: x[keep], trace)
+    accepted_step_limit = int(accepted_step_limit)
+    if accepted_step_limit <= 0:
+        raise ValueError("accepted_step_limit must be positive when provided.")
+
+    accepted_mask = jnp.asarray(trace.accepted_mask, dtype=bool)
+    active_mask = jnp.asarray(trace.active_mask, dtype=bool)
+    accepted_prefix_count = jnp.cumsum(accepted_mask.astype(jnp.int32))
+    keep_mask = jnp.logical_and(active_mask, accepted_prefix_count <= accepted_step_limit)
+    return dataclasses.replace(
+        trace,
+        active_mask=keep_mask,
+        accepted_mask=jnp.logical_and(accepted_mask, keep_mask),
+    )
 
 
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
