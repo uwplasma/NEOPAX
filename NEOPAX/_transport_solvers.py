@@ -5872,6 +5872,14 @@ def _radau_adaptive_final_state_rollout(
             lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=carry.lagged_response_valid,
             lagged_reference_y=carry.lagged_reference_y,
+            jacobian=carry.jacobian,
+            cache_valid=carry.cache_valid,
+            cache_dt=carry.cache_dt,
+            cache_age=carry.cache_age,
+            real_lu=carry.real_lu,
+            real_piv=carry.real_piv,
+            complex_lu=carry.complex_lu,
+            complex_piv=carry.complex_piv,
             y_end=carry.y,
         )
 
