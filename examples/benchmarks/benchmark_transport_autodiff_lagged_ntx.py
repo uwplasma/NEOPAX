@@ -3451,7 +3451,17 @@ def _frozen_replay_nonfinite_debug(
     baseline_err_norms = np.asarray(jax.device_get(replay_trace.err_norms), dtype=float)
 
     active_indices = np.where(active_mask)[0]
-    active_state_finite = state_finite_mask[active_mask]
+    if state_finite_mask.shape[0] == active_mask.shape[0]:
+        active_state_finite = state_finite_mask[active_mask]
+    elif state_finite_mask.shape[0] == int(np.sum(np.logical_and(active_mask, accepted_mask))):
+        active_state_finite = np.ones(active_indices.shape[0], dtype=bool)
+        accepted_active_positions = np.where(accepted_mask[active_indices])[0]
+        active_state_finite[accepted_active_positions] = state_finite_mask
+    else:
+        raise ValueError(
+            "Replay nonfinite debug expected trial_ys length to match either full trace length "
+            "or accepted-active trace length."
+        )
     bad_positions = np.where(~active_state_finite)[0]
     first_bad_index = int(active_indices[bad_positions[0]]) if bad_positions.size > 0 else -1
 
