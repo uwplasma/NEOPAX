@@ -202,6 +202,7 @@ def _print_summary(report: dict[str, Any]) -> None:
                 "[autodiff-gate] frozen replay minus nonfinite debug: "
                 f"first_bad_index={minus_nf.get('first_bad_index')} "
                 f"first_bad_was_accepted={minus_nf.get('first_bad_was_accepted')} "
+                f"first_bad_accepted_ordinal={minus_nf.get('first_bad_accepted_ordinal')} "
                 f"first_bad_dt={minus_nf.get('first_bad_dt')} "
                 f"final_state_finite={minus_nf.get('final_state_finite')} "
                 f"objectives_finite={minus_nf.get('objectives_finite')}"
@@ -217,12 +218,27 @@ def _print_summary(report: dict[str, Any]) -> None:
                     f"baseline_err_norm={entry.get('baseline_err_norm')} "
                     f"replay_state_finite={entry.get('replay_state_finite')}"
                 )
+            local_accepted_window = minus_nf.get("local_accepted_window") or []
+            if local_accepted_window:
+                print("  accepted-window:",)
+                for entry in local_accepted_window:
+                    print(
+                        "  "
+                        f"accepted_ordinal={entry.get('accepted_ordinal')} "
+                        f"trace_index={entry.get('trace_index')} "
+                        f"attempted_dt={entry.get('attempted_dt')} "
+                        f"next_dt={entry.get('next_dt')} "
+                        f"time={entry.get('time')} "
+                        f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                        f"replay_state_finite={entry.get('replay_state_finite')}"
+                    )
         plus_nf = plus.get("nonfinite_debug")
         if plus_nf is not None:
             print(
                 "[autodiff-gate] frozen replay plus nonfinite debug: "
                 f"first_bad_index={plus_nf.get('first_bad_index')} "
                 f"first_bad_was_accepted={plus_nf.get('first_bad_was_accepted')} "
+                f"first_bad_accepted_ordinal={plus_nf.get('first_bad_accepted_ordinal')} "
                 f"first_bad_dt={plus_nf.get('first_bad_dt')} "
                 f"final_state_finite={plus_nf.get('final_state_finite')} "
                 f"objectives_finite={plus_nf.get('objectives_finite')}"
@@ -238,6 +254,20 @@ def _print_summary(report: dict[str, Any]) -> None:
                     f"baseline_err_norm={entry.get('baseline_err_norm')} "
                     f"replay_state_finite={entry.get('replay_state_finite')}"
                 )
+            local_accepted_window = plus_nf.get("local_accepted_window") or []
+            if local_accepted_window:
+                print("  accepted-window:",)
+                for entry in local_accepted_window:
+                    print(
+                        "  "
+                        f"accepted_ordinal={entry.get('accepted_ordinal')} "
+                        f"trace_index={entry.get('trace_index')} "
+                        f"attempted_dt={entry.get('attempted_dt')} "
+                        f"next_dt={entry.get('next_dt')} "
+                        f"time={entry.get('time')} "
+                        f"baseline_err_norm={entry.get('baseline_err_norm')} "
+                        f"replay_state_finite={entry.get('replay_state_finite')}"
+                    )
 
 
 def main() -> None:

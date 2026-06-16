@@ -3467,8 +3467,12 @@ def _frozen_replay_nonfinite_debug(
         )
     bad_positions = np.where(~active_state_finite)[0]
     first_bad_index = int(active_indices[bad_positions[0]]) if bad_positions.size > 0 else -1
+    accepted_active_indices = active_indices[accepted_mask[active_indices]]
+    accepted_bad_positions = np.where(~trace_state_finite[accepted_active_indices])[0]
+    first_bad_accepted_ordinal = int(accepted_bad_positions[0]) if accepted_bad_positions.size > 0 else -1
 
     local_attempt_window: list[dict[str, Any]] = []
+    local_accepted_window: list[dict[str, Any]] = []
     if first_bad_index >= 0:
         start = max(0, first_bad_index - 2)
         stop = min(len(active_mask), first_bad_index + 3)
@@ -3486,6 +3490,22 @@ def _frozen_replay_nonfinite_debug(
                     "replay_state_finite": bool(trace_state_finite[idx]),
                 }
             )
+    if first_bad_accepted_ordinal >= 0:
+        start = max(0, first_bad_accepted_ordinal - 2)
+        stop = min(len(accepted_active_indices), first_bad_accepted_ordinal + 3)
+        for ordinal in range(start, stop):
+            idx = int(accepted_active_indices[ordinal])
+            local_accepted_window.append(
+                {
+                    "accepted_ordinal": int(ordinal),
+                    "trace_index": idx,
+                    "attempted_dt": float(attempted_dts[idx]),
+                    "next_dt": float(next_dts[idx]),
+                    "time": float(step_ts[idx]),
+                    "baseline_err_norm": float(baseline_err_norms[idx]),
+                    "replay_state_finite": bool(trace_state_finite[idx]),
+                }
+            )
 
     return {
         "final_state_finite": _tree_all_finite(replay_result["final_state"]),
@@ -3493,7 +3513,9 @@ def _frozen_replay_nonfinite_debug(
         "first_bad_index": first_bad_index,
         "first_bad_was_accepted": None if first_bad_index < 0 else bool(accepted_mask[first_bad_index]),
         "first_bad_dt": None if first_bad_index < 0 else float(attempted_dts[first_bad_index]),
+        "first_bad_accepted_ordinal": first_bad_accepted_ordinal,
         "local_attempt_window": local_attempt_window,
+        "local_accepted_window": local_accepted_window,
     }
 
 
