@@ -19,6 +19,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     _accepted_time_list_from_trace,
+    _accepted_replay_state_debug_for_parameter,
     _adaptive_rollout_diagnostics,
     _adaptive_rollout_final_state_for_parameter,
     _adaptive_rollout_objectives_for_parameter_on_frozen_trace,
@@ -84,6 +85,11 @@ def main() -> None:
         action="store_true",
         help="Run only the unperturbed baseline accepted replay consistency check.",
     )
+    parser.add_argument(
+        "--accepted-replay-step-debug",
+        action="store_true",
+        help="Run only the unperturbed accepted-step state-by-state baseline vs replay comparison.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -121,6 +127,7 @@ def main() -> None:
     baseline_replay_abs_diff = None
     accepted_time_list = None
     baseline_replay_elapsed_s = None
+    accepted_replay_step_debug = None
     if args.baseline_replay_debug and str(args.replay_mode).strip().lower() == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(replay_trace)
         print("[autodiff-gate] progress: running frozen baseline replay (accepted)", flush=True)
@@ -142,6 +149,30 @@ def main() -> None:
             np.asarray(jax.device_get(baseline_replay_objectives), dtype=float)
             - np.asarray(jax.device_get(baseline_objectives_adaptive), dtype=float)
         )
+    if args.accepted_replay_step_debug and str(args.replay_mode).strip().lower() == "accepted":
+        print("[autodiff-gate] progress: running accepted replay step debug", flush=True)
+        t_step_debug0 = time.perf_counter()
+        accepted_replay_step_debug = _accepted_replay_state_debug_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            accepted_step_limit=args.accepted_step_limit,
+        )
+        t_step_debug1 = time.perf_counter()
+        baseline_er = np.asarray(jax.device_get(accepted_replay_step_debug["baseline_saved_states"].Er), dtype=float)
+        replay_er = np.asarray(jax.device_get(accepted_replay_step_debug["replay_saved_states"].Er), dtype=float)
+        er_step_max_abs = np.max(np.abs(baseline_er - replay_er), axis=1) if baseline_er.size and replay_er.size else np.asarray([], dtype=float)
+        first_bad_step = int(np.argmax(er_step_max_abs > 1.0e-8)) if er_step_max_abs.size and np.any(er_step_max_abs > 1.0e-8) else -1
+        accepted_replay_step_debug = {
+            "accepted_count": int(baseline_er.shape[0]) if baseline_er.ndim >= 1 else 0,
+            "elapsed_s": t_step_debug1 - t_step_debug0,
+            "er_step_max_abs": er_step_max_abs.tolist(),
+            "first_bad_step": first_bad_step,
+            "first_bad_step_max_abs": None if first_bad_step < 0 else float(er_step_max_abs[first_bad_step]),
+        }
 
     adaptive_objectives_np = np.asarray(
         jax.device_get(baseline_objectives_adaptive),
@@ -151,7 +182,7 @@ def main() -> None:
     minus_replay = None
     plus_replay = None
     t_minus0 = t_minus1 = t_plus0 = t_plus1 = None
-    if not args.baseline_replay_debug:
+    if not args.baseline_replay_debug and not args.accepted_replay_step_debug:
         minus_value = baseline_value - fd_step
         plus_value = baseline_value + fd_step
 
@@ -194,6 +225,7 @@ def main() -> None:
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
+        "accepted_replay_step_debug": accepted_replay_step_debug,
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_fd": None if grad_np is None else grad_np.tolist(),
         "adaptive_objectives": adaptive_objectives_np.tolist(),
@@ -236,6 +268,13 @@ def main() -> None:
         print("[autodiff-gate] baseline replay abs diffs vs adaptive:")
         for label, value in zip(OBJECTIVE_LABELS, baseline_replay_abs_diff.tolist()):
             print(f"  - {label}: abs_diff={float(value):.6e}")
+    if accepted_replay_step_debug is not None:
+        print(
+            f"[autodiff-gate] accepted replay step debug: accepted_count={accepted_replay_step_debug['accepted_count']} "
+            f"elapsed_s={accepted_replay_step_debug['elapsed_s']:.6e} "
+            f"first_bad_step={accepted_replay_step_debug['first_bad_step']} "
+            f"first_bad_step_max_abs={0.0 if accepted_replay_step_debug['first_bad_step_max_abs'] is None else accepted_replay_step_debug['first_bad_step_max_abs']:.6e}"
+        )
     if grad_np is not None:
         print("[autodiff-gate] objective values:")
         for label, value in zip(OBJECTIVE_LABELS, grad_np.tolist()):

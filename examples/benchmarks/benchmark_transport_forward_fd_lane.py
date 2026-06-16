@@ -575,3 +575,75 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
         time_list,
     )
     return _objective_vector(replay["final_state"], runtime), replay
+
+
+def _accepted_replay_state_debug_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit: int | None = None,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit)
+        if accepted_step_limit is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    baseline_rollout = _radau_adaptive_payload_trace_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    replay_trace = _truncate_rollout_trace_by_accepted_steps(
+        baseline_rollout.trace,
+        accepted_step_limit,
+    )
+    accepted_time_list = _accepted_time_list_from_trace(replay_trace)
+
+    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    keep_mask = np.logical_and(active_mask, accepted_mask)
+    baseline_y_end = jax.device_get(replay_trace.y_end)
+    baseline_y_end_kept = jnp.asarray(np.asarray(baseline_y_end)[keep_mask])
+    baseline_saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(baseline_y_end_kept)
+
+    replay = _radau_forward_fd_run_prepared_on_time_list(
+        prepared_rollout,
+        accepted_time_list,
+    )
+    replay_saved_states = replay["saved_states"]
+    return {
+        "accepted_time_list": accepted_time_list,
+        "baseline_rollout": baseline_rollout,
+        "replay_trace": replay_trace,
+        "baseline_saved_states": baseline_saved_states,
+        "replay_saved_states": replay_saved_states,
+        "baseline_final_state": prepared_rollout.physics_context.unpack_flat(baseline_rollout.final_carry.y),
+        "replay_final_state": replay["final_state"],
+    }
