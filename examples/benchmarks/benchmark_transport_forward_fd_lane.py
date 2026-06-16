@@ -1,29 +1,23 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import sys
 from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
-    ALLOWED_PARAMETERS,
-    DEFAULT_CONFIG,
-    OBJECTIVE_LABELS,
-    _adaptive_rollout_diagnostics,
-    _baseline_profile_cfg,
-    _fd_step,
-    _objective_vector,
-    _parameterized_initial_state,
-    _prepare_benchmark_config,
-    _truncate_rollout_trace_by_accepted_steps,
-)
+import NEOPAX  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
+from NEOPAX._profiles import AnalyticalProfileModel  # noqa: E402
+from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
@@ -41,6 +35,332 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_forward_fd_run_prepared_on_realized_trace,
     _radau_forward_fd_run_prepared_on_time_list,
 )
+
+
+DEFAULT_CONFIG = Path(
+    "examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml"
+)
+ALLOWED_PARAMETERS = {"n0", "T0", "density_shape_power", "temperature_shape_power"}
+OBJECTIVE_LABELS = [
+    "softmax_Er",
+    "smooth_root_proxy",
+    "Er2_volume_average",
+    "Er_volume_average",
+    "electron_temperature_volume_average_keV",
+    "total_pressure_volume_average",
+    "alpha_power_volume_average_mw_m3",
+]
+
+
+def _prepare_benchmark_config(
+    config_path: Path,
+    *,
+    device: str | None,
+    ntx_exact_derivative_mode: str | None = None,
+) -> dict[str, Any]:
+    config = NEOPAX.prepare_config(config_path, device=device)
+    config = copy.deepcopy(config)
+    config.setdefault("general", {})["mode"] = "transport"
+    transport_output = config.setdefault("transport_output", {})
+    transport_output["transport_plot"] = False
+    transport_output["transport_write_hdf5"] = False
+    transport_output["transport_compare_ambipolarity_residual"] = False
+    transport_output["transport_scan_ambipolarity_residual"] = False
+    solver_cfg = config.setdefault("transport_solver", {})
+    solver_cfg["debug_stage_markers"] = False
+    solver_cfg["debug_disable_jit"] = False
+    if ntx_exact_derivative_mode is not None:
+        config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = str(ntx_exact_derivative_mode)
+    return config
+
+
+def _baseline_profile_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    profiles = copy.deepcopy(config.get("profiles", {}))
+    profiles.setdefault("model", "standard_analytical")
+    return profiles
+
+
+def _parameterized_profile_set(
+    profile_cfg: dict[str, Any],
+    geometry,
+    n_species: int,
+    *,
+    parameter_name: str,
+    parameter_value,
+):
+    cfg = dict(profile_cfg)
+    cfg[parameter_name] = parameter_value
+    model = AnalyticalProfileModel(
+        n0=cfg.get("n0", 4.21),
+        n_edge=cfg.get("n_edge", 0.6),
+        T0=cfg.get("T0", 17.8),
+        T_edge=cfg.get("T_edge", 0.7),
+        c_density=None if cfg.get("c_density") is None else tuple(cfg.get("c_density")),
+        c_temperature=None if cfg.get("c_temperature") is None else tuple(cfg.get("c_temperature")),
+        density_shape_power=cfg.get("density_shape_power", 2.0),
+        temperature_shape_power=cfg.get("temperature_shape_power", 2.0),
+        n_scale=cfg.get("n_scale", 1.0),
+        T_scale=cfg.get("T_scale", 1.0),
+        er0_scale=cfg.get("er0_scale", 100.0),
+        er0_peak_rho=cfg.get("er0_peak_rho", 0.8),
+        charge_qp=None if cfg.get("charge_qp") is None else tuple(cfg.get("charge_qp")),
+    )
+    return model.build(geometry, n_species)
+
+
+def _parameterized_initial_state(
+    *,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    geometry,
+    n_species: int,
+    parameter_name: str,
+    parameter_value,
+):
+    profile_set = _parameterized_profile_set(
+        profile_cfg,
+        geometry,
+        n_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
+    temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
+    pressure_state = density_state * temperature_state
+    return dataclasses.replace(
+        baseline_state,
+        density=density_state,
+        pressure=pressure_state,
+    )
+
+
+def _softmax_objective(er_profile: jax.Array, *, beta: float = 16.0) -> jax.Array:
+    beta_arr = jnp.asarray(beta, dtype=er_profile.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * er_profile) / beta_arr
+
+
+def _smooth_root_proxy(er_profile: jax.Array, rho_grid: jax.Array, *, beta: float = 24.0, eps: float = 1.0e-4):
+    beta_arr = jnp.asarray(beta, dtype=er_profile.dtype)
+    eps_arr = jnp.asarray(eps, dtype=er_profile.dtype)
+    smooth_abs = jnp.sqrt(er_profile * er_profile + eps_arr * eps_arr)
+    weights = jnp.exp(-beta_arr * smooth_abs)
+    return jnp.sum(rho_grid * weights) / jnp.maximum(jnp.sum(weights), jnp.asarray(1.0e-30, dtype=er_profile.dtype))
+
+
+def _volume_average(profile: jax.Array, geometry) -> jax.Array:
+    volume = jnp.trapezoid(jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+    integral = jnp.trapezoid(profile * jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+    return integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=integral.dtype))
+
+
+def _alpha_power_volume_average(final_state, runtime) -> jax.Array:
+    source_models = runtime.models.source or {}
+    pressure_source_model = source_models.get("temperature") if isinstance(source_models, dict) else None
+    if pressure_source_model is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    raw_sources = pressure_source_model(final_state)
+    alpha_power = raw_sources.get("AlphaPower") if isinstance(raw_sources, dict) else None
+    if alpha_power is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    alpha_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.asarray(alpha_power, dtype=final_state.pressure.dtype)
+    return _volume_average(alpha_mw_m3, runtime.geometry)
+
+
+def _electron_temperature_volume_average(final_state, runtime) -> jax.Array:
+    species_idx = getattr(runtime.species, "species_idx", {})
+    electron_idx = species_idx.get("e", 0)
+    temperature = jnp.asarray(final_state.temperature[electron_idx], dtype=final_state.pressure.dtype)
+    return _volume_average(temperature, runtime.geometry)
+
+
+def _total_pressure_volume_average(final_state, runtime) -> jax.Array:
+    total_pressure = jnp.sum(jnp.asarray(final_state.pressure, dtype=final_state.pressure.dtype), axis=0)
+    return _volume_average(total_pressure, runtime.geometry)
+
+
+def _objective_vector(final_state, runtime) -> jax.Array:
+    er = jnp.asarray(final_state.Er)
+    rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
+    er2_vol = _volume_average(er * er, runtime.geometry)
+    er_vol = _volume_average(er, runtime.geometry)
+    te_vol = _electron_temperature_volume_average(final_state, runtime)
+    p_tot_vol = _total_pressure_volume_average(final_state, runtime)
+    alpha_vol = _alpha_power_volume_average(final_state, runtime)
+    return jnp.stack(
+        [
+            _softmax_objective(er),
+            _smooth_root_proxy(er, rho),
+            er2_vol,
+            er_vol,
+            te_vol,
+            p_tot_vol,
+            alpha_vol,
+        ]
+    )
+
+
+def _fd_step(baseline_value: float, *, rel_step: float, abs_step: float) -> float:
+    return float(max(abs_step, abs(rel_step) * max(abs(baseline_value), 1.0)))
+
+
+def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | None):
+    if accepted_step_limit is None:
+        return trace
+    accepted_limit = int(max(0, accepted_step_limit))
+    accepted_mask_np = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask_np = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_seen = 0
+    keep = np.zeros_like(active_mask_np, dtype=bool)
+    for idx, (active, accepted) in enumerate(zip(active_mask_np, accepted_mask_np, strict=False)):
+        if not active:
+            continue
+        if accepted_seen >= accepted_limit:
+            break
+        keep[idx] = True
+        if accepted:
+            accepted_seen += 1
+    return jax.tree_util.tree_map(lambda x: x[keep], trace)
+
+
+def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
+    return {
+        "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
+        "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count)).item()),
+        "completed": bool(np.asarray(jax.device_get(rollout.completed)).item()),
+        "failed": bool(np.asarray(jax.device_get(rollout.failed)).item()),
+        "fail_code": int(np.asarray(jax.device_get(rollout.fail_code)).item()),
+    }
+
+
+def _adaptive_rollout_final_state_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    use_realized_schedule_jvp: bool = False,
+    accepted_step_limit_override: int | None = None,
+    use_schedule_trace_only: bool = False,
+    use_payload_trace: bool = False,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    if use_realized_schedule_jvp:
+        state0_static = _parameterized_initial_state(
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            geometry=runtime.geometry,
+            n_species=runtime.species.number_species,
+            parameter_name=parameter_name,
+            parameter_value=jax.lax.stop_gradient(parameter_value),
+        )
+        prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
+        solver = prepared_components_static["solver"]
+        solve_vector_field_static = prepared_components_static["solve_vector_field"]
+        prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0_static,
+            vector_field=solve_vector_field_static,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout_static,
+        )
+        prepared_components = prepare_transport_solver_components(config, runtime, state0)
+        solve_vector_field = prepared_components["solve_vector_field"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0,
+            vector_field=solve_vector_field,
+            species=runtime.species,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
+        final_y = _radau_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            prepared_rollout.initial_carry,
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+        if use_payload_trace:
+            rollout = _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        elif use_schedule_trace_only:
+            rollout = _radau_adaptive_schedule_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        else:
+            rollout = _radau_adaptive_final_state_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+    else:
+        prepared_components = prepare_transport_solver_components(config, runtime, state0)
+        solver = prepared_components["solver"]
+        solve_vector_field = prepared_components["solve_vector_field"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=state0,
+            vector_field=solve_vector_field,
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout,
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        stop_after_accepted_steps = (
+            int(accepted_step_limit_override)
+            if accepted_step_limit_override is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
+        rollout = (
+            _radau_adaptive_payload_trace_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_payload_trace
+            else _radau_adaptive_schedule_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+            if use_schedule_trace_only
+            else _radau_adaptive_final_state_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                max_total_steps=max_total_steps,
+                stop_after_accepted_steps=stop_after_accepted_steps,
+            )
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return final_state, rollout
 
 
 def _initial_carry_from_state_with_static_setup(
@@ -90,140 +410,10 @@ def _initial_carry_from_state_with_static_setup(
         initial_carry_static.complex_lu,
         initial_carry_static.complex_piv,
         initial_lagged_response,
-        jax.numpy.asarray(kernel_context.use_transport_lagged_response),
+        jnp.asarray(kernel_context.use_transport_lagged_response),
         flat_state0,
     )
     return _radau_carry_from_step_state(step_state0)
-
-
-def _adaptive_rollout_final_state_for_parameter(
-    parameter_value,
-    *,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_name: str,
-    use_realized_schedule_jvp: bool = False,
-    accepted_step_limit_override: int | None = None,
-    use_schedule_trace_only: bool = False,
-    use_payload_trace: bool = False,
-):
-    state0 = _parameterized_initial_state(
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        geometry=runtime.geometry,
-        n_species=runtime.species.number_species,
-        parameter_name=parameter_name,
-        parameter_value=parameter_value,
-    )
-    if use_realized_schedule_jvp:
-        state0_static = _parameterized_initial_state(
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            geometry=runtime.geometry,
-            n_species=runtime.species.number_species,
-            parameter_name=parameter_name,
-            parameter_value=jax.lax.stop_gradient(parameter_value),
-        )
-        prepared_components_static = prepare_transport_solver_components(config, runtime, state0_static)
-        solver = prepared_components_static["solver"]
-        solve_vector_field_static = prepared_components_static["solve_vector_field"]
-        prepared_rollout_static = _build_prepared_radau_accepted_rollout(
-            solver=solver,
-            state=state0_static,
-            vector_field=solve_vector_field_static,
-            species=runtime.species,
-        )
-        execution_context = _build_prepared_radau_execution_context(
-            solver=solver,
-            prepared_rollout=prepared_rollout_static,
-        )
-        initial_carry = _initial_carry_from_state_with_static_setup(
-            solver=solver,
-            state=state0,
-            solve_vector_field=solve_vector_field_static,
-            species=runtime.species,
-            prepared_rollout_static=prepared_rollout_static,
-        )
-        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-        stop_after_accepted_steps = (
-            int(accepted_step_limit_override)
-            if accepted_step_limit_override is not None
-            else getattr(solver, "stop_after_accepted_steps", None)
-        )
-        final_y = _radau_adaptive_final_y_realized_schedule(
-            execution_context,
-            max_total_steps,
-            stop_after_accepted_steps,
-            initial_carry,
-        )
-        final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
-        if use_payload_trace:
-            rollout = _radau_adaptive_payload_trace_rollout(
-                execution_context,
-                initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-        elif use_schedule_trace_only:
-            rollout = _radau_adaptive_schedule_rollout(
-                execution_context,
-                initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-        else:
-            rollout = _radau_adaptive_final_state_rollout(
-                execution_context,
-                initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-    else:
-        prepared_components = prepare_transport_solver_components(config, runtime, state0)
-        solver = prepared_components["solver"]
-        solve_vector_field = prepared_components["solve_vector_field"]
-        prepared_rollout = _build_prepared_radau_accepted_rollout(
-            solver=solver,
-            state=state0,
-            vector_field=solve_vector_field,
-            species=runtime.species,
-        )
-        execution_context = _build_prepared_radau_execution_context(
-            solver=solver,
-            prepared_rollout=prepared_rollout,
-        )
-        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-        stop_after_accepted_steps = (
-            int(accepted_step_limit_override)
-            if accepted_step_limit_override is not None
-            else getattr(solver, "stop_after_accepted_steps", None)
-        )
-        rollout = (
-            _radau_adaptive_payload_trace_rollout(
-                execution_context,
-                prepared_rollout.initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-            if use_payload_trace
-            else _radau_adaptive_schedule_rollout(
-                execution_context,
-                prepared_rollout.initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-            if use_schedule_trace_only
-            else _radau_adaptive_final_state_rollout(
-                execution_context,
-                prepared_rollout.initial_carry,
-                max_total_steps=max_total_steps,
-                stop_after_accepted_steps=stop_after_accepted_steps,
-            )
-        )
-        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
-    return final_state, rollout
 
 
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
