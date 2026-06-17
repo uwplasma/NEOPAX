@@ -1368,6 +1368,7 @@ def run_transport_on_time_list(
     from ._transport_solvers import (
         RADAUSolver,
         _build_prepared_radau_accepted_rollout,
+        _build_prepared_radau_execution_context,
         _radau_run_prepared_on_time_list,
     )
 
@@ -1384,7 +1385,15 @@ def run_transport_on_time_list(
         vector_field=prepared["solve_vector_field"],
         species=runtime.species,
     )
-    return _radau_run_prepared_on_time_list(prepared_rollout, time_list)
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    return _radau_run_prepared_on_time_list(
+        prepared_rollout,
+        execution_context,
+        time_list,
+    )
 
 
 def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState):

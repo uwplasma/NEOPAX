@@ -1,0 +1,229 @@
+# Fixed `dt` List For Solver Plan
+
+## Goal
+
+Add a solver-native fixed-time-step-list mode for the forward / FD lane in the
+current `NEOPAX` solver.
+
+Required behavior:
+
+- baseline run stays on the usual adaptive solver path
+- `fd-` and `fd+` use the same solver path as baseline
+- the only change for `fd-` / `fd+` is that the accepted `dt` values are given
+  externally instead of chosen by the adaptive controller
+- do **not** use the current replay machinery for the normal forward / FD lane
+
+This means the fixed-time mode must be a **sibling** of the current adaptive
+rollout, not a benchmark-local replay wrapper.
+
+## Non-goals
+
+- do not change reverse mode in this refactor
+- do not change the standard adaptive solver behavior
+- do not keep relying on `frozen trace` / `replay` helper semantics for the
+  normal FD workflow
+- do not force baseline `next_lagged_response_valid` or controller-history
+  decisions into the FD lane
+
+## Current problem
+
+The current FD refactor is still wrong structurally:
+
+- baseline uses the full adaptive schedule rollout path
+- fixed-time FD uses the same inner accepted-step primal, but **not** the same
+  outer solver path
+- therefore baseline and `fd-` / `fd+` are not yet evolving carry/state through
+  the same full solve wrapper
+
+That mismatch is likely why:
+
+- FD timing still looks suspicious
+- the electric-field-related metrics do not match the old intended benchmark
+- GPU work finishes and the remaining behavior looks inconsistent with a simple
+  “same solver, fixed `dt` list” interpretation
+
+## Refactor target
+
+We want two solver-native rollout modes:
+
+1. Adaptive baseline mode
+   - current production path
+   - chooses `dt` internally
+
+2. Fixed accepted-`dt` mode
+   - same step-state / carry evolution as baseline
+   - same accepted-step forward solve math as baseline
+   - does **not** run adaptive `dt` selection
+   - instead consumes a provided `dt_sequence`
+
+The FD benchmark should become:
+
+1. run adaptive baseline once
+2. extract accepted `dt` list from baseline
+3. run `fd-` with perturbed initial parameter and fixed `dt` list
+4. run `fd+` with perturbed initial parameter and fixed `dt` list
+
+No replay helpers in the normal path.
+
+## Implementation plan
+
+### Step 1. Isolate the exact baseline solver path
+
+Audit and preserve the current adaptive baseline path in:
+
+- `NEOPAX/_transport_solvers.py`
+- especially:
+  - `_radau_adaptive_schedule_rollout(...)`
+  - `_radau_attempt_step_with_payload(...)`
+  - `_apply_radau_lean_timestep_controller(...)`
+  - `_radau_step_state_from_carry(...)`
+  - `_radau_carry_from_step_state(...)`
+
+Requirement:
+
+- the new fixed-time mode must reuse the same accepted-step state evolution
+  logic as this path
+
+### Step 2. Add a solver-native fixed-`dt` schedule rollout
+
+Create a new solver function in `NEOPAX/_transport_solvers.py`, conceptually:
+
+- `_radau_fixed_dt_schedule_rollout(...)`
+
+Desired structure:
+
+- clone the skeleton of `_radau_adaptive_schedule_rollout(...)`
+- operate on `_RadauStepState`
+- iterate over a provided `dt_sequence`
+- for each supplied `dt`, run the same step attempt path used by baseline
+
+Important:
+
+- do not replace the outer solver path with `_radau_apply_accepted_step_map(...)`
+- do not use `_radau_run_prepared_on_realized_trace(...)`
+- do not use benchmark-local replay logic
+
+### Step 3. Define the fixed-`dt` accept-step behavior
+
+For each supplied `dt_value`:
+
+1. set the step state's `dt` to `dt_value`
+2. run the same accepted-step attempt code as baseline
+3. reuse the same accepted-step carry/state update logic as baseline
+4. clear only the adaptive-controller evolution that should not persist in the
+   fixed-time lane
+
+This is the key design constraint:
+
+- same forward solve path
+- same lagged-response numerical path
+- no adaptive `next_dt` decision
+
+### Step 4. Make the fixed-time lane explicit about controller bypass
+
+The fixed-time mode should explicitly document what is bypassed:
+
+- `next_dt` growth / shrink selection
+- reject / retry adaptive branching as a timestep-selection mechanism
+
+But it should still define what happens if a fixed `dt` step is not viable.
+
+Decision to make during implementation:
+
+Option A:
+- fail immediately if the supplied fixed step does not produce a valid accepted
+  step
+
+Option B:
+- keep enough solver diagnostics to show where the fixed schedule became invalid
+
+Recommended first pass:
+
+- fail clearly and report the step index / `dt` / solver diagnostics
+
+### Step 5. Add prepared-rollout entrypoint for fixed `dt` solves
+
+Add a prepared helper that forwards into the new solver-native mode, e.g.:
+
+- `_radau_solve_on_fixed_dt_list_final_state_only(...)`
+
+This helper should:
+
+- convert `time_list` to `dt_sequence`
+- call the new fixed-`dt` schedule rollout
+- return:
+  - `time_list`
+  - `dt_sequence`
+  - `final_state`
+  - `final_carry`
+  - rollout diagnostics
+
+It should **not** be named or documented as replay.
+
+### Step 6. Rewire the forward / FD benchmark lane
+
+Update:
+
+- `examples/benchmarks/benchmark_transport_forward_fd_lane.py`
+- `examples/benchmarks/benchmark_transport_frozen_fd_only.py`
+
+So that:
+
+- baseline still runs through the usual adaptive solver
+- accepted times are extracted from baseline
+- `fd-` / `fd+` call only the new solver-native fixed-`dt` mode
+- no normal-path dependence remains on the current replay helpers
+
+### Step 7. Keep the old replay machinery out of the normal FD path
+
+The following should no longer be part of the normal forward / FD workflow:
+
+- `_radau_forward_fd_run_prepared_on_realized_trace(...)`
+- `_radau_run_prepared_on_realized_trace(...)`
+- forced controller-history replay
+- forced `next_lagged_response_valid` replay
+
+If these helpers must remain for legacy debugging, they should be clearly
+marked as:
+
+- legacy
+- debug-only
+- not used by the normal FD benchmark lane
+
+### Step 8. Validation checks
+
+After implementing the new mode, validate in this order:
+
+1. Baseline adaptive solve diagnostics
+   - accepted count
+   - attempt count
+   - final metrics
+
+2. Baseline adaptive vs fixed-time baseline
+   - run the same initial state through the fixed `dt` list
+   - check final-state and metric agreement
+   - this must match closely before using `fd-` / `fd+`
+
+3. FD timing
+   - `fd-` and `fd+` should not take dramatically more time than baseline
+   - fixed-time mode should be comparable or cheaper than baseline
+
+4. FD values
+   - compare against the old trusted benchmark behavior
+   - especially:
+     - `softmax_Er`
+     - `Er2_volume_average`
+     - `Er_volume_average`
+     - pressure / temperature metrics
+
+## Expected outcome
+
+At the end of this refactor:
+
+- baseline remains the current standard adaptive solver
+- FD becomes a true fixed-time sibling solver lane
+- the solver, not benchmark-local replay code, owns the fixed-time semantics
+- `fd-` / `fd+` do what was originally requested:
+  - same solver path as baseline
+  - same forward numerical treatment
+  - only the `dt` list is externally prescribed

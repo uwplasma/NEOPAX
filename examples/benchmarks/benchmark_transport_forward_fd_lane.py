@@ -546,8 +546,13 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
         vector_field=solve_vector_field,
         species=runtime.species,
     )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
     replay = _radau_solve_on_fixed_time_map_final_state_only(
         prepared_rollout,
+        execution_context,
         time_list,
     )
     return _objective_vector(replay["final_state"], runtime), replay

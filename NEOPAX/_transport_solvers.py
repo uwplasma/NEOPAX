@@ -5198,6 +5198,249 @@ def _radau_adaptive_payload_trace_rollout(
     )
 
 
+def _radau_fixed_dt_schedule_rollout_scan_step(
+    execution_context: _RadauSolveExecutionContext,
+    step_state: _RadauStepState,
+    dt_value,
+    next_dt_value,
+    *,
+    stop_after_accepted_steps: int | None,
+):
+    """Advance one fixed-`dt` schedule-rollout scan step.
+
+    This mirrors the outer step-state evolution style of the adaptive baseline
+    rollout, but the trial `dt` is supplied externally. If that supplied step
+    is not accepted, the fixed schedule is treated as invalid and the rollout
+    fails immediately instead of inventing a retry / regrowth policy.
+    """
+
+    dtype = execution_context.dtype
+
+    def _inactive_step_info(state: _RadauStepState) -> _RadauStepInfo:
+        failed = state.status[0] != 0
+        fail_code = state.status[1]
+        return _RadauStepInfo(
+            y=state.y,
+            t=state.t,
+            dt=jnp.asarray(0.0, dtype=dtype),
+            next_dt=state.dt,
+            growth=jnp.asarray(1.0, dtype=dtype),
+            lagged_reused=jnp.asarray(False),
+            jacobian_reused=jnp.asarray(False),
+            accepted=jnp.asarray(False),
+            failed=failed,
+            fail_code=fail_code,
+            converged=jnp.asarray(False),
+            err_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            diverged=jnp.asarray(False),
+            nonfinite_stage_state=jnp.asarray(False),
+            nonfinite_stage_residual=jnp.asarray(False),
+            finite_f0=jnp.asarray(True),
+            finite_z0=jnp.asarray(True),
+            finite_initial_residual=jnp.asarray(True),
+            newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            final_residual_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            final_delta_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            theta_final=jnp.asarray(0.0, dtype=dtype),
+            slow_contraction=jnp.asarray(False),
+            residual_blowup=jnp.asarray(False),
+            newton_nonfinite=jnp.asarray(False),
+        )
+
+    def _scan_output(step_info: _RadauStepInfo, next_state: _RadauStepState):
+        return (
+            jnp.asarray(step_info.accepted),
+            jnp.asarray(step_info.err_norm, dtype=dtype),
+            jnp.asarray(step_info.dt, dtype=dtype),
+            jnp.asarray(step_info.next_dt, dtype=dtype),
+            jnp.asarray(step_info.t, dtype=dtype),
+            next_state.recent_reject_count,
+            next_state.regrowth_cooldown,
+            next_state.easy_growth_streak,
+            next_state.lagged_response_valid,
+        )
+
+    active = jnp.logical_and(
+        step_state.status[0] == 0,
+        jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)),
+    )
+
+    def _run(_):
+        forced_step_state = dataclasses.replace(step_state, dt=dt_value)
+        carry_in = _radau_carry_from_step_state(forced_step_state)
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=carry_in.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(execution_context.use_transport_lagged_response),
+        )
+        attempt_result = _execute_radau_accepted_step_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_in),
+            attempt_context,
+        )
+        accepted = jnp.logical_and(
+            attempt_result.converged,
+            attempt_result.err_norm <= jnp.asarray(1.0, dtype=dtype),
+        )
+        safe_error = jnp.maximum(
+            attempt_result.err_norm,
+            jnp.asarray(1.0e-12, dtype=dtype),
+        )
+        accepted_y = _project_flat_state_if_needed(
+            attempt_result.trial_y,
+            execution_context.project_flat,
+        )
+        lagged_reuse_global = execution_context.lagged_response_reuse_mode == "global_state_drift"
+        lagged_reuse_metric = _lagged_response_global_reuse_metric(
+            accepted_y,
+            forced_step_state.lagged_reference_y,
+            atol=execution_context.lagged_response_reuse_atol,
+            rtol=execution_context.lagged_response_reuse_rtol,
+        )
+        keep_lagged_response = jnp.logical_and(
+            jnp.asarray(execution_context.use_transport_lagged_response),
+            jnp.logical_and(
+                jnp.asarray(lagged_reuse_global),
+                lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
+            ),
+        )
+
+        def _accept_case(__):
+            status_next = jnp.asarray(
+                [0, forced_step_state.status[1], forced_step_state.status[2] + 1],
+                dtype=jnp.int32,
+            )
+            next_step_state = _RadauStepState(
+                t=forced_step_state.t + dt_value,
+                y=accepted_y,
+                dt=next_dt_value,
+                status=status_next,
+                prev_error=safe_error,
+                prev_stages=attempt_result.stage_history,
+                prev_dt=dt_value,
+                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                lagged_response_cache=forced_step_state.lagged_response_cache,
+                lagged_response_valid=keep_lagged_response,
+                lagged_reference_y=forced_step_state.lagged_reference_y,
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+            next_step_info = _RadauStepInfo(
+                y=accepted_y,
+                t=forced_step_state.t + dt_value,
+                dt=dt_value,
+                next_dt=next_dt_value,
+                growth=jnp.where(
+                    dt_value > 0,
+                    next_dt_value / dt_value,
+                    jnp.asarray(1.0, dtype=dtype),
+                ),
+                lagged_reused=attempt_result.lagged_response_reused,
+                jacobian_reused=attempt_result.jacobian_reused,
+                accepted=jnp.asarray(True),
+                failed=jnp.asarray(False),
+                fail_code=forced_step_state.status[1],
+                converged=attempt_result.converged,
+                err_norm=attempt_result.err_norm,
+                diverged=attempt_result.diverged_final,
+                nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+                nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+                finite_f0=attempt_result.finite_f0,
+                finite_z0=attempt_result.finite_z0,
+                finite_initial_residual=attempt_result.finite_initial_residual,
+                newton_iter_count=attempt_result.newton_iter_count,
+                final_residual_norm=attempt_result.final_residual_norm,
+                final_delta_norm=attempt_result.final_delta_norm,
+                theta_final=attempt_result.theta_final,
+                slow_contraction=attempt_result.slow_contraction_final,
+                residual_blowup=attempt_result.residual_blowup_final,
+                newton_nonfinite=attempt_result.newton_nonfinite_final,
+            )
+            return next_step_state, next_step_info
+
+        def _reject_case(__):
+            fail_code = jnp.where(
+                attempt_result.converged,
+                jnp.asarray(2, dtype=jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
+            )
+            failed_step_state = _RadauStepState(
+                t=forced_step_state.t,
+                y=forced_step_state.y,
+                dt=dt_value,
+                status=jnp.asarray(
+                    [1, fail_code, step_state.status[2]],
+                    dtype=jnp.int32,
+                ),
+                prev_error=forced_step_state.prev_error,
+                prev_stages=forced_step_state.prev_stages,
+                prev_dt=forced_step_state.prev_dt,
+                recent_reject_count=forced_step_state.recent_reject_count,
+                regrowth_cooldown=forced_step_state.regrowth_cooldown,
+                easy_growth_streak=forced_step_state.easy_growth_streak,
+                lagged_response_cache=forced_step_state.lagged_response_cache,
+                lagged_response_valid=forced_step_state.lagged_response_valid,
+                lagged_reference_y=forced_step_state.lagged_reference_y,
+                jacobian=attempt_result.jacobian_out,
+                cache_valid=attempt_result.cache_valid_out,
+                cache_dt=attempt_result.cache_dt_out,
+                cache_age=attempt_result.cache_age_out,
+                real_lu=attempt_result.real_lu_out,
+                real_piv=attempt_result.real_piv_out,
+                complex_lu=attempt_result.complex_lu_out,
+                complex_piv=attempt_result.complex_piv_out,
+                prev_theta_final=attempt_result.theta_final,
+                prev_newton_iter_count=attempt_result.newton_iter_count,
+            )
+            failed_step_info = _RadauStepInfo(
+                y=forced_step_state.y,
+                t=forced_step_state.t,
+                dt=dt_value,
+                next_dt=dt_value,
+                growth=jnp.asarray(1.0, dtype=dtype),
+                lagged_reused=attempt_result.lagged_response_reused,
+                jacobian_reused=attempt_result.jacobian_reused,
+                accepted=jnp.asarray(False),
+                failed=jnp.asarray(True),
+                fail_code=fail_code,
+                converged=attempt_result.converged,
+                err_norm=attempt_result.err_norm,
+                diverged=attempt_result.diverged_final,
+                nonfinite_stage_state=attempt_result.nonfinite_stage_state,
+                nonfinite_stage_residual=attempt_result.nonfinite_stage_residual,
+                finite_f0=attempt_result.finite_f0,
+                finite_z0=attempt_result.finite_z0,
+                finite_initial_residual=attempt_result.finite_initial_residual,
+                newton_iter_count=attempt_result.newton_iter_count,
+                final_residual_norm=attempt_result.final_residual_norm,
+                final_delta_norm=attempt_result.final_delta_norm,
+                theta_final=attempt_result.theta_final,
+                slow_contraction=attempt_result.slow_contraction_final,
+                residual_blowup=attempt_result.residual_blowup_final,
+                newton_nonfinite=attempt_result.newton_nonfinite_final,
+            )
+            return failed_step_state, failed_step_info
+
+        return jax.lax.cond(accepted, _accept_case, _reject_case, operand=None)
+
+    def _skip(_):
+        return step_state, _inactive_step_info(step_state)
+
+    next_step_state, step_info = jax.lax.cond(active, _run, _skip, operand=None)
+    scan_out = (active,) + _scan_output(step_info, next_step_state)
+    return next_step_state, scan_out
+
+
 def _radau_adaptive_schedule_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
@@ -5305,6 +5548,95 @@ def _radau_adaptive_schedule_rollout(
     )
     completed = jnp.logical_or(
         final_step_state.t >= (execution_context.attempt_context.t_final - 1.0e-15),
+        _accepted_step_limit_reached(final_step_state, stop_after_accepted_steps),
+    )
+    failed = final_step_state.status[0] != 0
+    fail_code = final_step_state.status[1]
+    return _RadauAdaptiveScheduleRolloutResult(
+        final_step_state=final_step_state,
+        final_carry=final_carry,
+        trace=trace,
+        attempt_count=jnp.sum(active_mask.astype(jnp.int32)),
+        accepted_count=jnp.sum(accepted_mask.astype(jnp.int32)),
+        completed=completed,
+        failed=failed,
+        fail_code=fail_code,
+    )
+
+
+def _radau_fixed_dt_schedule_rollout(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    dt_sequence,
+    *,
+    stop_after_accepted_steps: int | None = None,
+) -> _RadauAdaptiveScheduleRolloutResult:
+    """Run the solver on a caller-provided fixed `dt` sequence.
+
+    This is the solver-native sibling of `_radau_adaptive_schedule_rollout(...)`.
+    It preserves the same outer step-state / carry evolution style as the
+    baseline solver, but uses the supplied `dt_sequence` instead of adaptive
+    timestep selection.
+    """
+
+    dtype = execution_context.dtype
+    dt_sequence = jnp.asarray(dt_sequence, dtype=dtype)
+    step_state0 = _radau_step_state_from_carry(
+        carry0,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+    if dt_sequence.ndim != 1:
+        raise ValueError("dt_sequence must be a one-dimensional array.")
+    if int(dt_sequence.shape[0]) == 0:
+        next_dt_sequence = dt_sequence
+    else:
+        next_dt_sequence = jnp.concatenate(
+            [dt_sequence[1:], dt_sequence[-1:]],
+            axis=0,
+        )
+
+    def _scan_body(step_state, xs):
+        dt_value, next_dt_value = xs
+        return _radau_fixed_dt_schedule_rollout_scan_step(
+            execution_context,
+            step_state,
+            dt_value,
+            next_dt_value,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+
+    final_step_state, scan_outputs = jax.lax.scan(
+        _scan_body,
+        step_state0,
+        (dt_sequence, next_dt_sequence),
+    )
+    (
+        active_mask,
+        accepted_mask,
+        err_norms,
+        attempted_dts,
+        next_dts,
+        step_ts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    ) = scan_outputs
+    final_carry = _radau_carry_from_step_state(final_step_state)
+    trace = _RadauAdaptiveScheduleTrace(
+        accepted_mask=accepted_mask,
+        active_mask=active_mask,
+        err_norms=err_norms,
+        attempted_dts=attempted_dts,
+        next_dts=next_dts,
+        step_ts=step_ts,
+        next_recent_reject_count=next_recent_reject_count,
+        next_regrowth_cooldown=next_regrowth_cooldown,
+        next_easy_growth_streak=next_easy_growth_streak,
+        next_lagged_response_valid=next_lagged_response_valid,
+    )
+    completed = jnp.logical_or(
+        final_step_state.status[0] == 0,
         _accepted_step_limit_reached(final_step_state, stop_after_accepted_steps),
     )
     failed = final_step_state.status[0] != 0
@@ -5613,9 +5945,10 @@ def _radau_dt_sequence_from_time_list(
 
 def _radau_run_prepared_on_time_list(
     prepared_rollout: _PreparedRadauAcceptedRollout,
+    execution_context: _RadauSolveExecutionContext,
     time_list,
 ) -> dict[str, Any]:
-    """Replay the accepted-step Radau map on a caller-provided absolute time list."""
+    """Run the solver on a caller-provided absolute time list and save states."""
 
     t0 = prepared_rollout.initial_carry.t
     dt_sequence = _radau_dt_sequence_from_time_list(
@@ -5623,13 +5956,49 @@ def _radau_run_prepared_on_time_list(
         t0=t0,
         dtype=prepared_rollout.kernel_context.dtype,
     )
-    rollout = _radau_fixed_dt_accepted_rollout(
-        prepared_rollout.kernel_context,
-        prepared_rollout.physics_context,
+    rollout = _radau_fixed_dt_schedule_rollout(
+        execution_context,
         prepared_rollout.initial_carry,
         dt_sequence,
     )
-    saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(rollout.trial_ys)
+    if int(dt_sequence.shape[0]) == 0:
+        saved_states = []
+    else:
+        next_dt_sequence = jnp.concatenate(
+            [dt_sequence[1:], dt_sequence[-1:]],
+            axis=0,
+        )
+        step_state0 = _radau_step_state_from_carry(
+            prepared_rollout.initial_carry,
+            status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        )
+
+        def _scan_body(step_state, xs):
+            next_step_state, scan_out = _radau_fixed_dt_schedule_rollout_scan_step(
+                execution_context,
+                step_state,
+                xs[0],
+                xs[1],
+                stop_after_accepted_steps=None,
+            )
+            active, accepted = scan_out[0], scan_out[1]
+            return next_step_state, (next_step_state.y, active, accepted)
+
+        _, scan_outputs = jax.lax.scan(
+            _scan_body,
+            step_state0,
+            (dt_sequence, next_dt_sequence),
+        )
+        saved_ys, active_mask, accepted_mask = scan_outputs
+        keep_mask = np.logical_and(
+            np.asarray(jax.device_get(active_mask), dtype=bool),
+            np.asarray(jax.device_get(accepted_mask), dtype=bool),
+        )
+        saved_indices = np.flatnonzero(keep_mask)
+        saved_states = [
+            prepared_rollout.physics_context.unpack_flat(saved_ys[int(idx)])
+            for idx in saved_indices
+        ]
     final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return {
         "time_list": jnp.asarray(time_list, dtype=prepared_rollout.kernel_context.dtype),
@@ -5640,95 +6009,9 @@ def _radau_run_prepared_on_time_list(
         "rollout": rollout,
     }
 
-
-def _radau_forward_solver_fixed_time_map_rollout(
-    kernel_context: _RadauAcceptedStepKernelContext,
-    physics_context: _RadauAcceptedStepPhysicsContext,
-    carry0: _RadauAcceptedStepCarry,
-    dt_sequence,
-) -> _RadauAcceptedRolloutResult:
-    """Forward/FD solver-native fixed-time rollout over a caller-provided `dt` list.
-
-    This path is intentionally separate from the frozen-trace replay helpers.
-    It advances the same accepted-step forward solve used by the standard Radau
-    solver, but disables adaptive timestep selection by consuming an explicit
-    sequence of accepted `dt` values.
-    """
-
-    dtype = kernel_context.dtype
-
-    def _scan_body(carry, dt_value):
-        carry_for_step = dataclasses.replace(carry, dt=dt_value)
-        attempt_context = _RadauAcceptedStepAttemptContext(
-            t_final=carry.t + dt_value,
-            use_transport_lagged_response=jnp.asarray(kernel_context.use_transport_lagged_response),
-        )
-        step_map_result = _radau_apply_accepted_step_map(
-            kernel_context,
-            physics_context,
-            carry_for_step,
-            attempt_context,
-        )
-        keep_lagged_response = jnp.asarray(False)
-        if kernel_context.use_transport_lagged_response:
-            lagged_reuse_global = (
-                getattr(physics_context, "lagged_response_reuse_mode", "retry_only")
-                == "global_state_drift"
-            )
-            lagged_reuse_metric = _lagged_response_global_reuse_metric(
-                step_map_result.accepted_y,
-                carry.lagged_reference_y,
-                atol=jnp.asarray(
-                    getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8),
-                    dtype=dtype,
-                ),
-                rtol=jnp.asarray(
-                    getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2),
-                    dtype=dtype,
-                ),
-            )
-            keep_lagged_response = jnp.logical_and(
-                jnp.asarray(True),
-                jnp.logical_and(
-                    jnp.asarray(lagged_reuse_global),
-                    lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
-                ),
-            )
-        next_carry = dataclasses.replace(
-            step_map_result.next_carry,
-            prev_error=jnp.maximum(
-                step_map_result.err_norm,
-                jnp.asarray(1.0e-12, dtype=dtype),
-            ),
-            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
-            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
-            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            lagged_response_cache=carry.lagged_response_cache,
-            lagged_response_valid=keep_lagged_response,
-            lagged_reference_y=carry.lagged_reference_y,
-        )
-        scan_out = (
-            step_map_result.accepted_y,
-            step_map_result.err_norm,
-            step_map_result.converged,
-            step_map_result.accepted_dt,
-        )
-        return next_carry, scan_out
-
-    final_carry, scan_outputs = jax.lax.scan(_scan_body, carry0, dt_sequence)
-    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
-    return _RadauAcceptedRolloutResult(
-        final_carry=final_carry,
-        final_y=final_carry.y,
-        trial_ys=trial_ys,
-        err_norms=err_norms,
-        converged_mask=converged_mask,
-        accepted_dts=accepted_dts,
-    )
-
-
 def _radau_solve_on_fixed_time_map_final_state_only(
     prepared_rollout: _PreparedRadauAcceptedRollout,
+    execution_context: _RadauSolveExecutionContext,
     time_list,
 ) -> dict[str, Any]:
     """Run the forward solver on a fixed accepted-time map without saving states.
@@ -5744,9 +6027,8 @@ def _radau_solve_on_fixed_time_map_final_state_only(
         t0=t0,
         dtype=prepared_rollout.kernel_context.dtype,
     )
-    rollout = _radau_forward_solver_fixed_time_map_rollout(
-        prepared_rollout.kernel_context,
-        prepared_rollout.physics_context,
+    rollout = _radau_fixed_dt_schedule_rollout(
+        execution_context,
         prepared_rollout.initial_carry,
         dt_sequence,
     )
@@ -5763,49 +6045,16 @@ def _radau_solve_on_fixed_time_map_final_state_only(
 
 def _radau_run_prepared_on_time_list_final_state_only(
     prepared_rollout: _PreparedRadauAcceptedRollout,
+    execution_context: _RadauSolveExecutionContext,
     time_list,
 ) -> dict[str, Any]:
     """Compatibility wrapper for older callers of the fixed-time forward lane."""
 
     return _radau_solve_on_fixed_time_map_final_state_only(
         prepared_rollout,
+        execution_context,
         time_list,
     )
-
-
-def _radau_forward_fd_run_prepared_on_time_list(
-    prepared_rollout: _PreparedRadauAcceptedRollout,
-    time_list,
-) -> dict[str, Any]:
-    """Forward/FD benchmark replay on an absolute accepted-time list.
-
-    This keeps the pre-reverse scratch semantics for forward AD and frozen FD
-    benchmarks independent from the reverse replay lane.
-    """
-
-    t0 = prepared_rollout.initial_carry.t
-    dt_sequence = _radau_dt_sequence_from_time_list(
-        time_list,
-        t0=t0,
-        dtype=prepared_rollout.kernel_context.dtype,
-    )
-    rollout = _radau_forward_fd_fixed_dt_accepted_rollout(
-        prepared_rollout.kernel_context,
-        prepared_rollout.physics_context,
-        prepared_rollout.initial_carry,
-        dt_sequence,
-    )
-    saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(rollout.trial_ys)
-    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
-    return {
-        "time_list": jnp.asarray(time_list, dtype=prepared_rollout.kernel_context.dtype),
-        "dt_sequence": dt_sequence,
-        "saved_states": saved_states,
-        "final_state": final_state,
-        "final_carry": rollout.final_carry,
-        "rollout": rollout,
-    }
-
 
 def _radau_run_prepared_on_realized_trace(
     prepared_rollout: _PreparedRadauAcceptedRollout,
