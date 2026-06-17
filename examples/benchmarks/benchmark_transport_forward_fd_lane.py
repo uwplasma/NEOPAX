@@ -34,7 +34,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_eval_rhs,
     _radau_forward_fd_run_prepared_on_realized_trace,
-    _radau_run_prepared_on_time_list,
+    _radau_run_prepared_on_time_list_final_state_only,
 )
 
 
@@ -574,7 +574,7 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     # Accepted-step frozen replay should follow the same forward accepted-map
     # lane as the normal solver, while attempt-mode replay keeps its own
     # benchmark-local helper.
-    replay = _radau_run_prepared_on_time_list(
+    replay = _radau_run_prepared_on_time_list_final_state_only(
         prepared_rollout,
         time_list,
     )

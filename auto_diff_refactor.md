@@ -553,3 +553,115 @@ If that becomes finite, then:
 If baseline fixed-dt is still nonfinite, the next debugging target should stay
 inside the accepted-step fixed replay semantics rather than revisiting FD step
 size or AD comparisons.
+
+## Current State: accepted-step FD replay is finite but still not the old benchmark
+
+The latest scalar frozen-FD command under active investigation is now:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 3e-8 --fd-abs-step 1e-10 --replay-mode accepted --accepted-step-limit 115
+```
+
+### Latest confirmed output
+
+Observed output:
+
+- baseline adaptive rollout:
+  - `attempt_count=188`
+  - `accepted_count=115`
+  - `completed=True`
+  - `failed=False`
+  - `fail_code=0`
+- timings:
+  - `baseline_adaptive_s=8.417482e+02`
+  - `fd_minus_s=2.111428e+03`
+  - `fd_plus_s=2.111278e+03`
+- finite-difference values:
+  - `softmax_Er = -8.261394e+01`
+  - `smooth_root_proxy = 1.630489e-05`
+  - `Er2_volume_average = 3.384430e+00`
+  - `Er_volume_average = 1.676171e+01`
+  - `electron_temperature_volume_average_keV = 3.529213e-01`
+  - `total_pressure_volume_average = 1.639403e+00`
+  - `alpha_power_volume_average_mw_m3 = 4.440607e-02`
+
+### Interpretation
+
+This is an important narrowing relative to the earlier nonfinite replay state:
+
+- the accepted-step frozen replay is now finite
+- but it is still not reproducing the old trusted forward/FD benchmark values
+- and it is still far too expensive
+
+In particular:
+
+- the thermodynamic metrics are at least in the rough neighborhood
+- the `E_r`-sensitive metrics are still clearly wrong
+- each replay (`fd_minus`, `fd_plus`) is much slower than the adaptive baseline
+  solve, which should not happen if replay is really just the usual forward
+  solver on the baseline accepted `dt` sequence
+
+### Structural conclusion
+
+The current problem is no longer:
+
+- nonfinite accepted replay
+- FD step-size selection
+- accidental replay of rejected steps
+
+The current problem is now most likely:
+
+- the fixed accepted-time replay contract still does **not** match the usual
+  forward solver semantics closely enough, especially for the `E_r` /
+  lagged-response path
+- and/or the benchmark lane is rebuilding too much setup for each of
+  `fd_minus` / `fd_plus`
+
+### Important review result from the latest code pass
+
+The recent wrapper change:
+
+- `benchmark_transport_forward_fd_lane.py`
+  - accepted replay now calls `_radau_run_prepared_on_time_list(...)`
+  - instead of `_radau_forward_fd_run_prepared_on_time_list(...)`
+
+turned out to be mostly a behavior-neutral isolation step, because the two
+accepted-step rollout helpers are currently almost identical in solver logic.
+
+So:
+
+- the wrapper swap is safe
+- but it is not the real fix
+
+### Next steps
+
+The next refactor should stay strictly inside the forward/FD lane and make the
+accepted replay semantics match the ordinary forward pass more literally.
+
+1. Compare the old trusted forward/FD accepted-step contract from
+   `NEOPAX_reverse_scratch` against the current `NEOPAX` forward/FD lane.
+   Focus only on:
+   - accepted time-list construction
+   - carry entering accepted replay
+   - lagged-response / cache / `E_r`-relevant carry fields
+
+2. Refactor the frozen-FD accepted replay lane so it behaves as:
+   - the usual forward transport solver
+   - with the baseline accepted `dt` sequence imposed
+   - without adaptive accept/reject controller evolution
+
+3. Reduce duplicated setup work in the benchmark lane:
+   - avoid rebuilding more than necessary between `fd_minus` and `fd_plus`
+   - preserve the forward/FD lane as separate from reverse-specific replay code
+
+4. Revalidate with:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 3e-8 --fd-abs-step 1e-10 --replay-mode accepted --accepted-step-limit 115
+```
+
+Primary success criteria:
+
+- replay time drops materially below the current `~2111 s` per replay
+- `E_r`-sensitive FD metrics move back toward the historical trusted values
+- no reverse-lane code paths are involved in the forward/FD benchmark
