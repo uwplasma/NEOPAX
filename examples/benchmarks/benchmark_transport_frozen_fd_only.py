@@ -113,6 +113,7 @@ def main() -> None:
         parameter_name=args.parameter,
         use_realized_schedule_jvp=False,
         accepted_step_limit_override=args.accepted_step_limit,
+        use_schedule_trace_only=True,
     )
     t_baseline1 = time.perf_counter()
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
@@ -162,16 +163,18 @@ def main() -> None:
             accepted_step_limit=args.accepted_step_limit,
         )
         t_step_debug1 = time.perf_counter()
-        baseline_er = np.asarray(jax.device_get(accepted_replay_step_debug["baseline_saved_states"].Er), dtype=float)
-        replay_er = np.asarray(jax.device_get(accepted_replay_step_debug["replay_saved_states"].Er), dtype=float)
-        er_step_max_abs = np.max(np.abs(baseline_er - replay_er), axis=1) if baseline_er.size and replay_er.size else np.asarray([], dtype=float)
+        realized_er = np.asarray([np.asarray(jax.device_get(state.Er), dtype=float) for state in accepted_replay_step_debug["realized_saved_states"]], dtype=float)
+        time_list_er = np.asarray([np.asarray(jax.device_get(state.Er), dtype=float) for state in accepted_replay_step_debug["time_list_saved_states"]], dtype=float)
+        er_step_max_abs = np.max(np.abs(realized_er - time_list_er), axis=1) if realized_er.size and time_list_er.size else np.asarray([], dtype=float)
         first_bad_step = int(np.argmax(er_step_max_abs > 1.0e-8)) if er_step_max_abs.size and np.any(er_step_max_abs > 1.0e-8) else -1
         accepted_replay_step_debug = {
-            "accepted_count": int(baseline_er.shape[0]) if baseline_er.ndim >= 1 else 0,
+            "accepted_count": int(realized_er.shape[0]) if realized_er.ndim >= 1 else 0,
             "elapsed_s": t_step_debug1 - t_step_debug0,
             "er_step_max_abs": er_step_max_abs.tolist(),
             "first_bad_step": first_bad_step,
             "first_bad_step_max_abs": None if first_bad_step < 0 else float(er_step_max_abs[first_bad_step]),
+            "realized_lagged_valid_in": accepted_replay_step_debug["realized_lagged_valid_in"],
+            "time_list_lagged_valid_in": accepted_replay_step_debug["time_list_lagged_valid_in"],
         }
 
     adaptive_objectives_np = np.asarray(

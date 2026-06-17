@@ -26,10 +26,11 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _make_radau_initial_step_state,
     _make_solver_state_transform,
     _project_flat_state_if_needed,
+    _RadauAcceptedStepAttemptContext,
     _radau_adaptive_final_state_rollout,
-    _radau_adaptive_final_y_realized_schedule,
-    _radau_adaptive_payload_trace_rollout,
     _radau_adaptive_schedule_rollout,
+    _radau_adaptive_final_y_realized_schedule,
+    _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
     _radau_eval_rhs,
     _radau_forward_fd_run_prepared_on_realized_trace,
@@ -614,7 +615,7 @@ def _accepted_replay_state_debug_for_parameter(
         if accepted_step_limit is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
-    baseline_rollout = _radau_adaptive_payload_trace_rollout(
+    baseline_rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
@@ -625,25 +626,91 @@ def _accepted_replay_state_debug_for_parameter(
         accepted_step_limit,
     )
     accepted_time_list = _accepted_time_list_from_trace(replay_trace)
-
     accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
     active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
-    keep_mask = np.logical_and(active_mask, accepted_mask)
-    baseline_y_end = jax.device_get(replay_trace.y_end)
-    baseline_y_end_kept = jnp.asarray(np.asarray(baseline_y_end)[keep_mask])
-    baseline_saved_states = jax.vmap(prepared_rollout.physics_context.unpack_flat)(baseline_y_end_kept)
-
-    replay = _radau_forward_fd_run_prepared_on_time_list(
-        prepared_rollout,
-        accepted_time_list,
+    attempted_dts = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
+    next_lagged_response_valid = np.asarray(
+        jax.device_get(replay_trace.next_lagged_response_valid),
+        dtype=bool,
     )
-    replay_saved_states = replay["saved_states"]
+    keep_mask = np.logical_and(active_mask, accepted_mask)
+    accepted_dts = attempted_dts[keep_mask]
+    accepted_next_lagged_valid = next_lagged_response_valid[keep_mask]
+
+    realized_carry = prepared_rollout.initial_carry
+    time_list_carry = prepared_rollout.initial_carry
+    realized_states = []
+    time_list_states = []
+    realized_lagged_valid_in = []
+    time_list_lagged_valid_in = []
+
+    for dt_value_np, next_lagged_valid_np in zip(
+        accepted_dts,
+        accepted_next_lagged_valid,
+        strict=False,
+    ):
+        dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
+
+        realized_lagged_valid_in.append(bool(np.asarray(jax.device_get(realized_carry.lagged_response_valid)).item()))
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=realized_carry.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(prepared_rollout.kernel_context.use_transport_lagged_response),
+        )
+        realized_result = _radau_apply_accepted_step_map(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            dataclasses.replace(realized_carry, dt=dt_value),
+            attempt_context,
+        )
+        realized_carry = dataclasses.replace(
+            realized_result.next_carry,
+            prev_error=jnp.maximum(
+                realized_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=prepared_rollout.kernel_context.dtype),
+            ),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_valid=jnp.asarray(next_lagged_valid_np),
+        )
+        realized_states.append(
+            prepared_rollout.physics_context.unpack_flat(realized_result.accepted_y)
+        )
+
+        time_list_lagged_valid_in.append(bool(np.asarray(jax.device_get(time_list_carry.lagged_response_valid)).item()))
+        time_attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=time_list_carry.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(prepared_rollout.kernel_context.use_transport_lagged_response),
+        )
+        time_result = _radau_apply_accepted_step_map(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            dataclasses.replace(time_list_carry, dt=dt_value),
+            time_attempt_context,
+        )
+        time_list_carry = dataclasses.replace(
+            time_result.next_carry,
+            prev_error=jnp.maximum(
+                time_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=prepared_rollout.kernel_context.dtype),
+            ),
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            lagged_response_valid=jnp.asarray(False),
+            lagged_reference_y=time_result.accepted_y,
+        )
+        time_list_states.append(
+            prepared_rollout.physics_context.unpack_flat(time_result.accepted_y)
+        )
     return {
         "accepted_time_list": accepted_time_list,
         "baseline_rollout": baseline_rollout,
         "replay_trace": replay_trace,
-        "baseline_saved_states": baseline_saved_states,
-        "replay_saved_states": replay_saved_states,
-        "baseline_final_state": prepared_rollout.physics_context.unpack_flat(baseline_rollout.final_carry.y),
-        "replay_final_state": replay["final_state"],
+        "realized_saved_states": realized_states,
+        "time_list_saved_states": time_list_states,
+        "realized_lagged_valid_in": realized_lagged_valid_in,
+        "time_list_lagged_valid_in": time_list_lagged_valid_in,
+        "realized_final_state": prepared_rollout.physics_context.unpack_flat(realized_carry.y),
+        "time_list_final_state": prepared_rollout.physics_context.unpack_flat(time_list_carry.y),
     }
