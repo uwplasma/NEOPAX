@@ -33,8 +33,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
     _radau_eval_rhs,
-    _radau_forward_fd_run_prepared_on_realized_trace,
-    _radau_run_prepared_on_time_list_final_state_only,
+    _radau_solve_on_fixed_time_map_final_state_only,
 )
 
 
@@ -228,17 +227,6 @@ def _accepted_time_list_from_trace(trace) -> list[float]:
     step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
     keep = np.logical_and(active_mask, accepted_mask)
     return step_ts[keep].tolist()
-
-
-def _accepted_next_lagged_valid_from_trace(trace) -> list[bool]:
-    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
-    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
-    next_lagged_response_valid = np.asarray(
-        jax.device_get(trace.next_lagged_response_valid),
-        dtype=bool,
-    )
-    keep = np.logical_and(active_mask, accepted_mask)
-    return next_lagged_response_valid[keep].tolist()
 
 
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
@@ -513,48 +501,22 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     replay_mode: str = "attempt",
 ):
     replay_mode_normalized = str(replay_mode).strip().lower()
-    if replay_mode_normalized == "accepted":
-        accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
-        accepted_next_lagged_valid = _accepted_next_lagged_valid_from_trace(frozen_trace)
-        return _adaptive_rollout_objectives_for_parameter_on_time_list(
-            parameter_value,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            time_list=accepted_time_list,
-            next_lagged_response_valid_list=accepted_next_lagged_valid,
+    if replay_mode_normalized != "accepted":
+        raise ValueError(
+            "The forward/FD frozen lane now supports replay_mode='accepted' only. "
+            "FD runs use the solver-native fixed accepted-time-map path rather than the old replay machinery."
         )
 
-    state0 = _parameterized_initial_state(
+    accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
+    return _adaptive_rollout_objectives_for_parameter_on_time_list(
+        parameter_value,
+        config=config,
+        runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
-        geometry=runtime.geometry,
-        n_species=runtime.species.number_species,
         parameter_name=parameter_name,
-        parameter_value=parameter_value,
+        time_list=accepted_time_list,
     )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
-    solver = prepared_components["solver"]
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
-        solver=solver,
-        state=state0,
-        vector_field=solve_vector_field,
-        species=runtime.species,
-    )
-    execution_context = _build_prepared_radau_execution_context(
-        solver=solver,
-        prepared_rollout=prepared_rollout,
-    )
-    replay = _radau_forward_fd_run_prepared_on_realized_trace(
-        prepared_rollout,
-        execution_context,
-        frozen_trace,
-        replay_mode=replay_mode_normalized,
-    )
-    return _objective_vector(replay["final_state"], runtime), replay
 
 
 def _adaptive_rollout_objectives_for_parameter_on_time_list(
@@ -566,7 +528,6 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     time_list,
-    next_lagged_response_valid_list=None,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -585,13 +546,9 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
         vector_field=solve_vector_field,
         species=runtime.species,
     )
-    # Accepted-step frozen replay should follow the same forward accepted-map
-    # lane as the normal solver, while attempt-mode replay keeps its own
-    # benchmark-local helper.
-    replay = _radau_run_prepared_on_time_list_final_state_only(
+    replay = _radau_solve_on_fixed_time_map_final_state_only(
         prepared_rollout,
         time_list,
-        next_lagged_response_valid_list=next_lagged_response_valid_list,
     )
     return _objective_vector(replay["final_state"], runtime), replay
 
@@ -647,13 +604,8 @@ def _accepted_replay_state_debug_for_parameter(
     accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
     active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
     attempted_dts = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
-    next_lagged_response_valid = np.asarray(
-        jax.device_get(replay_trace.next_lagged_response_valid),
-        dtype=bool,
-    )
     keep_mask = np.logical_and(active_mask, accepted_mask)
     accepted_dts = attempted_dts[keep_mask]
-    accepted_next_lagged_valid = next_lagged_response_valid[keep_mask]
 
     realized_carry = prepared_rollout.initial_carry
     time_list_carry = prepared_rollout.initial_carry
@@ -662,11 +614,7 @@ def _accepted_replay_state_debug_for_parameter(
     realized_lagged_valid_in = []
     time_list_lagged_valid_in = []
 
-    for dt_value_np, next_lagged_valid_np in zip(
-        accepted_dts,
-        accepted_next_lagged_valid,
-        strict=False,
-    ):
+    for dt_value_np in accepted_dts:
         dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
 
         realized_lagged_valid_in.append(bool(np.asarray(jax.device_get(realized_carry.lagged_response_valid)).item()))
@@ -689,7 +637,6 @@ def _accepted_replay_state_debug_for_parameter(
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            lagged_response_valid=jnp.asarray(next_lagged_valid_np),
         )
         realized_states.append(
             prepared_rollout.physics_context.unpack_flat(realized_result.accepted_y)
@@ -715,8 +662,6 @@ def _accepted_replay_state_debug_for_parameter(
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            lagged_response_valid=jnp.asarray(False),
-            lagged_reference_y=time_result.accepted_y,
         )
         time_list_states.append(
             prepared_rollout.physics_context.unpack_flat(time_result.accepted_y)

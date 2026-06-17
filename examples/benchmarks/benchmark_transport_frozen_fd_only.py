@@ -48,7 +48,7 @@ def _tree_all_finite(tree) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Frozen-FD-only benchmark lane using scratch-compatible forward/FD helper semantics."
+        description="Frozen-FD-only benchmark lane using the solver-native fixed accepted-time-map forward path."
     )
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
     parser.add_argument(
@@ -63,9 +63,9 @@ def main() -> None:
     parser.add_argument(
         "--replay-mode",
         type=str,
-        default="attempt",
-        choices=("attempt", "accepted"),
-        help="Frozen replay mode used for FD.",
+        default="accepted",
+        choices=("accepted",),
+        help="Fixed accepted-time-map mode used for FD.",
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument(
@@ -131,7 +131,7 @@ def main() -> None:
     accepted_replay_step_debug = None
     if args.baseline_replay_debug and str(args.replay_mode).strip().lower() == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(replay_trace)
-        print("[autodiff-gate] progress: running frozen baseline replay (accepted)", flush=True)
+        print("[autodiff-gate] progress: running fixed-time baseline solve (accepted)", flush=True)
         t_replay0 = time.perf_counter()
         baseline_replay_objectives, baseline_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             jnp.asarray(baseline_value),
@@ -189,7 +189,7 @@ def main() -> None:
         minus_value = baseline_value - fd_step
         plus_value = baseline_value + fd_step
 
-        print(f"[autodiff-gate] progress: running frozen fd_minus replay ({args.replay_mode})", flush=True)
+        print(f"[autodiff-gate] progress: running fixed-time fd_minus solve ({args.replay_mode})", flush=True)
         t_minus0 = time.perf_counter()
         objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             jnp.asarray(minus_value),
@@ -202,7 +202,7 @@ def main() -> None:
             replay_mode=args.replay_mode,
         )
         t_minus1 = time.perf_counter()
-        print(f"[autodiff-gate] progress: running frozen fd_plus replay ({args.replay_mode})", flush=True)
+        print(f"[autodiff-gate] progress: running fixed-time fd_plus solve ({args.replay_mode})", flush=True)
         t_plus0 = time.perf_counter()
         objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             jnp.asarray(plus_value),
