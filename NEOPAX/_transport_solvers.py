@@ -5644,6 +5644,8 @@ def _radau_run_prepared_on_time_list(
 def _radau_run_prepared_on_time_list_final_state_only(
     prepared_rollout: _PreparedRadauAcceptedRollout,
     time_list,
+    *,
+    next_lagged_response_valid_list=None,
 ) -> dict[str, Any]:
     """Replay accepted-step forward physics on a fixed time list without saving states.
 
@@ -5658,8 +5660,23 @@ def _radau_run_prepared_on_time_list_final_state_only(
         t0=t0,
         dtype=prepared_rollout.kernel_context.dtype,
     )
+    forced_next_lagged_valid = None
+    if next_lagged_response_valid_list is not None:
+        forced_next_lagged_valid = jnp.asarray(
+            next_lagged_response_valid_list,
+            dtype=jnp.bool_,
+        )
+        if forced_next_lagged_valid.shape[0] != dt_sequence.shape[0]:
+            raise ValueError(
+                "next_lagged_response_valid_list must have the same length as the accepted-step time list."
+            )
 
-    def _scan_body(carry, dt_value):
+    def _scan_body(carry, xs):
+        if forced_next_lagged_valid is None:
+            dt_value = xs
+            forced_keep_lagged_response = None
+        else:
+            dt_value, forced_keep_lagged_response = xs
         carry_for_step = dataclasses.replace(carry, dt=dt_value)
         attempt_context = _RadauAcceptedStepAttemptContext(
             t_final=carry.t + dt_value,
@@ -5673,29 +5690,32 @@ def _radau_run_prepared_on_time_list_final_state_only(
         )
         keep_lagged_response = jnp.asarray(False)
         if prepared_rollout.kernel_context.use_transport_lagged_response:
-            lagged_reuse_global = (
-                getattr(prepared_rollout.physics_context, "lagged_response_reuse_mode", "retry_only")
-                == "global_state_drift"
-            )
-            lagged_reuse_metric = _lagged_response_global_reuse_metric(
-                step_map_result.accepted_y,
-                carry.lagged_reference_y,
-                atol=jnp.asarray(
-                    getattr(prepared_rollout.physics_context, "lagged_response_reuse_atol", 1.0e-8),
-                    dtype=prepared_rollout.kernel_context.dtype,
-                ),
-                rtol=jnp.asarray(
-                    getattr(prepared_rollout.physics_context, "lagged_response_reuse_rtol", 5.0e-2),
-                    dtype=prepared_rollout.kernel_context.dtype,
-                ),
-            )
-            keep_lagged_response = jnp.logical_and(
-                jnp.asarray(True),
-                jnp.logical_and(
-                    jnp.asarray(lagged_reuse_global),
-                    lagged_reuse_metric <= jnp.asarray(1.0, dtype=prepared_rollout.kernel_context.dtype),
-                ),
-            )
+            if forced_keep_lagged_response is None:
+                lagged_reuse_global = (
+                    getattr(prepared_rollout.physics_context, "lagged_response_reuse_mode", "retry_only")
+                    == "global_state_drift"
+                )
+                lagged_reuse_metric = _lagged_response_global_reuse_metric(
+                    step_map_result.accepted_y,
+                    carry.lagged_reference_y,
+                    atol=jnp.asarray(
+                        getattr(prepared_rollout.physics_context, "lagged_response_reuse_atol", 1.0e-8),
+                        dtype=prepared_rollout.kernel_context.dtype,
+                    ),
+                    rtol=jnp.asarray(
+                        getattr(prepared_rollout.physics_context, "lagged_response_reuse_rtol", 5.0e-2),
+                        dtype=prepared_rollout.kernel_context.dtype,
+                    ),
+                )
+                keep_lagged_response = jnp.logical_and(
+                    jnp.asarray(True),
+                    jnp.logical_and(
+                        jnp.asarray(lagged_reuse_global),
+                        lagged_reuse_metric <= jnp.asarray(1.0, dtype=prepared_rollout.kernel_context.dtype),
+                    ),
+                )
+            else:
+                keep_lagged_response = jnp.asarray(forced_keep_lagged_response, dtype=jnp.bool_)
         next_carry = dataclasses.replace(
             step_map_result.next_carry,
             prev_error=jnp.maximum(
@@ -5705,19 +5725,19 @@ def _radau_run_prepared_on_time_list_final_state_only(
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=keep_lagged_response,
-            lagged_reference_y=carry.lagged_reference_y,
         )
         return next_carry, None
 
-    final_carry, _ = jax.lax.scan(_scan_body, prepared_rollout.initial_carry, dt_sequence)
+    scan_xs = dt_sequence if forced_next_lagged_valid is None else (dt_sequence, forced_next_lagged_valid)
+    final_carry, _ = jax.lax.scan(_scan_body, prepared_rollout.initial_carry, scan_xs)
     final_state = prepared_rollout.physics_context.unpack_flat(final_carry.y)
     return {
         "time_list": jnp.asarray(time_list, dtype=prepared_rollout.kernel_context.dtype),
         "dt_sequence": dt_sequence,
         "final_state": final_state,
         "final_carry": final_carry,
+        "forced_next_lagged_response_valid_list": forced_next_lagged_valid,
     }
 
 

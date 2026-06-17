@@ -230,6 +230,17 @@ def _accepted_time_list_from_trace(trace) -> list[float]:
     return step_ts[keep].tolist()
 
 
+def _accepted_next_lagged_valid_from_trace(trace) -> list[bool]:
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    next_lagged_response_valid = np.asarray(
+        jax.device_get(trace.next_lagged_response_valid),
+        dtype=bool,
+    )
+    keep = np.logical_and(active_mask, accepted_mask)
+    return next_lagged_response_valid[keep].tolist()
+
+
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
     return {
         "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
@@ -504,6 +515,7 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     replay_mode_normalized = str(replay_mode).strip().lower()
     if replay_mode_normalized == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
+        accepted_next_lagged_valid = _accepted_next_lagged_valid_from_trace(frozen_trace)
         return _adaptive_rollout_objectives_for_parameter_on_time_list(
             parameter_value,
             config=config,
@@ -512,6 +524,7 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             profile_cfg=profile_cfg,
             parameter_name=parameter_name,
             time_list=accepted_time_list,
+            next_lagged_response_valid_list=accepted_next_lagged_valid,
         )
 
     state0 = _parameterized_initial_state(
@@ -553,6 +566,7 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     time_list,
+    next_lagged_response_valid_list=None,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -577,6 +591,7 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     replay = _radau_run_prepared_on_time_list_final_state_only(
         prepared_rollout,
         time_list,
+        next_lagged_response_valid_list=next_lagged_response_valid_list,
     )
     return _objective_vector(replay["final_state"], runtime), replay
 
