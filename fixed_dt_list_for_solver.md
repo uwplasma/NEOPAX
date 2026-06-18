@@ -227,3 +227,110 @@ At the end of this refactor:
   - same solver path as baseline
   - same forward numerical treatment
   - only the `dt` list is externally prescribed
+
+## Current solver-path findings (2026-06-18)
+
+These notes were added after a detailed code comparison between:
+
+- current `NEOPAX`
+- `NEOPAX copy 6`
+
+with focus on the plain forward solver path around NTX lagged-response usage.
+
+### What was checked
+
+- `RADAUSolver.solve(...)`
+- `_run_saved_loop(...)`
+- `_make_radau_initial_step_state(...)`
+- `_radau_step_fn(...)`
+- `_radau_step_fn_forward_solver(...)`
+- `_radau_attempt_step_lean(...)`
+- `_radau_attempt_step_forward_solver(...)`
+- `_execute_radau_accepted_step_attempt(...)`
+- `_radau_single_step_primal(...)`
+- `_radau_prepare_lagged_response(...)`
+- `TransportEquations.build_lagged_response(...)`
+- `TransportEquations.evaluate_with_lagged_response(...)`
+- `NTXExactLijRuntimeTransportModel.build_lagged_response(...)`
+- `NTXExactLijRuntimeTransportModel.evaluate_with_lagged_response(...)`
+
+### Main findings
+
+1. The NTX lagged-response primal path itself looks effectively the same
+   between current `NEOPAX` and `copy 6`.
+   - The lagged-response hook chain, equation-level lagged build/eval, and
+     NTX runtime lagged build/eval were not the source of an obvious solver
+     divergence.
+
+2. The plain solver orchestration is no longer identical.
+   - `copy 6` plain adaptive solve goes through:
+     - `_radau_step_fn(...)`
+     - `_radau_attempt_step_lean(...)`
+     - `_execute_radau_accepted_step_attempt(...)`
+   - current plain adaptive solve goes through:
+     - `_radau_step_fn_forward_solver(...)`
+     - `_radau_attempt_step_forward_solver(...)`
+     - `_radau_single_step_primal(...)`
+
+3. That orchestration split is structural, not obviously numerical.
+   - `_radau_attempt_step_forward_solver(...)` effectively inlines the same
+     primal one-step call and controller application that
+     `_radau_attempt_step_lean(...)` gets via
+     `_execute_radau_accepted_step_attempt(...)`.
+   - No clear numerical difference was identified from that wrapper split
+     alone.
+
+4. The accepted-step carry and kernel context are effectively the same.
+   - `_RadauAcceptedStepCarry`
+   - `_RadauAcceptedStepAttemptResult`
+   - `_RadauAcceptedStepKernelContext`
+   do not show a meaningful forward-runtime widening relative to `copy 6`.
+
+5. The accepted-step physics context is wider in current `NEOPAX`.
+   - Current `_RadauAcceptedStepPhysicsContext` carries extra closures:
+     - `project_flat_pullback`
+     - `build_lagged_response_pullback`
+     - `flat_rhs_with_shared_fluxes`
+   - `copy 6` only carries the smaller forward-facing fields:
+     - `unpack_flat`
+     - `project_flat`
+     - `build_lagged_response`
+     - `flat_rhs`
+     - `flat_rhs_with_lagged_response`
+
+6. `_radau_single_step_primal(...)` does not appear to use those extra fields.
+   - In the current code, the primal step only touches:
+     - `unpack_flat`
+     - `project_flat`
+     - `build_lagged_response`
+     - `flat_rhs`
+     - `flat_rhs_with_lagged_response`
+   - So the extra fields are not changing the primal math directly.
+
+### Best current hypothesis
+
+The strongest remaining code-level suspect for the forward solver compile-time
+inflation is not the NTX lagged-response numerical path itself, but the fact
+that the current plain solver closes over a wider `physics_context` than the
+older forward lane did, even though the extra reverse/shared-flux closures are
+not used by `_radau_single_step_primal(...)`.
+
+This is still a hypothesis. It has **not** yet been validated by refactoring
+the forward solver to use a smaller forward-only context and then rerunning the
+timing comparison.
+
+### Recommended next step
+
+Create a strictly forward-only accepted-step physics context for the plain
+solver lane, carrying only:
+
+- `unpack_flat`
+- `project_flat`
+- `build_lagged_response`
+- `flat_rhs`
+- `flat_rhs_with_lagged_response`
+
+Keep reverse / shared-flux / pullback closures in separate AD-facing contexts.
+
+Then test whether the rebuild / reuse compile times of the plain adaptive
+solver drop relative to the current path.
