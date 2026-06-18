@@ -113,6 +113,7 @@ def main() -> None:
         parameter_name=args.parameter,
         use_realized_schedule_jvp=False,
         accepted_step_limit_override=args.accepted_step_limit,
+        use_schedule_trace_only=True,
     )
     t_baseline1 = time.perf_counter()
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
