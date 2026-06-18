@@ -27,6 +27,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _objective_vector,
     _production_solver_baseline_final_state_and_schedule_for_parameter,
     _prepare_benchmark_config,
+    _single_step_compare_for_parameter,
     _truncate_rollout_trace_by_accepted_steps,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
@@ -90,6 +91,17 @@ def main() -> None:
         action="store_true",
         help="Run only the unperturbed accepted-step state-by-state baseline vs replay comparison.",
     )
+    parser.add_argument(
+        "--single-step-compare",
+        action="store_true",
+        help="Run only a one-step production-vs-fixed-dt comparison from the same incoming accepted-step boundary.",
+    )
+    parser.add_argument(
+        "--accepted-step-index",
+        type=int,
+        default=0,
+        help="Accepted-step index used by --single-step-compare.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -129,6 +141,7 @@ def main() -> None:
     accepted_time_list = None
     baseline_replay_elapsed_s = None
     accepted_replay_step_debug = None
+    single_step_compare = None
     if args.baseline_replay_debug and str(args.replay_mode).strip().lower() == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(replay_trace)
         print("[autodiff-gate] progress: running fixed-time baseline solve (accepted)", flush=True)
@@ -181,6 +194,20 @@ def main() -> None:
             "realized_lagged_valid_in": accepted_replay_step_debug["realized_lagged_valid_in"],
             "time_list_lagged_valid_in": accepted_replay_step_debug["time_list_lagged_valid_in"],
         }
+    if args.single_step_compare:
+        print("[autodiff-gate] progress: running single-step production vs fixed-dt comparison", flush=True)
+        t_single0 = time.perf_counter()
+        single_step_compare = _single_step_compare_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            accepted_step_index=args.accepted_step_index,
+        )
+        t_single1 = time.perf_counter()
+        single_step_compare["elapsed_s"] = t_single1 - t_single0
 
     adaptive_objectives_np = np.asarray(
         jax.device_get(baseline_objectives_adaptive),
@@ -190,7 +217,7 @@ def main() -> None:
     minus_replay = None
     plus_replay = None
     t_minus0 = t_minus1 = t_plus0 = t_plus1 = None
-    if not args.baseline_replay_debug and not args.accepted_replay_step_debug:
+    if not args.baseline_replay_debug and not args.accepted_replay_step_debug and not args.single_step_compare:
         minus_value = baseline_value - fd_step
         plus_value = baseline_value + fd_step
 
@@ -234,6 +261,7 @@ def main() -> None:
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
         "accepted_replay_step_debug": accepted_replay_step_debug,
+        "single_step_compare": single_step_compare,
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_fd": None if grad_np is None else grad_np.tolist(),
         "adaptive_objectives": adaptive_objectives_np.tolist(),
@@ -289,6 +317,32 @@ def main() -> None:
             f"elapsed_s={accepted_replay_step_debug['elapsed_s']:.6e} "
             f"first_bad_step={accepted_replay_step_debug['first_bad_step']} "
             f"first_bad_step_max_abs={0.0 if accepted_replay_step_debug['first_bad_step_max_abs'] is None else accepted_replay_step_debug['first_bad_step_max_abs']:.6e}"
+        )
+    if single_step_compare is not None:
+        print(
+            f"[autodiff-gate] single-step compare: accepted_step_index={single_step_compare['accepted_step_index']} "
+            f"incoming_t={single_step_compare['incoming_t']:.6e} "
+            f"accepted_dt={single_step_compare['accepted_dt']:.6e} "
+            f"elapsed_s={single_step_compare['elapsed_s']:.6e}"
+        )
+        print(
+            f"[autodiff-gate] single-step diffs: accepted_y={single_step_compare['accepted_y_max_abs_diff']:.6e} "
+            f"Er={single_step_compare['state_Er_max_abs_diff']:.6e} "
+            f"density={single_step_compare['state_density_max_abs_diff']:.6e} "
+            f"pressure={single_step_compare['state_pressure_max_abs_diff']:.6e}"
+        )
+        print(
+            f"[autodiff-gate] single-step carry diffs: prev_stages={single_step_compare['carry_prev_stages_max_abs_diff']:.6e} "
+            f"prev_dt={single_step_compare['carry_prev_dt_abs_diff']:.6e} "
+            f"prev_error={single_step_compare['carry_prev_error_abs_diff']:.6e} "
+            f"theta={single_step_compare['carry_prev_theta_final_abs_diff']:.6e} "
+            f"newton_iter_diff={single_step_compare['carry_prev_newton_iter_count_diff']} "
+            f"jacobian={single_step_compare['carry_jacobian_max_abs_diff']:.6e} "
+            f"real_lu={single_step_compare['carry_real_lu_max_abs_diff']:.6e} "
+            f"complex_lu={single_step_compare['carry_complex_lu_max_abs_diff']:.6e} "
+            f"lagged_cache={single_step_compare['carry_lagged_cache_max_abs_diff']:.6e} "
+            f"lagged_ref={single_step_compare['carry_lagged_reference_y_max_abs_diff']:.6e} "
+            f"lagged_valid_equal={single_step_compare['carry_lagged_valid_equal']}"
         )
     if grad_np is not None:
         print("[autodiff-gate] objective values:")

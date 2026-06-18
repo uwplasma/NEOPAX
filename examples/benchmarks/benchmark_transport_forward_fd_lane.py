@@ -821,3 +821,153 @@ def _accepted_replay_state_debug_for_parameter(
         "realized_final_state": prepared_rollout.physics_context.unpack_flat(adaptive_step_state.y),
         "time_list_final_state": prepared_rollout.physics_context.unpack_flat(time_list_carry.y),
     }
+
+
+def _max_abs_diff(a, b) -> float:
+    arr_a = np.asarray(jax.device_get(a), dtype=float)
+    arr_b = np.asarray(jax.device_get(b), dtype=float)
+    if arr_a.size == 0 and arr_b.size == 0:
+        return 0.0
+    return float(np.max(np.abs(arr_a - arr_b)))
+
+
+def _single_step_compare_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_index: int,
+):
+    if accepted_step_index < 0:
+        raise ValueError("accepted_step_index must be nonnegative.")
+
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    baseline_rollout = _forward_solver_schedule_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=accepted_step_index + 1,
+    )
+    trace = baseline_rollout.trace
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
+
+    adaptive_step_state = _radau_step_state_from_carry(
+        prepared_rollout.initial_carry,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+    accepted_seen = 0
+    target_incoming_step_state = None
+    target_dt = None
+    production_next_step_state = None
+    production_step_info = None
+
+    for active, accepted, dt_value_np in zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist()):
+        if not active:
+            continue
+        dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
+        step_state_in = dataclasses.replace(adaptive_step_state, dt=dt_value)
+        next_step_state, step_info = _radau_step_fn_forward_solver(
+            execution_context,
+            step_state_in,
+            None,
+        )
+        if accepted:
+            if accepted_seen == accepted_step_index:
+                target_incoming_step_state = step_state_in
+                target_dt = dt_value
+                production_next_step_state = next_step_state
+                production_step_info = step_info
+                break
+            accepted_seen += 1
+        adaptive_step_state = next_step_state
+
+    if target_incoming_step_state is None or target_dt is None:
+        raise ValueError(
+            f"accepted_step_index={accepted_step_index} is out of range; "
+            f"baseline accepted_count={int(np.asarray(jax.device_get(baseline_rollout.accepted_count)).item())}."
+        )
+
+    carry_in = _radau_carry_from_step_state(target_incoming_step_state)
+    fixed_attempt_context = _RadauAcceptedStepAttemptContext(
+        t_final=carry_in.t + target_dt,
+        use_transport_lagged_response=jnp.asarray(prepared_rollout.kernel_context.use_transport_lagged_response),
+    )
+    fixed_step_result = _radau_apply_accepted_step_map(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        dataclasses.replace(carry_in, dt=target_dt),
+        fixed_attempt_context,
+    )
+    fixed_next_carry = fixed_step_result.next_carry
+    production_state = prepared_rollout.physics_context.unpack_flat(production_step_info.y)
+    fixed_state = prepared_rollout.physics_context.unpack_flat(fixed_step_result.accepted_y)
+
+    return {
+        "accepted_step_index": int(accepted_step_index),
+        "accepted_dt": float(np.asarray(jax.device_get(target_dt)).item()),
+        "incoming_t": float(np.asarray(jax.device_get(target_incoming_step_state.t)).item()),
+        "production_accepted": bool(np.asarray(jax.device_get(production_step_info.accepted)).item()),
+        "fixed_converged": bool(np.asarray(jax.device_get(fixed_step_result.converged)).item()),
+        "accepted_y_max_abs_diff": _max_abs_diff(production_step_info.y, fixed_step_result.accepted_y),
+        "state_Er_max_abs_diff": _max_abs_diff(production_state.Er, fixed_state.Er),
+        "state_density_max_abs_diff": _max_abs_diff(production_state.density, fixed_state.density),
+        "state_pressure_max_abs_diff": _max_abs_diff(production_state.pressure, fixed_state.pressure),
+        "carry_prev_stages_max_abs_diff": _max_abs_diff(production_next_step_state.prev_stages, fixed_next_carry.prev_stages),
+        "carry_prev_dt_abs_diff": abs(
+            float(np.asarray(jax.device_get(production_next_step_state.prev_dt)).item())
+            - float(np.asarray(jax.device_get(fixed_next_carry.prev_dt)).item())
+        ),
+        "carry_prev_error_abs_diff": abs(
+            float(np.asarray(jax.device_get(production_next_step_state.prev_error)).item())
+            - float(np.asarray(jax.device_get(fixed_next_carry.prev_error)).item())
+        ),
+        "carry_prev_theta_final_abs_diff": abs(
+            float(np.asarray(jax.device_get(production_next_step_state.prev_theta_final)).item())
+            - float(np.asarray(jax.device_get(fixed_next_carry.prev_theta_final)).item())
+        ),
+        "carry_prev_newton_iter_count_diff": int(
+            np.asarray(jax.device_get(production_next_step_state.prev_newton_iter_count)).item()
+            - np.asarray(jax.device_get(fixed_next_carry.prev_newton_iter_count)).item()
+        ),
+        "carry_jacobian_max_abs_diff": _max_abs_diff(production_next_step_state.jacobian, fixed_next_carry.jacobian),
+        "carry_real_lu_max_abs_diff": _max_abs_diff(production_next_step_state.real_lu, fixed_next_carry.real_lu),
+        "carry_complex_lu_max_abs_diff": _max_abs_diff(production_next_step_state.complex_lu, fixed_next_carry.complex_lu),
+        "carry_lagged_cache_max_abs_diff": _max_abs_diff(
+            production_next_step_state.lagged_response_cache,
+            fixed_next_carry.lagged_response_cache,
+        ),
+        "carry_lagged_valid_equal": bool(
+            np.asarray(jax.device_get(production_next_step_state.lagged_response_valid)).item()
+            == np.asarray(jax.device_get(fixed_next_carry.lagged_response_valid)).item()
+        ),
+        "carry_lagged_reference_y_max_abs_diff": _max_abs_diff(
+            production_next_step_state.lagged_reference_y,
+            fixed_next_carry.lagged_reference_y,
+        ),
+    }
