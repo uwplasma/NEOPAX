@@ -3638,7 +3638,6 @@ def _radau_prepare_lagged_response(
     lagged_response_reused = jnp.asarray(False)
     if kernel_context.use_transport_lagged_response:
         flat_y = carry_in.y
-        candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
         lagged_response_reused = jnp.asarray(carry_in.lagged_response_valid)
 
         def _reuse_cached(_):
@@ -3647,6 +3646,7 @@ def _radau_prepare_lagged_response(
         def _rebuild_cached(_):
             if build_lagged_response is None:
                 return None
+            candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
             return build_lagged_response(candidate_state)
 
         lagged_response = jax.lax.cond(
