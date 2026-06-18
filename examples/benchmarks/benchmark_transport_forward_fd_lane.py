@@ -824,11 +824,25 @@ def _accepted_replay_state_debug_for_parameter(
 
 
 def _max_abs_diff(a, b) -> float:
-    arr_a = np.asarray(jax.device_get(a), dtype=float)
-    arr_b = np.asarray(jax.device_get(b), dtype=float)
-    if arr_a.size == 0 and arr_b.size == 0:
-        return 0.0
-    return float(np.max(np.abs(arr_a - arr_b)))
+    leaves_a = jax.tree_util.tree_leaves(jax.device_get(a))
+    leaves_b = jax.tree_util.tree_leaves(jax.device_get(b))
+    if len(leaves_a) != len(leaves_b):
+        raise ValueError("Tree structures do not match in _max_abs_diff.")
+    max_diff = 0.0
+    for leaf_a, leaf_b in zip(leaves_a, leaves_b):
+        arr_a = np.asarray(leaf_a)
+        arr_b = np.asarray(leaf_b)
+        if arr_a.shape != arr_b.shape:
+            raise ValueError("Leaf shapes do not match in _max_abs_diff.")
+        if arr_a.size == 0 and arr_b.size == 0:
+            continue
+        if np.issubdtype(arr_a.dtype, np.inexact) or np.issubdtype(arr_b.dtype, np.inexact):
+            diff = float(np.max(np.abs(arr_a.astype(float) - arr_b.astype(float))))
+        else:
+            diff = 0.0 if np.array_equal(arr_a, arr_b) else float(np.max(np.abs(arr_a.astype(float) - arr_b.astype(float))))
+        if diff > max_diff:
+            max_diff = diff
+    return max_diff
 
 
 def _single_step_compare_for_parameter(
