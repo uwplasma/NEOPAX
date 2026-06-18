@@ -21,6 +21,8 @@ from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
+    _accepted_step_limit_reached,
+    _custom_loop_active,
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
     _make_radau_initial_step_state,
@@ -52,6 +54,24 @@ OBJECTIVE_LABELS = [
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
 ]
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ForwardSolverScheduleTrace:
+    accepted_mask: Any
+    active_mask: Any
+    attempted_dts: Any
+    step_ts: Any
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ForwardSolverScheduleRolloutResult:
+    trace: _ForwardSolverScheduleTrace
+    attempt_count: Any
+    accepted_count: Any
+    completed: Any
+    failed: Any
+    fail_code: Any
 
 
 def _prepare_benchmark_config(
@@ -239,6 +259,128 @@ def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
         "failed": bool(np.asarray(jax.device_get(rollout.failed)).item()),
         "fail_code": int(np.asarray(jax.device_get(rollout.fail_code)).item()),
     }
+
+
+def _forward_solver_schedule_rollout(
+    execution_context,
+    carry0,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None = None,
+) -> _ForwardSolverScheduleRolloutResult:
+    """Compact accepted-dt trace using the same step dispatcher as the production solver."""
+
+    dtype = execution_context.dtype
+    step_state0 = _radau_step_state_from_carry(
+        carry0,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+    xs = jnp.arange(int(max_total_steps), dtype=jnp.int32)
+
+    def _scan_body_with_idx(step_state, step_idx):
+        active = jnp.logical_and(
+            _custom_loop_active(
+                step_state,
+                execution_context.attempt_context.t_final,
+                step_idx,
+                max_total_steps,
+            ),
+            jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)),
+        )
+
+        def _run(_):
+            next_step_state, step_info = _radau_step_fn_forward_solver(execution_context, step_state, None)
+            return next_step_state, (
+                jnp.asarray(step_info.accepted),
+                jnp.asarray(step_info.dt, dtype=dtype),
+                jnp.asarray(step_info.t, dtype=dtype),
+            )
+
+        def _skip(_):
+            return step_state, (
+                jnp.asarray(False),
+                jnp.asarray(0.0, dtype=dtype),
+                step_state.t,
+            )
+
+        next_step_state, wrapped_scan_out = jax.lax.cond(active, _run, _skip, operand=None)
+        accepted, attempted_dt, step_t = wrapped_scan_out
+        return next_step_state, (
+            active,
+            accepted,
+            attempted_dt,
+            step_t,
+        )
+
+    final_step_state, scan_outputs = jax.lax.scan(_scan_body_with_idx, step_state0, xs)
+    active_mask, accepted_mask, attempted_dts, step_ts = scan_outputs
+    trace = _ForwardSolverScheduleTrace(
+        accepted_mask=accepted_mask,
+        active_mask=active_mask,
+        attempted_dts=attempted_dts,
+        step_ts=step_ts,
+    )
+    completed = jnp.logical_or(
+        final_step_state.t >= (execution_context.attempt_context.t_final - 1.0e-15),
+        _accepted_step_limit_reached(final_step_state, stop_after_accepted_steps),
+    )
+    failed = final_step_state.status[0] != 0
+    fail_code = final_step_state.status[1]
+    return _ForwardSolverScheduleRolloutResult(
+        trace=trace,
+        attempt_count=jnp.sum(active_mask.astype(jnp.int32)),
+        accepted_count=jnp.sum(accepted_mask.astype(jnp.int32)),
+        completed=completed,
+        failed=failed,
+        fail_code=fail_code,
+    )
+
+
+def _production_solver_baseline_final_state_and_schedule_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    solver_output = solver.solve(state0, solve_vector_field, runtime.species)
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    rollout = _forward_solver_schedule_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return solver_output["final_state"], rollout
 
 
 def _adaptive_rollout_final_state_for_parameter(
@@ -597,7 +739,7 @@ def _accepted_replay_state_debug_for_parameter(
         if accepted_step_limit is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
-    baseline_rollout = _radau_adaptive_final_state_rollout(
+    baseline_rollout = _forward_solver_schedule_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
@@ -676,6 +818,6 @@ def _accepted_replay_state_debug_for_parameter(
         "time_list_saved_states": time_list_states,
         "realized_lagged_valid_in": realized_lagged_valid_in,
         "time_list_lagged_valid_in": time_list_lagged_valid_in,
-        "realized_final_state": prepared_rollout.physics_context.unpack_flat(realized_carry.y),
+        "realized_final_state": prepared_rollout.physics_context.unpack_flat(adaptive_step_state.y),
         "time_list_final_state": prepared_rollout.physics_context.unpack_flat(time_list_carry.y),
     }

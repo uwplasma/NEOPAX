@@ -21,11 +21,11 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _accepted_time_list_from_trace,
     _accepted_replay_state_debug_for_parameter,
     _adaptive_rollout_diagnostics,
-    _adaptive_rollout_final_state_for_parameter,
     _adaptive_rollout_objectives_for_parameter_on_frozen_trace,
     _baseline_profile_cfg,
     _fd_step,
     _objective_vector,
+    _production_solver_baseline_final_state_and_schedule_for_parameter,
     _prepare_benchmark_config,
     _truncate_rollout_trace_by_accepted_steps,
 )
@@ -104,16 +104,14 @@ def main() -> None:
 
     print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
     t_baseline0 = time.perf_counter()
-    baseline_final_state, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
+    baseline_final_state, baseline_rollout = _production_solver_baseline_final_state_and_schedule_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
-        use_realized_schedule_jvp=False,
         accepted_step_limit_override=args.accepted_step_limit,
-        use_schedule_trace_only=False,
     )
     t_baseline1 = time.perf_counter()
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
