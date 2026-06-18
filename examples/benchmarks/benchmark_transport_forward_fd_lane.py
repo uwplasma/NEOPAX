@@ -34,6 +34,8 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_eval_rhs,
     _radau_solve_on_fixed_time_map_final_state_only,
+    _radau_step_fn_forward_solver,
+    _radau_step_state_from_carry,
 )
 
 
@@ -612,41 +614,36 @@ def _accepted_replay_state_debug_for_parameter(
     keep_mask = np.logical_and(active_mask, accepted_mask)
     accepted_dts = attempted_dts[keep_mask]
 
-    realized_carry = prepared_rollout.initial_carry
+    adaptive_step_state = _radau_step_state_from_carry(
+        prepared_rollout.initial_carry,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
     time_list_carry = prepared_rollout.initial_carry
     realized_states = []
     time_list_states = []
     realized_lagged_valid_in = []
     time_list_lagged_valid_in = []
 
-    for dt_value_np in accepted_dts:
+    for active, accepted, dt_value_np in zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist()):
+        if not active:
+            continue
         dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
 
-        realized_lagged_valid_in.append(bool(np.asarray(jax.device_get(realized_carry.lagged_response_valid)).item()))
-        attempt_context = _RadauAcceptedStepAttemptContext(
-            t_final=realized_carry.t + dt_value,
-            use_transport_lagged_response=jnp.asarray(prepared_rollout.kernel_context.use_transport_lagged_response),
+        realized_lagged_valid_in.append(
+            bool(np.asarray(jax.device_get(adaptive_step_state.lagged_response_valid)).item())
         )
-        realized_result = _radau_apply_accepted_step_map(
-            prepared_rollout.kernel_context,
-            prepared_rollout.physics_context,
-            dataclasses.replace(realized_carry, dt=dt_value),
-            attempt_context,
+        adaptive_step_state, step_info = _radau_step_fn_forward_solver(
+            execution_context,
+            dataclasses.replace(adaptive_step_state, dt=dt_value),
+            None,
         )
-        realized_carry = dataclasses.replace(
-            realized_result.next_carry,
-            prev_error=jnp.maximum(
-                realized_result.err_norm,
-                jnp.asarray(1.0e-12, dtype=prepared_rollout.kernel_context.dtype),
-            ),
-            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
-            regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
-            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-        )
-        realized_states.append(
-            prepared_rollout.physics_context.unpack_flat(realized_result.accepted_y)
-        )
+        if accepted:
+            realized_states.append(
+                prepared_rollout.physics_context.unpack_flat(step_info.y)
+            )
 
+    for dt_value_np in accepted_dts:
+        dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
         time_list_lagged_valid_in.append(bool(np.asarray(jax.device_get(time_list_carry.lagged_response_valid)).item()))
         time_attempt_context = _RadauAcceptedStepAttemptContext(
             t_final=time_list_carry.t + dt_value,

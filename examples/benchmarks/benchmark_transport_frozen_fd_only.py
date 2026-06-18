@@ -126,6 +126,8 @@ def main() -> None:
     baseline_replay_objectives = None
     baseline_replay_state_finite = None
     baseline_replay_abs_diff = None
+    baseline_replay_er_max_abs_diff = None
+    baseline_replay_er_mean_abs_diff = None
     accepted_time_list = None
     baseline_replay_elapsed_s = None
     accepted_replay_step_debug = None
@@ -150,6 +152,11 @@ def main() -> None:
             np.asarray(jax.device_get(baseline_replay_objectives), dtype=float)
             - np.asarray(jax.device_get(baseline_objectives_adaptive), dtype=float)
         )
+        baseline_er = np.asarray(jax.device_get(baseline_final_state.Er), dtype=float)
+        replay_er = np.asarray(jax.device_get(baseline_replay["final_state"].Er), dtype=float)
+        er_abs_diff = np.abs(baseline_er - replay_er)
+        baseline_replay_er_max_abs_diff = float(np.max(er_abs_diff)) if er_abs_diff.size else 0.0
+        baseline_replay_er_mean_abs_diff = float(np.mean(er_abs_diff)) if er_abs_diff.size else 0.0
     if args.accepted_replay_step_debug and str(args.replay_mode).strip().lower() == "accepted":
         print("[autodiff-gate] progress: running accepted replay step debug", flush=True)
         t_step_debug0 = time.perf_counter()
@@ -234,6 +241,8 @@ def main() -> None:
         "adaptive_objectives": adaptive_objectives_np.tolist(),
         "baseline_replay_objectives": None if baseline_replay_objectives is None else np.asarray(jax.device_get(baseline_replay_objectives), dtype=float).tolist(),
         "baseline_replay_abs_diff": None if baseline_replay_abs_diff is None else baseline_replay_abs_diff.tolist(),
+        "baseline_replay_er_max_abs_diff": baseline_replay_er_max_abs_diff,
+        "baseline_replay_er_mean_abs_diff": baseline_replay_er_mean_abs_diff,
         "accepted_time_list": accepted_time_list,
         "rollout_path": {
             "baseline": baseline_diag,
@@ -267,6 +276,11 @@ def main() -> None:
         print(
             f"[autodiff-gate] baseline replay accepted_count={0 if accepted_time_list is None else len(accepted_time_list)} "
             f"state_finite={baseline_replay_state_finite}"
+        )
+        print(
+            "[autodiff-gate] baseline replay Er diffs vs adaptive: "
+            f"max_abs_diff={0.0 if baseline_replay_er_max_abs_diff is None else baseline_replay_er_max_abs_diff:.6e} "
+            f"mean_abs_diff={0.0 if baseline_replay_er_mean_abs_diff is None else baseline_replay_er_mean_abs_diff:.6e}"
         )
         print("[autodiff-gate] baseline replay abs diffs vs adaptive:")
         for label, value in zip(OBJECTIVE_LABELS, baseline_replay_abs_diff.tolist()):
