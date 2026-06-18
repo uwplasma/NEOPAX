@@ -597,7 +597,7 @@ def _accepted_replay_state_debug_for_parameter(
         if accepted_step_limit is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
-    baseline_rollout = _radau_adaptive_schedule_rollout(
+    baseline_rollout = _radau_adaptive_final_state_rollout(
         execution_context,
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
