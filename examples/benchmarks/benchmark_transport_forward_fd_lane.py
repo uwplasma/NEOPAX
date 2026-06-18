@@ -524,7 +524,7 @@ def _initial_carry_from_state_with_static_setup(
 ):
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
     density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
-    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat, _project_flat_pullback, _unpack_flat_pullback = _make_solver_state_transform(
+    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
         state,
         species,
         temperature_active_mask=temperature_active_mask,

@@ -18,9 +18,9 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     _adaptive_rollout_diagnostics,
-    _adaptive_rollout_final_state_for_parameter,
     _adaptive_rollout_objectives_realized_schedule_only_for_parameter,
     _baseline_profile_cfg,
+    _production_solver_baseline_final_state_and_schedule_for_parameter,
     _prepare_benchmark_config,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
@@ -73,16 +73,14 @@ def main() -> None:
     baseline_value = float(profile_cfg[args.parameter])
 
     print("[autodiff-gate] progress: running baseline adaptive rollout for forward AD lane", flush=True)
-    _, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
+    _, baseline_rollout = _production_solver_baseline_final_state_and_schedule_for_parameter(
         jnp.asarray(baseline_value),
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
-        use_realized_schedule_jvp=False,
         accepted_step_limit_override=args.accepted_step_limit,
-        use_schedule_trace_only=True,
     )
 
     objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
