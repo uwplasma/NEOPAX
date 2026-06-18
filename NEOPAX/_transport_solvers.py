@@ -5429,6 +5429,11 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
             _radau_carry_with_forward_only_jvp_fields(carry_in),
             attempt_context,
         )
+        carry_after_attempt = attempt_result.carry_after_attempt
+        step_state_attempt = _radau_step_state_from_carry(
+            carry_after_attempt,
+            status=forced_step_state.status,
+        )
         accepted = jnp.logical_and(
             attempt_result.converged,
             attempt_result.err_norm <= jnp.asarray(1.0, dtype=dtype),
@@ -5444,7 +5449,7 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
         lagged_reuse_global = execution_context.lagged_response_reuse_mode == "global_state_drift"
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             accepted_y,
-            forced_step_state.lagged_reference_y,
+            step_state_attempt.lagged_reference_y,
             atol=execution_context.lagged_response_reuse_atol,
             rtol=execution_context.lagged_response_reuse_rtol,
         )
@@ -5472,9 +5477,9 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
                 recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
                 regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
                 easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-                lagged_response_cache=forced_step_state.lagged_response_cache,
+                lagged_response_cache=step_state_attempt.lagged_response_cache,
                 lagged_response_valid=keep_lagged_response,
-                lagged_reference_y=forced_step_state.lagged_reference_y,
+                lagged_reference_y=step_state_attempt.lagged_reference_y,
                 jacobian=attempt_result.jacobian_out,
                 cache_valid=attempt_result.cache_valid_out,
                 cache_dt=attempt_result.cache_dt_out,
@@ -5539,9 +5544,9 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
                 recent_reject_count=forced_step_state.recent_reject_count,
                 regrowth_cooldown=forced_step_state.regrowth_cooldown,
                 easy_growth_streak=forced_step_state.easy_growth_streak,
-                lagged_response_cache=forced_step_state.lagged_response_cache,
-                lagged_response_valid=forced_step_state.lagged_response_valid,
-                lagged_reference_y=forced_step_state.lagged_reference_y,
+                lagged_response_cache=step_state_attempt.lagged_response_cache,
+                lagged_response_valid=step_state_attempt.lagged_response_valid,
+                lagged_reference_y=step_state_attempt.lagged_reference_y,
                 jacobian=attempt_result.jacobian_out,
                 cache_valid=attempt_result.cache_valid_out,
                 cache_dt=attempt_result.cache_dt_out,
