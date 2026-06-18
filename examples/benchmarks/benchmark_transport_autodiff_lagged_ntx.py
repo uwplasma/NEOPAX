@@ -602,7 +602,7 @@ def _forward_benchmark_adaptive_final_y_realized_schedule(
 ):
     """Forward-owned custom-JVP final-y helper for the scalar accepted-step lane."""
 
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
@@ -621,7 +621,7 @@ def _forward_benchmark_adaptive_final_y_realized_schedule_jvp(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,

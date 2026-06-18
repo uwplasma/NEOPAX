@@ -82,6 +82,7 @@ def main() -> None:
         parameter_name=args.parameter,
         use_realized_schedule_jvp=False,
         accepted_step_limit_override=args.accepted_step_limit,
+        use_schedule_trace_only=True,
     )
 
     objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
