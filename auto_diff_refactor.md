@@ -665,3 +665,66 @@ Primary success criteria:
 - replay time drops materially below the current `~2111 s` per replay
 - `E_r`-sensitive FD metrics move back toward the historical trusted values
 - no reverse-lane code paths are involved in the forward/FD benchmark
+
+## Current handoff state (2026-06-19)
+
+The forward/FD benchmark split was narrowed further.
+
+### Frozen-FD lane
+
+Current benchmark:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 3e-8 --fd-abs-step 1e-10 --replay-mode accepted
+```
+
+Current intended routing:
+
+- baseline:
+  - adaptive production forward solve
+- accepted schedule:
+  - extracted from baseline accepted entries only
+- `fd-` / `fd+`:
+  - direct accepted-step-map fixed-`dt` solves
+  - bypass the adaptive-controller wrapper
+
+So `fd-` / `fd+` no longer use the controller-wrapped fixed-time lane by
+default.
+
+### Baseline replay debug
+
+Current debug command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --replay-mode accepted --baseline-replay-debug --debug-direct-accepted-step-map
+```
+
+This runs only:
+
+- adaptive baseline solve
+- unperturbed fixed-`dt` baseline replay
+- final metric / `E_r` comparison
+
+### Important confirmed point
+
+The accepted time list is currently built from:
+
+- `active_mask`
+- `accepted_mask`
+- `step_ts`
+
+with `keep = active_mask & accepted_mask`
+
+So rejected attempts are **not** directly included in the frozen accepted time
+list.
+
+### Current remaining uncertainty
+
+The still-wrong FD behavior is therefore more likely due to one of:
+
+- accepted-step-map carry evolution under perturbation
+- exact accepted-time-map semantics
+- remaining mismatch between unperturbed direct fixed-`dt` replay and
+  perturbed direct fixed-`dt` solves
+
+not from a simple "rejected attempts leaked into replay times" bug.

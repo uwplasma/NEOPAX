@@ -334,3 +334,89 @@ Keep reverse / shared-flux / pullback closures in separate AD-facing contexts.
 
 Then test whether the rebuild / reuse compile times of the plain adaptive
 solver drop relative to the current path.
+
+## Current FD lane state (2026-06-19)
+
+The frozen-FD benchmark lane was narrowed further.
+
+### Confirmed current routing
+
+- baseline solve:
+  - still uses the adaptive production forward solver lane
+- accepted-time extraction:
+  - comes from `_accepted_time_list_from_trace(...)`
+  - uses only `active_mask & accepted_mask`
+  - so rejected attempts are **not** directly inserted into the frozen
+    accepted time list
+- `fd-` and `fd+`:
+  - now use the direct fixed-`dt` accepted-step-map path by default
+  - they do **not** go through the adaptive-controller wrapper anymore
+
+### Relevant code state
+
+In `examples/benchmarks/benchmark_transport_forward_fd_lane.py`:
+
+- `_adaptive_rollout_objectives_for_parameter_on_frozen_trace(...)`
+- `_adaptive_rollout_objectives_for_parameter_on_time_list(...)`
+- `_solve_on_fixed_time_map_direct_accepted_step_map_debug(...)`
+
+In `examples/benchmarks/benchmark_transport_frozen_fd_only.py`:
+
+- normal `fd-` / `fd+` now call the frozen-trace helper with:
+  - `use_direct_accepted_step_map_debug=True`
+
+This means the FD derivative lane is now:
+
+- baseline adaptive solve once
+- accepted time list extracted from baseline
+- `fd-` direct accepted-step-map fixed-`dt` solve
+- `fd+` direct accepted-step-map fixed-`dt` solve
+
+### Baseline replay debug behavior
+
+The CLI flag:
+
+- `--debug-direct-accepted-step-map`
+
+now matters only for the unperturbed baseline replay debug branch.
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --replay-mode accepted --baseline-replay-debug --debug-direct-accepted-step-map
+```
+
+runs only:
+
+- baseline adaptive solve
+- one unperturbed fixed-`dt` baseline replay
+- final-objective / `E_r` comparison
+
+It does **not** run:
+
+- `fd-`
+- `fd+`
+- accepted-step state debug
+- single-step compare
+
+### Current open issue
+
+Even after:
+
+- reducing the baseline replay mismatch
+- and moving `fd-` / `fd+` onto the direct accepted-step-map fixed-`dt` path
+
+the FD derivatives can still behave incorrectly, especially in the `E_r`
+metrics.
+
+So the remaining bug is no longer:
+
+- obvious rejected-step leakage into the time list
+- or `fd-` / `fd+` going through a different helper family than intended
+
+The next likely targets are:
+
+- exact accepted-time-map semantics
+- direct fixed-`dt` accepted-step-map carry evolution under perturbation
+- any remaining asymmetry between unperturbed baseline replay and perturbed
+  `fd-` / `fd+`

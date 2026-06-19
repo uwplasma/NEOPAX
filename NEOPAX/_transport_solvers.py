@@ -5076,7 +5076,7 @@ def _radau_forward_fd_fixed_dt_accepted_rollout(
             lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
             lagged_reuse_metric = _lagged_response_global_reuse_metric(
                 step_map_result.accepted_y,
-                carry.lagged_reference_y,
+                step_map_result.next_carry.lagged_reference_y,
                 atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                 rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             )
@@ -5096,9 +5096,7 @@ def _radau_forward_fd_fixed_dt_accepted_rollout(
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            lagged_response_cache=carry.lagged_response_cache,
             lagged_response_valid=keep_lagged_response,
-            lagged_reference_y=carry.lagged_reference_y,
         )
         scan_out = (
             step_map_result.accepted_y,
@@ -5151,7 +5149,7 @@ def _radau_forward_fd_replay_realized_accepted_rollout(
                 lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
                 lagged_reuse_metric = _lagged_response_global_reuse_metric(
                     step_map_result.accepted_y,
-                    carry.lagged_reference_y,
+                    step_map_result.next_carry.lagged_reference_y,
                     atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                     rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
                 )
@@ -5171,9 +5169,7 @@ def _radau_forward_fd_replay_realized_accepted_rollout(
                 recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
                 regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
                 easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-                lagged_response_cache=carry.lagged_response_cache,
                 lagged_response_valid=keep_lagged_response,
-                lagged_reference_y=carry.lagged_reference_y,
             )
             scan_out = (
                 step_map_result.accepted_y,

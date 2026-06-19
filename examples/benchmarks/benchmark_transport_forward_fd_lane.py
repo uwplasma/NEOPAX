@@ -36,7 +36,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_dt_sequence_from_time_list,
     _radau_eval_rhs,
-    _radau_fixed_dt_accepted_rollout,
+    _radau_forward_fd_fixed_dt_accepted_rollout,
     _radau_solve_on_fixed_time_map_final_state_only,
     _radau_step_fn_forward_solver,
     _radau_step_state_from_carry,
@@ -680,7 +680,7 @@ def _solve_on_fixed_time_map_direct_accepted_step_map_debug(
         t0=t0,
         dtype=dtype,
     )
-    rollout = _radau_fixed_dt_accepted_rollout(
+    rollout = _radau_forward_fd_fixed_dt_accepted_rollout(
         prepared_rollout.kernel_context,
         prepared_rollout.physics_context,
         prepared_rollout.initial_carry,

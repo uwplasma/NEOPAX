@@ -100,8 +100,8 @@ def main() -> None:
         "--debug-direct-accepted-step-map",
         action="store_true",
         help=(
-            "Debug-only: route fixed-time baseline replay and FD solves through the direct "
-            "accepted-step-map helper that bypasses the adaptive-controller wrapper."
+            "Deprecated compatibility flag. Baseline replay debug and FD solves now use "
+            "the direct accepted-step-map fixed-dt helper."
         ),
     )
     parser.add_argument(
@@ -166,7 +166,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
+            use_direct_accepted_step_map_debug=True,
         )
         t_replay1 = time.perf_counter()
         baseline_replay_elapsed_s = t_replay1 - t_replay0
@@ -246,6 +246,8 @@ def main() -> None:
         dtype=float,
     )
     grad_np = None
+    objectives_minus_np = None
+    objectives_plus_np = None
     minus_replay = None
     plus_replay = None
     t_minus0 = t_minus1 = t_plus0 = t_plus1 = None
@@ -264,7 +266,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
+            use_direct_accepted_step_map_debug=True,
         )
         t_minus1 = time.perf_counter()
         print(f"[autodiff-gate] progress: running fixed-time fd_plus solve ({args.replay_mode})", flush=True)
@@ -278,12 +280,14 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
+            use_direct_accepted_step_map_debug=True,
         )
         t_plus1 = time.perf_counter()
 
         gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
         grad_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+        objectives_minus_np = np.asarray(jax.device_get(objectives_minus), dtype=float)
+        objectives_plus_np = np.asarray(jax.device_get(objectives_plus), dtype=float)
     report = {
         "mode": "transport_frozen_fd_only",
         "config_path": str(Path(args.config)),
@@ -291,7 +295,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
-        "debug_direct_accepted_step_map": bool(args.debug_direct_accepted_step_map),
+        "debug_direct_accepted_step_map": True,
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
@@ -299,6 +303,8 @@ def main() -> None:
         "single_step_compare": single_step_compare,
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_fd": None if grad_np is None else grad_np.tolist(),
+        "objectives_minus": None if objectives_minus_np is None else objectives_minus_np.tolist(),
+        "objectives_plus": None if objectives_plus_np is None else objectives_plus_np.tolist(),
         "adaptive_objectives": adaptive_objectives_np.tolist(),
         "baseline_replay_objectives": None if baseline_replay_objectives is None else np.asarray(jax.device_get(baseline_replay_objectives), dtype=float).tolist(),
         "baseline_replay_abs_diff": None if baseline_replay_abs_diff is None else baseline_replay_abs_diff.tolist(),
@@ -405,6 +411,14 @@ def main() -> None:
         print("[autodiff-gate] objective values:")
         for label, value in zip(OBJECTIVE_LABELS, grad_np.tolist()):
             print(f"  - {label}: fd={float(value):.6e}")
+        if objectives_minus_np is not None and objectives_plus_np is not None:
+            print("[autodiff-gate] fd endpoint objectives:")
+            for label, minus_value, plus_value in zip(OBJECTIVE_LABELS, objectives_minus_np.tolist(), objectives_plus_np.tolist()):
+                print(
+                    f"  - {label}: minus={float(minus_value):.6e} "
+                    f"plus={float(plus_value):.6e} "
+                    f"delta={float(plus_value - minus_value):.6e}"
+                )
 
     outpath = _report_path(args.parameter)
     outpath.write_text(json.dumps(report, indent=2))
