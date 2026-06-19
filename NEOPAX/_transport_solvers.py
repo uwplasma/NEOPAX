@@ -4053,16 +4053,13 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
         jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
     )
     dt_close = jnp.abs(trial_dt - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
-    reuse_linearization = jnp.logical_and(
-        jnp.logical_and(cache_valid, dt_close),
+    reuse_jacobian = jnp.logical_and(
+        cache_valid,
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
+    reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
 
-    def _reuse_linearization(_):
-        return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
-
-    def _recompute_linearization(_):
-        jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+    def _factor_linear_systems(jacobian_ref):
         h_jacobian = trial_dt * jacobian_ref
         real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
         real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
@@ -4085,12 +4082,32 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
             _factor_pair,
             (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
         )
-        return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
+        return real_lu, real_piv, complex_lu, complex_piv
 
-    jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
-        reuse_linearization,
-        _reuse_linearization,
-        _recompute_linearization,
+    def _reuse_jacobian(_):
+        return jacobian_cache
+
+    def _recompute_jacobian(_):
+        return jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+
+    jacobian_ref = jax.lax.cond(
+        reuse_jacobian,
+        _reuse_jacobian,
+        _recompute_jacobian,
+        operand=None,
+    )
+
+    def _reuse_lu(_):
+        return real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+    def _recompute_lu(_):
+        real_lu, real_piv, complex_lu, complex_piv = _factor_linear_systems(jacobian_ref)
+        return real_lu, real_piv, complex_lu, complex_piv
+
+    real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+        reuse_lu,
+        _reuse_lu,
+        _recompute_lu,
         operand=None,
     )
     return _radau_build_stage_subsolve_inputs(
@@ -4583,16 +4600,13 @@ def _radau_single_step_primal(
         jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
     )
     dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
-    reuse_linearization = jnp.logical_and(
-        jnp.logical_and(cache_valid, dt_close),
+    reuse_jacobian = jnp.logical_and(
+        cache_valid,
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
+    reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
 
-    def _reuse_linearization(_):
-        return jacobian_cache, real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
-
-    def _recompute_linearization(_):
-        jacobian_ref = jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+    def _factor_linear_systems(jacobian_ref):
         h_jacobian = h_value * jacobian_ref
         real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
         real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
@@ -4615,15 +4629,34 @@ def _radau_single_step_primal(
             _factor_pair,
             (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
         )
-        return jacobian_ref, real_lu, real_piv, complex_lu, complex_piv
+        return real_lu, real_piv, complex_lu, complex_piv
 
-    jacobian_ref, real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
-        reuse_linearization,
-        _reuse_linearization,
-        _recompute_linearization,
+    def _reuse_jacobian(_):
+        return jacobian_cache
+
+    def _recompute_jacobian(_):
+        return jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+
+    jacobian_ref = jax.lax.cond(
+        reuse_jacobian,
+        _reuse_jacobian,
+        _recompute_jacobian,
         operand=None,
     )
-    jacobian_reused = reuse_linearization
+
+    def _reuse_lu(_):
+        return real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+    def _recompute_lu(_):
+        return _factor_linear_systems(jacobian_ref)
+
+    real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+        reuse_lu,
+        _reuse_lu,
+        _recompute_lu,
+        operand=None,
+    )
+    jacobian_reused = reuse_jacobian
 
     subsolve_inputs = _radau_build_stage_subsolve_inputs(
         flat_y=flat_y,
@@ -4816,7 +4849,7 @@ def _radau_single_step_primal(
     jacobian_out = jacobian_ref
     cache_valid_out = jnp.asarray(True)
     cache_dt_out = h_value
-    cache_age_out = jnp.where(reuse_linearization, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
+    cache_age_out = jnp.where(reuse_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
     return (
         flat_next,
         err_norm,
