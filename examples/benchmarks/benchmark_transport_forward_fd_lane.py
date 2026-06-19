@@ -68,6 +68,7 @@ class _ForwardSolverScheduleTrace:
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _ForwardSolverScheduleRolloutResult:
+    final_carry: Any
     trace: _ForwardSolverScheduleTrace
     attempt_count: Any
     accepted_count: Any
@@ -93,6 +94,7 @@ def _prepare_benchmark_config(
     solver_cfg = config.setdefault("transport_solver", {})
     solver_cfg["debug_stage_markers"] = False
     solver_cfg["debug_disable_jit"] = False
+    solver_cfg["debug_walltime_attempts"] = False
     if ntx_exact_derivative_mode is not None:
         config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = str(ntx_exact_derivative_mode)
     return config
@@ -249,9 +251,8 @@ def _accepted_time_list_from_trace(trace) -> list[float]:
     active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
     accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
     step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
-    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
     keep = np.logical_and(active_mask, accepted_mask)
-    return (step_ts[keep] + attempted_dts[keep]).tolist()
+    return step_ts[keep].tolist()
 
 
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
@@ -330,6 +331,7 @@ def _forward_solver_schedule_rollout(
     failed = final_step_state.status[0] != 0
     fail_code = final_step_state.status[1]
     return _ForwardSolverScheduleRolloutResult(
+        final_carry=_radau_carry_from_step_state(final_step_state),
         trace=trace,
         attempt_count=jnp.sum(active_mask.astype(jnp.int32)),
         accepted_count=jnp.sum(accepted_mask.astype(jnp.int32)),
@@ -360,7 +362,6 @@ def _production_solver_baseline_final_state_and_schedule_for_parameter(
     prepared_components = prepare_transport_solver_components(config, runtime, state0)
     solver = prepared_components["solver"]
     solve_vector_field = prepared_components["solve_vector_field"]
-    solver_output = solver.solve(state0, solve_vector_field, runtime.species)
     prepared_rollout = _build_prepared_radau_accepted_rollout(
         solver=solver,
         state=state0,
@@ -383,7 +384,8 @@ def _production_solver_baseline_final_state_and_schedule_for_parameter(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    return solver_output["final_state"], rollout
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return final_state, rollout
 
 
 def _adaptive_rollout_final_state_for_parameter(
