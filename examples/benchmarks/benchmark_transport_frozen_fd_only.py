@@ -47,6 +47,23 @@ def _tree_all_finite(tree) -> bool:
     return True
 
 
+def _fixed_time_replay_diagnostics(replay) -> dict | None:
+    if replay is None:
+        return None
+    rollout = replay.get("rollout") if isinstance(replay, dict) else None
+    final_carry = replay.get("final_carry") if isinstance(replay, dict) else None
+    if rollout is None:
+        return None
+    return {
+        "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
+        "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count)).item()),
+        "completed": bool(np.asarray(jax.device_get(rollout.completed)).item()),
+        "failed": bool(np.asarray(jax.device_get(rollout.failed)).item()),
+        "fail_code": int(np.asarray(jax.device_get(rollout.fail_code)).item()),
+        "final_t": None if final_carry is None else float(np.asarray(jax.device_get(final_carry.t)).item()),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Frozen-FD-only benchmark lane using the solver-native fixed accepted-time-map forward path."
@@ -309,6 +326,8 @@ def main() -> None:
             np.abs(adaptive_objectives_np),
             1.0e-30,
         )
+    minus_diag = _fixed_time_replay_diagnostics(minus_replay)
+    plus_diag = _fixed_time_replay_diagnostics(plus_replay)
     report = {
         "mode": "transport_frozen_fd_only",
         "config_path": str(Path(args.config)),
@@ -330,6 +349,8 @@ def main() -> None:
         "fd_midpoint_objectives": None if fd_midpoint_np is None else fd_midpoint_np.tolist(),
         "fd_midpoint_abs_diff_vs_adaptive": None if fd_midpoint_abs_diff_np is None else fd_midpoint_abs_diff_np.tolist(),
         "fd_midpoint_rel_diff_vs_adaptive": None if fd_midpoint_rel_diff_np is None else fd_midpoint_rel_diff_np.tolist(),
+        "fd_minus_rollout": minus_diag,
+        "fd_plus_rollout": plus_diag,
         "adaptive_objectives": adaptive_objectives_np.tolist(),
         "baseline_replay_objectives": None if baseline_replay_objectives is None else np.asarray(jax.device_get(baseline_replay_objectives), dtype=float).tolist(),
         "baseline_replay_abs_diff": None if baseline_replay_abs_diff is None else baseline_replay_abs_diff.tolist(),
@@ -434,6 +455,26 @@ def main() -> None:
             f"lagged_valid_equal={single_step_compare['carry_lagged_valid_equal']}"
         )
     if grad_np is not None:
+        if minus_diag is not None and plus_diag is not None:
+            print("[autodiff-gate] fixed-time endpoint rollout diagnostics:")
+            print(
+                "  - minus: "
+                f"attempt_count={minus_diag['attempt_count']} "
+                f"accepted_count={minus_diag['accepted_count']} "
+                f"completed={minus_diag['completed']} "
+                f"failed={minus_diag['failed']} "
+                f"fail_code={minus_diag['fail_code']} "
+                f"final_t={0.0 if minus_diag['final_t'] is None else minus_diag['final_t']:.6e}"
+            )
+            print(
+                "  - plus: "
+                f"attempt_count={plus_diag['attempt_count']} "
+                f"accepted_count={plus_diag['accepted_count']} "
+                f"completed={plus_diag['completed']} "
+                f"failed={plus_diag['failed']} "
+                f"fail_code={plus_diag['fail_code']} "
+                f"final_t={0.0 if plus_diag['final_t'] is None else plus_diag['final_t']:.6e}"
+            )
         print("[autodiff-gate] objective values:")
         for label, value in zip(OBJECTIVE_LABELS, grad_np.tolist()):
             print(f"  - {label}: fd={float(value):.6e}")
