@@ -4001,6 +4001,7 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
     prev_dt = carry_in.prev_dt
     prev_theta_final = carry_in.prev_theta_final
     prev_newton_iter_count = carry_in.prev_newton_iter_count
+    recent_reject_count = carry_in.recent_reject_count
     jacobian_cache = carry_in.jacobian
     cache_valid = carry_in.cache_valid
     cache_dt = carry_in.cache_dt
@@ -4054,7 +4055,7 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
     )
     dt_close = jnp.abs(trial_dt - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
     reuse_jacobian = jnp.logical_and(
-        cache_valid,
+        jnp.logical_and(cache_valid, recent_reject_count > jnp.asarray(0, dtype=jnp.int32)),
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
     reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
@@ -4545,6 +4546,7 @@ def _radau_single_step_primal(
     prev_dt = carry_in.prev_dt
     prev_theta_final = carry_in.prev_theta_final
     prev_newton_iter_count = carry_in.prev_newton_iter_count
+    recent_reject_count = carry_in.recent_reject_count
     jacobian_cache = carry_in.jacobian
     cache_valid = carry_in.cache_valid
     cache_dt = carry_in.cache_dt
@@ -4601,7 +4603,7 @@ def _radau_single_step_primal(
     )
     dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
     reuse_jacobian = jnp.logical_and(
-        cache_valid,
+        jnp.logical_and(cache_valid, recent_reject_count > jnp.asarray(0, dtype=jnp.int32)),
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
     reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
