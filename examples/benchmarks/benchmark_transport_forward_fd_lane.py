@@ -249,8 +249,9 @@ def _accepted_time_list_from_trace(trace) -> list[float]:
     active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
     accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
     step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
+    attempted_dts = np.asarray(jax.device_get(trace.attempted_dts), dtype=float)
     keep = np.logical_and(active_mask, accepted_mask)
-    return step_ts[keep].tolist()
+    return (step_ts[keep] + attempted_dts[keep]).tolist()
 
 
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:

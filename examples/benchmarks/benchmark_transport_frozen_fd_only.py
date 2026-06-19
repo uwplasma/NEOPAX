@@ -68,6 +68,17 @@ def main() -> None:
         choices=("accepted",),
         help="Fixed accepted-time-map mode used for FD.",
     )
+    parser.add_argument(
+        "--fixed-time-lane",
+        type=str,
+        default="solver",
+        choices=("solver", "direct"),
+        help=(
+            "Fixed-time implementation used by baseline replay and FD endpoints. "
+            "'solver' uses the forward-solver fixed-dt schedule path; 'direct' "
+            "uses the lower-level accepted-step-map helper."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument(
         "--accepted-step-limit",
@@ -100,8 +111,7 @@ def main() -> None:
         "--debug-direct-accepted-step-map",
         action="store_true",
         help=(
-            "Deprecated compatibility flag. Baseline replay debug and FD solves now use "
-            "the direct accepted-step-map fixed-dt helper."
+            "Deprecated compatibility flag. Equivalent to --fixed-time-lane direct."
         ),
     )
     parser.add_argument(
@@ -111,6 +121,8 @@ def main() -> None:
         help="Accepted-step index used by --single-step-compare.",
     )
     args = parser.parse_args()
+    fixed_time_lane = "direct" if args.debug_direct_accepted_step_map else str(args.fixed_time_lane).strip().lower()
+    use_direct_accepted_step_map = fixed_time_lane == "direct"
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -166,7 +178,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=True,
+            use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
         )
         t_replay1 = time.perf_counter()
         baseline_replay_elapsed_s = t_replay1 - t_replay0
@@ -248,6 +260,9 @@ def main() -> None:
     grad_np = None
     objectives_minus_np = None
     objectives_plus_np = None
+    fd_midpoint_np = None
+    fd_midpoint_abs_diff_np = None
+    fd_midpoint_rel_diff_np = None
     minus_replay = None
     plus_replay = None
     t_minus0 = t_minus1 = t_plus0 = t_plus1 = None
@@ -266,7 +281,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=True,
+            use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
         )
         t_minus1 = time.perf_counter()
         print(f"[autodiff-gate] progress: running fixed-time fd_plus solve ({args.replay_mode})", flush=True)
@@ -280,7 +295,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=True,
+            use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
         )
         t_plus1 = time.perf_counter()
 
@@ -288,6 +303,12 @@ def main() -> None:
         grad_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
         objectives_minus_np = np.asarray(jax.device_get(objectives_minus), dtype=float)
         objectives_plus_np = np.asarray(jax.device_get(objectives_plus), dtype=float)
+        fd_midpoint_np = 0.5 * (objectives_minus_np + objectives_plus_np)
+        fd_midpoint_abs_diff_np = np.abs(fd_midpoint_np - adaptive_objectives_np)
+        fd_midpoint_rel_diff_np = fd_midpoint_abs_diff_np / np.maximum(
+            np.abs(adaptive_objectives_np),
+            1.0e-30,
+        )
     report = {
         "mode": "transport_frozen_fd_only",
         "config_path": str(Path(args.config)),
@@ -295,7 +316,8 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
-        "debug_direct_accepted_step_map": True,
+        "fixed_time_lane": fixed_time_lane,
+        "debug_direct_accepted_step_map": use_direct_accepted_step_map,
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
@@ -305,6 +327,9 @@ def main() -> None:
         "gradient_fd": None if grad_np is None else grad_np.tolist(),
         "objectives_minus": None if objectives_minus_np is None else objectives_minus_np.tolist(),
         "objectives_plus": None if objectives_plus_np is None else objectives_plus_np.tolist(),
+        "fd_midpoint_objectives": None if fd_midpoint_np is None else fd_midpoint_np.tolist(),
+        "fd_midpoint_abs_diff_vs_adaptive": None if fd_midpoint_abs_diff_np is None else fd_midpoint_abs_diff_np.tolist(),
+        "fd_midpoint_rel_diff_vs_adaptive": None if fd_midpoint_rel_diff_np is None else fd_midpoint_rel_diff_np.tolist(),
         "adaptive_objectives": adaptive_objectives_np.tolist(),
         "baseline_replay_objectives": None if baseline_replay_objectives is None else np.asarray(jax.device_get(baseline_replay_objectives), dtype=float).tolist(),
         "baseline_replay_abs_diff": None if baseline_replay_abs_diff is None else baseline_replay_abs_diff.tolist(),
@@ -328,7 +353,8 @@ def main() -> None:
 
     print(
         f"[autodiff-gate] mode=transport_frozen_fd_only parameter={args.parameter} "
-        f"baseline_value={baseline_value:.6e} fd_step={fd_step:.6e} replay_mode={args.replay_mode}"
+        f"baseline_value={baseline_value:.6e} fd_step={fd_step:.6e} replay_mode={args.replay_mode} "
+        f"fixed_time_lane={fixed_time_lane}"
     )
     print(
         f"[autodiff-gate] rollout baseline: attempt_count={baseline_diag.get('attempt_count')} "
@@ -418,6 +444,21 @@ def main() -> None:
                     f"  - {label}: minus={float(minus_value):.6e} "
                     f"plus={float(plus_value):.6e} "
                     f"delta={float(plus_value - minus_value):.6e}"
+                )
+        if fd_midpoint_np is not None and fd_midpoint_abs_diff_np is not None and fd_midpoint_rel_diff_np is not None:
+            print("[autodiff-gate] fd midpoint vs adaptive baseline:")
+            for label, midpoint_value, adaptive_value, abs_diff, rel_diff in zip(
+                OBJECTIVE_LABELS,
+                fd_midpoint_np.tolist(),
+                adaptive_objectives_np.tolist(),
+                fd_midpoint_abs_diff_np.tolist(),
+                fd_midpoint_rel_diff_np.tolist(),
+            ):
+                print(
+                    f"  - {label}: midpoint={float(midpoint_value):.6e} "
+                    f"adaptive={float(adaptive_value):.6e} "
+                    f"abs_diff={float(abs_diff):.6e} "
+                    f"rel_diff={float(rel_diff):.6e}"
                 )
 
     outpath = _report_path(args.parameter)
