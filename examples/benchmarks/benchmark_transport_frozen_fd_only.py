@@ -136,8 +136,11 @@ def main() -> None:
     baseline_replay_objectives = None
     baseline_replay_state_finite = None
     baseline_replay_abs_diff = None
+    baseline_replay_rel_diff = None
     baseline_replay_er_max_abs_diff = None
     baseline_replay_er_mean_abs_diff = None
+    baseline_replay_er_max_rel_diff = None
+    baseline_replay_er_mean_rel_diff = None
     accepted_time_list = None
     baseline_replay_elapsed_s = None
     accepted_replay_step_debug = None
@@ -163,11 +166,25 @@ def main() -> None:
             np.asarray(jax.device_get(baseline_replay_objectives), dtype=float)
             - np.asarray(jax.device_get(baseline_objectives_adaptive), dtype=float)
         )
+        baseline_replay_rel_diff = baseline_replay_abs_diff / np.maximum(
+            np.abs(np.asarray(jax.device_get(baseline_objectives_adaptive), dtype=float)),
+            1.0e-30,
+        )
         baseline_er = np.asarray(jax.device_get(baseline_final_state.Er), dtype=float)
         replay_er = np.asarray(jax.device_get(baseline_replay["final_state"].Er), dtype=float)
         er_abs_diff = np.abs(baseline_er - replay_er)
         baseline_replay_er_max_abs_diff = float(np.max(er_abs_diff)) if er_abs_diff.size else 0.0
         baseline_replay_er_mean_abs_diff = float(np.mean(er_abs_diff)) if er_abs_diff.size else 0.0
+        baseline_replay_er_max_rel_diff = (
+            float(np.max(er_abs_diff) / max(np.max(np.abs(baseline_er)), 1.0e-30))
+            if er_abs_diff.size
+            else 0.0
+        )
+        baseline_replay_er_mean_rel_diff = (
+            float(np.mean(er_abs_diff) / max(np.mean(np.abs(baseline_er)), 1.0e-30))
+            if er_abs_diff.size
+            else 0.0
+        )
     if args.accepted_replay_step_debug and str(args.replay_mode).strip().lower() == "accepted":
         print("[autodiff-gate] progress: running accepted replay step debug", flush=True)
         t_step_debug0 = time.perf_counter()
@@ -193,6 +210,14 @@ def main() -> None:
             "first_bad_step_max_abs": None if first_bad_step < 0 else float(er_step_max_abs[first_bad_step]),
             "realized_lagged_valid_in": accepted_replay_step_debug["realized_lagged_valid_in"],
             "time_list_lagged_valid_in": accepted_replay_step_debug["time_list_lagged_valid_in"],
+            "realized_prev_theta_final": accepted_replay_step_debug["realized_prev_theta_final"],
+            "time_list_prev_theta_final": accepted_replay_step_debug["time_list_prev_theta_final"],
+            "realized_prev_newton_iter_count": accepted_replay_step_debug["realized_prev_newton_iter_count"],
+            "time_list_prev_newton_iter_count": accepted_replay_step_debug["time_list_prev_newton_iter_count"],
+            "realized_prev_error": accepted_replay_step_debug["realized_prev_error"],
+            "time_list_prev_error": accepted_replay_step_debug["time_list_prev_error"],
+            "realized_prev_dt": accepted_replay_step_debug["realized_prev_dt"],
+            "time_list_prev_dt": accepted_replay_step_debug["time_list_prev_dt"],
         }
     if args.single_step_compare:
         print("[autodiff-gate] progress: running single-step production vs fixed-dt comparison", flush=True)
@@ -267,8 +292,11 @@ def main() -> None:
         "adaptive_objectives": adaptive_objectives_np.tolist(),
         "baseline_replay_objectives": None if baseline_replay_objectives is None else np.asarray(jax.device_get(baseline_replay_objectives), dtype=float).tolist(),
         "baseline_replay_abs_diff": None if baseline_replay_abs_diff is None else baseline_replay_abs_diff.tolist(),
+        "baseline_replay_rel_diff": None if baseline_replay_rel_diff is None else baseline_replay_rel_diff.tolist(),
         "baseline_replay_er_max_abs_diff": baseline_replay_er_max_abs_diff,
         "baseline_replay_er_mean_abs_diff": baseline_replay_er_mean_abs_diff,
+        "baseline_replay_er_max_rel_diff": baseline_replay_er_max_rel_diff,
+        "baseline_replay_er_mean_rel_diff": baseline_replay_er_mean_rel_diff,
         "accepted_time_list": accepted_time_list,
         "rollout_path": {
             "baseline": baseline_diag,
@@ -306,11 +334,17 @@ def main() -> None:
         print(
             "[autodiff-gate] baseline replay Er diffs vs adaptive: "
             f"max_abs_diff={0.0 if baseline_replay_er_max_abs_diff is None else baseline_replay_er_max_abs_diff:.6e} "
-            f"mean_abs_diff={0.0 if baseline_replay_er_mean_abs_diff is None else baseline_replay_er_mean_abs_diff:.6e}"
+            f"mean_abs_diff={0.0 if baseline_replay_er_mean_abs_diff is None else baseline_replay_er_mean_abs_diff:.6e} "
+            f"max_rel_diff={0.0 if baseline_replay_er_max_rel_diff is None else baseline_replay_er_max_rel_diff:.6e} "
+            f"mean_rel_diff={0.0 if baseline_replay_er_mean_rel_diff is None else baseline_replay_er_mean_rel_diff:.6e}"
         )
-        print("[autodiff-gate] baseline replay abs diffs vs adaptive:")
-        for label, value in zip(OBJECTIVE_LABELS, baseline_replay_abs_diff.tolist()):
-            print(f"  - {label}: abs_diff={float(value):.6e}")
+        print("[autodiff-gate] baseline replay relative diffs vs adaptive:")
+        for label, abs_value, rel_value in zip(
+            OBJECTIVE_LABELS,
+            baseline_replay_abs_diff.tolist(),
+            baseline_replay_rel_diff.tolist(),
+        ):
+            print(f"  - {label}: rel_diff={float(rel_value):.6e} abs_diff={float(abs_value):.6e}")
     if accepted_replay_step_debug is not None:
         print(
             f"[autodiff-gate] accepted replay step debug: accepted_count={accepted_replay_step_debug['accepted_count']} "
@@ -318,6 +352,19 @@ def main() -> None:
             f"first_bad_step={accepted_replay_step_debug['first_bad_step']} "
             f"first_bad_step_max_abs={0.0 if accepted_replay_step_debug['first_bad_step_max_abs'] is None else accepted_replay_step_debug['first_bad_step_max_abs']:.6e}"
         )
+        first_bad_step = accepted_replay_step_debug["first_bad_step"]
+        if first_bad_step >= 0:
+            print(
+                "[autodiff-gate] accepted replay metadata at first bad step: "
+                f"realized_theta={accepted_replay_step_debug['realized_prev_theta_final'][first_bad_step]:.6e} "
+                f"replay_theta={accepted_replay_step_debug['time_list_prev_theta_final'][first_bad_step]:.6e} "
+                f"realized_newton_iter={accepted_replay_step_debug['realized_prev_newton_iter_count'][first_bad_step]} "
+                f"replay_newton_iter={accepted_replay_step_debug['time_list_prev_newton_iter_count'][first_bad_step]} "
+                f"realized_prev_error={accepted_replay_step_debug['realized_prev_error'][first_bad_step]:.6e} "
+                f"replay_prev_error={accepted_replay_step_debug['time_list_prev_error'][first_bad_step]:.6e} "
+                f"realized_prev_dt={accepted_replay_step_debug['realized_prev_dt'][first_bad_step]:.6e} "
+                f"replay_prev_dt={accepted_replay_step_debug['time_list_prev_dt'][first_bad_step]:.6e}"
+            )
     if single_step_compare is not None:
         print(
             f"[autodiff-gate] single-step compare: accepted_step_index={single_step_compare['accepted_step_index']} "

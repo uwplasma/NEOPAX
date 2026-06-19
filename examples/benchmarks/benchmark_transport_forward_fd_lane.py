@@ -765,6 +765,14 @@ def _accepted_replay_state_debug_for_parameter(
     time_list_states = []
     realized_lagged_valid_in = []
     time_list_lagged_valid_in = []
+    realized_prev_theta_final = []
+    time_list_prev_theta_final = []
+    realized_prev_newton_iter_count = []
+    time_list_prev_newton_iter_count = []
+    realized_prev_error = []
+    time_list_prev_error = []
+    realized_prev_dt = []
+    time_list_prev_dt = []
 
     for active, accepted, dt_value_np in zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist()):
         if not active:
@@ -782,6 +790,18 @@ def _accepted_replay_state_debug_for_parameter(
         if accepted:
             realized_states.append(
                 prepared_rollout.physics_context.unpack_flat(step_info.y)
+            )
+            realized_prev_theta_final.append(
+                float(np.asarray(jax.device_get(adaptive_step_state.prev_theta_final)).item())
+            )
+            realized_prev_newton_iter_count.append(
+                int(np.asarray(jax.device_get(adaptive_step_state.prev_newton_iter_count)).item())
+            )
+            realized_prev_error.append(
+                float(np.asarray(jax.device_get(adaptive_step_state.prev_error)).item())
+            )
+            realized_prev_dt.append(
+                float(np.asarray(jax.device_get(adaptive_step_state.prev_dt)).item())
             )
 
     for dt_value_np in accepted_dts:
@@ -810,6 +830,18 @@ def _accepted_replay_state_debug_for_parameter(
         time_list_states.append(
             prepared_rollout.physics_context.unpack_flat(time_result.accepted_y)
         )
+        time_list_prev_theta_final.append(
+            float(np.asarray(jax.device_get(time_list_carry.prev_theta_final)).item())
+        )
+        time_list_prev_newton_iter_count.append(
+            int(np.asarray(jax.device_get(time_list_carry.prev_newton_iter_count)).item())
+        )
+        time_list_prev_error.append(
+            float(np.asarray(jax.device_get(time_list_carry.prev_error)).item())
+        )
+        time_list_prev_dt.append(
+            float(np.asarray(jax.device_get(time_list_carry.prev_dt)).item())
+        )
     return {
         "accepted_time_list": accepted_time_list,
         "baseline_rollout": baseline_rollout,
@@ -818,6 +850,14 @@ def _accepted_replay_state_debug_for_parameter(
         "time_list_saved_states": time_list_states,
         "realized_lagged_valid_in": realized_lagged_valid_in,
         "time_list_lagged_valid_in": time_list_lagged_valid_in,
+        "realized_prev_theta_final": realized_prev_theta_final,
+        "time_list_prev_theta_final": time_list_prev_theta_final,
+        "realized_prev_newton_iter_count": realized_prev_newton_iter_count,
+        "time_list_prev_newton_iter_count": time_list_prev_newton_iter_count,
+        "realized_prev_error": realized_prev_error,
+        "time_list_prev_error": time_list_prev_error,
+        "realized_prev_dt": realized_prev_dt,
+        "time_list_prev_dt": time_list_prev_dt,
         "realized_final_state": prepared_rollout.physics_context.unpack_flat(adaptive_step_state.y),
         "time_list_final_state": prepared_rollout.physics_context.unpack_flat(time_list_carry.y),
     }
