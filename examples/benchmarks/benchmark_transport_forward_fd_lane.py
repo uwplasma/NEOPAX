@@ -34,7 +34,9 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_final_y_realized_schedule,
     _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
+    _radau_dt_sequence_from_time_list,
     _radau_eval_rhs,
+    _radau_fixed_dt_accepted_rollout,
     _radau_solve_on_fixed_time_map_final_state_only,
     _radau_step_fn_forward_solver,
     _radau_step_state_from_carry,
@@ -643,6 +645,7 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
     parameter_name: str,
     frozen_trace,
     replay_mode: str = "attempt",
+    use_direct_accepted_step_map_debug: bool = False,
 ):
     replay_mode_normalized = str(replay_mode).strip().lower()
     if replay_mode_normalized != "accepted":
@@ -660,7 +663,39 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         time_list=accepted_time_list,
+        use_direct_accepted_step_map_debug=use_direct_accepted_step_map_debug,
     )
+
+
+def _solve_on_fixed_time_map_direct_accepted_step_map_debug(
+    prepared_rollout,
+    time_list,
+):
+    """Debug-only fixed-time lane that bypasses the adaptive controller wrapper."""
+
+    t0 = prepared_rollout.initial_carry.t
+    dtype = prepared_rollout.kernel_context.dtype
+    dt_sequence = _radau_dt_sequence_from_time_list(
+        time_list,
+        t0=t0,
+        dtype=dtype,
+    )
+    rollout = _radau_fixed_dt_accepted_rollout(
+        prepared_rollout.kernel_context,
+        prepared_rollout.physics_context,
+        prepared_rollout.initial_carry,
+        dt_sequence,
+    )
+    final_carry = rollout.final_carry
+    final_state = prepared_rollout.physics_context.unpack_flat(final_carry.y)
+    return {
+        "time_list": jnp.asarray(time_list, dtype=dtype),
+        "dt_sequence": dt_sequence,
+        "final_state": final_state,
+        "final_carry": final_carry,
+        "rollout": rollout,
+        "fixed_time_mode": "direct_accepted_step_map_debug",
+    }
 
 
 def _adaptive_rollout_objectives_for_parameter_on_time_list(
@@ -672,6 +707,7 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
     profile_cfg: dict[str, Any],
     parameter_name: str,
     time_list,
+    use_direct_accepted_step_map_debug: bool = False,
 ):
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -694,10 +730,17 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
         solver=solver,
         prepared_rollout=prepared_rollout,
     )
-    replay = _radau_solve_on_fixed_time_map_final_state_only(
-        prepared_rollout,
-        execution_context,
-        time_list,
+    replay = (
+        _solve_on_fixed_time_map_direct_accepted_step_map_debug(
+            prepared_rollout,
+            time_list,
+        )
+        if use_direct_accepted_step_map_debug
+        else _radau_solve_on_fixed_time_map_final_state_only(
+            prepared_rollout,
+            execution_context,
+            time_list,
+        )
     )
     return _objective_vector(replay["final_state"], runtime), replay
 
@@ -761,8 +804,6 @@ def _accepted_replay_state_debug_for_parameter(
         status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
     )
     time_list_carry = prepared_rollout.initial_carry
-    realized_states = []
-    time_list_states = []
     realized_lagged_valid_in = []
     time_list_lagged_valid_in = []
     realized_prev_theta_final = []
@@ -773,6 +814,7 @@ def _accepted_replay_state_debug_for_parameter(
     time_list_prev_error = []
     realized_prev_dt = []
     time_list_prev_dt = []
+    er_step_max_abs = []
 
     for active, accepted, dt_value_np in zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist()):
         if not active:
@@ -788,9 +830,6 @@ def _accepted_replay_state_debug_for_parameter(
             None,
         )
         if accepted:
-            realized_states.append(
-                prepared_rollout.physics_context.unpack_flat(step_info.y)
-            )
             realized_prev_theta_final.append(
                 float(np.asarray(jax.device_get(adaptive_step_state.prev_theta_final)).item())
             )
@@ -827,9 +866,6 @@ def _accepted_replay_state_debug_for_parameter(
             regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
         )
-        time_list_states.append(
-            prepared_rollout.physics_context.unpack_flat(time_result.accepted_y)
-        )
         time_list_prev_theta_final.append(
             float(np.asarray(jax.device_get(time_list_carry.prev_theta_final)).item())
         )
@@ -842,12 +878,14 @@ def _accepted_replay_state_debug_for_parameter(
         time_list_prev_dt.append(
             float(np.asarray(jax.device_get(time_list_carry.prev_dt)).item())
         )
+        realized_er = np.asarray(jax.device_get(adaptive_step_state.y), dtype=float)
+        replay_er = np.asarray(jax.device_get(time_list_carry.y), dtype=float)
+        er_step_max_abs.append(float(np.max(np.abs(realized_er - replay_er))) if realized_er.size else 0.0)
     return {
         "accepted_time_list": accepted_time_list,
         "baseline_rollout": baseline_rollout,
         "replay_trace": replay_trace,
-        "realized_saved_states": realized_states,
-        "time_list_saved_states": time_list_states,
+        "er_step_max_abs": er_step_max_abs,
         "realized_lagged_valid_in": realized_lagged_valid_in,
         "time_list_lagged_valid_in": time_list_lagged_valid_in,
         "realized_prev_theta_final": realized_prev_theta_final,
@@ -858,8 +896,6 @@ def _accepted_replay_state_debug_for_parameter(
         "time_list_prev_error": time_list_prev_error,
         "realized_prev_dt": realized_prev_dt,
         "time_list_prev_dt": time_list_prev_dt,
-        "realized_final_state": prepared_rollout.physics_context.unpack_flat(adaptive_step_state.y),
-        "time_list_final_state": prepared_rollout.physics_context.unpack_flat(time_list_carry.y),
     }
 
 

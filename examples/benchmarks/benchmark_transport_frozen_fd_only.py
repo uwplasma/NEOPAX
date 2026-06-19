@@ -97,6 +97,14 @@ def main() -> None:
         help="Run only a one-step production-vs-fixed-dt comparison from the same incoming accepted-step boundary.",
     )
     parser.add_argument(
+        "--debug-direct-accepted-step-map",
+        action="store_true",
+        help=(
+            "Debug-only: route fixed-time baseline replay and FD solves through the direct "
+            "accepted-step-map helper that bypasses the adaptive-controller wrapper."
+        ),
+    )
+    parser.add_argument(
         "--accepted-step-index",
         type=int,
         default=0,
@@ -158,6 +166,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
         )
         t_replay1 = time.perf_counter()
         baseline_replay_elapsed_s = t_replay1 - t_replay0
@@ -198,12 +207,10 @@ def main() -> None:
             accepted_step_limit=args.accepted_step_limit,
         )
         t_step_debug1 = time.perf_counter()
-        realized_er = np.asarray([np.asarray(jax.device_get(state.Er), dtype=float) for state in accepted_replay_step_debug["realized_saved_states"]], dtype=float)
-        time_list_er = np.asarray([np.asarray(jax.device_get(state.Er), dtype=float) for state in accepted_replay_step_debug["time_list_saved_states"]], dtype=float)
-        er_step_max_abs = np.max(np.abs(realized_er - time_list_er), axis=1) if realized_er.size and time_list_er.size else np.asarray([], dtype=float)
+        er_step_max_abs = np.asarray(accepted_replay_step_debug["er_step_max_abs"], dtype=float)
         first_bad_step = int(np.argmax(er_step_max_abs > 1.0e-8)) if er_step_max_abs.size and np.any(er_step_max_abs > 1.0e-8) else -1
         accepted_replay_step_debug = {
-            "accepted_count": int(realized_er.shape[0]) if realized_er.ndim >= 1 else 0,
+            "accepted_count": int(er_step_max_abs.shape[0]),
             "elapsed_s": t_step_debug1 - t_step_debug0,
             "er_step_max_abs": er_step_max_abs.tolist(),
             "first_bad_step": first_bad_step,
@@ -257,6 +264,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
         )
         t_minus1 = time.perf_counter()
         print(f"[autodiff-gate] progress: running fixed-time fd_plus solve ({args.replay_mode})", flush=True)
@@ -270,6 +278,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_direct_accepted_step_map_debug=bool(args.debug_direct_accepted_step_map),
         )
         t_plus1 = time.perf_counter()
 
@@ -282,6 +291,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
+        "debug_direct_accepted_step_map": bool(args.debug_direct_accepted_step_map),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
