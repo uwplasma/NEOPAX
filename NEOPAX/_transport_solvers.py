@@ -5923,40 +5923,156 @@ def _radau_forward_solver_fixed_dt_schedule_rollout(
 
         def _run(_):
             forced_step_state = dataclasses.replace(step_state, dt=dt_value)
-            next_step_state_raw, step_info_raw = _radau_step_fn_forward_solver(
-                execution_context,
-                forced_step_state,
-                None,
+            carry_in = _radau_carry_from_step_state(forced_step_state)
+            trial_dt = jnp.asarray(dt_value, dtype=dtype)
+            (
+                trial_y, err_norm, converged, stage_history, theta_final,
+                newton_iter_count, final_residual_norm, final_delta_norm,
+                slow_contraction_final, residual_blowup_final, newton_nonfinite_final,
+                jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
+                real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
+                _newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
+                finite_f0, finite_z0, finite_initial_residual, _density_err_norm, _pressure_err_norm, _er_err_norm,
+                lagged_response_out, lagged_reference_y_out, lagged_response_reused,
+                jacobian_reused,
+            ) = _radau_single_step_primal(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_in,
+                trial_dt,
+            )
+            accepted_y = _project_flat_state_if_needed(trial_y, execution_context.project_flat)
+            lagged_reuse_global = execution_context.lagged_response_reuse_mode == "global_state_drift"
+            lagged_reuse_metric = _lagged_response_global_reuse_metric(
+                accepted_y,
+                lagged_reference_y_out,
+                atol=execution_context.lagged_response_reuse_atol,
+                rtol=execution_context.lagged_response_reuse_rtol,
+            )
+            keep_lagged_response = jnp.logical_and(
+                jnp.asarray(execution_context.use_transport_lagged_response),
+                jnp.logical_and(
+                    jnp.asarray(lagged_reuse_global),
+                    lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
+                ),
+            )
+            step_ok = jnp.logical_and(
+                converged,
+                jnp.logical_not(
+                    jnp.logical_or(
+                        jnp.logical_or(diverged_final, newton_nonfinite_final),
+                        jnp.logical_or(nonfinite_stage_state, nonfinite_stage_residual),
+                    )
+                ),
+            )
+            step_ok = jnp.logical_and(
+                step_ok,
+                jnp.logical_and(
+                    finite_f0,
+                    jnp.logical_and(finite_z0, finite_initial_residual),
+                ),
             )
 
             def _accept_case(__):
-                next_step_state = dataclasses.replace(next_step_state_raw, dt=next_dt_value)
-                step_info = dataclasses.replace(
-                    step_info_raw,
+                status_next = jnp.asarray(
+                    [0, forced_step_state.status[1], forced_step_state.status[2] + 1],
+                    dtype=jnp.int32,
+                )
+                next_step_state = _RadauStepState(
+                    t=forced_step_state.t + trial_dt,
+                    y=accepted_y,
+                    dt=next_dt_value,
+                    status=status_next,
+                    prev_error=jnp.maximum(err_norm, jnp.asarray(1.0e-12, dtype=dtype)),
+                    prev_stages=stage_history,
+                    prev_dt=trial_dt,
+                    recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                    regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                    easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                    lagged_response_cache=lagged_response_out,
+                    lagged_response_valid=keep_lagged_response,
+                    lagged_reference_y=lagged_reference_y_out,
+                    jacobian=jacobian_out,
+                    cache_valid=cache_valid_out,
+                    cache_dt=cache_dt_out,
+                    cache_age=cache_age_out,
+                    real_lu=real_lu_out,
+                    real_piv=real_piv_out,
+                    complex_lu=complex_lu_out,
+                    complex_piv=complex_piv_out,
+                    prev_theta_final=theta_final,
+                    prev_newton_iter_count=newton_iter_count,
+                )
+                step_info = _RadauStepInfo(
+                    y=accepted_y,
+                    t=forced_step_state.t + trial_dt,
+                    dt=trial_dt,
                     next_dt=next_dt_value,
+                    growth=jnp.asarray(1.0, dtype=dtype),
+                    lagged_reused=lagged_response_reused,
+                    jacobian_reused=jacobian_reused,
+                    accepted=jnp.asarray(True),
+                    failed=jnp.asarray(False),
+                    fail_code=forced_step_state.status[1],
+                    converged=converged,
+                    err_norm=err_norm,
+                    diverged=diverged_final,
+                    nonfinite_stage_state=nonfinite_stage_state,
+                    nonfinite_stage_residual=nonfinite_stage_residual,
+                    finite_f0=finite_f0,
+                    finite_z0=finite_z0,
+                    finite_initial_residual=finite_initial_residual,
+                    newton_iter_count=newton_iter_count,
+                    final_residual_norm=final_residual_norm,
+                    final_delta_norm=final_delta_norm,
+                    theta_final=theta_final,
+                    slow_contraction=slow_contraction_final,
+                    residual_blowup=residual_blowup_final,
+                    newton_nonfinite=newton_nonfinite_final,
                 )
                 return next_step_state, step_info
 
             def _reject_case(__):
                 fail_code = jnp.where(
-                    step_info_raw.converged,
+                    converged,
                     jnp.asarray(2, dtype=jnp.int32),
                     jnp.asarray(1, dtype=jnp.int32),
                 )
                 failed_state = dataclasses.replace(
-                    next_step_state_raw,
+                    forced_step_state,
                     status=jnp.asarray([1, fail_code, forced_step_state.status[2]], dtype=jnp.int32),
                     dt=dt_value,
                 )
-                failed_info = dataclasses.replace(
-                    step_info_raw,
+                failed_info = _RadauStepInfo(
+                    y=forced_step_state.y,
+                    t=forced_step_state.t,
+                    dt=trial_dt,
+                    next_dt=dt_value,
+                    growth=jnp.asarray(1.0, dtype=dtype),
+                    lagged_reused=lagged_response_reused,
+                    jacobian_reused=jacobian_reused,
+                    accepted=jnp.asarray(False),
                     failed=jnp.asarray(True),
                     fail_code=fail_code,
-                    next_dt=dt_value,
+                    converged=converged,
+                    err_norm=err_norm,
+                    diverged=diverged_final,
+                    nonfinite_stage_state=nonfinite_stage_state,
+                    nonfinite_stage_residual=nonfinite_stage_residual,
+                    finite_f0=finite_f0,
+                    finite_z0=finite_z0,
+                    finite_initial_residual=finite_initial_residual,
+                    newton_iter_count=newton_iter_count,
+                    final_residual_norm=final_residual_norm,
+                    final_delta_norm=final_delta_norm,
+                    theta_final=theta_final,
+                    slow_contraction=slow_contraction_final,
+                    residual_blowup=residual_blowup_final,
+                    newton_nonfinite=newton_nonfinite_final,
                 )
                 return failed_state, failed_info
 
-            return jax.lax.cond(step_info_raw.accepted, _accept_case, _reject_case, operand=None)
+            return jax.lax.cond(step_ok, _accept_case, _reject_case, operand=None)
 
         def _skip(_):
             return step_state, _inactive_step_info(step_state)
