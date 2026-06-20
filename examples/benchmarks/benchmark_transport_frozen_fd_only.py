@@ -110,6 +110,16 @@ def main() -> None:
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
+        "--radau-jacobian-reuse-mode",
+        default="retry_only",
+        choices=("retry_only", "retry_or_accepted_dt_close", "accepted_dt_close"),
+        help=(
+            "Radau Jacobian/LU reuse policy for the adaptive baseline and fixed-time endpoints. "
+            "'retry_only' is the current default; 'retry_or_accepted_dt_close' keeps retry reuse "
+            "and additionally reuses after accepted steps when the next dt is close to the cached dt."
+        ),
+    )
+    parser.add_argument(
         "--baseline-replay-debug",
         action="store_true",
         help="Run only the unperturbed baseline accepted replay consistency check.",
@@ -145,6 +155,7 @@ def main() -> None:
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
@@ -336,6 +347,7 @@ def main() -> None:
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
         "fixed_time_lane": fixed_time_lane,
+        "radau_jacobian_reuse_mode": str(args.radau_jacobian_reuse_mode),
         "debug_direct_accepted_step_map": use_direct_accepted_step_map,
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
@@ -375,7 +387,7 @@ def main() -> None:
     print(
         f"[autodiff-gate] mode=transport_frozen_fd_only parameter={args.parameter} "
         f"baseline_value={baseline_value:.6e} fd_step={fd_step:.6e} replay_mode={args.replay_mode} "
-        f"fixed_time_lane={fixed_time_lane}"
+        f"fixed_time_lane={fixed_time_lane} radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode}"
     )
     print(
         f"[autodiff-gate] rollout baseline: attempt_count={baseline_diag.get('attempt_count')} "

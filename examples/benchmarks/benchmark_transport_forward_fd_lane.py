@@ -82,6 +82,7 @@ def _prepare_benchmark_config(
     *,
     device: str | None,
     ntx_exact_derivative_mode: str | None = None,
+    radau_jacobian_reuse_mode: str | None = None,
 ) -> dict[str, Any]:
     config = NEOPAX.prepare_config(config_path, device=device)
     config = copy.deepcopy(config)
@@ -95,6 +96,8 @@ def _prepare_benchmark_config(
     solver_cfg["debug_stage_markers"] = False
     solver_cfg["debug_disable_jit"] = False
     solver_cfg["debug_walltime_attempts"] = False
+    if radau_jacobian_reuse_mode is not None:
+        solver_cfg["radau_jacobian_reuse_mode"] = str(radau_jacobian_reuse_mode)
     if ntx_exact_derivative_mode is not None:
         config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = str(ntx_exact_derivative_mode)
     return config

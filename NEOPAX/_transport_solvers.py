@@ -2011,6 +2011,7 @@ class _RadauSolverConfig(TransportSolver):
     min_step_factor: float = 0.1
     max_step_factor: float = 5.0
     jacobian_reuse_rtol: float = 0.1
+    jacobian_reuse_mode: str = "retry_only"
     max_jacobian_age: int = 8
     rhs_mode: str = "black_box"
     newton_divergence_mode: str = "legacy"
@@ -2045,6 +2046,7 @@ class _RadauSolverConfig(TransportSolver):
         min_step_factor: float = 0.1,
         max_step_factor: float = 5.0,
         jacobian_reuse_rtol: float = 0.1,
+        jacobian_reuse_mode: str = "retry_only",
         max_jacobian_age: int = 8,
         rhs_mode: str = "black_box",
         newton_divergence_mode: str = "legacy",
@@ -2108,6 +2110,22 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "min_step_factor", float(min_step_factor))
         object.__setattr__(self, "max_step_factor", float(max_step_factor))
         object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
+        jacobian_reuse_mode_norm = str(jacobian_reuse_mode).strip().lower()
+        jacobian_reuse_aliases = {
+            "default": "retry_only",
+            "retry": "retry_only",
+            "current": "retry_only",
+            "accepted": "retry_or_accepted_dt_close",
+            "accepted_dt_close": "retry_or_accepted_dt_close",
+            "retry_plus_accepted": "retry_or_accepted_dt_close",
+            "retry_plus_accepted_dt_close": "retry_or_accepted_dt_close",
+        }
+        jacobian_reuse_mode_norm = jacobian_reuse_aliases.get(jacobian_reuse_mode_norm, jacobian_reuse_mode_norm)
+        if jacobian_reuse_mode_norm not in {"retry_only", "retry_or_accepted_dt_close"}:
+            raise ValueError(
+                "radau_jacobian_reuse_mode must be one of: retry_only, retry_or_accepted_dt_close"
+            )
+        object.__setattr__(self, "jacobian_reuse_mode", jacobian_reuse_mode_norm)
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
         object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
         object.__setattr__(self, "newton_divergence_mode", str(newton_divergence_mode).strip().lower())
@@ -2616,6 +2634,7 @@ class _RadauAcceptedStepKernelContext:
     er_size: Any
     predictor_mode: Any
     jacobian_reuse_rtol: Any
+    jacobian_reuse_mode: Any
     use_lagged_linear_response: Any
     num_stages: Any
     state_dim: Any
@@ -4054,9 +4073,22 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
         jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
     )
     dt_close = jnp.abs(trial_dt - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
-    reuse_jacobian = jnp.logical_and(
+    reuse_jacobian_retry = jnp.logical_and(
         jnp.logical_and(cache_valid, recent_reject_count > jnp.asarray(0, dtype=jnp.int32)),
         jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    reuse_jacobian_dt_close = jnp.logical_and(
+        jnp.logical_and(cache_valid, dt_close),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    reuse_after_accepted_dt_close = jnp.logical_and(
+        reuse_jacobian_dt_close,
+        recent_reject_count == jnp.asarray(0, dtype=jnp.int32),
+    )
+    use_accepted_dt_close_reuse = kernel_context.jacobian_reuse_mode == "retry_or_accepted_dt_close"
+    reuse_jacobian = jnp.logical_or(
+        reuse_jacobian_retry,
+        jnp.logical_and(use_accepted_dt_close_reuse, reuse_after_accepted_dt_close),
     )
     reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
 
@@ -4602,9 +4634,22 @@ def _radau_single_step_primal(
         jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
     )
     dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
-    reuse_jacobian = jnp.logical_and(
+    reuse_jacobian_retry = jnp.logical_and(
         jnp.logical_and(cache_valid, recent_reject_count > jnp.asarray(0, dtype=jnp.int32)),
         jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    reuse_jacobian_dt_close = jnp.logical_and(
+        jnp.logical_and(cache_valid, dt_close),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    reuse_after_accepted_dt_close = jnp.logical_and(
+        reuse_jacobian_dt_close,
+        recent_reject_count == jnp.asarray(0, dtype=jnp.int32),
+    )
+    use_accepted_dt_close_reuse = kernel_context.jacobian_reuse_mode == "retry_or_accepted_dt_close"
+    reuse_jacobian = jnp.logical_or(
+        reuse_jacobian_retry,
+        jnp.logical_and(use_accepted_dt_close_reuse, reuse_after_accepted_dt_close),
     )
     reuse_lu = jnp.logical_and(reuse_jacobian, dt_close)
 
@@ -7753,6 +7798,7 @@ def _build_prepared_radau_accepted_rollout(
         er_size=int(er_size),
         predictor_mode=predictor_mode,
         jacobian_reuse_rtol=jnp.asarray(solver.jacobian_reuse_rtol, dtype=dtype),
+        jacobian_reuse_mode=str(getattr(solver, "jacobian_reuse_mode", "retry_only")).strip().lower(),
         use_lagged_linear_response=bool(rhs_mode == "lagged_linear_state"),
         num_stages=int(num_stages),
         state_dim=int(state_dim),
@@ -8041,6 +8087,7 @@ class RADAUSolver(_RadauSolverConfig):
             er_size=int(er_size),
             predictor_mode=predictor_mode,
             jacobian_reuse_rtol=jnp.asarray(self.jacobian_reuse_rtol, dtype=dtype),
+            jacobian_reuse_mode=str(getattr(self, "jacobian_reuse_mode", "retry_only")).strip().lower(),
             use_lagged_linear_response=bool(use_lagged_linear_response),
             num_stages=int(num_stages),
             state_dim=int(state_dim),
@@ -10121,6 +10168,8 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             safety_factor=float(_cfg_get("safety_factor", 0.9)),
             min_step_factor=float(_cfg_get("min_step_factor", 0.1)),
             max_step_factor=float(_cfg_get("max_step_factor", 5.0)),
+            jacobian_reuse_rtol=float(_cfg_get("radau_jacobian_reuse_rtol", _cfg_get("jacobian_reuse_rtol", 0.1))),
+            jacobian_reuse_mode=str(_cfg_get("radau_jacobian_reuse_mode", "retry_only")),
             rhs_mode=str(_cfg_get("radau_rhs_mode", generic_rhs_mode)),
             newton_divergence_mode=str(_cfg_get("radau_newton_divergence_mode", "legacy")),
             newton_residual_norm=str(_cfg_get("radau_newton_residual_norm", "raw")),
