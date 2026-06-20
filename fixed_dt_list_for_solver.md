@@ -420,3 +420,134 @@ The next likely targets are:
 - direct fixed-`dt` accepted-step-map carry evolution under perturbation
 - any remaining asymmetry between unperturbed baseline replay and perturbed
   `fd-` / `fd+`
+
+## Current FD lane state (2026-06-20)
+
+This note supersedes the 2026-06-19 routing summary above for the current
+working tree.
+
+### Latest observed failing case
+
+Command family:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 1e-8 --fd-abs-step 1e-12 --replay-mode accepted --fixed-time-lane solver
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 3e-8 --fd-abs-step 1e-12 --replay-mode accepted --fixed-time-lane solver
+```
+
+Observed behavior:
+
+- baseline adaptive solve completes:
+  - `attempt_count=158`
+  - `accepted_count=99`
+  - `completed=True`
+- `fd_plus` completes the full fixed-time map:
+  - `accepted_count=99`
+  - `final_t=1.0e-02`
+- `fd_minus` does **not** complete:
+  - for `fd_rel=1e-8`: `accepted_count=96`, `completed=False`,
+    `final_t=9.910954e-03`
+  - for `fd_rel=3e-8`: `accepted_count=45`, `completed=False`,
+    `final_t=1.838964e-03`
+
+Therefore the huge printed central-FD gradients in these runs are not valid
+finite-difference derivatives. They mix:
+
+- one complete `fd_plus` endpoint
+- one incomplete `fd_minus` endpoint
+
+The benchmark should not report a normal FD gradient when either endpoint
+fails to consume the full prescribed fixed-time map.
+
+### Current implementation issue
+
+The current fixed-time solver lane is still not literally "the production
+forward solver with an external `dt` list".
+
+In `NEOPAX/_transport_solvers.py`,
+`_radau_forward_solver_fixed_dt_schedule_rollout(...)` currently:
+
+1. calls `_radau_single_step_primal(...)` directly
+2. checks only nonlinear/subsolve health for fixed-time acceptance
+3. manually constructs the next `_RadauStepState`
+
+This duplicates part of the production accepted-step update that normally
+lives behind:
+
+- `_radau_attempt_step_forward_solver(...)`
+- `_apply_radau_lean_timestep_controller(...)`
+
+That duplication is a real mismatch risk for:
+
+- `prev_error`
+- `prev_stages`
+- `prev_dt`
+- `prev_theta_final`
+- `prev_newton_iter_count`
+- lagged-response cache validity
+- Jacobian/LU cache state
+- controller-history fields
+
+The normal adaptive solver lane itself should remain untouched.
+
+### Current conclusion
+
+The immediate problem is not just "Er is sensitive".
+
+The latest data show a clearer failure mode:
+
+- the fixed-time `fd_minus` endpoint fails before `t_final`
+- the benchmark still computes and prints central FD values
+- those values are therefore contaminated by an incomplete endpoint
+
+The next code change should first make this invalid state explicit:
+
+- if either endpoint has `completed=False` or `failed=True`, print the endpoint
+  diagnostics and mark the FD gradient as invalid
+- do not present the central difference as a normal derivative in that case
+
+### Recommended next implementation step
+
+Refactor only the fixed-time FD lane so it reuses the production forward
+attempt/update path as much as possible.
+
+Target behavior:
+
+1. baseline remains the standard adaptive production solver
+2. accepted `dt` values are extracted from the baseline trace
+3. fixed-time `fd-` / `fd+` run the same forward attempt/update machinery
+4. the only fixed-time override is the next prescribed `dt`
+5. no adaptive timestep selection is used to choose the next `dt`
+6. standard adaptive solver behavior is not changed
+
+In other words:
+
+- reuse production forward accepted-step state evolution
+- bypass only adaptive `next_dt` selection
+- do not hand-build the accepted step state in the fixed-time lane
+
+### Validation order
+
+After the refactor:
+
+1. Run unperturbed baseline vs fixed-time baseline:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --replay-mode accepted --baseline-replay-debug --fixed-time-lane solver
+   ```
+
+2. Run a tiny FD step and require both endpoints to complete:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 1e-10 --fd-abs-step 1e-12 --replay-mode accepted --fixed-time-lane solver
+   ```
+
+3. Only after both endpoints complete, inspect FD values for larger `h`:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 1e-8 --fd-abs-step 1e-12 --replay-mode accepted --fixed-time-lane solver
+   python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --fd-rel-step 3e-8 --fd-abs-step 1e-12 --replay-mode accepted --fixed-time-lane solver
+   ```
+
+Do not resume forward-AD comparison until the FD fixed-time lane has a valid
+completed-minus/completed-plus baseline.

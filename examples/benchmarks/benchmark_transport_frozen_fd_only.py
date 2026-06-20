@@ -338,12 +338,23 @@ def main() -> None:
         )
     minus_diag = _fixed_time_replay_diagnostics(minus_replay)
     plus_diag = _fixed_time_replay_diagnostics(plus_replay)
+    fd_valid = None
+    if minus_diag is not None and plus_diag is not None:
+        fd_valid = bool(
+            minus_diag.get("completed")
+            and not minus_diag.get("failed")
+            and plus_diag.get("completed")
+            and not plus_diag.get("failed")
+        )
+        if not fd_valid:
+            grad_np = None
     report = {
         "mode": "transport_frozen_fd_only",
         "config_path": str(Path(args.config)),
         "parameter_name": args.parameter,
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
+        "fd_valid": fd_valid,
         "replay_mode": str(args.replay_mode),
         "fixed_time_lane": fixed_time_lane,
         "radau_jacobian_reuse_mode": str(args.radau_jacobian_reuse_mode),
@@ -465,38 +476,44 @@ def main() -> None:
             f"lagged_ref={single_step_compare['carry_lagged_reference_y_max_abs_diff']:.6e} "
             f"lagged_valid_equal={single_step_compare['carry_lagged_valid_equal']}"
         )
+    if minus_diag is not None and plus_diag is not None:
+        print("[autodiff-gate] fixed-time endpoint rollout diagnostics:")
+        print(
+            "  - minus: "
+            f"attempt_count={minus_diag['attempt_count']} "
+            f"accepted_count={minus_diag['accepted_count']} "
+            f"completed={minus_diag['completed']} "
+            f"failed={minus_diag['failed']} "
+            f"fail_code={minus_diag['fail_code']} "
+            f"final_t={0.0 if minus_diag['final_t'] is None else minus_diag['final_t']:.6e}"
+        )
+        print(
+            "  - plus: "
+            f"attempt_count={plus_diag['attempt_count']} "
+            f"accepted_count={plus_diag['accepted_count']} "
+            f"completed={plus_diag['completed']} "
+            f"failed={plus_diag['failed']} "
+            f"fail_code={plus_diag['fail_code']} "
+            f"final_t={0.0 if plus_diag['final_t'] is None else plus_diag['final_t']:.6e}"
+        )
+        if fd_valid is False:
+            print(
+                "[autodiff-gate] fd_valid=False: not reporting central FD gradients "
+                "because at least one fixed-time endpoint did not complete."
+            )
     if grad_np is not None:
-        if minus_diag is not None and plus_diag is not None:
-            print("[autodiff-gate] fixed-time endpoint rollout diagnostics:")
-            print(
-                "  - minus: "
-                f"attempt_count={minus_diag['attempt_count']} "
-                f"accepted_count={minus_diag['accepted_count']} "
-                f"completed={minus_diag['completed']} "
-                f"failed={minus_diag['failed']} "
-                f"fail_code={minus_diag['fail_code']} "
-                f"final_t={0.0 if minus_diag['final_t'] is None else minus_diag['final_t']:.6e}"
-            )
-            print(
-                "  - plus: "
-                f"attempt_count={plus_diag['attempt_count']} "
-                f"accepted_count={plus_diag['accepted_count']} "
-                f"completed={plus_diag['completed']} "
-                f"failed={plus_diag['failed']} "
-                f"fail_code={plus_diag['fail_code']} "
-                f"final_t={0.0 if plus_diag['final_t'] is None else plus_diag['final_t']:.6e}"
-            )
         print("[autodiff-gate] objective values:")
         for label, value in zip(OBJECTIVE_LABELS, grad_np.tolist()):
             print(f"  - {label}: fd={float(value):.6e}")
-        if objectives_minus_np is not None and objectives_plus_np is not None:
-            print("[autodiff-gate] fd endpoint objectives:")
-            for label, minus_value, plus_value in zip(OBJECTIVE_LABELS, objectives_minus_np.tolist(), objectives_plus_np.tolist()):
-                print(
-                    f"  - {label}: minus={float(minus_value):.6e} "
-                    f"plus={float(plus_value):.6e} "
-                    f"delta={float(plus_value - minus_value):.6e}"
-                )
+    if objectives_minus_np is not None and objectives_plus_np is not None:
+        print("[autodiff-gate] fd endpoint objectives:")
+        for label, minus_value, plus_value in zip(OBJECTIVE_LABELS, objectives_minus_np.tolist(), objectives_plus_np.tolist()):
+            print(
+                f"  - {label}: minus={float(minus_value):.6e} "
+                f"plus={float(plus_value):.6e} "
+                f"delta={float(plus_value - minus_value):.6e}"
+            )
+    if grad_np is not None:
         if fd_midpoint_np is not None and fd_midpoint_abs_diff_np is not None and fd_midpoint_rel_diff_np is not None:
             print("[autodiff-gate] fd midpoint vs adaptive baseline:")
             for label, midpoint_value, adaptive_value, abs_diff, rel_diff in zip(
