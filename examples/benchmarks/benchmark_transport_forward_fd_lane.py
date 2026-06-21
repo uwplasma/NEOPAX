@@ -917,6 +917,33 @@ def _int_scalar(value) -> int:
     return int(np.asarray(jax.device_get(value)).item())
 
 
+def _tree_max_abs_diff_expr(a, b, dtype):
+    leaves_a = jax.tree_util.tree_leaves(a)
+    leaves_b = jax.tree_util.tree_leaves(b)
+    if len(leaves_a) != len(leaves_b):
+        raise ValueError("Tree structures do not match in _tree_max_abs_diff_expr.")
+    max_diff = jnp.asarray(0.0, dtype=dtype)
+    for leaf_a, leaf_b in zip(leaves_a, leaves_b):
+        if leaf_a is None and leaf_b is None:
+            continue
+        if (leaf_a is None) != (leaf_b is None):
+            raise ValueError("Leaf values do not match in _tree_max_abs_diff_expr.")
+        arr_a = jnp.asarray(leaf_a)
+        arr_b = jnp.asarray(leaf_b)
+        if arr_a.shape != arr_b.shape:
+            raise ValueError("Leaf shapes do not match in _tree_max_abs_diff_expr.")
+        if arr_a.size == 0 and arr_b.size == 0:
+            continue
+        if arr_a.dtype == jnp.bool_ or arr_b.dtype == jnp.bool_:
+            leaf_diff = jnp.max(
+                jnp.abs(arr_a.astype(jnp.int32) - arr_b.astype(jnp.int32))
+            ).astype(dtype)
+        else:
+            leaf_diff = jnp.max(jnp.abs(arr_a - arr_b)).astype(dtype)
+        max_diff = jnp.maximum(max_diff, leaf_diff)
+    return max_diff
+
+
 def _first_accepted_replay_mismatch_for_parameter(
     parameter_value,
     *,
@@ -958,134 +985,256 @@ def _first_accepted_replay_mismatch_for_parameter(
         prepared_rollout=prepared_rollout,
     )
 
-    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
-    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
-    attempted_dts = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
+    active_mask = jnp.asarray(replay_trace.active_mask, dtype=bool)
+    accepted_mask = jnp.asarray(replay_trace.accepted_mask, dtype=bool)
+    attempted_dts = jnp.asarray(replay_trace.attempted_dts, dtype=prepared_rollout.kernel_context.dtype)
+    attempt_indices = jnp.arange(active_mask.shape[0], dtype=jnp.int32)
 
-    production_state = _radau_step_state_from_carry(
+    production_state0 = _radau_step_state_from_carry(
         prepared_rollout.initial_carry,
         status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
     )
-    fixed_state = _radau_step_state_from_carry(
+    fixed_state0 = _radau_step_state_from_carry(
         prepared_rollout.initial_carry,
         status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
     )
-
-    accepted_seen = 0
-    active_attempt_seen = 0
+    dtype = prepared_rollout.kernel_context.dtype
     mismatch_tol = float(mismatch_tol)
     max_accepted_steps = int(max(1, max_accepted_steps))
+    mismatch_tol_value = jnp.asarray(mismatch_tol, dtype=dtype)
+    max_accepted_steps_value = jnp.asarray(max_accepted_steps, dtype=jnp.int32)
+    nan = jnp.asarray(jnp.nan, dtype=dtype)
+    minus_one = jnp.asarray(-1, dtype=jnp.int32)
 
-    for attempt_index, (active, accepted, dt_value_np) in enumerate(
-        zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist())
-    ):
-        if not active:
-            continue
-        active_attempt_seen += 1
-        dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
-
-        production_in = dataclasses.replace(production_state, dt=dt_value)
-        production_next, production_info = _radau_step_fn_forward_solver(
-            execution_context,
-            production_in,
-            None,
-        )
-
-        if not accepted:
-            production_state = production_next
-            continue
-
-        fixed_in = dataclasses.replace(fixed_state, dt=dt_value)
-        fixed_next, fixed_info = _radau_step_fn_forward_solver(
-            execution_context,
-            fixed_in,
-            None,
-        )
-
-        incoming_y_diff = _max_abs_diff(production_in.y, fixed_in.y)
-        incoming_prev_stages_diff = _max_abs_diff(production_in.prev_stages, fixed_in.prev_stages)
-        incoming_jacobian_diff = _max_abs_diff(production_in.jacobian, fixed_in.jacobian)
-        incoming_real_lu_diff = _max_abs_diff(production_in.real_lu, fixed_in.real_lu)
-        incoming_complex_lu_diff = _max_abs_diff(production_in.complex_lu, fixed_in.complex_lu)
-        incoming_lagged_cache_diff = _max_abs_diff(
-            production_in.lagged_response_cache,
-            fixed_in.lagged_response_cache,
-        )
-        outgoing_y_diff = _max_abs_diff(production_next.y, fixed_next.y)
-        production_out_state = prepared_rollout.physics_context.unpack_flat(production_next.y)
-        fixed_out_state = prepared_rollout.physics_context.unpack_flat(fixed_next.y)
-        outgoing_er_diff = _max_abs_diff(production_out_state.Er, fixed_out_state.Er)
-        outgoing_density_diff = _max_abs_diff(production_out_state.density, fixed_out_state.density)
-        outgoing_pressure_diff = _max_abs_diff(production_out_state.pressure, fixed_out_state.pressure)
-
-        found_mismatch = outgoing_y_diff > mismatch_tol or outgoing_er_diff > mismatch_tol
-        result = {
-            "found_mismatch": bool(found_mismatch),
-            "accepted_index": int(accepted_seen),
-            "attempt_index": int(attempt_index),
-            "active_attempt_index": int(active_attempt_seen - 1),
-            "accepted_dt": _float_scalar(dt_value),
-            "incoming_t": _float_scalar(production_in.t),
-            "incoming_y_max_abs_diff": float(incoming_y_diff),
-            "incoming_prev_stages_max_abs_diff": float(incoming_prev_stages_diff),
-            "incoming_jacobian_max_abs_diff": float(incoming_jacobian_diff),
-            "incoming_real_lu_max_abs_diff": float(incoming_real_lu_diff),
-            "incoming_complex_lu_max_abs_diff": float(incoming_complex_lu_diff),
-            "incoming_lagged_cache_max_abs_diff": float(incoming_lagged_cache_diff),
-            "incoming_production_recent_reject_count": _int_scalar(production_in.recent_reject_count),
-            "incoming_fixed_recent_reject_count": _int_scalar(fixed_in.recent_reject_count),
-            "incoming_production_cache_valid": _bool_scalar(production_in.cache_valid),
-            "incoming_fixed_cache_valid": _bool_scalar(fixed_in.cache_valid),
-            "incoming_production_cache_dt": _float_scalar(production_in.cache_dt),
-            "incoming_fixed_cache_dt": _float_scalar(fixed_in.cache_dt),
-            "incoming_production_cache_age": _int_scalar(production_in.cache_age),
-            "incoming_fixed_cache_age": _int_scalar(fixed_in.cache_age),
-            "incoming_production_lagged_valid": _bool_scalar(production_in.lagged_response_valid),
-            "incoming_fixed_lagged_valid": _bool_scalar(fixed_in.lagged_response_valid),
-            "incoming_production_prev_dt": _float_scalar(production_in.prev_dt),
-            "incoming_fixed_prev_dt": _float_scalar(fixed_in.prev_dt),
-            "incoming_production_prev_error": _float_scalar(production_in.prev_error),
-            "incoming_fixed_prev_error": _float_scalar(fixed_in.prev_error),
-            "incoming_production_prev_theta_final": _float_scalar(production_in.prev_theta_final),
-            "incoming_fixed_prev_theta_final": _float_scalar(fixed_in.prev_theta_final),
-            "incoming_production_prev_newton_iter_count": _int_scalar(production_in.prev_newton_iter_count),
-            "incoming_fixed_prev_newton_iter_count": _int_scalar(fixed_in.prev_newton_iter_count),
-            "production_accepted": _bool_scalar(production_info.accepted),
-            "fixed_accepted": _bool_scalar(fixed_info.accepted),
-            "production_converged": _bool_scalar(production_info.converged),
-            "fixed_converged": _bool_scalar(fixed_info.converged),
-            "production_jacobian_reused": _bool_scalar(production_info.jacobian_reused),
-            "fixed_jacobian_reused": _bool_scalar(fixed_info.jacobian_reused),
-            "production_lagged_reused": _bool_scalar(production_info.lagged_reused),
-            "fixed_lagged_reused": _bool_scalar(fixed_info.lagged_reused),
-            "production_newton_iter_count": _int_scalar(production_info.newton_iter_count),
-            "fixed_newton_iter_count": _int_scalar(fixed_info.newton_iter_count),
-            "production_err_norm": _float_scalar(production_info.err_norm),
-            "fixed_err_norm": _float_scalar(fixed_info.err_norm),
-            "outgoing_y_max_abs_diff": float(outgoing_y_diff),
-            "outgoing_Er_max_abs_diff": float(outgoing_er_diff),
-            "outgoing_density_max_abs_diff": float(outgoing_density_diff),
-            "outgoing_pressure_max_abs_diff": float(outgoing_pressure_diff),
-            "checked_accepted_count": int(accepted_seen + 1),
-            "mismatch_tol": mismatch_tol,
-            "max_accepted_steps": max_accepted_steps,
+    def _initial_stats():
+        return {
+            "found_mismatch": jnp.asarray(False),
+            "accepted_index": minus_one,
+            "attempt_index": minus_one,
+            "active_attempt_index": minus_one,
+            "accepted_dt": nan,
+            "incoming_t": nan,
+            "incoming_y_max_abs_diff": nan,
+            "incoming_prev_stages_max_abs_diff": nan,
+            "incoming_jacobian_max_abs_diff": nan,
+            "incoming_real_lu_max_abs_diff": nan,
+            "incoming_complex_lu_max_abs_diff": nan,
+            "incoming_lagged_cache_max_abs_diff": nan,
+            "incoming_production_recent_reject_count": minus_one,
+            "incoming_fixed_recent_reject_count": minus_one,
+            "incoming_production_cache_valid": jnp.asarray(False),
+            "incoming_fixed_cache_valid": jnp.asarray(False),
+            "incoming_production_cache_dt": nan,
+            "incoming_fixed_cache_dt": nan,
+            "incoming_production_cache_age": minus_one,
+            "incoming_fixed_cache_age": minus_one,
+            "incoming_production_lagged_valid": jnp.asarray(False),
+            "incoming_fixed_lagged_valid": jnp.asarray(False),
+            "incoming_production_prev_dt": nan,
+            "incoming_fixed_prev_dt": nan,
+            "incoming_production_prev_error": nan,
+            "incoming_fixed_prev_error": nan,
+            "incoming_production_prev_theta_final": nan,
+            "incoming_fixed_prev_theta_final": nan,
+            "incoming_production_prev_newton_iter_count": minus_one,
+            "incoming_fixed_prev_newton_iter_count": minus_one,
+            "production_accepted": jnp.asarray(False),
+            "fixed_accepted": jnp.asarray(False),
+            "production_converged": jnp.asarray(False),
+            "fixed_converged": jnp.asarray(False),
+            "production_jacobian_reused": jnp.asarray(False),
+            "fixed_jacobian_reused": jnp.asarray(False),
+            "production_lagged_reused": jnp.asarray(False),
+            "fixed_lagged_reused": jnp.asarray(False),
+            "production_newton_iter_count": minus_one,
+            "fixed_newton_iter_count": minus_one,
+            "production_err_norm": nan,
+            "fixed_err_norm": nan,
+            "outgoing_y_max_abs_diff": nan,
+            "outgoing_Er_max_abs_diff": nan,
+            "outgoing_density_max_abs_diff": nan,
+            "outgoing_pressure_max_abs_diff": nan,
+            "checked_accepted_count": jnp.asarray(0, dtype=jnp.int32),
+            "mismatch_tol": mismatch_tol_value,
+            "max_accepted_steps": max_accepted_steps_value,
         }
-        if found_mismatch or accepted_seen + 1 >= max_accepted_steps:
-            return result
 
-        production_state = production_next
-        fixed_state = fixed_next
-        accepted_seen += 1
+    def _scan_body(carry, xs):
+        production_state, fixed_state, accepted_seen, active_attempt_seen, found, stats = carry
+        active, accepted, dt_value, attempt_index = xs
+        should_run = jnp.logical_and(
+            active,
+            jnp.logical_and(
+                jnp.logical_not(found),
+                accepted_seen < max_accepted_steps_value,
+            ),
+        )
 
-    return {
-        "found_mismatch": False,
-        "accepted_index": None,
-        "attempt_index": None,
-        "active_attempt_index": None,
-        "checked_accepted_count": int(accepted_seen),
-        "mismatch_tol": mismatch_tol,
-        "max_accepted_steps": max_accepted_steps,
-    }
+        def _run_attempt(_):
+            active_attempt_next = active_attempt_seen + jnp.asarray(1, dtype=jnp.int32)
+            production_in = dataclasses.replace(production_state, dt=dt_value)
+            production_next, production_info = _radau_step_fn_forward_solver(
+                execution_context,
+                production_in,
+                None,
+            )
+
+            def _accepted_case(__):
+                fixed_in = dataclasses.replace(fixed_state, dt=dt_value)
+                fixed_next, fixed_info = _radau_step_fn_forward_solver(
+                    execution_context,
+                    fixed_in,
+                    None,
+                )
+                incoming_y_diff = _tree_max_abs_diff_expr(production_in.y, fixed_in.y, dtype)
+                incoming_prev_stages_diff = _tree_max_abs_diff_expr(
+                    production_in.prev_stages,
+                    fixed_in.prev_stages,
+                    dtype,
+                )
+                incoming_jacobian_diff = _tree_max_abs_diff_expr(
+                    production_in.jacobian,
+                    fixed_in.jacobian,
+                    dtype,
+                )
+                incoming_real_lu_diff = _tree_max_abs_diff_expr(
+                    production_in.real_lu,
+                    fixed_in.real_lu,
+                    dtype,
+                )
+                incoming_complex_lu_diff = _tree_max_abs_diff_expr(
+                    production_in.complex_lu,
+                    fixed_in.complex_lu,
+                    dtype,
+                )
+                incoming_lagged_cache_diff = _tree_max_abs_diff_expr(
+                    production_in.lagged_response_cache,
+                    fixed_in.lagged_response_cache,
+                    dtype,
+                )
+                outgoing_y_diff = _tree_max_abs_diff_expr(production_next.y, fixed_next.y, dtype)
+                production_out_state = prepared_rollout.physics_context.unpack_flat(production_next.y)
+                fixed_out_state = prepared_rollout.physics_context.unpack_flat(fixed_next.y)
+                outgoing_er_diff = _tree_max_abs_diff_expr(production_out_state.Er, fixed_out_state.Er, dtype)
+                outgoing_density_diff = _tree_max_abs_diff_expr(
+                    production_out_state.density,
+                    fixed_out_state.density,
+                    dtype,
+                )
+                outgoing_pressure_diff = _tree_max_abs_diff_expr(
+                    production_out_state.pressure,
+                    fixed_out_state.pressure,
+                    dtype,
+                )
+                mismatch = jnp.logical_or(
+                    outgoing_y_diff > mismatch_tol_value,
+                    outgoing_er_diff > mismatch_tol_value,
+                )
+                accepted_seen_next = accepted_seen + jnp.asarray(1, dtype=jnp.int32)
+                record = jnp.logical_or(mismatch, accepted_seen_next >= max_accepted_steps_value)
+                new_stats = {
+                    "found_mismatch": mismatch,
+                    "accepted_index": accepted_seen,
+                    "attempt_index": attempt_index,
+                    "active_attempt_index": active_attempt_next - jnp.asarray(1, dtype=jnp.int32),
+                    "accepted_dt": dt_value,
+                    "incoming_t": production_in.t,
+                    "incoming_y_max_abs_diff": incoming_y_diff,
+                    "incoming_prev_stages_max_abs_diff": incoming_prev_stages_diff,
+                    "incoming_jacobian_max_abs_diff": incoming_jacobian_diff,
+                    "incoming_real_lu_max_abs_diff": incoming_real_lu_diff,
+                    "incoming_complex_lu_max_abs_diff": incoming_complex_lu_diff,
+                    "incoming_lagged_cache_max_abs_diff": incoming_lagged_cache_diff,
+                    "incoming_production_recent_reject_count": production_in.recent_reject_count,
+                    "incoming_fixed_recent_reject_count": fixed_in.recent_reject_count,
+                    "incoming_production_cache_valid": production_in.cache_valid,
+                    "incoming_fixed_cache_valid": fixed_in.cache_valid,
+                    "incoming_production_cache_dt": production_in.cache_dt,
+                    "incoming_fixed_cache_dt": fixed_in.cache_dt,
+                    "incoming_production_cache_age": production_in.cache_age,
+                    "incoming_fixed_cache_age": fixed_in.cache_age,
+                    "incoming_production_lagged_valid": production_in.lagged_response_valid,
+                    "incoming_fixed_lagged_valid": fixed_in.lagged_response_valid,
+                    "incoming_production_prev_dt": production_in.prev_dt,
+                    "incoming_fixed_prev_dt": fixed_in.prev_dt,
+                    "incoming_production_prev_error": production_in.prev_error,
+                    "incoming_fixed_prev_error": fixed_in.prev_error,
+                    "incoming_production_prev_theta_final": production_in.prev_theta_final,
+                    "incoming_fixed_prev_theta_final": fixed_in.prev_theta_final,
+                    "incoming_production_prev_newton_iter_count": production_in.prev_newton_iter_count,
+                    "incoming_fixed_prev_newton_iter_count": fixed_in.prev_newton_iter_count,
+                    "production_accepted": production_info.accepted,
+                    "fixed_accepted": fixed_info.accepted,
+                    "production_converged": production_info.converged,
+                    "fixed_converged": fixed_info.converged,
+                    "production_jacobian_reused": production_info.jacobian_reused,
+                    "fixed_jacobian_reused": fixed_info.jacobian_reused,
+                    "production_lagged_reused": production_info.lagged_reused,
+                    "fixed_lagged_reused": fixed_info.lagged_reused,
+                    "production_newton_iter_count": production_info.newton_iter_count,
+                    "fixed_newton_iter_count": fixed_info.newton_iter_count,
+                    "production_err_norm": production_info.err_norm,
+                    "fixed_err_norm": fixed_info.err_norm,
+                    "outgoing_y_max_abs_diff": outgoing_y_diff,
+                    "outgoing_Er_max_abs_diff": outgoing_er_diff,
+                    "outgoing_density_max_abs_diff": outgoing_density_diff,
+                    "outgoing_pressure_max_abs_diff": outgoing_pressure_diff,
+                    "checked_accepted_count": accepted_seen_next,
+                    "mismatch_tol": mismatch_tol_value,
+                    "max_accepted_steps": max_accepted_steps_value,
+                }
+                next_stats = jax.tree_util.tree_map(
+                    lambda old, new: jnp.where(record, new, old),
+                    stats,
+                    new_stats,
+                )
+                next_found = jnp.logical_or(found, mismatch)
+                return production_next, fixed_next, accepted_seen_next, next_found, next_stats
+
+            def _rejected_case(__):
+                return production_next, fixed_state, accepted_seen, found, stats
+
+            production_out, fixed_out, accepted_out, found_out, stats_out = jax.lax.cond(
+                accepted,
+                _accepted_case,
+                _rejected_case,
+                operand=None,
+            )
+            return production_out, fixed_out, accepted_out, active_attempt_next, found_out, stats_out
+
+        def _skip_attempt(_):
+            return production_state, fixed_state, accepted_seen, active_attempt_seen, found, stats
+
+        next_carry = jax.lax.cond(should_run, _run_attempt, _skip_attempt, operand=None)
+        return next_carry, None
+
+    initial_carry = (
+        production_state0,
+        fixed_state0,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(False),
+        _initial_stats(),
+    )
+    final_carry, _ = jax.lax.scan(
+        _scan_body,
+        initial_carry,
+        (active_mask, accepted_mask, attempted_dts, attempt_indices),
+    )
+    _, _, accepted_seen, _, found, stats = final_carry
+    stats = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)).item(), stats)
+    stats["found_mismatch"] = bool(found) and bool(stats["found_mismatch"])
+    stats["checked_accepted_count"] = int(stats["checked_accepted_count"]) if int(stats["checked_accepted_count"]) > 0 else int(np.asarray(jax.device_get(accepted_seen)).item())
+    for key in ("accepted_index", "attempt_index", "active_attempt_index"):
+        stats[key] = None if int(stats[key]) < 0 else int(stats[key])
+    for key, value in list(stats.items()):
+        if isinstance(value, np.bool_):
+            stats[key] = bool(value)
+        elif isinstance(value, np.integer):
+            stats[key] = int(value)
+        elif isinstance(value, np.floating):
+            stats[key] = float(value)
+    return stats
 
 
 def _max_abs_diff(a, b) -> float:

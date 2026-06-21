@@ -193,6 +193,9 @@ def main() -> None:
     profile_cfg = _baseline_profile_cfg(config)
     baseline_value = float(profile_cfg[args.parameter])
     fd_step = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+    effective_accepted_step_limit = args.accepted_step_limit
+    if args.first_replay_mismatch_debug and effective_accepted_step_limit is None:
+        effective_accepted_step_limit = int(max(1, args.first_replay_max_accepted_steps))
 
     print("[autodiff-gate] progress: running baseline adaptive rollout for frozen FD trace", flush=True)
     t_baseline0 = time.perf_counter()
@@ -203,13 +206,13 @@ def main() -> None:
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
-        accepted_step_limit_override=args.accepted_step_limit,
+        accepted_step_limit_override=effective_accepted_step_limit,
     )
     t_baseline1 = time.perf_counter()
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     replay_trace = _truncate_rollout_trace_by_accepted_steps(
         baseline_rollout.trace,
-        args.accepted_step_limit,
+        effective_accepted_step_limit,
     )
     baseline_objectives_adaptive = _objective_vector(baseline_final_state, runtime)
 
@@ -277,7 +280,7 @@ def main() -> None:
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=args.parameter,
-            accepted_step_limit=args.accepted_step_limit,
+            accepted_step_limit=effective_accepted_step_limit,
         )
         t_step_debug1 = time.perf_counter()
         er_step_max_abs = np.asarray(accepted_replay_step_debug["er_step_max_abs"], dtype=float)
@@ -363,7 +366,7 @@ def main() -> None:
                 baseline_state=baseline_state,
                 profile_cfg=profile_cfg,
                 parameter_name=args.parameter,
-                accepted_step_limit_override=args.accepted_step_limit,
+                accepted_step_limit_override=effective_accepted_step_limit,
             )
             objectives_minus = _objective_vector(minus_final_state, runtime)
             minus_replay = {
@@ -394,7 +397,7 @@ def main() -> None:
                 baseline_state=baseline_state,
                 profile_cfg=profile_cfg,
                 parameter_name=args.parameter,
-                accepted_step_limit_override=args.accepted_step_limit,
+                accepted_step_limit_override=effective_accepted_step_limit,
             )
             objectives_plus = _objective_vector(plus_final_state, runtime)
             plus_replay = {
@@ -450,7 +453,7 @@ def main() -> None:
         "fixed_time_lane": fixed_time_lane,
         "radau_jacobian_reuse_mode": str(args.radau_jacobian_reuse_mode),
         "debug_direct_accepted_step_map": use_direct_accepted_step_map,
-        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "accepted_step_limit": None if effective_accepted_step_limit is None else int(effective_accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "baseline_replay_debug": bool(args.baseline_replay_debug),
         "accepted_replay_step_debug": accepted_replay_step_debug,
