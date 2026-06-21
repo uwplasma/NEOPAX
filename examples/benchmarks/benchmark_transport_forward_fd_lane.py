@@ -905,6 +905,189 @@ def _accepted_replay_state_debug_for_parameter(
     }
 
 
+def _bool_scalar(value) -> bool:
+    return bool(np.asarray(jax.device_get(value)).item())
+
+
+def _float_scalar(value) -> float:
+    return float(np.asarray(jax.device_get(value)).item())
+
+
+def _int_scalar(value) -> int:
+    return int(np.asarray(jax.device_get(value)).item())
+
+
+def _first_accepted_replay_mismatch_for_parameter(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    replay_trace,
+    mismatch_tol: float = 1.0e-8,
+    max_accepted_steps: int = 32,
+):
+    """Lightweight production-vs-fixed accepted-step replay mismatch scanner.
+
+    This intentionally avoids collecting full per-step state history. It walks
+    the realized attempt trace and the fixed accepted-dt path side by side,
+    then returns immediately when an accepted step exceeds `mismatch_tol`.
+    """
+
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+
+    active_mask = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+    accepted_mask = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+    attempted_dts = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
+
+    production_state = _radau_step_state_from_carry(
+        prepared_rollout.initial_carry,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+    fixed_state = _radau_step_state_from_carry(
+        prepared_rollout.initial_carry,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+
+    accepted_seen = 0
+    active_attempt_seen = 0
+    mismatch_tol = float(mismatch_tol)
+    max_accepted_steps = int(max(1, max_accepted_steps))
+
+    for attempt_index, (active, accepted, dt_value_np) in enumerate(
+        zip(active_mask.tolist(), accepted_mask.tolist(), attempted_dts.tolist())
+    ):
+        if not active:
+            continue
+        active_attempt_seen += 1
+        dt_value = jnp.asarray(dt_value_np, dtype=prepared_rollout.kernel_context.dtype)
+
+        production_in = dataclasses.replace(production_state, dt=dt_value)
+        production_next, production_info = _radau_step_fn_forward_solver(
+            execution_context,
+            production_in,
+            None,
+        )
+
+        if not accepted:
+            production_state = production_next
+            continue
+
+        fixed_in = dataclasses.replace(fixed_state, dt=dt_value)
+        fixed_next, fixed_info = _radau_step_fn_forward_solver(
+            execution_context,
+            fixed_in,
+            None,
+        )
+
+        incoming_y_diff = _max_abs_diff(production_in.y, fixed_in.y)
+        incoming_prev_stages_diff = _max_abs_diff(production_in.prev_stages, fixed_in.prev_stages)
+        incoming_jacobian_diff = _max_abs_diff(production_in.jacobian, fixed_in.jacobian)
+        incoming_real_lu_diff = _max_abs_diff(production_in.real_lu, fixed_in.real_lu)
+        incoming_complex_lu_diff = _max_abs_diff(production_in.complex_lu, fixed_in.complex_lu)
+        incoming_lagged_cache_diff = _max_abs_diff(
+            production_in.lagged_response_cache,
+            fixed_in.lagged_response_cache,
+        )
+        outgoing_y_diff = _max_abs_diff(production_next.y, fixed_next.y)
+        production_out_state = prepared_rollout.physics_context.unpack_flat(production_next.y)
+        fixed_out_state = prepared_rollout.physics_context.unpack_flat(fixed_next.y)
+        outgoing_er_diff = _max_abs_diff(production_out_state.Er, fixed_out_state.Er)
+        outgoing_density_diff = _max_abs_diff(production_out_state.density, fixed_out_state.density)
+        outgoing_pressure_diff = _max_abs_diff(production_out_state.pressure, fixed_out_state.pressure)
+
+        found_mismatch = outgoing_y_diff > mismatch_tol or outgoing_er_diff > mismatch_tol
+        result = {
+            "found_mismatch": bool(found_mismatch),
+            "accepted_index": int(accepted_seen),
+            "attempt_index": int(attempt_index),
+            "active_attempt_index": int(active_attempt_seen - 1),
+            "accepted_dt": _float_scalar(dt_value),
+            "incoming_t": _float_scalar(production_in.t),
+            "incoming_y_max_abs_diff": float(incoming_y_diff),
+            "incoming_prev_stages_max_abs_diff": float(incoming_prev_stages_diff),
+            "incoming_jacobian_max_abs_diff": float(incoming_jacobian_diff),
+            "incoming_real_lu_max_abs_diff": float(incoming_real_lu_diff),
+            "incoming_complex_lu_max_abs_diff": float(incoming_complex_lu_diff),
+            "incoming_lagged_cache_max_abs_diff": float(incoming_lagged_cache_diff),
+            "incoming_production_recent_reject_count": _int_scalar(production_in.recent_reject_count),
+            "incoming_fixed_recent_reject_count": _int_scalar(fixed_in.recent_reject_count),
+            "incoming_production_cache_valid": _bool_scalar(production_in.cache_valid),
+            "incoming_fixed_cache_valid": _bool_scalar(fixed_in.cache_valid),
+            "incoming_production_cache_dt": _float_scalar(production_in.cache_dt),
+            "incoming_fixed_cache_dt": _float_scalar(fixed_in.cache_dt),
+            "incoming_production_cache_age": _int_scalar(production_in.cache_age),
+            "incoming_fixed_cache_age": _int_scalar(fixed_in.cache_age),
+            "incoming_production_lagged_valid": _bool_scalar(production_in.lagged_response_valid),
+            "incoming_fixed_lagged_valid": _bool_scalar(fixed_in.lagged_response_valid),
+            "incoming_production_prev_dt": _float_scalar(production_in.prev_dt),
+            "incoming_fixed_prev_dt": _float_scalar(fixed_in.prev_dt),
+            "incoming_production_prev_error": _float_scalar(production_in.prev_error),
+            "incoming_fixed_prev_error": _float_scalar(fixed_in.prev_error),
+            "incoming_production_prev_theta_final": _float_scalar(production_in.prev_theta_final),
+            "incoming_fixed_prev_theta_final": _float_scalar(fixed_in.prev_theta_final),
+            "incoming_production_prev_newton_iter_count": _int_scalar(production_in.prev_newton_iter_count),
+            "incoming_fixed_prev_newton_iter_count": _int_scalar(fixed_in.prev_newton_iter_count),
+            "production_accepted": _bool_scalar(production_info.accepted),
+            "fixed_accepted": _bool_scalar(fixed_info.accepted),
+            "production_converged": _bool_scalar(production_info.converged),
+            "fixed_converged": _bool_scalar(fixed_info.converged),
+            "production_jacobian_reused": _bool_scalar(production_info.jacobian_reused),
+            "fixed_jacobian_reused": _bool_scalar(fixed_info.jacobian_reused),
+            "production_lagged_reused": _bool_scalar(production_info.lagged_reused),
+            "fixed_lagged_reused": _bool_scalar(fixed_info.lagged_reused),
+            "production_newton_iter_count": _int_scalar(production_info.newton_iter_count),
+            "fixed_newton_iter_count": _int_scalar(fixed_info.newton_iter_count),
+            "production_err_norm": _float_scalar(production_info.err_norm),
+            "fixed_err_norm": _float_scalar(fixed_info.err_norm),
+            "outgoing_y_max_abs_diff": float(outgoing_y_diff),
+            "outgoing_Er_max_abs_diff": float(outgoing_er_diff),
+            "outgoing_density_max_abs_diff": float(outgoing_density_diff),
+            "outgoing_pressure_max_abs_diff": float(outgoing_pressure_diff),
+            "checked_accepted_count": int(accepted_seen + 1),
+            "mismatch_tol": mismatch_tol,
+            "max_accepted_steps": max_accepted_steps,
+        }
+        if found_mismatch or accepted_seen + 1 >= max_accepted_steps:
+            return result
+
+        production_state = production_next
+        fixed_state = fixed_next
+        accepted_seen += 1
+
+    return {
+        "found_mismatch": False,
+        "accepted_index": None,
+        "attempt_index": None,
+        "active_attempt_index": None,
+        "checked_accepted_count": int(accepted_seen),
+        "mismatch_tol": mismatch_tol,
+        "max_accepted_steps": max_accepted_steps,
+    }
+
+
 def _max_abs_diff(a, b) -> float:
     leaves_a = jax.tree_util.tree_leaves(a)
     leaves_b = jax.tree_util.tree_leaves(b)

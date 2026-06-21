@@ -551,3 +551,224 @@ After the refactor:
 
 Do not resume forward-AD comparison until the FD fixed-time lane has a valid
 completed-minus/completed-plus baseline.
+
+## Current FD replay state (2026-06-21)
+
+This section records the latest narrowing of the accepted-time FD / replay
+debugging path.
+
+### Current benchmark TOML
+
+The default TOML for `benchmark_transport_frozen_fd_only.py` is:
+
+```text
+examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml
+```
+
+Relevant settings:
+
+```toml
+[transport_solver]
+transport_solver_backend = "radau"
+integrator = "radau"
+radau_rhs_mode = "lagged_response"
+radau_num_stages = 7
+radau_controller_mode = "hairer_lean_transport_discounted"
+radau_predictor_mode = "collocation_transport_weighted"
+lagged_response_reuse_mode = "global_state_drift"
+t_final = 0.01
+dt = 1.0e-5
+rtol = 1.0e-6
+atol = 1.0e-8
+max_steps = 20000
+```
+
+The profile baseline values used by the scalar FD benchmark are:
+
+```toml
+n0 = 4.21
+T0 = 17.8
+density_shape_power = 10.0
+temperature_shape_power = 2.0
+```
+
+### Latest baseline-vs-fixed-time replay result
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --replay-mode accepted --baseline-replay-debug --fixed-time-lane solver
+```
+
+Observed result:
+
+- baseline adaptive:
+  - `attempt_count=158`
+  - `accepted_count=99`
+  - `completed=True`
+  - `failed=False`
+- fixed-time baseline replay:
+  - `accepted_count=99`
+  - `state_finite=True`
+- mismatch:
+  - `Er max_abs_diff=1.912787e-06`
+  - `Er mean_abs_diff=4.108936e-08`
+  - `Er max_rel_diff=7.333392e-08`
+  - `Er mean_rel_diff=3.359405e-09`
+  - `softmax_Er rel_diff=2.508350e-10`
+  - `Er2_volume_average rel_diff=2.145113e-09`
+  - `Er_volume_average rel_diff=1.035160e-08`
+
+This mismatch did **not** change when `nonlinear_solver_tol` was tightened to
+`1.0e-12`.
+
+### Newton tolerance conclusion
+
+The TOML uses:
+
+```toml
+radau_newton_tol_mode = "hairer"
+radau_newton_fnewt_mode = "hairer"
+```
+
+Therefore convergence is not checked simply as:
+
+```text
+final_residual_norm <= nonlinear_solver_tol
+```
+
+The active Hairer-style check is:
+
+```text
+newton_metric_final <= predictor_fnewt
+```
+
+where `predictor_fnewt` is derived mainly from `rtol`, machine epsilon, and
+`radau_num_stages`.
+
+Changing only `nonlinear_solver_tol` is therefore not expected to tighten the
+active Newton stopping condition in this TOML.
+
+### Jacobian/LU reuse modes
+
+A new benchmark/solver mode was added:
+
+```text
+radau_jacobian_reuse_mode = "retry_refactor_lu"
+```
+
+Current meanings:
+
+- `retry_only`
+  - reuse Jacobian only on same-`t_i` retry after a rejected attempt
+  - reuse LU only if retry and `dt_close`
+- `retry_refactor_lu`
+  - reuse Jacobian only on same-`t_i` retry after a rejected attempt
+  - always refactor LU for the current trial `dt`
+- `dt_close` / `legacy`
+  - old behavior
+  - reuse Jacobian and LU whenever `cache_valid && dt_close`
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py --ntx-exact-derivative-mode direct --parameter T0 --replay-mode accepted --baseline-replay-debug --fixed-time-lane solver --radau-jacobian-reuse-mode retry_refactor_lu
+```
+
+Observed result was identical to `retry_only`:
+
+- `Er max_abs_diff=1.912787e-06`
+- `Er mean_abs_diff=4.108936e-08`
+
+So LU reuse from a nearby rejected `dt` is **not** the observed mismatch source.
+
+### Fully adaptive FD endpoint test
+
+An explicit endpoint lane was added:
+
+```bash
+--fd-endpoint-lane adaptive
+```
+
+This runs `fd-` and `fd+` through the same production adaptive solve helper as
+the baseline, rather than the fixed accepted-time map.
+
+Result:
+
+- this is worse for the old accepted-history benchmark target
+- `fd-` and `fd+` choose different adaptive histories:
+  - example: baseline `accepted_count=99`
+  - `fd_minus accepted_count=122` or `115`
+  - `fd_plus accepted_count=114` or `106`
+- therefore this endpoint lane is useful only as a diagnostic that full
+  adaptive FD is not the old intended comparison object
+
+### Current narrowed diagnosis
+
+The accepted-time replay mismatch is not explained by:
+
+- loose Newton tolerance via `nonlinear_solver_tol`
+- LU reuse at nearby rejected `dt`
+- fully adaptive endpoint FD
+
+The remaining issue is that accepted-time replay freezes only the accepted
+`dt` list, while the production accepted attempt may also depend on carry /
+cache context produced by previous rejected attempts.
+
+However, the current TOML narrows the likely channels:
+
+- lagged response:
+  - should not change during retries at the same `t_i` because accepted `y_i`
+    does not advance
+  - it only rebuilds at an attempt start if `lagged_response_valid=False`
+  - accepted branch uses the global state drift test against
+    `lagged_reference_y`
+- `prev_stages`:
+  - stored only on accepted steps
+  - used directly in `_make_radau_stage_predictor(...)` to construct `z0`
+- `prev_dt`:
+  - stored only on accepted steps
+  - used to scale `prev_stages` in the predictor via `h / prev_dt`
+  - also used in adaptive controller growth formulas
+- `prev_error`:
+  - stored only on accepted steps
+  - used by adaptive controller growth formulas
+  - should not affect the physical state if fixed `dt` is truly enforced
+- `prev_theta_final` and `prev_newton_iter_count`:
+  - can be updated by rejected attempts
+  - but the active TOML predictor mode is `collocation_transport_weighted`, not
+    `newton_quality_gated_collocation`, so these should not currently drive
+    `z0`
+
+### Next useful diagnostic
+
+The next diagnostic should be lightweight and should avoid storing large arrays.
+
+Goal:
+
+- stop at the first accepted step where fixed-time replay differs from the
+  production adaptive accepted state beyond a chosen tolerance
+- print only the incoming carry/context differences for that step
+
+Fields to compare:
+
+- accepted `dt`
+- incoming `t`
+- incoming `y` max/relative diff
+- `prev_stages` max diff
+- `prev_dt` diff
+- `prev_error` diff
+- `lagged_response_valid`
+- `lagged_reference_y` max diff
+- `cache_valid`
+- `cache_dt`
+- `recent_reject_count`
+- whether Jacobian was reused
+- whether LU was reused/refactored
+
+The main question for the next session is:
+
+```text
+Which incoming carry/context field first differs between production adaptive
+accepted steps and fixed accepted-time replay?
+```

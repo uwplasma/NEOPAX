@@ -24,6 +24,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _adaptive_rollout_objectives_for_parameter_on_frozen_trace,
     _baseline_profile_cfg,
     _fd_step,
+    _first_accepted_replay_mismatch_for_parameter,
     _objective_vector,
     _production_solver_baseline_final_state_and_schedule_for_parameter,
     _prepare_benchmark_config,
@@ -145,6 +146,26 @@ def main() -> None:
         help="Run only a one-step production-vs-fixed-dt comparison from the same incoming accepted-step boundary.",
     )
     parser.add_argument(
+        "--first-replay-mismatch-debug",
+        action="store_true",
+        help=(
+            "Run a lightweight production-vs-fixed accepted-step replay scan and stop at the "
+            "first accepted step whose output mismatch exceeds --first-replay-mismatch-tol."
+        ),
+    )
+    parser.add_argument(
+        "--first-replay-mismatch-tol",
+        type=float,
+        default=1.0e-8,
+        help="Absolute mismatch threshold for --first-replay-mismatch-debug.",
+    )
+    parser.add_argument(
+        "--first-replay-max-accepted-steps",
+        type=int,
+        default=32,
+        help="Maximum accepted steps inspected by --first-replay-mismatch-debug.",
+    )
+    parser.add_argument(
         "--debug-direct-accepted-step-map",
         action="store_true",
         help=(
@@ -204,6 +225,7 @@ def main() -> None:
     baseline_replay_elapsed_s = None
     accepted_replay_step_debug = None
     single_step_compare = None
+    first_replay_mismatch_debug = None
     if args.baseline_replay_debug and str(args.replay_mode).strip().lower() == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(replay_trace)
         print("[autodiff-gate] progress: running fixed-time baseline solve (accepted)", flush=True)
@@ -291,6 +313,22 @@ def main() -> None:
         )
         t_single1 = time.perf_counter()
         single_step_compare["elapsed_s"] = t_single1 - t_single0
+    if args.first_replay_mismatch_debug:
+        print("[autodiff-gate] progress: running lightweight first replay mismatch debug", flush=True)
+        t_first_mismatch0 = time.perf_counter()
+        first_replay_mismatch_debug = _first_accepted_replay_mismatch_for_parameter(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            replay_trace=replay_trace,
+            mismatch_tol=args.first_replay_mismatch_tol,
+            max_accepted_steps=args.first_replay_max_accepted_steps,
+        )
+        t_first_mismatch1 = time.perf_counter()
+        first_replay_mismatch_debug["elapsed_s"] = t_first_mismatch1 - t_first_mismatch0
 
     adaptive_objectives_np = np.asarray(
         jax.device_get(baseline_objectives_adaptive),
@@ -305,7 +343,12 @@ def main() -> None:
     minus_replay = None
     plus_replay = None
     t_minus0 = t_minus1 = t_plus0 = t_plus1 = None
-    if not args.baseline_replay_debug and not args.accepted_replay_step_debug and not args.single_step_compare:
+    if (
+        not args.baseline_replay_debug
+        and not args.accepted_replay_step_debug
+        and not args.single_step_compare
+        and not args.first_replay_mismatch_debug
+    ):
         minus_value = baseline_value - fd_step
         plus_value = baseline_value + fd_step
 
@@ -412,6 +455,7 @@ def main() -> None:
         "baseline_replay_debug": bool(args.baseline_replay_debug),
         "accepted_replay_step_debug": accepted_replay_step_debug,
         "single_step_compare": single_step_compare,
+        "first_replay_mismatch_debug": first_replay_mismatch_debug,
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_fd": None if grad_np is None else grad_np.tolist(),
         "objectives_minus": None if objectives_minus_np is None else objectives_minus_np.tolist(),
@@ -525,6 +569,58 @@ def main() -> None:
             f"lagged_ref={single_step_compare['carry_lagged_reference_y_max_abs_diff']:.6e} "
             f"lagged_valid_equal={single_step_compare['carry_lagged_valid_equal']}"
         )
+    if first_replay_mismatch_debug is not None:
+        print(
+            "[autodiff-gate] first replay mismatch debug: "
+            f"found_mismatch={first_replay_mismatch_debug['found_mismatch']} "
+            f"checked_accepted_count={first_replay_mismatch_debug['checked_accepted_count']} "
+            f"accepted_index={first_replay_mismatch_debug['accepted_index']} "
+            f"attempt_index={first_replay_mismatch_debug['attempt_index']} "
+            f"elapsed_s={first_replay_mismatch_debug['elapsed_s']:.6e}"
+        )
+        if first_replay_mismatch_debug.get("accepted_index") is not None:
+            print(
+                "[autodiff-gate] first replay mismatch incoming: "
+                f"t={first_replay_mismatch_debug['incoming_t']:.6e} "
+                f"dt={first_replay_mismatch_debug['accepted_dt']:.6e} "
+                f"y_diff={first_replay_mismatch_debug['incoming_y_max_abs_diff']:.6e} "
+                f"prev_stages_diff={first_replay_mismatch_debug['incoming_prev_stages_max_abs_diff']:.6e} "
+                f"jacobian_diff={first_replay_mismatch_debug['incoming_jacobian_max_abs_diff']:.6e} "
+                f"real_lu_diff={first_replay_mismatch_debug['incoming_real_lu_max_abs_diff']:.6e} "
+                f"complex_lu_diff={first_replay_mismatch_debug['incoming_complex_lu_max_abs_diff']:.6e} "
+                f"lagged_cache_diff={first_replay_mismatch_debug['incoming_lagged_cache_max_abs_diff']:.6e}"
+            )
+            print(
+                "[autodiff-gate] first replay mismatch carry: "
+                f"production_recent_reject={first_replay_mismatch_debug['incoming_production_recent_reject_count']} "
+                f"fixed_recent_reject={first_replay_mismatch_debug['incoming_fixed_recent_reject_count']} "
+                f"production_cache_valid={first_replay_mismatch_debug['incoming_production_cache_valid']} "
+                f"fixed_cache_valid={first_replay_mismatch_debug['incoming_fixed_cache_valid']} "
+                f"production_cache_dt={first_replay_mismatch_debug['incoming_production_cache_dt']:.6e} "
+                f"fixed_cache_dt={first_replay_mismatch_debug['incoming_fixed_cache_dt']:.6e} "
+                f"production_lagged_valid={first_replay_mismatch_debug['incoming_production_lagged_valid']} "
+                f"fixed_lagged_valid={first_replay_mismatch_debug['incoming_fixed_lagged_valid']}"
+            )
+            print(
+                "[autodiff-gate] first replay mismatch step: "
+                f"production_accepted={first_replay_mismatch_debug['production_accepted']} "
+                f"fixed_accepted={first_replay_mismatch_debug['fixed_accepted']} "
+                f"production_jacobian_reused={first_replay_mismatch_debug['production_jacobian_reused']} "
+                f"fixed_jacobian_reused={first_replay_mismatch_debug['fixed_jacobian_reused']} "
+                f"production_lagged_reused={first_replay_mismatch_debug['production_lagged_reused']} "
+                f"fixed_lagged_reused={first_replay_mismatch_debug['fixed_lagged_reused']} "
+                f"production_newton_iter={first_replay_mismatch_debug['production_newton_iter_count']} "
+                f"fixed_newton_iter={first_replay_mismatch_debug['fixed_newton_iter_count']}"
+            )
+            print(
+                "[autodiff-gate] first replay mismatch outgoing: "
+                f"y_diff={first_replay_mismatch_debug['outgoing_y_max_abs_diff']:.6e} "
+                f"Er_diff={first_replay_mismatch_debug['outgoing_Er_max_abs_diff']:.6e} "
+                f"density_diff={first_replay_mismatch_debug['outgoing_density_max_abs_diff']:.6e} "
+                f"pressure_diff={first_replay_mismatch_debug['outgoing_pressure_max_abs_diff']:.6e} "
+                f"production_err_norm={first_replay_mismatch_debug['production_err_norm']:.6e} "
+                f"fixed_err_norm={first_replay_mismatch_debug['fixed_err_norm']:.6e}"
+            )
     if minus_diag is not None and plus_diag is not None:
         print(f"[autodiff-gate] {fd_endpoint_lane} endpoint rollout diagnostics:")
         print(
