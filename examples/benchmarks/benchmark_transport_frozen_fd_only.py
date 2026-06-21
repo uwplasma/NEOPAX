@@ -96,6 +96,16 @@ def main() -> None:
             "uses the lower-level accepted-step-map helper."
         ),
     )
+    parser.add_argument(
+        "--fd-endpoint-lane",
+        type=str,
+        default="fixed-time",
+        choices=("fixed-time", "adaptive"),
+        help=(
+            "FD endpoint solve lane. 'fixed-time' freezes the baseline accepted time map; "
+            "'adaptive' runs fd-/fd+ through the same production adaptive solver lane as the baseline."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument(
         "--accepted-step-limit",
@@ -114,7 +124,7 @@ def main() -> None:
         default="retry_only",
         choices=("retry_only", "dt_close", "legacy"),
         help=(
-            "Radau Jacobian/LU reuse policy for the adaptive baseline and fixed-time endpoints. "
+            "Radau Jacobian/LU reuse policy for the adaptive baseline and FD endpoints. "
             "'retry_only' is the current default; 'dt_close'/'legacy' restores the old cache_valid && dt_close linearization reuse."
         ),
     )
@@ -148,6 +158,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     fixed_time_lane = "direct" if args.debug_direct_accepted_step_map else str(args.fixed_time_lane).strip().lower()
+    fd_endpoint_lane = str(args.fd_endpoint_lane).strip().lower()
     use_direct_accepted_step_map = fixed_time_lane == "direct"
 
     config = _prepare_benchmark_config(
@@ -297,33 +308,68 @@ def main() -> None:
         minus_value = baseline_value - fd_step
         plus_value = baseline_value + fd_step
 
-        print(f"[autodiff-gate] progress: running fixed-time fd_minus solve ({args.replay_mode})", flush=True)
+        endpoint_label = "production adaptive" if fd_endpoint_lane == "adaptive" else "fixed-time"
+        print(f"[autodiff-gate] progress: running {endpoint_label} fd_minus solve ({args.replay_mode})", flush=True)
         t_minus0 = time.perf_counter()
-        objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-            jnp.asarray(minus_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=args.parameter,
-            frozen_trace=replay_trace,
-            replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
-        )
+        if fd_endpoint_lane == "adaptive":
+            minus_final_state, minus_rollout = _production_solver_baseline_final_state_and_schedule_for_parameter(
+                jnp.asarray(minus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                accepted_step_limit_override=args.accepted_step_limit,
+            )
+            objectives_minus = _objective_vector(minus_final_state, runtime)
+            minus_replay = {
+                "rollout": minus_rollout,
+                "final_state": minus_final_state,
+                "final_carry": minus_rollout.final_carry,
+            }
+        else:
+            objectives_minus, minus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+                jnp.asarray(minus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                frozen_trace=replay_trace,
+                replay_mode=args.replay_mode,
+                use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
+            )
         t_minus1 = time.perf_counter()
-        print(f"[autodiff-gate] progress: running fixed-time fd_plus solve ({args.replay_mode})", flush=True)
+        print(f"[autodiff-gate] progress: running {endpoint_label} fd_plus solve ({args.replay_mode})", flush=True)
         t_plus0 = time.perf_counter()
-        objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-            jnp.asarray(plus_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=args.parameter,
-            frozen_trace=replay_trace,
-            replay_mode=args.replay_mode,
-            use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
-        )
+        if fd_endpoint_lane == "adaptive":
+            plus_final_state, plus_rollout = _production_solver_baseline_final_state_and_schedule_for_parameter(
+                jnp.asarray(plus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                accepted_step_limit_override=args.accepted_step_limit,
+            )
+            objectives_plus = _objective_vector(plus_final_state, runtime)
+            plus_replay = {
+                "rollout": plus_rollout,
+                "final_state": plus_final_state,
+                "final_carry": plus_rollout.final_carry,
+            }
+        else:
+            objectives_plus, plus_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+                jnp.asarray(plus_value),
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                frozen_trace=replay_trace,
+                replay_mode=args.replay_mode,
+                use_direct_accepted_step_map_debug=use_direct_accepted_step_map,
+            )
         t_plus1 = time.perf_counter()
 
         gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
@@ -355,6 +401,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "fd_valid": fd_valid,
+        "fd_endpoint_lane": fd_endpoint_lane,
         "replay_mode": str(args.replay_mode),
         "fixed_time_lane": fixed_time_lane,
         "radau_jacobian_reuse_mode": str(args.radau_jacobian_reuse_mode),
@@ -397,7 +444,8 @@ def main() -> None:
     print(
         f"[autodiff-gate] mode=transport_frozen_fd_only parameter={args.parameter} "
         f"baseline_value={baseline_value:.6e} fd_step={fd_step:.6e} replay_mode={args.replay_mode} "
-        f"fixed_time_lane={fixed_time_lane} radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode}"
+        f"fixed_time_lane={fixed_time_lane} fd_endpoint_lane={fd_endpoint_lane} "
+        f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode}"
     )
     print(
         f"[autodiff-gate] rollout baseline: attempt_count={baseline_diag.get('attempt_count')} "
@@ -477,7 +525,7 @@ def main() -> None:
             f"lagged_valid_equal={single_step_compare['carry_lagged_valid_equal']}"
         )
     if minus_diag is not None and plus_diag is not None:
-        print("[autodiff-gate] fixed-time endpoint rollout diagnostics:")
+        print(f"[autodiff-gate] {fd_endpoint_lane} endpoint rollout diagnostics:")
         print(
             "  - minus: "
             f"attempt_count={minus_diag['attempt_count']} "
@@ -499,7 +547,7 @@ def main() -> None:
         if fd_valid is False:
             print(
                 "[autodiff-gate] fd_valid=False: not reporting central FD gradients "
-                "because at least one fixed-time endpoint did not complete."
+                "because at least one FD endpoint did not complete."
             )
     if grad_np is not None:
         print("[autodiff-gate] objective values:")
