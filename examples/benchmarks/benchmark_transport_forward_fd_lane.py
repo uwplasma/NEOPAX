@@ -37,6 +37,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_dt_sequence_from_time_list,
     _radau_eval_rhs,
     _radau_forward_fd_fixed_dt_accepted_rollout,
+    _radau_forward_solver_fixed_dt_schedule_rollout,
     _radau_solve_on_fixed_time_map_final_state_only,
     _radau_step_fn_forward_solver,
     _radau_step_state_from_carry,
@@ -256,6 +257,14 @@ def _accepted_time_list_from_trace(trace) -> list[float]:
     step_ts = np.asarray(jax.device_get(trace.step_ts), dtype=float)
     keep = np.logical_and(active_mask, accepted_mask)
     return step_ts[keep].tolist()
+
+
+def _accepted_dt_sequence_from_trace(trace):
+    active_mask = jnp.asarray(trace.active_mask, dtype=bool)
+    accepted_mask = jnp.asarray(trace.accepted_mask, dtype=bool)
+    attempted_dts = jnp.asarray(trace.attempted_dts)
+    keep = jnp.logical_and(active_mask, accepted_mask)
+    return attempted_dts[keep]
 
 
 def _adaptive_rollout_diagnostics(rollout) -> dict[str, Any]:
@@ -660,15 +669,15 @@ def _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
             "FD runs use the solver-native fixed accepted-time-map path rather than the old replay machinery."
         )
 
-    accepted_time_list = _accepted_time_list_from_trace(frozen_trace)
-    return _adaptive_rollout_objectives_for_parameter_on_time_list(
+    accepted_dt_sequence = _accepted_dt_sequence_from_trace(frozen_trace)
+    return _adaptive_rollout_objectives_for_parameter_on_dt_sequence(
         parameter_value,
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
-        time_list=accepted_time_list,
+        dt_sequence=accepted_dt_sequence,
         use_direct_accepted_step_map_debug=use_direct_accepted_step_map_debug,
     )
 
@@ -747,6 +756,81 @@ def _adaptive_rollout_objectives_for_parameter_on_time_list(
             execution_context,
             time_list,
         )
+    )
+    return _objective_vector(replay["final_state"], runtime), replay
+
+
+def _solve_on_fixed_dt_sequence(
+    prepared_rollout,
+    execution_context,
+    dt_sequence,
+    *,
+    use_direct_accepted_step_map_debug: bool = False,
+):
+    dt_sequence = jnp.asarray(dt_sequence, dtype=prepared_rollout.kernel_context.dtype)
+    if use_direct_accepted_step_map_debug:
+        rollout = _radau_forward_fd_fixed_dt_accepted_rollout(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            prepared_rollout.initial_carry,
+            dt_sequence,
+        )
+        fixed_time_mode = "direct_accepted_dt_sequence_debug"
+    else:
+        rollout = _radau_forward_solver_fixed_dt_schedule_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            dt_sequence,
+        )
+        fixed_time_mode = "solver_accepted_dt_sequence"
+    final_carry = rollout.final_carry
+    final_state = prepared_rollout.physics_context.unpack_flat(final_carry.y)
+    return {
+        "dt_sequence": dt_sequence,
+        "final_state": final_state,
+        "final_carry": final_carry,
+        "rollout": rollout,
+        "fixed_time_mode": fixed_time_mode,
+    }
+
+
+def _adaptive_rollout_objectives_for_parameter_on_dt_sequence(
+    parameter_value,
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    parameter_name: str,
+    dt_sequence,
+    use_direct_accepted_step_map_debug: bool = False,
+):
+    state0 = _parameterized_initial_state(
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        n_species=runtime.species.number_species,
+        parameter_name=parameter_name,
+        parameter_value=parameter_value,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    replay = _solve_on_fixed_dt_sequence(
+        prepared_rollout,
+        execution_context,
+        dt_sequence,
+        use_direct_accepted_step_map_debug=use_direct_accepted_step_map_debug,
     )
     return _objective_vector(replay["final_state"], runtime), replay
 

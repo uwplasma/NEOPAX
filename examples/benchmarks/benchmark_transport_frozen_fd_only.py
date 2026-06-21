@@ -225,12 +225,19 @@ def main() -> None:
     baseline_replay_er_max_rel_diff = None
     baseline_replay_er_mean_rel_diff = None
     accepted_time_list = None
+    accepted_dt_sequence = None
     baseline_replay_elapsed_s = None
     accepted_replay_step_debug = None
     single_step_compare = None
     first_replay_mismatch_debug = None
     if args.baseline_replay_debug and str(args.replay_mode).strip().lower() == "accepted":
         accepted_time_list = _accepted_time_list_from_trace(replay_trace)
+        accepted_mask_for_report = np.asarray(jax.device_get(replay_trace.accepted_mask), dtype=bool)
+        active_mask_for_report = np.asarray(jax.device_get(replay_trace.active_mask), dtype=bool)
+        attempted_dts_for_report = np.asarray(jax.device_get(replay_trace.attempted_dts), dtype=float)
+        accepted_dt_sequence = attempted_dts_for_report[
+            np.logical_and(active_mask_for_report, accepted_mask_for_report)
+        ].tolist()
         print("[autodiff-gate] progress: running fixed-time baseline solve (accepted)", flush=True)
         t_replay0 = time.perf_counter()
         baseline_replay_objectives, baseline_replay = _adaptive_rollout_objectives_for_parameter_on_frozen_trace(
@@ -477,6 +484,7 @@ def main() -> None:
         "baseline_replay_er_max_rel_diff": baseline_replay_er_max_rel_diff,
         "baseline_replay_er_mean_rel_diff": baseline_replay_er_mean_rel_diff,
         "accepted_time_list": accepted_time_list,
+        "accepted_dt_sequence": accepted_dt_sequence,
         "rollout_path": {
             "baseline": baseline_diag,
             "baseline_adaptive_elapsed_s": t_baseline1 - t_baseline0,
