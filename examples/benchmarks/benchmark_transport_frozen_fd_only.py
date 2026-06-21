@@ -122,10 +122,11 @@ def main() -> None:
     parser.add_argument(
         "--radau-jacobian-reuse-mode",
         default="retry_only",
-        choices=("retry_only", "dt_close", "legacy"),
+        choices=("retry_only", "retry_refactor_lu", "dt_close", "legacy"),
         help=(
             "Radau Jacobian/LU reuse policy for the adaptive baseline and FD endpoints. "
-            "'retry_only' is the current default; 'dt_close'/'legacy' restores the old cache_valid && dt_close linearization reuse."
+            "'retry_only' is the current default; 'retry_refactor_lu' reuses retry Jacobians "
+            "but always refactors LU; 'dt_close'/'legacy' restores the old cache_valid && dt_close linearization reuse."
         ),
     )
     parser.add_argument(

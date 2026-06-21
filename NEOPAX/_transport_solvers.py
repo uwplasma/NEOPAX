@@ -2115,6 +2115,9 @@ class _RadauSolverConfig(TransportSolver):
             "default": "retry_only",
             "retry": "retry_only",
             "current": "retry_only",
+            "retry_recompute_lu": "retry_refactor_lu",
+            "retry_no_lu_reuse": "retry_refactor_lu",
+            "retry_refactor": "retry_refactor_lu",
             "legacy": "dt_close",
             "old": "dt_close",
             "old_linearization": "dt_close",
@@ -2124,9 +2127,9 @@ class _RadauSolverConfig(TransportSolver):
             "reuse_linearization": "dt_close",
         }
         jacobian_reuse_mode_norm = jacobian_reuse_aliases.get(jacobian_reuse_mode_norm, jacobian_reuse_mode_norm)
-        if jacobian_reuse_mode_norm not in {"retry_only", "dt_close"}:
+        if jacobian_reuse_mode_norm not in {"retry_only", "retry_refactor_lu", "dt_close"}:
             raise ValueError(
-                "radau_jacobian_reuse_mode must be one of: retry_only, dt_close"
+                "radau_jacobian_reuse_mode must be one of: retry_only, retry_refactor_lu, dt_close"
             )
         object.__setattr__(self, "jacobian_reuse_mode", jacobian_reuse_mode_norm)
         object.__setattr__(self, "max_jacobian_age", int(max(0, max_jacobian_age)))
@@ -4085,8 +4088,14 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
     use_dt_close_reuse = kernel_context.jacobian_reuse_mode == "dt_close"
+    force_lu_refactor = kernel_context.jacobian_reuse_mode == "retry_refactor_lu"
     reuse_jacobian = jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_jacobian_retry)
-    reuse_lu = jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, jnp.logical_and(reuse_jacobian_retry, dt_close))
+    reuse_lu_retry = jnp.logical_and(reuse_jacobian_retry, dt_close)
+    reuse_lu = jnp.where(
+        force_lu_refactor,
+        jnp.asarray(False),
+        jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_lu_retry),
+    )
 
     def _factor_linear_systems(jacobian_ref):
         h_jacobian = trial_dt * jacobian_ref
@@ -4639,8 +4648,14 @@ def _radau_single_step_primal(
         jnp.logical_not(kernel_context.use_lagged_linear_response),
     )
     use_dt_close_reuse = kernel_context.jacobian_reuse_mode == "dt_close"
+    force_lu_refactor = kernel_context.jacobian_reuse_mode == "retry_refactor_lu"
     reuse_jacobian = jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_jacobian_retry)
-    reuse_lu = jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, jnp.logical_and(reuse_jacobian_retry, dt_close))
+    reuse_lu_retry = jnp.logical_and(reuse_jacobian_retry, dt_close)
+    reuse_lu = jnp.where(
+        force_lu_refactor,
+        jnp.asarray(False),
+        jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_lu_retry),
+    )
 
     def _factor_linear_systems(jacobian_ref):
         h_jacobian = h_value * jacobian_ref
