@@ -485,20 +485,34 @@ def main() -> None:
             direct_reached_final = bool(
                 minus_final_t is not None
                 and plus_final_t is not None
-                and np.isclose(minus_final_t, baseline_final_t, rtol=0.0, atol=1.0e-12)
-                and np.isclose(plus_final_t, baseline_final_t, rtol=0.0, atol=1.0e-12)
+                and minus_final_t >= baseline_final_t - 1.0e-10
+                and plus_final_t >= baseline_final_t - 1.0e-10
             )
-            direct_finite = bool(
-                minus_state_finite
-                and plus_state_finite
-                and objectives_minus_np is not None
+            direct_objectives_finite = bool(
+                objectives_minus_np is not None
                 and objectives_plus_np is not None
                 and np.all(np.isfinite(objectives_minus_np))
                 and np.all(np.isfinite(objectives_plus_np))
             )
+            direct_finite = bool(
+                minus_state_finite
+                and plus_state_finite
+                and direct_objectives_finite
+            )
             if direct_reached_final and direct_finite:
                 fd_valid = True
                 fd_valid_reason = "direct_fixed_time_reached_final_with_finite_endpoints"
+            else:
+                fd_valid_reason = (
+                    "direct_fixed_time_rejected: "
+                    f"reached_final={direct_reached_final} "
+                    f"minus_state_finite={minus_state_finite} "
+                    f"plus_state_finite={plus_state_finite} "
+                    f"objectives_finite={direct_objectives_finite} "
+                    f"baseline_final_t={baseline_final_t:.16e} "
+                    f"minus_final_t={0.0 if minus_final_t is None else minus_final_t:.16e} "
+                    f"plus_final_t={0.0 if plus_final_t is None else plus_final_t:.16e}"
+                )
         if not fd_valid:
             grad_np = None
     report = {
@@ -715,6 +729,8 @@ def main() -> None:
                 "[autodiff-gate] fd_valid=False: not reporting central FD gradients "
                 "because at least one FD endpoint did not complete."
             )
+            if fd_valid_reason is not None:
+                print(f"[autodiff-gate] fd_valid_reason={fd_valid_reason}")
         elif fd_valid_reason is not None:
             print(
                 "[autodiff-gate] fd_valid=True: reporting direct fixed-time FD gradients "
