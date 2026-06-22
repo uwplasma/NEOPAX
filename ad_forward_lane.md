@@ -258,3 +258,77 @@ Reverse AD should be treated as a separate lane:
 
 The forward-AD row above is now the primary numerical reference for the next
 reverse-AD recovery work.
+
+## 2026-06-22 Status Update: Step-Fused Forward AD Timing
+
+The experimental step-compute-fused forward AD mode was implemented and tested
+for the full `T0` case:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter T0 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode step
+```
+
+Reference replay timing:
+
+```text
+forward_ad_fusion_mode=replay forward_ad_total_s=1.098723e+03
+```
+
+Step-fused timing:
+
+```text
+forward_ad_fusion_mode=step forward_ad_total_s=8.988777e+02
+```
+
+This is about a `1.22x` speedup, or roughly an `18%` wall-time reduction.
+
+The step-fused gradients match the recovered replay/reference values closely:
+
+```text
+softmax_Er                         -2.160408e+01
+smooth_root_proxy                   2.070901e-05
+Er2_volume_average                 -2.765769e+01
+Er_volume_average                   2.291391e+00
+electron_temperature_volume_average 3.571291e-01
+total_pressure_volume_average       1.835267e+00
+alpha_power_volume_average          7.221950e-02
+```
+
+The reference replay values were:
+
+```text
+softmax_Er                         -2.160399e+01
+smooth_root_proxy                   2.070901e-05
+Er2_volume_average                 -2.765749e+01
+Er_volume_average                   2.291385e+00
+electron_temperature_volume_average 3.571291e-01
+total_pressure_volume_average       1.835267e+00
+alpha_power_volume_average          7.221955e-02
+```
+
+### Possible Further Efficiency Improvements
+
+The current step-fused mode is correct-looking and meaningfully faster, but
+there are likely still gains available inside the accepted-step tangent
+assembly:
+
+- avoid extra lagged/RHS work inside
+  `_radau_accepted_step_attempt_tangent_from_primal(...)`
+- reuse quantities already available from the primal accepted-step result where
+  mathematically valid
+- specialize the common approximate-tangent / lagged-response-reuse path
+- reduce compile size from carrying all exact/rebuild branches through every
+  accepted step
+- add lightweight counters for tangent-path branch usage before optimizing
+  blindly
+- consider fusing metric evaluation only after the full-state tangent path is
+  validated and stable
+
+The most likely next optimization target is
+`_radau_accepted_step_attempt_tangent_from_primal(...)`, specifically checking
+which lagged response, RHS, and stage-evaluation quantities are recomputed even
+though equivalent primal data already exists.
