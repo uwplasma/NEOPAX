@@ -420,6 +420,15 @@ def main() -> None:
         action="store_true",
         help="Run an extra primal schedule rollout to print attempt/accepted counts before reverse AD.",
     )
+    parser.add_argument(
+        "--timing-mode",
+        choices=("eager", "jit-warm"),
+        default="eager",
+        help=(
+            "Timing harness. 'eager' preserves the original un-jitted grad timing; "
+            "'jit-warm' reports first jit call and second warm execute call separately."
+        ),
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -460,10 +469,25 @@ def main() -> None:
     )
 
     print("[autodiff-gate] progress: running reverse custom-VJP", flush=True)
+    reverse_compile_plus_execute_s = None
+    reverse_execute_s = None
     t_reverse_start = time.perf_counter()
-    gradient_rev = jax.grad(objective_fn)(baseline_values)
+    if args.timing_mode == "jit-warm":
+        grad_fn = jax.jit(jax.grad(objective_fn))
+        first_gradient = grad_fn(baseline_values)
+        first_gradient = jax.block_until_ready(first_gradient)
+        reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
+
+        t_execute_start = time.perf_counter()
+        gradient_rev = grad_fn(baseline_values)
+        gradient_rev = jax.block_until_ready(gradient_rev)
+        reverse_execute_s = time.perf_counter() - t_execute_start
+        reverse_total_s = reverse_compile_plus_execute_s + reverse_execute_s
+    else:
+        gradient_rev = jax.grad(objective_fn)(baseline_values)
+        gradient_rev = jax.block_until_ready(gradient_rev)
+        reverse_total_s = time.perf_counter() - t_reverse_start
     grad_np = np.asarray(jax.device_get(gradient_rev), dtype=float)
-    reverse_total_s = time.perf_counter() - t_reverse_start
 
     report = {
         "mode": "transport_reverse_ad_only",
@@ -474,7 +498,10 @@ def main() -> None:
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+        "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
+        "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
+        "reverse_execute_s": None if reverse_execute_s is None else float(reverse_execute_s),
         "gradient_reverse_ad": grad_np.tolist(),
         "rollout_path": {
             "baseline": baseline_diag,
@@ -485,8 +512,14 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )
+    if reverse_compile_plus_execute_s is not None:
+        print(
+            f"[autodiff-gate] timing reverse_compile_plus_execute_s={reverse_compile_plus_execute_s:.6e} "
+            f"reverse_execute_s={reverse_execute_s:.6e}"
+        )
     if baseline_diag is not None:
         print(
             f"[autodiff-gate] rollout baseline: attempt_count={baseline_diag.get('attempt_count')} "
