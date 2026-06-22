@@ -567,7 +567,7 @@ class DiffraxSolver(TransportSolver):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -836,6 +836,14 @@ def _lagged_response_hooks(vector_field: Callable):
     if callable(build_fn) and callable(eval_fn):
         return build_fn, eval_fn
     return None, None
+
+
+def _lagged_response_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_build_lagged_response", None)
+    return pullback_fn if callable(pullback_fn) else None
 
 
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
@@ -2680,8 +2688,10 @@ class _RadauAcceptedStepKernelContext:
 @dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepPhysicsContext:
     unpack_flat: Callable[[Any], Any]
+    pack_flat: Callable[[Any], Any]
     project_flat: Callable[[Any], Any] | None
     build_lagged_response: Callable[[Any], Any] | None
+    pullback_build_lagged_response: Callable[[Any, Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
     lagged_response_reuse_mode: str = "retry_only"
@@ -2967,8 +2977,16 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     primal_result: _RadauAcceptedStepAttemptResult,
     *,
     force_lagged_response_reuse: bool = False,
+    lagged_response_branch: str | None = None,
 ) -> _RadauAcceptedStepAttemptResult:
     """Compute the accepted-step tangent from an already computed primal result."""
+    if force_lagged_response_reuse:
+        lagged_response_branch = "reuse"
+    if lagged_response_branch is not None:
+        lagged_response_branch = str(lagged_response_branch).strip().lower()
+        if lagged_response_branch not in {"reuse", "rebuild"}:
+            raise ValueError(f"Unknown lagged response branch '{lagged_response_branch}'.")
+
     lagged_response, _, _ = _radau_prepare_lagged_response(
         kernel_context,
         carry_in,
@@ -2993,7 +3011,7 @@ def _radau_accepted_step_attempt_tangent_from_primal(
         if not kernel_context.use_transport_lagged_response:
             return None, tangent_inputs.dy
 
-        if force_lagged_response_reuse:
+        if lagged_response_branch == "reuse":
             return (
                 _radau_align_tangent_tree_to_primal(
                     tangent_inputs.dlagged_response_cache,
@@ -3005,10 +3023,13 @@ def _radau_accepted_step_attempt_tangent_from_primal(
                 ),
             )
 
-        def _reuse_lagged_response(_):
-            return tangent_inputs.dlagged_response_cache
+        if lagged_response_branch == "rebuild":
+            raise ValueError(
+                "The branch-aware reverse rebuild path must route lagged-response cotangents "
+                "through pullback_build_lagged_response; do not JVP build_lagged_response here."
+            )
 
-        def _rebuild_lagged_response(_):
+        def _rebuild_lagged_response():
             if physics_context.build_lagged_response is None:
                 return None
 
@@ -3025,10 +3046,16 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             )
             return dlagged_response_out
 
+        def _reuse_lagged_response(_):
+            return tangent_inputs.dlagged_response_cache
+
+        def _rebuild_lagged_response_cond(_):
+            return _rebuild_lagged_response()
+
         dlagged_response_cache_out = jax.lax.cond(
             carry_in.lagged_response_valid,
             _reuse_lagged_response,
-            _rebuild_lagged_response,
+            _rebuild_lagged_response_cond,
             operand=None,
         )
         dlagged_reference_y_out = jax.lax.cond(
@@ -3085,7 +3112,7 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             real_piv_out=primal_result.real_piv_out,
             complex_lu_out=primal_result.complex_lu_out,
             complex_piv_out=primal_result.complex_piv_out,
-            skip_zero_tangent_shortcut=force_lagged_response_reuse,
+            skip_zero_tangent_shortcut=lagged_response_branch is not None,
         )
 
     def _exact_lagged_cache_tangent(_):
@@ -3153,7 +3180,7 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             dstage_history=dz_flat,
         )
 
-    if force_lagged_response_reuse:
+    if lagged_response_branch is not None:
         tangent_result = _approximate_tangent(None)
     else:
         lagged_cache_tangent_active = jnp.asarray(False)
@@ -3362,14 +3389,15 @@ def _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse_jvp(
     return primal_y, tangent_y
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 3))
-def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 3, 4))
+def _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
 ) -> jax.Array:
-    """Diagnostic reverse wrapper returning only projected trial_y."""
+    """Reverse wrapper returning only projected trial_y for one lagged branch."""
 
     attempt_result = _execute_radau_accepted_step_attempt(
         kernel_context,
@@ -3380,11 +3408,12 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
     return _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
 
 
-def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd(
+def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_fwd(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
 ):
     attempt_result = _execute_radau_accepted_step_attempt(
         kernel_context,
@@ -3396,10 +3425,11 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd(
     return primal_y, (carry_in, attempt_result)
 
 
-def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
+def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
     residuals,
     trial_y_bar,
 ):
@@ -3411,9 +3441,16 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
             return jnp.zeros_like(arr)
         return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
+    carry_for_linear_map = dataclasses.replace(
+        carry_in,
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+
     def _trial_y_tangent(dy, dlagged_response_cache, dlagged_reference_y):
         carry_tangent = dataclasses.replace(
-            jax.tree_util.tree_map(_zero_tangent_like, carry_in),
+            jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map),
             y=dy,
             dt=jnp.asarray(0.0, dtype=kernel_context.dtype),
             lagged_response_cache=dlagged_response_cache,
@@ -3422,17 +3459,20 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
         tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
             kernel_context,
             physics_context,
-            carry_in,
+            carry_for_linear_map,
             carry_tangent,
             context,
             primal_result,
-            force_lagged_response_reuse=True,
+            lagged_response_branch="reuse",
         )
         return tangent_attempt.trial_y
 
     zero_dy = jnp.zeros_like(carry_in.y)
-    zero_lagged_response_cache = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
-    zero_lagged_reference_y = jnp.zeros_like(carry_in.lagged_reference_y)
+    zero_lagged_response_cache = _radau_align_tangent_tree_to_primal(
+        None,
+        primal_result.carry_after_attempt.lagged_response_cache,
+    )
+    zero_lagged_reference_y = jnp.zeros_like(primal_result.carry_after_attempt.lagged_reference_y)
     _, pullback = jax.vjp(
         _trial_y_tangent,
         zero_dy,
@@ -3440,6 +3480,25 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
         zero_lagged_reference_y,
     )
     dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = pullback(trial_y_bar)
+
+    if lagged_response_branch == "rebuild":
+        if physics_context.pullback_build_lagged_response is None:
+            raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
+
+        projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+        rebuild_state = physics_context.unpack_flat(projected_y)
+        rebuild_state_bar = physics_context.pullback_build_lagged_response(
+            rebuild_state,
+            dlagged_response_cache_bar,
+        )
+        rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+            (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
+        dy_bar = dy_bar + rebuild_flat_bar
+        dlagged_response_cache_bar = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
+        dlagged_reference_y_bar = jnp.zeros_like(carry_in.lagged_reference_y)
+
     carry_bar = dataclasses.replace(
         jax.tree_util.tree_map(_zero_tangent_like, carry_in),
         y=dy_bar,
@@ -3449,9 +3508,9 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
     return (carry_bar,)
 
 
-_execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse.defvjp(
-    _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd,
-    _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd,
+_execute_radau_accepted_step_trial_y_vjp_lagged_branch.defvjp(
+    _execute_radau_accepted_step_trial_y_vjp_lagged_branch_fwd,
+    _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd,
 )
 
 
@@ -7702,11 +7761,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             accepted_index = jnp.argmax(jnp.asarray(active_mask, dtype=jnp.int32))
             dt_value = jnp.asarray(attempted_dts[accepted_index], dtype=execution_context.dtype)
             carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-            return _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
+            return _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
                 execution_context.kernel_context,
                 execution_context.physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_for_step),
                 execution_context.attempt_context,
+                "reuse",
             )
 
         _, pullback = jax.vjp(_first_accepted_step, carry0)
@@ -8221,7 +8281,7 @@ def _build_prepared_radau_accepted_rollout(
     kwargs: dict[str, Any] = {}
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
     density_floor, temperature_floor = _extract_state_regularization(vector_field)
-    flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+    flat_state0, unpack_flat, _unpack_packed, pack_state, project_flat = _make_solver_state_transform(
         state,
         species,
         temperature_active_mask=temperature_active_mask,
@@ -8286,6 +8346,7 @@ def _build_prepared_radau_accepted_rollout(
 
     flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
     build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+    pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
     flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -8428,8 +8489,10 @@ def _build_prepared_radau_accepted_rollout(
     )
     physics_context = _RadauAcceptedStepPhysicsContext(
         unpack_flat=unpack_flat,
+        pack_flat=pack_state,
         project_flat=project_flat,
         build_lagged_response=build_lagged_response,
+        pullback_build_lagged_response=pullback_build_lagged_response,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
@@ -8557,6 +8620,7 @@ class RADAUSolver(_RadauSolverConfig):
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+        pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
@@ -8720,8 +8784,10 @@ class RADAUSolver(_RadauSolverConfig):
         )
         physics_context = _RadauAcceptedStepPhysicsContext(
             unpack_flat=unpack_flat,
+            pack_flat=pack_state,
             project_flat=project_flat,
             build_lagged_response=build_lagged_response,
+            pullback_build_lagged_response=pullback_build_lagged_response,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),

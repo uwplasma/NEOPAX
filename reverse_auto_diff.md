@@ -1270,6 +1270,56 @@ safe inside a transposed linear map.
 This remains a diagnostic bridge. The next real implementation is to replace
 `force_lagged_response_reuse=True` with branch-aware reuse/rebuild handling.
 
+### 2026-06-22 branch-aware local wrapper start
+
+The accepted-step reverse wrapper now supports an explicit static lagged branch:
+
+```text
+lagged_response_branch="reuse"
+lagged_response_branch="rebuild"
+```
+
+When a branch is supplied, the wrapper no longer uses the old generic
+`lax.cond` over lagged reuse/rebuild in the reverse path:
+
+- `reuse` takes the lagged-cache tangent and lagged-reference tangent from the
+  incoming carry tangent.
+- `rebuild` is handled in the local VJP by treating lagged response as an
+  independent Radau-step input, then routing the resulting lagged-response
+  cotangent through the model-aware lagged-response pullback.
+
+The lower-level forward tangent helper intentionally refuses
+`lagged_response_branch="rebuild"` so that the reverse lane cannot accidentally
+reintroduce:
+
+```text
+jax.jvp(build_lagged_response, ...)
+```
+
+in the rebuild branch.
+
+The active one-step reverse smoke path now calls:
+
+```text
+_execute_radau_accepted_step_trial_y_vjp_lagged_branch(..., "reuse")
+```
+
+because the initialized carry has a valid lagged-response cache for the first
+accepted step. The wrapper itself is branch-capable, but the schedule-level
+reverse replay still needs to be extended to dispatch `"reuse"` or `"rebuild"`
+per accepted step using primal metadata.
+
+The rebuild branch now has the key non-generic-AD hook:
+
+```text
+physics_context.pullback_build_lagged_response(rebuild_state, lagged_response_bar)
+```
+
+The returned state cotangent is packed back to the flat Radau state and added to
+`dy_bar`. This is the piece required before a JAX-native `lax.cond` can select
+between reuse/rebuild branches without tracing generic NTX AD in the rebuild
+branch.
+
 The first run of this wrapper exposed an argument-order bug in the custom-VJP
 forward rule: with `nondiff_argnums=(0, 1, 3)`, the forward rule still receives
 the original function argument order, so it must be:
