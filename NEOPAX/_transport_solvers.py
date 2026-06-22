@@ -2684,6 +2684,9 @@ class _RadauAcceptedStepPhysicsContext:
     build_lagged_response: Callable[[Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
+    lagged_response_reuse_mode: str = "retry_only"
+    lagged_response_reuse_rtol: Any = 5.0e-2
+    lagged_response_reuse_atol: Any = 1.0e-8
 
 
 @jax.tree_util.register_dataclass
@@ -7738,6 +7741,9 @@ def _build_prepared_radau_accepted_rollout(
         build_lagged_response=build_lagged_response,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+        lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+        lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+        lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
     )
     step_state0 = _make_radau_initial_step_state(
         t0,
@@ -8027,6 +8033,9 @@ class RADAUSolver(_RadauSolverConfig):
             build_lagged_response=build_lagged_response,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+            lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+            lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+            lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
         )
 
         attempt_context = _RadauAcceptedStepAttemptContext(
