@@ -55,13 +55,28 @@ def _fixed_time_replay_diagnostics(replay) -> dict | None:
     final_carry = replay.get("final_carry") if isinstance(replay, dict) else None
     if rollout is None:
         return None
+    if hasattr(rollout, "attempt_count"):
+        return {
+            "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
+            "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count)).item()),
+            "completed": bool(np.asarray(jax.device_get(rollout.completed)).item()),
+            "failed": bool(np.asarray(jax.device_get(rollout.failed)).item()),
+            "fail_code": int(np.asarray(jax.device_get(rollout.fail_code)).item()),
+            "final_t": None if final_carry is None else float(np.asarray(jax.device_get(final_carry.t)).item()),
+            "fixed_time_mode": replay.get("fixed_time_mode") if isinstance(replay, dict) else None,
+        }
+    converged_mask = getattr(rollout, "converged_mask", None)
+    accepted_dts = getattr(rollout, "accepted_dts", None)
+    accepted_count = 0 if accepted_dts is None else int(np.asarray(jax.device_get(accepted_dts)).reshape(-1).shape[0])
+    all_converged = True if converged_mask is None else bool(np.all(np.asarray(jax.device_get(converged_mask), dtype=bool)))
     return {
-        "attempt_count": int(np.asarray(jax.device_get(rollout.attempt_count)).item()),
-        "accepted_count": int(np.asarray(jax.device_get(rollout.accepted_count)).item()),
-        "completed": bool(np.asarray(jax.device_get(rollout.completed)).item()),
-        "failed": bool(np.asarray(jax.device_get(rollout.failed)).item()),
-        "fail_code": int(np.asarray(jax.device_get(rollout.fail_code)).item()),
+        "attempt_count": accepted_count,
+        "accepted_count": accepted_count,
+        "completed": bool(all_converged),
+        "failed": bool(not all_converged),
+        "fail_code": int(0 if all_converged else 1),
         "final_t": None if final_carry is None else float(np.asarray(jax.device_get(final_carry.t)).item()),
+        "fixed_time_mode": replay.get("fixed_time_mode") if isinstance(replay, dict) else None,
     }
 
 
