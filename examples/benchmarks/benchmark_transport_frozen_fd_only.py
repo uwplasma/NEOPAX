@@ -68,7 +68,18 @@ def _fixed_time_replay_diagnostics(replay) -> dict | None:
     converged_mask = getattr(rollout, "converged_mask", None)
     accepted_dts = getattr(rollout, "accepted_dts", None)
     accepted_count = 0 if accepted_dts is None else int(np.asarray(jax.device_get(accepted_dts)).reshape(-1).shape[0])
-    all_converged = True if converged_mask is None else bool(np.all(np.asarray(jax.device_get(converged_mask), dtype=bool)))
+    converged_np = None if converged_mask is None else np.asarray(jax.device_get(converged_mask), dtype=bool).reshape(-1)
+    all_converged = True if converged_np is None else bool(np.all(converged_np))
+    first_nonconverged_index = (
+        None
+        if converged_np is None or all_converged
+        else int(np.argmax(np.logical_not(converged_np)))
+    )
+    nonconverged_count = (
+        None
+        if converged_np is None
+        else int(np.sum(np.logical_not(converged_np)))
+    )
     return {
         "attempt_count": accepted_count,
         "accepted_count": accepted_count,
@@ -77,6 +88,9 @@ def _fixed_time_replay_diagnostics(replay) -> dict | None:
         "fail_code": int(0 if all_converged else 1),
         "final_t": None if final_carry is None else float(np.asarray(jax.device_get(final_carry.t)).item()),
         "fixed_time_mode": replay.get("fixed_time_mode") if isinstance(replay, dict) else None,
+        "all_converged": bool(all_converged),
+        "nonconverged_count": nonconverged_count,
+        "first_nonconverged_index": first_nonconverged_index,
     }
 
 
@@ -656,7 +670,9 @@ def main() -> None:
             f"completed={minus_diag['completed']} "
             f"failed={minus_diag['failed']} "
             f"fail_code={minus_diag['fail_code']} "
-            f"final_t={0.0 if minus_diag['final_t'] is None else minus_diag['final_t']:.6e}"
+            f"final_t={0.0 if minus_diag['final_t'] is None else minus_diag['final_t']:.6e} "
+            f"nonconverged_count={minus_diag.get('nonconverged_count')} "
+            f"first_nonconverged_index={minus_diag.get('first_nonconverged_index')}"
         )
         print(
             "  - plus: "
@@ -665,7 +681,9 @@ def main() -> None:
             f"completed={plus_diag['completed']} "
             f"failed={plus_diag['failed']} "
             f"fail_code={plus_diag['fail_code']} "
-            f"final_t={0.0 if plus_diag['final_t'] is None else plus_diag['final_t']:.6e}"
+            f"final_t={0.0 if plus_diag['final_t'] is None else plus_diag['final_t']:.6e} "
+            f"nonconverged_count={plus_diag.get('nonconverged_count')} "
+            f"first_nonconverged_index={plus_diag.get('first_nonconverged_index')}"
         )
         if fd_valid is False:
             print(
