@@ -3349,7 +3349,14 @@ def _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse_jvp(
         context,
     )
     primal_y = _project_flat_state_if_needed(primal_result.trial_y, physics_context.project_flat)
-    tangent_y = _project_flat_state_if_needed(tangent_attempt.trial_y, physics_context.project_flat)
+    if physics_context.project_flat is None:
+        tangent_y = tangent_attempt.trial_y
+    else:
+        _, tangent_y = jax.jvp(
+            physics_context.project_flat,
+            (primal_result.trial_y,),
+            (tangent_attempt.trial_y,),
+        )
     return primal_y, tangent_y
 
 

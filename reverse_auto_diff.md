@@ -1238,6 +1238,21 @@ This is still a smoke-test tool, not the final reverse rule. The purpose is to
 isolate the accepted-step state map before implementing the full branch-aware
 reuse/rebuild reverse path.
 
+The follow-up smoke test then reached a JAX transpose error for `max`. The
+immediate issue was in the diagnostic `trial_y` custom-JVP wrapper: it projected
+the tangent vector by calling the nonlinear projection on the tangent itself.
+That is not the correct JVP for a projected output. The wrapper now computes the
+projection tangent as:
+
+```text
+jax.jvp(project_flat, (primal_trial_y,), (trial_y_dot,))[1]
+```
+
+If this still exposes unsupported transpose rules through projection/flooring,
+the next reverse-local decision is whether projection/flooring belongs in the
+reverse state-map derivative or should be treated as a forward-only projection
+at the accepted-step boundary.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step
