@@ -7773,17 +7773,36 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         (carry0_bar,) = pullback(final_y_bar)
         return (carry0_bar,)
 
+    if stop_after_accepted_steps is not None:
+        accepted_count = int(stop_after_accepted_steps)
+        accepted_indices = jnp.nonzero(active_mask, size=accepted_count, fill_value=0)[0]
+        replay_active_mask = jnp.ones((accepted_count,), dtype=jnp.bool_)
+        replay_attempted_dts = jnp.take(attempted_dts, accepted_indices, axis=0)
+        replay_next_dts = jnp.take(next_dts, accepted_indices, axis=0)
+        replay_next_recent_reject_count = jnp.take(next_recent_reject_count, accepted_indices, axis=0)
+        replay_next_regrowth_cooldown = jnp.take(next_regrowth_cooldown, accepted_indices, axis=0)
+        replay_next_easy_growth_streak = jnp.take(next_easy_growth_streak, accepted_indices, axis=0)
+        replay_next_lagged_response_valid = jnp.take(next_lagged_response_valid, accepted_indices, axis=0)
+    else:
+        replay_active_mask = active_mask
+        replay_attempted_dts = attempted_dts
+        replay_next_dts = next_dts
+        replay_next_recent_reject_count = next_recent_reject_count
+        replay_next_regrowth_cooldown = next_regrowth_cooldown
+        replay_next_easy_growth_streak = next_easy_growth_streak
+        replay_next_lagged_response_valid = next_lagged_response_valid
+
     def _replay(carry_value):
         replay = _radau_replay_realized_accepted_rollout(
             execution_context,
             carry_value,
-            active_mask,
-            attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
+            replay_active_mask,
+            replay_attempted_dts,
+            replay_next_dts,
+            replay_next_recent_reject_count,
+            replay_next_regrowth_cooldown,
+            replay_next_easy_growth_streak,
+            replay_next_lagged_response_valid,
         )
         return replay.final_carry.y
 
