@@ -2935,6 +2935,8 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     carry_tangent: _RadauAcceptedStepCarry,
     context: _RadauAcceptedStepAttemptContext,
     primal_result: _RadauAcceptedStepAttemptResult,
+    *,
+    force_lagged_response_reuse: bool = False,
 ) -> _RadauAcceptedStepAttemptResult:
     """Compute the accepted-step tangent from an already computed primal result."""
     lagged_response, _, _ = _radau_prepare_lagged_response(
@@ -2960,6 +2962,9 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     def _lagged_output_tangent():
         if not kernel_context.use_transport_lagged_response:
             return None, tangent_inputs.dy
+
+        if force_lagged_response_reuse:
+            return tangent_inputs.dlagged_response_cache, carry_tangent.lagged_reference_y
 
         def _reuse_lagged_response(_):
             return tangent_inputs.dlagged_response_cache
@@ -3164,6 +3169,33 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
     return primal_result, tangent_attempt
 
 
+def _execute_radau_accepted_step_attempt_with_forced_reuse_tangent(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    carry_tangent: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> tuple[_RadauAcceptedStepAttemptResult, _RadauAcceptedStepAttemptResult]:
+    """Accepted-step JVP variant for known lagged-cache reuse contexts."""
+
+    primal_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+        kernel_context,
+        physics_context,
+        carry_in,
+        carry_tangent,
+        context,
+        primal_result,
+        force_lagged_response_reuse=True,
+    )
+    return primal_result, tangent_attempt
+
+
 @partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
 def _execute_radau_accepted_step_attempt_autodiff(
     kernel_context: _RadauAcceptedStepKernelContext,
@@ -3197,6 +3229,42 @@ def _execute_radau_accepted_step_attempt_autodiff_jvp(
     (carry_in,) = primals
     (carry_tangent,) = tangents
     return _execute_radau_accepted_step_attempt_with_approx_tangent(
+        kernel_context,
+        physics_context,
+        carry_in,
+        carry_tangent,
+        context,
+    )
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
+def _execute_radau_accepted_step_attempt_autodiff_force_lagged_reuse(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepAttemptResult:
+    """AD-facing accepted-step wrapper for statically known lagged-cache reuse."""
+
+    return _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+
+
+@_execute_radau_accepted_step_attempt_autodiff_force_lagged_reuse.defjvp
+def _execute_radau_accepted_step_attempt_autodiff_force_lagged_reuse_jvp(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    primals,
+    tangents,
+):
+    (carry_in,) = primals
+    (carry_tangent,) = tangents
+    return _execute_radau_accepted_step_attempt_with_forced_reuse_tangent(
         kernel_context,
         physics_context,
         carry_in,
@@ -6382,7 +6450,7 @@ def _radau_replay_first_realized_accepted_step(
     lagged_response_valid_value = next_lagged_response_valid[accepted_index]
 
     carry_for_step = dataclasses.replace(carry0, dt=dt_value)
-    attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+    attempt_result = _execute_radau_accepted_step_attempt_autodiff_force_lagged_reuse(
         execution_context.kernel_context,
         execution_context.physics_context,
         _radau_carry_with_forward_only_jvp_fields(carry_for_step),
