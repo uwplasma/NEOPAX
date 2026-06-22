@@ -1297,6 +1297,18 @@ dlagged_reference_y
 
 and then rebuilds a carry cotangent with all other fields zero.
 
+`jax.linear_transpose(...)` still asserted on the local tangent map, so the
+diagnostic wrapper now takes a VJP of that tangent map evaluated at zero
+tangents:
+
+```text
+_, pullback = jax.vjp(local_trial_y_tangent, zero_dy, zero_lagged_cache, zero_lagged_reference_y)
+```
+
+Because the local tangent map is intended to be linear in those inputs, this is
+the same transpose conceptually but avoids `linear_transpose`'s stricter
+primitive checks while we build the final explicit branch-aware reverse rule.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step

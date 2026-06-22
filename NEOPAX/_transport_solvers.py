@@ -3430,12 +3430,16 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
         )
         return tangent_attempt.trial_y
 
-    dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = jax.linear_transpose(
+    zero_dy = jnp.zeros_like(carry_in.y)
+    zero_lagged_response_cache = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
+    zero_lagged_reference_y = jnp.zeros_like(carry_in.lagged_reference_y)
+    _, pullback = jax.vjp(
         _trial_y_tangent,
-        carry_in.y,
-        carry_in.lagged_response_cache,
-        carry_in.lagged_reference_y,
-    )(trial_y_bar)
+        zero_dy,
+        zero_lagged_response_cache,
+        zero_lagged_reference_y,
+    )
+    dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = pullback(trial_y_bar)
     carry_bar = dataclasses.replace(
         jax.tree_util.tree_map(_zero_tangent_like, carry_in),
         y=dy_bar,
