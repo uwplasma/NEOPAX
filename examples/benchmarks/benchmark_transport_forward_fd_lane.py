@@ -32,6 +32,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_final_state_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
+    _radau_adaptive_final_y_realized_schedule_step_fused,
     _radau_apply_accepted_step_map,
     _radau_carry_from_step_state,
     _radau_dt_sequence_from_time_list,
@@ -645,14 +646,25 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
     derivative_mode_key = str(derivative_mode).strip().lower()
-    if derivative_mode_key != "jvp":
-        raise NotImplementedError("The scratch forward benchmark lane supports derivative_mode='jvp' only.")
-    final_y = _radau_adaptive_final_y_realized_schedule(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        initial_carry,
-    )
+    if derivative_mode_key == "jvp":
+        final_y = _radau_adaptive_final_y_realized_schedule(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    elif derivative_mode_key == "jvp_step":
+        final_y = _radau_adaptive_final_y_realized_schedule_step_fused(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            initial_carry,
+        )
+    else:
+        raise NotImplementedError(
+            "The scratch forward benchmark lane supports derivative_mode='jvp' "
+            "or derivative_mode='jvp_step' only."
+        )
     final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 

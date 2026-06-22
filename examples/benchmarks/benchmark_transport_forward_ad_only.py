@@ -65,6 +65,16 @@ def main() -> None:
         default=None,
         help="Optional Radau Jacobian reuse mode override, e.g. legacy or retry_only.",
     )
+    parser.add_argument(
+        "--forward-ad-fusion-mode",
+        type=str,
+        default="replay",
+        choices=("replay", "step"),
+        help=(
+            "Forward AD implementation. 'replay' is the recovered reference; "
+            "'step' is the experimental shared primal/tangent accepted-step path."
+        ),
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -85,7 +95,7 @@ def main() -> None:
         profile_cfg=profile_cfg,
         parameter_name=args.parameter,
         accepted_step_limit_override=args.accepted_step_limit,
-        derivative_mode="jvp",
+        derivative_mode="jvp_step" if args.forward_ad_fusion_mode == "step" else "jvp",
     )
 
     print("[autodiff-gate] progress: running forward custom-JVP", flush=True)
@@ -104,6 +114,7 @@ def main() -> None:
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+        "forward_ad_fusion_mode": str(args.forward_ad_fusion_mode),
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_forward_ad": grad_np.tolist(),
     }
@@ -111,7 +122,8 @@ def main() -> None:
     print(
         f"[autodiff-gate] mode=transport_forward_ad_only parameter={args.parameter} "
         f"baseline_value={baseline_value:.6e} "
-        f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode}"
+        f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"forward_ad_fusion_mode={args.forward_ad_fusion_mode}"
     )
     print("[autodiff-gate] objective values:")
     for label, value in zip(OBJECTIVE_LABELS, _to_float_list(gradient_ad)):
