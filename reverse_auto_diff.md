@@ -39,6 +39,50 @@ Recommended order from here:
 Reverse AD remains a separate lane and should not reuse or modify forward/FD
 helpers in ways that change their recovered behavior.
 
+## 2026-06-22 Reverse JIT Timing Checkpoint
+
+The reverse-only benchmark now has a JIT warm timing mode:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 1 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm
+```
+
+Validated one accepted-step result:
+
+```text
+reverse_compile_plus_execute_s = 2.452687e+02
+reverse_execute_s              = 6.585443e+00
+
+dsoftmax_Er/dn0                       = -6.194191e-02
+dsoftmax_Er/dT0                       =  5.209582e-02
+dsoftmax_Er/ddensity_shape_power      = -1.365955e-03
+dsoftmax_Er/dtemperature_shape_power  =  3.083125e-02
+```
+
+Interpretation:
+
+- The earlier mostly-CPU resource trace was dominated by trace/compile/static setup.
+- The warm reverse execution for one accepted step is about 6.6 s, so the active
+  reverse step is JIT-compatible and GPU-executable.
+- The benchmark had to hoist reverse static solver setup out of the jitted
+  objective. Keeping `prepare_transport_solver_components(...)` inside the JIT
+  leaked traced profile values into Python `int(...)` conversion in the Radau
+  constructor.
+
+Next reverse steps:
+
+1. Scale the same command to small accepted-step prefixes, for example 2, 4, and 8.
+2. Watch whether `reverse_execute_s` grows roughly with accepted-step count.
+3. If warm execution stays reasonable but compile time explodes, optimize graph
+   size without moving work to Python loops or CPU-side replay.
+4. Do not force lagged-response no-rebuild. Reverse must remain branch-aware:
+   reuse and rebuild are both valid accepted-step branches.
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path
