@@ -83,6 +83,87 @@ Next reverse steps:
 4. Do not force lagged-response no-rebuild. Reverse must remain branch-aware:
    reuse and rebuild are both valid accepted-step branches.
 
+## 2026-06-22 Reverse Two-Step Checkpoint
+
+After the one-step reverse path worked, the two-step run initially failed with
+an `AssertionError` in `_radau_adaptive_final_y_realized_schedule_vjp_bwd(...)`.
+
+Cause:
+
+- `--accepted-step-limit 1` used the local branch-aware custom VJP wrapper
+  `_execute_radau_accepted_step_trial_y_vjp_lagged_branch(...)`.
+- `--accepted-step-limit 2` fell back to
+  `_radau_replay_realized_accepted_rollout(...)`, whose differentiable state
+  update still used the older accepted-step autodiff wrapper.
+- Compacting the accepted-step arrays removed inactive scan tail, but did not
+  remove the failing old transpose path.
+
+Current code changes:
+
+- `benchmark_transport_reverse_ad_only.py` hoists reverse static setup out of
+  the jitted objective via `_ReverseStaticSetup`.
+- `benchmark_transport_reverse_ad_only.py` supports `--timing-mode jit-warm`.
+- `benchmark_transport_reverse_ad_only.py` supports `--warm-repeats N` and
+  reports individual warm execution times.
+- `_radau_adaptive_final_y_realized_schedule_vjp_bwd(...)` compacts the
+  accepted prefix when `stop_after_accepted_steps` is known.
+- `_radau_replay_realized_accepted_rollout(...)` now computes differentiable
+  `accepted_y` through `_execute_radau_accepted_step_trial_y_vjp_lagged_branch(...)`
+  while keeping the heavy carry bookkeeping primal-only.
+
+Validated two accepted-step command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm
+```
+
+Validated two accepted-step result:
+
+```text
+reverse_compile_plus_execute_s = 2.893168e+02
+reverse_execute_s              = 6.699766e+00
+
+dsoftmax_Er/dn0                       = -3.576265e-01
+dsoftmax_Er/dT0                       =  3.279577e-01
+dsoftmax_Er/ddensity_shape_power      = -7.885395e-03
+dsoftmax_Er/dtemperature_shape_power  =  2.917042e-01
+```
+
+Interpretation:
+
+- The two-step reverse path now runs.
+- XLA emitted a "Very slow compile" warning, so the long wall time is still
+  dominated by GPU compilation.
+- Warm execution is about 6.7 s for two accepted steps, close to the one-step
+  warm execution. This needs repeated warm-call confirmation because the
+  resource plot can make short GPU execution look CPU-heavy.
+
+Next command to run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --warm-repeats 5
+```
+
+Next decisions:
+
+1. If all warm repeats stay near 6-7 s, focus next on compile graph size.
+2. If warm repeats grow or show host-heavy behavior, inspect for hidden host
+   dispatch inside the reverse replay.
+3. After two-step repeated timing, scale to `--accepted-step-limit 4` and `8`.
+4. Keep reverse lane independent and JAX-native; do not introduce Python loops,
+   NumPy step loops, or CPU-side replay to make reverse "work".
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path

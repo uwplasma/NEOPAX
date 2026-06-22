@@ -457,6 +457,12 @@ def main() -> None:
             "'jit-warm' reports first jit call and second warm execute call separately."
         ),
     )
+    parser.add_argument(
+        "--warm-repeats",
+        type=int,
+        default=1,
+        help="Number of post-compile warm executions to time when --timing-mode=jit-warm.",
+    )
     args = parser.parse_args()
 
     config = _prepare_benchmark_config(
@@ -506,6 +512,7 @@ def main() -> None:
     print("[autodiff-gate] progress: running reverse custom-VJP", flush=True)
     reverse_compile_plus_execute_s = None
     reverse_execute_s = None
+    reverse_execute_times_s: list[float] = []
     t_reverse_start = time.perf_counter()
     if args.timing_mode == "jit-warm":
         grad_fn = jax.jit(jax.grad(objective_fn))
@@ -513,11 +520,14 @@ def main() -> None:
         first_gradient = jax.block_until_ready(first_gradient)
         reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
 
-        t_execute_start = time.perf_counter()
-        gradient_rev = grad_fn(baseline_values)
-        gradient_rev = jax.block_until_ready(gradient_rev)
-        reverse_execute_s = time.perf_counter() - t_execute_start
-        reverse_total_s = reverse_compile_plus_execute_s + reverse_execute_s
+        gradient_rev = first_gradient
+        for _ in range(max(1, int(args.warm_repeats))):
+            t_execute_start = time.perf_counter()
+            gradient_rev = grad_fn(baseline_values)
+            gradient_rev = jax.block_until_ready(gradient_rev)
+            reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
+        reverse_execute_s = float(np.mean(reverse_execute_times_s))
+        reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
     else:
         gradient_rev = jax.grad(objective_fn)(baseline_values)
         gradient_rev = jax.block_until_ready(gradient_rev)
@@ -537,6 +547,7 @@ def main() -> None:
         "reverse_total_s": float(reverse_total_s),
         "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
         "reverse_execute_s": None if reverse_execute_s is None else float(reverse_execute_s),
+        "reverse_execute_times_s": [float(value) for value in reverse_execute_times_s],
         "gradient_reverse_ad": grad_np.tolist(),
         "rollout_path": {
             "baseline": baseline_diag,
@@ -553,7 +564,13 @@ def main() -> None:
     if reverse_compile_plus_execute_s is not None:
         print(
             f"[autodiff-gate] timing reverse_compile_plus_execute_s={reverse_compile_plus_execute_s:.6e} "
-            f"reverse_execute_s={reverse_execute_s:.6e}"
+            f"reverse_execute_s_mean={reverse_execute_s:.6e} "
+            f"reverse_execute_s_min={min(reverse_execute_times_s):.6e} "
+            f"reverse_execute_repeats={len(reverse_execute_times_s)}"
+        )
+        print(
+            "[autodiff-gate] timing reverse_execute_times_s="
+            + ",".join(f"{float(value):.6e}" for value in reverse_execute_times_s)
         )
     if baseline_diag is not None:
         print(
