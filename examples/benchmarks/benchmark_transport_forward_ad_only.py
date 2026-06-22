@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import jax
@@ -99,6 +100,7 @@ def main() -> None:
     )
 
     print("[autodiff-gate] progress: running forward custom-JVP", flush=True)
+    t_forward_ad_start = time.perf_counter()
     _, gradient_ad = jax.jvp(
         objective_fn,
         (jnp.asarray(baseline_value),),
@@ -106,6 +108,7 @@ def main() -> None:
     )
 
     grad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
+    forward_ad_total_s = time.perf_counter() - t_forward_ad_start
     report = {
         "mode": "transport_forward_ad_only",
         "config_path": str(Path(args.config)),
@@ -115,6 +118,7 @@ def main() -> None:
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "forward_ad_fusion_mode": str(args.forward_ad_fusion_mode),
+        "forward_ad_total_s": float(forward_ad_total_s),
         "objective_labels": OBJECTIVE_LABELS,
         "gradient_forward_ad": grad_np.tolist(),
     }
@@ -123,7 +127,8 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_forward_ad_only parameter={args.parameter} "
         f"baseline_value={baseline_value:.6e} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
-        f"forward_ad_fusion_mode={args.forward_ad_fusion_mode}"
+        f"forward_ad_fusion_mode={args.forward_ad_fusion_mode} "
+        f"forward_ad_total_s={forward_ad_total_s:.6e}"
     )
     print("[autodiff-gate] objective values:")
     for label, value in zip(OBJECTIVE_LABELS, _to_float_list(gradient_ad)):
