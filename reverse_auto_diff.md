@@ -1,5 +1,44 @@
 ## Reverse Auto-Diff Plan
 
+## 2026-06-22 Resume Note: Forward AD Reference Recovered
+
+Before resuming reverse AD work, use the recovered forward-AD lane as the
+primary reference.
+
+Validated command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter T0 \
+  --radau-jacobian-reuse-mode legacy
+```
+
+Recovered forward-AD values:
+
+```text
+softmax_Er                         -2.160399e+01
+smooth_root_proxy                   2.070900e-05
+Er2_volume_average                 -2.765750e+01
+Er_volume_average                   2.291385e+00
+electron_temperature_volume_average 3.571291e-01
+total_pressure_volume_average       1.835267e+00
+alpha_power_volume_average          7.221955e-02
+```
+
+The forward-AD fix was to use the compact adaptive schedule rollout inside
+`_radau_adaptive_final_y_realized_schedule_jvp(...)`, not the payload-heavy
+rollout. Reverse recovery should not disturb this recovered forward path.
+
+Recommended order from here:
+
+1. finish/validate the fused forward-AD optimization
+2. then recover reverse AD against the forward-AD values above
+3. use frozen FD only as a secondary sanity check
+
+Reverse AD remains a separate lane and should not reuse or modify forward/FD
+helpers in ways that change their recovered behavior.
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path

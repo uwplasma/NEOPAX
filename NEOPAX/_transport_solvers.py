@@ -6340,6 +6340,150 @@ def _radau_replay_realized_accepted_rollout(
     )
 
 
+def _radau_adaptive_final_y_realized_schedule_fused_jvp(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    carry0_dot: _RadauAcceptedStepCarry,
+    *,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None = None,
+):
+    """Run primal adaptive control and accepted-step tangent propagation together.
+
+    The primal adaptive state follows the normal schedule rollout. The tangent
+    carry advances only on accepted attempts, matching the recovered
+    realized-schedule JVP contract where controller/rejection choices are
+    primal-only and nondifferentiated.
+    """
+
+    dtype = execution_context.dtype
+    step_state0 = _radau_step_state_from_carry(
+        carry0,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+    )
+    xs = jnp.arange(int(max_total_steps), dtype=jnp.int32)
+
+    def _inactive_step_info(step_state: _RadauStepState):
+        failed = step_state.status[0] != 0
+        fail_code = step_state.status[1]
+        return _RadauStepInfo(
+            y=step_state.y,
+            t=step_state.t,
+            dt=jnp.asarray(0.0, dtype=dtype),
+            next_dt=step_state.dt,
+            growth=jnp.asarray(1.0, dtype=dtype),
+            lagged_reused=jnp.asarray(False),
+            jacobian_reused=jnp.asarray(False),
+            accepted=jnp.asarray(False),
+            failed=failed,
+            fail_code=fail_code,
+            converged=jnp.asarray(False),
+            err_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            diverged=jnp.asarray(False),
+            nonfinite_stage_state=jnp.asarray(False),
+            nonfinite_stage_residual=jnp.asarray(False),
+            finite_f0=jnp.asarray(True),
+            finite_z0=jnp.asarray(True),
+            finite_initial_residual=jnp.asarray(True),
+            newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+            final_residual_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            final_delta_norm=jnp.asarray(jnp.inf, dtype=dtype),
+            theta_final=jnp.asarray(0.0, dtype=dtype),
+            slow_contraction=jnp.asarray(False),
+            residual_blowup=jnp.asarray(False),
+            newton_nonfinite=jnp.asarray(False),
+        )
+
+    def _scan_body(carry_tuple, step_idx):
+        step_state, replay_carry, tangent_carry = carry_tuple
+        active = jnp.logical_and(
+            _custom_loop_active(
+                step_state,
+                execution_context.attempt_context.t_final,
+                step_idx,
+                max_total_steps,
+            ),
+            jnp.logical_not(_accepted_step_limit_reached(step_state, stop_after_accepted_steps)),
+        )
+
+        def _run_primal(_):
+            return _radau_step_fn(execution_context, step_state, None)
+
+        def _skip_primal(_):
+            return step_state, _inactive_step_info(step_state)
+
+        next_step_state, step_info = jax.lax.cond(active, _run_primal, _skip_primal, operand=None)
+        accepted_active = jnp.logical_and(active, jnp.asarray(step_info.accepted))
+
+        def _advance_tangent(_):
+            dt_value = jax.lax.stop_gradient(jnp.asarray(step_info.dt, dtype=dtype))
+            next_dt_value = jax.lax.stop_gradient(jnp.asarray(step_info.next_dt, dtype=dtype))
+            carry_for_step = dataclasses.replace(replay_carry, dt=dt_value)
+            tangent_for_step = dataclasses.replace(
+                tangent_carry,
+                dt=jnp.zeros_like(tangent_carry.dt),
+            )
+
+            def _accepted_map(carry_value):
+                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_value),
+                    execution_context.attempt_context,
+                )
+                accepted_y = _project_flat_state_if_needed(
+                    attempt_result.trial_y,
+                    execution_context.physics_context.project_flat,
+                )
+                return dataclasses.replace(
+                    attempt_result.carry_after_attempt,
+                    t=carry_value.t + dt_value,
+                    y=accepted_y,
+                    dt=next_dt_value,
+                    prev_error=jnp.maximum(
+                        attempt_result.err_norm,
+                        jnp.asarray(1.0e-12, dtype=dtype),
+                    ),
+                    prev_stages=attempt_result.stage_history,
+                    prev_dt=dt_value,
+                    recent_reject_count=jax.lax.stop_gradient(next_step_state.recent_reject_count),
+                    regrowth_cooldown=jax.lax.stop_gradient(next_step_state.regrowth_cooldown),
+                    easy_growth_streak=jax.lax.stop_gradient(next_step_state.easy_growth_streak),
+                    lagged_response_valid=jax.lax.stop_gradient(next_step_state.lagged_response_valid),
+                    jacobian=attempt_result.jacobian_out,
+                    cache_valid=attempt_result.cache_valid_out,
+                    cache_dt=attempt_result.cache_dt_out,
+                    cache_age=attempt_result.cache_age_out,
+                    real_lu=attempt_result.real_lu_out,
+                    real_piv=attempt_result.real_piv_out,
+                    complex_lu=attempt_result.complex_lu_out,
+                    complex_piv=attempt_result.complex_piv_out,
+                    prev_theta_final=attempt_result.theta_final,
+                    prev_newton_iter_count=attempt_result.newton_iter_count,
+                )
+
+            replay_next, tangent_next = jax.jvp(_accepted_map, (carry_for_step,), (tangent_for_step,))
+            return replay_next, tangent_next
+
+        def _keep_tangent(_):
+            return replay_carry, tangent_carry
+
+        replay_carry_next, tangent_carry_next = jax.lax.cond(
+            accepted_active,
+            _advance_tangent,
+            _keep_tangent,
+            operand=None,
+        )
+        return (next_step_state, replay_carry_next, tangent_carry_next), None
+
+    (final_step_state, _final_replay_carry, final_tangent_carry), _ = jax.lax.scan(
+        _scan_body,
+        (step_state0, carry0, carry0_dot),
+        xs,
+    )
+    return final_step_state.y, final_tangent_carry.y
+
+
 def _radau_dt_sequence_from_time_list(
     time_list,
     *,
@@ -6922,35 +7066,13 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    rollout = _radau_adaptive_schedule_rollout(
+    primal_out, tangent_out = _radau_adaptive_final_y_realized_schedule_fused_jvp(
         execution_context,
         carry0,
+        carry0_dot,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
-
-    def _replay(carry_value):
-        replay = _radau_replay_realized_accepted_rollout(
-            execution_context,
-            carry_value,
-            active_mask,
-            attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
-        )
-        return replay.final_carry.y
-
-    primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
     return primal_out, tangent_out
 
 

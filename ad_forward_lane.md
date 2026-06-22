@@ -145,3 +145,116 @@ The fused strategy should be an optimization/refactor of a correct forward AD la
 Start with Phase A, Step 1:
 
 - recover the forward AD baseline so it uses the same lightweight adaptive primal lane as the restored FD benchmark baseline
+
+## 2026-06-22 Status Update: Forward AD Recovered
+
+The scalar forward-AD lane has been recovered for the `T0` benchmark case.
+
+### What was fixed
+
+The forward-AD custom JVP had regressed into a payload-heavy path:
+
+- `_radau_adaptive_final_y_realized_schedule_jvp(...)`
+- was calling `_radau_adaptive_final_state_rollout(...)`
+- which materialized large per-attempt payloads, including state snapshots,
+  stage/carry data, lagged-cache data, and LU/cache fields
+
+This produced the large HLO/input-output memory signature and OOM even for
+short accepted-step prefix tests.
+
+The custom-JVP primal schedule capture now uses the compact schedule rollout:
+
+- `_radau_adaptive_schedule_rollout(...)`
+
+This restored the lightweight realized-schedule forward-AD behavior:
+
+- primal adaptive solve is performed inside the custom JVP
+- the realized schedule/control trace is treated as nondifferentiable
+- tangent propagation replays the realized accepted-step map
+- no external baseline run is required for forward AD
+- no reverse-lane payload machinery is used
+
+### Validation command
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter T0 \
+  --radau-jacobian-reuse-mode legacy
+```
+
+### Recovered forward-AD values
+
+```text
+softmax_Er                         -2.160399e+01
+smooth_root_proxy                   2.070900e-05
+Er2_volume_average                 -2.765750e+01
+Er_volume_average                   2.291385e+00
+electron_temperature_volume_average 3.571291e-01
+total_pressure_volume_average       1.835267e+00
+alpha_power_volume_average          7.221955e-02
+```
+
+These match the old trusted benchmark regime and agree closely with the
+recovered frozen-FD accepted-time benchmark.
+
+### Current FD reference state
+
+The recovered FD reference uses:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_frozen_fd_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter T0 \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10 \
+  --replay-mode accepted \
+  --fixed-time-lane direct \
+  --radau-jacobian-reuse-mode legacy
+```
+
+Important interpretation:
+
+- the FD lane runs a separate baseline adaptive solve to get the accepted
+  `dt` list
+- `fd-` and `fd+` then recompute physics from their own perturbed initial
+  carries on that accepted time grid
+- baseline carry history is not copied into the FD endpoints
+- the direct fixed-time lane may report a few Newton nonconvergence flags, but
+  it reaches `t_final` with finite endpoint objectives and recovers the old
+  FD scale
+
+### Next Implementation Step: Fused Forward AD
+
+The current recovered forward AD is correct but still two-phase inside the
+custom JVP:
+
+1. primal adaptive solve records the compact realized schedule
+2. accepted-step replay propagates the tangent
+
+The next optimization is a fused forward-AD lane:
+
+- propagate primal and tangent together during the adaptive solve
+- controller decisions remain primal-only
+- tangent does not affect accept/reject or next-`dt` decisions
+- the fused result must reproduce the recovered forward-AD values above
+- only after matching the recovered values should the replay-based JVP be
+  retired or downgraded to a diagnostic/reference path
+
+### Next Milestone After Fused Forward AD: Reverse AD Recovery
+
+After fused forward AD is validated, recover the reverse AD lane against the
+forward-AD reference values above.
+
+Reverse AD should be treated as a separate lane:
+
+- no changes to the recovered forward solver / FD / forward-AD lanes unless
+  explicitly required and reviewed
+- reverse should match the accepted-step AD contract used by forward AD
+- validation order should be:
+  1. reverse vs recovered forward AD on short prefixes
+  2. reverse vs recovered forward AD on full `T0`
+  3. reverse vs recovered FD only as a secondary sanity check
+
+The forward-AD row above is now the primary numerical reference for the next
+reverse-AD recovery work.
