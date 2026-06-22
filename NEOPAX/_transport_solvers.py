@@ -6903,7 +6903,7 @@ def _radau_adaptive_final_y_realized_schedule(
 ):
     """Final adaptive state with a solve-level JVP over the realized accepted schedule."""
 
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
@@ -6922,7 +6922,7 @@ def _radau_adaptive_final_y_realized_schedule_jvp(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
@@ -6963,7 +6963,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp(
 ):
     """Final adaptive state with a solve-level VJP over the realized accepted schedule."""
 
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,
@@ -6978,7 +6978,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     stop_after_accepted_steps: int | None,
     carry0: _RadauAcceptedStepCarry,
 ):
-    rollout = _radau_adaptive_final_state_rollout(
+    rollout = _radau_adaptive_schedule_rollout(
         execution_context,
         carry0,
         max_total_steps=max_total_steps,

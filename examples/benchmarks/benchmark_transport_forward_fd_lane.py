@@ -631,12 +631,19 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
         species=runtime.species,
         prepared_rollout_static=prepared_rollout_static,
     )
-    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = (
         int(accepted_step_limit_override)
         if accepted_step_limit_override is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    if stop_after_accepted_steps is not None:
+        # Prefix AD tests should not materialize the full production max-step
+        # trace. Keep enough room for rejected attempts while bounding memory.
+        max_total_steps = min(
+            max_total_steps,
+            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+        )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key != "jvp":
         raise NotImplementedError("The scratch forward benchmark lane supports derivative_mode='jvp' only.")
