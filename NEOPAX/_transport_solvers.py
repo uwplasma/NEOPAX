@@ -3405,7 +3405,20 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
 ):
     carry_in, primal_result = residuals
 
-    def _trial_y_tangent(carry_tangent):
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _trial_y_tangent(dy, dlagged_response_cache, dlagged_reference_y):
+        carry_tangent = dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry_in),
+            y=dy,
+            dt=jnp.asarray(0.0, dtype=kernel_context.dtype),
+            lagged_response_cache=dlagged_response_cache,
+            lagged_reference_y=dlagged_reference_y,
+        )
         tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
             kernel_context,
             physics_context,
@@ -3417,7 +3430,18 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
         )
         return tangent_attempt.trial_y
 
-    (carry_bar,) = jax.linear_transpose(_trial_y_tangent, carry_in)(trial_y_bar)
+    dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = jax.linear_transpose(
+        _trial_y_tangent,
+        carry_in.y,
+        carry_in.lagged_response_cache,
+        carry_in.lagged_reference_y,
+    )(trial_y_bar)
+    carry_bar = dataclasses.replace(
+        jax.tree_util.tree_map(_zero_tangent_like, carry_in),
+        y=dy_bar,
+        lagged_response_cache=dlagged_response_cache_bar,
+        lagged_reference_y=dlagged_reference_y_bar,
+    )
     return (carry_bar,)
 
 

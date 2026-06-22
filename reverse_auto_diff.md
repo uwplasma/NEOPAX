@@ -1284,6 +1284,19 @@ The backward rule receives only the nondifferentiable args before residuals:
 (kernel_context, physics_context, context, residuals, trial_y_bar)
 ```
 
+The next smoke test exposed that `jax.linear_transpose(...)` cannot take the
+full Radau carry as its linear input because the carry contains bool/int
+controller and cache-status leaves. The diagnostic reverse wrapper now
+transposes only the floating active inputs used by the local tangent rule:
+
+```text
+dy
+dlagged_response_cache
+dlagged_reference_y
+```
+
+and then rebuilds a carry cotangent with all other fields zero.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step
