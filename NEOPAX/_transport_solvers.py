@@ -3383,8 +3383,8 @@ def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
 def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
-    context: _RadauAcceptedStepAttemptContext,
     carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
 ):
     attempt_result = _execute_radau_accepted_step_attempt(
         kernel_context,

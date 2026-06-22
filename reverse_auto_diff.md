@@ -1270,6 +1270,20 @@ safe inside a transposed linear map.
 This remains a diagnostic bridge. The next real implementation is to replace
 `force_lagged_response_reuse=True` with branch-aware reuse/rebuild handling.
 
+The first run of this wrapper exposed an argument-order bug in the custom-VJP
+forward rule: with `nondiff_argnums=(0, 1, 3)`, the forward rule still receives
+the original function argument order, so it must be:
+
+```text
+(kernel_context, physics_context, carry_in, context)
+```
+
+The backward rule receives only the nondifferentiable args before residuals:
+
+```text
+(kernel_context, physics_context, context, residuals, trial_y_bar)
+```
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step
