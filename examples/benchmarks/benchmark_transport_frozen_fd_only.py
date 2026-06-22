@@ -467,7 +467,10 @@ def main() -> None:
         )
     minus_diag = _fixed_time_replay_diagnostics(minus_replay)
     plus_diag = _fixed_time_replay_diagnostics(plus_replay)
+    minus_state_finite = None if minus_replay is None else _tree_all_finite(minus_replay["final_state"])
+    plus_state_finite = None if plus_replay is None else _tree_all_finite(plus_replay["final_state"])
     fd_valid = None
+    fd_valid_reason = None
     if minus_diag is not None and plus_diag is not None:
         fd_valid = bool(
             minus_diag.get("completed")
@@ -475,6 +478,27 @@ def main() -> None:
             and plus_diag.get("completed")
             and not plus_diag.get("failed")
         )
+        if not fd_valid and fixed_time_lane == "direct":
+            baseline_final_t = float(np.asarray(jax.device_get(baseline_rollout.final_carry.t)).item())
+            minus_final_t = minus_diag.get("final_t")
+            plus_final_t = plus_diag.get("final_t")
+            direct_reached_final = bool(
+                minus_final_t is not None
+                and plus_final_t is not None
+                and np.isclose(minus_final_t, baseline_final_t, rtol=0.0, atol=1.0e-12)
+                and np.isclose(plus_final_t, baseline_final_t, rtol=0.0, atol=1.0e-12)
+            )
+            direct_finite = bool(
+                minus_state_finite
+                and plus_state_finite
+                and objectives_minus_np is not None
+                and objectives_plus_np is not None
+                and np.all(np.isfinite(objectives_minus_np))
+                and np.all(np.isfinite(objectives_plus_np))
+            )
+            if direct_reached_final and direct_finite:
+                fd_valid = True
+                fd_valid_reason = "direct_fixed_time_reached_final_with_finite_endpoints"
         if not fd_valid:
             grad_np = None
     report = {
@@ -484,6 +508,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "fd_valid": fd_valid,
+        "fd_valid_reason": fd_valid_reason,
         "fd_endpoint_lane": fd_endpoint_lane,
         "replay_mode": str(args.replay_mode),
         "fixed_time_lane": fixed_time_lane,
@@ -521,8 +546,8 @@ def main() -> None:
             "baseline_replay_state_finite": baseline_replay_state_finite,
             "fd_minus_elapsed_s": None if t_minus0 is None or t_minus1 is None else (t_minus1 - t_minus0),
             "fd_plus_elapsed_s": None if t_plus0 is None or t_plus1 is None else (t_plus1 - t_plus0),
-            "frozen_fd_minus_state_finite": None if minus_replay is None else _tree_all_finite(minus_replay["final_state"]),
-            "frozen_fd_plus_state_finite": None if plus_replay is None else _tree_all_finite(plus_replay["final_state"]),
+            "frozen_fd_minus_state_finite": minus_state_finite,
+            "frozen_fd_plus_state_finite": plus_state_finite,
         },
     }
 
@@ -689,6 +714,11 @@ def main() -> None:
             print(
                 "[autodiff-gate] fd_valid=False: not reporting central FD gradients "
                 "because at least one FD endpoint did not complete."
+            )
+        elif fd_valid_reason is not None:
+            print(
+                "[autodiff-gate] fd_valid=True: reporting direct fixed-time FD gradients "
+                f"because {fd_valid_reason}; inspect nonconverged_count diagnostics above."
             )
     if grad_np is not None:
         print("[autodiff-gate] objective values:")
