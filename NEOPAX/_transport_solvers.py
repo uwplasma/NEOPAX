@@ -6359,6 +6359,67 @@ def _radau_replay_realized_accepted_rollout(
     )
 
 
+def _radau_replay_first_realized_accepted_step(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    accepted_active_mask,
+    accepted_dts,
+    next_dts,
+    next_recent_reject_count,
+    next_regrowth_cooldown,
+    next_easy_growth_streak,
+    next_lagged_response_valid,
+) -> _RadauAcceptedStepCarry:
+    """Replay the first realized accepted step without tracing a scan VJP."""
+
+    dtype = execution_context.dtype
+    accepted_index = jnp.argmax(jnp.asarray(accepted_active_mask, dtype=jnp.int32))
+    dt_value = jnp.asarray(accepted_dts[accepted_index], dtype=dtype)
+    next_dt_value = jnp.asarray(next_dts[accepted_index], dtype=dtype)
+    recent_reject_count_value = next_recent_reject_count[accepted_index]
+    regrowth_cooldown_value = next_regrowth_cooldown[accepted_index]
+    easy_growth_streak_value = next_easy_growth_streak[accepted_index]
+    lagged_response_valid_value = next_lagged_response_valid[accepted_index]
+
+    carry_for_step = dataclasses.replace(carry0, dt=dt_value)
+    attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+        execution_context.kernel_context,
+        execution_context.physics_context,
+        _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+        execution_context.attempt_context,
+    )
+    accepted_y = _project_flat_state_if_needed(
+        attempt_result.trial_y,
+        execution_context.physics_context.project_flat,
+    )
+    return dataclasses.replace(
+        attempt_result.carry_after_attempt,
+        t=carry0.t + dt_value,
+        y=accepted_y,
+        dt=next_dt_value,
+        prev_error=jnp.maximum(
+            attempt_result.err_norm,
+            jnp.asarray(1.0e-12, dtype=dtype),
+        ),
+        prev_stages=attempt_result.stage_history,
+        prev_dt=dt_value,
+        recent_reject_count=recent_reject_count_value,
+        regrowth_cooldown=regrowth_cooldown_value,
+        easy_growth_streak=easy_growth_streak_value,
+        lagged_response_valid=lagged_response_valid_value,
+        jacobian=attempt_result.jacobian_out,
+        cache_valid=attempt_result.cache_valid_out,
+        cache_dt=attempt_result.cache_dt_out,
+        cache_age=attempt_result.cache_age_out,
+        real_lu=attempt_result.real_lu_out,
+        real_piv=attempt_result.real_piv_out,
+        complex_lu=attempt_result.complex_lu_out,
+        complex_piv=attempt_result.complex_piv_out,
+        prev_theta_final=attempt_result.theta_final,
+        prev_newton_iter_count=attempt_result.newton_iter_count,
+    )
+
+
 def _radau_adaptive_final_y_realized_schedule_fused_jvp(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
@@ -7377,6 +7438,25 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         next_easy_growth_streak,
         next_lagged_response_valid,
     ) = residuals
+
+    if stop_after_accepted_steps == 1:
+        def _first_accepted_step(carry_value):
+            next_carry = _radau_replay_first_realized_accepted_step(
+                execution_context,
+                carry_value,
+                active_mask,
+                attempted_dts,
+                next_dts,
+                next_recent_reject_count,
+                next_regrowth_cooldown,
+                next_easy_growth_streak,
+                next_lagged_response_valid,
+            )
+            return next_carry.y
+
+        _, pullback = jax.vjp(_first_accepted_step, carry0)
+        (carry0_bar,) = pullback(final_y_bar)
+        return (carry0_bar,)
 
     def _replay(carry_value):
         replay = _radau_replay_realized_accepted_rollout(
