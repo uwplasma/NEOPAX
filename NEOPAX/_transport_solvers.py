@@ -3313,6 +3313,46 @@ def _execute_radau_accepted_step_attempt_autodiff_force_lagged_reuse_jvp(
     )
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 3))
+def _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> jax.Array:
+    """Diagnostic AD wrapper returning only projected trial_y for one-step VJP."""
+
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    return _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
+
+
+@_execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse.defjvp
+def _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse_jvp(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    primals,
+    tangents,
+):
+    (carry_in,) = primals
+    (carry_tangent,) = tangents
+    primal_result, tangent_attempt = _execute_radau_accepted_step_attempt_with_forced_reuse_tangent(
+        kernel_context,
+        physics_context,
+        carry_in,
+        carry_tangent,
+        context,
+    )
+    primal_y = _project_flat_state_if_needed(primal_result.trial_y, physics_context.project_flat)
+    tangent_y = _project_flat_state_if_needed(tangent_attempt.trial_y, physics_context.project_flat)
+    return primal_y, tangent_y
+
+
 def _execute_radau_accepted_step_attempt(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -7549,18 +7589,15 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     if stop_after_accepted_steps == 1:
         def _first_accepted_step(carry_value):
-            next_carry = _radau_replay_first_realized_accepted_step(
-                execution_context,
-                carry_value,
-                active_mask,
-                attempted_dts,
-                next_dts,
-                next_recent_reject_count,
-                next_regrowth_cooldown,
-                next_easy_growth_streak,
-                next_lagged_response_valid,
+            accepted_index = jnp.argmax(jnp.asarray(active_mask, dtype=jnp.int32))
+            dt_value = jnp.asarray(attempted_dts[accepted_index], dtype=execution_context.dtype)
+            carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+            return _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
             )
-            return next_carry.y
 
         _, pullback = jax.vjp(_first_accepted_step, carry0)
         (carry0_bar,) = pullback(final_y_bar)

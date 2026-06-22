@@ -1225,6 +1225,19 @@ The same smoke-test path was then tightened further: when
 unused exact branch from being traced/transposed during the diagnostic one-step
 reverse run.
 
+The one-step VJP path was then narrowed again to avoid transposing the full
+`_RadauAcceptedStepAttemptResult`. For `stop_after_accepted_steps == 1`, the
+backward pass now differentiates a diagnostic wrapper that returns only the
+projected `trial_y`:
+
+```text
+_execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse(...)
+```
+
+This is still a smoke-test tool, not the final reverse rule. The purpose is to
+isolate the accepted-step state map before implementing the full branch-aware
+reuse/rebuild reverse path.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step
