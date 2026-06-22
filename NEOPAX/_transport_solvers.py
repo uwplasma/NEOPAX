@@ -6597,15 +6597,19 @@ def _radau_replay_realized_accepted_rollout(
 
         def _do_step(_):
             carry_for_step = dataclasses.replace(carry, dt=dt_value)
-            attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            carry_for_primal_bookkeeping = jax.lax.stop_gradient(carry_for_step)
+            attempt_result = _execute_radau_accepted_step_attempt(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_primal_bookkeeping),
+                execution_context.attempt_context,
+            )
+            accepted_y = _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
                 execution_context.kernel_context,
                 execution_context.physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_for_step),
                 execution_context.attempt_context,
-            )
-            accepted_y = _project_flat_state_if_needed(
-                attempt_result.trial_y,
-                execution_context.physics_context.project_flat,
+                "reuse",
             )
             next_carry = dataclasses.replace(
                 attempt_result.carry_after_attempt,
