@@ -44,6 +44,16 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 
 
+@dataclasses.dataclass(frozen=True)
+class _ReverseStaticSetup:
+    solver: object
+    solve_vector_field: object
+    prepared_rollout: object
+    execution_context: object
+    stop_after_accepted_steps: int | None
+    max_total_steps: int
+
+
 def _report_path(objective_name: str) -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "reverse_ad"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -277,12 +287,11 @@ def _reverse_initial_carry_from_state_with_static_setup(
 def _reverse_objective_for_parameter_vector(
     parameter_values,
     *,
-    config: dict,
     runtime,
     baseline_state,
     profile_cfg: dict,
     objective_index: int,
-    accepted_step_limit_override: int | None = None,
+    reverse_setup: _ReverseStaticSetup,
 ):
     state0 = _initial_state_for_parameter_vector(
         parameter_values,
@@ -290,8 +299,34 @@ def _reverse_objective_for_parameter_vector(
         profile_cfg=profile_cfg,
         runtime=runtime,
     )
+    initial_carry = _reverse_initial_carry_from_state_with_static_setup(
+        solver=reverse_setup.solver,
+        state=state0,
+        solve_vector_field=reverse_setup.solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=reverse_setup.prepared_rollout,
+    )
+    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        initial_carry,
+    )
+    final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)[objective_index]
+
+
+def _prepare_reverse_static_setup(
+    parameter_values,
+    *,
+    config: dict,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    accepted_step_limit_override: int | None = None,
+) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
-        jax.lax.stop_gradient(parameter_values),
+        parameter_values,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
@@ -309,13 +344,6 @@ def _reverse_objective_for_parameter_vector(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
-    initial_carry = _reverse_initial_carry_from_state_with_static_setup(
-        solver=solver,
-        state=state0,
-        solve_vector_field=solve_vector_field_static,
-        species=runtime.species,
-        prepared_rollout_static=prepared_rollout_static,
-    )
     stop_after_accepted_steps = (
         int(accepted_step_limit_override)
         if accepted_step_limit_override is not None
@@ -327,14 +355,14 @@ def _reverse_objective_for_parameter_vector(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
-    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        initial_carry,
+    return _ReverseStaticSetup(
+        solver=solver,
+        solve_vector_field=solve_vector_field_static,
+        prepared_rollout=prepared_rollout_static,
+        execution_context=execution_context,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+        max_total_steps=max_total_steps,
     )
-    final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
-    return _objective_vector(final_state, runtime)[objective_index]
 
 
 def _baseline_rollout_for_diagnostics(
@@ -444,6 +472,14 @@ def main() -> None:
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
     objective_index = OBJECTIVE_LABELS.index(args.objective)
+    reverse_setup = _prepare_reverse_static_setup(
+        baseline_values,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        accepted_step_limit_override=args.accepted_step_limit,
+    )
 
     baseline_diag = None
     if args.baseline_diagnostics:
@@ -460,12 +496,11 @@ def main() -> None:
 
     objective_fn = lambda p: _reverse_objective_for_parameter_vector(  # noqa: E731
         p,
-        config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         objective_index=objective_index,
-        accepted_step_limit_override=args.accepted_step_limit,
+        reverse_setup=reverse_setup,
     )
 
     print("[autodiff-gate] progress: running reverse custom-VJP", flush=True)
