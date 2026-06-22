@@ -1096,3 +1096,151 @@ The remaining design target is:
   model-aware rebuild adjoint
 
 That is now the real blocker for the reverse accepted-step path.
+
+## 2026-06-22 Status Update: Reverse Recovery After Forward/FD Lane Lessons
+
+The current reverse-only benchmark interface has been reshaped to match the
+natural reverse-mode contract:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 1 \
+  --radau-jacobian-reuse-mode legacy
+```
+
+This means:
+
+- one scalar objective is selected with `--objective`
+- one reverse sweep should return gradients for all profile parameters:
+  - `n0`
+  - `T0`
+  - `density_shape_power`
+  - `temperature_shape_power`
+
+### Current failure sequence
+
+The first OOM happened while raw reverse AD differentiated through the initial
+lagged-response construction:
+
+```text
+_reverse_objective_for_parameter_vector
+  -> _initial_carry_from_state_with_static_setup
+  -> physics_context.build_lagged_response(...)
+```
+
+A reverse-lane-only custom initial-carry VJP was added in
+`benchmark_transport_reverse_ad_only.py` so the initial lagged-response
+cotangent can use the existing model-aware:
+
+```text
+pullback_build_lagged_response(...)
+```
+
+instead of raw reverse AD through NTX initialization.
+
+After that, the OOM moved to the active solve-level reverse path:
+
+```text
+_radau_adaptive_final_y_realized_schedule_vjp_bwd
+  -> jax.vjp(_replay, carry0)
+  -> _radau_replay_realized_accepted_rollout(...)
+```
+
+A narrow one-accepted-step special case was added:
+
+```text
+_radau_replay_first_realized_accepted_step(...)
+```
+
+so `accepted_step_limit == 1` does not reverse through the whole accepted replay
+`lax.scan`.
+
+The next OOM then moved into the local accepted-step custom-JVP transpose:
+
+```text
+_radau_accepted_step_attempt_tangent_from_primal(...)
+  -> _lagged_output_tangent()
+  -> jax.lax.cond(...)
+```
+
+The immediate cause is that JAX traces both lagged-response branches. Even when
+the first accepted step reuses the initialized lagged cache, the rebuild branch
+still traces:
+
+```text
+jax.jvp(build_lagged_response, ...)
+```
+
+which reopens the large NTX lagged-response graph.
+
+### Important branch-policy correction
+
+Do **not** force lagged rebuild in reverse.
+
+Do **not** force lagged reuse in the general reverse path either.
+
+The correct reverse rule must follow the primal accepted-step branch:
+
+```text
+if lagged_response_valid:
+    use the reuse-branch pullback
+else:
+    use the rebuild-branch pullback
+```
+
+The temporary forced-reuse accepted-step wrapper is diagnostic-only for the
+`accepted_step_limit == 1` smoke test, because the initialized carry should have
+a valid lagged-response cache. It is not the intended general reverse
+implementation and must not be used to validate later accepted steps where the
+primal path may rebuild lagged response.
+
+### 2026-06-22 forced-reuse smoke-test update
+
+After the forced-reuse diagnostic removed the local NTX rebuild trace, the
+one-step reverse smoke test reached the pullback but failed with an
+`AssertionError` at:
+
+```text
+_radau_adaptive_final_y_realized_schedule_vjp_bwd
+  -> pullback(final_y_bar)
+```
+
+The likely cause was a custom-JVP tangent/primal pytree mismatch for the
+lagged-response cache in the diagnostic forced-reuse branch. A narrow structural
+normalization helper was added:
+
+```text
+_radau_align_tangent_tree_to_primal(...)
+```
+
+and is used only when `force_lagged_response_reuse=True`. This does not change
+the normal branch-aware lagged path and does not make forced reuse a valid
+general reverse strategy.
+
+### Next correct implementation step
+
+Replace the lagged-response tangent/reverse handling inside the accepted-step
+reverse path with a branch-aware implementation that does not trace the heavy
+opposite branch.
+
+The intended design is:
+
+- reuse branch:
+  - propagate cotangent through the cached lagged response / lagged reference
+    path
+- rebuild branch:
+  - call the model-aware `pullback_build_lagged_response(...)`
+  - avoid raw `jax.jvp(build_lagged_response, ...)` or generic VJP through the
+    full NTX object
+
+This is the direct reverse analogue of what was relearned from FD and forward
+AD recovery:
+
+- production primal adaptive solve determines the accepted schedule and branch
+  decisions
+- the differentiated map follows accepted steps only
+- branch/control decisions are primal metadata
+- local derivative rules must be specialized enough that unused heavy branches
+  are not traced into the compiled reverse graph

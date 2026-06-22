@@ -2886,6 +2886,34 @@ def _radau_build_approximate_tangent_result(
     )
 
 
+def _radau_align_tangent_tree_to_primal(tangent_tree, primal_tree):
+    """Return a tangent tree with the exact same pytree structure as primal_tree."""
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    if primal_tree is None:
+        return None
+    if tangent_tree is None:
+        return jax.tree_util.tree_map(_zero_tangent_like, primal_tree)
+    if jax.tree_util.tree_structure(tangent_tree) != jax.tree_util.tree_structure(primal_tree):
+        return jax.tree_util.tree_map(_zero_tangent_like, primal_tree)
+
+    def _align_leaf(tangent_leaf, primal_leaf):
+        primal_arr = jnp.asarray(primal_leaf)
+        tangent_arr = jnp.asarray(tangent_leaf)
+        if jnp.issubdtype(primal_arr.dtype, jnp.inexact):
+            if tangent_arr.dtype == jax.dtypes.float0:
+                return jnp.zeros_like(primal_arr)
+            return jnp.asarray(tangent_arr, dtype=primal_arr.dtype)
+        return jnp.zeros(primal_arr.shape, dtype=jax.dtypes.float0)
+
+    return jax.tree_util.tree_map(_align_leaf, tangent_tree, primal_tree)
+
+
 def _radau_compute_approximate_attempt_tangent(
     kernel_context: _RadauAcceptedStepKernelContext,
     *,
@@ -2964,7 +2992,16 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             return None, tangent_inputs.dy
 
         if force_lagged_response_reuse:
-            return tangent_inputs.dlagged_response_cache, carry_tangent.lagged_reference_y
+            return (
+                _radau_align_tangent_tree_to_primal(
+                    tangent_inputs.dlagged_response_cache,
+                    carry_in.lagged_response_cache,
+                ),
+                _radau_align_tangent_tree_to_primal(
+                    carry_tangent.lagged_reference_y,
+                    carry_in.lagged_reference_y,
+                ),
+            )
 
         def _reuse_lagged_response(_):
             return tangent_inputs.dlagged_response_cache
