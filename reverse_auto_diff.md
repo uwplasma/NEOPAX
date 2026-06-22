@@ -1253,6 +1253,23 @@ the next reverse-local decision is whether projection/flooring belongs in the
 reverse state-map derivative or should be treated as a forward-only projection
 at the accepted-step boundary.
 
+The subsequent repeated `AssertionError` showed that transposing the
+`custom_jvp` trial-y smoke wrapper was still too fragile. The active one-step
+reverse smoke path now uses an explicit `custom_vjp` wrapper:
+
+```text
+_execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(...)
+```
+
+Its backward applies `jax.linear_transpose(...)` to the local accepted-step
+tangent map rather than asking JAX to transpose the full custom-JVP attempt
+result. The tangent helpers also gained reverse-local switches to bypass
+zero-tangent shortcuts, because predicates like `all(tangent == 0)` are not
+safe inside a transposed linear map.
+
+This remains a diagnostic bridge. The next real implementation is to replace
+`force_lagged_response_reuse=True` with branch-aware reuse/rebuild handling.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step

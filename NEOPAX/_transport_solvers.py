@@ -2927,6 +2927,7 @@ def _radau_compute_approximate_attempt_tangent(
     real_piv_out,
     complex_lu_out,
     complex_piv_out,
+    skip_zero_tangent_shortcut: bool = False,
 ) -> _RadauAcceptedStepApproximateTangentResult:
     """Compute the first approximate implicit-diff tangent for one accepted step.
 
@@ -2946,6 +2947,7 @@ def _radau_compute_approximate_attempt_tangent(
         real_piv_out=real_piv_out,
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
+        skip_zero_tangent_shortcut=skip_zero_tangent_shortcut,
     )
     return _RadauAcceptedStepApproximateTangentResult(
         dy_next=dy_next,
@@ -3070,16 +3072,6 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             (dlagged_response_cache_out,),
         )
 
-    lagged_cache_tangent_active = jnp.asarray(False)
-    if dlagged_response_cache_out is not None:
-        lagged_cache_tangent_active = jnp.any(
-            jax.tree_util.tree_reduce(
-                lambda acc, x: jnp.logical_or(acc, jnp.any(jnp.asarray(x) != 0)),
-                dlagged_response_cache_out,
-                initializer=jnp.asarray(False),
-            )
-        )
-
     def _approximate_tangent(_):
         return _radau_compute_approximate_attempt_tangent(
             kernel_context,
@@ -3093,6 +3085,7 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             real_piv_out=primal_result.real_piv_out,
             complex_lu_out=primal_result.complex_lu_out,
             complex_piv_out=primal_result.complex_piv_out,
+            skip_zero_tangent_shortcut=force_lagged_response_reuse,
         )
 
     def _exact_lagged_cache_tangent(_):
@@ -3163,6 +3156,15 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     if force_lagged_response_reuse:
         tangent_result = _approximate_tangent(None)
     else:
+        lagged_cache_tangent_active = jnp.asarray(False)
+        if dlagged_response_cache_out is not None:
+            lagged_cache_tangent_active = jnp.any(
+                jax.tree_util.tree_reduce(
+                    lambda acc, x: jnp.logical_or(acc, jnp.any(jnp.asarray(x) != 0)),
+                    dlagged_response_cache_out,
+                    initializer=jnp.asarray(False),
+                )
+            )
         tangent_result = jax.lax.cond(
             jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
             _exact_lagged_cache_tangent,
@@ -3358,6 +3360,71 @@ def _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse_jvp(
             (tangent_attempt.trial_y,),
         )
     return primal_y, tangent_y
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 3))
+def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> jax.Array:
+    """Diagnostic reverse wrapper returning only projected trial_y."""
+
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    return _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
+
+
+def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    carry_in: _RadauAcceptedStepCarry,
+):
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    primal_y = _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
+    return primal_y, (carry_in, attempt_result)
+
+
+def _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    residuals,
+    trial_y_bar,
+):
+    carry_in, primal_result = residuals
+
+    def _trial_y_tangent(carry_tangent):
+        tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+            kernel_context,
+            physics_context,
+            carry_in,
+            carry_tangent,
+            context,
+            primal_result,
+            force_lagged_response_reuse=True,
+        )
+        return tangent_attempt.trial_y
+
+    (carry_bar,) = jax.linear_transpose(_trial_y_tangent, carry_in)(trial_y_bar)
+    return (carry_bar,)
+
+
+_execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse.defvjp(
+    _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_fwd,
+    _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse_bwd,
+)
 
 
 def _execute_radau_accepted_step_attempt(
@@ -3987,9 +4054,9 @@ def _radau_apply_stage_linear_solve(
     real_piv_out,
     complex_lu_out,
     complex_piv_out,
+    skip_zero_rhs_shortcut: bool = False,
 ):
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
-    zero_rhs = jnp.all(rhs_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
 
     def _solve_zero_rhs(rhs_flat):
         return jnp.zeros_like(rhs_flat)
@@ -4020,6 +4087,10 @@ def _radau_apply_stage_linear_solve(
         )
         return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
 
+    if skip_zero_rhs_shortcut:
+        return _solve_nonzero_rhs(rhs_arr)
+
+    zero_rhs = jnp.all(rhs_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
     return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
 
 
@@ -4037,6 +4108,7 @@ def _radau_approximate_accepted_step_tangent(
     real_piv_out,
     complex_lu_out,
     complex_piv_out,
+    skip_zero_tangent_shortcut: bool = False,
 ):
     """Approximate accepted-step tangent via the current Newton linearization.
 
@@ -4059,11 +4131,6 @@ def _radau_approximate_accepted_step_tangent(
     dy_source = jnp.asarray(dy_source, dtype=kernel_context.dtype)
     dh_source = jnp.asarray(dh_source, dtype=kernel_context.dtype)
     lagged_eval_tangent = jnp.asarray(lagged_eval_tangent, dtype=kernel_context.dtype)
-    zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
-    zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
-    zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
-    zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
-
     def _zero_tangent(_):
         dz_zero = jnp.zeros((kernel_context.num_stages, kernel_context.state_dim), dtype=kernel_context.dtype)
         dy_zero = jnp.zeros((kernel_context.state_dim,), dtype=kernel_context.dtype)
@@ -4084,6 +4151,7 @@ def _radau_approximate_accepted_step_tangent(
             real_piv_out=real_piv_out,
             complex_lu_out=complex_lu_out,
             complex_piv_out=complex_piv_out,
+            skip_zero_rhs_shortcut=skip_zero_tangent_shortcut,
         )
         dz_stages = dz_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
         dy_next = (
@@ -4093,6 +4161,13 @@ def _radau_approximate_accepted_step_tangent(
         )
         return dy_next, dz_stages
 
+    if skip_zero_tangent_shortcut:
+        return _compute_tangent(None)
+
+    zero_dy = jnp.all(dy_source == jnp.asarray(0.0, dtype=kernel_context.dtype))
+    zero_dh = dh_source == jnp.asarray(0.0, dtype=kernel_context.dtype)
+    zero_lagged = jnp.all(lagged_eval_tangent == jnp.asarray(0.0, dtype=kernel_context.dtype))
+    zero_input = jnp.logical_and(jnp.logical_and(zero_dy, zero_dh), zero_lagged)
     return jax.lax.cond(zero_input, _zero_tangent, _compute_tangent, operand=None)
 
 
@@ -7599,7 +7674,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             accepted_index = jnp.argmax(jnp.asarray(active_mask, dtype=jnp.int32))
             dt_value = jnp.asarray(attempted_dts[accepted_index], dtype=execution_context.dtype)
             carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-            return _execute_radau_accepted_step_trial_y_autodiff_force_lagged_reuse(
+            return _execute_radau_accepted_step_trial_y_vjp_force_lagged_reuse(
                 execution_context.kernel_context,
                 execution_context.physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_for_step),
