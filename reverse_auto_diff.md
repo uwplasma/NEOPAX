@@ -1219,6 +1219,12 @@ and is used only when `force_lagged_response_reuse=True`. This does not change
 the normal branch-aware lagged path and does not make forced reuse a valid
 general reverse strategy.
 
+The same smoke-test path was then tightened further: when
+`force_lagged_response_reuse=True`, the accepted-step tangent now bypasses the
+`lax.cond` that chooses the exact lagged-cache tangent branch. This prevents the
+unused exact branch from being traced/transposed during the diagnostic one-step
+reverse run.
+
 ### Next correct implementation step
 
 Replace the lagged-response tangent/reverse handling inside the accepted-step

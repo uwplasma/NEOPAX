@@ -3160,12 +3160,15 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             dstage_history=dz_flat,
         )
 
-    tangent_result = jax.lax.cond(
-        jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
-        _exact_lagged_cache_tangent,
-        _approximate_tangent,
-        operand=None,
-    )
+    if force_lagged_response_reuse:
+        tangent_result = _approximate_tangent(None)
+    else:
+        tangent_result = jax.lax.cond(
+            jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
+            _exact_lagged_cache_tangent,
+            _approximate_tangent,
+            operand=None,
+        )
     tangent_attempt = _radau_build_approximate_tangent_result(
         tangent_inputs,
         tangent_result,
