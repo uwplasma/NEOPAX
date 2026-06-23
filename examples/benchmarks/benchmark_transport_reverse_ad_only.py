@@ -564,6 +564,9 @@ def main() -> None:
             "local_branch_reuse": bool(diagnostic.local_branch_reuse),
             "lhs_v_dot_ju": float(diagnostic.lhs_v_dot_ju),
             "rhs_jtv_dot_u": float(diagnostic.rhs_jtv_dot_u),
+            "lhs_additivity_residual": float(diagnostic.lhs_additivity_residual),
+            "rhs_additivity_residual": float(diagnostic.rhs_additivity_residual),
+            "additivity_residual_abs_err": float(diagnostic.additivity_residual_abs_err),
             "abs_err": float(diagnostic.abs_err),
             "rel_err": float(diagnostic.rel_err),
         }
@@ -583,6 +586,13 @@ def main() -> None:
             f"abs_err={report['abs_err']:.6e} "
             f"rel_err={report['rel_err']:.6e}"
         )
+        if args.local_transpose_diagnostic_seed_mode == "y_lagged_cache":
+            print(
+                "[autodiff-gate] local transpose additivity residuals: "
+                f"lhs={report['lhs_additivity_residual']:.6e} "
+                f"rhs={report['rhs_additivity_residual']:.6e} "
+                f"abs_err={report['additivity_residual_abs_err']:.6e}"
+            )
         outpath = _report_path(args.objective)
         outpath.write_text(json.dumps(report, indent=2))
         print(f"Wrote {outpath.relative_to(ROOT)}")

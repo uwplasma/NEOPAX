@@ -2485,6 +2485,9 @@ class _RadauAcceptedStepTransposeDiagnostic:
     local_branch_reuse: Any
     lhs_v_dot_ju: Any
     rhs_jtv_dot_u: Any
+    lhs_additivity_residual: Any
+    rhs_additivity_residual: Any
+    additivity_residual_abs_err: Any
     abs_err: Any
     rel_err: Any
 
@@ -7171,57 +7174,83 @@ def _radau_debug_local_accepted_step_transpose(
 
         return jax.lax.cond(local_branch_reuse, _reuse_branch, _rebuild_branch, operand=None)
 
-    carry_direction = jax.tree_util.tree_map(_zero_tangent_like, carry_for_step)
-    if seed_mode in {"y", "y_lagged_cache", "y_lagged_reference", "all"}:
-        carry_direction = dataclasses.replace(
-            carry_direction,
-            y=_deterministic_vec(target_carry.y.shape[0], phase=0.0),
-        )
-    if seed_mode in {"prev_stages", "all"}:
-        carry_direction = dataclasses.replace(
-            carry_direction,
-            prev_stages=_deterministic_vec(target_carry.prev_stages.size, phase=1.0).reshape(target_carry.prev_stages.shape),
-        )
-    if seed_mode in {"lagged_cache", "y_lagged_cache", "lagged_cache_reference", "all"}:
-        carry_direction = dataclasses.replace(
-            carry_direction,
-            lagged_response_cache=_seed_tree_like(target_carry.lagged_response_cache, phase=2.0),
-        )
-    if seed_mode in {"lagged_reference", "y_lagged_reference", "lagged_cache_reference", "all"}:
-        carry_direction = dataclasses.replace(
-            carry_direction,
-            lagged_reference_y=_deterministic_vec(target_carry.lagged_reference_y.size, phase=3.0).reshape(target_carry.lagged_reference_y.shape),
-        )
+    def _direction_for_seed(seed_name):
+        direction = jax.tree_util.tree_map(_zero_tangent_like, carry_for_step)
+        if seed_name in {"y", "y_lagged_cache", "y_lagged_reference", "all"}:
+            direction = dataclasses.replace(
+                direction,
+                y=_deterministic_vec(target_carry.y.shape[0], phase=0.0),
+            )
+        if seed_name in {"prev_stages", "all"}:
+            direction = dataclasses.replace(
+                direction,
+                prev_stages=_deterministic_vec(target_carry.prev_stages.size, phase=1.0).reshape(target_carry.prev_stages.shape),
+            )
+        if seed_name in {"lagged_cache", "y_lagged_cache", "lagged_cache_reference", "all"}:
+            direction = dataclasses.replace(
+                direction,
+                lagged_response_cache=_seed_tree_like(target_carry.lagged_response_cache, phase=2.0),
+            )
+        if seed_name in {"lagged_reference", "y_lagged_reference", "lagged_cache_reference", "all"}:
+            direction = dataclasses.replace(
+                direction,
+                lagged_reference_y=_deterministic_vec(target_carry.lagged_reference_y.size, phase=3.0).reshape(target_carry.lagged_reference_y.shape),
+            )
+        return direction
 
+    def _cotangent_for_seed(seed_name, output_carry_value):
+        cotangent = jax.tree_util.tree_map(_zero_tangent_like, output_carry_value)
+        if seed_name in {"y", "y_lagged_cache", "y_lagged_reference", "all"}:
+            cotangent = dataclasses.replace(
+                cotangent,
+                y=_deterministic_vec(output_carry_value.y.shape[0], phase=4.0),
+            )
+        if seed_name in {"prev_stages", "all"}:
+            cotangent = dataclasses.replace(
+                cotangent,
+                prev_stages=_deterministic_vec(output_carry_value.prev_stages.size, phase=5.0).reshape(output_carry_value.prev_stages.shape),
+            )
+        if seed_name in {"lagged_cache", "y_lagged_cache", "lagged_cache_reference", "all"}:
+            cotangent = dataclasses.replace(
+                cotangent,
+                lagged_response_cache=_seed_tree_like(output_carry_value.lagged_response_cache, phase=6.0),
+            )
+        if seed_name in {"lagged_reference", "y_lagged_reference", "lagged_cache_reference", "all"}:
+            cotangent = dataclasses.replace(
+                cotangent,
+                lagged_reference_y=_deterministic_vec(output_carry_value.lagged_reference_y.size, phase=7.0).reshape(output_carry_value.lagged_reference_y.shape),
+            )
+        return cotangent
+
+    carry_direction = _direction_for_seed(seed_mode)
     output_carry_primal = _local_step_reverse(carry_for_step)
-    output_cotangent = jax.tree_util.tree_map(_zero_tangent_like, output_carry_primal)
-    if seed_mode in {"y", "y_lagged_cache", "y_lagged_reference", "all"}:
-        output_cotangent = dataclasses.replace(
-            output_cotangent,
-            y=_deterministic_vec(output_carry_primal.y.shape[0], phase=4.0),
-        )
-    if seed_mode in {"prev_stages", "all"}:
-        output_cotangent = dataclasses.replace(
-            output_cotangent,
-            prev_stages=_deterministic_vec(output_carry_primal.prev_stages.size, phase=5.0).reshape(output_carry_primal.prev_stages.shape),
-        )
-    if seed_mode in {"lagged_cache", "y_lagged_cache", "lagged_cache_reference", "all"}:
-        output_cotangent = dataclasses.replace(
-            output_cotangent,
-            lagged_response_cache=_seed_tree_like(output_carry_primal.lagged_response_cache, phase=6.0),
-        )
-    if seed_mode in {"lagged_reference", "y_lagged_reference", "lagged_cache_reference", "all"}:
-        output_cotangent = dataclasses.replace(
-            output_cotangent,
-            lagged_reference_y=_deterministic_vec(output_carry_primal.lagged_reference_y.size, phase=7.0).reshape(output_carry_primal.lagged_reference_y.shape),
-        )
+    output_cotangent = _cotangent_for_seed(seed_mode, output_carry_primal)
 
-    _, output_tangent = jax.jvp(_local_step_forward, (carry_for_step,), (carry_direction,))
-    _, pullback = jax.vjp(_local_step_reverse, carry_for_step)
-    (input_cotangent,) = pullback(output_cotangent)
+    def _transpose_dots(direction_value, cotangent_value):
+        _, output_tangent_value = jax.jvp(_local_step_forward, (carry_for_step,), (direction_value,))
+        _, local_pullback = jax.vjp(_local_step_reverse, carry_for_step)
+        (input_cotangent_value,) = local_pullback(cotangent_value)
+        lhs_value = _dot_tree(cotangent_value, output_tangent_value)
+        rhs_value = _dot_tree(input_cotangent_value, direction_value)
+        return lhs_value, rhs_value
 
-    lhs = _dot_tree(output_cotangent, output_tangent)
-    rhs = _dot_tree(input_cotangent, carry_direction)
+    lhs, rhs = _transpose_dots(carry_direction, output_cotangent)
+
+    zero_scalar = jnp.asarray(0.0, dtype=dtype)
+    lhs_additivity_residual = zero_scalar
+    rhs_additivity_residual = zero_scalar
+
+    if seed_mode == "y_lagged_cache":
+        y_direction = _direction_for_seed("y")
+        cache_direction = _direction_for_seed("lagged_cache")
+        y_cotangent = _cotangent_for_seed("y", output_carry_primal)
+        cache_cotangent = _cotangent_for_seed("lagged_cache", output_carry_primal)
+        lhs_y, rhs_y = _transpose_dots(y_direction, y_cotangent)
+        lhs_cache, rhs_cache = _transpose_dots(cache_direction, cache_cotangent)
+        lhs_additivity_residual = lhs - lhs_y - lhs_cache
+        rhs_additivity_residual = rhs - rhs_y - rhs_cache
+
+    additivity_residual_abs_err = jnp.abs(lhs_additivity_residual - rhs_additivity_residual)
     abs_err = jnp.abs(lhs - rhs)
     rel_err = abs_err / jnp.maximum(jnp.maximum(jnp.abs(lhs), jnp.abs(rhs)), jnp.asarray(1.0e-30, dtype=dtype))
     return _RadauAcceptedStepTransposeDiagnostic(
@@ -7232,6 +7261,9 @@ def _radau_debug_local_accepted_step_transpose(
         local_branch_reuse=local_branch_reuse,
         lhs_v_dot_ju=lhs,
         rhs_jtv_dot_u=rhs,
+        lhs_additivity_residual=lhs_additivity_residual,
+        rhs_additivity_residual=rhs_additivity_residual,
+        additivity_residual_abs_err=additivity_residual_abs_err,
         abs_err=abs_err,
         rel_err=rel_err,
     )
