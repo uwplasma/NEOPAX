@@ -486,6 +486,13 @@ def main() -> None:
             "check at this zero-based accepted-step ordinal, then exit."
         ),
     )
+    parser.add_argument(
+        "--local-transpose-diagnostic-seed-mode",
+        type=str,
+        default="y",
+        choices=("y", "prev_stages", "lagged_cache", "lagged_reference", "all"),
+        help="Seed channel for --local-transpose-diagnostic-accepted-step.",
+    )
     args = parser.parse_args()
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
@@ -532,6 +539,7 @@ def main() -> None:
             reverse_setup.prepared_rollout.initial_carry,
             baseline_rollout.trace,
             accepted_step_index=accepted_step_index,
+            seed_mode=args.local_transpose_diagnostic_seed_mode,
         )
         diagnostic = jax.device_get(diagnostic)
         report = {
@@ -540,6 +548,7 @@ def main() -> None:
             "objective_name": args.objective,
             "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
             "diagnostic_accepted_step_index": accepted_step_index,
+            "diagnostic_seed_mode": str(args.local_transpose_diagnostic_seed_mode),
             "target_attempt_index": int(diagnostic.target_attempt_index),
             "found_target": bool(diagnostic.found_target),
             "lagged_response_valid_in": bool(diagnostic.lagged_response_valid_in),
@@ -552,6 +561,7 @@ def main() -> None:
         print(
             "[autodiff-gate] local transpose diagnostic: "
             f"accepted_step_index={accepted_step_index} "
+            f"seed_mode={args.local_transpose_diagnostic_seed_mode} "
             f"target_attempt_index={report['target_attempt_index']} "
             f"found_target={report['found_target']} "
             f"lagged_response_valid_in={report['lagged_response_valid_in']} "

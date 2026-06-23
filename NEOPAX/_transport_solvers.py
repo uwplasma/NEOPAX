@@ -6892,6 +6892,7 @@ def _radau_debug_local_accepted_step_transpose(
     trace: _RadauAdaptiveScheduleTrace,
     *,
     accepted_step_index: int,
+    seed_mode: str = "y",
 ) -> _RadauAcceptedStepTransposeDiagnostic:
     """Lightweight local dot-product check for one accepted-step VJP.
 
@@ -6912,15 +6913,43 @@ def _radau_debug_local_accepted_step_transpose(
             return jnp.zeros_like(arr)
         return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
+    seed_mode = str(seed_mode).strip().lower()
+    if seed_mode not in {"y", "prev_stages", "lagged_cache", "lagged_reference", "all"}:
+        raise ValueError(
+            "seed_mode must be one of {'y', 'prev_stages', 'lagged_cache', 'lagged_reference', 'all'}."
+        )
+
     def _deterministic_vec(size, *, phase):
         idx = jnp.arange(size, dtype=dtype)
         values = jnp.sin((idx + jnp.asarray(1.0 + phase, dtype=dtype)) * jnp.asarray(0.173, dtype=dtype))
         norm = jnp.linalg.norm(values)
         return values / jnp.maximum(norm, jnp.asarray(1.0, dtype=dtype))
 
+    def _seed_tree_like(tree, *, phase):
+        leaves, treedef = jax.tree_util.tree_flatten(tree, is_leaf=lambda x: x is None)
+        seeded_leaves = []
+        for leaf_index, leaf in enumerate(leaves):
+            if leaf is None:
+                seeded_leaves.append(None)
+                continue
+            leaf_arr = jnp.asarray(leaf)
+            if not jnp.issubdtype(leaf_arr.dtype, jnp.inexact):
+                seeded_leaves.append(jnp.zeros(leaf_arr.shape, dtype=jax.dtypes.float0))
+                continue
+            flat_seed = _deterministic_vec(
+                leaf_arr.size,
+                phase=phase + float(leaf_index) * 7.0,
+            ).reshape(leaf_arr.shape)
+            seeded_leaves.append(flat_seed.astype(leaf_arr.dtype))
+        return jax.tree_util.tree_unflatten(treedef, seeded_leaves)
+
     def _dot_tree(lhs, rhs):
         total = jnp.asarray(0.0, dtype=dtype)
-        for left_leaf, right_leaf in zip(jax.tree_util.tree_leaves(lhs), jax.tree_util.tree_leaves(rhs)):
+        lhs_leaves = jax.tree_util.tree_leaves(lhs, is_leaf=lambda x: x is None)
+        rhs_leaves = jax.tree_util.tree_leaves(rhs, is_leaf=lambda x: x is None)
+        for left_leaf, right_leaf in zip(lhs_leaves, rhs_leaves):
+            if left_leaf is None or right_leaf is None:
+                continue
             left_arr = jnp.asarray(left_leaf)
             right_arr = jnp.asarray(right_leaf)
             if jnp.issubdtype(left_arr.dtype, jnp.inexact) and jnp.issubdtype(right_arr.dtype, jnp.inexact):
@@ -7130,14 +7159,50 @@ def _radau_debug_local_accepted_step_transpose(
 
         return jax.lax.cond(local_branch_reuse, _reuse_branch, _rebuild_branch, operand=None)
 
-    y_direction = _deterministic_vec(target_carry.y.shape[0], phase=0.0)
-    y_cotangent = _deterministic_vec(target_carry.y.shape[0], phase=3.0)
-    carry_direction = dataclasses.replace(
-        jax.tree_util.tree_map(_zero_tangent_like, carry_for_step),
-        y=y_direction,
-    )
-    output_cotangent_template = jax.tree_util.tree_map(_zero_tangent_like, _local_step_reverse(carry_for_step))
-    output_cotangent = dataclasses.replace(output_cotangent_template, y=y_cotangent)
+    carry_direction = jax.tree_util.tree_map(_zero_tangent_like, carry_for_step)
+    if seed_mode in {"y", "all"}:
+        carry_direction = dataclasses.replace(
+            carry_direction,
+            y=_deterministic_vec(target_carry.y.shape[0], phase=0.0),
+        )
+    if seed_mode in {"prev_stages", "all"}:
+        carry_direction = dataclasses.replace(
+            carry_direction,
+            prev_stages=_deterministic_vec(target_carry.prev_stages.size, phase=1.0).reshape(target_carry.prev_stages.shape),
+        )
+    if seed_mode in {"lagged_cache", "all"}:
+        carry_direction = dataclasses.replace(
+            carry_direction,
+            lagged_response_cache=_seed_tree_like(target_carry.lagged_response_cache, phase=2.0),
+        )
+    if seed_mode in {"lagged_reference", "all"}:
+        carry_direction = dataclasses.replace(
+            carry_direction,
+            lagged_reference_y=_deterministic_vec(target_carry.lagged_reference_y.size, phase=3.0).reshape(target_carry.lagged_reference_y.shape),
+        )
+
+    output_carry_primal = _local_step_reverse(carry_for_step)
+    output_cotangent = jax.tree_util.tree_map(_zero_tangent_like, output_carry_primal)
+    if seed_mode in {"y", "all"}:
+        output_cotangent = dataclasses.replace(
+            output_cotangent,
+            y=_deterministic_vec(output_carry_primal.y.shape[0], phase=4.0),
+        )
+    if seed_mode in {"prev_stages", "all"}:
+        output_cotangent = dataclasses.replace(
+            output_cotangent,
+            prev_stages=_deterministic_vec(output_carry_primal.prev_stages.size, phase=5.0).reshape(output_carry_primal.prev_stages.shape),
+        )
+    if seed_mode in {"lagged_cache", "all"}:
+        output_cotangent = dataclasses.replace(
+            output_cotangent,
+            lagged_response_cache=_seed_tree_like(output_carry_primal.lagged_response_cache, phase=6.0),
+        )
+    if seed_mode in {"lagged_reference", "all"}:
+        output_cotangent = dataclasses.replace(
+            output_cotangent,
+            lagged_reference_y=_deterministic_vec(output_carry_primal.lagged_reference_y.size, phase=7.0).reshape(output_carry_primal.lagged_reference_y.shape),
+        )
 
     _, output_tangent = jax.jvp(_local_step_forward, (carry_for_step,), (carry_direction,))
     _, pullback = jax.vjp(_local_step_reverse, carry_for_step)
