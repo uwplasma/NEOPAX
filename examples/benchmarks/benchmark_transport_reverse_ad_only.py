@@ -490,7 +490,16 @@ def main() -> None:
         "--local-transpose-diagnostic-seed-mode",
         type=str,
         default="y",
-        choices=("y", "prev_stages", "lagged_cache", "lagged_reference", "all"),
+        choices=(
+            "y",
+            "prev_stages",
+            "lagged_cache",
+            "lagged_reference",
+            "y_lagged_cache",
+            "y_lagged_reference",
+            "lagged_cache_reference",
+            "all",
+        ),
         help="Seed channel for --local-transpose-diagnostic-accepted-step.",
     )
     args = parser.parse_args()
