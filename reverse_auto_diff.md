@@ -164,6 +164,65 @@ Next decisions:
 4. Keep reverse lane independent and JAX-native; do not introduce Python loops,
    NumPy step loops, or CPU-side replay to make reverse "work".
 
+### 2026-06-23 Full Reverse OOM Checkpoint
+
+A no-prefix reverse JIT run was attempted:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm
+```
+
+It failed during the first JIT call with:
+
+```text
+RESOURCE_EXHAUSTED while trying to allocate about 363.81 GiB
+```
+
+Reason:
+
+- With no `--accepted-step-limit`, the benchmark uses the solver `max_steps`
+  horizon for the compiled scan.
+- That is much larger than the realized accepted path we have validated in
+  small prefixes.
+- This is not a useful next debugging target until prefix scaling and graph-size
+  reduction are under control.
+
+Benchmark guard added:
+
+- `benchmark_transport_reverse_ad_only.py` now refuses no-prefix reverse runs
+  unless `--allow-full-reverse` is passed explicitly.
+- Use explicit prefixes while scaling reverse, for example:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm
+```
+
+Current known prefix result:
+
+```text
+accepted_step_limit=16
+reverse_compile_plus_execute_s = 4.462832e+02
+reverse_execute_s_mean         = 1.510171e+02
+
+dsoftmax_Er/dn0                       = -3.634210e+00
+dsoftmax_Er/dT0                       =  3.278763e+00
+dsoftmax_Er/ddensity_shape_power      = -8.247932e-02
+dsoftmax_Er/dtemperature_shape_power  =  4.484110e+00
+```
+
+The 16-step warm execution is much slower than the 2-step warm execution, so
+the next investigation should bracket scaling with 4 and 8 accepted steps and
+then reduce multi-step reverse replay graph/carry size.
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path

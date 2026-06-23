@@ -3514,6 +3514,191 @@ _execute_radau_accepted_step_trial_y_vjp_lagged_branch.defvjp(
 )
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 3, 9))
+def _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+    lagged_response_branch: str,
+) -> _RadauAcceptedStepCarry:
+    """Reverse wrapper for one accepted-step carry update.
+
+    This is the multi-step analogue of
+    `_execute_radau_accepted_step_trial_y_vjp_lagged_branch`: the output carry
+    exposes the same differentiable inter-step fields that forward JVP
+    propagates, while controller metadata remains fixed by the primal trace.
+    """
+
+    dtype = kernel_context.dtype
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    accepted_y = _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
+    return dataclasses.replace(
+        attempt_result.carry_after_attempt,
+        t=carry_in.t + attempt_result.trial_dt,
+        y=accepted_y,
+        dt=next_dt_value,
+        prev_error=jnp.maximum(
+            attempt_result.err_norm,
+            jnp.asarray(1.0e-12, dtype=dtype),
+        ),
+        prev_stages=attempt_result.stage_history,
+        prev_dt=attempt_result.trial_dt,
+        recent_reject_count=recent_reject_count_value,
+        regrowth_cooldown=regrowth_cooldown_value,
+        easy_growth_streak=easy_growth_streak_value,
+        lagged_response_valid=lagged_response_valid_value,
+        jacobian=attempt_result.jacobian_out,
+        cache_valid=attempt_result.cache_valid_out,
+        cache_dt=attempt_result.cache_dt_out,
+        cache_age=attempt_result.cache_age_out,
+        real_lu=attempt_result.real_lu_out,
+        real_piv=attempt_result.real_piv_out,
+        complex_lu=attempt_result.complex_lu_out,
+        complex_piv=attempt_result.complex_piv_out,
+        prev_theta_final=attempt_result.theta_final,
+        prev_newton_iter_count=attempt_result.newton_iter_count,
+    )
+
+
+def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_fwd(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+    lagged_response_branch: str,
+):
+    dtype = kernel_context.dtype
+    attempt_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    accepted_y = _project_flat_state_if_needed(attempt_result.trial_y, physics_context.project_flat)
+    next_carry = dataclasses.replace(
+        attempt_result.carry_after_attempt,
+        t=carry_in.t + attempt_result.trial_dt,
+        y=accepted_y,
+        dt=next_dt_value,
+        prev_error=jnp.maximum(
+            attempt_result.err_norm,
+            jnp.asarray(1.0e-12, dtype=dtype),
+        ),
+        prev_stages=attempt_result.stage_history,
+        prev_dt=attempt_result.trial_dt,
+        recent_reject_count=recent_reject_count_value,
+        regrowth_cooldown=regrowth_cooldown_value,
+        easy_growth_streak=easy_growth_streak_value,
+        lagged_response_valid=lagged_response_valid_value,
+        jacobian=attempt_result.jacobian_out,
+        cache_valid=attempt_result.cache_valid_out,
+        cache_dt=attempt_result.cache_dt_out,
+        cache_age=attempt_result.cache_age_out,
+        real_lu=attempt_result.real_lu_out,
+        real_piv=attempt_result.real_piv_out,
+        complex_lu=attempt_result.complex_lu_out,
+        complex_piv=attempt_result.complex_piv_out,
+        prev_theta_final=attempt_result.theta_final,
+        prev_newton_iter_count=attempt_result.newton_iter_count,
+    )
+    return next_carry, (carry_in, attempt_result)
+
+
+def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    residuals,
+    next_carry_bar,
+):
+    carry_in, primal_result = residuals
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _next_carry_tangent(carry_tangent):
+        tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+            kernel_context,
+            physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_in),
+            carry_tangent,
+            context,
+            primal_result,
+            lagged_response_branch=lagged_response_branch,
+        )
+        accepted_y_dot = _project_flat_state_if_needed(
+            tangent_attempt.trial_y,
+            physics_context.project_flat,
+        )
+        if physics_context.project_flat is not None:
+            _, accepted_y_dot = jax.jvp(
+                physics_context.project_flat,
+                (primal_result.trial_y,),
+                (tangent_attempt.trial_y,),
+            )
+        return dataclasses.replace(
+            tangent_attempt.carry_after_attempt,
+            t=carry_tangent.t,
+            y=accepted_y_dot,
+            dt=jnp.zeros_like(carry_tangent.dt),
+            prev_error=jnp.zeros_like(carry_tangent.prev_error),
+            prev_stages=tangent_attempt.stage_history,
+            prev_dt=jnp.zeros_like(carry_tangent.prev_dt),
+            recent_reject_count=jax.lax.stop_gradient(carry_tangent.recent_reject_count),
+            regrowth_cooldown=jax.lax.stop_gradient(carry_tangent.regrowth_cooldown),
+            easy_growth_streak=jax.lax.stop_gradient(carry_tangent.easy_growth_streak),
+            lagged_response_valid=jax.lax.stop_gradient(carry_tangent.lagged_response_valid),
+            jacobian=tangent_attempt.jacobian_out,
+            cache_valid=tangent_attempt.cache_valid_out,
+            cache_dt=tangent_attempt.cache_dt_out,
+            cache_age=tangent_attempt.cache_age_out,
+            real_lu=tangent_attempt.real_lu_out,
+            real_piv=tangent_attempt.real_piv_out,
+            complex_lu=tangent_attempt.complex_lu_out,
+            complex_piv=tangent_attempt.complex_piv_out,
+            prev_theta_final=tangent_attempt.theta_final,
+            prev_newton_iter_count=tangent_attempt.newton_iter_count,
+        )
+
+    zero_carry_tangent = jax.tree_util.tree_map(_zero_tangent_like, carry_in)
+    _, pullback = jax.vjp(_next_carry_tangent, zero_carry_tangent)
+    (carry_bar,) = pullback(next_carry_bar)
+    return (
+        carry_bar,
+        _zero_tangent_like(next_carry_bar.dt),
+        _zero_tangent_like(next_carry_bar.recent_reject_count),
+        _zero_tangent_like(next_carry_bar.regrowth_cooldown),
+        _zero_tangent_like(next_carry_bar.easy_growth_streak),
+        _zero_tangent_like(next_carry_bar.lagged_response_valid),
+    )
+
+
+_execute_radau_accepted_step_next_carry_vjp_lagged_branch.defvjp(
+    _execute_radau_accepted_step_next_carry_vjp_lagged_branch_fwd,
+    _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd,
+)
+
+
 def _execute_radau_accepted_step_attempt(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -6597,50 +6782,22 @@ def _radau_replay_realized_accepted_rollout(
 
         def _do_step(_):
             carry_for_step = dataclasses.replace(carry, dt=dt_value)
-            carry_for_primal_bookkeeping = jax.lax.stop_gradient(carry_for_step)
-            attempt_result = _execute_radau_accepted_step_attempt(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_primal_bookkeeping),
-                execution_context.attempt_context,
-            )
-            accepted_y = _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            next_carry = _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
                 execution_context.kernel_context,
                 execution_context.physics_context,
                 _radau_carry_with_forward_only_jvp_fields(carry_for_step),
                 execution_context.attempt_context,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
                 "reuse",
-            )
-            next_carry = dataclasses.replace(
-                attempt_result.carry_after_attempt,
-                t=carry.t + dt_value,
-                y=accepted_y,
-                dt=next_dt_value,
-                prev_error=jnp.maximum(
-                    attempt_result.err_norm,
-                    jnp.asarray(1.0e-12, dtype=dtype),
-                ),
-                prev_stages=attempt_result.stage_history,
-                prev_dt=dt_value,
-                recent_reject_count=recent_reject_count_value,
-                regrowth_cooldown=regrowth_cooldown_value,
-                easy_growth_streak=easy_growth_streak_value,
-                lagged_response_valid=lagged_response_valid_value,
-                jacobian=attempt_result.jacobian_out,
-                cache_valid=attempt_result.cache_valid_out,
-                cache_dt=attempt_result.cache_dt_out,
-                cache_age=attempt_result.cache_age_out,
-                real_lu=attempt_result.real_lu_out,
-                real_piv=attempt_result.real_piv_out,
-                complex_lu=attempt_result.complex_lu_out,
-                complex_piv=attempt_result.complex_piv_out,
-                prev_theta_final=attempt_result.theta_final,
-                prev_newton_iter_count=attempt_result.newton_iter_count,
             )
             scan_out = (
                 next_carry.y,
-                attempt_result.err_norm,
-                attempt_result.converged,
+                next_carry.prev_error,
+                jnp.asarray(True),
                 dt_value,
             )
             return next_carry, scan_out
