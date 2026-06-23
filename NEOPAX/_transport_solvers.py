@@ -3617,7 +3617,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_fwd(
         prev_theta_final=attempt_result.theta_final,
         prev_newton_iter_count=attempt_result.newton_iter_count,
     )
-    return next_carry, (carry_in, attempt_result)
+    return next_carry, carry_in
 
 
 def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
@@ -3628,7 +3628,13 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
     residuals,
     next_carry_bar,
 ):
-    carry_in, primal_result = residuals
+    carry_in = residuals
+    primal_result = _execute_radau_accepted_step_attempt(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
 
     def _zero_tangent_like(x):
         arr = jnp.asarray(x)
