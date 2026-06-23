@@ -52,6 +52,7 @@ class _ReverseStaticSetup:
     execution_context: object
     stop_after_accepted_steps: int | None
     max_total_steps: int
+    reverse_segment_length: int | None
 
 
 def _report_path(objective_name: str) -> Path:
@@ -310,6 +311,7 @@ def _reverse_objective_for_parameter_vector(
         reverse_setup.execution_context,
         reverse_setup.max_total_steps,
         reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
         initial_carry,
     )
     final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
@@ -324,6 +326,7 @@ def _prepare_reverse_static_setup(
     baseline_state,
     profile_cfg: dict,
     accepted_step_limit_override: int | None = None,
+    reverse_segment_length: int | None = None,
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -362,6 +365,7 @@ def _prepare_reverse_static_setup(
         execution_context=execution_context,
         stop_after_accepted_steps=stop_after_accepted_steps,
         max_total_steps=max_total_steps,
+        reverse_segment_length=reverse_segment_length,
     )
 
 
@@ -449,6 +453,15 @@ def main() -> None:
         help="Run an extra primal schedule rollout to print attempt/accepted counts before reverse AD.",
     )
     parser.add_argument(
+        "--reverse-segment-length",
+        type=int,
+        default=None,
+        help=(
+            "Optional reverse checkpoint segment length for accepted-step replay. "
+            "Omit for the current unsegmented reference path."
+        ),
+    )
+    parser.add_argument(
         "--timing-mode",
         choices=("eager", "jit-warm"),
         default="eager",
@@ -464,6 +477,11 @@ def main() -> None:
         help="Number of post-compile warm executions to time when --timing-mode=jit-warm.",
     )
     args = parser.parse_args()
+    reverse_segment_length = None
+    if args.reverse_segment_length is not None:
+        reverse_segment_length = int(args.reverse_segment_length)
+        if reverse_segment_length <= 0:
+            raise SystemExit("[autodiff-gate] --reverse-segment-length must be positive when provided.")
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -485,6 +503,7 @@ def main() -> None:
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         accepted_step_limit_override=args.accepted_step_limit,
+        reverse_segment_length=reverse_segment_length,
     )
 
     baseline_diag = None
@@ -543,6 +562,7 @@ def main() -> None:
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+        "reverse_segment_length": reverse_segment_length,
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
         "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
@@ -558,6 +578,7 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"reverse_segment_length={reverse_segment_length} "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )

@@ -223,6 +223,104 @@ The 16-step warm execution is much slower than the 2-step warm execution, so
 the next investigation should bracket scaling with 4 and 8 accepted steps and
 then reduce multi-step reverse replay graph/carry size.
 
+### 2026-06-23 Two-Step Reverse vs Forward Checkpoint
+
+Forward AD references for `softmax_Er` at `--accepted-step-limit 2` were run
+with:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter <parameter> \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode replay
+```
+
+Forward vs reverse comparison for `softmax_Er`:
+
+```text
+parameter                  forward AD        reverse AD        abs diff
+n0                        -3.578618e-01     -3.576914e-01     1.704e-04
+T0                         3.010300e-01      3.009718e-01     5.820e-05
+density_shape_power       -7.886158e-03     -7.886075e-03     8.300e-08
+temperature_shape_power    1.779141e-01      1.776649e-01     2.492e-04
+```
+
+Conclusion:
+
+- The one-step local reverse VJP was already correct for `T0`.
+- The two-step mismatch was caused by missing inter-step carry cotangents.
+- Adding the reverse-local full accepted-carry VJP recovered the 2-step
+  `softmax_Er` gradient for all four profile parameters.
+- To reduce memory pressure, the full-carry custom VJP now saves only
+  `carry_in` and recomputes the accepted-step attempt in backward instead of
+  saving the full `attempt_result` residual.
+
+Next target:
+
+- correctness for longer prefixes is plausible, but the main blocker is now
+  compile/memory scaling.
+- The reverse path should keep recomputing local step physics from compact
+  accepted-step schedule data, matching the forward lane philosophy.
+- Do not solve scaling by saving per-step full attempt payloads.
+
+### 2026-06-23 Segmented Reverse Checkpointing Start
+
+Step 2 of the checkpointing plan has started.
+
+Implemented first controlled segmented reverse mode:
+
+- `benchmark_transport_reverse_ad_only.py` has `--reverse-segment-length`.
+- `_radau_adaptive_final_y_realized_schedule_vjp(...)` now accepts a static
+  `reverse_segment_length`.
+- When `reverse_segment_length > 0` and an explicit
+  `--accepted-step-limit` is provided, the reverse VJP:
+  1. compacts the realized accepted-step schedule,
+  2. pads it to a whole number of segments,
+  3. saves segment-boundary carries,
+  4. runs the backward pass as a reverse `lax.scan` over segments,
+  5. recomputes each segment locally and applies the accepted-step pullback.
+
+This is a correctness-first segmented path. It intentionally keeps the
+unsegmented path available by default for comparison.
+
+First validation commands:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1
+```
+
+Then:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2
+```
+
+Expected 2-step `softmax_Er` reverse gradients should remain close to:
+
+```text
+n0                       -3.576914e-01
+T0                        3.009718e-01
+density_shape_power      -7.886075e-03
+temperature_shape_power   1.776649e-01
+```
+
+If segment lengths 1 and 2 match, test `accepted_step_limit=4` with
+`reverse_segment_length=2` next.
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path

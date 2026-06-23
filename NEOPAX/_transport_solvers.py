@@ -7855,11 +7855,12 @@ def _radau_adaptive_final_y_realized_schedule_step_fused_jvp(
     return primal_out, tangent_out
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
 def _radau_adaptive_final_y_realized_schedule_vjp(
     execution_context: _RadauSolveExecutionContext,
     max_total_steps: int,
     stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
     carry0: _RadauAcceptedStepCarry,
 ):
     """Final adaptive state with a solve-level VJP over the realized accepted schedule."""
@@ -7877,6 +7878,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     execution_context: _RadauSolveExecutionContext,
     max_total_steps: int,
     stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
     carry0: _RadauAcceptedStepCarry,
 ):
     rollout = _radau_adaptive_schedule_rollout(
@@ -7892,6 +7894,54 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
     next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
     next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    segment_start_carries = None
+    segmented_final_carry = None
+    segmented_replay_arrays = None
+    if reverse_segment_length is not None and int(reverse_segment_length) > 0 and stop_after_accepted_steps is not None:
+        accepted_count = int(stop_after_accepted_steps)
+        segment_length = int(reverse_segment_length)
+        segment_count = (accepted_count + segment_length - 1) // segment_length
+        padded_count = segment_count * segment_length
+        accepted_indices = jnp.nonzero(active_mask, size=accepted_count, fill_value=0)[0]
+
+        def _compact_and_pad(values):
+            compact = jnp.take(values, accepted_indices, axis=0)
+            pad_count = padded_count - accepted_count
+            if pad_count == 0:
+                return compact
+            pad_values = jnp.repeat(compact[-1:], pad_count, axis=0)
+            return jnp.concatenate([compact, pad_values], axis=0)
+
+        replay_active_mask = jnp.arange(padded_count) < accepted_count
+        replay_attempted_dts = _compact_and_pad(attempted_dts)
+        replay_next_dts = _compact_and_pad(next_dts)
+        replay_next_recent_reject_count = _compact_and_pad(next_recent_reject_count)
+        replay_next_regrowth_cooldown = _compact_and_pad(next_regrowth_cooldown)
+        replay_next_easy_growth_streak = _compact_and_pad(next_easy_growth_streak)
+        replay_next_lagged_response_valid = _compact_and_pad(next_lagged_response_valid)
+        segmented_replay_arrays = (
+            replay_active_mask.reshape((segment_count, segment_length)),
+            replay_attempted_dts.reshape((segment_count, segment_length)),
+            replay_next_dts.reshape((segment_count, segment_length)),
+            replay_next_recent_reject_count.reshape((segment_count, segment_length)),
+            replay_next_regrowth_cooldown.reshape((segment_count, segment_length)),
+            replay_next_easy_growth_streak.reshape((segment_count, segment_length)),
+            replay_next_lagged_response_valid.reshape((segment_count, segment_length)),
+        )
+
+        def _segment_forward(carry, xs):
+            segment_rollout = _radau_replay_realized_accepted_rollout(
+                execution_context,
+                carry,
+                *xs,
+            )
+            return segment_rollout.final_carry, carry
+
+        segmented_final_carry, segment_start_carries = jax.lax.scan(
+            _segment_forward,
+            carry0,
+            segmented_replay_arrays,
+        )
     residuals = (
         carry0,
         active_mask,
@@ -7901,6 +7951,9 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         next_regrowth_cooldown,
         next_easy_growth_streak,
         next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
     )
     return rollout.final_carry.y, residuals
 
@@ -7909,6 +7962,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     execution_context: _RadauSolveExecutionContext,
     max_total_steps: int,
     stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
     residuals,
     final_y_bar,
 ):
@@ -7921,7 +7975,50 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         next_regrowth_cooldown,
         next_easy_growth_streak,
         next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
     ) = residuals
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    if (
+        reverse_segment_length is not None
+        and int(reverse_segment_length) > 0
+        and stop_after_accepted_steps is not None
+        and int(stop_after_accepted_steps) > 1
+    ):
+        final_carry_bar = dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry),
+            y=final_y_bar,
+        )
+
+        def _segment_bwd(carry_bar, xs):
+            segment_start_carry, segment_arrays = xs
+
+            def _segment_replay(carry_value):
+                segment_rollout = _radau_replay_realized_accepted_rollout(
+                    execution_context,
+                    carry_value,
+                    *segment_arrays,
+                )
+                return segment_rollout.final_carry
+
+            _, pullback = jax.vjp(_segment_replay, segment_start_carry)
+            (start_carry_bar,) = pullback(carry_bar)
+            return start_carry_bar, None
+
+        carry0_bar, _ = jax.lax.scan(
+            _segment_bwd,
+            final_carry_bar,
+            (segment_start_carries, segmented_replay_arrays),
+            reverse=True,
+        )
+        return (carry0_bar,)
 
     if stop_after_accepted_steps == 1:
         def _first_accepted_step(carry_value):
