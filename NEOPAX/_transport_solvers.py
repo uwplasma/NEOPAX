@@ -6638,46 +6638,22 @@ def _radau_replay_realized_attempt_rollout(
         def _do_attempt(_):
             def _accepted_attempt(__):
                 carry_for_step = dataclasses.replace(carry, dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+                next_carry = _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     _radau_carry_with_forward_only_jvp_fields(carry_for_step),
                     execution_context.attempt_context,
-                )
-                accepted_y = _project_flat_state_if_needed(
-                    attempt_result.trial_y,
-                    execution_context.physics_context.project_flat,
-                )
-                next_carry = dataclasses.replace(
-                    attempt_result.carry_after_attempt,
-                    t=carry.t + dt_value,
-                    y=accepted_y,
-                    dt=next_dt_value,
-                    prev_error=jnp.maximum(
-                        attempt_result.err_norm,
-                        jnp.asarray(1.0e-12, dtype=dtype),
-                    ),
-                    prev_stages=attempt_result.stage_history,
-                    prev_dt=dt_value,
-                    recent_reject_count=recent_reject_count_value,
-                    regrowth_cooldown=regrowth_cooldown_value,
-                    easy_growth_streak=easy_growth_streak_value,
-                    lagged_response_valid=lagged_response_valid_value,
-                    jacobian=attempt_result.jacobian_out,
-                    cache_valid=attempt_result.cache_valid_out,
-                    cache_dt=attempt_result.cache_dt_out,
-                    cache_age=attempt_result.cache_age_out,
-                    real_lu=attempt_result.real_lu_out,
-                    real_piv=attempt_result.real_piv_out,
-                    complex_lu=attempt_result.complex_lu_out,
-                    complex_piv=attempt_result.complex_piv_out,
-                    prev_theta_final=attempt_result.theta_final,
-                    prev_newton_iter_count=attempt_result.newton_iter_count,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                    "reuse",
                 )
                 scan_out = (
                     next_carry.y,
-                    attempt_result.err_norm,
-                    attempt_result.converged,
+                    next_carry.prev_error,
+                    jnp.asarray(True),
                     dt_value,
                 )
                 return next_carry, scan_out
@@ -7887,7 +7863,8 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    active_mask = jax.lax.stop_gradient(jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask))
+    active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
     attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
     next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
     next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
@@ -7898,21 +7875,27 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     segmented_final_carry = None
     segmented_replay_arrays = None
     if reverse_segment_length is not None and int(reverse_segment_length) > 0 and stop_after_accepted_steps is not None:
-        accepted_count = int(stop_after_accepted_steps)
         segment_length = int(reverse_segment_length)
-        segment_count = (accepted_count + segment_length - 1) // segment_length
+        attempt_count = int(active_mask.shape[0])
+        segment_count = (attempt_count + segment_length - 1) // segment_length
         padded_count = segment_count * segment_length
-        accepted_indices = jnp.nonzero(active_mask, size=accepted_count, fill_value=0)[0]
 
         def _compact_and_pad(values):
-            compact = jnp.take(values, accepted_indices, axis=0)
-            pad_count = padded_count - accepted_count
+            compact = values
+            pad_count = padded_count - attempt_count
             if pad_count == 0:
                 return compact
             pad_values = jnp.repeat(compact[-1:], pad_count, axis=0)
             return jnp.concatenate([compact, pad_values], axis=0)
 
-        replay_active_mask = jnp.arange(padded_count) < accepted_count
+        replay_active_mask = jnp.concatenate(
+            [
+                active_mask,
+                jnp.zeros((padded_count - attempt_count,), dtype=jnp.bool_),
+            ],
+            axis=0,
+        )
+        replay_accepted_mask = _compact_and_pad(accepted_mask)
         replay_attempted_dts = _compact_and_pad(attempted_dts)
         replay_next_dts = _compact_and_pad(next_dts)
         replay_next_recent_reject_count = _compact_and_pad(next_recent_reject_count)
@@ -7921,6 +7904,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         replay_next_lagged_response_valid = _compact_and_pad(next_lagged_response_valid)
         segmented_replay_arrays = (
             replay_active_mask.reshape((segment_count, segment_length)),
+            replay_accepted_mask.reshape((segment_count, segment_length)),
             replay_attempted_dts.reshape((segment_count, segment_length)),
             replay_next_dts.reshape((segment_count, segment_length)),
             replay_next_recent_reject_count.reshape((segment_count, segment_length)),
@@ -7930,7 +7914,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         )
 
         def _segment_forward(carry, xs):
-            segment_rollout = _radau_replay_realized_accepted_rollout(
+            segment_rollout = _radau_replay_realized_attempt_rollout(
                 execution_context,
                 carry,
                 *xs,
@@ -7945,6 +7929,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     residuals = (
         carry0,
         active_mask,
+        accepted_mask,
         attempted_dts,
         next_dts,
         next_recent_reject_count,
@@ -7969,6 +7954,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
     (
         carry0,
         active_mask,
+        accepted_mask,
         attempted_dts,
         next_dts,
         next_recent_reject_count,
@@ -8001,7 +7987,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_start_carry, segment_arrays = xs
 
             def _segment_replay(carry_value):
-                segment_rollout = _radau_replay_realized_accepted_rollout(
+                segment_rollout = _radau_replay_realized_attempt_rollout(
                     execution_context,
                     carry_value,
                     *segment_arrays,
@@ -8022,7 +8008,8 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
     if stop_after_accepted_steps == 1:
         def _first_accepted_step(carry_value):
-            accepted_index = jnp.argmax(jnp.asarray(active_mask, dtype=jnp.int32))
+            accepted_active_mask = jnp.logical_and(active_mask, accepted_mask)
+            accepted_index = jnp.argmax(jnp.asarray(accepted_active_mask, dtype=jnp.int32))
             dt_value = jnp.asarray(attempted_dts[accepted_index], dtype=execution_context.dtype)
             carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
             return _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
@@ -8037,36 +8024,18 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         (carry0_bar,) = pullback(final_y_bar)
         return (carry0_bar,)
 
-    if stop_after_accepted_steps is not None:
-        accepted_count = int(stop_after_accepted_steps)
-        accepted_indices = jnp.nonzero(active_mask, size=accepted_count, fill_value=0)[0]
-        replay_active_mask = jnp.ones((accepted_count,), dtype=jnp.bool_)
-        replay_attempted_dts = jnp.take(attempted_dts, accepted_indices, axis=0)
-        replay_next_dts = jnp.take(next_dts, accepted_indices, axis=0)
-        replay_next_recent_reject_count = jnp.take(next_recent_reject_count, accepted_indices, axis=0)
-        replay_next_regrowth_cooldown = jnp.take(next_regrowth_cooldown, accepted_indices, axis=0)
-        replay_next_easy_growth_streak = jnp.take(next_easy_growth_streak, accepted_indices, axis=0)
-        replay_next_lagged_response_valid = jnp.take(next_lagged_response_valid, accepted_indices, axis=0)
-    else:
-        replay_active_mask = active_mask
-        replay_attempted_dts = attempted_dts
-        replay_next_dts = next_dts
-        replay_next_recent_reject_count = next_recent_reject_count
-        replay_next_regrowth_cooldown = next_regrowth_cooldown
-        replay_next_easy_growth_streak = next_easy_growth_streak
-        replay_next_lagged_response_valid = next_lagged_response_valid
-
     def _replay(carry_value):
-        replay = _radau_replay_realized_accepted_rollout(
+        replay = _radau_replay_realized_attempt_rollout(
             execution_context,
             carry_value,
-            replay_active_mask,
-            replay_attempted_dts,
-            replay_next_dts,
-            replay_next_recent_reject_count,
-            replay_next_regrowth_cooldown,
-            replay_next_easy_growth_streak,
-            replay_next_lagged_response_valid,
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
         )
         return replay.final_carry.y
 

@@ -321,6 +321,30 @@ temperature_shape_power   1.776649e-01
 If segment lengths 1 and 2 match, test `accepted_step_limit=4` with
 `reverse_segment_length=2` next.
 
+### 2026-06-23 Sixteen-Step Forward References
+
+Forward AD references for `softmax_Er` at `--accepted-step-limit 16`:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter <parameter> \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode replay
+```
+
+Reference `softmax_Er` gradients:
+
+```text
+n0                       -3.759631e+00
+T0                        3.054047e+00
+density_shape_power      -8.518430e-02
+temperature_shape_power   3.214063e+00
+```
+
+These should be used to compare the reverse 16-step `softmax_Er` row.
+
 ### Goal
 Make the transport reverse path mirror the same accepted-step AD contract that forward mode already uses:
 - same primal replay path
