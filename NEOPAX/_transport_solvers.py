@@ -6711,37 +6711,15 @@ def _radau_replay_realized_attempt_rollout(
                 return next_carry, scan_out
 
             def _rejected_attempt(__):
-                carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry), dt=dt_value)
-                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                )
-                next_carry = dataclasses.replace(
-                    carry,
-                    dt=next_dt_value,
-                    recent_reject_count=recent_reject_count_value,
-                    regrowth_cooldown=regrowth_cooldown_value,
-                    easy_growth_streak=easy_growth_streak_value,
-                    lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
-                    lagged_response_valid=lagged_response_valid_value,
-                    lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
-                    jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
-                    cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
-                    cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
-                    cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
-                    real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
-                    real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
-                    complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
-                    complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
-                    prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
-                    prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
-                )
+                # The forward JVP lane keeps the derivative replay carry fixed
+                # across rejected attempts. Rejected attempts only determine the
+                # primal realized schedule; they must not update the accepted-map
+                # replay carry, even with stopped gradients.
+                next_carry = carry
                 scan_out = (
                     next_carry.y,
-                    jax.lax.stop_gradient(attempt_result.err_norm),
-                    jax.lax.stop_gradient(attempt_result.converged),
+                    jnp.asarray(jnp.inf, dtype=dtype),
+                    jnp.asarray(False),
                     jnp.asarray(0.0, dtype=dtype),
                 )
                 return next_carry, scan_out
