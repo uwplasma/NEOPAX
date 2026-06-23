@@ -1690,3 +1690,104 @@ AD recovery:
 - branch/control decisions are primal metadata
 - local derivative rules must be specialized enough that unused heavy branches
   are not traced into the compiled reverse graph
+
+## 2026-06-23 current reverse-AD checkpoint
+
+Current validated forward-AD reference for `softmax_Er`, 16 accepted steps,
+`--radau-jacobian-reuse-mode legacy`, replay fusion mode:
+
+```text
+dsoftmax_Er/dn0 = -3.759631e+00
+dsoftmax_Er/dT0 =  3.054047e+00
+dsoftmax_Er/ddensity_shape_power = -8.518430e-02
+dsoftmax_Er/dtemperature_shape_power =  3.214063e+00
+```
+
+Latest useful reverse command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4
+```
+
+State after the accepted-branch and rejected-carry fixes, before the reverted
+generic tangent experiment:
+
+```text
+dsoftmax_Er/dn0 = -3.736527e+00
+dsoftmax_Er/dT0 =  3.042112e+00
+dsoftmax_Er/ddensity_shape_power = -8.490155e-02
+dsoftmax_Er/dtemperature_shape_power =  3.172378e+00
+```
+
+Relative mismatch against forward was roughly:
+
+```text
+n0: 0.61%
+T0: 0.39%
+density_shape_power: 0.33%
+temperature_shape_power: 1.30%
+```
+
+Changes that should be kept:
+
+- Accepted-step reverse replay is branch-aware: it dispatches `"reuse"` or
+  `"rebuild"` from the incoming carry's `lagged_response_valid`, instead of
+  hard-coding `"reuse"`.
+- Rebuild branch cotangents are routed through
+  `physics_context.pullback_build_lagged_response(...)`.
+- Rebuild branch also routes the `lagged_reference_y` cotangent back into the
+  incoming flat state before zeroing cache/reference cotangents.
+- Rejected attempts in `_radau_replay_realized_attempt_rollout(...)` leave the
+  derivative replay carry unchanged. This matches the forward-JVP contract:
+  rejected attempts determine the primal schedule only and must not update the
+  accepted-map replay carry, even with stopped gradients.
+
+Experiment that was reverted:
+
+- Removing `lagged_response_branch="reuse"` inside the local reverse VJP
+  tangent map caused all reverse gradients to become exactly zero for the
+  16-step run.
+- That generic local tangent experiment was reverted. Keep the stable
+  forced-reuse local tangent inside the custom VJP until a more explicit local
+  transpose is implemented.
+
+The all-zero bad run was:
+
+```text
+dsoftmax_Er/dn0 = 0
+dsoftmax_Er/dT0 = 0
+dsoftmax_Er/ddensity_shape_power = 0
+dsoftmax_Er/dtemperature_shape_power = 0
+```
+
+Current interpretation:
+
+- The large earlier 16-step drift was mainly from rejected attempts mutating
+  the derivative replay carry and from accepted-step lagged branch mismatch.
+- The remaining 0.3-1.3% mismatch is likely a smaller local-adjoint contract
+  mismatch, not a whole-lane failure.
+- Reverse memory/compile time increased when branch-aware `lax.cond` was added,
+  because XLA traces both reuse and rebuild branches. The second RAM hill in
+  the run is likely this branch-aware reverse graph.
+
+Recommended next steps:
+
+1. Re-test the current code after the revert to confirm the near-match values
+   above are restored.
+2. Add a lightweight local accepted-step transpose diagnostic for the first
+   accepted step where forward and reverse begin to differ beyond tolerance.
+3. Do not reintroduce rejected-step derivative carry updates.
+4. Once correctness is nailed down, reduce memory by replacing dynamic per-step
+   branch `lax.cond` with static branch/rebuild segmentation from the primal
+   trace.
+5. Reverse cannot be primal/tangent fused like forward JVP because the final
+   cotangent is known only after the forward pass. The reverse analogue is a
+   checkpointed custom VJP: store compact checkpoints/branch masks in the
+   forward pass, recompute short primal segments in the backward pass, and apply
+   local VJPs.
