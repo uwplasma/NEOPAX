@@ -3470,6 +3470,7 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
             lagged_response_cache=dlagged_response_cache,
             lagged_reference_y=dlagged_reference_y,
         )
+        tangent_lagged_branch = None if lagged_response_branch == "reuse" else "reuse"
         tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
             kernel_context,
             physics_context,
@@ -3477,7 +3478,7 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
             carry_tangent,
             context,
             primal_result,
-            lagged_response_branch="reuse",
+            lagged_response_branch=tangent_lagged_branch,
         )
         return tangent_attempt.trial_y
 
@@ -3664,6 +3665,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
     )
 
     def _next_carry_tangent(carry_tangent):
+        tangent_lagged_branch = None if lagged_response_branch == "reuse" else "reuse"
         tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
             kernel_context,
             physics_context,
@@ -3671,7 +3673,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             carry_tangent,
             context,
             primal_result,
-            lagged_response_branch="reuse",
+            lagged_response_branch=tangent_lagged_branch,
         )
         accepted_y_dot = _project_flat_state_if_needed(
             tangent_attempt.trial_y,
