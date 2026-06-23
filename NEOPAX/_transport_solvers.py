@@ -3463,7 +3463,6 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
             carry_tangent,
             context,
             primal_result,
-            lagged_response_branch="reuse",
         )
         return tangent_attempt.trial_y
 
@@ -3657,7 +3656,6 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             carry_tangent,
             context,
             primal_result,
-            lagged_response_branch="reuse",
         )
         accepted_y_dot = _project_flat_state_if_needed(
             tangent_attempt.trial_y,
