@@ -328,6 +328,7 @@ def _prepare_reverse_static_setup(
     profile_cfg: dict,
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
+    reverse_direct_stage_adjoint: bool = False,
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -348,6 +349,14 @@ def _prepare_reverse_static_setup(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
+    if reverse_direct_stage_adjoint:
+        execution_context = dataclasses.replace(
+            execution_context,
+            physics_context=dataclasses.replace(
+                execution_context.physics_context,
+                reverse_direct_stage_adjoint=True,
+            ),
+        )
     stop_after_accepted_steps = (
         int(accepted_step_limit_override)
         if accepted_step_limit_override is not None
@@ -463,6 +472,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-direct-stage-adjoint",
+        action="store_true",
+        help=(
+            "Use the reverse-only structured accepted-step adjoint. This is the default; "
+            "the flag is kept as an explicit marker for old command lines."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-transpose-fallback",
+        action="store_true",
+        help=(
+            "Use the older transpose-of-forward-tangent helper instead of the "
+            "structured reverse accepted-step adjoint. Intended only for comparisons."
+        ),
+    )
+    parser.add_argument(
         "--timing-mode",
         choices=("eager", "jit-warm"),
         default="eager",
@@ -502,12 +527,45 @@ def main() -> None:
         ),
         help="Seed channel for --local-transpose-diagnostic-accepted-step.",
     )
+    parser.add_argument(
+        "--local-transpose-diagnostic-input-seed-mode",
+        type=str,
+        default=None,
+        choices=(
+            "y",
+            "prev_stages",
+            "lagged_cache",
+            "lagged_reference",
+            "y_lagged_cache",
+            "y_lagged_reference",
+            "lagged_cache_reference",
+            "all",
+        ),
+        help="Optional input tangent seed channel. Defaults to --local-transpose-diagnostic-seed-mode.",
+    )
+    parser.add_argument(
+        "--local-transpose-diagnostic-output-seed-mode",
+        type=str,
+        default=None,
+        choices=(
+            "y",
+            "prev_stages",
+            "lagged_cache",
+            "lagged_reference",
+            "y_lagged_cache",
+            "y_lagged_reference",
+            "lagged_cache_reference",
+            "all",
+        ),
+        help="Optional output cotangent seed channel. Defaults to --local-transpose-diagnostic-seed-mode.",
+    )
     args = parser.parse_args()
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
         reverse_segment_length = int(args.reverse_segment_length)
         if reverse_segment_length <= 0:
             raise SystemExit("[autodiff-gate] --reverse-segment-length must be positive when provided.")
+    reverse_direct_stage_adjoint = not bool(args.reverse_transpose_fallback)
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -530,6 +588,7 @@ def main() -> None:
         profile_cfg=profile_cfg,
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=reverse_segment_length,
+        reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
     )
 
     if args.local_transpose_diagnostic_accepted_step is not None:
@@ -549,8 +608,20 @@ def main() -> None:
             baseline_rollout.trace,
             accepted_step_index=accepted_step_index,
             seed_mode=args.local_transpose_diagnostic_seed_mode,
+            input_seed_mode=args.local_transpose_diagnostic_input_seed_mode,
+            output_seed_mode=args.local_transpose_diagnostic_output_seed_mode,
         )
         diagnostic = jax.device_get(diagnostic)
+        input_seed_mode = (
+            args.local_transpose_diagnostic_seed_mode
+            if args.local_transpose_diagnostic_input_seed_mode is None
+            else args.local_transpose_diagnostic_input_seed_mode
+        )
+        output_seed_mode = (
+            args.local_transpose_diagnostic_seed_mode
+            if args.local_transpose_diagnostic_output_seed_mode is None
+            else args.local_transpose_diagnostic_output_seed_mode
+        )
         report = {
             "mode": "transport_reverse_ad_only_local_transpose_diagnostic",
             "config_path": str(Path(args.config)),
@@ -558,15 +629,14 @@ def main() -> None:
             "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
             "diagnostic_accepted_step_index": accepted_step_index,
             "diagnostic_seed_mode": str(args.local_transpose_diagnostic_seed_mode),
+            "diagnostic_input_seed_mode": str(input_seed_mode),
+            "diagnostic_output_seed_mode": str(output_seed_mode),
             "target_attempt_index": int(diagnostic.target_attempt_index),
             "found_target": bool(diagnostic.found_target),
             "lagged_response_valid_in": bool(diagnostic.lagged_response_valid_in),
             "local_branch_reuse": bool(diagnostic.local_branch_reuse),
             "lhs_v_dot_ju": float(diagnostic.lhs_v_dot_ju),
             "rhs_jtv_dot_u": float(diagnostic.rhs_jtv_dot_u),
-            "lhs_additivity_residual": float(diagnostic.lhs_additivity_residual),
-            "rhs_additivity_residual": float(diagnostic.rhs_additivity_residual),
-            "additivity_residual_abs_err": float(diagnostic.additivity_residual_abs_err),
             "abs_err": float(diagnostic.abs_err),
             "rel_err": float(diagnostic.rel_err),
         }
@@ -574,6 +644,8 @@ def main() -> None:
             "[autodiff-gate] local transpose diagnostic: "
             f"accepted_step_index={accepted_step_index} "
             f"seed_mode={args.local_transpose_diagnostic_seed_mode} "
+            f"input_seed_mode={input_seed_mode} "
+            f"output_seed_mode={output_seed_mode} "
             f"target_attempt_index={report['target_attempt_index']} "
             f"found_target={report['found_target']} "
             f"lagged_response_valid_in={report['lagged_response_valid_in']} "
@@ -586,13 +658,6 @@ def main() -> None:
             f"abs_err={report['abs_err']:.6e} "
             f"rel_err={report['rel_err']:.6e}"
         )
-        if args.local_transpose_diagnostic_seed_mode == "y_lagged_cache":
-            print(
-                "[autodiff-gate] local transpose additivity residuals: "
-                f"lhs={report['lhs_additivity_residual']:.6e} "
-                f"rhs={report['rhs_additivity_residual']:.6e} "
-                f"abs_err={report['additivity_residual_abs_err']:.6e}"
-            )
         outpath = _report_path(args.objective)
         outpath.write_text(json.dumps(report, indent=2))
         print(f"Wrote {outpath.relative_to(ROOT)}")
@@ -655,6 +720,8 @@ def main() -> None:
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
+        "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
+        "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
         "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
@@ -671,6 +738,7 @@ def main() -> None:
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
         f"reverse_segment_length={reverse_segment_length} "
+        f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )

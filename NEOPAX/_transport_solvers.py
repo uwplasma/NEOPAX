@@ -2485,9 +2485,6 @@ class _RadauAcceptedStepTransposeDiagnostic:
     local_branch_reuse: Any
     lhs_v_dot_ju: Any
     rhs_jtv_dot_u: Any
-    lhs_additivity_residual: Any
-    rhs_additivity_residual: Any
-    additivity_residual_abs_err: Any
     abs_err: Any
     rel_err: Any
 
@@ -2714,6 +2711,7 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
+    reverse_direct_stage_adjoint: bool = False
 
 
 @jax.tree_util.register_dataclass
@@ -3135,26 +3133,6 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     def _exact_lagged_cache_tangent(_):
         z_final = primal_result.stage_history
 
-        def _residual_wrt_z(z_flat):
-            f0_local = _radau_eval_rhs(
-                carry_in.t,
-                carry_in.y,
-                lagged_response,
-                physics_context.flat_rhs,
-                physics_context.flat_rhs_with_lagged_response,
-            )
-            return _radau_stage_residual(
-                kernel_context,
-                physics_context,
-                flat_y=carry_in.y,
-                t_value=carry_in.t,
-                h_value=primal_result.trial_dt,
-                z_flat=z_flat,
-                f0=f0_local,
-                jacobian_ref=primal_result.jacobian_out,
-                lagged_response=lagged_response,
-            )
-
         def _residual_wrt_inputs(flat_y, h_scalar, lagged_response_value):
             f0_local = _radau_eval_rhs(
                 carry_in.t,
@@ -3465,38 +3443,105 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
         lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
     )
 
-    def _trial_y_tangent(dy, dlagged_response_cache, dlagged_reference_y):
-        carry_tangent = dataclasses.replace(
-            jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map),
-            y=dy,
-            dt=jnp.asarray(0.0, dtype=kernel_context.dtype),
-            lagged_response_cache=dlagged_response_cache,
-            lagged_reference_y=dlagged_reference_y,
-        )
-        tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+    def _structured_trial_y_adjoint(_):
+        lagged_response, _, _ = _radau_prepare_lagged_response(
             kernel_context,
-            physics_context,
             carry_for_linear_map,
-            carry_tangent,
-            context,
-            primal_result,
-            lagged_response_branch="reuse",
+            physics_context.unpack_flat,
+            physics_context.project_flat,
+            physics_context.build_lagged_response,
         )
-        return tangent_attempt.trial_y
 
-    zero_dy = jnp.zeros_like(carry_in.y)
-    zero_lagged_response_cache = _radau_align_tangent_tree_to_primal(
-        None,
-        primal_result.carry_after_attempt.lagged_response_cache,
-    )
-    zero_lagged_reference_y = jnp.zeros_like(primal_result.carry_after_attempt.lagged_reference_y)
-    _, pullback = jax.vjp(
-        _trial_y_tangent,
-        zero_dy,
-        zero_lagged_response_cache,
-        zero_lagged_reference_y,
-    )
-    dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = pullback(trial_y_bar)
+        if lagged_response is None:
+            return _transpose_trial_y_tangent_helper_adjoint(None)
+
+        primal_trial_y_bar = trial_y_bar
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
+            (primal_trial_y_bar,) = project_pullback(trial_y_bar)
+
+        stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        dz_bar = (
+            primal_result.trial_dt
+            * kernel_context.b[:, None]
+            * jnp.asarray(primal_trial_y_bar, dtype=kernel_context.dtype)[None, :]
+        )
+
+        stage_rhs_bar = _radau_apply_stage_linear_transpose_solve(
+            kernel_context,
+            rhs=dz_bar.reshape((-1,)),
+            real_lu_out=primal_result.real_lu_out,
+            real_piv_out=primal_result.real_piv_out,
+            complex_lu_out=primal_result.complex_lu_out,
+            complex_piv_out=primal_result.complex_piv_out,
+            skip_zero_rhs_shortcut=True,
+        ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+
+        stage_state_source_bar = stage_rhs_bar @ primal_result.jacobian_out
+        stage_state_source = kernel_context.a @ stages_final
+        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+        stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_state_source
+
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
+
+        _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+        (dlagged_response_cache_bar,) = lagged_pullback(stage_rhs_bar)
+
+        dy_bar_value = (
+            jnp.asarray(primal_trial_y_bar, dtype=kernel_context.dtype)
+            + jnp.sum(stage_state_source_bar, axis=0)
+        )
+        dlagged_reference_y_bar_value = jnp.zeros_like(primal_result.carry_after_attempt.lagged_reference_y)
+        return dy_bar_value, dlagged_response_cache_bar, dlagged_reference_y_bar_value
+
+    def _transpose_trial_y_tangent_helper_adjoint(_):
+        def _trial_y_tangent(dy, dlagged_response_cache, dlagged_reference_y):
+            carry_tangent = dataclasses.replace(
+                jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map),
+                y=dy,
+                dt=jnp.asarray(0.0, dtype=kernel_context.dtype),
+                lagged_response_cache=dlagged_response_cache,
+                lagged_reference_y=dlagged_reference_y,
+            )
+            tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+                kernel_context,
+                physics_context,
+                carry_for_linear_map,
+                carry_tangent,
+                context,
+                primal_result,
+                lagged_response_branch="reuse",
+            )
+            return _project_flat_state_if_needed(tangent_attempt.trial_y, physics_context.project_flat)
+
+        zero_dy = jnp.zeros_like(carry_in.y)
+        zero_lagged_response_cache = _radau_align_tangent_tree_to_primal(
+            None,
+            primal_result.carry_after_attempt.lagged_response_cache,
+        )
+        zero_lagged_reference_y = jnp.zeros_like(primal_result.carry_after_attempt.lagged_reference_y)
+        _, pullback = jax.vjp(
+            _trial_y_tangent,
+            zero_dy,
+            zero_lagged_response_cache,
+            zero_lagged_reference_y,
+        )
+        return pullback(trial_y_bar)
+
+    if bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
+        dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = _structured_trial_y_adjoint(None)
+    else:
+        dy_bar, dlagged_response_cache_bar, dlagged_reference_y_bar = _transpose_trial_y_tangent_helper_adjoint(None)
 
     if lagged_response_branch == "rebuild":
         if physics_context.pullback_build_lagged_response is None:
@@ -3666,53 +3711,167 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
         lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
     )
 
-    def _next_carry_tangent(carry_tangent):
-        tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+    def _add_tangent_trees(lhs, rhs, primal):
+        lhs_aligned = _radau_align_tangent_tree_to_primal(lhs, primal)
+        rhs_aligned = _radau_align_tangent_tree_to_primal(rhs, primal)
+        if lhs_aligned is None:
+            return rhs_aligned
+        if rhs_aligned is None:
+            return lhs_aligned
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
+
+    def _direct_stage_cache_adjoint(_):
+        lagged_response, _, _ = _radau_prepare_lagged_response(
             kernel_context,
-            physics_context,
             carry_for_linear_map,
-            carry_tangent,
-            context,
-            primal_result,
-            lagged_response_branch="reuse",
-        )
-        accepted_y_dot = _project_flat_state_if_needed(
-            tangent_attempt.trial_y,
+            physics_context.unpack_flat,
             physics_context.project_flat,
-        )
-        if physics_context.project_flat is not None:
-            _, accepted_y_dot = jax.jvp(
-                physics_context.project_flat,
-                (primal_result.trial_y,),
-                (tangent_attempt.trial_y,),
-            )
-        return dataclasses.replace(
-            tangent_attempt.carry_after_attempt,
-            t=carry_tangent.t,
-            y=accepted_y_dot,
-            dt=jnp.zeros_like(carry_tangent.dt),
-            prev_error=jnp.zeros_like(carry_tangent.prev_error),
-            prev_stages=tangent_attempt.stage_history,
-            prev_dt=jnp.zeros_like(carry_tangent.prev_dt),
-            recent_reject_count=jax.lax.stop_gradient(carry_tangent.recent_reject_count),
-            regrowth_cooldown=jax.lax.stop_gradient(carry_tangent.regrowth_cooldown),
-            easy_growth_streak=jax.lax.stop_gradient(carry_tangent.easy_growth_streak),
-            lagged_response_valid=jax.lax.stop_gradient(carry_tangent.lagged_response_valid),
-            jacobian=tangent_attempt.jacobian_out,
-            cache_valid=tangent_attempt.cache_valid_out,
-            cache_dt=tangent_attempt.cache_dt_out,
-            cache_age=tangent_attempt.cache_age_out,
-            real_lu=tangent_attempt.real_lu_out,
-            real_piv=tangent_attempt.real_piv_out,
-            complex_lu=tangent_attempt.complex_lu_out,
-            complex_piv=tangent_attempt.complex_piv_out,
-            prev_theta_final=tangent_attempt.theta_final,
-            prev_newton_iter_count=tangent_attempt.newton_iter_count,
+            physics_context.build_lagged_response,
         )
 
-    zero_carry_tangent = jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map)
-    _, pullback = jax.vjp(_next_carry_tangent, zero_carry_tangent)
-    (carry_bar,) = pullback(next_carry_bar)
+        if lagged_response is None:
+            return _transpose_tangent_helper_adjoint(None)
+
+        stage_history = primal_result.stage_history
+        stages_final = stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        trial_y_bar = next_carry_bar.y
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
+            (trial_y_bar,) = project_pullback(trial_y_bar)
+
+        stage_bar = jnp.asarray(next_carry_bar.prev_stages, dtype=kernel_context.dtype).reshape(
+            (kernel_context.num_stages, kernel_context.state_dim)
+        )
+        dz_bar = (
+            stage_bar
+            + primal_result.trial_dt
+            * kernel_context.b[:, None]
+            * jnp.asarray(trial_y_bar, dtype=kernel_context.dtype)[None, :]
+        )
+
+        stage_rhs_bar = _radau_apply_stage_linear_transpose_solve(
+            kernel_context,
+            rhs=dz_bar.reshape((-1,)),
+            real_lu_out=primal_result.real_lu_out,
+            real_piv_out=primal_result.real_piv_out,
+            complex_lu_out=primal_result.complex_lu_out,
+            complex_piv_out=primal_result.complex_piv_out,
+            skip_zero_rhs_shortcut=True,
+        ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+
+        stage_state_source_bar = stage_rhs_bar @ primal_result.jacobian_out
+        stage_state_source = kernel_context.a @ stages_final
+
+        def _rhs_eval_at_state(t_eval):
+            return _radau_eval_rhs(
+                t_eval,
+                carry_in.y,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        rhs_time_ref = jax.jacfwd(_rhs_eval_at_state)(carry_in.t)
+
+        stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+        stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_state_source
+
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
+
+        _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+        (residual_lagged_bar,) = lagged_pullback(stage_rhs_bar)
+
+        y_bar = (
+            jnp.asarray(trial_y_bar, dtype=kernel_context.dtype)
+            + jnp.sum(stage_state_source_bar, axis=0)
+        )
+        dt_bar = (
+            jnp.vdot(jnp.asarray(trial_y_bar, dtype=kernel_context.dtype), kernel_context.b @ stages_final)
+            + jnp.sum(stage_state_source_bar * stage_state_source)
+            + jnp.sum(stage_rhs_bar * (kernel_context.c[:, None] * rhs_time_ref[None, :]))
+        )
+        lagged_cache_bar = _add_tangent_trees(
+            residual_lagged_bar,
+            next_carry_bar.lagged_response_cache,
+            carry_for_linear_map.lagged_response_cache,
+        )
+        lagged_reference_y_bar = jnp.asarray(
+            next_carry_bar.lagged_reference_y,
+            dtype=kernel_context.dtype,
+        )
+
+        return dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry_in),
+            y=y_bar,
+            dt=dt_bar,
+            lagged_response_cache=lagged_cache_bar,
+            lagged_reference_y=lagged_reference_y_bar,
+        )
+
+    def _transpose_tangent_helper_adjoint(_):
+        def _next_carry_tangent(carry_tangent):
+            tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
+                kernel_context,
+                physics_context,
+                carry_for_linear_map,
+                carry_tangent,
+                context,
+                primal_result,
+                lagged_response_branch="reuse",
+            )
+            accepted_y_dot = _project_flat_state_if_needed(
+                tangent_attempt.trial_y,
+                physics_context.project_flat,
+            )
+            if physics_context.project_flat is not None:
+                _, accepted_y_dot = jax.jvp(
+                    physics_context.project_flat,
+                    (primal_result.trial_y,),
+                    (tangent_attempt.trial_y,),
+                )
+            return dataclasses.replace(
+                tangent_attempt.carry_after_attempt,
+                t=carry_tangent.t,
+                y=accepted_y_dot,
+                dt=jnp.zeros_like(carry_tangent.dt),
+                prev_error=jnp.zeros_like(carry_tangent.prev_error),
+                prev_stages=tangent_attempt.stage_history,
+                prev_dt=jnp.zeros_like(carry_tangent.prev_dt),
+                recent_reject_count=jax.lax.stop_gradient(carry_tangent.recent_reject_count),
+                regrowth_cooldown=jax.lax.stop_gradient(carry_tangent.regrowth_cooldown),
+                easy_growth_streak=jax.lax.stop_gradient(carry_tangent.easy_growth_streak),
+                lagged_response_valid=jax.lax.stop_gradient(carry_tangent.lagged_response_valid),
+                jacobian=tangent_attempt.jacobian_out,
+                cache_valid=tangent_attempt.cache_valid_out,
+                cache_dt=tangent_attempt.cache_dt_out,
+                cache_age=tangent_attempt.cache_age_out,
+                real_lu=tangent_attempt.real_lu_out,
+                real_piv=tangent_attempt.real_piv_out,
+                complex_lu=tangent_attempt.complex_lu_out,
+                complex_piv=tangent_attempt.complex_piv_out,
+                prev_theta_final=tangent_attempt.theta_final,
+                prev_newton_iter_count=tangent_attempt.newton_iter_count,
+            )
+
+        zero_carry_tangent = jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map)
+        _, pullback = jax.vjp(_next_carry_tangent, zero_carry_tangent)
+        (carry_bar_value,) = pullback(next_carry_bar)
+        return carry_bar_value
+
+    if bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
+        carry_bar = _direct_stage_cache_adjoint(None)
+    else:
+        carry_bar = _transpose_tangent_helper_adjoint(None)
 
     if lagged_response_branch == "rebuild":
         if physics_context.pullback_build_lagged_response is None:
@@ -4410,6 +4569,68 @@ def _radau_apply_stage_linear_solve(
             axis=0,
         )
         return _radau_inverse_transform_stage_stack(kernel_context, delta_transformed).reshape((-1,))
+
+    if skip_zero_rhs_shortcut:
+        return _solve_nonzero_rhs(rhs_arr)
+
+    zero_rhs = jnp.all(rhs_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
+    return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
+
+
+def _radau_apply_stage_linear_transpose_solve(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    rhs,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+    skip_zero_rhs_shortcut: bool = False,
+):
+    """Apply the transpose of the Radau stage linear solve.
+
+    `_radau_apply_stage_linear_solve` applies
+
+        T^{-1} block_solve(T rhs)
+
+    for the transformed Radau stage system.  Reverse mode needs the transpose
+    operator, so this applies
+
+        T^T block_solve_transpose(T^{-T} rhs)
+
+    without forming the dense stage Jacobian.
+    """
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
+
+    def _solve_zero_rhs(rhs_flat):
+        return jnp.zeros_like(rhs_flat)
+
+    def _solve_nonzero_rhs(rhs_flat):
+        rhs_stages = rhs_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        rhs_transformed = kernel_context.radau_inv_transform.T @ rhs_stages
+        rhs_real = rhs_transformed[0]
+        delta_real = jax.scipy.linalg.lu_solve((real_lu_out, real_piv_out), rhs_real, trans=1)
+        rhs_complex_pairs = rhs_transformed[1:].reshape((kernel_context.num_complex_pairs, 2, kernel_context.state_dim))
+
+        def _solve_pair(i, pair_solutions):
+            delta_pair = jax.scipy.linalg.lu_solve(
+                (complex_lu_out[i], complex_piv_out[i]),
+                rhs_complex_pairs[i].reshape((-1,)),
+                trans=1,
+            ).reshape((2, kernel_context.state_dim))
+            return pair_solutions.at[i].set(delta_pair)
+
+        delta_complex_pairs = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _solve_pair,
+            jnp.zeros_like(rhs_complex_pairs),
+        )
+        delta_transformed = jnp.concatenate(
+            [delta_real[None, :], delta_complex_pairs.reshape((2 * kernel_context.num_complex_pairs, kernel_context.state_dim))],
+            axis=0,
+        )
+        return (kernel_context.radau_transform.T @ delta_transformed).reshape((-1,))
 
     if skip_zero_rhs_shortcut:
         return _solve_nonzero_rhs(rhs_arr)
@@ -6896,6 +7117,8 @@ def _radau_debug_local_accepted_step_transpose(
     *,
     accepted_step_index: int,
     seed_mode: str = "y",
+    input_seed_mode: str | None = None,
+    output_seed_mode: str | None = None,
 ) -> _RadauAcceptedStepTransposeDiagnostic:
     """Lightweight local dot-product check for one accepted-step VJP.
 
@@ -6917,6 +7140,8 @@ def _radau_debug_local_accepted_step_transpose(
         return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
     seed_mode = str(seed_mode).strip().lower()
+    input_seed_mode = seed_mode if input_seed_mode is None else str(input_seed_mode).strip().lower()
+    output_seed_mode = seed_mode if output_seed_mode is None else str(output_seed_mode).strip().lower()
     valid_seed_modes = {
         "y",
         "prev_stages",
@@ -6927,7 +7152,7 @@ def _radau_debug_local_accepted_step_transpose(
         "lagged_cache_reference",
         "all",
     }
-    if seed_mode not in valid_seed_modes:
+    if seed_mode not in valid_seed_modes or input_seed_mode not in valid_seed_modes or output_seed_mode not in valid_seed_modes:
         raise ValueError(
             "seed_mode must be one of "
             "{'y', 'prev_stages', 'lagged_cache', 'lagged_reference', "
@@ -7222,35 +7447,16 @@ def _radau_debug_local_accepted_step_transpose(
             )
         return cotangent
 
-    carry_direction = _direction_for_seed(seed_mode)
+    carry_direction = _direction_for_seed(input_seed_mode)
     output_carry_primal = _local_step_reverse(carry_for_step)
-    output_cotangent = _cotangent_for_seed(seed_mode, output_carry_primal)
+    output_cotangent = _cotangent_for_seed(output_seed_mode, output_carry_primal)
 
-    def _transpose_dots(direction_value, cotangent_value):
-        _, output_tangent_value = jax.jvp(_local_step_forward, (carry_for_step,), (direction_value,))
-        _, local_pullback = jax.vjp(_local_step_reverse, carry_for_step)
-        (input_cotangent_value,) = local_pullback(cotangent_value)
-        lhs_value = _dot_tree(cotangent_value, output_tangent_value)
-        rhs_value = _dot_tree(input_cotangent_value, direction_value)
-        return lhs_value, rhs_value
+    _, output_tangent = jax.jvp(_local_step_forward, (carry_for_step,), (carry_direction,))
+    _, pullback = jax.vjp(_local_step_reverse, carry_for_step)
+    (input_cotangent,) = pullback(output_cotangent)
 
-    lhs, rhs = _transpose_dots(carry_direction, output_cotangent)
-
-    zero_scalar = jnp.asarray(0.0, dtype=dtype)
-    lhs_additivity_residual = zero_scalar
-    rhs_additivity_residual = zero_scalar
-
-    if seed_mode == "y_lagged_cache":
-        y_direction = _direction_for_seed("y")
-        cache_direction = _direction_for_seed("lagged_cache")
-        y_cotangent = _cotangent_for_seed("y", output_carry_primal)
-        cache_cotangent = _cotangent_for_seed("lagged_cache", output_carry_primal)
-        lhs_y, rhs_y = _transpose_dots(y_direction, y_cotangent)
-        lhs_cache, rhs_cache = _transpose_dots(cache_direction, cache_cotangent)
-        lhs_additivity_residual = lhs - lhs_y - lhs_cache
-        rhs_additivity_residual = rhs - rhs_y - rhs_cache
-
-    additivity_residual_abs_err = jnp.abs(lhs_additivity_residual - rhs_additivity_residual)
+    lhs = _dot_tree(output_cotangent, output_tangent)
+    rhs = _dot_tree(input_cotangent, carry_direction)
     abs_err = jnp.abs(lhs - rhs)
     rel_err = abs_err / jnp.maximum(jnp.maximum(jnp.abs(lhs), jnp.abs(rhs)), jnp.asarray(1.0e-30, dtype=dtype))
     return _RadauAcceptedStepTransposeDiagnostic(
@@ -7261,9 +7467,6 @@ def _radau_debug_local_accepted_step_transpose(
         local_branch_reuse=local_branch_reuse,
         lhs_v_dot_ju=lhs,
         rhs_jtv_dot_u=rhs,
-        lhs_additivity_residual=lhs_additivity_residual,
-        rhs_additivity_residual=rhs_additivity_residual,
-        additivity_residual_abs_err=additivity_residual_abs_err,
         abs_err=abs_err,
         rel_err=rel_err,
     )
