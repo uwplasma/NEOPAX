@@ -2477,6 +2477,20 @@ class _RadauAcceptedStepZeroTangentComparison:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepTransposeDiagnostic:
+    accepted_step_index: Any
+    target_attempt_index: Any
+    found_target: Any
+    lagged_response_valid_in: Any
+    local_branch_reuse: Any
+    lhs_v_dot_ju: Any
+    rhs_jtv_dot_u: Any
+    abs_err: Any
+    rel_err: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepMapResult:
     next_carry: Any
     accepted_y: Any
@@ -6869,6 +6883,280 @@ def _radau_replay_realized_accepted_rollout(
         err_norms=err_norms,
         converged_mask=converged_mask,
         accepted_dts=accepted_dts_out,
+    )
+
+
+def _radau_debug_local_accepted_step_transpose(
+    execution_context: _RadauSolveExecutionContext,
+    carry0: _RadauAcceptedStepCarry,
+    trace: _RadauAdaptiveScheduleTrace,
+    *,
+    accepted_step_index: int,
+) -> _RadauAcceptedStepTransposeDiagnostic:
+    """Lightweight local dot-product check for one accepted-step VJP.
+
+    This checks only the local accepted-step map at one accepted-step ordinal:
+
+        <v, J u> == <J^T v, u>
+
+    using deterministic `y`-only tangent/cotangent seeds. It does not compute
+    full parameter gradients and does not save a trajectory.
+    """
+
+    dtype = execution_context.dtype
+    target_accepted_index = jnp.asarray(int(accepted_step_index), dtype=jnp.int32)
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _deterministic_vec(size, *, phase):
+        idx = jnp.arange(size, dtype=dtype)
+        values = jnp.sin((idx + jnp.asarray(1.0 + phase, dtype=dtype)) * jnp.asarray(0.173, dtype=dtype))
+        norm = jnp.linalg.norm(values)
+        return values / jnp.maximum(norm, jnp.asarray(1.0, dtype=dtype))
+
+    def _dot_tree(lhs, rhs):
+        total = jnp.asarray(0.0, dtype=dtype)
+        for left_leaf, right_leaf in zip(jax.tree_util.tree_leaves(lhs), jax.tree_util.tree_leaves(rhs)):
+            left_arr = jnp.asarray(left_leaf)
+            right_arr = jnp.asarray(right_leaf)
+            if jnp.issubdtype(left_arr.dtype, jnp.inexact) and jnp.issubdtype(right_arr.dtype, jnp.inexact):
+                total = total + jnp.sum(left_arr * right_arr).astype(dtype)
+        return total
+
+    initial_scan_state = (
+        carry0,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(-1, dtype=jnp.int32),
+        jnp.asarray(False),
+    )
+
+    def _scan_body(scan_state, xs):
+        carry, accepted_count, target_attempt_index, found_target = scan_state
+        (
+            attempt_index,
+            active,
+            accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
+
+        is_target = jnp.logical_and(
+            active,
+            jnp.logical_and(
+                accepted,
+                jnp.logical_and(
+                    accepted_count == target_accepted_index,
+                    jnp.logical_not(found_target),
+                ),
+            ),
+        )
+        should_advance = jnp.logical_and(
+            active,
+            jnp.logical_and(jnp.logical_not(found_target), jnp.logical_not(is_target)),
+        )
+
+        def _advance_accepted(_):
+            carry_for_step = dataclasses.replace(carry, dt=dt_value)
+
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                    "reuse",
+                )
+
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                    "rebuild",
+                )
+
+            next_carry = jax.lax.cond(
+                carry_for_step.lagged_response_valid,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
+            )
+            return next_carry
+
+        def _advance_rejected(_):
+            return carry
+
+        advanced_carry = jax.lax.cond(accepted, _advance_accepted, _advance_rejected, operand=None)
+        next_carry = jax.lax.cond(should_advance, lambda _: advanced_carry, lambda _: carry, operand=None)
+        next_accepted_count = accepted_count + jnp.where(jnp.logical_and(active, accepted), 1, 0)
+        next_target_attempt_index = jnp.where(is_target, attempt_index, target_attempt_index)
+        next_found_target = jnp.logical_or(found_target, is_target)
+        return (
+            next_carry,
+            next_accepted_count,
+            next_target_attempt_index,
+            next_found_target,
+        ), None
+
+    attempt_indices = jnp.arange(trace.active_mask.shape[0], dtype=jnp.int32)
+    (
+        target_carry,
+        _accepted_count,
+        target_attempt_index,
+        found_target,
+    ), _ = jax.lax.scan(
+        _scan_body,
+        initial_scan_state,
+        (
+            attempt_indices,
+            jax.lax.stop_gradient(trace.active_mask),
+            jax.lax.stop_gradient(trace.accepted_mask),
+            jax.lax.stop_gradient(trace.attempted_dts),
+            jax.lax.stop_gradient(trace.next_dts),
+            jax.lax.stop_gradient(trace.next_recent_reject_count),
+            jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+            jax.lax.stop_gradient(trace.next_easy_growth_streak),
+            jax.lax.stop_gradient(trace.next_lagged_response_valid),
+        ),
+    )
+
+    dt_value = jnp.take(jax.lax.stop_gradient(trace.attempted_dts), jnp.maximum(target_attempt_index, 0))
+    next_dt_value = jnp.take(jax.lax.stop_gradient(trace.next_dts), jnp.maximum(target_attempt_index, 0))
+    recent_reject_count_value = jnp.take(
+        jax.lax.stop_gradient(trace.next_recent_reject_count),
+        jnp.maximum(target_attempt_index, 0),
+    )
+    regrowth_cooldown_value = jnp.take(
+        jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+        jnp.maximum(target_attempt_index, 0),
+    )
+    easy_growth_streak_value = jnp.take(
+        jax.lax.stop_gradient(trace.next_easy_growth_streak),
+        jnp.maximum(target_attempt_index, 0),
+    )
+    lagged_response_valid_value = jnp.take(
+        jax.lax.stop_gradient(trace.next_lagged_response_valid),
+        jnp.maximum(target_attempt_index, 0),
+    )
+
+    carry_for_step = dataclasses.replace(target_carry, dt=dt_value)
+    local_branch_reuse = carry_for_step.lagged_response_valid
+
+    def _local_step_forward(carry_value):
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_value),
+            execution_context.attempt_context,
+        )
+        accepted_y = _project_flat_state_if_needed(
+            attempt_result.trial_y,
+            execution_context.physics_context.project_flat,
+        )
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + attempt_result.trial_dt,
+            y=accepted_y,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=attempt_result.trial_dt,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    def _local_step_reverse(carry_value):
+        def _reuse_branch(_):
+            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_value),
+                execution_context.attempt_context,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+                "reuse",
+            )
+
+        def _rebuild_branch(_):
+            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_value),
+                execution_context.attempt_context,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+                "rebuild",
+            )
+
+        return jax.lax.cond(local_branch_reuse, _reuse_branch, _rebuild_branch, operand=None)
+
+    y_direction = _deterministic_vec(target_carry.y.shape[0], phase=0.0)
+    y_cotangent = _deterministic_vec(target_carry.y.shape[0], phase=3.0)
+    carry_direction = dataclasses.replace(
+        jax.tree_util.tree_map(_zero_tangent_like, carry_for_step),
+        y=y_direction,
+    )
+    output_cotangent_template = jax.tree_util.tree_map(_zero_tangent_like, _local_step_reverse(carry_for_step))
+    output_cotangent = dataclasses.replace(output_cotangent_template, y=y_cotangent)
+
+    _, output_tangent = jax.jvp(_local_step_forward, (carry_for_step,), (carry_direction,))
+    _, pullback = jax.vjp(_local_step_reverse, carry_for_step)
+    (input_cotangent,) = pullback(output_cotangent)
+
+    lhs = _dot_tree(output_cotangent, output_tangent)
+    rhs = _dot_tree(input_cotangent, carry_direction)
+    abs_err = jnp.abs(lhs - rhs)
+    rel_err = abs_err / jnp.maximum(jnp.maximum(jnp.abs(lhs), jnp.abs(rhs)), jnp.asarray(1.0e-30, dtype=dtype))
+    return _RadauAcceptedStepTransposeDiagnostic(
+        accepted_step_index=target_accepted_index,
+        target_attempt_index=target_attempt_index,
+        found_target=found_target,
+        lagged_response_valid_in=carry_for_step.lagged_response_valid,
+        local_branch_reuse=local_branch_reuse,
+        lhs_v_dot_ju=lhs,
+        rhs_jtv_dot_u=rhs,
+        abs_err=abs_err,
+        rel_err=rel_err,
     )
 
 

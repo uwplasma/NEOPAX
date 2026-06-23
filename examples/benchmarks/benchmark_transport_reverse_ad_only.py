@@ -37,6 +37,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_adaptive_schedule_rollout,
     _radau_carry_from_step_state,
+    _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
 )
 
@@ -476,6 +477,15 @@ def main() -> None:
         default=1,
         help="Number of post-compile warm executions to time when --timing-mode=jit-warm.",
     )
+    parser.add_argument(
+        "--local-transpose-diagnostic-accepted-step",
+        type=int,
+        default=None,
+        help=(
+            "Diagnostic-only mode: run one local accepted-step dot-product transpose "
+            "check at this zero-based accepted-step ordinal, then exit."
+        ),
+    )
     args = parser.parse_args()
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
@@ -505,6 +515,59 @@ def main() -> None:
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=reverse_segment_length,
     )
+
+    if args.local_transpose_diagnostic_accepted_step is not None:
+        accepted_step_index = int(args.local_transpose_diagnostic_accepted_step)
+        if accepted_step_index < 0:
+            raise SystemExit("[autodiff-gate] --local-transpose-diagnostic-accepted-step must be >= 0.")
+        print("[autodiff-gate] progress: running local accepted-step transpose diagnostic", flush=True)
+        baseline_rollout = _radau_adaptive_schedule_rollout(
+            reverse_setup.execution_context,
+            reverse_setup.prepared_rollout.initial_carry,
+            max_total_steps=reverse_setup.max_total_steps,
+            stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
+        )
+        diagnostic = _radau_debug_local_accepted_step_transpose(
+            reverse_setup.execution_context,
+            reverse_setup.prepared_rollout.initial_carry,
+            baseline_rollout.trace,
+            accepted_step_index=accepted_step_index,
+        )
+        diagnostic = jax.device_get(diagnostic)
+        report = {
+            "mode": "transport_reverse_ad_only_local_transpose_diagnostic",
+            "config_path": str(Path(args.config)),
+            "objective_name": args.objective,
+            "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+            "diagnostic_accepted_step_index": accepted_step_index,
+            "target_attempt_index": int(diagnostic.target_attempt_index),
+            "found_target": bool(diagnostic.found_target),
+            "lagged_response_valid_in": bool(diagnostic.lagged_response_valid_in),
+            "local_branch_reuse": bool(diagnostic.local_branch_reuse),
+            "lhs_v_dot_ju": float(diagnostic.lhs_v_dot_ju),
+            "rhs_jtv_dot_u": float(diagnostic.rhs_jtv_dot_u),
+            "abs_err": float(diagnostic.abs_err),
+            "rel_err": float(diagnostic.rel_err),
+        }
+        print(
+            "[autodiff-gate] local transpose diagnostic: "
+            f"accepted_step_index={accepted_step_index} "
+            f"target_attempt_index={report['target_attempt_index']} "
+            f"found_target={report['found_target']} "
+            f"lagged_response_valid_in={report['lagged_response_valid_in']} "
+            f"local_branch_reuse={report['local_branch_reuse']}"
+        )
+        print(
+            "[autodiff-gate] local transpose diagnostic values: "
+            f"lhs_v_dot_ju={report['lhs_v_dot_ju']:.6e} "
+            f"rhs_jtv_dot_u={report['rhs_jtv_dot_u']:.6e} "
+            f"abs_err={report['abs_err']:.6e} "
+            f"rel_err={report['rel_err']:.6e}"
+        )
+        outpath = _report_path(args.objective)
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
 
     baseline_diag = None
     if args.baseline_diagnostics:
@@ -603,7 +666,6 @@ def main() -> None:
     print("[autodiff-gate] reverse gradients:")
     for name, value in zip(PARAMETER_ORDER, grad_np.tolist()):
         print(f"  - d{args.objective}/d{name}: rev={float(value):.6e}")
-
     outpath = _report_path(args.objective)
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
