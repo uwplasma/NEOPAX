@@ -3642,15 +3642,22 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             return jnp.zeros_like(arr)
         return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
 
+    carry_for_linear_map = dataclasses.replace(
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+
     def _next_carry_tangent(carry_tangent):
         tangent_attempt = _radau_accepted_step_attempt_tangent_from_primal(
             kernel_context,
             physics_context,
-            _radau_carry_with_forward_only_jvp_fields(carry_in),
+            carry_for_linear_map,
             carry_tangent,
             context,
             primal_result,
-            lagged_response_branch=lagged_response_branch,
+            lagged_response_branch="reuse",
         )
         accepted_y_dot = _project_flat_state_if_needed(
             tangent_attempt.trial_y,
@@ -3686,9 +3693,31 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             prev_newton_iter_count=tangent_attempt.newton_iter_count,
         )
 
-    zero_carry_tangent = jax.tree_util.tree_map(_zero_tangent_like, carry_in)
+    zero_carry_tangent = jax.tree_util.tree_map(_zero_tangent_like, carry_for_linear_map)
     _, pullback = jax.vjp(_next_carry_tangent, zero_carry_tangent)
     (carry_bar,) = pullback(next_carry_bar)
+
+    if lagged_response_branch == "rebuild":
+        if physics_context.pullback_build_lagged_response is None:
+            raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
+
+        projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+        rebuild_state = physics_context.unpack_flat(projected_y)
+        rebuild_state_bar = physics_context.pullback_build_lagged_response(
+            rebuild_state,
+            carry_bar.lagged_response_cache,
+        )
+        rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+            (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
+        carry_bar = dataclasses.replace(
+            carry_bar,
+            y=carry_bar.y + rebuild_flat_bar + carry_bar.lagged_reference_y,
+            lagged_response_cache=_radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache),
+            lagged_reference_y=jnp.zeros_like(carry_in.lagged_reference_y),
+        )
+
     return (
         carry_bar,
         _zero_tangent_like(next_carry_bar.dt),
@@ -6638,17 +6667,40 @@ def _radau_replay_realized_attempt_rollout(
         def _do_attempt(_):
             def _accepted_attempt(__):
                 carry_for_step = dataclasses.replace(carry, dt=dt_value)
-                next_carry = _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                    next_dt_value,
-                    recent_reject_count_value,
-                    regrowth_cooldown_value,
-                    easy_growth_streak_value,
-                    lagged_response_valid_value,
-                    "reuse",
+
+                def _reuse_branch(_):
+                    return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                        execution_context.attempt_context,
+                        next_dt_value,
+                        recent_reject_count_value,
+                        regrowth_cooldown_value,
+                        easy_growth_streak_value,
+                        lagged_response_valid_value,
+                        "reuse",
+                    )
+
+                def _rebuild_branch(_):
+                    return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                        execution_context.attempt_context,
+                        next_dt_value,
+                        recent_reject_count_value,
+                        regrowth_cooldown_value,
+                        easy_growth_streak_value,
+                        lagged_response_valid_value,
+                        "rebuild",
+                    )
+
+                next_carry = jax.lax.cond(
+                    carry_for_step.lagged_response_valid,
+                    _reuse_branch,
+                    _rebuild_branch,
+                    operand=None,
                 )
                 scan_out = (
                     next_carry.y,
@@ -6764,17 +6816,40 @@ def _radau_replay_realized_accepted_rollout(
 
         def _do_step(_):
             carry_for_step = dataclasses.replace(carry, dt=dt_value)
-            next_carry = _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                execution_context.attempt_context,
-                next_dt_value,
-                recent_reject_count_value,
-                regrowth_cooldown_value,
-                easy_growth_streak_value,
-                lagged_response_valid_value,
-                "reuse",
+
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                    "reuse",
+                )
+
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                    "rebuild",
+                )
+
+            next_carry = jax.lax.cond(
+                carry_for_step.lagged_response_valid,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
             )
             scan_out = (
                 next_carry.y,
@@ -8012,12 +8087,30 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             accepted_index = jnp.argmax(jnp.asarray(accepted_active_mask, dtype=jnp.int32))
             dt_value = jnp.asarray(attempted_dts[accepted_index], dtype=execution_context.dtype)
             carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-            return _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
-                execution_context.kernel_context,
-                execution_context.physics_context,
-                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                execution_context.attempt_context,
-                "reuse",
+
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    "reuse",
+                )
+
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                    execution_context.attempt_context,
+                    "rebuild",
+                )
+
+            return jax.lax.cond(
+                carry_for_step.lagged_response_valid,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
             )
 
         _, pullback = jax.vjp(_first_accepted_step, carry0)
