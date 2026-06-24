@@ -1568,6 +1568,43 @@ class ComposedEquationSystem:
             (flux_response_bar,) = flux_pullback(flux_bar)
         return TransportLaggedResponse(flux_response=flux_response_bar)
 
+    def pullback_evaluate_with_lagged_response_state(self, t, state, runtime, lagged_response, rhs_bar):
+        """Reverse-only split pullback for state dependence of the lagged RHS."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            _, rhs_pullback = jax.vjp(
+                lambda state_value: self._evaluate_state(state_value, lagged_response=lagged_response),
+                state,
+            )
+            (state_bar,) = rhs_pullback(rhs_bar)
+            return state_bar
+
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+        )
+
+        _, direct_state_pullback = jax.vjp(
+            lambda state_value: self.evaluate_with_shared_fluxes(0.0, state_value, None, shared_fluxes),
+            state,
+        )
+        (direct_state_bar,) = direct_state_pullback(rhs_bar)
+
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        _, flux_state_pullback = jax.vjp(
+            lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                working_state_value,
+                lagged_response.flux_response,
+            ),
+            working_state,
+        )
+        (working_state_bar,) = flux_state_pullback(flux_bar)
+
+        _, prepare_pullback = jax.vjp(lambda state_value: self._prepare_working_state(state_value)[0], state)
+        (flux_state_bar,) = prepare_pullback(working_state_bar)
+        return jax.tree_util.tree_map(lambda a, b: a + b, direct_state_bar, flux_state_bar)
+
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState

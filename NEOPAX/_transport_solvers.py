@@ -854,6 +854,14 @@ def _lagged_response_eval_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_state_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
     _, eval_fn = _lagged_response_hooks(vector_field)
@@ -895,6 +903,36 @@ def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwar
             rhs_bar=rhs_bar_state,
             **kwargs,
         )
+
+    return _pullback
+
+
+def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwargs, project_flat=None):
+    pullback_fn = _lagged_response_state_pullback_hook(vector_field)
+    if pullback_fn is None:
+        return None
+
+    def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
+        projected_flat_y = _project_flat_state_if_needed(
+            flat_y,
+            project_flat,
+        )
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        state_bar = pullback_fn(
+            t_value,
+            state_y,
+            *args,
+            lagged_response=lagged_response,
+            rhs_bar=rhs_bar_state,
+            **kwargs,
+        )
+        projected_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        (flat_bar,) = project_pullback(projected_bar)
+        return flat_bar
 
     return _pullback
 
@@ -2742,6 +2780,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
@@ -4745,6 +4784,14 @@ def _radau_exact_stage_residual_input_pullback(
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
 
     def _stage_y_pullback(t_eval, y_eval, cotangent):
+        if physics_context.flat_rhs_state_pullback is not None:
+            return physics_context.flat_rhs_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                cotangent,
+            )
+
         def _rhs_at_stage(y_value):
             return _radau_eval_rhs(
                 t_eval,
@@ -4849,6 +4896,14 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         )
 
         def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+            if physics_context.flat_rhs_state_pullback is not None:
+                return physics_context.flat_rhs_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+
             def _rhs_at_stage(y_value):
                 return _radau_eval_rhs(
                     t_eval,
@@ -9647,6 +9702,14 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
@@ -9789,6 +9852,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
+        flat_rhs_state_pullback=flat_rhs_state_pullback,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
@@ -9862,7 +9926,7 @@ class RADAUSolver(_RadauSolverConfig):
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+        flat_state0, unpack_flat, _unpack_packed, pack_state, project_flat = _make_solver_state_transform(
             state,
             species,
             temperature_active_mask=temperature_active_mask,
@@ -9924,6 +9988,14 @@ class RADAUSolver(_RadauSolverConfig):
         )
         flat_rhs_lagged_response_pullback = _flat_rhs_lagged_response_pullback_factory(
             unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
             vector_field=vector_field,
             args=args,
             kwargs=kwargs,
@@ -10092,6 +10164,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
+            flat_rhs_state_pullback=flat_rhs_state_pullback,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
             lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
