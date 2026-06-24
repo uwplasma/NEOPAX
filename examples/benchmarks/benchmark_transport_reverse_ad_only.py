@@ -734,6 +734,12 @@ def main() -> None:
         gradient_rev = jax.block_until_ready(gradient_rev)
         reverse_total_s = time.perf_counter() - t_reverse_start
     grad_np = np.asarray(jax.device_get(gradient_rev), dtype=float)
+    reverse_checkpoint_count = None
+    if reverse_segment_length is not None:
+        reverse_checkpoint_count = int(
+            (int(reverse_setup.max_total_steps) + int(reverse_segment_length) - 1)
+            // int(reverse_segment_length)
+        )
 
     report = {
         "mode": "transport_reverse_ad_only",
@@ -743,6 +749,7 @@ def main() -> None:
         "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "max_total_steps": int(reverse_setup.max_total_steps),
+        "reverse_checkpoint_count": reverse_checkpoint_count,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
@@ -765,6 +772,7 @@ def main() -> None:
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
         f"max_total_steps={reverse_setup.max_total_steps} "
+        f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "

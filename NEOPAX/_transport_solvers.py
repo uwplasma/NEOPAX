@@ -4737,39 +4737,48 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
 ):
     """Solve the exact stage-residual transpose system without materializing it.
 
-    This is the reverse-mode counterpart of the dense exact lagged-cache tangent
-    solve.  It keeps the exact residual derivative but applies it as a VJP
-    matvec, using the Radau LU linearization as a preconditioner instead of
-    forming the dense `(num_stages * state_dim)^2` matrix.
+    For the converged Radau stage residual
+
+        R_i = z_i - f(t_i, y + h sum_j a_ij z_j),
+
+    the exact transpose action is
+
+        (dR/dz)^T lambda_j = lambda_j - h sum_i a_ij J_i^T lambda_i.
+
+    Applying that formula directly avoids both the dense stage-block matrix and
+    a generic VJP over the full flattened residual.
     """
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
-    z_final = primal_result.stage_history
-
-    def _residual_wrt_z(z_flat):
-        f0_local = _radau_eval_rhs(
-            carry_in.t,
-            carry_in.y,
-            lagged_response,
-            physics_context.flat_rhs,
-            physics_context.flat_rhs_with_lagged_response,
-        )
-        return _radau_stage_residual(
-            kernel_context,
-            physics_context,
-            flat_y=carry_in.y,
-            t_value=carry_in.t,
-            h_value=primal_result.trial_dt,
-            z_flat=z_flat,
-            f0=f0_local,
-            jacobian_ref=primal_result.jacobian_out,
-            lagged_response=lagged_response,
-        )
-
-    _, residual_z_pullback = jax.vjp(_residual_wrt_z, z_final)
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
 
     def _transpose_matvec(vector):
-        (result,) = residual_z_pullback(jnp.asarray(vector, dtype=kernel_context.dtype).reshape((-1,)))
-        return result.reshape((-1,))
+        lambda_stages = jnp.asarray(vector, dtype=kernel_context.dtype).reshape(
+            (kernel_context.num_stages, kernel_context.state_dim)
+        )
+
+        def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+            def _rhs_at_stage(y_value):
+                return _radau_eval_rhs(
+                    t_eval,
+                    y_value,
+                    lagged_response,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )
+
+            _, rhs_pullback = jax.vjp(_rhs_at_stage, y_eval)
+            (jt_lambda,) = rhs_pullback(lambda_eval)
+            return jt_lambda
+
+        jt_lambda_stages = jax.vmap(_stage_rhs_vjp, in_axes=(0, 0, 0))(
+            stage_times,
+            stage_states,
+            lambda_stages,
+        )
+        coupled_jt_lambda = kernel_context.a.T @ jt_lambda_stages
+        return (lambda_stages - primal_result.trial_dt * coupled_jt_lambda).reshape((-1,))
 
     def _preconditioner(vector):
         return _radau_apply_stage_linear_transpose_solve(
