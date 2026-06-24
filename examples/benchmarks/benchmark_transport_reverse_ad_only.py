@@ -370,6 +370,17 @@ def _prepare_reverse_static_setup(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
+        schedule_probe = _radau_adaptive_schedule_rollout(
+            execution_context,
+            prepared_rollout_static.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
+        max_total_steps = min(
+            max_total_steps,
+            max(actual_attempt_count + 2, int(stop_after_accepted_steps)),
+        )
     return _ReverseStaticSetup(
         solver=solver,
         solve_vector_field=solve_vector_field_static,
@@ -730,6 +741,7 @@ def main() -> None:
         "parameter_order": list(PARAMETER_ORDER),
         "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "max_total_steps": int(reverse_setup.max_total_steps),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
@@ -751,6 +763,7 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_segment_length={reverse_segment_length} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
