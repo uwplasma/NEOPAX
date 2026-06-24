@@ -2788,6 +2788,7 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_atol: Any = 1.0e-8
     reverse_direct_stage_adjoint: bool = False
     reverse_stage_adjoint_solve_mode: str = "structured"
+    reverse_rhs_transpose_mode: str = "generic"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
 
@@ -4784,9 +4785,13 @@ def _radau_exact_stage_residual_input_pullback(
     stage_source = kernel_context.a @ stages_final
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
+    rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
 
     def _stage_y_pullback(t_eval, y_eval, cotangent):
-        if physics_context.flat_rhs_state_pullback is not None:
+        if (
+            rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+            and physics_context.flat_rhs_state_pullback is not None
+        ):
             return physics_context.flat_rhs_state_pullback(
                 t_eval,
                 y_eval,
@@ -4896,9 +4901,13 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         lambda_stages = jnp.asarray(vector, dtype=kernel_context.dtype).reshape(
             (kernel_context.num_stages, kernel_context.state_dim)
         )
+        rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
 
         def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
-            if physics_context.flat_rhs_state_pullback is not None:
+            if (
+                rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_state_pullback is not None
+            ):
                 return physics_context.flat_rhs_state_pullback(
                     t_eval,
                     y_eval,
