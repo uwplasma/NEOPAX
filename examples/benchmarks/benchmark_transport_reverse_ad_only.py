@@ -330,6 +330,8 @@ def _prepare_reverse_static_setup(
     reverse_segment_length: int | None = None,
     reverse_direct_stage_adjoint: bool = False,
     reverse_stage_adjoint_solve_mode: str = "structured",
+    reverse_stage_adjoint_iter_maxiter: int = 40,
+    reverse_stage_adjoint_iter_tol: float = 1.0e-10,
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -357,6 +359,8 @@ def _prepare_reverse_static_setup(
                 execution_context.physics_context,
                 reverse_direct_stage_adjoint=True,
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
+                reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
+                reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
             ),
         )
     stop_after_accepted_steps = (
@@ -512,6 +516,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-stage-adjoint-iter-maxiter",
+        type=int,
+        default=40,
+        help=(
+            "Maximum Krylov iterations for exact iterative reverse stage-adjoint "
+            "modes ('bicgstab'/'gmres'). Defaults to the current conservative value."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-stage-adjoint-iter-tol",
+        type=float,
+        default=1.0e-10,
+        help=(
+            "Relative tolerance for exact iterative reverse stage-adjoint modes "
+            "('bicgstab'/'gmres'). Defaults to the current conservative value."
+        ),
+    )
+    parser.add_argument(
         "--timing-mode",
         choices=("eager", "jit-warm"),
         default="eager",
@@ -584,6 +606,10 @@ def main() -> None:
         help="Optional output cotangent seed channel. Defaults to --local-transpose-diagnostic-seed-mode.",
     )
     args = parser.parse_args()
+    if int(args.reverse_stage_adjoint_iter_maxiter) <= 0:
+        raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-maxiter must be positive.")
+    if float(args.reverse_stage_adjoint_iter_tol) <= 0.0:
+        raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-tol must be positive.")
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
         reverse_segment_length = int(args.reverse_segment_length)
@@ -614,6 +640,8 @@ def main() -> None:
         reverse_segment_length=reverse_segment_length,
         reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
         reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
+        reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
+        reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
     )
 
     if args.local_transpose_diagnostic_accepted_step is not None:
@@ -755,6 +783,8 @@ def main() -> None:
         "reverse_segment_length": reverse_segment_length,
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+        "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+        "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
@@ -776,6 +806,8 @@ def main() -> None:
         f"reverse_segment_length={reverse_segment_length} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
+        f"reverse_stage_adjoint_iter_maxiter={args.reverse_stage_adjoint_iter_maxiter} "
+        f"reverse_stage_adjoint_iter_tol={args.reverse_stage_adjoint_iter_tol:.6e} "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )

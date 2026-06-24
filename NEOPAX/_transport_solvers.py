@@ -2713,6 +2713,8 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_atol: Any = 1.0e-8
     reverse_direct_stage_adjoint: bool = False
     reverse_stage_adjoint_solve_mode: str = "structured"
+    reverse_stage_adjoint_iter_maxiter: int = 40
+    reverse_stage_adjoint_iter_tol: float = 1.0e-10
 
 
 @jax.tree_util.register_dataclass
@@ -4826,23 +4828,25 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             skip_zero_rhs_shortcut=True,
         )
 
+    iter_tol = float(getattr(physics_context, "reverse_stage_adjoint_iter_tol", 1.0e-10))
+    iter_maxiter = int(getattr(physics_context, "reverse_stage_adjoint_iter_maxiter", 40))
     if method == "bicgstab":
         solution, _info = jax.scipy.sparse.linalg.bicgstab(
             _transpose_matvec,
             -rhs_arr,
-            tol=1.0e-10,
+            tol=iter_tol,
             atol=0.0,
-            maxiter=40,
+            maxiter=iter_maxiter,
             M=_preconditioner,
         )
     else:
         solution, _info = jax.scipy.sparse.linalg.gmres(
             _transpose_matvec,
             -rhs_arr,
-            tol=1.0e-10,
+            tol=iter_tol,
             atol=0.0,
             restart=20,
-            maxiter=20,
+            maxiter=iter_maxiter,
             M=_preconditioner,
         )
     return solution.reshape((-1,))
