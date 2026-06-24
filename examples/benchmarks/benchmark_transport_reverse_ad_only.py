@@ -329,7 +329,7 @@ def _prepare_reverse_static_setup(
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
     reverse_direct_stage_adjoint: bool = False,
-    reverse_stage_adjoint_solve_mode: str = "block",
+    reverse_stage_adjoint_solve_mode: str = "structured",
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -491,12 +491,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-solve-mode",
-        choices=("block", "gmres"),
-        default="block",
+        choices=("structured", "block", "gmres"),
+        default="structured",
         help=(
-            "Exact reverse stage-adjoint linear solve. 'block' builds the Radau "
-            "stage-Jacobian block system directly; 'gmres' keeps the matrix-free "
-            "correctness oracle but is much slower to compile."
+            "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
+            "transformed LU transpose approximation and is the lightweight default; "
+            "'block' and 'gmres' are exact correctness oracles but are memory/compile heavy."
         ),
     )
     parser.add_argument(

@@ -2712,7 +2712,7 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
     reverse_direct_stage_adjoint: bool = False
-    reverse_stage_adjoint_solve_mode: str = "block"
+    reverse_stage_adjoint_solve_mode: str = "structured"
 
 
 @jax.tree_util.register_dataclass
@@ -4770,7 +4770,17 @@ def _radau_solve_exact_stage_residual_transpose(
     *,
     rhs,
 ):
-    mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "block")).strip().lower()
+    mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
+    if mode == "structured":
+        return -_radau_apply_stage_linear_transpose_solve(
+            kernel_context,
+            rhs=rhs,
+            real_lu_out=primal_result.real_lu_out,
+            real_piv_out=primal_result.real_piv_out,
+            complex_lu_out=primal_result.complex_lu_out,
+            complex_piv_out=primal_result.complex_piv_out,
+            skip_zero_rhs_shortcut=True,
+        )
     if mode == "gmres":
         return _radau_solve_exact_stage_residual_transpose_matrix_free(
             kernel_context,
