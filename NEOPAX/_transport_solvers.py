@@ -3523,6 +3523,7 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
                     primal_result,
                     lagged_response,
                     residual_bar,
+                    compute_dt_bar=False,
                 )
             )
             dy_bar_value = jnp.asarray(primal_trial_y_bar, dtype=kernel_context.dtype) + residual_y_bar
@@ -3840,6 +3841,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                 primal_result,
                 lagged_response,
                 residual_bar,
+                compute_dt_bar=False,
             )
 
         y_bar = (
@@ -4696,6 +4698,8 @@ def _radau_exact_stage_residual_input_pullback(
     primal_result: _RadauAcceptedStepAttemptResult,
     lagged_response,
     residual_bar,
+    *,
+    compute_dt_bar: bool = True,
 ):
     """Apply exact residual input pullbacks without tracing the full residual."""
     residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
@@ -4726,20 +4730,6 @@ def _radau_exact_stage_residual_input_pullback(
         residual_stages,
     )
 
-    def _stage_time_derivative(t_eval, y_eval):
-        def _rhs_at_time(time_value):
-            return _radau_eval_rhs(
-                time_value,
-                y_eval,
-                lagged_response,
-                physics_context.flat_rhs,
-                physics_context.flat_rhs_with_lagged_response,
-            )
-
-        return jax.jacfwd(_rhs_at_time)(t_eval)
-
-    rhs_time_ref = jax.vmap(_stage_time_derivative, in_axes=(0, 0))(stage_times, stage_states)
-
     def _stage_evals_from_lagged(lagged_response_value):
         return jax.vmap(
             lambda t_eval, y_eval: _radau_eval_rhs(
@@ -4755,10 +4745,27 @@ def _radau_exact_stage_residual_input_pullback(
     _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
     (residual_lagged_bar,) = lagged_pullback(-residual_stages)
     residual_y_bar = -jnp.sum(jt_residual_stages, axis=0)
-    residual_dt_bar = -(
-        jnp.sum(jt_residual_stages * stage_source)
-        + jnp.sum(residual_stages * (kernel_context.c[:, None] * rhs_time_ref))
-    )
+
+    if compute_dt_bar:
+        def _stage_time_derivative(t_eval, y_eval):
+            def _rhs_at_time(time_value):
+                return _radau_eval_rhs(
+                    time_value,
+                    y_eval,
+                    lagged_response,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )
+
+            return jax.jacfwd(_rhs_at_time)(t_eval)
+
+        rhs_time_ref = jax.vmap(_stage_time_derivative, in_axes=(0, 0))(stage_times, stage_states)
+        residual_dt_bar = -(
+            jnp.sum(jt_residual_stages * stage_source)
+            + jnp.sum(residual_stages * (kernel_context.c[:, None] * rhs_time_ref))
+        )
+    else:
+        residual_dt_bar = jnp.asarray(0.0, dtype=kernel_context.dtype)
     return residual_y_bar, residual_dt_bar, residual_lagged_bar
 
 
