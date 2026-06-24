@@ -329,6 +329,7 @@ def _prepare_reverse_static_setup(
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
     reverse_direct_stage_adjoint: bool = False,
+    reverse_stage_adjoint_solve_mode: str = "block",
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -355,6 +356,7 @@ def _prepare_reverse_static_setup(
             physics_context=dataclasses.replace(
                 execution_context.physics_context,
                 reverse_direct_stage_adjoint=True,
+                reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
             ),
         )
     stop_after_accepted_steps = (
@@ -488,6 +490,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-stage-adjoint-solve-mode",
+        choices=("block", "gmres"),
+        default="block",
+        help=(
+            "Exact reverse stage-adjoint linear solve. 'block' builds the Radau "
+            "stage-Jacobian block system directly; 'gmres' keeps the matrix-free "
+            "correctness oracle but is much slower to compile."
+        ),
+    )
+    parser.add_argument(
         "--timing-mode",
         choices=("eager", "jit-warm"),
         default="eager",
@@ -589,6 +601,7 @@ def main() -> None:
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=reverse_segment_length,
         reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
+        reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
     )
 
     if args.local_transpose_diagnostic_accepted_step is not None:
@@ -721,6 +734,7 @@ def main() -> None:
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
+        "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
@@ -739,6 +753,7 @@ def main() -> None:
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
         f"reverse_segment_length={reverse_segment_length} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
+        f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )

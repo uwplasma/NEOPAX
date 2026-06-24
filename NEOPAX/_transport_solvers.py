@@ -2712,6 +2712,7 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
     reverse_direct_stage_adjoint: bool = False
+    reverse_stage_adjoint_solve_mode: str = "block"
 
 
 @jax.tree_util.register_dataclass
@@ -3467,7 +3468,7 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
             * jnp.asarray(primal_trial_y_bar, dtype=kernel_context.dtype)[None, :]
         )
 
-        residual_bar = _radau_solve_exact_stage_residual_transpose_matrix_free(
+        residual_bar = _radau_solve_exact_stage_residual_transpose(
             kernel_context,
             physics_context,
             carry_in,
@@ -3753,7 +3754,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             * jnp.asarray(trial_y_bar, dtype=kernel_context.dtype)[None, :]
         )
 
-        residual_bar = _radau_solve_exact_stage_residual_transpose_matrix_free(
+        residual_bar = _radau_solve_exact_stage_residual_transpose(
             kernel_context,
             physics_context,
             carry_in,
@@ -4703,6 +4704,92 @@ def _radau_solve_exact_stage_residual_transpose_matrix_free(
         M=_preconditioner,
     )
     return solution.reshape((-1,))
+
+
+def _radau_solve_exact_stage_residual_transpose_block(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+):
+    """Solve the exact stage-residual transpose system from stage Jacobian blocks.
+
+    For the converged Radau stages,
+
+        R_i = z_i - f_i(y + h sum_j a_ij z_j)
+
+    so
+
+        dR_i/dz_j = delta_ij I - h a_ij J_i.
+
+    This avoids `jacfwd` over the whole flattened residual and avoids generic
+    Krylov iteration.  It still constructs the small stage-block system needed
+    for the direct exact adjoint solve.
+    """
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+    def _stage_jacobian(t_eval, y_eval):
+        def _rhs_at_stage(y_value):
+            return _radau_eval_rhs(
+                t_eval,
+                y_value,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        return jax.jacfwd(_rhs_at_stage)(y_eval)
+
+    stage_jacobians = jax.vmap(_stage_jacobian, in_axes=(0, 0))(stage_times, stage_states)
+    eye_s = jnp.eye(kernel_context.num_stages, dtype=kernel_context.dtype)
+    eye_n = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
+    block_system = (
+        eye_s[:, :, None, None] * eye_n[None, None, :, :]
+        - primal_result.trial_dt
+        * kernel_context.a[:, :, None, None]
+        * stage_jacobians[:, None, :, :]
+    )
+    matrix = jnp.transpose(block_system, (0, 2, 1, 3)).reshape(
+        (kernel_context.num_stages * kernel_context.state_dim, kernel_context.num_stages * kernel_context.state_dim)
+    )
+    return jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
+
+
+def _radau_solve_exact_stage_residual_transpose(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+):
+    mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "block")).strip().lower()
+    if mode == "gmres":
+        return _radau_solve_exact_stage_residual_transpose_matrix_free(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+        )
+    if mode != "block":
+        raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
+    return _radau_solve_exact_stage_residual_transpose_block(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        rhs=rhs,
+    )
 
 
 def _radau_approximate_accepted_step_tangent(
