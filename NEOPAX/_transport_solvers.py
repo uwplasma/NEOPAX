@@ -4898,6 +4898,14 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         )
 
         def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+            if physics_context.flat_rhs_state_pullback is not None:
+                return physics_context.flat_rhs_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+
             def _rhs_at_stage(y_value):
                 return _radau_eval_rhs(
                     t_eval,

@@ -1294,21 +1294,7 @@ class ComposedEquationSystem:
     def _shared_fluxes_add(lhs, rhs):
         return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
 
-    def build_lagged_response(self, state):
-        working_state, _ = self._prepare_working_state(state)
-        if lagged_timing_enabled():
-            jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
-        flux_response = None
-        if self.shared_flux_model is not None:
-            flux_response = self.shared_flux_model.build_lagged_response(working_state)
-        if lagged_timing_enabled():
-            jax.debug.callback(lambda: lagged_timing_end("equations.build_lagged_response"), ordered=True)
-        return TransportLaggedResponse(
-            flux_response=flux_response,
-        )
-
-    def pullback_build_lagged_response(self, state, lagged_response_bar):
-        working_state, _ = self._prepare_working_state(state)
+    def _prepare_working_state_pullback(self, state, working_state_bar):
         prepared_qn = None
         if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
             try:
@@ -1326,93 +1312,107 @@ class ComposedEquationSystem:
             self.fixed_temperature_profile,
         )
 
-        def _prepare_working_state_pullback(working_state_bar):
-            density_bar = jnp.asarray(working_state_bar.density)
-            pressure_bar = jnp.asarray(working_state_bar.pressure)
-            er_bar = jnp.asarray(working_state_bar.Er)
+        density_bar = jnp.asarray(working_state_bar.density)
+        pressure_bar = jnp.asarray(working_state_bar.pressure)
+        er_bar = jnp.asarray(working_state_bar.Er)
 
-            fixed_density = jnp.asarray(prepared_fixed.density)
-            fixed_pressure = jnp.asarray(prepared_fixed.pressure)
-            safe_n = safe_density(fixed_density, self.density_floor)
-            floored_density_bar = jnp.zeros_like(safe_n)
-            projected_pressure_pre_bar = pressure_bar
-            if self.temperature_floor is not None:
-                projected_temperature_pre = fixed_pressure / safe_n
-                temp_floor_arr = _broadcast_species_floor(projected_temperature_pre, self.temperature_floor)
-                active_temp_mask = projected_temperature_pre > temp_floor_arr
-                floored_density_bar = floored_density_bar + jnp.where(active_temp_mask, 0.0, pressure_bar * temp_floor_arr)
-                projected_pressure_pre_bar = jnp.where(active_temp_mask, pressure_bar, 0.0)
+        fixed_density = jnp.asarray(prepared_fixed.density)
+        fixed_pressure = jnp.asarray(prepared_fixed.pressure)
+        safe_n = safe_density(fixed_density, self.density_floor)
+        floored_density_bar = jnp.zeros_like(safe_n)
+        projected_pressure_pre_bar = pressure_bar
+        if self.temperature_floor is not None:
+            projected_temperature_pre = fixed_pressure / safe_n
+            temp_floor_arr = _broadcast_species_floor(projected_temperature_pre, self.temperature_floor)
+            active_temp_mask = projected_temperature_pre > temp_floor_arr
+            floored_density_bar = floored_density_bar + jnp.where(active_temp_mask, 0.0, pressure_bar * temp_floor_arr)
+            projected_pressure_pre_bar = jnp.where(active_temp_mask, pressure_bar, 0.0)
 
-            fixed_density_bar = density_bar
-            fixed_pressure_bar = projected_pressure_pre_bar
-            density_floor_arr = _broadcast_species_floor(fixed_density, self.density_floor)
-            active_density_mask = fixed_density > density_floor_arr
-            fixed_density_bar = fixed_density_bar + floored_density_bar * active_density_mask.astype(floored_density_bar.dtype)
+        fixed_density_bar = density_bar
+        fixed_pressure_bar = projected_pressure_pre_bar
+        density_floor_arr = _broadcast_species_floor(fixed_density, self.density_floor)
+        active_density_mask = fixed_density > density_floor_arr
+        fixed_density_bar = fixed_density_bar + floored_density_bar * active_density_mask.astype(floored_density_bar.dtype)
 
-            er_density = jnp.asarray(prepared_er.density)
-            er_pressure = jnp.asarray(prepared_er.pressure)
-            er_bar_out = er_bar
-            er_density_bar = fixed_density_bar
-            er_pressure_bar = fixed_pressure_bar
-            if self.temperature_active_mask is not None and self.fixed_temperature_profile is not None:
-                active_mask = jnp.asarray(self.temperature_active_mask, dtype=bool)
-                fixed_temperature = jnp.asarray(self.fixed_temperature_profile, dtype=er_pressure.dtype)
-                active_mask = active_mask.reshape((1,) * (er_pressure.ndim - 2) + (active_mask.shape[0], 1))
-                fixed_temperature = jnp.broadcast_to(fixed_temperature, er_pressure.shape)
-                er_pressure_bar = jnp.where(active_mask, er_pressure_bar, 0.0)
-                er_density_floor_arr = _broadcast_species_floor(er_density, self.density_floor)
-                er_density_active = er_density > er_density_floor_arr
-                er_density_bar = er_density_bar + (
-                    jnp.where(active_mask, 0.0, fixed_pressure_bar * fixed_temperature)
-                    * er_density_active.astype(fixed_pressure_bar.dtype)
-                )
+        er_density = jnp.asarray(prepared_er.density)
+        er_pressure = jnp.asarray(prepared_er.pressure)
+        er_bar_out = er_bar
+        er_density_bar = fixed_density_bar
+        er_pressure_bar = fixed_pressure_bar
+        if self.temperature_active_mask is not None and self.fixed_temperature_profile is not None:
+            active_mask = jnp.asarray(self.temperature_active_mask, dtype=bool)
+            fixed_temperature = jnp.asarray(self.fixed_temperature_profile, dtype=er_pressure.dtype)
+            active_mask = active_mask.reshape((1,) * (er_pressure.ndim - 2) + (active_mask.shape[0], 1))
+            fixed_temperature = jnp.broadcast_to(fixed_temperature, er_pressure.shape)
+            er_pressure_bar = jnp.where(active_mask, er_pressure_bar, 0.0)
+            er_density_floor_arr = _broadcast_species_floor(er_density, self.density_floor)
+            er_density_active = er_density > er_density_floor_arr
+            er_density_bar = er_density_bar + (
+                jnp.where(active_mask, 0.0, fixed_pressure_bar * fixed_temperature)
+                * er_density_active.astype(fixed_pressure_bar.dtype)
+            )
 
-            density_floor_density = jnp.asarray(prepared_density.density)
-            density_floor_pressure_bar = er_pressure_bar
-            density_floor_density_bar = er_density_bar
-            density_floor_er_bar = er_bar_out
-            if self.er_bc_model is not None:
-                left_type = str(getattr(self.er_bc_model, "left_type", "")).strip().lower()
-                if left_type == "dirichlet":
-                    density_floor_er_bar = density_floor_er_bar.at[0].set(jnp.asarray(0.0, dtype=density_floor_er_bar.dtype))
-                right_type = str(getattr(self.er_bc_model, "right_type", "")).strip().lower()
-                if right_type == "dirichlet":
-                    density_floor_er_bar = density_floor_er_bar.at[-1].set(jnp.asarray(0.0, dtype=density_floor_er_bar.dtype))
+        density_floor_density = jnp.asarray(prepared_density.density)
+        density_floor_pressure_bar = er_pressure_bar
+        density_floor_density_bar = er_density_bar
+        density_floor_er_bar = er_bar_out
+        if self.er_bc_model is not None:
+            left_type = str(getattr(self.er_bc_model, "left_type", "")).strip().lower()
+            if left_type == "dirichlet":
+                density_floor_er_bar = density_floor_er_bar.at[0].set(jnp.asarray(0.0, dtype=density_floor_er_bar.dtype))
+            right_type = str(getattr(self.er_bc_model, "right_type", "")).strip().lower()
+            if right_type == "dirichlet":
+                density_floor_er_bar = density_floor_er_bar.at[-1].set(jnp.asarray(0.0, dtype=density_floor_er_bar.dtype))
 
-            qn_density_bar = density_floor_density_bar
-            density_floor_arr = _broadcast_species_floor(density_floor_density, self.density_floor)
-            density_floor_active = density_floor_density > density_floor_arr
-            qn_density_bar = qn_density_bar * density_floor_active.astype(qn_density_bar.dtype)
+        qn_density_bar = density_floor_density_bar
+        density_floor_arr = _broadcast_species_floor(density_floor_density, self.density_floor)
+        density_floor_active = density_floor_density > density_floor_arr
+        qn_density_bar = qn_density_bar * density_floor_active.astype(qn_density_bar.dtype)
 
-            if prepared_qn is None:
-                return dataclasses.replace(
-                    state,
-                    density=qn_density_bar,
-                    pressure=density_floor_pressure_bar,
-                    Er=density_floor_er_bar,
-                )
-
-            state_density_bar = qn_density_bar
-            if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
-                names = tuple(getattr(self.species, "names", ()))
-                eidx = int(names.index("e"))
-                charge_qp = jnp.asarray(self.species.charge_qp, dtype=state_density_bar.dtype)
-                ion_indices = jnp.asarray(getattr(self.species, "ion_indices", ()), dtype=jnp.int32)
-                electron_bar = state_density_bar[eidx]
-                state_density_bar = state_density_bar.at[eidx].set(jnp.asarray(0.0, dtype=state_density_bar.dtype))
-                if ion_indices.size > 0:
-                    Z_i = jnp.take(charge_qp, ion_indices, axis=0)
-                    state_density_bar = state_density_bar.at[ion_indices].add(
-                        electron_bar[None, :] * (-Z_i[:, None] / charge_qp[eidx])
-                    )
-
+        if prepared_qn is None:
             return dataclasses.replace(
                 state,
-                density=state_density_bar,
+                density=qn_density_bar,
                 pressure=density_floor_pressure_bar,
                 Er=density_floor_er_bar,
             )
 
+        state_density_bar = qn_density_bar
+        if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
+            names = tuple(getattr(self.species, "names", ()))
+            eidx = int(names.index("e"))
+            charge_qp = jnp.asarray(self.species.charge_qp, dtype=state_density_bar.dtype)
+            ion_indices = jnp.asarray(getattr(self.species, "ion_indices", ()), dtype=jnp.int32)
+            electron_bar = state_density_bar[eidx]
+            state_density_bar = state_density_bar.at[eidx].set(jnp.asarray(0.0, dtype=state_density_bar.dtype))
+            if ion_indices.size > 0:
+                Z_i = jnp.take(charge_qp, ion_indices, axis=0)
+                state_density_bar = state_density_bar.at[ion_indices].add(
+                    electron_bar[None, :] * (-Z_i[:, None] / charge_qp[eidx])
+                )
+
+        return dataclasses.replace(
+            state,
+            density=state_density_bar,
+            pressure=density_floor_pressure_bar,
+            Er=density_floor_er_bar,
+        )
+
+    def build_lagged_response(self, state):
+        working_state, eidx = self._prepare_working_state(state)
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
+        flux_response = None
+        if self.shared_flux_model is not None:
+            flux_response = self.shared_flux_model.build_lagged_response(working_state)
+        if lagged_timing_enabled():
+            jax.debug.callback(lambda: lagged_timing_end("equations.build_lagged_response"), ordered=True)
+        return TransportLaggedResponse(
+            flux_response=flux_response,
+        )
+
+    def pullback_build_lagged_response(self, state, lagged_response_bar):
+        working_state, eidx = self._prepare_working_state(state)
         flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
         if self.shared_flux_model is None or flux_response_bar is None:
             working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
@@ -1423,35 +1423,33 @@ class ComposedEquationSystem:
             else:
                 _, flux_pullback = jax.vjp(self.shared_flux_model.build_lagged_response, working_state)
                 (working_state_bar,) = flux_pullback(flux_response_bar)
-        return _prepare_working_state_pullback(working_state_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
 
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
 
-    def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
-        del t, runtime
+    def _evaluate_with_shared_fluxes_from_working_state(self, working_state, eidx, state_reference, shared_fluxes):
         from ._state import TransportState
-        working_state, eidx = self._prepare_working_state(state)
         density_eq, temperature_eq, er_eq = self._resolve_equations()
 
         density_rhs = (
             density_eq(working_state, fluxes=shared_fluxes)
             if density_eq is not None
-            else jnp.zeros_like(state.density)
+            else jnp.zeros_like(state_reference.density)
         )
         pressure_rhs = (
             temperature_eq(working_state, fluxes=shared_fluxes)
             if temperature_eq is not None
-            else jnp.zeros_like(state.pressure)
+            else jnp.zeros_like(state_reference.pressure)
         )
         Er_rhs = (
             er_eq(working_state, fluxes=shared_fluxes)
             if er_eq is not None
-            else jnp.zeros_like(state.Er)
+            else jnp.zeros_like(state_reference.Er)
         )
 
-        density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+        density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state_reference.density, self.species)
 
         if eidx is not None:
             density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
@@ -1469,6 +1467,16 @@ class ComposedEquationSystem:
             density=density_rhs,
             pressure=pressure_rhs,
             Er=Er_rhs,
+        )
+
+    def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
+        del t, runtime
+        working_state, eidx = self._prepare_working_state(state)
+        return self._evaluate_with_shared_fluxes_from_working_state(
+            working_state,
+            eidx,
+            state,
+            shared_fluxes,
         )
 
     def pullback_shared_fluxes(self, state, shared_fluxes, rhs_bar):
@@ -1548,7 +1556,7 @@ class ComposedEquationSystem:
         if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
             return TransportLaggedResponse(flux_response=None)
 
-        working_state, _ = self._prepare_working_state(state)
+        working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
@@ -1579,31 +1587,47 @@ class ComposedEquationSystem:
             (state_bar,) = rhs_pullback(rhs_bar)
             return state_bar
 
-        working_state, _ = self._prepare_working_state(state)
+        working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
         )
 
-        _, direct_state_pullback = jax.vjp(
-            lambda state_value: self.evaluate_with_shared_fluxes(0.0, state_value, None, shared_fluxes),
-            state,
-        )
-        (direct_state_bar,) = direct_state_pullback(rhs_bar)
-
-        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
-        _, flux_state_pullback = jax.vjp(
-            lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+        _, direct_working_state_pullback = jax.vjp(
+            lambda working_state_value: self._evaluate_with_shared_fluxes_from_working_state(
                 working_state_value,
-                lagged_response.flux_response,
+                eidx,
+                state,
+                shared_fluxes,
             ),
             working_state,
         )
-        (working_state_bar,) = flux_state_pullback(flux_bar)
+        (direct_working_state_bar,) = direct_working_state_pullback(rhs_bar)
 
-        _, prepare_pullback = jax.vjp(lambda state_value: self._prepare_working_state(state_value)[0], state)
-        (flux_state_bar,) = prepare_pullback(working_state_bar)
-        return jax.tree_util.tree_map(lambda a, b: a + b, direct_state_bar, flux_state_bar)
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+
+        total_working_state_bar = jax.tree_util.tree_map(
+            lambda a, b: a + b,
+            direct_working_state_bar,
+            working_state_bar,
+        )
+        return self._prepare_working_state_pullback(state, total_working_state_bar)
 
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp

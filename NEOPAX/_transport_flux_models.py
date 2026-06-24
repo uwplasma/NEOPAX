@@ -813,6 +813,74 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             ),
         )
 
+    def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
+        def _zero_state_bar():
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        def _submodel_state_pullback(model, subresponse, subflux_bar):
+            if subresponse is None:
+                return _zero_state_bar()
+            pullback_fn = getattr(model, "pullback_evaluate_with_lagged_response_state", None)
+            if callable(pullback_fn):
+                return pullback_fn(state, subresponse, subflux_bar, **kwargs)
+            _, pb = jax.vjp(
+                lambda state_value: model.evaluate_with_lagged_response(
+                    state_value,
+                    subresponse,
+                    **kwargs,
+                ),
+                state,
+            )
+            (state_bar,) = pb(subflux_bar)
+            return state_bar
+
+        gamma_total_bar = flux_bar.get("Gamma", 0)
+        q_total_bar = flux_bar.get("Q", 0)
+        upar_total_bar = flux_bar.get("Upar", 0)
+
+        zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
+        neo_flux_bar = {
+            "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
+            "Q": q_total_bar + flux_bar.get("Q_neo", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+        }
+        turb_flux_bar = {
+            "Gamma": (
+                gamma_total_bar + flux_bar.get("Gamma_turb", zero_gamma)
+                if self.include_turbulent_particle_flux
+                else flux_bar.get("Gamma_turb", zero_gamma)
+            ),
+            "Q": q_total_bar + flux_bar.get("Q_turb", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+        }
+        classical_flux_bar = {
+            "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
+            "Q": q_total_bar + flux_bar.get("Q_classical", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+        }
+
+        neo_state_bar = _submodel_state_pullback(
+            self.neoclassical_model,
+            lagged_response.neoclassical_response,
+            neo_flux_bar,
+        )
+        turb_state_bar = _submodel_state_pullback(
+            self.turbulent_model,
+            lagged_response.turbulent_response,
+            turb_flux_bar,
+        )
+        classical_state_bar = _submodel_state_pullback(
+            self.classical_model,
+            lagged_response.classical_response,
+            classical_flux_bar,
+        )
+        return jax.tree_util.tree_map(
+            lambda a, b, c: a + b + c,
+            neo_state_bar,
+            turb_state_bar,
+            classical_state_bar,
+        )
+
 
 
 
@@ -4016,6 +4084,116 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         (center_response_bar,) = pb(flux_bar)
         return NTXExactLijLaggedResponse(center_response=center_response_bar)
+
+    def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
+        del kwargs
+        center_response = lagged_response.center_response
+
+        if isinstance(center_response, NTXInterpolatedMomentResponse):
+            density = safe_density(state.density)
+            temperature = state.temperature
+
+            def _eval_from_primitives(density_value, temperature_value, er_value):
+                n_species = int(temperature_value.shape[0])
+                n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
+                if n_right is None:
+                    n_right = density_value[:, -1]
+                n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
+                if n_right_grad is None:
+                    n_right_grad = jnp.zeros_like(n_right)
+                t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
+                if t_right is None:
+                    t_right = temperature_value[:, -1]
+                t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
+                if t_right_grad is None:
+                    t_right_grad = jnp.zeros_like(t_right)
+
+                support = self._static_support()
+                collisionality_kind = _collisionality_kind(self.collisionality_model)
+                v_thermal = get_v_thermal(self.species.mass, temperature_value)
+                species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+                radius_indices = jnp.arange(er_value.shape[0], dtype=jnp.int32)
+
+                def _current_log_nu_star_per_radius(radius_index):
+                    drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                    er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(temperature_value, radius_index, axis=1, keepdims=False)
+                    density_local = jax.lax.dynamic_index_in_dim(density_value, radius_index, axis=1, keepdims=False)
+                    vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                    return jax.vmap(
+                        lambda species_index: self._log_nu_star_from_nu_hat(
+                            self._local_scan_inputs(
+                                drds_value=drds_value,
+                                species_index=species_index,
+                                er_value=er_local,
+                                temperature_local=temperature_local,
+                                density_local=density_local,
+                                vthermal_local=vthermal_local,
+                                collisionality_kind=collisionality_kind,
+                            )[0]
+                        )
+                    )(species_indices)
+
+                current_log_nu_star = jnp.swapaxes(
+                    self._map_radius_axis_regularized_at_axis0(
+                        _current_log_nu_star_per_radius,
+                        radius_indices,
+                        self.geometry.r_grid,
+                        unbatched=True,
+                    ),
+                    0,
+                    1,
+                )
+                delta_er = er_value - center_response.reference_er
+                delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
+                transport_moments = (
+                    center_response.reference_transport_moments
+                    + center_response.dtransport_moments_d_er * delta_er[None, :, None]
+                    + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+                )
+                lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
+                gamma, q, upar = self._assemble_center_fluxes(
+                    er_value,
+                    temperature_value,
+                    density_value,
+                    lij,
+                    n_right,
+                    n_right_grad,
+                    t_right,
+                    t_right_grad,
+                )
+                gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
+                return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+            _, pb = jax.vjp(
+                _eval_from_primitives,
+                density,
+                temperature,
+                state.Er,
+            )
+            density_bar_direct, temperature_bar, er_bar = pb(flux_bar)
+            density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), DEFAULT_TRANSPORT_DENSITY_FLOOR)
+            density_active = jnp.asarray(state.density) > density_floor_arr
+            density_safe = safe_density(state.density)
+            pressure_bar = temperature_bar / density_safe
+            density_bar = density_bar_direct - temperature_bar * state.pressure / (density_safe * density_safe)
+            density_bar = density_bar * density_active.astype(density_bar.dtype)
+            return dataclasses.replace(
+                state,
+                density=density_bar,
+                pressure=pressure_bar,
+                Er=er_bar,
+            )
+
+        _, pb = jax.vjp(
+            lambda state_value: self.evaluate_with_lagged_response(
+                state_value,
+                lagged_response,
+            ),
+            state,
+        )
+        (state_bar,) = pb(flux_bar)
+        return state_bar
 
     def build_local_particle_flux_evaluator(self, state):
         density = safe_density(state.density)
