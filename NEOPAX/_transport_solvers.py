@@ -3513,34 +3513,16 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
                 lagged_response,
                 rhs=dz_bar.reshape((-1,)),
             )
-
-            def _residual_wrt_inputs(flat_y, h_scalar, lagged_response_value):
-                f0_local = _radau_eval_rhs(
-                    carry_in.t,
-                    flat_y,
-                    lagged_response_value,
-                    physics_context.flat_rhs,
-                    physics_context.flat_rhs_with_lagged_response,
-                )
-                return _radau_stage_residual(
+            residual_y_bar, _residual_dt_bar, dlagged_response_cache_bar = (
+                _radau_exact_stage_residual_input_pullback(
                     kernel_context,
                     physics_context,
-                    flat_y=flat_y,
-                    t_value=carry_in.t,
-                    h_value=h_scalar,
-                    z_flat=primal_result.stage_history,
-                    f0=f0_local,
-                    jacobian_ref=primal_result.jacobian_out,
-                    lagged_response=lagged_response_value,
+                    carry_in,
+                    primal_result,
+                    lagged_response,
+                    residual_bar,
                 )
-
-            _, residual_pullback = jax.vjp(
-                _residual_wrt_inputs,
-                carry_in.y,
-                primal_result.trial_dt,
-                lagged_response,
             )
-            residual_y_bar, _residual_dt_bar, dlagged_response_cache_bar = residual_pullback(residual_bar)
             dy_bar_value = jnp.asarray(primal_trial_y_bar, dtype=kernel_context.dtype) + residual_y_bar
 
         dlagged_reference_y_bar_value = jnp.zeros_like(primal_result.carry_after_attempt.lagged_reference_y)
@@ -3849,34 +3831,14 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                 lagged_response,
                 rhs=dz_bar.reshape((-1,)),
             )
-
-            def _residual_wrt_inputs(flat_y, h_scalar, lagged_response_value):
-                f0_local = _radau_eval_rhs(
-                    carry_in.t,
-                    flat_y,
-                    lagged_response_value,
-                    physics_context.flat_rhs,
-                    physics_context.flat_rhs_with_lagged_response,
-                )
-                return _radau_stage_residual(
-                    kernel_context,
-                    physics_context,
-                    flat_y=flat_y,
-                    t_value=carry_in.t,
-                    h_value=h_scalar,
-                    z_flat=stage_history,
-                    f0=f0_local,
-                    jacobian_ref=primal_result.jacobian_out,
-                    lagged_response=lagged_response_value,
-                )
-
-            _, residual_pullback = jax.vjp(
-                _residual_wrt_inputs,
-                carry_in.y,
-                primal_result.trial_dt,
+            residual_y_bar, residual_dt_bar, residual_lagged_bar = _radau_exact_stage_residual_input_pullback(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
                 lagged_response,
+                residual_bar,
             )
-            residual_y_bar, residual_dt_bar, residual_lagged_bar = residual_pullback(residual_bar)
 
         y_bar = (
             jnp.asarray(trial_y_bar, dtype=kernel_context.dtype)
@@ -4723,6 +4685,79 @@ def _radau_apply_stage_linear_transpose_solve(
 
     zero_rhs = jnp.all(rhs_arr == jnp.asarray(0.0, dtype=kernel_context.dtype))
     return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
+
+
+def _radau_exact_stage_residual_input_pullback(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    residual_bar,
+):
+    """Apply exact residual input pullbacks without tracing the full residual."""
+    residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_source = kernel_context.a @ stages_final
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
+
+    def _stage_y_pullback(t_eval, y_eval, cotangent):
+        def _rhs_at_stage(y_value):
+            return _radau_eval_rhs(
+                t_eval,
+                y_value,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        _, rhs_pullback = jax.vjp(_rhs_at_stage, y_eval)
+        (jt_cotangent,) = rhs_pullback(cotangent)
+        return jt_cotangent
+
+    jt_residual_stages = jax.vmap(_stage_y_pullback, in_axes=(0, 0, 0))(
+        stage_times,
+        stage_states,
+        residual_stages,
+    )
+
+    def _stage_time_derivative(t_eval, y_eval):
+        def _rhs_at_time(time_value):
+            return _radau_eval_rhs(
+                time_value,
+                y_eval,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        return jax.jacfwd(_rhs_at_time)(t_eval)
+
+    rhs_time_ref = jax.vmap(_stage_time_derivative, in_axes=(0, 0))(stage_times, stage_states)
+
+    def _stage_evals_from_lagged(lagged_response_value):
+        return jax.vmap(
+            lambda t_eval, y_eval: _radau_eval_rhs(
+                t_eval,
+                y_eval,
+                lagged_response_value,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            ),
+            in_axes=(0, 0),
+        )(stage_times, stage_states)
+
+    _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+    (residual_lagged_bar,) = lagged_pullback(-residual_stages)
+    residual_y_bar = -jnp.sum(jt_residual_stages, axis=0)
+    residual_dt_bar = -(
+        jnp.sum(jt_residual_stages * stage_source)
+        + jnp.sum(residual_stages * (kernel_context.c[:, None] * rhs_time_ref))
+    )
+    return residual_y_bar, residual_dt_bar, residual_lagged_bar
 
 
 def _radau_solve_exact_stage_residual_transpose_iterative(
