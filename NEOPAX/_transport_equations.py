@@ -1542,6 +1542,32 @@ class ComposedEquationSystem:
             flux_bar = self._shared_fluxes_add(flux_bar, er_flux_bar)
         return flux_bar
 
+    def pullback_evaluate_with_lagged_response(self, t, state, runtime, lagged_response, rhs_bar):
+        """Reverse-only pullback for lagged-response dependence of the RHS."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return TransportLaggedResponse(flux_response=None)
+
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response", None)
+        if callable(pullback_fn):
+            flux_response_bar = pullback_fn(working_state, lagged_response.flux_response, flux_bar)
+        else:
+            _, flux_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                ),
+                lagged_response.flux_response,
+            )
+            (flux_response_bar,) = flux_pullback(flux_bar)
+        return TransportLaggedResponse(flux_response=flux_response_bar)
+
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState

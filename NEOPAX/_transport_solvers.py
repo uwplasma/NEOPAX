@@ -846,6 +846,14 @@ def _lagged_response_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_eval_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
     _, eval_fn = _lagged_response_hooks(vector_field)
@@ -864,6 +872,31 @@ def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, 
         return rhs_flat
 
     return _flat_rhs
+
+
+def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwargs, project_flat=None):
+    species = _extract_species_from_args(args)
+    pullback_fn = _lagged_response_eval_pullback_hook(vector_field)
+    if pullback_fn is None:
+        return None
+
+    def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
+        projected_flat_y = _project_flat_state_if_needed(
+            flat_y,
+            project_flat,
+        )
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        return pullback_fn(
+            t_value,
+            state_y,
+            *args,
+            lagged_response=lagged_response,
+            rhs_bar=rhs_bar_state,
+            **kwargs,
+        )
+
+    return _pullback
 
 
 def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max", rtol_eff=None, scale_override=None):
@@ -2708,6 +2741,7 @@ class _RadauAcceptedStepPhysicsContext:
     pullback_build_lagged_response: Callable[[Any, Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
+    flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
@@ -4730,20 +4764,32 @@ def _radau_exact_stage_residual_input_pullback(
         residual_stages,
     )
 
-    def _stage_evals_from_lagged(lagged_response_value):
-        return jax.vmap(
-            lambda t_eval, y_eval: _radau_eval_rhs(
+    if physics_context.flat_rhs_lagged_response_pullback is not None:
+        staged_lagged_bars = jax.vmap(
+            lambda t_eval, y_eval, rhs_bar_eval: physics_context.flat_rhs_lagged_response_pullback(
                 t_eval,
                 y_eval,
-                lagged_response_value,
-                physics_context.flat_rhs,
-                physics_context.flat_rhs_with_lagged_response,
+                lagged_response,
+                rhs_bar_eval,
             ),
-            in_axes=(0, 0),
-        )(stage_times, stage_states)
+            in_axes=(0, 0, 0),
+        )(stage_times, stage_states, -residual_stages)
+        residual_lagged_bar = jax.tree_util.tree_map(lambda value: jnp.sum(value, axis=0), staged_lagged_bars)
+    else:
+        def _stage_evals_from_lagged(lagged_response_value):
+            return jax.vmap(
+                lambda t_eval, y_eval: _radau_eval_rhs(
+                    t_eval,
+                    y_eval,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                ),
+                in_axes=(0, 0),
+            )(stage_times, stage_states)
 
-    _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
-    (residual_lagged_bar,) = lagged_pullback(-residual_stages)
+        _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+        (residual_lagged_bar,) = lagged_pullback(-residual_stages)
     residual_y_bar = -jnp.sum(jt_residual_stages, axis=0)
 
     if compute_dt_bar:
@@ -9594,6 +9640,13 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_lagged_response_pullback = _flat_rhs_lagged_response_pullback_factory(
+        unravel=unpack_flat,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
@@ -9735,6 +9788,7 @@ def _build_prepared_radau_accepted_rollout(
         pullback_build_lagged_response=pullback_build_lagged_response,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+        flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
@@ -9862,6 +9916,13 @@ class RADAUSolver(_RadauSolverConfig):
         build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
         pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        flat_rhs_lagged_response_pullback = _flat_rhs_lagged_response_pullback_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
             args=args,
@@ -10030,6 +10091,7 @@ class RADAUSolver(_RadauSolverConfig):
             pullback_build_lagged_response=pullback_build_lagged_response,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+            flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
             lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
