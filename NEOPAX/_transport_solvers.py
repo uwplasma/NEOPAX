@@ -928,11 +928,13 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
             **kwargs,
         )
         projected_bar = pack_flat(state_bar)
-        if project_flat is None:
-            return projected_bar
-        _, project_pullback = jax.vjp(project_flat, flat_y)
-        (flat_bar,) = project_pullback(projected_bar)
-        return flat_bar
+        # Keep the iterative reverse-stage linear operator linear-transpose
+        # friendly.  A nested VJP through project_flat includes floor/max
+        # primitives, and bicgstab/gmres asks JAX to transpose this matvec.
+        # The production trajectory is already projected; floor-active cases
+        # should use the generic fallback until we add a handwritten projector
+        # transpose.
+        return projected_bar
 
     return _pullback
 
