@@ -4725,7 +4725,7 @@ def _radau_apply_stage_linear_transpose_solve(
     return jax.lax.cond(zero_rhs, _solve_zero_rhs, _solve_nonzero_rhs, rhs_arr)
 
 
-def _radau_solve_exact_stage_residual_transpose_matrix_free(
+def _radau_solve_exact_stage_residual_transpose_iterative(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
@@ -4733,6 +4733,7 @@ def _radau_solve_exact_stage_residual_transpose_matrix_free(
     lagged_response,
     *,
     rhs,
+    method: str,
 ):
     """Solve the exact stage-residual transpose system without materializing it.
 
@@ -4781,15 +4782,25 @@ def _radau_solve_exact_stage_residual_transpose_matrix_free(
             skip_zero_rhs_shortcut=True,
         )
 
-    solution, _info = jax.scipy.sparse.linalg.gmres(
-        _transpose_matvec,
-        -rhs_arr,
-        tol=1.0e-10,
-        atol=0.0,
-        restart=20,
-        maxiter=20,
-        M=_preconditioner,
-    )
+    if method == "bicgstab":
+        solution, _info = jax.scipy.sparse.linalg.bicgstab(
+            _transpose_matvec,
+            -rhs_arr,
+            tol=1.0e-10,
+            atol=0.0,
+            maxiter=40,
+            M=_preconditioner,
+        )
+    else:
+        solution, _info = jax.scipy.sparse.linalg.gmres(
+            _transpose_matvec,
+            -rhs_arr,
+            tol=1.0e-10,
+            atol=0.0,
+            restart=20,
+            maxiter=20,
+            M=_preconditioner,
+        )
     return solution.reshape((-1,))
 
 
@@ -4868,14 +4879,15 @@ def _radau_solve_exact_stage_residual_transpose(
             complex_piv_out=primal_result.complex_piv_out,
             skip_zero_rhs_shortcut=True,
         )
-    if mode == "gmres":
-        return _radau_solve_exact_stage_residual_transpose_matrix_free(
+    if mode in {"gmres", "bicgstab"}:
+        return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
             physics_context,
             carry_in,
             primal_result,
             lagged_response,
             rhs=rhs,
+            method=mode,
         )
     if mode != "block":
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
