@@ -36,6 +36,7 @@ from ._state import (
     DEFAULT_TRANSPORT_DENSITY_FLOOR,
     DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
     TransportState,
+    _broadcast_species_floor,
     apply_transport_density_floor,
     apply_transport_temperature_floor,
     get_v_thermal,
