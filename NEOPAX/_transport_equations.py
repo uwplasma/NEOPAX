@@ -1390,6 +1390,8 @@ class ComposedEquationSystem:
                 if target_key not in shared_fluxes:
                     return flux_bar_in
                 gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * faces_from_cell_centered(shared_fluxes[target_key])
+                if gamma_faces.shape != temperature_left.shape or gamma_faces.shape != temperature_right.shape:
+                    return None
                 temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
                 gamma_bar = PARTICLE_FLUX_PHYSICAL_TO_STATE * self._faces_from_cell_centered_pullback(
                     energy_faces_bar * temperature_upwind,
@@ -1404,6 +1406,8 @@ class ComposedEquationSystem:
                 # In the NTX center-interpolation face path, the neo face flux
                 # is built from the total center `Gamma` passed as center_fluxes.
                 flux_bar = _add_convective_gamma_bar(flux_bar, "Gamma")
+                if flux_bar is None:
+                    return None
             if bool(getattr(temperature_eq, "include_turbulent_convection", False)):
                 return None
             if bool(getattr(temperature_eq, "include_classical_convection", False)):
