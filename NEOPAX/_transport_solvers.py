@@ -2383,6 +2383,20 @@ class _RadauAcceptedStepAttemptResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepReverseMinimalAttemptResult:
+    carry_after_attempt: Any
+    trial_dt: Any
+    trial_y: Any
+    stage_history: Any
+    jacobian_out: Any
+    real_lu_out: Any
+    real_piv_out: Any
+    complex_lu_out: Any
+    complex_piv_out: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepBackwardPayloadCandidate:
     t_start: Any
     y_start: Any
@@ -3794,12 +3808,21 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
     next_carry_bar,
 ):
     carry_in = residuals
-    primal_result = _execute_radau_accepted_step_attempt(
-        kernel_context,
-        physics_context,
-        carry_in,
-        context,
-    )
+    reverse_direct_stage_adjoint = bool(getattr(physics_context, "reverse_direct_stage_adjoint", False))
+    if reverse_direct_stage_adjoint:
+        primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+            kernel_context,
+            physics_context,
+            carry_in,
+            context,
+        )
+    else:
+        primal_result = _execute_radau_accepted_step_attempt(
+            kernel_context,
+            physics_context,
+            carry_in,
+            context,
+        )
 
     def _zero_tangent_like(x):
         arr = jnp.asarray(x)
@@ -3996,7 +4019,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
         (carry_bar_value,) = pullback(next_carry_bar)
         return carry_bar_value
 
-    if bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
+    if reverse_direct_stage_adjoint:
         carry_bar = _direct_stage_cache_adjoint(None)
     else:
         carry_bar = _transpose_tangent_helper_adjoint(None)
@@ -4102,6 +4125,44 @@ def _execute_radau_accepted_step_attempt(
         er_err_norm=er_err_norm,
         lagged_response_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
+    )
+
+
+def _execute_radau_accepted_step_attempt_reverse_minimal(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> _RadauAcceptedStepReverseMinimalAttemptResult:
+    """Reverse-only accepted-step attempt data for the direct adjoint path."""
+    trial_dt = jnp.minimum(carry_in.dt, context.t_final - carry_in.t)
+    (
+        trial_y,
+        stage_history,
+        jacobian_out,
+        real_lu_out,
+        real_piv_out,
+        complex_lu_out,
+        complex_piv_out,
+        lagged_response_out,
+        lagged_reference_y_out,
+    ) = _radau_single_step_primal_reverse_minimal(kernel_context, physics_context, carry_in, trial_dt)
+    carry_after_attempt = dataclasses.replace(
+        carry_in,
+        lagged_response_cache=lagged_response_out,
+        lagged_response_valid=jnp.asarray(context.use_transport_lagged_response),
+        lagged_reference_y=lagged_reference_y_out,
+    )
+    return _RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry_after_attempt,
+        trial_dt=trial_dt,
+        trial_y=trial_y,
+        stage_history=stage_history,
+        jacobian_out=jacobian_out,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
     )
 
 
@@ -6241,6 +6302,182 @@ def _radau_single_step_primal(
         lagged_reference_y,
         lagged_response_reused,
         jacobian_reused,
+    )
+
+
+def _radau_single_step_primal_reverse_minimal(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    h_value,
+):
+    """Reverse-only primal step data needed by the accepted-step adjoint.
+
+    This keeps the same Radau nonlinear solve and cache/linearization choices
+    as `_radau_single_step_primal`, but it does not build the adaptive
+    estimator/controller diagnostics that the accepted-step reverse rule never
+    consumes.
+    """
+    flat_y = carry_in.y
+    t_value = carry_in.t
+    prev_stages = carry_in.prev_stages
+    prev_dt = carry_in.prev_dt
+    prev_theta_final = carry_in.prev_theta_final
+    prev_newton_iter_count = carry_in.prev_newton_iter_count
+    recent_reject_count = carry_in.recent_reject_count
+    jacobian_cache = carry_in.jacobian
+    cache_valid = carry_in.cache_valid
+    cache_dt = carry_in.cache_dt
+    cache_age = carry_in.cache_age
+    real_lu_cache = carry_in.real_lu
+    real_piv_cache = carry_in.real_piv
+    complex_lu_cache = carry_in.complex_lu
+    complex_piv_cache = carry_in.complex_piv
+    lagged_response, lagged_reference_y, _lagged_response_reused = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_in,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+
+    def _rhs_eval(t_eval, y_eval):
+        return _radau_eval_rhs(
+            t_eval,
+            y_eval,
+            lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    def _rhs_eval_at_current_time(y_eval):
+        return _rhs_eval(t_value, y_eval)
+
+    def _rhs_eval_at_state_time(t_eval):
+        return _rhs_eval(t_eval, flat_y)
+
+    f0 = _rhs_eval(t_value, flat_y)
+    rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_time)(t_value)
+    z0 = _make_radau_stage_predictor(
+        f0,
+        prev_stages,
+        prev_dt,
+        h_value,
+        kernel_context.c,
+        kernel_context.dtype,
+        density_size=kernel_context.density_size,
+        pressure_size=kernel_context.pressure_size,
+        er_size=kernel_context.er_size,
+        prev_theta_final=prev_theta_final,
+        prev_newton_iter_count=prev_newton_iter_count,
+        predictor_mode=kernel_context.predictor_mode,
+    )
+
+    jacobian_dt_scale = jnp.maximum(
+        jnp.abs(cache_dt),
+        jnp.asarray(1.0e-14, dtype=kernel_context.dtype),
+    )
+    dt_close = jnp.abs(h_value - cache_dt) <= kernel_context.jacobian_reuse_rtol * jacobian_dt_scale
+    reuse_jacobian_retry = jnp.logical_and(
+        jnp.logical_and(cache_valid, recent_reject_count > jnp.asarray(0, dtype=jnp.int32)),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    reuse_jacobian_dt_close = jnp.logical_and(
+        jnp.logical_and(cache_valid, dt_close),
+        jnp.logical_not(kernel_context.use_lagged_linear_response),
+    )
+    use_dt_close_reuse = kernel_context.jacobian_reuse_mode == "dt_close"
+    force_lu_refactor = kernel_context.jacobian_reuse_mode == "retry_refactor_lu"
+    reuse_jacobian = jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_jacobian_retry)
+    reuse_lu_retry = jnp.logical_and(reuse_jacobian_retry, dt_close)
+    reuse_lu = jnp.where(
+        force_lu_refactor,
+        jnp.asarray(False),
+        jnp.where(use_dt_close_reuse, reuse_jacobian_dt_close, reuse_lu_retry),
+    )
+
+    def _factor_linear_systems(jacobian_ref):
+        h_jacobian = h_value * jacobian_ref
+        real_matrix = kernel_context.identity_n - kernel_context.radau_real_eig * h_jacobian
+        real_lu, real_piv = jax.scipy.linalg.lu_factor(real_matrix)
+        complex_dense_all = jnp.transpose(
+            kernel_context.identity_2[None, :, :, None, None] * kernel_context.identity_n[None, None, None, :, :]
+            - kernel_context.radau_complex_blocks[:, :, :, None, None] * h_jacobian[None, None, None, :, :],
+            (0, 1, 3, 2, 4),
+        ).reshape((kernel_context.num_complex_pairs, kernel_context.complex_dim, kernel_context.complex_dim))
+
+        def _factor_pair(i, carry):
+            lu_all, piv_all = carry
+            lu_i, piv_i = jax.scipy.linalg.lu_factor(complex_dense_all[i])
+            lu_all = lu_all.at[i].set(lu_i)
+            piv_all = piv_all.at[i].set(piv_i)
+            return lu_all, piv_all
+
+        complex_lu, complex_piv = jax.lax.fori_loop(
+            0,
+            kernel_context.num_complex_pairs,
+            _factor_pair,
+            (jnp.zeros_like(complex_lu_cache), jnp.zeros_like(complex_piv_cache)),
+        )
+        return real_lu, real_piv, complex_lu, complex_piv
+
+    def _reuse_jacobian(_):
+        return jacobian_cache
+
+    def _recompute_jacobian(_):
+        return jax.jacfwd(_rhs_eval_at_current_time)(flat_y)
+
+    jacobian_ref = jax.lax.cond(
+        reuse_jacobian,
+        _reuse_jacobian,
+        _recompute_jacobian,
+        operand=None,
+    )
+
+    def _reuse_lu(_):
+        return real_lu_cache, real_piv_cache, complex_lu_cache, complex_piv_cache
+
+    def _recompute_lu(_):
+        return _factor_linear_systems(jacobian_ref)
+
+    real_lu_out, real_piv_out, complex_lu_out, complex_piv_out = jax.lax.cond(
+        reuse_lu,
+        _reuse_lu,
+        _recompute_lu,
+        operand=None,
+    )
+
+    subsolve_inputs = _radau_build_stage_subsolve_inputs(
+        flat_y=flat_y,
+        t_value=t_value,
+        h_value=h_value,
+        z0=z0,
+        f0=f0,
+        jacobian_ref=jacobian_ref,
+        rhs_time_ref=rhs_time_ref,
+        lagged_response=lagged_response,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+    )
+    subsolve_result = _radau_run_stage_subsolve_from_inputs(
+        kernel_context,
+        physics_context,
+        subsolve_inputs,
+    )
+    stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
+    return (
+        flat_next,
+        subsolve_result.z_final,
+        jacobian_ref,
+        real_lu_out,
+        real_piv_out,
+        complex_lu_out,
+        complex_piv_out,
+        lagged_response,
+        lagged_reference_y,
     )
 
 
