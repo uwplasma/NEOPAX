@@ -9038,13 +9038,23 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     segmented_replay_arrays = None
     if reverse_segment_length is not None and int(reverse_segment_length) > 0 and stop_after_accepted_steps is not None:
         segment_length = int(reverse_segment_length)
-        attempt_count = int(active_mask.shape[0])
-        segment_count = (attempt_count + segment_length - 1) // segment_length
+        accepted_limit = int(stop_after_accepted_steps)
+        segment_count = (accepted_limit + segment_length - 1) // segment_length
         padded_count = segment_count * segment_length
+        accepted_active_mask = jnp.logical_and(active_mask, accepted_mask)
+        accepted_count = jnp.minimum(
+            jnp.sum(accepted_active_mask.astype(jnp.int32)),
+            jnp.asarray(accepted_limit, dtype=jnp.int32),
+        )
+        accepted_positions = jnp.nonzero(
+            accepted_active_mask,
+            size=accepted_limit,
+            fill_value=0,
+        )[0]
 
         def _compact_and_pad(values):
-            compact = values
-            pad_count = padded_count - attempt_count
+            compact = jnp.take(values, accepted_positions, axis=0)
+            pad_count = padded_count - accepted_limit
             if pad_count == 0:
                 return compact
             pad_values = jnp.repeat(compact[-1:], pad_count, axis=0)
@@ -9052,12 +9062,11 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
 
         replay_active_mask = jnp.concatenate(
             [
-                active_mask,
-                jnp.zeros((padded_count - attempt_count,), dtype=jnp.bool_),
+                jnp.arange(accepted_limit, dtype=jnp.int32) < accepted_count,
+                jnp.zeros((padded_count - accepted_limit,), dtype=jnp.bool_),
             ],
             axis=0,
         )
-        replay_accepted_mask = _compact_and_pad(accepted_mask)
         replay_attempted_dts = _compact_and_pad(attempted_dts)
         replay_next_dts = _compact_and_pad(next_dts)
         replay_next_recent_reject_count = _compact_and_pad(next_recent_reject_count)
@@ -9066,7 +9075,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         replay_next_lagged_response_valid = _compact_and_pad(next_lagged_response_valid)
         segmented_replay_arrays = (
             replay_active_mask.reshape((segment_count, segment_length)),
-            replay_accepted_mask.reshape((segment_count, segment_length)),
             replay_attempted_dts.reshape((segment_count, segment_length)),
             replay_next_dts.reshape((segment_count, segment_length)),
             replay_next_recent_reject_count.reshape((segment_count, segment_length)),
@@ -9076,7 +9084,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         )
 
         def _segment_forward(carry, xs):
-            segment_rollout = _radau_replay_realized_attempt_rollout(
+            segment_rollout = _radau_replay_realized_accepted_rollout(
                 execution_context,
                 carry,
                 *xs,
@@ -9149,7 +9157,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             segment_start_carry, segment_arrays = xs
 
             def _segment_replay(carry_value):
-                segment_rollout = _radau_replay_realized_attempt_rollout(
+                segment_rollout = _radau_replay_realized_accepted_rollout(
                     execution_context,
                     carry_value,
                     *segment_arrays,

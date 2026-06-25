@@ -786,8 +786,13 @@ def main() -> None:
     grad_np = np.asarray(jax.device_get(gradient_rev), dtype=float)
     reverse_checkpoint_count = None
     if reverse_segment_length is not None:
+        reverse_checkpoint_base = (
+            int(args.accepted_step_limit)
+            if args.accepted_step_limit is not None
+            else int(reverse_setup.max_total_steps)
+        )
         reverse_checkpoint_count = int(
-            (int(reverse_setup.max_total_steps) + int(reverse_segment_length) - 1)
+            (reverse_checkpoint_base + int(reverse_segment_length) - 1)
             // int(reverse_segment_length)
         )
 
