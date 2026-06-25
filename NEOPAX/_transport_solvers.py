@@ -7509,6 +7509,77 @@ def _radau_replay_realized_attempt_rollout(
     )
 
 
+def _radau_replay_realized_accepted_slot(
+    execution_context: _RadauSolveExecutionContext,
+    carry: _RadauAcceptedStepCarry,
+    active,
+    dt_value,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+):
+    """Replay one realized accepted-step slot, or pass through padding."""
+    dtype = execution_context.dtype
+
+    def _do_step(_):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+
+        def _reuse_branch(_):
+            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+                "reuse",
+            )
+
+        def _rebuild_branch(_):
+            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                execution_context.attempt_context,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+                "rebuild",
+            )
+
+        next_carry = jax.lax.cond(
+            carry_for_step.lagged_response_valid,
+            _reuse_branch,
+            _rebuild_branch,
+            operand=None,
+        )
+        scan_out = (
+            next_carry.y,
+            next_carry.prev_error,
+            jnp.asarray(True),
+            dt_value,
+        )
+        return next_carry, scan_out
+
+    def _skip(_):
+        scan_out = (
+            carry.y,
+            jnp.asarray(jnp.inf, dtype=dtype),
+            jnp.asarray(False),
+            jnp.asarray(0.0, dtype=dtype),
+        )
+        return carry, scan_out
+
+    return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+
 def _radau_replay_realized_accepted_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
@@ -7526,74 +7597,13 @@ def _radau_replay_realized_accepted_rollout(
     restricted to the realized accepted-step map.
     """
 
-    dtype = execution_context.dtype
-
     def _scan_body(carry, xs):
-        (
-            active,
-            dt_value,
-            next_dt_value,
-            recent_reject_count_value,
-            regrowth_cooldown_value,
-            easy_growth_streak_value,
-            lagged_response_valid_value,
-        ) = xs
-
-        def _do_step(_):
-            carry_for_step = dataclasses.replace(carry, dt=dt_value)
-
-            def _reuse_branch(_):
-                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                    next_dt_value,
-                    recent_reject_count_value,
-                    regrowth_cooldown_value,
-                    easy_growth_streak_value,
-                    lagged_response_valid_value,
-                    "reuse",
-                )
-
-            def _rebuild_branch(_):
-                return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                    execution_context.attempt_context,
-                    next_dt_value,
-                    recent_reject_count_value,
-                    regrowth_cooldown_value,
-                    easy_growth_streak_value,
-                    lagged_response_valid_value,
-                    "rebuild",
-                )
-
-            next_carry = jax.lax.cond(
-                carry_for_step.lagged_response_valid,
-                _reuse_branch,
-                _rebuild_branch,
-                operand=None,
-            )
-            scan_out = (
-                next_carry.y,
-                next_carry.prev_error,
-                jnp.asarray(True),
-                dt_value,
-            )
-            return next_carry, scan_out
-
-        def _skip(_):
-            scan_out = (
-                carry.y,
-                jnp.asarray(jnp.inf, dtype=dtype),
-                jnp.asarray(False),
-                jnp.asarray(0.0, dtype=dtype),
-            )
-            return carry, scan_out
-
-        return jax.lax.cond(active, _do_step, _skip, operand=None)
+        next_carry, scan_out = _radau_replay_realized_accepted_slot(
+            execution_context,
+            carry,
+            *xs,
+        )
+        return next_carry, scan_out
 
     final_carry, scan_outputs = jax.lax.scan(
         _scan_body,
@@ -9156,17 +9166,42 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         def _segment_bwd(carry_bar, xs):
             segment_start_carry, segment_arrays = xs
 
-            def _segment_replay(carry_value):
-                segment_rollout = _radau_replay_realized_accepted_rollout(
+            def _segment_collect_start_carries(carry, slot_xs):
+                next_carry, _ = _radau_replay_realized_accepted_slot(
                     execution_context,
-                    carry_value,
-                    *segment_arrays,
+                    carry,
+                    *slot_xs,
                 )
-                return segment_rollout.final_carry
+                return next_carry, carry
 
-            _, pullback = jax.vjp(_segment_replay, segment_start_carry)
-            (start_carry_bar,) = pullback(carry_bar)
-            return start_carry_bar, None
+            _, step_start_carries = jax.lax.scan(
+                _segment_collect_start_carries,
+                segment_start_carry,
+                segment_arrays,
+            )
+
+            def _slot_bwd(slot_carry_bar, slot_xs):
+                step_start_carry, slot_arrays = slot_xs
+
+                def _slot_replay(carry_value):
+                    next_carry, _ = _radau_replay_realized_accepted_slot(
+                        execution_context,
+                        carry_value,
+                        *slot_arrays,
+                    )
+                    return next_carry
+
+                _, pullback = jax.vjp(_slot_replay, step_start_carry)
+                (step_start_carry_bar,) = pullback(slot_carry_bar)
+                return step_start_carry_bar, None
+
+            segment_start_carry_bar, _ = jax.lax.scan(
+                _slot_bwd,
+                carry_bar,
+                (step_start_carries, segment_arrays),
+                reverse=True,
+            )
+            return segment_start_carry_bar, None
 
         carry0_bar, _ = jax.lax.scan(
             _segment_bwd,

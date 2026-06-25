@@ -9,6 +9,13 @@
 - Preserve the current forward AD path during this reverse refactor; use its
   values as the reference that reverse must match before any forward-path
   optimization is considered.
+- Efficiency and correctness changes must not be specialized to a single
+  benchmark invocation or TOML file. Benchmark runs may expose a problem, but
+  the resulting code path must be formulated as a solver/reverse-lane rule with
+  clear general preconditions and safe fallback behavior.
+- Do not add benchmark-specific algebra shortcuts merely because they fit the
+  current test case. If a specialization is introduced, it must correspond to a
+  reusable mathematical/operator mode, not to one example configuration.
 
 ## Current OOM Reduction Rules
 
