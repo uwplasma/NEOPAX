@@ -9068,16 +9068,163 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         def _segment_bwd(carry_bar, xs):
             segment_start_carry, segment_arrays = xs
 
-            def _segment_replay(carry_value):
-                segment_rollout = _radau_replay_realized_attempt_rollout(
-                    execution_context,
-                    carry_value,
-                    *segment_arrays,
-                )
-                return segment_rollout.final_carry
+            (
+                segment_active_mask,
+                segment_accepted_mask,
+                segment_attempted_dts,
+                segment_next_dts,
+                segment_next_recent_reject_count,
+                segment_next_regrowth_cooldown,
+                segment_next_easy_growth_streak,
+                segment_next_lagged_response_valid,
+            ) = segment_arrays
 
-            _, pullback = jax.vjp(_segment_replay, segment_start_carry)
-            (start_carry_bar,) = pullback(carry_bar)
+            def _segment_fwd_body(carry_value, step_xs):
+                (
+                    active,
+                    accepted,
+                    dt_value,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                ) = step_xs
+
+                def _accepted_attempt(_):
+                    carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+
+                    def _reuse_branch(__):
+                        return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                            execution_context.attempt_context,
+                            next_dt_value,
+                            recent_reject_count_value,
+                            regrowth_cooldown_value,
+                            easy_growth_streak_value,
+                            lagged_response_valid_value,
+                            "reuse",
+                        )
+
+                    def _rebuild_branch(__):
+                        return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+                            execution_context.attempt_context,
+                            next_dt_value,
+                            recent_reject_count_value,
+                            regrowth_cooldown_value,
+                            easy_growth_streak_value,
+                            lagged_response_valid_value,
+                            "rebuild",
+                        )
+
+                    return jax.lax.cond(
+                        carry_for_step.lagged_response_valid,
+                        _reuse_branch,
+                        _rebuild_branch,
+                        operand=None,
+                    )
+
+                should_advance = jnp.logical_and(active, accepted)
+                next_carry = jax.lax.cond(
+                    should_advance,
+                    _accepted_attempt,
+                    lambda _: carry_value,
+                    operand=None,
+                )
+                return next_carry, carry_value
+
+            _segment_final_carry, segment_input_carries = jax.lax.scan(
+                _segment_fwd_body,
+                segment_start_carry,
+                segment_arrays,
+            )
+
+            def _segment_rev_body(step_carry_bar, step_xs):
+                (
+                    carry_value,
+                    active,
+                    accepted,
+                    dt_value,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                ) = step_xs
+
+                def _accepted_attempt(_):
+                    def _accepted_step(carry_arg):
+                        carry_for_step_arg = dataclasses.replace(carry_arg, dt=dt_value)
+
+                        def _reuse_branch(__):
+                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                                execution_context.kernel_context,
+                                execution_context.physics_context,
+                                _radau_carry_with_forward_only_jvp_fields(carry_for_step_arg),
+                                execution_context.attempt_context,
+                                next_dt_value,
+                                recent_reject_count_value,
+                                regrowth_cooldown_value,
+                                easy_growth_streak_value,
+                                lagged_response_valid_value,
+                                "reuse",
+                            )
+
+                        def _rebuild_branch(__):
+                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
+                                execution_context.kernel_context,
+                                execution_context.physics_context,
+                                _radau_carry_with_forward_only_jvp_fields(carry_for_step_arg),
+                                execution_context.attempt_context,
+                                next_dt_value,
+                                recent_reject_count_value,
+                                regrowth_cooldown_value,
+                                easy_growth_streak_value,
+                                lagged_response_valid_value,
+                                "rebuild",
+                            )
+
+                        return jax.lax.cond(
+                            carry_for_step_arg.lagged_response_valid,
+                            _reuse_branch,
+                            _rebuild_branch,
+                            operand=None,
+                        )
+
+                    _, pullback = jax.vjp(_accepted_step, carry_value)
+                    (carry_value_bar,) = pullback(step_carry_bar)
+                    return carry_value_bar
+
+                should_advance = jnp.logical_and(active, accepted)
+                prev_carry_bar = jax.lax.cond(
+                    should_advance,
+                    _accepted_attempt,
+                    lambda _: step_carry_bar,
+                    operand=None,
+                )
+                return prev_carry_bar, None
+
+            start_carry_bar, _ = jax.lax.scan(
+                _segment_rev_body,
+                carry_bar,
+                (
+                    segment_input_carries,
+                    segment_active_mask,
+                    segment_accepted_mask,
+                    segment_attempted_dts,
+                    segment_next_dts,
+                    segment_next_recent_reject_count,
+                    segment_next_regrowth_cooldown,
+                    segment_next_easy_growth_streak,
+                    segment_next_lagged_response_valid,
+                ),
+                reverse=True,
+            )
             return start_carry_bar, None
 
         carry0_bar, _ = jax.lax.scan(
