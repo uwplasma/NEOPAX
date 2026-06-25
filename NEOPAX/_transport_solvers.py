@@ -4947,16 +4947,85 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             skip_zero_rhs_shortcut=True,
         )
 
+    def _safe_divide(numerator, denominator):
+        denominator = jnp.asarray(denominator, dtype=kernel_context.dtype)
+        safe_denominator = jnp.where(
+            jnp.abs(denominator) > jnp.asarray(0.0, dtype=kernel_context.dtype),
+            denominator,
+            jnp.asarray(1.0, dtype=kernel_context.dtype),
+        )
+        return numerator / safe_denominator
+
+    def _bicgstab_fixed_iterations(matvec, b, preconditioner, *, tol, maxiter):
+        """BiCGSTAB in a fixed JAX loop, avoiding custom_linear_solve transposes."""
+
+        b = jnp.asarray(b, dtype=kernel_context.dtype)
+        x0 = jnp.zeros_like(b)
+        r0 = b - matvec(x0)
+        r_hat = r0
+        zeros = jnp.zeros_like(b)
+        one = jnp.asarray(1.0, dtype=kernel_context.dtype)
+        norm_b = jnp.sqrt(jnp.maximum(jnp.vdot(b, b), jnp.asarray(0.0, dtype=kernel_context.dtype)))
+        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * jnp.maximum(norm_b, one)
+        initial_residual_norm = jnp.sqrt(
+            jnp.maximum(jnp.vdot(r0, r0), jnp.asarray(0.0, dtype=kernel_context.dtype))
+        )
+
+        initial_state = (
+            x0,
+            r0,
+            r_hat,
+            zeros,
+            zeros,
+            one,
+            one,
+            one,
+            initial_residual_norm <= threshold,
+        )
+
+        def _body(_idx, state):
+            x, r, r_shadow, p, v, rho_prev, alpha_prev, omega_prev, converged = state
+            rho = jnp.vdot(r_shadow, r)
+            beta = _safe_divide(rho, rho_prev) * _safe_divide(alpha_prev, omega_prev)
+            p_candidate = r + beta * (p - omega_prev * v)
+            p_hat = preconditioner(p_candidate)
+            v_candidate = matvec(p_hat)
+            alpha = _safe_divide(rho, jnp.vdot(r_shadow, v_candidate))
+            s = r - alpha * v_candidate
+            s_hat = preconditioner(s)
+            t = matvec(s_hat)
+            omega = _safe_divide(jnp.vdot(t, s), jnp.vdot(t, t))
+            x_candidate = x + alpha * p_hat + omega * s_hat
+            r_candidate = s - omega * t
+            residual_norm = jnp.sqrt(
+                jnp.maximum(jnp.vdot(r_candidate, r_candidate), jnp.asarray(0.0, dtype=kernel_context.dtype))
+            )
+            converged_candidate = residual_norm <= threshold
+            use_candidate = jnp.logical_not(converged)
+            return (
+                jnp.where(use_candidate, x_candidate, x),
+                jnp.where(use_candidate, r_candidate, r),
+                r_shadow,
+                jnp.where(use_candidate, p_candidate, p),
+                jnp.where(use_candidate, v_candidate, v),
+                jnp.where(use_candidate, rho, rho_prev),
+                jnp.where(use_candidate, alpha, alpha_prev),
+                jnp.where(use_candidate, omega, omega_prev),
+                jnp.logical_or(converged, converged_candidate),
+            )
+
+        final_state = jax.lax.fori_loop(0, int(maxiter), _body, initial_state)
+        return final_state[0]
+
     iter_tol = float(getattr(physics_context, "reverse_stage_adjoint_iter_tol", 1.0e-10))
     iter_maxiter = int(getattr(physics_context, "reverse_stage_adjoint_iter_maxiter", 40))
     if method == "bicgstab":
-        solution, _info = jax.scipy.sparse.linalg.bicgstab(
+        solution = _bicgstab_fixed_iterations(
             _transpose_matvec,
             -rhs_arr,
             tol=iter_tol,
-            atol=0.0,
             maxiter=iter_maxiter,
-            M=_preconditioner,
+            preconditioner=_preconditioner,
         )
     else:
         solution, _info = jax.scipy.sparse.linalg.gmres(

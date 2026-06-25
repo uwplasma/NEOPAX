@@ -624,13 +624,13 @@ def main() -> None:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-tol must be positive.")
     if (
         str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
-        and str(args.reverse_stage_adjoint_solve_mode) in {"bicgstab", "gmres"}
+        and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
     ):
         raise SystemExit(
             "[autodiff-gate] --reverse-rhs-transpose-mode explicit_ntx_interpolated is not ready for "
-            "Krylov reverse stage solves: the current NTX state pullback still contains nested VJPs "
-            "through max/floor logic. Implement a fully handwritten NTX RHS-state transpose before "
-            "using this mode with bicgstab/gmres."
+            "JAX scipy GMRES: the current NTX state pullback still contains nested VJPs through "
+            "max/floor logic, and JAX scipy GMRES asks JAX to transpose that matvec. Use "
+            "bicgstab, which uses the reverse-lane fixed-iteration JAX loop instead."
         )
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
