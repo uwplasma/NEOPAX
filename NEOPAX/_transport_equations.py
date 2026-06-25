@@ -1294,6 +1294,186 @@ class ComposedEquationSystem:
     def _shared_fluxes_add(lhs, rhs):
         return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
 
+    @staticmethod
+    def _faces_from_cell_centered_pullback(face_bar, template):
+        face_bar = jnp.asarray(face_bar)
+        template = jnp.asarray(template)
+        cell_bar = jnp.zeros_like(template)
+        cell_bar = cell_bar.at[..., 0].add(face_bar[..., 0])
+        cell_bar = cell_bar.at[..., -1].add(face_bar[..., -1])
+        if template.shape[-1] > 1:
+            interior_bar = 0.5 * face_bar[..., 1:-1]
+            cell_bar = cell_bar.at[..., :-1].add(interior_bar)
+            cell_bar = cell_bar.at[..., 1:].add(interior_bar)
+        return cell_bar
+
+    @staticmethod
+    def _conservative_update_flux_pullback(update_bar, dx, Vprime=None, Vprime_half=None):
+        update_bar = jnp.asarray(update_bar)
+        if Vprime is not None and Vprime_half is not None:
+            point_volume = Vprime * dx
+            face_volume = 0.5 * (Vprime_half[1:] + Vprime_half[:-1]) * dx
+            cell_volume = jnp.where(jnp.abs(point_volume) > 0.0, point_volume, face_volume)
+            net_flux_bar = -update_bar / cell_volume
+            flux_bar = jnp.zeros(update_bar.shape[:-1] + (update_bar.shape[-1] + 1,), dtype=update_bar.dtype)
+            flux_bar = flux_bar.at[..., 1:].add(Vprime_half[1:] * net_flux_bar)
+            flux_bar = flux_bar.at[..., :-1].add(-Vprime_half[:-1] * net_flux_bar)
+            return flux_bar
+
+        net_flux_bar = -update_bar / dx
+        flux_bar = jnp.zeros(update_bar.shape[:-1] + (update_bar.shape[-1] + 1,), dtype=update_bar.dtype)
+        flux_bar = flux_bar.at[..., 1:].add(net_flux_bar)
+        flux_bar = flux_bar.at[..., :-1].add(-net_flux_bar)
+        return flux_bar
+
+    def _try_pullback_shared_fluxes_explicit(self, state, shared_fluxes, rhs_bar):
+        """Small explicit shared-flux pullback for the reverse transport benchmark.
+
+        This intentionally covers only simple algebraic flux-to-RHS assembly.
+        If the active configuration needs a broader map, return None and let
+        the existing generic VJP path handle it.
+        """
+        if not isinstance(shared_fluxes, dict):
+            return None
+
+        working_state, eidx = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        if density_eq is not None:
+            return None
+
+        flux_bar = self._shared_fluxes_zero_like(shared_fluxes)
+
+        if temperature_eq is not None:
+            heat_mode = str(getattr(temperature_eq, "heat_flux_reconstruction", "")).strip().lower()
+            convection_mode = str(getattr(temperature_eq, "convection_reconstruction", "")).strip().lower()
+            use_face_q = heat_mode in {"closure_face_flux", "model_face_flux", "face_closure"}
+            use_face_gamma = convection_mode in {"closure_face_flux", "model_face_flux", "face_closure"}
+            if not (use_face_q and use_face_gamma):
+                return None
+            neoclassical_model = getattr(self.shared_flux_model, "neoclassical_model", None)
+            face_response_mode = str(getattr(neoclassical_model, "face_response_mode", "")).strip().lower()
+            if face_response_mode not in {"interpolate_center_response", "interpolate_center_fluxes", "center_interpolation"}:
+                return None
+            if getattr(temperature_eq, "source_model", None) is not None:
+                # Source terms are direct state terms; they do not affect
+                # shared-flux cotangents.
+                pass
+
+            pressure_bar = jnp.asarray(rhs_bar.pressure)
+            active_mask = jnp.asarray(temperature_eq.active_species_mask, dtype=bool)[:, None]
+            pressure_bar = (jnp.asarray(2.0 / 3.0, dtype=pressure_bar.dtype) * pressure_bar) * active_mask.astype(pressure_bar.dtype)
+            energy_faces_bar = self._conservative_update_flux_pullback(
+                pressure_bar,
+                temperature_eq.dr_cells,
+                temperature_eq.Vprime,
+                temperature_eq.Vprime_half,
+            )
+
+            if "Q" not in shared_fluxes:
+                return None
+            q_bar = HEAT_FLUX_PHYSICAL_TO_STATE * self._faces_from_cell_centered_pullback(
+                energy_faces_bar,
+                shared_fluxes["Q"],
+            )
+            flux_bar = self._shared_fluxes_add(
+                flux_bar,
+                {key: (q_bar if key == "Q" else jnp.zeros_like(value)) for key, value in shared_fluxes.items()},
+            )
+
+            temperature_ghost = temperature_eq.temperature_ghost_builder(working_state.temperature)
+            temperature_left, temperature_right = _temperature_face_states(
+                temperature_ghost,
+                convection_mode,
+            )
+
+            def _add_convective_gamma_bar(flux_bar_in, target_key):
+                if target_key not in shared_fluxes:
+                    return flux_bar_in
+                gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * faces_from_cell_centered(shared_fluxes[target_key])
+                temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
+                gamma_bar = PARTICLE_FLUX_PHYSICAL_TO_STATE * self._faces_from_cell_centered_pullback(
+                    energy_faces_bar * temperature_upwind,
+                    shared_fluxes[target_key],
+                )
+                return self._shared_fluxes_add(
+                    flux_bar_in,
+                    {key: (gamma_bar if key == target_key else jnp.zeros_like(value)) for key, value in shared_fluxes.items()},
+                )
+
+            if bool(getattr(temperature_eq, "include_neo_convection", False)):
+                # In the NTX center-interpolation face path, the neo face flux
+                # is built from the total center `Gamma` passed as center_fluxes.
+                flux_bar = _add_convective_gamma_bar(flux_bar, "Gamma")
+            if bool(getattr(temperature_eq, "include_turbulent_convection", False)):
+                return None
+            if bool(getattr(temperature_eq, "include_classical_convection", False)):
+                return None
+
+            if bool(getattr(temperature_eq, "include_work_term", False)):
+                if "Gamma" not in shared_fluxes:
+                    return None
+                work_gamma_bar = (
+                    pressure_bar
+                    * temperature_eq.charge_qp[:, None]
+                    * jnp.asarray(PARTICLE_FLUX_PHYSICAL_TO_STATE, dtype=pressure_bar.dtype)
+                    * working_state.Er[None, :]
+                )
+                flux_bar = self._shared_fluxes_add(
+                    flux_bar,
+                    {key: (work_gamma_bar if key == "Gamma" else jnp.zeros_like(value)) for key, value in shared_fluxes.items()},
+                )
+
+        if er_eq is not None:
+            if "Gamma" not in shared_fluxes:
+                return None
+            er_bar = jnp.asarray(rhs_bar.Er)
+            bc = getattr(er_eq, "er_bc_model", None)
+            if bc is None:
+                er_bar = er_bar.at[0].set(jnp.asarray(0.0, dtype=er_bar.dtype))
+            else:
+                left_type = str(getattr(bc, "left_type", "")).strip().lower()
+                if left_type == "dirichlet":
+                    er_bar = er_bar.at[0].set(jnp.asarray(0.0, dtype=er_bar.dtype))
+                right_type = str(getattr(bc, "right_type", "")).strip().lower()
+                if right_type == "dirichlet" and str(getattr(er_eq, "boundary_mode", "")).strip().lower() != "floating_ambipolar_edge":
+                    er_bar = er_bar.at[-1].set(jnp.asarray(0.0, dtype=er_bar.dtype))
+
+            mode = str(getattr(er_eq, "permitivity_mode", "")).strip().lower()
+            if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
+                density_indices = er_eq.ntss_density_indices
+                if density_indices is None:
+                    ni_mid = jnp.asarray(1.0, dtype=er_bar.dtype)
+                else:
+                    ni_mid = jnp.sum(working_state.density[density_indices, working_state.density.shape[1] // 2])
+                ni_mid = jnp.maximum(ni_mid, jnp.asarray(1.0e-30, dtype=er_bar.dtype))
+                coeff = (
+                    jnp.asarray(95780.0, dtype=er_bar.dtype)
+                    * jnp.asarray(er_eq.ntss_B0_mid, dtype=er_bar.dtype) ** 2
+                    / (ni_mid * jnp.asarray(er_eq.ntss_psfactor_mid, dtype=er_bar.dtype))
+                    * jnp.asarray(1.0e-20, dtype=er_bar.dtype)
+                )
+                coeff = jnp.ones_like(er_bar) * coeff
+            else:
+                plasma_permitivity = _plasma_permitivity_from_prefactor(
+                    working_state,
+                    er_eq.species_mass,
+                    er_eq.permitivity_prefactor,
+                )
+                coeff = elementary_charge * jnp.asarray(1.0e-3, dtype=er_bar.dtype) / plasma_permitivity
+
+            gamma_bar = (
+                -jnp.asarray(er_eq.Er_relax, dtype=er_bar.dtype)
+                * er_bar[None, :]
+                * coeff[None, :]
+                * jnp.asarray(er_eq.charge_qp, dtype=er_bar.dtype)[:, None]
+            )
+            flux_bar = self._shared_fluxes_add(
+                flux_bar,
+                {key: (gamma_bar if key == "Gamma" else jnp.zeros_like(value)) for key, value in shared_fluxes.items()},
+            )
+
+        return flux_bar
+
     def _prepare_working_state_pullback(self, state, working_state_bar):
         prepared_qn = None
         if self.species is not None and hasattr(self.species, "names") and "e" in tuple(getattr(self.species, "names", ())):
@@ -1486,6 +1666,10 @@ class ComposedEquationSystem:
         transport flux assembly by equation instead of VJP-ing the whole
         composed RHS map as one giant object.
         """
+        explicit_flux_bar = self._try_pullback_shared_fluxes_explicit(state, shared_fluxes, rhs_bar)
+        if explicit_flux_bar is not None:
+            return explicit_flux_bar
+
         working_state, eidx = self._prepare_working_state(state)
         density_eq, temperature_eq, er_eq = self._resolve_equations()
         zero_flux_bar = self._shared_fluxes_zero_like(shared_fluxes)
