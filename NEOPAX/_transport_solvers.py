@@ -4947,85 +4947,16 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             skip_zero_rhs_shortcut=True,
         )
 
-    def _safe_divide(numerator, denominator):
-        denominator = jnp.asarray(denominator, dtype=kernel_context.dtype)
-        safe_denominator = jnp.where(
-            jnp.abs(denominator) > jnp.asarray(0.0, dtype=kernel_context.dtype),
-            denominator,
-            jnp.asarray(1.0, dtype=kernel_context.dtype),
-        )
-        return numerator / safe_denominator
-
-    def _bicgstab_fixed_iterations(matvec, b, preconditioner, *, tol, maxiter):
-        """BiCGSTAB in a fixed JAX loop, avoiding custom_linear_solve transposes."""
-
-        b = jnp.asarray(b, dtype=kernel_context.dtype)
-        x0 = jnp.zeros_like(b)
-        r0 = b - matvec(x0)
-        r_hat = r0
-        zeros = jnp.zeros_like(b)
-        one = jnp.asarray(1.0, dtype=kernel_context.dtype)
-        norm_b = jnp.sqrt(jnp.maximum(jnp.vdot(b, b), jnp.asarray(0.0, dtype=kernel_context.dtype)))
-        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * jnp.maximum(norm_b, one)
-        initial_residual_norm = jnp.sqrt(
-            jnp.maximum(jnp.vdot(r0, r0), jnp.asarray(0.0, dtype=kernel_context.dtype))
-        )
-
-        initial_state = (
-            x0,
-            r0,
-            r_hat,
-            zeros,
-            zeros,
-            one,
-            one,
-            one,
-            initial_residual_norm <= threshold,
-        )
-
-        def _body(_idx, state):
-            x, r, r_shadow, p, v, rho_prev, alpha_prev, omega_prev, converged = state
-            rho = jnp.vdot(r_shadow, r)
-            beta = _safe_divide(rho, rho_prev) * _safe_divide(alpha_prev, omega_prev)
-            p_candidate = r + beta * (p - omega_prev * v)
-            p_hat = preconditioner(p_candidate)
-            v_candidate = matvec(p_hat)
-            alpha = _safe_divide(rho, jnp.vdot(r_shadow, v_candidate))
-            s = r - alpha * v_candidate
-            s_hat = preconditioner(s)
-            t = matvec(s_hat)
-            omega = _safe_divide(jnp.vdot(t, s), jnp.vdot(t, t))
-            x_candidate = x + alpha * p_hat + omega * s_hat
-            r_candidate = s - omega * t
-            residual_norm = jnp.sqrt(
-                jnp.maximum(jnp.vdot(r_candidate, r_candidate), jnp.asarray(0.0, dtype=kernel_context.dtype))
-            )
-            converged_candidate = residual_norm <= threshold
-            use_candidate = jnp.logical_not(converged)
-            return (
-                jnp.where(use_candidate, x_candidate, x),
-                jnp.where(use_candidate, r_candidate, r),
-                r_shadow,
-                jnp.where(use_candidate, p_candidate, p),
-                jnp.where(use_candidate, v_candidate, v),
-                jnp.where(use_candidate, rho, rho_prev),
-                jnp.where(use_candidate, alpha, alpha_prev),
-                jnp.where(use_candidate, omega, omega_prev),
-                jnp.logical_or(converged, converged_candidate),
-            )
-
-        final_state = jax.lax.fori_loop(0, int(maxiter), _body, initial_state)
-        return final_state[0]
-
     iter_tol = float(getattr(physics_context, "reverse_stage_adjoint_iter_tol", 1.0e-10))
     iter_maxiter = int(getattr(physics_context, "reverse_stage_adjoint_iter_maxiter", 40))
     if method == "bicgstab":
-        solution = _bicgstab_fixed_iterations(
+        solution, _info = jax.scipy.sparse.linalg.bicgstab(
             _transpose_matvec,
             -rhs_arr,
             tol=iter_tol,
+            atol=0.0,
             maxiter=iter_maxiter,
-            preconditioner=_preconditioner,
+            M=_preconditioner,
         )
     else:
         solution, _info = jax.scipy.sparse.linalg.gmres(
@@ -9129,192 +9060,24 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         and stop_after_accepted_steps is not None
         and int(stop_after_accepted_steps) > 1
     ):
-        def _slim_carry_bar_from_full(full_bar):
-            return (
-                full_bar.y,
-                full_bar.prev_stages,
-                full_bar.lagged_response_cache,
-                full_bar.lagged_reference_y,
-            )
-
-        def _full_carry_bar_from_slim(slim_bar, primal_carry):
-            y_bar, prev_stages_bar, lagged_response_cache_bar, lagged_reference_y_bar = slim_bar
-            return dataclasses.replace(
-                jax.tree_util.tree_map(_zero_tangent_like, primal_carry),
-                y=y_bar,
-                prev_stages=prev_stages_bar,
-                lagged_response_cache=lagged_response_cache_bar,
-                lagged_reference_y=lagged_reference_y_bar,
-            )
-
-        final_carry_bar = (
-            final_y_bar,
-            jnp.zeros_like(segmented_final_carry.prev_stages),
-            jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry.lagged_response_cache),
-            jnp.zeros_like(segmented_final_carry.lagged_reference_y),
+        final_carry_bar = dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry),
+            y=final_y_bar,
         )
 
         def _segment_bwd(carry_bar, xs):
             segment_start_carry, segment_arrays = xs
 
-            (
-                segment_active_mask,
-                segment_accepted_mask,
-                segment_attempted_dts,
-                segment_next_dts,
-                segment_next_recent_reject_count,
-                segment_next_regrowth_cooldown,
-                segment_next_easy_growth_streak,
-                segment_next_lagged_response_valid,
-            ) = segment_arrays
-
-            def _segment_fwd_body(carry_value, step_xs):
-                (
-                    active,
-                    accepted,
-                    dt_value,
-                    next_dt_value,
-                    recent_reject_count_value,
-                    regrowth_cooldown_value,
-                    easy_growth_streak_value,
-                    lagged_response_valid_value,
-                ) = step_xs
-
-                def _accepted_attempt(_):
-                    carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
-
-                    def _reuse_branch(__):
-                        return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                            execution_context.kernel_context,
-                            execution_context.physics_context,
-                            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                            execution_context.attempt_context,
-                            next_dt_value,
-                            recent_reject_count_value,
-                            regrowth_cooldown_value,
-                            easy_growth_streak_value,
-                            lagged_response_valid_value,
-                            "reuse",
-                        )
-
-                    def _rebuild_branch(__):
-                        return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                            execution_context.kernel_context,
-                            execution_context.physics_context,
-                            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-                            execution_context.attempt_context,
-                            next_dt_value,
-                            recent_reject_count_value,
-                            regrowth_cooldown_value,
-                            easy_growth_streak_value,
-                            lagged_response_valid_value,
-                            "rebuild",
-                        )
-
-                    return jax.lax.cond(
-                        carry_for_step.lagged_response_valid,
-                        _reuse_branch,
-                        _rebuild_branch,
-                        operand=None,
-                    )
-
-                should_advance = jnp.logical_and(active, accepted)
-                next_carry = jax.lax.cond(
-                    should_advance,
-                    _accepted_attempt,
-                    lambda _: carry_value,
-                    operand=None,
-                )
-                return next_carry, carry_value
-
-            _segment_final_carry, segment_input_carries = jax.lax.scan(
-                _segment_fwd_body,
-                segment_start_carry,
-                segment_arrays,
-            )
-
-            def _segment_rev_body(step_carry_bar, step_xs):
-                (
+            def _segment_replay(carry_value):
+                segment_rollout = _radau_replay_realized_attempt_rollout(
+                    execution_context,
                     carry_value,
-                    active,
-                    accepted,
-                    dt_value,
-                    next_dt_value,
-                    recent_reject_count_value,
-                    regrowth_cooldown_value,
-                    easy_growth_streak_value,
-                    lagged_response_valid_value,
-                ) = step_xs
-
-                def _accepted_attempt(_):
-                    def _accepted_step(carry_arg):
-                        carry_for_step_arg = dataclasses.replace(carry_arg, dt=dt_value)
-
-                        def _reuse_branch(__):
-                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                                execution_context.kernel_context,
-                                execution_context.physics_context,
-                                _radau_carry_with_forward_only_jvp_fields(carry_for_step_arg),
-                                execution_context.attempt_context,
-                                next_dt_value,
-                                recent_reject_count_value,
-                                regrowth_cooldown_value,
-                                easy_growth_streak_value,
-                                lagged_response_valid_value,
-                                "reuse",
-                            )
-
-                        def _rebuild_branch(__):
-                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch(
-                                execution_context.kernel_context,
-                                execution_context.physics_context,
-                                _radau_carry_with_forward_only_jvp_fields(carry_for_step_arg),
-                                execution_context.attempt_context,
-                                next_dt_value,
-                                recent_reject_count_value,
-                                regrowth_cooldown_value,
-                                easy_growth_streak_value,
-                                lagged_response_valid_value,
-                                "rebuild",
-                            )
-
-                        return jax.lax.cond(
-                            carry_for_step_arg.lagged_response_valid,
-                            _reuse_branch,
-                            _rebuild_branch,
-                            operand=None,
-                        )
-
-                    accepted_primal, pullback = jax.vjp(_accepted_step, carry_value)
-                    full_step_carry_bar = _full_carry_bar_from_slim(step_carry_bar, accepted_primal)
-                    (carry_value_bar,) = pullback(full_step_carry_bar)
-                    return _slim_carry_bar_from_full(carry_value_bar)
-
-                should_advance = jnp.logical_and(active, accepted)
-                prev_carry_bar = jax.lax.cond(
-                    should_advance,
-                    _accepted_attempt,
-                    lambda _: step_carry_bar,
-                    operand=None,
+                    *segment_arrays,
                 )
-                return prev_carry_bar, None
+                return segment_rollout.final_carry
 
-            start_carry_bar, _ = jax.lax.scan(
-                _segment_rev_body,
-                carry_bar,
-                (
-                    segment_input_carries,
-                    segment_active_mask,
-                    segment_accepted_mask,
-                    segment_attempted_dts,
-                    segment_next_dts,
-                    segment_next_recent_reject_count,
-                    segment_next_regrowth_cooldown,
-                    segment_next_easy_growth_streak,
-                    segment_next_lagged_response_valid,
-                ),
-                reverse=True,
-            )
+            _, pullback = jax.vjp(_segment_replay, segment_start_carry)
+            (start_carry_bar,) = pullback(carry_bar)
             return start_carry_bar, None
 
         carry0_bar, _ = jax.lax.scan(
@@ -9323,7 +9086,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             (segment_start_carries, segmented_replay_arrays),
             reverse=True,
         )
-        return (_full_carry_bar_from_slim(carry0_bar, carry0),)
+        return (carry0_bar,)
 
     if stop_after_accepted_steps == 1:
         def _first_accepted_step(carry_value):

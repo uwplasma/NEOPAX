@@ -628,9 +628,8 @@ def main() -> None:
     ):
         raise SystemExit(
             "[autodiff-gate] --reverse-rhs-transpose-mode explicit_ntx_interpolated is not ready for "
-            "JAX scipy GMRES: the current NTX state pullback still contains nested VJPs through "
-            "max/floor logic, and JAX scipy GMRES asks JAX to transpose that matvec. Use "
-            "bicgstab, which uses the reverse-lane fixed-iteration JAX loop instead."
+            "JAX scipy GMRES. Use bicgstab for this experimental mode while the NTX RHS-state "
+            "transpose is being specialized."
         )
     reverse_segment_length = None
     if args.reverse_segment_length is not None:

@@ -4093,86 +4093,218 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if isinstance(center_response, NTXInterpolatedMomentResponse):
             density = safe_density(state.density)
             temperature = state.temperature
+            n_species = int(temperature.shape[0])
+            n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
+            if n_right is None:
+                n_right = density[:, -1]
+            n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
+            if n_right_grad is None:
+                n_right_grad = jnp.zeros_like(n_right)
+            t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
+            if t_right is None:
+                t_right = temperature[:, -1]
+            t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
+            if t_right_grad is None:
+                t_right_grad = jnp.zeros_like(t_right)
 
-            def _eval_from_primitives(density_value, temperature_value, er_value):
-                n_species = int(temperature_value.shape[0])
-                n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-                if n_right is None:
-                    n_right = density_value[:, -1]
-                n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-                if n_right_grad is None:
-                    n_right_grad = jnp.zeros_like(n_right)
-                t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-                if t_right is None:
-                    t_right = temperature_value[:, -1]
-                t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-                if t_right_grad is None:
-                    t_right_grad = jnp.zeros_like(t_right)
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            v_thermal = get_v_thermal(self.species.mass, temperature)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
-                support = self._static_support()
-                collisionality_kind = _collisionality_kind(self.collisionality_model)
-                v_thermal = get_v_thermal(self.species.mass, temperature_value)
-                species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
-                radius_indices = jnp.arange(er_value.shape[0], dtype=jnp.int32)
+            def _raw_log_nu_star_per_radius(radius_index):
+                drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                er_local = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                return jax.vmap(
+                    lambda species_index: self._log_nu_star_from_nu_hat(
+                        self._local_scan_inputs(
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_local,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )[0]
+                    )
+                )(species_indices)
 
-                def _current_log_nu_star_per_radius(radius_index):
-                    drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
-                    er_local = jax.lax.dynamic_index_in_dim(er_value, radius_index, axis=0, keepdims=False)
-                    temperature_local = jax.lax.dynamic_index_in_dim(temperature_value, radius_index, axis=1, keepdims=False)
-                    density_local = jax.lax.dynamic_index_in_dim(density_value, radius_index, axis=1, keepdims=False)
-                    vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
-                    return jax.vmap(
-                        lambda species_index: self._log_nu_star_from_nu_hat(
-                            self._local_scan_inputs(
-                                drds_value=drds_value,
-                                species_index=species_index,
-                                er_value=er_local,
-                                temperature_local=temperature_local,
-                                density_local=density_local,
-                                vthermal_local=vthermal_local,
-                                collisionality_kind=collisionality_kind,
-                            )[0]
-                        )
-                    )(species_indices)
-
-                current_log_nu_star = jnp.swapaxes(
-                    self._map_radius_axis_regularized_at_axis0(
-                        _current_log_nu_star_per_radius,
-                        radius_indices,
-                        self.geometry.r_grid,
-                        unbatched=True,
-                    ),
-                    0,
-                    1,
+            raw_current_log_nu_star_by_radius = self._map_radius_axis_unbatched(
+                _raw_log_nu_star_per_radius,
+                radius_indices,
+            )
+            current_log_nu_star_by_radius = self._map_radius_axis_regularized_at_axis0(
+                _raw_log_nu_star_per_radius,
+                radius_indices,
+                self.geometry.r_grid,
+                unbatched=True,
+            )
+            current_log_nu_star = jnp.swapaxes(current_log_nu_star_by_radius, 0, 1)
+            delta_er = state.Er - center_response.reference_er
+            delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
+            transport_moments = (
+                center_response.reference_transport_moments
+                + center_response.dtransport_moments_d_er * delta_er[None, :, None]
+                + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+            )
+            lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
+            gamma, q, upar = self._assemble_center_fluxes(
+                state.Er,
+                temperature,
+                density,
+                lij,
+                n_right,
+                n_right_grad,
+                t_right,
+                t_right_grad,
+            )
+            _, regularize_pullback = jax.vjp(
+                lambda gamma_value, q_value, upar_value: self._regularize_center_fluxes_axis0(
+                    gamma_value,
+                    q_value,
+                    upar_value,
+                ),
+                gamma,
+                q,
+                upar,
+            )
+            gamma_bar, q_bar, upar_bar = regularize_pullback(
+                (
+                    flux_bar["Gamma"],
+                    flux_bar["Q"],
+                    flux_bar["Upar"],
                 )
-                delta_er = er_value - center_response.reference_er
-                delta_log_nu_star = current_log_nu_star - center_response.reference_log_nu_star
-                transport_moments = (
-                    center_response.reference_transport_moments
-                    + center_response.dtransport_moments_d_er * delta_er[None, :, None]
-                    + center_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
-                )
-                lij = self._batched_lij_from_transport_moments(transport_moments, v_thermal)
-                gamma, q, upar = self._assemble_center_fluxes(
+            )
+
+            def _assemble_from_state(er_value, temperature_value, density_value, lij_value):
+                local_n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
+                if local_n_right is None:
+                    local_n_right = density_value[:, -1]
+                local_n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
+                if local_n_right_grad is None:
+                    local_n_right_grad = jnp.zeros_like(local_n_right)
+                local_t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
+                if local_t_right is None:
+                    local_t_right = temperature_value[:, -1]
+                local_t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
+                if local_t_right_grad is None:
+                    local_t_right_grad = jnp.zeros_like(local_t_right)
+                return self._assemble_center_fluxes(
                     er_value,
                     temperature_value,
                     density_value,
-                    lij,
-                    n_right,
-                    n_right_grad,
-                    t_right,
-                    t_right_grad,
+                    lij_value,
+                    local_n_right,
+                    local_n_right_grad,
+                    local_t_right,
+                    local_t_right_grad,
                 )
-                gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
-                return {"Gamma": gamma, "Q": q, "Upar": upar}
 
-            _, pb = jax.vjp(
-                _eval_from_primitives,
-                density,
-                temperature,
-                state.Er,
+            _, assemble_pullback = jax.vjp(_assemble_from_state, state.Er, temperature, density, lij)
+            er_bar_direct, temperature_bar_direct, density_bar_direct, lij_bar = assemble_pullback(
+                (gamma_bar, q_bar, upar_bar)
             )
-            density_bar_direct, temperature_bar, er_bar = pb(flux_bar)
+
+            _, lij_pullback = jax.vjp(
+                lambda transport_moments_value, v_thermal_value: self._batched_lij_from_transport_moments(
+                    transport_moments_value,
+                    v_thermal_value,
+                ),
+                transport_moments,
+                v_thermal,
+            )
+            transport_moments_bar, v_thermal_bar = lij_pullback(lij_bar)
+
+            er_bar = er_bar_direct + jnp.sum(
+                transport_moments_bar * center_response.dtransport_moments_d_er,
+                axis=(0, 2),
+            )
+            current_log_nu_star_bar = jnp.sum(
+                transport_moments_bar * center_response.dtransport_moments_d_log_nu_star,
+                axis=2,
+            )
+            temperature_bar = temperature_bar_direct + 0.5 * v_thermal_bar * v_thermal / temperature
+
+            regularized_log_bar_by_radius = jnp.swapaxes(current_log_nu_star_bar, 0, 1)
+            raw_log_templates = jnp.zeros_like(raw_current_log_nu_star_by_radius)
+
+            def _regularize_raw_log_values(raw_values):
+                n_radius = int(radius_indices.shape[0])
+                if n_radius < 4:
+                    return raw_values
+
+                def _regularized_skip_axis(_):
+                    mapped_with_placeholder = jnp.concatenate([raw_values[1:2], raw_values[1:]], axis=0)
+                    return self._regularize_axis_radius0(mapped_with_placeholder, self.geometry.r_grid)
+
+                def _direct_map(_):
+                    return raw_values
+
+                return jax.lax.cond(
+                    jnp.isclose(jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[0], 0.0),
+                    _regularized_skip_axis,
+                    _direct_map,
+                    operand=None,
+                )
+
+            (raw_log_bar_by_radius,) = jax.linear_transpose(
+                _regularize_raw_log_values,
+                raw_log_templates,
+            )(regularized_log_bar_by_radius)
+
+            def _local_log_nu_star_pullback(radius_index, log_bar_local):
+                drds_value = jax.lax.dynamic_index_in_dim(support.center_channels.drds, radius_index, axis=0, keepdims=False)
+                er_local = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+
+                def _per_species(species_index, species_log_bar):
+                    nu_hat, epsi_hat, vth_a = self._interpolated_moment_local_scan_primitives(
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_local,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                    del epsi_hat
+                    nu_hat_bar = self._pullback_log_nu_star_from_nu_hat(nu_hat, species_log_bar)
+                    return self._pullback_local_scan_inputs_from_primitives(
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_local,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                        reference_nu_hat_bar=nu_hat_bar,
+                        reference_epsi_hat_bar=jnp.zeros_like(nu_hat),
+                        vth_a_bar=jnp.zeros_like(vth_a),
+                    )
+
+                er_species_bar, temperature_species_bar, density_species_bar = jax.vmap(
+                    _per_species,
+                    in_axes=(0, 0),
+                )(species_indices, log_bar_local)
+                return (
+                    jnp.sum(er_species_bar, axis=0),
+                    jnp.sum(temperature_species_bar, axis=0),
+                    jnp.sum(density_species_bar, axis=0),
+                )
+
+            er_log_bar_by_radius, temperature_log_bar_by_radius, density_log_bar_by_radius = jax.vmap(
+                _local_log_nu_star_pullback,
+                in_axes=(0, 0),
+            )(radius_indices, raw_log_bar_by_radius)
+            er_bar = er_bar + er_log_bar_by_radius
+            temperature_bar = temperature_bar + jnp.swapaxes(temperature_log_bar_by_radius, 0, 1)
+            density_bar_direct = density_bar_direct + jnp.swapaxes(density_log_bar_by_radius, 0, 1)
             density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), DEFAULT_TRANSPORT_DENSITY_FLOOR)
             density_active = jnp.asarray(state.density) > density_floor_arr
             density_safe = safe_density(state.density)
