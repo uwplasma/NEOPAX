@@ -9129,9 +9129,29 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         and stop_after_accepted_steps is not None
         and int(stop_after_accepted_steps) > 1
     ):
-        final_carry_bar = dataclasses.replace(
-            jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry),
-            y=final_y_bar,
+        def _slim_carry_bar_from_full(full_bar):
+            return (
+                full_bar.y,
+                full_bar.prev_stages,
+                full_bar.lagged_response_cache,
+                full_bar.lagged_reference_y,
+            )
+
+        def _full_carry_bar_from_slim(slim_bar, primal_carry):
+            y_bar, prev_stages_bar, lagged_response_cache_bar, lagged_reference_y_bar = slim_bar
+            return dataclasses.replace(
+                jax.tree_util.tree_map(_zero_tangent_like, primal_carry),
+                y=y_bar,
+                prev_stages=prev_stages_bar,
+                lagged_response_cache=lagged_response_cache_bar,
+                lagged_reference_y=lagged_reference_y_bar,
+            )
+
+        final_carry_bar = (
+            final_y_bar,
+            jnp.zeros_like(segmented_final_carry.prev_stages),
+            jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry.lagged_response_cache),
+            jnp.zeros_like(segmented_final_carry.lagged_reference_y),
         )
 
         def _segment_bwd(carry_bar, xs):
@@ -9265,9 +9285,10 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                             operand=None,
                         )
 
-                    _, pullback = jax.vjp(_accepted_step, carry_value)
-                    (carry_value_bar,) = pullback(step_carry_bar)
-                    return carry_value_bar
+                    accepted_primal, pullback = jax.vjp(_accepted_step, carry_value)
+                    full_step_carry_bar = _full_carry_bar_from_slim(step_carry_bar, accepted_primal)
+                    (carry_value_bar,) = pullback(full_step_carry_bar)
+                    return _slim_carry_bar_from_full(carry_value_bar)
 
                 should_advance = jnp.logical_and(active, accepted)
                 prev_carry_bar = jax.lax.cond(
@@ -9302,7 +9323,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             (segment_start_carries, segmented_replay_arrays),
             reverse=True,
         )
-        return (carry0_bar,)
+        return (_full_carry_bar_from_slim(carry0_bar, carry0),)
 
     if stop_after_accepted_steps == 1:
         def _first_accepted_step(carry_value):
