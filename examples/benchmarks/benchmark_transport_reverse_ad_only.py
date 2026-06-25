@@ -353,6 +353,7 @@ def _prepare_reverse_static_setup(
     reverse_direct_stage_adjoint: bool = False,
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
+    reverse_stage_cotangent_mode: str = "full",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
 ) -> _ReverseStaticSetup:
@@ -383,6 +384,7 @@ def _prepare_reverse_static_setup(
                 reverse_direct_stage_adjoint=True,
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+                reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
             ),
@@ -550,6 +552,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-stage-cotangent-mode",
+        choices=("full", "zero_lagged", "zero_rhs_state"),
+        default="full",
+        help=(
+            "Diagnostic-only branch toggle for exact stage adjoints. 'full' is the normal "
+            "reverse lane; 'zero_lagged' drops stage lagged-response cotangents; "
+            "'zero_rhs_state' drops stage RHS-state cotangents, including inside the exact "
+            "iterative transpose matvec. Non-full modes intentionally change gradients."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-adjoint-iter-maxiter",
         type=int,
         default=40,
@@ -684,6 +697,7 @@ def main() -> None:
         reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
         reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+        reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
         reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
     )
@@ -833,6 +847,7 @@ def main() -> None:
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+        "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
@@ -857,6 +872,7 @@ def main() -> None:
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
+        f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_stage_adjoint_iter_maxiter={args.reverse_stage_adjoint_iter_maxiter} "
         f"reverse_stage_adjoint_iter_tol={args.reverse_stage_adjoint_iter_tol:.6e} "
         f"timing_mode={args.timing_mode} "

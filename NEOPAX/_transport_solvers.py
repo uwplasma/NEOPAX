@@ -2803,6 +2803,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_direct_stage_adjoint: bool = False
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
+    reverse_stage_cotangent_mode: str = "full"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
 
@@ -4847,8 +4848,13 @@ def _radau_exact_stage_residual_input_pullback(
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
     rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+    cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+    zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
+    zero_lagged_cotangent = cotangent_mode in {"zero_lagged", "lagged_zero"}
 
     def _stage_y_pullback(t_eval, y_eval, cotangent):
+        if zero_rhs_state_cotangent:
+            return jnp.zeros_like(y_eval)
         if (
             rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
             and physics_context.flat_rhs_state_pullback is not None
@@ -4879,7 +4885,9 @@ def _radau_exact_stage_residual_input_pullback(
         residual_stages,
     )
 
-    if physics_context.flat_rhs_lagged_response_pullback is not None:
+    if zero_lagged_cotangent:
+        residual_lagged_bar = _radau_align_tangent_tree_to_primal(None, lagged_response)
+    elif physics_context.flat_rhs_lagged_response_pullback is not None:
         staged_lagged_bars = jax.vmap(
             lambda t_eval, y_eval, rhs_bar_eval: physics_context.flat_rhs_lagged_response_pullback(
                 t_eval,
@@ -4963,8 +4971,12 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             (kernel_context.num_stages, kernel_context.state_dim)
         )
         rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
 
         def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+            if zero_rhs_state_cotangent:
+                return jnp.zeros_like(y_eval)
             if (
                 rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
                 and physics_context.flat_rhs_state_pullback is not None
