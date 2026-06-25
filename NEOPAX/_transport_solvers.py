@@ -9182,17 +9182,76 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
             def _slot_bwd(slot_carry_bar, slot_xs):
                 step_start_carry, slot_arrays = slot_xs
+                (
+                    active,
+                    dt_value,
+                    next_dt_value,
+                    recent_reject_count_value,
+                    regrowth_cooldown_value,
+                    easy_growth_streak_value,
+                    lagged_response_valid_value,
+                ) = slot_arrays
 
-                def _slot_replay(carry_value):
-                    next_carry, _ = _radau_replay_realized_accepted_slot(
-                        execution_context,
-                        carry_value,
-                        *slot_arrays,
+                def _mask_fixed_slot_input_cotangent(carry_bar_value):
+                    # Match the chain rule of _radau_replay_realized_accepted_slot:
+                    # dt is supplied by the fixed accepted schedule, and the
+                    # controller/cache fields are masked by
+                    # _radau_carry_with_forward_only_jvp_fields.
+                    return dataclasses.replace(
+                        carry_bar_value,
+                        dt=_zero_tangent_like(step_start_carry.dt),
+                        prev_error=_zero_tangent_like(step_start_carry.prev_error),
+                        recent_reject_count=_zero_tangent_like(step_start_carry.recent_reject_count),
+                        regrowth_cooldown=_zero_tangent_like(step_start_carry.regrowth_cooldown),
+                        easy_growth_streak=_zero_tangent_like(step_start_carry.easy_growth_streak),
+                        jacobian=_zero_tangent_like(step_start_carry.jacobian),
+                        cache_valid=_zero_tangent_like(step_start_carry.cache_valid),
+                        cache_dt=_zero_tangent_like(step_start_carry.cache_dt),
+                        cache_age=_zero_tangent_like(step_start_carry.cache_age),
+                        real_lu=_zero_tangent_like(step_start_carry.real_lu),
+                        real_piv=_zero_tangent_like(step_start_carry.real_piv),
+                        complex_lu=_zero_tangent_like(step_start_carry.complex_lu),
+                        complex_piv=_zero_tangent_like(step_start_carry.complex_piv),
                     )
-                    return next_carry
 
-                _, pullback = jax.vjp(_slot_replay, step_start_carry)
-                (step_start_carry_bar,) = pullback(slot_carry_bar)
+                def _do_step_bwd(_):
+                    carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+                    residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+
+                    def _reuse_branch(_):
+                        carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            "reuse",
+                            residual_carry,
+                            slot_carry_bar,
+                        )
+                        return carry_bar_value
+
+                    def _rebuild_branch(_):
+                        carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            "rebuild",
+                            residual_carry,
+                            slot_carry_bar,
+                        )
+                        return carry_bar_value
+
+                    step_start_carry_bar = jax.lax.cond(
+                        residual_carry.lagged_response_valid,
+                        _reuse_branch,
+                        _rebuild_branch,
+                        operand=None,
+                    )
+                    return _mask_fixed_slot_input_cotangent(step_start_carry_bar)
+
+                def _skip_bwd(_):
+                    return slot_carry_bar
+
+                step_start_carry_bar = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
                 return step_start_carry_bar, None
 
             segment_start_carry_bar, _ = jax.lax.scan(
