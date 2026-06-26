@@ -234,6 +234,12 @@ dsoftmax_Er/dtemperature_shape_power = 3.214063e+00
     - `reverse_compile_plus_execute_s = 8.459905e+02`
     - `reverse_execute_s_mean = 2.389553e+02`
   - Interpretation: the dynamic branch remains correct, but XLA still effectively carries the heavy branch bodies. The call boundary is not enough.
+- `zero_prev_stages_bwd` dropped cotangents through the next-step predictor stage history.
+  - It preserved the correct gradients.
+  - It did not reduce memory or warmed execution and made compile+execute worse:
+    - `reverse_compile_plus_execute_s = 1.109335e+03`
+    - `reverse_execute_s_mean = 2.401833e+02`
+  - This diagnostic was removed from executable code/CLI because it adds noise without helping memory.
 
 Important implementation/strategy note:
 
@@ -271,3 +277,33 @@ Next direction:
 - The dynamic branch remains correct but expensive; `dynamic_call_bwd` proved a non-inlined JIT call boundary did not reduce memory/time.
 - The next viable optimization should keep the dynamic solver decision while reducing the accepted-step bwd body itself, or introduce a real custom primitive/call boundary that does not inline/duplicate the reuse and rebuild bwd bodies.
 - Keep `zero_step_bwd` as the main localization diagnostic: it proves the accepted-step bwd body is the hot path.
+
+2026-06-26 update:
+
+- Added an internal `fixed_replay` path to `_execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd`.
+  - The segmented fixed accepted-step reverse replay now calls the branch bwd with `fixed_replay=True`.
+  - This is not a new public forcing mode and does not change the solver's reuse/rebuild decision.
+  - It avoids constructing cotangents for replay-only fields such as the accepted `dt` inside the branch bwd; only the fields that can flow back through accepted replay remain exposed (`y`, lagged cache/reference, with other carry fields zero).
+  - The generic custom-VJP bwd path remains unchanged for non-fixed-replay use.
+- Lightweight validation so far:
+  - `compile(...)` check passed for `_transport_solvers.py` and `benchmark_transport_reverse_ad_only.py`.
+  - The expensive 16-step benchmark has not yet been rerun after this patch.
+- Next test:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated
+```
+
+- Expected correctness target remains:
+  - `dsoftmax_Er/dn0 = -3.759631e+00`
+  - `dsoftmax_Er/dT0 = 3.054047e+00`
+  - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+  - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`

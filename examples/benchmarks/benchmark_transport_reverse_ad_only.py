@@ -586,7 +586,6 @@ def main() -> None:
             "force_reuse_bwd",
             "force_rebuild_bwd",
             "dynamic_call_bwd",
-            "zero_prev_stages_bwd",
         ),
         default="full",
         help=(
@@ -601,8 +600,7 @@ def main() -> None:
             "compile only one lagged-response backward branch for diagnosis. Non-full "
             "modes intentionally change gradients unless the forced branch matches the "
             "realized primal branch for every accepted step; 'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
-            "a non-inlined compiled call boundary; 'zero_prev_stages_bwd' drops cotangents "
-            "through the next-step predictor stage history."
+            "a non-inlined compiled call boundary."
         ),
     )
     parser.add_argument(
