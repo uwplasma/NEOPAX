@@ -162,3 +162,122 @@ If memory is still unchanged:
   - `direct_working_state_pullback = jax.vjp(...)`
   - per-equation `_density_map`, `_pressure_map`, `_er_map` VJPs.
 - Also check whether `flat_rhs_lagged_response_pullback` still stages a large lagged-response VJP in the hot path.
+
+## 2026-06-26 reverse accepted-step bwd localization
+
+Current correct 16 accepted-step reference for:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated
+```
+
+is:
+
+```text
+dsoftmax_Er/dn0 = -3.759631e+00
+dsoftmax_Er/dT0 = 3.054047e+00
+dsoftmax_Er/ddensity_shape_power = -8.518430e-02
+dsoftmax_Er/dtemperature_shape_power = 3.214064e+00
+```
+
+Latest diagnostic conclusions:
+
+- `zero_rhs_flux` kept only the direct equation-assembly RHS-state cotangent.
+  - It changed gradients, proving the mode was active.
+  - Memory and warmed execution stayed essentially unchanged.
+- `zero_rhs_direct` kept only the shared-flux/NTX RHS-state cotangent.
+  - It changed gradients, proving the mode was active.
+  - Memory and warmed execution again stayed essentially unchanged.
+- `zero_stage_solve` bypassed the exact stage-adjoint solve and residual-input pullback.
+  - Gradients became zero, as expected for this diagnostic.
+  - `reverse_compile_plus_execute_s` dropped materially, but warmed execution was still about `2.36e+02 s`.
+  - Interpretation: the exact stage solve contributes to compile graph size, but not most of the warmed execution plateau.
+- `zero_step_bwd` bypassed the accepted-step backward body inside the segmented reverse scan.
+  - Gradients became zero, as expected.
+  - `reverse_compile_plus_execute_s = 2.839014e+02`
+  - `reverse_execute_s_mean = 5.637258e+01`
+  - RAM dropped to around the low 20-25% host range in the observed graph.
+  - Interpretation: the remaining memory/runtime plateau is inside the accepted-step backward body.
+- `force_reuse_bwd` forced the reuse branch in accepted-step bwd.
+  - It reduced time/memory compared with full dynamic bwd.
+  - It was wrong because this run has rebuild slots:
+    - `reverse_lagged_reuse_count = 4`
+    - `reverse_lagged_rebuild_count = 12`
+  - Gradients changed to:
+
+```text
+dsoftmax_Er/dn0 = -3.661887e+00
+dsoftmax_Er/dT0 = 2.967747e+00
+dsoftmax_Er/ddensity_shape_power = -8.274362e-02
+dsoftmax_Er/dtemperature_shape_power = 3.124692e+00
+```
+
+- `dynamic_call_bwd` kept the dynamic reuse/rebuild branch but placed each branch body behind a non-inlined `jax.jit(..., inline=False)` call boundary.
+  - It was correct:
+
+```text
+dsoftmax_Er/dn0 = -3.759631e+00
+dsoftmax_Er/dT0 = 3.054047e+00
+dsoftmax_Er/ddensity_shape_power = -8.518430e-02
+dsoftmax_Er/dtemperature_shape_power = 3.214063e+00
+```
+
+  - It did not materially reduce memory or warmed execution:
+    - `reverse_compile_plus_execute_s = 8.459905e+02`
+    - `reverse_execute_s_mean = 2.389553e+02`
+  - Interpretation: the dynamic branch remains correct, but XLA still effectively carries the heavy branch bodies. The call boundary is not enough.
+
+Important implementation/strategy note:
+
+- The final reverse lane should not expose user-controlled reuse/rebuild forcing.
+- The solver should choose reuse vs rebuild from the primal/replayed accepted-step logic.
+- Saving one compact branch bit per accepted step is compatible with checkpointing; saving full branch-local arrays is not.
+- True checkpointing should still store only checkpoint carries plus compact metadata such as:
+  - accepted `dt[k]`,
+  - accepted active mask,
+  - incoming lagged branch bit,
+  - minimal status bits if needed.
+- Binomial/Revolve checkpointing is a later improvement to the checkpoint placement/recompute schedule. It does not by itself remove the heavy accepted-step bwd body.
+
+Current code diagnostics/modes that were added:
+
+- `zero_rhs_direct`
+- `zero_rhs_flux`
+- `zero_stage_solve`
+- `zero_step_bwd`
+- `force_reuse_bwd`
+- `force_rebuild_bwd`
+- `dynamic_call_bwd`
+- `branch_schedule_bwd`
+
+The branch-scheduled path is the next test. It uses the baseline realized accepted-step branch schedule as compact metadata and calls only the recorded branch for each accepted-step bwd slot. This is closer to the intended big custom reverse rule, but should ultimately become an internal optimized reverse path rather than a user-facing mode.
+
+Next test:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-stage-cotangent-mode branch_schedule_bwd
+```
+
+What to check:
+
+- Gradients should match the correct full dynamic values above.
+- It should print `reverse_lagged_reuse_count=4` and `reverse_lagged_rebuild_count=12` for the current 16 accepted-step run.
+- If time/RAM improves, the production-quality next step is to turn the realized branch schedule into internal compact reverse metadata, not a manual flag.
+- If it fails or does not improve, inspect whether the Python/static loop unrolled too much or whether segment replay/start-carry recomputation still dominates.
