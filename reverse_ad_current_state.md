@@ -247,7 +247,15 @@ Important implementation/strategy note:
   - minimal status bits if needed.
 - Binomial/Revolve checkpointing is a later improvement to the checkpoint placement/recompute schedule. It does not by itself remove the heavy accepted-step bwd body.
 
-Current code diagnostics/modes that were added:
+Additional failed experiment:
+
+- `branch_schedule_bwd` used the baseline realized accepted-step branch schedule as compact metadata, but implemented it with a Python/static unrolled reverse loop.
+  - This exploded host memory and the process was killed.
+  - Interpretation: naive static unrolling duplicates the heavy accepted-step bwd graph and is not viable.
+  - This mode was removed from executable code and from the benchmark CLI choices.
+  - Any future branch-scheduled implementation must avoid unrolling the heavy per-step body. It would need a genuinely compact custom primitive/call strategy or grouped kernels that do not duplicate the whole graph.
+
+Current code diagnostics/modes that remain:
 
 - `zero_rhs_direct`
 - `zero_rhs_flux`
@@ -256,28 +264,10 @@ Current code diagnostics/modes that were added:
 - `force_reuse_bwd`
 - `force_rebuild_bwd`
 - `dynamic_call_bwd`
-- `branch_schedule_bwd`
 
-The branch-scheduled path is the next test. It uses the baseline realized accepted-step branch schedule as compact metadata and calls only the recorded branch for each accepted-step bwd slot. This is closer to the intended big custom reverse rule, but should ultimately become an internal optimized reverse path rather than a user-facing mode.
+Next direction:
 
-Next test:
-
-```bash
-python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
-  --ntx-exact-derivative-mode direct \
-  --objective softmax_Er \
-  --accepted-step-limit 16 \
-  --radau-jacobian-reuse-mode legacy \
-  --timing-mode jit-warm \
-  --reverse-segment-length 4 \
-  --reverse-stage-adjoint-solve-mode bicgstab \
-  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
-  --reverse-stage-cotangent-mode branch_schedule_bwd
-```
-
-What to check:
-
-- Gradients should match the correct full dynamic values above.
-- It should print `reverse_lagged_reuse_count=4` and `reverse_lagged_rebuild_count=12` for the current 16 accepted-step run.
-- If time/RAM improves, the production-quality next step is to turn the realized branch schedule into internal compact reverse metadata, not a manual flag.
-- If it fails or does not improve, inspect whether the Python/static loop unrolled too much or whether segment replay/start-carry recomputation still dominates.
+- Do not continue with naive static branch unrolling.
+- The dynamic branch remains correct but expensive; `dynamic_call_bwd` proved a non-inlined JIT call boundary did not reduce memory/time.
+- The next viable optimization should keep the dynamic solver decision while reducing the accepted-step bwd body itself, or introduce a real custom primitive/call boundary that does not inline/duplicate the reuse and rebuild bwd bodies.
+- Keep `zero_step_bwd` as the main localization diagnostic: it proves the accepted-step bwd body is the hot path.

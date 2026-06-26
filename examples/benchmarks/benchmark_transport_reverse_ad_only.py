@@ -585,7 +585,6 @@ def main() -> None:
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
-            "branch_schedule_bwd",
             "dynamic_call_bwd",
         ),
         default="full",
@@ -600,9 +599,7 @@ def main() -> None:
             "body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Non-full "
             "modes intentionally change gradients unless the forced branch matches the "
-            "realized primal branch for every accepted step; 'branch_schedule_bwd' uses "
-            "the baseline realized accepted-step branch schedule statically; "
-            "'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
+            "realized primal branch for every accepted step; 'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
             "a non-inlined compiled call boundary."
         ),
     )

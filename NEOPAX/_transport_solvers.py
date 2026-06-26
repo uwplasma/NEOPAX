@@ -9551,10 +9551,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         cotangent_mode = str(
             getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
         ).strip().lower()
-        use_static_branch_schedule = (
-            cotangent_mode in {"branch_schedule_bwd", "static_branch_bwd", "realized_branch_bwd"}
-            and getattr(execution_context.physics_context, "reverse_lagged_branch_schedule", None) is not None
-        )
 
         def _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry):
             # Match the chain rule of _radau_replay_realized_accepted_slot:
@@ -9576,86 +9572,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 complex_lu=_zero_tangent_like(step_start_carry.complex_lu),
                 complex_piv=_zero_tangent_like(step_start_carry.complex_piv),
             )
-
-        def _static_branch_step_bwd(slot_carry_bar, step_start_carry, slot_arrays, *, branch: str):
-            (
-                active,
-                dt_value,
-                _next_dt_value,
-                _recent_reject_count_value,
-                _regrowth_cooldown_value,
-                _easy_growth_streak_value,
-                _lagged_response_valid_value,
-            ) = slot_arrays
-
-            def _do_step_bwd(_):
-                carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
-                residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
-                carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    execution_context.attempt_context,
-                    branch,
-                    residual_carry,
-                    slot_carry_bar,
-                )
-                return _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry)
-
-            return jax.lax.cond(active, _do_step_bwd, lambda _: slot_carry_bar, operand=None)
-
-        if use_static_branch_schedule:
-            branch_schedule = tuple(
-                bool(value) for value in execution_context.physics_context.reverse_lagged_branch_schedule
-            )
-            segment_length = int(reverse_segment_length)
-            accepted_limit = int(stop_after_accepted_steps)
-            segment_count = (accepted_limit + segment_length - 1) // segment_length
-            carry_bar_loop = final_carry_bar
-            for segment_idx in range(segment_count - 1, -1, -1):
-                segment_start_carry = jax.tree_util.tree_map(
-                    lambda value, idx=segment_idx: value[idx],
-                    segment_start_carries,
-                )
-                segment_arrays = tuple(
-                    value[segment_idx]
-                    for value in segmented_replay_arrays
-                )
-
-                def _segment_collect_start_carries(carry, slot_xs):
-                    next_carry, _ = _radau_replay_realized_accepted_slot(
-                        execution_context,
-                        carry,
-                        *slot_xs,
-                    )
-                    return next_carry, carry
-
-                _, step_start_carries = jax.lax.scan(
-                    _segment_collect_start_carries,
-                    segment_start_carry,
-                    segment_arrays,
-                )
-                segment_carry_bar = carry_bar_loop
-                for slot_idx in range(segment_length - 1, -1, -1):
-                    accepted_idx = segment_idx * segment_length + slot_idx
-                    if accepted_idx >= accepted_limit:
-                        continue
-                    step_start_carry = jax.tree_util.tree_map(
-                        lambda value, idx=slot_idx: value[idx],
-                        step_start_carries,
-                    )
-                    slot_arrays = tuple(
-                        value[slot_idx]
-                        for value in segment_arrays
-                    )
-                    branch = "reuse" if branch_schedule[accepted_idx] else "rebuild"
-                    segment_carry_bar = _static_branch_step_bwd(
-                        segment_carry_bar,
-                        step_start_carry,
-                        slot_arrays,
-                        branch=branch,
-                    )
-                carry_bar_loop = segment_carry_bar
-            return (carry_bar_loop,)
 
         def _segment_bwd(carry_bar, xs):
             segment_start_carry, segment_arrays = xs
