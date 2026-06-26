@@ -345,6 +345,20 @@ Next optimization target:
   - It skips the anchor-field interpolation/local moment-response pullback inside rebuild.
   - It intentionally changes gradients.
   - Goal: determine whether the rebuild cost comes mostly from the local NTX interpolated anchor-field transpose.
+- Test result:
+  - `reverse_compile_plus_execute_s = 8.805706e+02`
+  - `reverse_execute_s_mean = 2.075852e+02`
+  - Gradients changed, as expected:
+    - `dsoftmax_Er/dn0 = -2.659934e+00`
+    - `dsoftmax_Er/dT0 = 2.395321e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -6.021805e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.289570e+00`
+  - Interpretation: almost all of the rebuild-pullback runtime saving comes from skipping the interpolated anchor/local moment-response pullback; the direct `reference_er` piece is cheap.
+- Added `--reverse-stage-cotangent-mode zero_rebuild_local_moment_pullback`.
+  - This keeps the interpolation transpose to anchor bars.
+  - It skips only the per-anchor/species local NTX moment-response pullback.
+  - It intentionally changes gradients.
+  - Goal: separate interpolation transpose cost from local moment-response physics pullback cost.
 - Next diagnostic command:
 
 ```bash
@@ -357,5 +371,5 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --reverse-segment-length 4 \
   --reverse-stage-adjoint-solve-mode bicgstab \
   --reverse-rhs-transpose-mode explicit_ntx_interpolated \
-  --reverse-stage-cotangent-mode zero_rebuild_anchor_fields
+  --reverse-stage-cotangent-mode zero_rebuild_local_moment_pullback
 ```

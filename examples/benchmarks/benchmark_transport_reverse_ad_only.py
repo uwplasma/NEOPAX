@@ -584,6 +584,7 @@ def main() -> None:
             "zero_stage_solve",
             "zero_rebuild_pullback",
             "zero_rebuild_anchor_fields",
+            "zero_rebuild_local_moment_pullback",
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
@@ -600,6 +601,8 @@ def main() -> None:
             "residual-input pullback; 'zero_rebuild_pullback' skips only the lagged-response "
             "rebuild pullback in rebuild branches; 'zero_rebuild_anchor_fields' keeps only "
             "the direct reference-Er part of the NTX interpolated rebuild pullback; "
+            "'zero_rebuild_local_moment_pullback' keeps the rebuild interpolation transpose "
+            "but skips the local NTX moment-response pullback; "
             "'zero_step_bwd' bypasses the accepted-step "
             "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Non-full "
