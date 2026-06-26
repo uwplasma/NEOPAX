@@ -411,6 +411,28 @@ def _prepare_reverse_static_setup(
             max_total_steps,
             max(actual_attempt_count + 2, int(stop_after_accepted_steps)),
         )
+        accepted_limit = int(stop_after_accepted_steps)
+        active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
+        accepted_mask_np = np.asarray(jax.device_get(schedule_probe.trace.accepted_mask), dtype=bool)
+        next_lagged_valid_np = np.asarray(
+            jax.device_get(schedule_probe.trace.next_lagged_response_valid),
+            dtype=bool,
+        )
+        accepted_positions = np.nonzero(np.logical_and(active_mask_np, accepted_mask_np))[0][:accepted_limit]
+        incoming_valid = bool(np.asarray(jax.device_get(prepared_rollout_static.initial_carry.lagged_response_valid)))
+        lagged_branch_schedule: list[bool] = []
+        for accepted_position in accepted_positions:
+            lagged_branch_schedule.append(bool(incoming_valid))
+            incoming_valid = bool(next_lagged_valid_np[int(accepted_position)])
+        if len(lagged_branch_schedule) < accepted_limit:
+            lagged_branch_schedule.extend([bool(incoming_valid)] * (accepted_limit - len(lagged_branch_schedule)))
+        execution_context = dataclasses.replace(
+            execution_context,
+            physics_context=dataclasses.replace(
+                execution_context.physics_context,
+                reverse_lagged_branch_schedule=tuple(lagged_branch_schedule),
+            ),
+        )
     return _ReverseStaticSetup(
         solver=solver,
         solve_vector_field=solve_vector_field_static,
@@ -563,6 +585,8 @@ def main() -> None:
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
+            "branch_schedule_bwd",
+            "dynamic_call_bwd",
         ),
         default="full",
         help=(
@@ -576,7 +600,10 @@ def main() -> None:
             "body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Non-full "
             "modes intentionally change gradients unless the forced branch matches the "
-            "realized primal branch for every accepted step."
+            "realized primal branch for every accepted step; 'branch_schedule_bwd' uses "
+            "the baseline realized accepted-step branch schedule statically; "
+            "'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
+            "a non-inlined compiled call boundary."
         ),
     )
     parser.add_argument(
@@ -848,6 +875,16 @@ def main() -> None:
             (reverse_checkpoint_base + int(reverse_segment_length) - 1)
             // int(reverse_segment_length)
         )
+    reverse_lagged_branch_schedule = getattr(
+        reverse_setup.execution_context.physics_context,
+        "reverse_lagged_branch_schedule",
+        None,
+    )
+    reverse_lagged_reuse_count = None
+    reverse_lagged_rebuild_count = None
+    if reverse_lagged_branch_schedule is not None:
+        reverse_lagged_reuse_count = int(sum(bool(value) for value in reverse_lagged_branch_schedule))
+        reverse_lagged_rebuild_count = int(len(reverse_lagged_branch_schedule) - reverse_lagged_reuse_count)
 
     report = {
         "mode": "transport_reverse_ad_only",
@@ -861,6 +898,8 @@ def main() -> None:
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
+        "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
+        "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
@@ -886,6 +925,8 @@ def main() -> None:
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "
+        f"reverse_lagged_reuse_count={reverse_lagged_reuse_count} "
+        f"reverse_lagged_rebuild_count={reverse_lagged_rebuild_count} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "

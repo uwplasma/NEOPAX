@@ -2863,6 +2863,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_cotangent_mode: str = "full"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
+    reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -4117,6 +4118,26 @@ _execute_radau_accepted_step_next_carry_vjp_lagged_branch.defvjp(
     _execute_radau_accepted_step_next_carry_vjp_lagged_branch_fwd,
     _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd,
 )
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
+def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    residual_carry: _RadauAcceptedStepCarry,
+    next_carry_bar: _RadauAcceptedStepCarry,
+):
+    carry_bar, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        residual_carry,
+        next_carry_bar,
+    )
+    return carry_bar
 
 
 def _execute_radau_accepted_step_attempt(
@@ -9527,6 +9548,114 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             jax.tree_util.tree_map(_zero_tangent_like, segmented_final_carry),
             y=final_y_bar,
         )
+        cotangent_mode = str(
+            getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+        ).strip().lower()
+        use_static_branch_schedule = (
+            cotangent_mode in {"branch_schedule_bwd", "static_branch_bwd", "realized_branch_bwd"}
+            and getattr(execution_context.physics_context, "reverse_lagged_branch_schedule", None) is not None
+        )
+
+        def _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry):
+            # Match the chain rule of _radau_replay_realized_accepted_slot:
+            # dt is supplied by the fixed accepted schedule, and controller/cache
+            # fields are forward-only for this realized accepted-step replay.
+            return dataclasses.replace(
+                carry_bar_value,
+                dt=_zero_tangent_like(step_start_carry.dt),
+                prev_error=_zero_tangent_like(step_start_carry.prev_error),
+                recent_reject_count=_zero_tangent_like(step_start_carry.recent_reject_count),
+                regrowth_cooldown=_zero_tangent_like(step_start_carry.regrowth_cooldown),
+                easy_growth_streak=_zero_tangent_like(step_start_carry.easy_growth_streak),
+                jacobian=_zero_tangent_like(step_start_carry.jacobian),
+                cache_valid=_zero_tangent_like(step_start_carry.cache_valid),
+                cache_dt=_zero_tangent_like(step_start_carry.cache_dt),
+                cache_age=_zero_tangent_like(step_start_carry.cache_age),
+                real_lu=_zero_tangent_like(step_start_carry.real_lu),
+                real_piv=_zero_tangent_like(step_start_carry.real_piv),
+                complex_lu=_zero_tangent_like(step_start_carry.complex_lu),
+                complex_piv=_zero_tangent_like(step_start_carry.complex_piv),
+            )
+
+        def _static_branch_step_bwd(slot_carry_bar, step_start_carry, slot_arrays, *, branch: str):
+            (
+                active,
+                dt_value,
+                _next_dt_value,
+                _recent_reject_count_value,
+                _regrowth_cooldown_value,
+                _easy_growth_streak_value,
+                _lagged_response_valid_value,
+            ) = slot_arrays
+
+            def _do_step_bwd(_):
+                carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+                residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+                carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    branch,
+                    residual_carry,
+                    slot_carry_bar,
+                )
+                return _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry)
+
+            return jax.lax.cond(active, _do_step_bwd, lambda _: slot_carry_bar, operand=None)
+
+        if use_static_branch_schedule:
+            branch_schedule = tuple(
+                bool(value) for value in execution_context.physics_context.reverse_lagged_branch_schedule
+            )
+            segment_length = int(reverse_segment_length)
+            accepted_limit = int(stop_after_accepted_steps)
+            segment_count = (accepted_limit + segment_length - 1) // segment_length
+            carry_bar_loop = final_carry_bar
+            for segment_idx in range(segment_count - 1, -1, -1):
+                segment_start_carry = jax.tree_util.tree_map(
+                    lambda value, idx=segment_idx: value[idx],
+                    segment_start_carries,
+                )
+                segment_arrays = tuple(
+                    value[segment_idx]
+                    for value in segmented_replay_arrays
+                )
+
+                def _segment_collect_start_carries(carry, slot_xs):
+                    next_carry, _ = _radau_replay_realized_accepted_slot(
+                        execution_context,
+                        carry,
+                        *slot_xs,
+                    )
+                    return next_carry, carry
+
+                _, step_start_carries = jax.lax.scan(
+                    _segment_collect_start_carries,
+                    segment_start_carry,
+                    segment_arrays,
+                )
+                segment_carry_bar = carry_bar_loop
+                for slot_idx in range(segment_length - 1, -1, -1):
+                    accepted_idx = segment_idx * segment_length + slot_idx
+                    if accepted_idx >= accepted_limit:
+                        continue
+                    step_start_carry = jax.tree_util.tree_map(
+                        lambda value, idx=slot_idx: value[idx],
+                        step_start_carries,
+                    )
+                    slot_arrays = tuple(
+                        value[slot_idx]
+                        for value in segment_arrays
+                    )
+                    branch = "reuse" if branch_schedule[accepted_idx] else "rebuild"
+                    segment_carry_bar = _static_branch_step_bwd(
+                        segment_carry_bar,
+                        step_start_carry,
+                        slot_arrays,
+                        branch=branch,
+                    )
+                carry_bar_loop = segment_carry_bar
+            return (carry_bar_loop,)
 
         def _segment_bwd(carry_bar, xs):
             segment_start_carry, segment_arrays = xs
@@ -9553,6 +9682,9 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             force_rebuild_bwd = str(
                 getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
             ).strip().lower() in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+            dynamic_call_bwd = str(
+                getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+            ).strip().lower() in {"dynamic_call_bwd", "call_bwd", "cond_call_bwd"}
 
             def _slot_bwd(slot_carry_bar, slot_xs):
                 step_start_carry, slot_arrays = slot_xs
@@ -9570,32 +9702,22 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 ) = slot_arrays
 
                 def _mask_fixed_slot_input_cotangent(carry_bar_value):
-                    # Match the chain rule of _radau_replay_realized_accepted_slot:
-                    # dt is supplied by the fixed accepted schedule, and the
-                    # controller/cache fields are masked by
-                    # _radau_carry_with_forward_only_jvp_fields.
-                    return dataclasses.replace(
-                        carry_bar_value,
-                        dt=_zero_tangent_like(step_start_carry.dt),
-                        prev_error=_zero_tangent_like(step_start_carry.prev_error),
-                        recent_reject_count=_zero_tangent_like(step_start_carry.recent_reject_count),
-                        regrowth_cooldown=_zero_tangent_like(step_start_carry.regrowth_cooldown),
-                        easy_growth_streak=_zero_tangent_like(step_start_carry.easy_growth_streak),
-                        jacobian=_zero_tangent_like(step_start_carry.jacobian),
-                        cache_valid=_zero_tangent_like(step_start_carry.cache_valid),
-                        cache_dt=_zero_tangent_like(step_start_carry.cache_dt),
-                        cache_age=_zero_tangent_like(step_start_carry.cache_age),
-                        real_lu=_zero_tangent_like(step_start_carry.real_lu),
-                        real_piv=_zero_tangent_like(step_start_carry.real_piv),
-                        complex_lu=_zero_tangent_like(step_start_carry.complex_lu),
-                        complex_piv=_zero_tangent_like(step_start_carry.complex_piv),
-                    )
+                    return _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry)
 
                 def _do_step_bwd(_):
                     carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
                     residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
 
                     def _reuse_branch(_):
+                        if dynamic_call_bwd:
+                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
+                                execution_context.kernel_context,
+                                execution_context.physics_context,
+                                execution_context.attempt_context,
+                                "reuse",
+                                residual_carry,
+                                slot_carry_bar,
+                            )
                         carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                             execution_context.kernel_context,
                             execution_context.physics_context,
@@ -9607,6 +9729,15 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                         return carry_bar_value
 
                     def _rebuild_branch(_):
+                        if dynamic_call_bwd:
+                            return _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
+                                execution_context.kernel_context,
+                                execution_context.physics_context,
+                                execution_context.attempt_context,
+                                "rebuild",
+                                residual_carry,
+                                slot_carry_bar,
+                            )
                         carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                             execution_context.kernel_context,
                             execution_context.physics_context,
