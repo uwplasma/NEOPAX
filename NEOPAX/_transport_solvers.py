@@ -9556,7 +9556,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             and getattr(execution_context.physics_context, "reverse_lagged_branch_schedule", None) is not None
         )
 
-        def _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry):
+        def _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry):
             # Match the chain rule of _radau_replay_realized_accepted_slot:
             # dt is supplied by the fixed accepted schedule, and controller/cache
             # fields are forward-only for this realized accepted-step replay.
@@ -9599,7 +9599,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     residual_carry,
                     slot_carry_bar,
                 )
-                return _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry)
+                return _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry)
 
             return jax.lax.cond(active, _do_step_bwd, lambda _: slot_carry_bar, operand=None)
 
@@ -9702,7 +9702,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 ) = slot_arrays
 
                 def _mask_fixed_slot_input_cotangent(carry_bar_value):
-                    return _mask_fixed_slot_input_cotangent(carry_bar_value, step_start_carry)
+                    return _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry)
 
                 def _do_step_bwd(_):
                     carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
