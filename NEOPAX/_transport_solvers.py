@@ -4101,6 +4101,7 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             rebuild_state_bar = physics_context.pullback_build_lagged_response(
                 rebuild_state,
                 carry_bar.lagged_response_cache,
+                reverse_stage_cotangent_mode=cotangent_mode,
             )
             rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
             if physics_context.project_flat is not None:

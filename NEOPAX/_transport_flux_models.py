@@ -3333,6 +3333,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return NTXExactLijLaggedResponse(center_response=response_by_radius)
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        reverse_stage_cotangent_mode = str(kwargs.pop("reverse_stage_cotangent_mode", "full")).strip().lower()
         del kwargs
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if center_response_bar is None:
@@ -3537,6 +3538,22 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             pressure_bar = jnp.zeros_like(pressure0)
             er_bar = jnp.asarray(er_bar_direct)
 
+            if reverse_stage_cotangent_mode in {
+                "zero_rebuild_anchor_fields",
+                "zero_rebuild_interpolated_fields",
+                "rebuild_anchor_fields_zero",
+            }:
+                return dataclasses.replace(
+                    state,
+                    density=density_bar,
+                    pressure=pressure_bar,
+                    Er=er_bar,
+                )
+
+            def _local_density_pressure_map(density_local, pressure_local):
+                density_safe_local = safe_density(density_local)
+                return density_safe_local, pressure_local / density_safe_local
+
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
             def _pullback_one_anchor(anchor_pos):
@@ -3636,18 +3653,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         field_bars=local_field_bars,
                     )
 
-                    density_floor_local = _broadcast_species_floor(
-                        density_local0,
-                        DEFAULT_TRANSPORT_DENSITY_FLOOR,
-                    )
-                    density_active_local = density_local0 > density_floor_local
-                    pressure_local_bar = temperature_local_bar / density_safe_local
-                    density_safe_total_bar = (
-                        density_safe_local_bar
-                        - temperature_local_bar * pressure_local0 / (density_safe_local * density_safe_local)
-                    )
-                    density_local_bar = density_safe_total_bar * density_active_local.astype(
-                        density_safe_total_bar.dtype
+                    def _forward_linearized_density_pressure(
+                        ddensity_local,
+                        dpressure_local,
+                    ):
+                        _, doutputs = jax.jvp(
+                            _local_density_pressure_map,
+                            (density_local0, pressure_local0),
+                            (ddensity_local, dpressure_local),
+                        )
+                        return doutputs
+
+                    density_local_bar, pressure_local_bar = jax.linear_transpose(
+                        _forward_linearized_density_pressure,
+                        jnp.zeros_like(density_local0),
+                        jnp.zeros_like(pressure_local0),
+                    )(
+                        (
+                            density_safe_local_bar,
+                            temperature_local_bar,
+                        )
                     )
 
                     return (

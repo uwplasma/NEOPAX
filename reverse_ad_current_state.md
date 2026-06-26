@@ -334,7 +334,18 @@ Next optimization target:
 - Follow-up implementation:
   - In `NTXExactLijTransportModel.pullback_build_lagged_response`, replaced a local `jax.linear_transpose(jax.jvp(...))` for the simple map `(density, pressure) -> (safe_density, pressure / safe_density)` with the explicit algebraic pullback.
   - This is general NTX pullback cleanup, not a benchmark-specific shortcut.
-- Next full correctness/performance test:
+- Full correctness/performance test after that cleanup:
+  - Correct gradients were preserved.
+  - It did not help performance:
+    - `reverse_compile_plus_execute_s = 1.102192e+03`
+    - `reverse_execute_s_mean = 2.429593e+02`
+  - This cleanup was reverted because it made the full path slightly worse.
+- Added `--reverse-stage-cotangent-mode zero_rebuild_anchor_fields`.
+  - This keeps only the direct `reference_er` part of the NTX interpolated rebuild pullback.
+  - It skips the anchor-field interpolation/local moment-response pullback inside rebuild.
+  - It intentionally changes gradients.
+  - Goal: determine whether the rebuild cost comes mostly from the local NTX interpolated anchor-field transpose.
+- Next diagnostic command:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
@@ -345,5 +356,6 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --timing-mode jit-warm \
   --reverse-segment-length 4 \
   --reverse-stage-adjoint-solve-mode bicgstab \
-  --reverse-rhs-transpose-mode explicit_ntx_interpolated
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-stage-cotangent-mode zero_rebuild_anchor_fields
 ```
