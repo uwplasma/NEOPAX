@@ -322,7 +322,19 @@ Next optimization target:
   - This skips only `pullback_build_lagged_response` in rebuild branches.
   - It intentionally changes gradients.
   - It is meant to isolate whether the 12 rebuild branches are a major compile/memory/runtime source.
-- Test command:
+- Test result:
+  - `reverse_compile_plus_execute_s = 8.447915e+02`
+  - `reverse_execute_s_mean = 2.101824e+02`
+  - Gradients changed, as expected:
+    - `dsoftmax_Er/dn0 = -3.656530e+00`
+    - `dsoftmax_Er/dT0 = 3.282627e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.275152e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 4.491006e+00`
+  - Interpretation: rebuild pullback is a real contributor, but not the whole hot path.
+- Follow-up implementation:
+  - In `NTXExactLijTransportModel.pullback_build_lagged_response`, replaced a local `jax.linear_transpose(jax.jvp(...))` for the simple map `(density, pressure) -> (safe_density, pressure / safe_density)` with the explicit algebraic pullback.
+  - This is general NTX pullback cleanup, not a benchmark-specific shortcut.
+- Next full correctness/performance test:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
@@ -333,6 +345,5 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --timing-mode jit-warm \
   --reverse-segment-length 4 \
   --reverse-stage-adjoint-solve-mode bicgstab \
-  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
-  --reverse-stage-cotangent-mode zero_rebuild_pullback
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated
 ```
