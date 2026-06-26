@@ -9547,6 +9547,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             zero_step_bwd = str(
                 getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
             ).strip().lower() in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+            force_reuse_bwd = str(
+                getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+            ).strip().lower() in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
+            force_rebuild_bwd = str(
+                getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+            ).strip().lower() in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
 
             def _slot_bwd(slot_carry_bar, slot_xs):
                 step_start_carry, slot_arrays = slot_xs
@@ -9611,12 +9617,17 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                         )
                         return carry_bar_value
 
-                    step_start_carry_bar = jax.lax.cond(
-                        residual_carry.lagged_response_valid,
-                        _reuse_branch,
-                        _rebuild_branch,
-                        operand=None,
-                    )
+                    if force_reuse_bwd:
+                        step_start_carry_bar = _reuse_branch(None)
+                    elif force_rebuild_bwd:
+                        step_start_carry_bar = _rebuild_branch(None)
+                    else:
+                        step_start_carry_bar = jax.lax.cond(
+                            residual_carry.lagged_response_valid,
+                            _reuse_branch,
+                            _rebuild_branch,
+                            operand=None,
+                        )
                     return _mask_fixed_slot_input_cotangent(step_start_carry_bar)
 
                 def _skip_bwd(_):
