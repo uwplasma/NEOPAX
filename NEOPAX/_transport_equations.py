@@ -1698,6 +1698,56 @@ class ComposedEquationSystem:
         )
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 
+    def pullback_evaluate_with_lagged_response_state_direct(self, t, state, runtime, lagged_response, rhs_bar):
+        """State pullback through equation assembly with shared fluxes held fixed."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+        )
+        direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_flux(self, t, state, runtime, lagged_response, rhs_bar):
+        """State pullback through the shared-flux model, with equation assembly transposed separately."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
+
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState

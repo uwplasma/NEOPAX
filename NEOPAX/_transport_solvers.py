@@ -862,6 +862,22 @@ def _lagged_response_state_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_direct_state_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_direct", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
+def _lagged_response_flux_state_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_flux", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
     _, eval_fn = _lagged_response_hooks(vector_field)
@@ -935,6 +951,45 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
         # should use the generic fallback until we add a handwritten projector
         # transpose.
         return projected_bar
+
+    return _pullback
+
+
+def _flat_rhs_split_state_pullback_factory(
+    unravel,
+    pack_flat,
+    vector_field,
+    args,
+    kwargs,
+    *,
+    project_flat=None,
+    component: str,
+):
+    if component == "direct":
+        pullback_fn = _lagged_response_direct_state_pullback_hook(vector_field)
+    elif component == "flux":
+        pullback_fn = _lagged_response_flux_state_pullback_hook(vector_field)
+    else:
+        raise ValueError(f"Unknown RHS-state pullback component {component!r}.")
+    if pullback_fn is None:
+        return None
+
+    def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
+        projected_flat_y = _project_flat_state_if_needed(
+            flat_y,
+            project_flat,
+        )
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        state_bar = pullback_fn(
+            t_value,
+            state_y,
+            *args,
+            lagged_response=lagged_response,
+            rhs_bar=rhs_bar_state,
+            **kwargs,
+        )
+        return pack_flat(state_bar)
 
     return _pullback
 
@@ -2797,6 +2852,8 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_flux_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
@@ -4850,11 +4907,35 @@ def _radau_exact_stage_residual_input_pullback(
     rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
     cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
     zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
+    zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
+    zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
     zero_lagged_cotangent = cotangent_mode in {"zero_lagged", "lagged_zero"}
 
     def _stage_y_pullback(t_eval, y_eval, cotangent):
         if zero_rhs_state_cotangent:
             return jnp.zeros_like(y_eval)
+        if (
+            zero_rhs_direct_cotangent
+            and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+            and physics_context.flat_rhs_flux_state_pullback is not None
+        ):
+            return physics_context.flat_rhs_flux_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                cotangent,
+            )
+        if (
+            zero_rhs_flux_cotangent
+            and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+            and physics_context.flat_rhs_direct_state_pullback is not None
+        ):
+            return physics_context.flat_rhs_direct_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                cotangent,
+            )
         if (
             rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
             and physics_context.flat_rhs_state_pullback is not None
@@ -4973,10 +5054,34 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
         zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
+        zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
+        zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
 
         def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
             if zero_rhs_state_cotangent:
                 return jnp.zeros_like(y_eval)
+            if (
+                zero_rhs_direct_cotangent
+                and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_flux_state_pullback is not None
+            ):
+                return physics_context.flat_rhs_flux_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+            if (
+                zero_rhs_flux_cotangent
+                and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_direct_state_pullback is not None
+            ):
+                return physics_context.flat_rhs_direct_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
             if (
                 rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
                 and physics_context.flat_rhs_state_pullback is not None
@@ -10152,6 +10257,24 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_direct_state_pullback = _flat_rhs_split_state_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+        component="direct",
+    )
+    flat_rhs_flux_state_pullback = _flat_rhs_split_state_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+        component="flux",
+    )
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
@@ -10295,6 +10418,8 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
+        flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
+        flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
@@ -10442,6 +10567,24 @@ class RADAUSolver(_RadauSolverConfig):
             args=args,
             kwargs=kwargs,
             project_flat=project_flat,
+        )
+        flat_rhs_direct_state_pullback = _flat_rhs_split_state_pullback_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+            component="direct",
+        )
+        flat_rhs_flux_state_pullback = _flat_rhs_split_state_pullback_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+            component="flux",
         )
         rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
         if rhs_mode not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
@@ -10607,6 +10750,8 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,
+            flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
+            flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
             lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
