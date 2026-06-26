@@ -9544,9 +9544,15 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                 segment_start_carry,
                 segment_arrays,
             )
+            zero_step_bwd = str(
+                getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+            ).strip().lower() in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
 
             def _slot_bwd(slot_carry_bar, slot_xs):
                 step_start_carry, slot_arrays = slot_xs
+                if zero_step_bwd:
+                    return jax.tree_util.tree_map(_zero_tangent_like, step_start_carry), None
+
                 (
                     active,
                     dt_value,

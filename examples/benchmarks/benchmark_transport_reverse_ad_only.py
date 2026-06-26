@@ -560,6 +560,7 @@ def main() -> None:
             "zero_rhs_direct",
             "zero_rhs_flux",
             "zero_stage_solve",
+            "zero_step_bwd",
         ),
         default="full",
         help=(
@@ -569,7 +570,8 @@ def main() -> None:
             "iterative transpose matvec; 'zero_rhs_direct' keeps only shared-flux state "
             "cotangents; 'zero_rhs_flux' keeps only direct equation-assembly state "
             "cotangents; 'zero_stage_solve' bypasses the exact stage-adjoint solve and "
-            "residual-input pullback. Non-full modes intentionally change gradients."
+            "residual-input pullback; 'zero_step_bwd' bypasses the accepted-step backward "
+            "body inside segmented replay. Non-full modes intentionally change gradients."
         ),
     )
     parser.add_argument(
