@@ -3865,8 +3865,6 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
     lagged_response_branch: str,
     residuals,
     next_carry_bar,
-    *,
-    fixed_replay: bool = False,
 ):
     carry_in = residuals
     reverse_direct_stage_adjoint = bool(getattr(physics_context, "reverse_direct_stage_adjoint", False))
@@ -4018,25 +4016,12 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
             dtype=kernel_context.dtype,
         )
 
-        carry_bar_zero = jax.tree_util.tree_map(_zero_tangent_like, carry_in)
-        if fixed_replay:
-            # In fixed accepted-step replay the schedule/controller/LU fields are
-            # replay data, not differentiable inputs. Avoid building their
-            # cotangents in the branch bwd and only expose the fields that can
-            # actually feed earlier accepted steps.
-            return dataclasses.replace(
-                carry_bar_zero,
-                y=y_bar,
-                lagged_response_cache=lagged_cache_bar,
-                lagged_reference_y=lagged_reference_y_bar,
-            )
-
         dt_bar = (
             jnp.vdot(jnp.asarray(trial_y_bar, dtype=kernel_context.dtype), kernel_context.b @ stages_final)
             + jnp.asarray(residual_dt_bar, dtype=kernel_context.dtype)
         )
         return dataclasses.replace(
-            carry_bar_zero,
+            jax.tree_util.tree_map(_zero_tangent_like, carry_in),
             y=y_bar,
             dt=dt_bar,
             lagged_response_cache=lagged_cache_bar,
@@ -4102,16 +4087,25 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
 
-        projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
-        rebuild_state = physics_context.unpack_flat(projected_y)
-        rebuild_state_bar = physics_context.pullback_build_lagged_response(
-            rebuild_state,
-            carry_bar.lagged_response_cache,
-        )
-        rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
-        if physics_context.project_flat is not None:
-            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
-            (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        zero_rebuild_pullback = cotangent_mode in {
+            "zero_rebuild_pullback",
+            "zero_lagged_rebuild",
+            "rebuild_pullback_zero",
+        }
+        if zero_rebuild_pullback:
+            rebuild_flat_bar = jnp.zeros_like(carry_in.y)
+        else:
+            projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+            rebuild_state = physics_context.unpack_flat(projected_y)
+            rebuild_state_bar = physics_context.pullback_build_lagged_response(
+                rebuild_state,
+                carry_bar.lagged_response_cache,
+            )
+            rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
         carry_bar = dataclasses.replace(
             carry_bar,
             y=carry_bar.y + rebuild_flat_bar + carry_bar.lagged_reference_y,
@@ -4135,7 +4129,7 @@ _execute_radau_accepted_step_next_carry_vjp_lagged_branch.defvjp(
 )
 
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 6), inline=False)
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -4143,7 +4137,6 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
     lagged_response_branch: str,
     residual_carry: _RadauAcceptedStepCarry,
     next_carry_bar: _RadauAcceptedStepCarry,
-    fixed_replay: bool = False,
 ):
     carry_bar, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
         kernel_context,
@@ -4152,7 +4145,6 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
         lagged_response_branch,
         residual_carry,
         next_carry_bar,
-        fixed_replay=fixed_replay,
     )
     return carry_bar
 
@@ -9650,7 +9642,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                                 "reuse",
                                 residual_carry,
                                 slot_carry_bar,
-                                True,
                             )
                         carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                             execution_context.kernel_context,
@@ -9659,7 +9650,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                             "reuse",
                             residual_carry,
                             slot_carry_bar,
-                            fixed_replay=True,
                         )
                         return carry_bar_value
 
@@ -9672,7 +9662,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                                 "rebuild",
                                 residual_carry,
                                 slot_carry_bar,
-                                True,
                             )
                         carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                             execution_context.kernel_context,
@@ -9681,7 +9670,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                             "rebuild",
                             residual_carry,
                             slot_carry_bar,
-                            fixed_replay=True,
                         )
                         return carry_bar_value
 

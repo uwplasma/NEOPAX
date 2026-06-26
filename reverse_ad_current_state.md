@@ -266,6 +266,7 @@ Current code diagnostics/modes that remain:
 - `zero_rhs_direct`
 - `zero_rhs_flux`
 - `zero_stage_solve`
+- `zero_rebuild_pullback`
 - `zero_step_bwd`
 - `force_reuse_bwd`
 - `force_rebuild_bwd`
@@ -278,17 +279,17 @@ Next direction:
 - The next viable optimization should keep the dynamic solver decision while reducing the accepted-step bwd body itself, or introduce a real custom primitive/call boundary that does not inline/duplicate the reuse and rebuild bwd bodies.
 - Keep `zero_step_bwd` as the main localization diagnostic: it proves the accepted-step bwd body is the hot path.
 
-2026-06-26 update:
+2026-06-26 fixed-replay cleanup experiment:
 
-- Added an internal `fixed_replay` path to `_execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd`.
-  - The segmented fixed accepted-step reverse replay now calls the branch bwd with `fixed_replay=True`.
-  - This is not a new public forcing mode and does not change the solver's reuse/rebuild decision.
-  - It avoids constructing cotangents for replay-only fields such as the accepted `dt` inside the branch bwd; only the fields that can flow back through accepted replay remain exposed (`y`, lagged cache/reference, with other carry fields zero).
-  - The generic custom-VJP bwd path remains unchanged for non-fixed-replay use.
-- Lightweight validation so far:
-  - `compile(...)` check passed for `_transport_solvers.py` and `benchmark_transport_reverse_ad_only.py`.
-  - The expensive 16-step benchmark has not yet been rerun after this patch.
-- Next test:
+- Tried an internal `fixed_replay` path in `_execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd`.
+  - The idea was to avoid constructing cotangents for replay-only fields such as the accepted `dt` inside the branch bwd.
+  - It preserved gradients but did not improve memory or warmed execution.
+  - Test result:
+    - `reverse_compile_plus_execute_s = 1.028776e+03`
+    - `reverse_execute_s_mean = 2.396921e+02`
+  - This was removed/reverted because it added complexity without helping.
+
+Current reference command:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
@@ -307,3 +308,31 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   - `dsoftmax_Er/dT0 = 3.054047e+00`
   - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
   - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+
+Next optimization target:
+
+- The cost is not fixed replay field cotangents or `prev_stages` cotangents.
+- The remaining hot path is the accepted-step bwd body itself.
+- `zero_step_bwd` remains the most important localization result because it drops execution to roughly `5.6e+01` seconds.
+- Further improvement needs to reduce the actual stage/RHS/lagged adjoint work or package it behind a truly smaller custom primitive/checkpoint strategy; masking carry fields after or inside the step is not enough.
+
+2026-06-26 diagnostic addition:
+
+- Added `--reverse-stage-cotangent-mode zero_rebuild_pullback`.
+  - This skips only `pullback_build_lagged_response` in rebuild branches.
+  - It intentionally changes gradients.
+  - It is meant to isolate whether the 12 rebuild branches are a major compile/memory/runtime source.
+- Test command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-stage-cotangent-mode zero_rebuild_pullback
+```
