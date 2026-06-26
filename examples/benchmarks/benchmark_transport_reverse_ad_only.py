@@ -553,7 +553,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-cotangent-mode",
-        choices=("full", "zero_lagged", "zero_rhs_state", "zero_rhs_direct", "zero_rhs_flux"),
+        choices=(
+            "full",
+            "zero_lagged",
+            "zero_rhs_state",
+            "zero_rhs_direct",
+            "zero_rhs_flux",
+            "zero_stage_solve",
+        ),
         default="full",
         help=(
             "Diagnostic-only branch toggle for exact stage adjoints. 'full' is the normal "
@@ -561,7 +568,8 @@ def main() -> None:
             "'zero_rhs_state' drops stage RHS-state cotangents, including inside the exact "
             "iterative transpose matvec; 'zero_rhs_direct' keeps only shared-flux state "
             "cotangents; 'zero_rhs_flux' keeps only direct equation-assembly state "
-            "cotangents. Non-full modes intentionally change gradients."
+            "cotangents; 'zero_stage_solve' bypasses the exact stage-adjoint solve and "
+            "residual-input pullback. Non-full modes intentionally change gradients."
         ),
     )
     parser.add_argument(

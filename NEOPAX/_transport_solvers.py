@@ -4897,6 +4897,14 @@ def _radau_exact_stage_residual_input_pullback(
     compute_dt_bar: bool = True,
 ):
     """Apply exact residual input pullbacks without tracing the full residual."""
+    cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+    if cotangent_mode in {"zero_stage_solve", "stage_solve_zero", "zero_stage_adjoint"}:
+        return (
+            jnp.zeros_like(carry_in.y),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+            _radau_align_tangent_tree_to_primal(None, lagged_response),
+        )
+
     residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
         (kernel_context.num_stages, kernel_context.state_dim)
     )
@@ -4905,7 +4913,6 @@ def _radau_exact_stage_residual_input_pullback(
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
     rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
-    cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
     zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
     zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
     zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
@@ -5293,6 +5300,10 @@ def _radau_solve_exact_stage_residual_transpose(
     *,
     rhs,
 ):
+    cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+    if cotangent_mode in {"zero_stage_solve", "stage_solve_zero", "zero_stage_adjoint"}:
+        return jnp.zeros_like(jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,)))
+
     mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
     if mode == "structured":
         return -_radau_apply_stage_linear_transpose_solve(
