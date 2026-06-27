@@ -359,6 +359,9 @@ Next optimization target:
   - It skips only the per-anchor/species local NTX moment-response pullback.
   - It intentionally changes gradients.
   - Goal: separate interpolation transpose cost from local moment-response physics pullback cost.
+- Implementation started on the real local moment-response pullback reduction:
+  - Replaced the local `linear_transpose(jvp(get_v_thermal))` inside `_pullback_local_scan_inputs_from_primitives` with the analytic pullback `temperature_bar += vthermal_bar * vthermal / (2 * temperature)`.
+  - This should preserve gradients; next full run should check whether it changes compile or warmed execution.
 - Next diagnostic command:
 
 ```bash

@@ -2869,21 +2869,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
         )
 
-        def _forward_linearized_vthermal(dtemperature_local):
-            _, dvthermal = jax.jvp(
-                lambda temperature_local_value: get_v_thermal(
-                    self.species.mass,
-                    temperature_local_value,
-                ),
-                (temperature_local,),
-                (dtemperature_local,),
+        vthermal_pullback_dtype = jnp.result_type(
+            temperature_local,
+            vthermal_local,
+            vthermal_local_bar,
+        )
+        temperature_local_vthermal_bar = (
+            jnp.asarray(vthermal_local_bar, dtype=vthermal_pullback_dtype)
+            * jnp.asarray(vthermal_local, dtype=vthermal_pullback_dtype)
+            / (
+                jnp.asarray(2.0, dtype=vthermal_pullback_dtype)
+                * jnp.asarray(temperature_local, dtype=vthermal_pullback_dtype)
             )
-            return dvthermal
-
-        (temperature_local_vthermal_bar,) = jax.linear_transpose(
-            _forward_linearized_vthermal,
-            jnp.zeros_like(temperature_local),
-        )(vthermal_local_bar)
+        )
 
         return (
             er_local_bar,
