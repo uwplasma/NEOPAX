@@ -361,7 +361,15 @@ Next optimization target:
   - Goal: separate interpolation transpose cost from local moment-response physics pullback cost.
 - Implementation started on the real local moment-response pullback reduction:
   - Replaced the local `linear_transpose(jvp(get_v_thermal))` inside `_pullback_local_scan_inputs_from_primitives` with the analytic pullback `temperature_bar += vthermal_bar * vthermal / (2 * temperature)`.
-  - This should preserve gradients; next full run should check whether it changes compile or warmed execution.
+  - Full test preserved gradients but did not improve performance:
+    - `reverse_compile_plus_execute_s = 1.107230e+03`
+    - `reverse_execute_s_mean = 2.434195e+02`
+  - This was reverted because it added code without reducing the full-path graph cost.
+- Next implementation attempt:
+  - Replaced the full black-box transpose of `_local_scan_inputs` with a hybrid pullback.
+  - `nu_hat` still uses a generic VJP through `_nu_over_vnew_local` to preserve the active collisionality model.
+  - `epsi_hat` and `vth_a` are transposed explicitly, including finite-`drds` and `er_v_floor` activity.
+  - This is a larger graph reduction than the scalar `get_v_thermal` substitution and should be tested on the full path.
 - Next diagnostic command:
 
 ```bash
