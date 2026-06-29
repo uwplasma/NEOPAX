@@ -5366,7 +5366,7 @@ def _radau_solve_exact_stage_residual_transpose(
             complex_piv_out=primal_result.complex_piv_out,
             skip_zero_rhs_shortcut=True,
         )
-    if mode in {"gmres", "bicgstab"}:
+    if mode in {"gmres", "bicgstab", "bicgstab_cls", "bicgstab_custom_linear_solve"}:
         return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
             physics_context,
