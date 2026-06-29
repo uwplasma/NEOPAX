@@ -5255,25 +5255,6 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
                 maxiter=iter_maxiter,
                 M=_preconditioner,
             )
-    elif method in {"bicgstab_cls", "bicgstab_custom_linear_solve"}:
-        def _solve_fn(matvec, b):
-            return _bicgstab_fixed_iterations(
-                matvec,
-                b,
-                tol=iter_tol,
-                maxiter=iter_maxiter,
-                preconditioner=_preconditioner,
-            )
-
-        # This solve is used inside a first-order custom VJP backward rule.
-        # Marking the linear solve boundary explicitly keeps the Krylov solve
-        # from being exposed as ordinary bwd arithmetic to outer AD.
-        solution = jax.lax.custom_linear_solve(
-            _transpose_matvec,
-            -rhs_arr,
-            solve=_solve_fn,
-            symmetric=True,
-        )
     else:
         solution, _info = jax.scipy.sparse.linalg.gmres(
             _transpose_matvec,
@@ -5366,7 +5347,7 @@ def _radau_solve_exact_stage_residual_transpose(
             complex_piv_out=primal_result.complex_piv_out,
             skip_zero_rhs_shortcut=True,
         )
-    if mode in {"gmres", "bicgstab", "bicgstab_cls", "bicgstab_custom_linear_solve"}:
+    if mode in {"gmres", "bicgstab"}:
         return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
             physics_context,

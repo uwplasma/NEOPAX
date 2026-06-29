@@ -556,14 +556,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-solve-mode",
-        choices=("structured", "bicgstab", "bicgstab_cls", "block", "gmres"),
+        choices=("structured", "bicgstab", "block", "gmres"),
         default="structured",
         help=(
             "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
             "transformed LU transpose approximation and is the lightweight default; "
-            "'bicgstab' is the lower-memory exact iterative candidate; 'bicgstab_cls' "
-            "wraps the same fixed BiCGSTAB solve in a custom_linear_solve boundary; "
-            "'block' and 'gmres' are correctness oracles but are memory/compile heavy."
+            "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
+            "'gmres' are correctness oracles but are memory/compile heavy."
         ),
     )
     parser.add_argument(
