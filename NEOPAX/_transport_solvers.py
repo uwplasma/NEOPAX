@@ -9612,6 +9612,9 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             dynamic_call_bwd = str(
                 getattr(execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
             ).strip().lower() in {"dynamic_call_bwd", "call_bwd", "cond_call_bwd"}
+            step_bwd_mode = str(
+                getattr(execution_context.physics_context, "reverse_step_bwd_mode", "current")
+            ).strip().lower()
 
             def _slot_bwd(slot_carry_bar, slot_xs):
                 step_start_carry, slot_arrays = slot_xs
@@ -9702,12 +9705,87 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             )
             return segment_start_carry_bar, None
 
-        carry0_bar, _ = jax.lax.scan(
-            _segment_bwd,
-            final_carry_bar,
-            (segment_start_carries, segmented_replay_arrays),
-            reverse=True,
+        step_bwd_mode = str(
+            getattr(execution_context.physics_context, "reverse_step_bwd_mode", "current")
+        ).strip().lower()
+        static_lagged_branch_schedule = getattr(
+            execution_context.physics_context,
+            "reverse_lagged_branch_schedule",
+            None,
         )
+        use_manual_split_schedule = (
+            step_bwd_mode in {"manual_split", "static_branch", "scheduled"}
+            and static_lagged_branch_schedule is not None
+            and stop_after_accepted_steps is not None
+        )
+
+        if use_manual_split_schedule:
+            static_schedule_values = tuple(bool(value) for value in static_lagged_branch_schedule)
+            segment_length = int(reverse_segment_length)
+            segment_count = int((int(stop_after_accepted_steps) + segment_length - 1) // segment_length)
+
+            def _tree_index(tree, index: int):
+                return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+            def _manual_segment_bwd(carry_bar, segment_index: int):
+                segment_start_carry = _tree_index(segment_start_carries, segment_index)
+                segment_arrays = tuple(values[segment_index] for values in segmented_replay_arrays)
+
+                def _segment_collect_start_carries(carry, slot_xs):
+                    next_carry, _ = _radau_replay_realized_accepted_slot(
+                        execution_context,
+                        carry,
+                        *slot_xs,
+                    )
+                    return next_carry, carry
+
+                _, step_start_carries_for_segment = jax.lax.scan(
+                    _segment_collect_start_carries,
+                    segment_start_carry,
+                    segment_arrays,
+                )
+
+                segment_carry_bar = carry_bar
+                for slot_index in range(segment_length - 1, -1, -1):
+                    accepted_index = segment_index * segment_length + slot_index
+                    if accepted_index >= len(static_schedule_values):
+                        continue
+
+                    step_start_carry = _tree_index(step_start_carries_for_segment, slot_index)
+                    active = segment_arrays[0][slot_index]
+                    dt_value = segment_arrays[1][slot_index]
+                    branch_name = "reuse" if static_schedule_values[accepted_index] else "rebuild"
+
+                    def _do_step_bwd(_):
+                        carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+                        residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+                        carry_bar_value, *_ = _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            branch_name,
+                            residual_carry,
+                            segment_carry_bar,
+                        )
+                        return _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry)
+
+                    def _skip_bwd(_):
+                        return segment_carry_bar
+
+                    segment_carry_bar = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
+
+                return segment_carry_bar
+
+            carry0_bar = final_carry_bar
+            for segment_index in range(segment_count - 1, -1, -1):
+                carry0_bar = _manual_segment_bwd(carry0_bar, segment_index)
+        else:
+            carry0_bar, _ = jax.lax.scan(
+                _segment_bwd,
+                final_carry_bar,
+                (segment_start_carries, segmented_replay_arrays),
+                reverse=True,
+            )
         return (carry0_bar,)
 
     if stop_after_accepted_steps == 1:
