@@ -370,7 +370,10 @@ Next optimization target:
   - `nu_hat` still uses a generic VJP through `_nu_over_vnew_local` to preserve the active collisionality model.
   - `epsi_hat` and `vth_a` are transposed explicitly, including finite-`drds` and `er_v_floor` activity.
   - This is a larger graph reduction than the scalar `get_v_thermal` substitution and should be tested on the full path.
-- Next diagnostic command:
+- Validation already done:
+  - Syntax compile passed for `_transport_flux_models.py`, `_transport_solvers.py`, `_transport_equations.py`, and `benchmark_transport_reverse_ad_only.py`.
+  - `git diff --check` passed, with only line-ending warnings.
+- Next full correctness/performance command:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
@@ -381,6 +384,40 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --timing-mode jit-warm \
   --reverse-segment-length 4 \
   --reverse-stage-adjoint-solve-mode bicgstab \
-  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
-  --reverse-stage-cotangent-mode zero_rebuild_local_moment_pullback
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated
 ```
+
+- Keep/revert criteria:
+  - Keep only if the gradients remain at the correctness target:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - Also require a meaningful improvement in compile, warmed execution, or memory. If it preserves gradients but remains around `reverse_execute_s_mean ~= 2.4e+02` and `reverse_compile_plus_execute_s ~= 1.1e+03`, revert it like the previous scalar pullback attempts.
+  - If gradients change, inspect the explicit `epsi_hat`/`er_v_floor` activity logic first; likely issue would be the floor boundary or finite-`drds` branch in the hybrid pullback.
+
+Current useful localization facts:
+
+- `zero_step_bwd` remains the strongest localization: accepted-step bwd is the main hot path.
+- `zero_rebuild_pullback` and `zero_rebuild_anchor_fields` showed rebuild pullback is a contributor, and most of that contribution is in the interpolated anchor/local moment-response part.
+- Micro-optimizations to simple scalar transposes did not help; the current hybrid local-scan pullback is the first larger graph-reduction attempt after those negative results.
+
+2026-06-27 handoff:
+
+- Current code state includes the hybrid `_local_scan_inputs` pullback attempt in the NTX interpolated local moment-response path.
+- This attempt is intended to reduce reverse graph size generically, not to special-case the active benchmark TOML.
+- Full correctness/performance test result:
+  - Gradients remained correct:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - Timing did not meaningfully improve:
+    - `reverse_total_s = 1.273964e+03`
+    - `reverse_compile_plus_execute_s = 1.032273e+03`
+    - `reverse_execute_s_mean = 2.416912e+02`
+    - `reverse_execute_s_min = 2.416912e+02`
+  - Resource graph still showed high host RAM during compile and a long GPU execution plateau; memory looked broadly similar to the prior full path.
+- Conclusion: the hybrid `_local_scan_inputs` pullback preserves correctness but fails the keep criteria because memory and warmed execution remain essentially unchanged.
+- Next action should be to revert the hybrid local-scan pullback attempt and return to the last known-correct full path before choosing the next optimization target.
+- Git currently reports a stale `.git/index.lock` warning in this checkout; do not remove it unless intentionally cleaning up Git state.

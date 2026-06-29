@@ -354,6 +354,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
     reverse_stage_cotangent_mode: str = "full",
+    reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
 ) -> _ReverseStaticSetup:
@@ -385,6 +386,7 @@ def _prepare_reverse_static_setup(
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
+                reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
             ),
@@ -612,6 +614,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-step-bwd-mode",
+        choices=("current", "manual_split"),
+        default="current",
+        help=(
+            "Accepted-step backward implementation selector. 'current' keeps the "
+            "existing reverse path. 'manual_split' is reserved for the upcoming "
+            "split/manual accepted-step adjoint and currently routes through the "
+            "same implementation while plumbing is validated."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-adjoint-iter-maxiter",
         type=int,
         default=40,
@@ -747,6 +760,7 @@ def main() -> None:
         reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
         reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
+        reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
         reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
     )
@@ -909,6 +923,7 @@ def main() -> None:
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+        "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
         "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
@@ -936,6 +951,7 @@ def main() -> None:
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
+        f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
         f"reverse_stage_adjoint_iter_maxiter={args.reverse_stage_adjoint_iter_maxiter} "
         f"reverse_stage_adjoint_iter_tol={args.reverse_stage_adjoint_iter_tol:.6e} "
         f"timing_mode={args.timing_mode} "

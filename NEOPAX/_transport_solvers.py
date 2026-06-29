@@ -2861,6 +2861,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
     reverse_stage_cotangent_mode: str = "full"
+    reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
