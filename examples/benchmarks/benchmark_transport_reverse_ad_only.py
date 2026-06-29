@@ -355,6 +355,7 @@ def _prepare_reverse_static_setup(
     reverse_rhs_transpose_mode: str = "generic",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
+    reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
 ) -> _ReverseStaticSetup:
@@ -387,6 +388,7 @@ def _prepare_reverse_static_setup(
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
+                reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
             ),
@@ -625,6 +627,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-stage-adjoint-memory-mode",
+        choices=("default", "remat_matvec"),
+        default="default",
+        help=(
+            "Memory strategy inside the exact reverse stage-adjoint matvec. "
+            "'default' keeps the current graph. 'remat_matvec' checkpoints the "
+            "per-stage RHS transpose inside the Krylov matvec while preserving "
+            "the outer lax.scan structure."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-adjoint-iter-maxiter",
         type=int,
         default=40,
@@ -761,6 +774,7 @@ def main() -> None:
         reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
         reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
         reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+        reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
         reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
     )
@@ -924,6 +938,7 @@ def main() -> None:
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+        "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
         "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
@@ -952,6 +967,7 @@ def main() -> None:
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
+        f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "
         f"reverse_stage_adjoint_iter_maxiter={args.reverse_stage_adjoint_iter_maxiter} "
         f"reverse_stage_adjoint_iter_tol={args.reverse_stage_adjoint_iter_tol:.6e} "
         f"timing_mode={args.timing_mode} "

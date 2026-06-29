@@ -2862,6 +2862,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_rhs_transpose_mode: str = "generic"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
+    reverse_stage_adjoint_memory_mode: str = "default"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
@@ -5092,6 +5093,7 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         )
         rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
         zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
         zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
         zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
@@ -5145,7 +5147,13 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             (jt_lambda,) = rhs_pullback(lambda_eval)
             return jt_lambda
 
-        jt_lambda_stages = jax.vmap(_stage_rhs_vjp, in_axes=(0, 0, 0))(
+        stage_rhs_vjp = (
+            jax.checkpoint(_stage_rhs_vjp)
+            if memory_mode in {"remat_matvec", "remat_rhs", "checkpoint_matvec", "checkpoint_rhs"}
+            else _stage_rhs_vjp
+        )
+
+        jt_lambda_stages = jax.vmap(stage_rhs_vjp, in_axes=(0, 0, 0))(
             stage_times,
             stage_states,
             lambda_stages,
