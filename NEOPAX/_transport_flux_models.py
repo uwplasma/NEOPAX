@@ -3289,6 +3289,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
         reverse_stage_cotangent_mode = str(kwargs.pop("reverse_stage_cotangent_mode", "full")).strip().lower()
+        reverse_stage_adjoint_memory_mode = str(
+            kwargs.pop("reverse_stage_adjoint_memory_mode", "default")
+        ).strip().lower()
         del kwargs
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if center_response_bar is None:
@@ -3610,18 +3613,37 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             jnp.zeros_like(density_safe_local),
                         )
                     else:
+                        def _local_moment_pullback(
+                            er_value_arg,
+                            temperature_local_arg,
+                            density_local_arg,
+                        ):
+                            return self._pullback_interpolated_moment_response_local_fields(
+                                prepared_local,
+                                drds_value=drds_value_local,
+                                er_value=er_value_arg,
+                                temperature_local=temperature_local_arg,
+                                density_local=density_local_arg,
+                                collisionality_kind=collisionality_kind,
+                                field_bars=local_field_bars,
+                            )
+
+                        if reverse_stage_adjoint_memory_mode in {
+                            "remat_rebuild_pullback",
+                            "remat_rebuild",
+                            "checkpoint_rebuild_pullback",
+                            "remat_all",
+                        }:
+                            _local_moment_pullback = jax.checkpoint(_local_moment_pullback)
+
                         (
                             er_local_bar,
                             temperature_local_bar,
                             density_safe_local_bar,
-                        ) = self._pullback_interpolated_moment_response_local_fields(
-                            prepared_local,
-                            drds_value=drds_value_local,
-                            er_value=er_local0,
-                            temperature_local=temperature_local0,
-                            density_local=density_safe_local,
-                            collisionality_kind=collisionality_kind,
-                            field_bars=local_field_bars,
+                        ) = _local_moment_pullback(
+                            er_local0,
+                            temperature_local0,
+                            density_safe_local,
                         )
 
                     def _forward_linearized_density_pressure(

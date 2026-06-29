@@ -628,12 +628,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-memory-mode",
-        choices=("default", "remat_matvec"),
+        choices=("default", "remat_matvec", "remat_rebuild_pullback", "remat_all"),
         default="default",
         help=(
             "Memory strategy inside the exact reverse stage-adjoint matvec. "
             "'default' keeps the current graph. 'remat_matvec' checkpoints the "
-            "per-stage RHS transpose inside the Krylov matvec while preserving "
+            "per-stage RHS transpose inside the Krylov matvec; "
+            "'remat_rebuild_pullback' checkpoints the NTX interpolated rebuild "
+            "local moment pullback; 'remat_all' enables both while preserving "
             "the outer lax.scan structure."
         ),
     )
