@@ -421,3 +421,48 @@ Current useful localization facts:
 - Conclusion: the hybrid `_local_scan_inputs` pullback preserves correctness but fails the keep criteria because memory and warmed execution remain essentially unchanged.
 - Next action should be to revert the hybrid local-scan pullback attempt and return to the last known-correct full path before choosing the next optimization target.
 - Git currently reports a stale `.git/index.lock` warning in this checkout; do not remove it unless intentionally cleaning up Git state.
+
+2026-06-30 handoff:
+
+- Recent memory-reduction diagnostics did not identify a cheap subfield fix.
+- `remat_rebuild_pullback` was tested on the 16-step reverse lane.
+  - It preserved the correct gradients:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - It made performance much worse:
+    - `reverse_total_s = 1.919843e+03`
+    - `reverse_compile_plus_execute_s = 1.285655e+03`
+    - `reverse_execute_s_mean = 6.341880e+02`
+  - It did not reduce the RAM plateau enough to justify keeping.
+  - This mode was reverted/removed from the intended working state.
+- `zero_rebuild_derivative_fields` was tested on the 16-step reverse lane.
+  - It intentionally changed gradients and also made performance worse:
+    - `reverse_total_s = 1.916134e+03`
+    - `reverse_compile_plus_execute_s = 1.288350e+03`
+    - `reverse_execute_s_mean = 6.277836e+02`
+    - `dsoftmax_Er/dn0 = -3.770725e+00`
+    - `dsoftmax_Er/dT0 = 3.060427e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.536199e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.223957e+00`
+  - This rules out the derivative-field rebuild pullbacks as the main memory target.
+  - This diagnostic mode was reverted/removed from the intended working state.
+- An attempted NTX `solve_prepared_coefficient_vector_vjp(...)` boundary for the reverse local transport-moment pullback failed before performance testing.
+  - Failure:
+    - `UnexpectedTracerError`
+    - `prepared` was passed as an argument marked by NTX as `nondiff_argnums=(0,)`, but in this reverse rebuild path `prepared` contains JAX tracers.
+  - This confirms the warning in the older notes: the existing NTX custom-VJP API cannot be called directly from the traced reverse rebuild path.
+  - The attempted branch was reverted/removed from the intended working state.
+- Current evidence:
+  - There is not enough evidence to claim that a new NTX coefficient-solve boundary will reduce the graph.
+  - There is enough evidence to justify it only as a small proof-of-concept experiment.
+  - Do not start a large refactor assuming it will help.
+- Next recommended step:
+  - Prototype a tiny JAX-compatible coefficient-solve boundary where only truly static metadata is nondifferentiable and the prepared array payload is passed as ordinary JAX operands.
+  - Compare compile/JAXPR/HLO or a 2-step reverse run before generalizing.
+  - Only continue if this prototype measurably reduces graph size, compile time, RAM, or warmed execution.
+- Avoid next session:
+  - Do not rerun `remat_rebuild_pullback`.
+  - Do not rerun `zero_rebuild_derivative_fields`.
+  - Do not rerun the existing NTX `custom_vjp` path inside reverse rebuild without changing the NTX/NEOPAX boundary API.

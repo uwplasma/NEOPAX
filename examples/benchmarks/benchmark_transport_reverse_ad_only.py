@@ -578,6 +578,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-ntx-coeff-boundary",
+        choices=("manual", "array_custom_vjp"),
+        default="manual",
+        help=(
+            "Experimental NTX coefficient-solve boundary used by the exact reverse pullback. "
+            "'manual' keeps the current NEOPAX-side adjoint algebra. 'array_custom_vjp' wraps "
+            "the per-energy coefficient solve in a custom VJP with zero prepared-system cotangent."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-cotangent-mode",
         choices=(
             "full",
@@ -753,6 +763,9 @@ def main() -> None:
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
+    )
+    config.setdefault("neoclassical", {})["reverse_ntx_coefficient_boundary"] = str(
+        args.reverse_ntx_coeff_boundary
     )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
@@ -936,6 +949,7 @@ def main() -> None:
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+        "reverse_ntx_coefficient_boundary": str(args.reverse_ntx_coeff_boundary),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
         "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
@@ -965,6 +979,7 @@ def main() -> None:
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
+        f"reverse_ntx_coefficient_boundary={args.reverse_ntx_coeff_boundary} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
         f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "

@@ -75,6 +75,117 @@ def _ntx_local_pullback_finite_debug_enabled() -> bool:
     return raw not in {"", "0", "false", "no", "off"}
 
 
+@jax.custom_vjp
+def _ntx_coefficient_vector_array_custom_vjp(prepared, nu_hat_value, epsi_hat_value):
+    from ntx._solver_prepared import _solve_prepared_coefficient_vector_raw
+
+    return _solve_prepared_coefficient_vector_raw(prepared, nu_hat_value, epsi_hat_value)
+
+
+def _ntx_coefficient_vector_array_custom_vjp_fwd(prepared, nu_hat_value, epsi_hat_value):
+    from ntx._solver_adjoint import _prepared_implicit_vjp_primal
+
+    (
+        coefficients,
+        f1_full_value,
+        f3_full_value,
+        saved_lu_value,
+        saved_piv_value,
+        saved_lower_value,
+        saved_upper_value,
+    ) = _prepared_implicit_vjp_primal(
+        prepared,
+        nu_hat_value,
+        epsi_hat_value,
+    )
+    residual = (
+        prepared,
+        nu_hat_value,
+        epsi_hat_value,
+        f1_full_value,
+        f3_full_value,
+        saved_lu_value,
+        saved_piv_value,
+        saved_lower_value,
+        saved_upper_value,
+    )
+    return coefficients, residual
+
+
+def _ntx_coefficient_vector_array_custom_vjp_bwd(residual, coefficient_bar):
+    from ntx._solver_adjoint import (
+        _coefficient_mode_pullback,
+        _parameter_gradient_from_adjoint,
+    )
+    from ntx._solver_context import _operator_context
+    from ntx._solver_factorization import _solve_factorized_adjoint
+
+    (
+        prepared,
+        nu_hat_value,
+        epsi_hat_value,
+        f1_full_value,
+        f3_full_value,
+        saved_lu_value,
+        saved_piv_value,
+        saved_lower_value,
+        saved_upper_value,
+    ) = residual
+    ctx = _operator_context(
+        prepared.surface,
+        prepared.geometry,
+        prepared.grid,
+        nu_hat_value,
+        epsi_hat_value,
+    )
+    f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
+        prepared.geometry,
+        f1_full_value[:3],
+        f3_full_value[:3],
+        ctx.nu_hat,
+        coefficient_bar,
+    )
+    g1 = jnp.zeros_like(f1_full_value).at[:3].set(f1_bar_low)
+    g3 = jnp.zeros_like(f3_full_value).at[:3].set(f3_bar_low)
+    lambda1 = _solve_factorized_adjoint(
+        saved_lu_value,
+        saved_piv_value,
+        saved_lower_value,
+        saved_upper_value,
+        g1,
+    )
+    lambda3 = _solve_factorized_adjoint(
+        saved_lu_value,
+        saved_piv_value,
+        saved_lower_value,
+        saved_upper_value,
+        g3,
+    )
+    nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
+        prepared,
+        ctx,
+        f1_full_value,
+        f3_full_value,
+        lambda1,
+        lambda3,
+    )
+
+    def _zero_prepared_cotangent(leaf):
+        leaf_array = jnp.asarray(leaf)
+        if jnp.issubdtype(leaf_array.dtype, jnp.inexact):
+            return jnp.zeros_like(leaf_array)
+        return jnp.zeros(leaf_array.shape, dtype=jax.dtypes.float0)
+
+    prepared_bar = jax.tree_util.tree_map(_zero_prepared_cotangent, prepared)
+    return prepared_bar, nu_bar_direct + nu_bar_implicit, epsi_bar
+
+
+_ntx_coefficient_vector_array_custom_vjp.defvjp(
+    _ntx_coefficient_vector_array_custom_vjp_fwd,
+    _ntx_coefficient_vector_array_custom_vjp_bwd,
+)
+
+
 def compute_total_power_mw(state, species, pressure_source_model, geometry, fallback_mw=3.0):
     fallback = jnp.asarray(fallback_mw, dtype=state.density.dtype)
     if pressure_source_model is None or geometry is None:
@@ -1475,6 +1586,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     response_anchor_count: int | None = None
     use_remat: bool = False
     derivative_mode: str = "direct"
+    reverse_ntx_coefficient_boundary: str = "manual"
     er_v_floor: float | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
@@ -1543,6 +1655,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def with_derivative_mode(self, derivative_mode: str) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, derivative_mode=self._normalize_derivative_mode(derivative_mode))
 
+    def with_reverse_ntx_coefficient_boundary(
+        self,
+        reverse_ntx_coefficient_boundary: str | None,
+    ) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(
+            self,
+            reverse_ntx_coefficient_boundary=self._normalize_reverse_ntx_coefficient_boundary(
+                reverse_ntx_coefficient_boundary
+            ),
+        )
+
     def with_er_v_floor(self, er_v_floor: float | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if er_v_floor in (None, "", 0, "0") else float(er_v_floor)
         return dataclasses.replace(self, er_v_floor=normalized)
@@ -1581,6 +1704,25 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if mode not in {"direct", "custom_vjp"}:
             raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_vjp")
         return mode
+
+    @staticmethod
+    def _normalize_reverse_ntx_coefficient_boundary(mode: str | None) -> str:
+        normalized = "manual" if mode in (None, "") else str(mode).strip().lower()
+        aliases = {
+            "default": "manual",
+            "none": "manual",
+            "current": "manual",
+            "array-custom-vjp": "array_custom_vjp",
+            "arraycustomvjp": "array_custom_vjp",
+            "custom_vjp": "array_custom_vjp",
+            "custom-vjp": "array_custom_vjp",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"manual", "array_custom_vjp"}:
+            raise ValueError(
+                "reverse_ntx_coefficient_boundary must be one of: manual, array_custom_vjp"
+            )
+        return normalized
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
         batch_size = self.radial_batch_size
@@ -2397,40 +2539,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         reference_transport_moments_bar,
     ):
-        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
-        if derivative_mode == "custom_vjp":
-            ntx = _import_ntx()
-            energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
-
-            def _one_case_pullback(energy_index):
-                nu_hat_value = reference_nu_hat[energy_index]
-                epsi_hat_value = reference_epsi_hat[energy_index]
-
-                def _coefficient_vector_from_values(nu_value, epsi_value):
-                    return ntx.solve_prepared_coefficient_vector_vjp(
-                        prepared,
-                        ntx.MonoenergeticCase(nu_hat=nu_value, epsi_hat=epsi_value),
-                    )
-
-                coefficients, coefficient_pullback = jax.vjp(
-                    _coefficient_vector_from_values,
-                    nu_hat_value,
-                    epsi_hat_value,
-                )
-                coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
-                    coefficients,
-                    drds_value=drds_value,
-                    energy_index=energy_index,
-                    transport_moments_bar=reference_transport_moments_bar,
-                )
-                return coefficient_pullback(coefficient_bar)
-
-            nu_hat_bar, epsi_hat_bar = jax.lax.map(
-                _one_case_pullback,
-                energy_indices,
-            )
-            return nu_hat_bar, epsi_hat_bar
-
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
         # stays on the NEOPAX side and never pushes a traced `prepared` through
         # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.
@@ -2443,10 +2551,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         from ntx._solver_factorization import _solve_factorized_adjoint
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+        coefficient_boundary = self._normalize_reverse_ntx_coefficient_boundary(
+            self.reverse_ntx_coefficient_boundary
+        )
 
         def _one_case_pullback(energy_index):
             nu_hat_value = reference_nu_hat[energy_index]
             epsi_hat_value = reference_epsi_hat[energy_index]
+            if coefficient_boundary == "array_custom_vjp":
+                coefficients, coefficient_pullback = jax.vjp(
+                    _ntx_coefficient_vector_array_custom_vjp,
+                    prepared,
+                    nu_hat_value,
+                    epsi_hat_value,
+                )
+                coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                    coefficients,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                    transport_moments_bar=reference_transport_moments_bar,
+                )
+                _, nu_bar_total, epsi_bar = coefficient_pullback(coefficient_bar)
+                return nu_bar_total, epsi_bar
+
             (
                 coefficients,
                 f1_full_value,
@@ -4618,6 +4745,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
     ntx_exact_derivative_mode="direct",
+    reverse_ntx_coefficient_boundary="manual",
     ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -4659,6 +4787,11 @@ def build_ntx_exact_lij_runtime_transport_model(
         use_remat=bool(ntx_exact_use_remat),
         derivative_mode=NTXExactLijRuntimeTransportModel._normalize_derivative_mode(
             ntx_exact_derivative_mode
+        ),
+        reverse_ntx_coefficient_boundary=(
+            NTXExactLijRuntimeTransportModel._normalize_reverse_ntx_coefficient_boundary(
+                reverse_ntx_coefficient_boundary
+            )
         ),
         er_v_floor=(
             None
