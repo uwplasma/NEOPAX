@@ -2397,6 +2397,40 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         reference_transport_moments_bar,
     ):
+        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
+        if derivative_mode == "custom_vjp":
+            ntx = _import_ntx()
+            energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+            def _one_case_pullback(energy_index):
+                nu_hat_value = reference_nu_hat[energy_index]
+                epsi_hat_value = reference_epsi_hat[energy_index]
+
+                def _coefficient_vector_from_values(nu_value, epsi_value):
+                    return ntx.solve_prepared_coefficient_vector_vjp(
+                        prepared,
+                        ntx.MonoenergeticCase(nu_hat=nu_value, epsi_hat=epsi_value),
+                    )
+
+                coefficients, coefficient_pullback = jax.vjp(
+                    _coefficient_vector_from_values,
+                    nu_hat_value,
+                    epsi_hat_value,
+                )
+                coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                    coefficients,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                    transport_moments_bar=reference_transport_moments_bar,
+                )
+                return coefficient_pullback(coefficient_bar)
+
+            nu_hat_bar, epsi_hat_bar = jax.lax.map(
+                _one_case_pullback,
+                energy_indices,
+            )
+            return nu_hat_bar, epsi_hat_bar
+
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
         # stays on the NEOPAX side and never pushes a traced `prepared` through
         # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.
@@ -3509,12 +3543,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "zero_rebuild_local_moments",
                 "rebuild_local_moment_pullback_zero",
             }
-            zero_derivative_field_pullback = reverse_stage_cotangent_mode in {
-                "zero_rebuild_derivative_fields",
-                "zero_rebuild_second_order_fields",
-                "rebuild_derivative_fields_zero",
-            }
-
             def _local_density_pressure_map(density_local, pressure_local):
                 density_safe_local = safe_density(density_local)
                 return density_safe_local, pressure_local / density_safe_local
@@ -3572,13 +3600,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         )
                         for field_bar in raw_anchor_response_fields
                     )
-                    if zero_derivative_field_pullback:
-                        local_field_bars = (
-                            local_field_bars[0],
-                            local_field_bars[1],
-                            jnp.zeros_like(local_field_bars[2]),
-                            jnp.zeros_like(local_field_bars[3]),
-                        )
                     density_local0 = jax.lax.dynamic_index_in_dim(
                         density0,
                         radius_index,
