@@ -589,6 +589,7 @@ def main() -> None:
             "zero_rebuild_pullback",
             "zero_rebuild_anchor_fields",
             "zero_rebuild_local_moment_pullback",
+            "zero_rebuild_derivative_fields",
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
@@ -607,6 +608,8 @@ def main() -> None:
             "the direct reference-Er part of the NTX interpolated rebuild pullback; "
             "'zero_rebuild_local_moment_pullback' keeps the rebuild interpolation transpose "
             "but skips the local NTX moment-response pullback; "
+            "'zero_rebuild_derivative_fields' keeps value-field rebuild pullbacks but drops "
+            "the derivative-field rebuild pullbacks; "
             "'zero_step_bwd' bypasses the accepted-step "
             "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Non-full "
@@ -628,14 +631,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-memory-mode",
-        choices=("default", "remat_matvec", "remat_rebuild_pullback", "remat_all"),
+        choices=("default", "remat_matvec"),
         default="default",
         help=(
             "Memory strategy inside the exact reverse stage-adjoint matvec. "
             "'default' keeps the current graph. 'remat_matvec' checkpoints the "
-            "per-stage RHS transpose inside the Krylov matvec; "
-            "'remat_rebuild_pullback' checkpoints the NTX interpolated rebuild "
-            "local moment pullback; 'remat_all' enables both while preserving "
+            "per-stage RHS transpose inside the Krylov matvec while preserving "
             "the outer lax.scan structure."
         ),
     )

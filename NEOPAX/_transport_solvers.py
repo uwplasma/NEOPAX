@@ -3730,9 +3730,6 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
         rebuild_state_bar = physics_context.pullback_build_lagged_response(
             rebuild_state,
             dlagged_response_cache_bar,
-            reverse_stage_adjoint_memory_mode=str(
-                getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")
-            ),
         )
         rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
         if physics_context.project_flat is not None:
@@ -4107,9 +4104,6 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                 rebuild_state,
                 carry_bar.lagged_response_cache,
                 reverse_stage_cotangent_mode=cotangent_mode,
-                reverse_stage_adjoint_memory_mode=str(
-                    getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")
-                ),
             )
             rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
             if physics_context.project_flat is not None:
@@ -5155,7 +5149,7 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
 
         stage_rhs_vjp = (
             jax.checkpoint(_stage_rhs_vjp)
-            if memory_mode in {"remat_matvec", "remat_rhs", "checkpoint_matvec", "checkpoint_rhs", "remat_all"}
+            if memory_mode in {"remat_matvec", "remat_rhs", "checkpoint_matvec", "checkpoint_rhs"}
             else _stage_rhs_vjp
         )
 
