@@ -595,3 +595,75 @@ Reverse AD compile-time and memory reduction plan:
    - Avoid compiling the whole reverse rollout as one monolithic `jax.grad(objective_fn)` XLA module.
    - Move toward separately compiled segment or accepted-step adjoint kernels, orchestrated outside one giant compiled graph.
    - This is a larger design change, but it is the credible path if the accepted-step bwd graph remains too large after explicit pullbacks.
+
+2026-07-01 explicit stage-lagged pullback result:
+
+- Implemented an opt-in `--reverse-stage-lagged-pullback-mode explicit` proof that replaced the broad `_stage_evals_from_lagged` VJP inside `_direct_stage_cache_adjoint` with the existing `physics_context.flat_rhs_lagged_response_pullback` hook.
+- 16-step mixed reuse/rebuild result:
+  - Command used:
+    - `--accepted-step-limit 16`
+    - `--reverse-segment-length 4`
+    - `--reverse-stage-adjoint-solve-mode bicgstab`
+    - `--reverse-rhs-transpose-mode explicit_ntx_interpolated`
+    - `--reverse-stage-lagged-pullback-mode explicit`
+  - Branch counts:
+    - `reverse_lagged_reuse_count = 4`
+    - `reverse_lagged_rebuild_count = 12`
+  - Gradients remained correct:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - Timing:
+    - `reverse_total_s = 1.291324e+03`
+    - `reverse_compile_plus_execute_s = 1.049949e+03`
+    - `reverse_execute_s_mean = 2.413754e+02`
+  - Resource graph:
+    - RAM plateau remained in the same broad class as the previous full reverse path.
+- Conclusion:
+  - This explicit lagged-response pullback is correct but does not solve compile time or memory.
+  - It fails the keep criteria because compile plus execute worsened and warm execution/RAM did not materially improve.
+  - The opt-in mode and CLI flag were removed to avoid carrying another dead memory path.
+- Updated next-step conclusion:
+  - At this point several local graph-narrowing attempts have preserved correctness but failed to reduce compile RAM:
+    - NTX coefficient boundary
+    - explicit stage-lagged RHS pullback
+    - rebuild subfield masking/remat attempts
+    - dynamic branch call boundary
+  - The credible next implementation target is compilation granularity, not another local pullback micro-optimization:
+    - stop using one monolithic `jax.grad(objective_fn)` for the whole reverse rollout,
+    - split reverse execution into separately compiled segment/accepted-step adjoint kernels,
+    - orchestrate the reverse sweep outside a single XLA module while preserving the realized accepted-step schedule.
+
+2026-07-01 reduced-cotangent accepted-step bwd attempt:
+
+- Implemented an opt-in `--reverse-step-bwd-mode reduced_cotangent` path.
+- This is not the old option-4 path and does not save full per-step lagged/RHS payloads.
+- The new path adds `_RadauAcceptedStepReducedCotangent` and makes the segmented reverse scan carry only:
+  - final-state cotangent `y`,
+  - lagged-response cache cotangent,
+  - lagged-reference-y cotangent.
+- It structurally omits the `next_carry_bar.prev_stages` cotangent path inside the accepted-step bwd body.
+  - This is based on the earlier `zero_prev_stages_bwd` diagnostic, which preserved the final-state objective gradients but did not reduce memory because it masked too late.
+- Reuse vs rebuild is still chosen dynamically from the replayed/primal accepted-step carry via `residual_carry.lagged_response_valid`.
+- First test should be the 2-step correctness run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+- Expected 2-step gradients from the forward/reverse reference:
+  - `dsoftmax_Er/dn0 = -3.578617e-01`
+  - `dsoftmax_Er/dT0 = 3.010300e-01`
+  - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+  - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+- If the 2-step run matches, test the 16-step mixed reuse/rebuild case with the same `--reverse-step-bwd-mode reduced_cotangent` flag.
