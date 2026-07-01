@@ -558,12 +558,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-solve-mode",
-        choices=("structured", "bicgstab", "block", "gmres"),
+        choices=("structured", "bicgstab", "bicgstab_while", "block", "gmres"),
         default="structured",
         help=(
             "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
             "transformed LU transpose approximation and is the lightweight default; "
-            "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
+            "'bicgstab' is the lower-memory exact iterative candidate; "
+            "'bicgstab_while' uses a JAX while-loop variant to test whether early "
+            "Krylov termination reduces compile/runtime pressure; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy."
         ),
     )
@@ -645,7 +647,8 @@ def main() -> None:
         default=40,
         help=(
             "Maximum Krylov iterations for exact iterative reverse stage-adjoint "
-            "modes ('bicgstab'/'gmres'). Defaults to the current conservative value."
+            "modes ('bicgstab'/'bicgstab_while'/'gmres'). Defaults to the current "
+            "conservative value."
         ),
     )
     parser.add_argument(
@@ -654,7 +657,7 @@ def main() -> None:
         default=1.0e-10,
         help=(
             "Relative tolerance for exact iterative reverse stage-adjoint modes "
-            "('bicgstab'/'gmres'). Defaults to the current conservative value."
+            "('bicgstab'/'bicgstab_while'/'gmres'). Defaults to the current conservative value."
         ),
     )
     parser.add_argument(

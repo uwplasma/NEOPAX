@@ -2811,70 +2811,40 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat_bar,
         vth_a_bar,
     ):
-        def _nu_hat_from_temperature_density(temperature_value, density_value):
-            vthermal_value = get_v_thermal(self.species.mass, temperature_value)
-            vth_value = vthermal_value[species_index]
-            v_new_value = self.energy_grid.v_norm * vth_value
-            return _nu_over_vnew_local(
-                self.species,
-                species_index,
-                v_new_value,
-                density_value,
-                temperature_value,
-                vthermal_value,
-                collisionality_kind,
+        def _forward_linearized_local_scan_inputs(
+            der_value,
+            dtemperature_local,
+            ddensity_local,
+        ):
+            _, dvthermal = jax.jvp(
+                lambda temperature_local_value: get_v_thermal(
+                    self.species.mass,
+                    temperature_local_value,
+                ),
+                (temperature_local,),
+                (dtemperature_local,),
             )
-
-        _, nu_hat_pullback = jax.vjp(
-            _nu_hat_from_temperature_density,
-            temperature_local,
-            density_local,
-        )
-        temperature_bar_from_nu, density_bar = nu_hat_pullback(reference_nu_hat_bar)
-
-        vth_a = vthermal_local[species_index]
-        v_new_a = self.energy_grid.v_norm * vth_a
-        drds_is_finite = jnp.isfinite(drds_value)
-        er_times_drds = jnp.where(
-            drds_is_finite,
-            jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
-            jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
-        )
-        epsi_hat_raw = er_times_drds * 1.0e3 / v_new_a
-        if self.er_v_floor is None:
-            epsi_raw_bar = jnp.where(
-                drds_is_finite,
-                jnp.asarray(reference_epsi_hat_bar, dtype=epsi_hat_raw.dtype),
-                jnp.zeros_like(epsi_hat_raw),
+            _, local_scan_tangent = jax.jvp(
+                lambda er_local_value, temperature_local_value, density_local_value, vthermal_local_value: self._local_scan_inputs(
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_local_value,
+                    temperature_local=temperature_local_value,
+                    density_local=density_local_value,
+                    vthermal_local=vthermal_local_value,
+                    collisionality_kind=collisionality_kind,
+                ),
+                (er_value, temperature_local, density_local, vthermal_local),
+                (der_value, dtemperature_local, ddensity_local, dvthermal),
             )
-        else:
-            er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
-            active_floor = jnp.abs(jnp.asarray(epsi_hat_raw, dtype=jnp.float64)) > er_v_floor
-            epsi_raw_bar = jnp.where(
-                jnp.logical_and(drds_is_finite, active_floor),
-                jnp.asarray(reference_epsi_hat_bar, dtype=epsi_hat_raw.dtype),
-                jnp.zeros_like(epsi_hat_raw),
-            )
+            return local_scan_tangent
 
-        er_bar = jnp.sum(epsi_raw_bar * jnp.asarray(drds_value * 1.0e3 / v_new_a, dtype=epsi_hat_raw.dtype))
-        vth_bar_from_epsi = jnp.sum(epsi_raw_bar * (-epsi_hat_raw / vth_a))
-        vth_bar_total = jnp.asarray(vth_a_bar, dtype=vth_a.dtype) + jnp.asarray(vth_bar_from_epsi, dtype=vth_a.dtype)
-
-        temperature_species = temperature_local[species_index]
-        dvth_dtemperature = jnp.where(
-            jnp.abs(temperature_species) > jnp.asarray(0.0, dtype=temperature_species.dtype),
-            vth_a / (jnp.asarray(2.0, dtype=temperature_species.dtype) * temperature_species),
-            jnp.asarray(0.0, dtype=temperature_species.dtype),
-        )
-        temperature_bar_from_vth = jnp.zeros_like(temperature_local).at[species_index].add(
-            vth_bar_total * dvth_dtemperature
-        )
-
-        return (
-            jnp.asarray(er_bar, dtype=er_value.dtype),
-            jnp.asarray(temperature_bar_from_nu + temperature_bar_from_vth, dtype=temperature_local.dtype),
-            jnp.asarray(density_bar, dtype=density_local.dtype),
-        )
+        return jax.linear_transpose(
+            _forward_linearized_local_scan_inputs,
+            jnp.zeros_like(er_value),
+            jnp.zeros_like(temperature_local),
+            jnp.zeros_like(density_local),
+        )((reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar))
 
     def _interpolated_response_field_bars(
         self,

@@ -5413,11 +5413,82 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         final_state = jax.lax.fori_loop(0, int(maxiter), _body, initial_state)
         return final_state[0]
 
+    def _bicgstab_while_loop(matvec, b, preconditioner, *, tol, maxiter):
+        """BiCGSTAB with a JAX while-loop so converged solves can stop early."""
+
+        b = jnp.asarray(b, dtype=kernel_context.dtype)
+        x0 = jnp.zeros_like(b)
+        r0 = b - matvec(x0)
+        r_hat = r0
+        zeros = jnp.zeros_like(b)
+        one = jnp.asarray(1.0, dtype=kernel_context.dtype)
+        zero = jnp.asarray(0.0, dtype=kernel_context.dtype)
+        norm_b = jnp.sqrt(jnp.maximum(jnp.vdot(b, b), zero))
+        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * jnp.maximum(norm_b, one)
+        initial_residual_norm = jnp.sqrt(jnp.maximum(jnp.vdot(r0, r0), zero))
+
+        initial_state = (
+            jnp.asarray(0, dtype=jnp.int32),
+            x0,
+            r0,
+            r_hat,
+            zeros,
+            zeros,
+            one,
+            one,
+            one,
+            initial_residual_norm <= threshold,
+        )
+
+        def _cond(state):
+            idx, _x, _r, _r_shadow, _p, _v, _rho_prev, _alpha_prev, _omega_prev, converged = state
+            return jnp.logical_and(idx < jnp.asarray(maxiter, dtype=jnp.int32), jnp.logical_not(converged))
+
+        def _body(state):
+            idx, x, r, r_shadow, p, v, rho_prev, alpha_prev, omega_prev, _converged = state
+            rho = jnp.vdot(r_shadow, r)
+            beta = _safe_divide(rho, rho_prev) * _safe_divide(alpha_prev, omega_prev)
+            p_candidate = r + beta * (p - omega_prev * v)
+            p_hat = preconditioner(p_candidate)
+            v_candidate = matvec(p_hat)
+            alpha = _safe_divide(rho, jnp.vdot(r_shadow, v_candidate))
+            s = r - alpha * v_candidate
+            s_hat = preconditioner(s)
+            t = matvec(s_hat)
+            omega = _safe_divide(jnp.vdot(t, s), jnp.vdot(t, t))
+            x_candidate = x + alpha * p_hat + omega * s_hat
+            r_candidate = s - omega * t
+            residual_norm = jnp.sqrt(jnp.maximum(jnp.vdot(r_candidate, r_candidate), zero))
+            converged_candidate = residual_norm <= threshold
+            return (
+                idx + jnp.asarray(1, dtype=jnp.int32),
+                x_candidate,
+                r_candidate,
+                r_shadow,
+                p_candidate,
+                v_candidate,
+                rho,
+                alpha,
+                omega,
+                converged_candidate,
+            )
+
+        final_state = jax.lax.while_loop(_cond, _body, initial_state)
+        return final_state[1]
+
     iter_tol = float(getattr(physics_context, "reverse_stage_adjoint_iter_tol", 1.0e-10))
     iter_maxiter = int(getattr(physics_context, "reverse_stage_adjoint_iter_maxiter", 40))
-    if method == "bicgstab":
+    if method in {"bicgstab", "bicgstab_while"}:
         rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
-        if rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}:
+        if method == "bicgstab_while":
+            solution = _bicgstab_while_loop(
+                _transpose_matvec,
+                -rhs_arr,
+                tol=iter_tol,
+                maxiter=iter_maxiter,
+                preconditioner=_preconditioner,
+            )
+        elif rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}:
             solution = _bicgstab_fixed_iterations(
                 _transpose_matvec,
                 -rhs_arr,
@@ -5526,7 +5597,7 @@ def _radau_solve_exact_stage_residual_transpose(
             complex_piv_out=primal_result.complex_piv_out,
             skip_zero_rhs_shortcut=True,
         )
-    if mode in {"gmres", "bicgstab"}:
+    if mode in {"gmres", "bicgstab", "bicgstab_while"}:
         return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
             physics_context,
