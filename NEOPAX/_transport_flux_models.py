@@ -170,14 +170,7 @@ def _ntx_coefficient_vector_array_custom_vjp_bwd(residual, coefficient_bar):
         lambda3,
     )
 
-    def _zero_prepared_cotangent(leaf):
-        leaf_array = jnp.asarray(leaf)
-        if jnp.issubdtype(leaf_array.dtype, jnp.inexact):
-            return jnp.zeros_like(leaf_array)
-        return jnp.zeros(leaf_array.shape, dtype=jax.dtypes.float0)
-
-    prepared_bar = jax.tree_util.tree_map(_zero_prepared_cotangent, prepared)
-    return prepared_bar, nu_bar_direct + nu_bar_implicit, epsi_bar
+    return None, nu_bar_direct + nu_bar_implicit, epsi_bar
 
 
 _ntx_coefficient_vector_array_custom_vjp.defvjp(
