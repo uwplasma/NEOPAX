@@ -667,3 +667,39 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
   - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
 - If the 2-step run matches, test the 16-step mixed reuse/rebuild case with the same `--reverse-step-bwd-mode reduced_cotangent` flag.
+
+Reduced-cotangent test results:
+
+- 2 accepted steps, reuse-only:
+  - `reverse_lagged_reuse_count = 2`
+  - `reverse_lagged_rebuild_count = 0`
+  - Correct gradients:
+    - `dsoftmax_Er/dn0 = -3.578617e-01`
+    - `dsoftmax_Er/dT0 = 3.010300e-01`
+    - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+    - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+  - Timing:
+    - `reverse_total_s = 7.967464e+02`
+    - `reverse_compile_plus_execute_s = 7.893813e+02`
+    - `reverse_execute_s_mean = 7.365115e+00`
+  - Interpretation:
+    - Correctness is good.
+    - Warm execution improved for the 2-step reuse-only case.
+    - Compile time/RAM still did not improve enough.
+- 16 accepted steps, mixed reuse/rebuild:
+  - `reverse_lagged_reuse_count = 4`
+  - `reverse_lagged_rebuild_count = 12`
+  - Correct gradients:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - Timing:
+    - `reverse_total_s = 1.202889e+03`
+    - `reverse_compile_plus_execute_s = 9.634324e+02`
+    - `reverse_execute_s_mean = 2.394570e+02`
+  - Resource graph:
+    - RAM plateau remained in the same broad class as the full/current mixed run.
+  - Interpretation:
+    - Reduced-cotangent is correct but does not solve the real 16-step mixed reuse/rebuild memory/runtime plateau.
+    - The dominant remaining cost is still inside the accepted-step bwd body, especially the rebuild/stage machinery that reduced-cotangent still invokes.
