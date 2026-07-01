@@ -2863,6 +2863,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"
+    reverse_stage_lagged_pullback_mode: str = "generic"
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
@@ -3977,8 +3978,34 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                     in_axes=(0, 0),
                 )(stage_times, stage_states)
 
-            _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
-            (residual_lagged_bar,) = lagged_pullback(stage_rhs_bar)
+            lagged_pullback_mode = str(
+                getattr(physics_context, "reverse_stage_lagged_pullback_mode", "generic")
+            ).strip().lower()
+            zero_lagged_cotangent = str(
+                getattr(physics_context, "reverse_stage_cotangent_mode", "full")
+            ).strip().lower() in {"zero_lagged", "lagged_zero", "zero_lagged_response"}
+            if zero_lagged_cotangent:
+                residual_lagged_bar = _radau_align_tangent_tree_to_primal(None, lagged_response)
+            elif (
+                lagged_pullback_mode in {"explicit", "explicit_rhs", "direct"}
+                and physics_context.flat_rhs_lagged_response_pullback is not None
+            ):
+                staged_lagged_bars = jax.vmap(
+                    lambda t_eval, y_eval, rhs_bar_eval: physics_context.flat_rhs_lagged_response_pullback(
+                        t_eval,
+                        y_eval,
+                        lagged_response,
+                        rhs_bar_eval,
+                    ),
+                    in_axes=(0, 0, 0),
+                )(stage_times, stage_states, stage_rhs_bar)
+                residual_lagged_bar = jax.tree_util.tree_map(
+                    lambda value: jnp.sum(value, axis=0),
+                    staged_lagged_bars,
+                )
+            else:
+                _, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)
+                (residual_lagged_bar,) = lagged_pullback(stage_rhs_bar)
 
             residual_y_bar = jnp.sum(stage_state_source_bar, axis=0)
             residual_dt_bar = (

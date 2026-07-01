@@ -466,3 +466,132 @@ Current useful localization facts:
   - Do not rerun `remat_rebuild_pullback`.
   - Do not rerun `zero_rebuild_derivative_fields`.
   - Do not rerun the existing NTX `custom_vjp` path inside reverse rebuild without changing the NTX/NEOPAX boundary API.
+
+2026-07-01 handoff:
+
+- A JAX-compatible NTX coefficient-solve boundary proof was tested as an opt-in `array_custom_vjp` mode.
+- Implementation shape:
+  - The first attempt passed `prepared` as a differentiable custom-VJP argument and failed with:
+    - `TypeError: object of type 'object' has no len()`
+    - Cause: JAX reconstructed a zero cotangent PyTree for NTX geometry metadata and triggered `GeometryOnGrid.__post_init__`.
+  - A closure-based boundary, where `prepared` was captured and only `(nu_hat, epsi_hat)` were VJP arguments, fixed correctness.
+- 2 accepted-step reuse-only result:
+  - Command used `--accepted-step-limit 2`, `--reverse-segment-length 2`, `--reverse-stage-adjoint-solve-mode bicgstab`, `--reverse-rhs-transpose-mode explicit_ntx_interpolated`, and `--reverse-ntx-coeff-boundary array_custom_vjp`.
+  - Branch counts:
+    - `reverse_lagged_reuse_count = 2`
+    - `reverse_lagged_rebuild_count = 0`
+  - Gradients matched the known 2-step targets:
+    - `dsoftmax_Er/dn0 = -3.578617e-01`
+    - `dsoftmax_Er/dT0 = 3.010300e-01`
+    - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+    - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+  - Timing:
+    - `reverse_total_s = 6.671918e+02`
+    - `reverse_compile_plus_execute_s = 6.592605e+02`
+    - `reverse_execute_s_mean = 7.931390e+00`
+  - Interpretation:
+    - Warm execution improved in the small reuse-only case compared with the recent default roughly `18 s`.
+    - Compile time and compile-memory class did not improve.
+- 16 accepted-step mixed reuse/rebuild result:
+  - Command used `--accepted-step-limit 16`, `--reverse-segment-length 4`, `--reverse-stage-adjoint-solve-mode bicgstab`, `--reverse-rhs-transpose-mode explicit_ntx_interpolated`, and `--reverse-ntx-coeff-boundary array_custom_vjp`.
+  - Branch counts:
+    - `reverse_lagged_reuse_count = 4`
+    - `reverse_lagged_rebuild_count = 12`
+  - Gradients matched the full 16-step correctness target:
+    - `dsoftmax_Er/dn0 = -3.759631e+00`
+    - `dsoftmax_Er/dT0 = 3.054047e+00`
+    - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+    - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+  - Timing:
+    - `reverse_total_s = 1.176691e+03`
+    - `reverse_compile_plus_execute_s = 9.279624e+02`
+    - `reverse_execute_s_mean = 2.487290e+02`
+  - Resource graph:
+    - RAM plateau still looked broadly similar to the previous full reverse path.
+  - Interpretation:
+    - The coefficient boundary is correct but is not a real compile-time or memory fix.
+    - It did not improve the actual 16-step mixed reuse/rebuild target and was slightly worse than recent full-path warmed execution timings.
+  - Action taken:
+    - Removed the `array_custom_vjp` / `reverse_ntx_coefficient_boundary` experiment and the benchmark CLI flag to avoid keeping a misleading optimization path.
+- Current corrected conclusion:
+  - The real compile-time and memory problem is not the NTX coefficient solve boundary.
+  - The decisive localization remains `zero_step_bwd`: the accepted-step backward body is the dominant hot path.
+  - Static branch scheduling / Python unrolling is not the path forward; it previously exploded host memory.
+  - `dynamic_call_bwd` did not materially reduce memory or warmed execution.
+- Next real compilation-time and memory-reduction target:
+  - Work inside `_execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd`, not in the NTX coefficient pullback.
+  - Remove broad nested `jax.vjp(...)` calls from the accepted-step backward body where possible.
+  - First concrete targets:
+    - The stage-lagged RHS pullback in `_direct_stage_cache_adjoint`, currently built through a broad VJP of `_stage_evals_from_lagged`.
+    - Projector pullbacks from `jax.vjp(physics_context.project_flat, ...)` if they are still nontrivial in the active path.
+    - Rebuild `pullback_build_lagged_response(...)` only after the stage-lagged RHS pullback is narrowed, because rebuild-only subfield masking did not solve memory by itself.
+  - If explicit/manual accepted-step pullbacks still leave compile RAM unchanged, the remaining real solution is compilation granularity:
+    - Stop compiling the whole reverse rollout as one monolithic `jax.grad(objective_fn)`.
+    - Move toward separately compiled segment/accepted-step adjoint kernels orchestrated outside a single XLA module.
+    - This is a larger design change, but it is the credible path if the accepted-step bwd graph remains too large.
+
+Reverse AD compile-time and memory reduction plan:
+
+1. Freeze the current baseline.
+   - Use the known-correct 16-step mixed reuse/rebuild command:
+     - `--ntx-exact-derivative-mode direct`
+     - `--objective softmax_Er`
+     - `--accepted-step-limit 16`
+     - `--radau-jacobian-reuse-mode legacy`
+     - `--timing-mode jit-warm`
+     - `--reverse-segment-length 4`
+     - `--reverse-stage-adjoint-solve-mode bicgstab`
+     - `--reverse-rhs-transpose-mode explicit_ntx_interpolated`
+   - Correct gradient target:
+     - `dsoftmax_Er/dn0 = -3.759631e+00`
+     - `dsoftmax_Er/dT0 = 3.054047e+00`
+     - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+     - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+   - Current representative timings are still too heavy:
+     - compile plus first execute is roughly `9e+02` to `1.1e+03 s`
+     - warm execute is roughly `2.4e+02 s`
+     - RAM plateau remains high during the monolithic JIT compile.
+
+2. Target accepted-step backward internals first.
+   - Do not return to static branch scheduling or Python/static unrolling:
+     - static schedule/unroll previously exploded host memory.
+     - `dynamic_call_bwd` did not materially improve memory or warmed execution.
+   - Do not continue coefficient-boundary experiments for memory:
+     - the `array_custom_vjp` proof was correct but did not improve the real 16-step compile/RAM target.
+   - Work inside `_execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd`.
+   - Keep `zero_step_bwd` as the main localization evidence: accepted-step bwd is the hot path.
+
+3. First concrete implementation target: stage-lagged RHS pullback.
+   - Current broad path in `_direct_stage_cache_adjoint` builds a nested VJP around `_stage_evals_from_lagged`:
+     - `_, lagged_pullback = jax.vjp(_stage_evals_from_lagged, lagged_response)`
+     - `(residual_lagged_bar,) = lagged_pullback(stage_rhs_bar)`
+   - Replace this with an explicit/manual lagged-response pullback when available, using existing `physics_context.flat_rhs_lagged_response_pullback`-style machinery.
+   - Keep the default path unchanged behind a mode flag during testing.
+   - Suggested mode name:
+     - `reverse_stage_lagged_pullback_mode = "generic" | "explicit"`
+   - Suggested benchmark flag:
+     - `--reverse-stage-lagged-pullback-mode explicit`
+
+4. Test sequence for the explicit stage-lagged pullback.
+   - First run a 2-step test to catch correctness or tracing failures cheaply.
+   - Then run the real 16-step mixed reuse/rebuild case.
+   - Keep criteria:
+     - gradients match the 16-step correctness target,
+     - compile time or compile RAM meaningfully improves, or
+     - warm execution meaningfully improves without memory regression.
+   - Revert criteria:
+     - gradients change without a clear, intentional reason,
+     - compile RAM is unchanged and execution worsens,
+     - implementation adds branch/mode clutter without evidence of helping the main target.
+
+5. Second concrete target if stage-lagged pullback is not enough.
+   - Inspect and narrow remaining broad pullbacks inside accepted-step bwd:
+     - `jax.vjp(physics_context.project_flat, ...)`
+     - rebuild `pullback_build_lagged_response(...)`
+   - Only target rebuild after the stage-lagged RHS pullback is narrowed, because rebuild-only subfield masking did not solve memory by itself.
+
+6. Larger fallback if accepted-step manual pullbacks do not reduce compile RAM.
+   - Change compilation granularity instead of continuing local micro-optimizations.
+   - Avoid compiling the whole reverse rollout as one monolithic `jax.grad(objective_fn)` XLA module.
+   - Move toward separately compiled segment or accepted-step adjoint kernels, orchestrated outside one giant compiled graph.
+   - This is a larger design change, but it is the credible path if the accepted-step bwd graph remains too large after explicit pullbacks.

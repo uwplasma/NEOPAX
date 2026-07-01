@@ -356,6 +356,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
+    reverse_stage_lagged_pullback_mode: str = "generic",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
 ) -> _ReverseStaticSetup:
@@ -389,6 +390,7 @@ def _prepare_reverse_static_setup(
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
+                reverse_stage_lagged_pullback_mode=str(reverse_stage_lagged_pullback_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
             ),
@@ -578,16 +580,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--reverse-ntx-coeff-boundary",
-        choices=("manual", "array_custom_vjp"),
-        default="manual",
-        help=(
-            "Experimental NTX coefficient-solve boundary used by the exact reverse pullback. "
-            "'manual' keeps the current NEOPAX-side adjoint algebra. 'array_custom_vjp' wraps "
-            "the per-energy coefficient solve in a custom VJP with zero prepared-system cotangent."
-        ),
-    )
-    parser.add_argument(
         "--reverse-stage-cotangent-mode",
         choices=(
             "full",
@@ -645,6 +637,16 @@ def main() -> None:
             "'default' keeps the current graph. 'remat_matvec' checkpoints the "
             "per-stage RHS transpose inside the Krylov matvec while preserving "
             "the outer lax.scan structure."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-stage-lagged-pullback-mode",
+        choices=("generic", "explicit"),
+        default="generic",
+        help=(
+            "Lagged-response cotangent path inside the direct stage-adjoint accepted-step "
+            "backward body. 'generic' keeps the broad VJP over stage RHS evaluations; "
+            "'explicit' uses the vector-field lagged-response pullback hook when available."
         ),
     )
     parser.add_argument(
@@ -764,9 +766,6 @@ def main() -> None:
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
-    config.setdefault("neoclassical", {})["reverse_ntx_coefficient_boundary"] = str(
-        args.reverse_ntx_coeff_boundary
-    )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(
@@ -788,6 +787,7 @@ def main() -> None:
         reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
         reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
         reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
+        reverse_stage_lagged_pullback_mode=str(args.reverse_stage_lagged_pullback_mode),
         reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
     )
@@ -949,10 +949,10 @@ def main() -> None:
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
-        "reverse_ntx_coefficient_boundary": str(args.reverse_ntx_coeff_boundary),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
         "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+        "reverse_stage_lagged_pullback_mode": str(args.reverse_stage_lagged_pullback_mode),
         "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
@@ -979,10 +979,10 @@ def main() -> None:
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
-        f"reverse_ntx_coefficient_boundary={args.reverse_ntx_coeff_boundary} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
         f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "
+        f"reverse_stage_lagged_pullback_mode={args.reverse_stage_lagged_pullback_mode} "
         f"reverse_stage_adjoint_iter_maxiter={args.reverse_stage_adjoint_iter_maxiter} "
         f"reverse_stage_adjoint_iter_tol={args.reverse_stage_adjoint_iter_tol:.6e} "
         f"timing_mode={args.timing_mode} "
