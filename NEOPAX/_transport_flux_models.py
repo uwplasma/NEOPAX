@@ -3509,10 +3509,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "zero_rebuild_local_moments",
                 "rebuild_local_moment_pullback_zero",
             }
-            def _local_density_pressure_map(density_local, pressure_local):
-                density_safe_local = safe_density(density_local)
-                return density_safe_local, pressure_local / density_safe_local
-
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
             def _pullback_one_anchor(anchor_pos):
@@ -3623,26 +3619,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             field_bars=local_field_bars,
                         )
 
-                    def _forward_linearized_density_pressure(
-                        ddensity_local,
-                        dpressure_local,
-                    ):
-                        _, doutputs = jax.jvp(
-                            _local_density_pressure_map,
-                            (density_local0, pressure_local0),
-                            (ddensity_local, dpressure_local),
-                        )
-                        return doutputs
-
-                    density_local_bar, pressure_local_bar = jax.linear_transpose(
-                        _forward_linearized_density_pressure,
-                        jnp.zeros_like(density_local0),
-                        jnp.zeros_like(pressure_local0),
-                    )(
-                        (
-                            density_safe_local_bar,
-                            temperature_local_bar,
-                        )
+                    pressure_local_bar = temperature_local_bar / density_safe_local
+                    density_safe_total_bar = density_safe_local_bar - (
+                        temperature_local_bar * pressure_local0 / (density_safe_local * density_safe_local)
+                    )
+                    density_floor_local = _broadcast_species_floor(
+                        density_local0,
+                        DEFAULT_TRANSPORT_DENSITY_FLOOR,
+                    )
+                    density_local_bar = jnp.where(
+                        density_local0 > density_floor_local,
+                        density_safe_total_bar,
+                        jnp.zeros_like(density_safe_total_bar),
                     )
 
                     return (
