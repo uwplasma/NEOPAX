@@ -719,3 +719,12 @@ Reduced-cotangent test results:
       - RAM plateau remained in the same broad class.
   - Interpretation:
     - This explicit algebraic cleanup is correct but not enough to reduce the real mixed-case memory/runtime plateau.
+
+Split local-scan pullback attempt:
+
+- Replaced the broad `_pullback_local_scan_inputs_from_primitives` transpose over the full `_local_scan_inputs(er, T, n, vthermal)` map with:
+  - a VJP over the smaller `nu_hat(T, n)` collisionality submap,
+  - explicit algebraic pullbacks for `epsi_hat(Er, vth)` and `vth(T)`.
+- The first version incorrectly used `jax.linear_transpose` directly on nonlinear `nu_hat(T, n)`, which raised an `AssertionError` during reverse compilation.
+- Fixed by using `jax.vjp` for the nonlinear `nu_hat` submap while keeping the explicit `epsi_hat/vth` pullback.
+- Next test is the same 16-step reduced-cotangent command.

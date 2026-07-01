@@ -2825,11 +2825,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 collisionality_kind,
             )
 
-        temperature_bar_from_nu, density_bar = jax.linear_transpose(
+        _, nu_hat_pullback = jax.vjp(
             _nu_hat_from_temperature_density,
-            jnp.zeros_like(temperature_local),
-            jnp.zeros_like(density_local),
-        )(reference_nu_hat_bar)
+            temperature_local,
+            density_local,
+        )
+        temperature_bar_from_nu, density_bar = nu_hat_pullback(reference_nu_hat_bar)
 
         vth_a = vthermal_local[species_index]
         v_new_a = self.energy_grid.v_norm * vth_a
