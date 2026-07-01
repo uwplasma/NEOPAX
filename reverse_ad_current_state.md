@@ -703,3 +703,19 @@ Reduced-cotangent test results:
   - Interpretation:
     - Reduced-cotangent is correct but does not solve the real 16-step mixed reuse/rebuild memory/runtime plateau.
     - The dominant remaining cost is still inside the accepted-step bwd body, especially the rebuild/stage machinery that reduced-cotangent still invokes.
+- Follow-up rebuild cleanup:
+  - Replaced the per-anchor generic `jax.linear_transpose(jax.jvp(...))` for the simple local map `(density, pressure) -> (safe_density, pressure / safe_density)` inside `NTXExactLijRuntimeTransportModel.pullback_build_lagged_response` with an explicit algebraic pullback.
+  - 16-step reduced-cotangent result after cleanup:
+    - Correct gradients preserved:
+      - `dsoftmax_Er/dn0 = -3.759631e+00`
+      - `dsoftmax_Er/dT0 = 3.054047e+00`
+      - `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+      - `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+    - Timing:
+      - `reverse_total_s = 1.177058e+03`
+      - `reverse_compile_plus_execute_s = 9.363880e+02`
+      - `reverse_execute_s_mean = 2.406704e+02`
+    - Resource graph:
+      - RAM plateau remained in the same broad class.
+  - Interpretation:
+    - This explicit algebraic cleanup is correct but not enough to reduce the real mixed-case memory/runtime plateau.
