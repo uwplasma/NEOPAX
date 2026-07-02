@@ -2537,6 +2537,229 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return nu_hat_bar, epsi_hat_bar
 
+    def _pullback_derivative_transport_moments_from_single_energy(
+        self,
+        prepared,
+        *,
+        drds_value,
+        energy_index,
+        nu_hat_value,
+        epsi_hat_value,
+        nu_hat_tangent_value,
+        epsi_hat_tangent_value,
+        derivative_transport_moments_bar,
+    ):
+        # Explicit Hessian-vector pullback for
+        #   bar . J_transport(nu_hat, epsi_hat)[nu_dot, epsi_dot].
+        # This replaces the old `jax.jvp(transport_pullback, ...)` route, which
+        # forced XLA to differentiate through the full NTX factorization adjoint.
+        from ntx._solver_adjoint import (
+            _parameter_gradient_from_adjoint,
+            _prepared_implicit_vjp_primal,
+        )
+        from ntx._solver_context import _operator_context
+        from ntx._solver_factorization import (
+            _solve_factorized_adjoint,
+            _solve_factorized_modes,
+        )
+        from ntx.operators import parameter_derivative_blocks
+        from ntx.transport import coefficients_from_modes
+
+        def _zero_first_row(block):
+            return block.at[0, :].set(jnp.zeros((block.shape[1],), dtype=block.dtype))
+
+        (
+            coefficients,
+            f1_full_value,
+            f3_full_value,
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+        ) = _prepared_implicit_vjp_primal(
+            prepared,
+            nu_hat_value,
+            epsi_hat_value,
+        )
+        coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+            coefficients,
+            drds_value=drds_value,
+            energy_index=energy_index,
+            transport_moments_bar=derivative_transport_moments_bar,
+        )
+        ctx = _operator_context(
+            prepared.surface,
+            prepared.geometry,
+            prepared.grid,
+            nu_hat_value,
+            epsi_hat_value,
+        )
+
+        source1_dot = []
+        source3_dot = []
+        for k in range(prepared.grid.n_xi + 1):
+            diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                ctx,
+                k,
+                prepared.d_theta,
+                prepared.d_zeta,
+            )
+            if k == 0:
+                diagonal_nu = _zero_first_row(diagonal_nu)
+                diagonal_epsi = _zero_first_row(diagonal_epsi)
+            diagonal_dot = (
+                nu_hat_tangent_value * diagonal_nu
+                + epsi_hat_tangent_value * diagonal_epsi
+            )
+            source1_dot.append(-(diagonal_dot @ f1_full_value[k]))
+            source3_dot.append(-(diagonal_dot @ f3_full_value[k]))
+
+        f1_dot = _solve_factorized_modes(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            jnp.stack(source1_dot),
+        )
+        f3_dot = _solve_factorized_modes(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            jnp.stack(source3_dot),
+        )
+
+        def coefficient_fn(modes1, modes3, nu_value):
+            return jnp.stack(
+                coefficients_from_modes(prepared.geometry, modes1, modes3, nu_value)
+            )
+
+        def coefficient_tangent_from_tangents(modes1_dot, modes3_dot, nu_dot):
+            return jax.jvp(
+                coefficient_fn,
+                (f1_full_value[:3], f3_full_value[:3], ctx.nu_hat),
+                (modes1_dot, modes3_dot, nu_dot),
+            )[1]
+
+        _, tangent_pullback = jax.vjp(
+            coefficient_tangent_from_tangents,
+            f1_dot[:3],
+            f3_dot[:3],
+            nu_hat_tangent_value,
+        )
+        f1_dot_bar_low, f3_dot_bar_low, nu_hat_tangent_bar = tangent_pullback(
+            coefficient_bar
+        )
+
+        def coefficient_tangent_from_primals(modes1, modes3, nu_value):
+            return jax.jvp(
+                coefficient_fn,
+                (modes1, modes3, nu_value),
+                (f1_dot[:3], f3_dot[:3], nu_hat_tangent_value),
+            )[1]
+
+        _, primal_coefficient_pullback = jax.vjp(
+            coefficient_tangent_from_primals,
+            f1_full_value[:3],
+            f3_full_value[:3],
+            ctx.nu_hat,
+        )
+        (
+            f1_primal_bar_low,
+            f3_primal_bar_low,
+            nu_bar_from_coefficient_second_derivative,
+        ) = primal_coefficient_pullback(coefficient_bar)
+
+        f1_dot_bar = jnp.zeros_like(f1_full_value).at[:3].set(f1_dot_bar_low)
+        f3_dot_bar = jnp.zeros_like(f3_full_value).at[:3].set(f3_dot_bar_low)
+        lambda1_dot = _solve_factorized_adjoint(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            f1_dot_bar,
+        )
+        lambda3_dot = _solve_factorized_adjoint(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            f3_dot_bar,
+        )
+
+        f1_primal_bar = jnp.zeros_like(f1_full_value).at[:3].set(f1_primal_bar_low)
+        f3_primal_bar = jnp.zeros_like(f3_full_value).at[:3].set(f3_primal_bar_low)
+        nu_bar_from_tangent_solve = jnp.asarray(0.0, dtype=prepared.grid.jax_dtype)
+        epsi_bar_from_tangent_solve = jnp.asarray(0.0, dtype=prepared.grid.jax_dtype)
+        epsi_hat_tangent_bar = jnp.asarray(0.0, dtype=prepared.grid.jax_dtype)
+
+        for k in range(prepared.grid.n_xi + 1):
+            diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                ctx,
+                k,
+                prepared.d_theta,
+                prepared.d_zeta,
+            )
+            if k == 0:
+                diagonal_nu = _zero_first_row(diagonal_nu)
+                diagonal_epsi = _zero_first_row(diagonal_epsi)
+            diagonal_dot = (
+                nu_hat_tangent_value * diagonal_nu
+                + epsi_hat_tangent_value * diagonal_epsi
+            )
+
+            f1_primal_bar = f1_primal_bar.at[k].add(-(diagonal_dot.T @ lambda1_dot[k]))
+            f3_primal_bar = f3_primal_bar.at[k].add(-(diagonal_dot.T @ lambda3_dot[k]))
+
+            nu_bar_from_tangent_solve = nu_bar_from_tangent_solve - (
+                jnp.vdot(lambda1_dot[k], diagonal_nu @ f1_dot[k])
+                + jnp.vdot(lambda3_dot[k], diagonal_nu @ f3_dot[k])
+            )
+            epsi_bar_from_tangent_solve = epsi_bar_from_tangent_solve - (
+                jnp.vdot(lambda1_dot[k], diagonal_epsi @ f1_dot[k])
+                + jnp.vdot(lambda3_dot[k], diagonal_epsi @ f3_dot[k])
+            )
+            nu_hat_tangent_bar = nu_hat_tangent_bar - (
+                jnp.vdot(lambda1_dot[k], diagonal_nu @ f1_full_value[k])
+                + jnp.vdot(lambda3_dot[k], diagonal_nu @ f3_full_value[k])
+            )
+            epsi_hat_tangent_bar = epsi_hat_tangent_bar - (
+                jnp.vdot(lambda1_dot[k], diagonal_epsi @ f1_full_value[k])
+                + jnp.vdot(lambda3_dot[k], diagonal_epsi @ f3_full_value[k])
+            )
+
+        lambda1_primal = _solve_factorized_adjoint(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            f1_primal_bar,
+        )
+        lambda3_primal = _solve_factorized_adjoint(
+            saved_lu_value,
+            saved_piv_value,
+            saved_lower_value,
+            saved_upper_value,
+            f3_primal_bar,
+        )
+        nu_bar_from_primal_solve, epsi_bar_from_primal_solve = (
+            _parameter_gradient_from_adjoint(
+                prepared,
+                ctx,
+                f1_full_value,
+                f3_full_value,
+                lambda1_primal,
+                lambda3_primal,
+            )
+        )
+        nu_hat_bar = (
+            nu_bar_from_coefficient_second_derivative
+            + nu_bar_from_tangent_solve
+            + nu_bar_from_primal_solve
+        )
+        epsi_hat_bar = epsi_bar_from_tangent_solve + epsi_bar_from_primal_solve
+        return nu_hat_bar, epsi_hat_bar, nu_hat_tangent_bar, epsi_hat_tangent_bar
+
     def _dtransport_moments_d_er_from_scan_primitives(
         self,
         prepared,
@@ -2616,22 +2839,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
             self.energy_grid.v_norm * vth_a
         )
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
-        def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
-            return self._pullback_transport_moments_from_scan_primitives(
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value, epsi_hat_tangent_value = args
+            return self._pullback_derivative_transport_moments_from_single_energy(
                 prepared,
                 drds_value=drds_value,
-                reference_nu_hat=nu_hat_value,
-                reference_epsi_hat=epsi_hat_value,
-                reference_transport_moments_bar=dtransport_moments_d_er_bar,
+                energy_index=energy_index,
+                nu_hat_value=nu_hat_value,
+                epsi_hat_value=epsi_hat_value,
+                nu_hat_tangent_value=jnp.asarray(0.0, dtype=nu_hat_value.dtype),
+                epsi_hat_tangent_value=epsi_hat_tangent_value,
+                derivative_transport_moments_bar=dtransport_moments_d_er_bar,
             )
 
-        (base_nu_bar, base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
-            _transport_pullback_fn,
-            (reference_nu_hat, reference_epsi_hat),
-            (jnp.zeros_like(reference_nu_hat), epsi_hat_tangent),
+        nu_hat_bar, epsi_hat_bar, _nu_hat_tangent_bar, epsi_hat_tangent_bar = jax.lax.map(
+            _per_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
         )
-        vth_a_bar = jnp.sum(base_epsi_bar * (-epsi_hat_tangent / vth_a), axis=0)
+        vth_a_bar = jnp.sum(epsi_hat_tangent_bar * (-epsi_hat_tangent / vth_a), axis=0)
         return nu_hat_bar, epsi_hat_bar, vth_a_bar
 
     def _pullback_dtransport_moments_d_log_nu_star_from_scan_primitives(
@@ -2643,21 +2870,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         dtransport_moments_d_log_nu_star_bar,
     ):
-        def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
-            return self._pullback_transport_moments_from_scan_primitives(
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+        def _per_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value = args
+            return self._pullback_derivative_transport_moments_from_single_energy(
                 prepared,
                 drds_value=drds_value,
-                reference_nu_hat=nu_hat_value,
-                reference_epsi_hat=epsi_hat_value,
-                reference_transport_moments_bar=dtransport_moments_d_log_nu_star_bar,
+                energy_index=energy_index,
+                nu_hat_value=nu_hat_value,
+                epsi_hat_value=epsi_hat_value,
+                nu_hat_tangent_value=nu_hat_value,
+                epsi_hat_tangent_value=jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
+                derivative_transport_moments_bar=dtransport_moments_d_log_nu_star_bar,
             )
 
-        (base_nu_bar, _base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
-            _transport_pullback_fn,
-            (reference_nu_hat, reference_epsi_hat),
-            (reference_nu_hat, jnp.zeros_like(reference_epsi_hat)),
+        nu_hat_bar, epsi_hat_bar, nu_hat_tangent_bar, _epsi_hat_tangent_bar = jax.lax.map(
+            _per_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat),
         )
-        return nu_hat_bar + base_nu_bar, epsi_hat_bar
+        return nu_hat_bar + nu_hat_tangent_bar, epsi_hat_bar
 
     def _pullback_log_nu_star_from_nu_hat(
         self,
