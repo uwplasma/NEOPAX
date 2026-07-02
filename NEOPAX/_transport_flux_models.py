@@ -2811,40 +2811,61 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat_bar,
         vth_a_bar,
     ):
-        def _forward_linearized_local_scan_inputs(
-            der_value,
-            dtemperature_local,
-            ddensity_local,
-        ):
-            _, dvthermal = jax.jvp(
-                lambda temperature_local_value: get_v_thermal(
-                    self.species.mass,
-                    temperature_local_value,
-                ),
-                (temperature_local,),
-                (dtemperature_local,),
-            )
-            _, local_scan_tangent = jax.jvp(
-                lambda er_local_value, temperature_local_value, density_local_value, vthermal_local_value: self._local_scan_inputs(
-                    drds_value=drds_value,
-                    species_index=species_index,
-                    er_value=er_local_value,
-                    temperature_local=temperature_local_value,
-                    density_local=density_local_value,
-                    vthermal_local=vthermal_local_value,
-                    collisionality_kind=collisionality_kind,
-                ),
-                (er_value, temperature_local, density_local, vthermal_local),
-                (der_value, dtemperature_local, ddensity_local, dvthermal),
-            )
-            return local_scan_tangent
+        vth_a = vthermal_local[species_index]
+        v_norm = jnp.asarray(self.energy_grid.v_norm, dtype=jnp.float64)
+        v_new_a = v_norm * vth_a
 
-        return jax.linear_transpose(
-            _forward_linearized_local_scan_inputs,
-            jnp.zeros_like(er_value),
-            jnp.zeros_like(temperature_local),
-            jnp.zeros_like(density_local),
-        )((reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar))
+        _, nu_pullback = jax.vjp(
+            lambda v_new_value, density_value, temperature_value, vthermal_value: _nu_over_vnew_local(
+                self.species,
+                species_index,
+                v_new_value,
+                density_value,
+                temperature_value,
+                vthermal_value,
+                collisionality_kind,
+            ),
+            v_new_a,
+            density_local,
+            temperature_local,
+            vthermal_local,
+        )
+        v_new_bar, density_bar, temperature_bar, vthermal_bar = nu_pullback(reference_nu_hat_bar)
+
+        drds_is_finite = jnp.isfinite(drds_value)
+        er_times_drds = jnp.where(
+            drds_is_finite,
+            jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+            jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
+        )
+        raw_epsi_hat = er_times_drds * 1.0e3 / v_new_a
+        if self.er_v_floor is not None:
+            er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
+            epsi_active = jnp.logical_and(drds_is_finite, jnp.abs(raw_epsi_hat) > er_v_floor)
+        else:
+            epsi_active = jnp.broadcast_to(drds_is_finite, raw_epsi_hat.shape)
+        epsi_raw_bar = jnp.where(
+            epsi_active,
+            jnp.asarray(reference_epsi_hat_bar, dtype=raw_epsi_hat.dtype),
+            jnp.zeros_like(raw_epsi_hat),
+        )
+        der_bar = jnp.sum(epsi_raw_bar * jnp.where(drds_is_finite, drds_value * 1.0e3 / v_new_a, 0.0))
+        v_new_bar = v_new_bar - epsi_raw_bar * raw_epsi_hat / v_new_a
+
+        vth_total_bar = jnp.asarray(vth_a_bar, dtype=vth_a.dtype) + jnp.sum(v_new_bar * v_norm)
+        vthermal_bar = vthermal_bar.at[species_index].add(vth_total_bar)
+
+        _, vthermal_pullback = jax.vjp(
+            lambda temperature_value: get_v_thermal(
+                self.species.mass,
+                temperature_value,
+            ),
+            temperature_local,
+        )
+        (temperature_from_vthermal_bar,) = vthermal_pullback(vthermal_bar)
+        temperature_bar = temperature_bar + temperature_from_vthermal_bar
+
+        return der_bar, temperature_bar, density_bar
 
     def _interpolated_response_field_bars(
         self,
