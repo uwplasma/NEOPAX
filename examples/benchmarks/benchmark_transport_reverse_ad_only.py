@@ -661,11 +661,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--timing-mode",
-        choices=("eager", "jit-warm"),
+        choices=("eager", "jit-warm", "jit-compile-only"),
         default="eager",
         help=(
             "Timing harness. 'eager' preserves the original un-jitted grad timing; "
-            "'jit-warm' reports first jit call and second warm execute call separately."
+            "'jit-warm' reports first jit call and second warm execute call separately; "
+            "'jit-compile-only' lowers and compiles the jitted gradient, then exits "
+            "without executing it."
         ),
     )
     parser.add_argument(
@@ -882,6 +884,84 @@ def main() -> None:
     reverse_execute_s = None
     reverse_execute_times_s: list[float] = []
     t_reverse_start = time.perf_counter()
+    if args.timing_mode == "jit-compile-only":
+        grad_fn = jax.jit(jax.grad(objective_fn))
+        compiled_grad_fn = grad_fn.lower(baseline_values).compile()
+        del compiled_grad_fn
+        reverse_total_s = time.perf_counter() - t_reverse_start
+        reverse_checkpoint_count = None
+        if reverse_segment_length is not None:
+            reverse_checkpoint_base = (
+                int(args.accepted_step_limit)
+                if args.accepted_step_limit is not None
+                else int(reverse_setup.max_total_steps)
+            )
+            reverse_checkpoint_count = int(
+                (reverse_checkpoint_base + int(reverse_segment_length) - 1)
+                // int(reverse_segment_length)
+            )
+        reverse_lagged_branch_schedule = getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_lagged_branch_schedule",
+            None,
+        )
+        reverse_lagged_reuse_count = None
+        reverse_lagged_rebuild_count = None
+        if reverse_lagged_branch_schedule is not None:
+            reverse_lagged_reuse_count = int(sum(bool(value) for value in reverse_lagged_branch_schedule))
+            reverse_lagged_rebuild_count = int(len(reverse_lagged_branch_schedule) - reverse_lagged_reuse_count)
+        report = {
+            "mode": "transport_reverse_ad_only",
+            "config_path": str(Path(args.config)),
+            "objective_name": args.objective,
+            "parameter_order": list(PARAMETER_ORDER),
+            "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
+            "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+            "max_total_steps": int(reverse_setup.max_total_steps),
+            "reverse_checkpoint_count": reverse_checkpoint_count,
+            "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+            "reverse_segment_length": reverse_segment_length,
+            "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
+            "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
+            "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
+            "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+            "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+            "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+            "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+            "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+            "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+            "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
+            "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
+            "timing_mode": str(args.timing_mode),
+            "reverse_total_s": float(reverse_total_s),
+            "gradient_reverse_ad": None,
+            "rollout_path": {
+                "baseline": baseline_diag,
+            },
+        }
+        print(
+            f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
+            f"parameters={list(PARAMETER_ORDER)} "
+            f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+            f"max_total_steps={reverse_setup.max_total_steps} "
+            f"reverse_checkpoint_count={reverse_checkpoint_count} "
+            f"reverse_segment_length={reverse_segment_length} "
+            f"reverse_lagged_reuse_count={reverse_lagged_reuse_count} "
+            f"reverse_lagged_rebuild_count={reverse_lagged_rebuild_count} "
+            f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
+            f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
+            f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
+            f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
+            f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
+            f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "
+            f"timing_mode={args.timing_mode} "
+            f"reverse_compile_s={reverse_total_s:.6e}"
+        )
+        outpath = _report_path(args.objective)
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
     if args.timing_mode == "jit-warm":
         grad_fn = jax.jit(jax.grad(objective_fn))
         first_gradient = grad_fn(baseline_values)
