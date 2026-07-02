@@ -1576,10 +1576,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "custom": "custom_vjp",
             "custom-vjp": "custom_vjp",
             "customvjp": "custom_vjp",
+            "custom-jvp": "custom_jvp",
+            "customjvp": "custom_jvp",
+            "implicit-jvp": "custom_jvp",
+            "implicit_jvp": "custom_jvp",
         }
         mode = aliases.get(mode, mode)
-        if mode not in {"direct", "custom_vjp"}:
-            raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_vjp")
+        if mode not in {"direct", "custom_jvp", "custom_vjp"}:
+            raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_jvp, custom_vjp")
         return mode
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
@@ -2074,6 +2078,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
+            if derivative_mode == "custom_jvp":
+                return ntx.solve_prepared_coefficient_vector_jvp(prepared, case)
             if derivative_mode == "custom_vjp":
                 return ntx.solve_prepared_coefficient_vector_vjp(prepared, case)
             return ntx.solve_prepared_coefficient_vector(prepared, case)
@@ -2388,14 +2394,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return coeff_scan_bar
 
-    def _pullback_single_energy_transport_moment_from_inputs(
+    def _pullback_transport_moments_from_scan_primitives(
         self,
         prepared,
         *,
         drds_value,
-        energy_index,
-        nu_hat_value,
-        epsi_hat_value,
+        reference_nu_hat,
+        reference_epsi_hat,
         reference_transport_moments_bar,
     ):
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
@@ -2409,143 +2414,126 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         from ntx._solver_context import _operator_context
         from ntx._solver_factorization import _solve_factorized_adjoint
 
-        (
-            coefficients,
-            f1_full_value,
-            f3_full_value,
-            saved_lu_value,
-            saved_piv_value,
-            saved_lower_value,
-            saved_upper_value,
-        ) = _prepared_implicit_vjp_primal(
-            prepared,
-            nu_hat_value,
-            epsi_hat_value,
-        )
-        coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
-            coefficients,
-            drds_value=drds_value,
-            energy_index=energy_index,
-            transport_moments_bar=reference_transport_moments_bar,
-        )
-        ctx = _operator_context(
-            prepared.surface,
-            prepared.geometry,
-            prepared.grid,
-            nu_hat_value,
-            epsi_hat_value,
-        )
-        f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
-            prepared.geometry,
-            f1_full_value[:3],
-            f3_full_value[:3],
-            ctx.nu_hat,
-            coefficient_bar,
-        )
-        g1 = jnp.zeros_like(f1_full_value).at[:3].set(f1_bar_low)
-        g3 = jnp.zeros_like(f3_full_value).at[:3].set(f3_bar_low)
-        lambda1 = _solve_factorized_adjoint(
-            saved_lu_value,
-            saved_piv_value,
-            saved_lower_value,
-            saved_upper_value,
-            g1,
-        )
-        lambda3 = _solve_factorized_adjoint(
-            saved_lu_value,
-            saved_piv_value,
-            saved_lower_value,
-            saved_upper_value,
-            g3,
-        )
-        nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
-            prepared,
-            ctx,
-            f1_full_value,
-            f3_full_value,
-            lambda1,
-            lambda3,
-        )
-        nu_bar_total = nu_bar_direct + nu_bar_implicit
-        if _ntx_local_pullback_finite_debug_enabled():
-            def _tm_case_debug_callback(
-                energy_idx,
-                nu_value,
-                epsi_value,
-                coeff_bar_value,
-                nu_direct_value,
-                nu_implicit_value,
-                nu_total_value,
-                epsi_bar_value,
-            ):
-                entries = [
-                    ("nu_hat_value", nu_value),
-                    ("epsi_hat_value", epsi_value),
-                    ("coefficient_bar", coeff_bar_value),
-                    ("nu_bar_direct", nu_direct_value),
-                    ("nu_bar_implicit", nu_implicit_value),
-                    ("nu_bar_total", nu_total_value),
-                    ("epsi_bar", epsi_bar_value),
-                ]
-                for name, value in entries:
-                    arr = np.asarray(value)
-                    if not np.issubdtype(arr.dtype, np.inexact):
-                        continue
-                    if not np.all(np.isfinite(arr)):
-                        finite_mask = np.isfinite(arr)
-                        if arr.ndim == 0:
-                            value_summary = f"value={arr!r}"
-                        else:
-                            value_summary = (
-                                f"value={arr} "
-                                f"finite_mask={finite_mask}"
-                            )
-                        print(
-                            "[autodiff-gate] ntx-transport-pullback-nonfinite "
-                            f"energy_index={int(np.asarray(energy_idx))} "
-                            f"name={name} shape={arr.shape} {value_summary}"
-                        )
-                        break
-
-            jax.debug.callback(
-                _tm_case_debug_callback,
-                energy_index,
-                nu_hat_value,
-                epsi_hat_value,
-                coefficient_bar,
-                nu_bar_direct,
-                nu_bar_implicit,
-                nu_bar_total,
-                epsi_bar,
-                ordered=True,
-            )
-        return nu_bar_total, epsi_bar
-
-    def _pullback_transport_moments_from_scan_primitives(
-        self,
-        prepared,
-        *,
-        drds_value,
-        reference_nu_hat,
-        reference_epsi_hat,
-        reference_transport_moments_bar,
-    ):
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
-        def _one_case_pullback(args):
-            energy_index, nu_hat_value, epsi_hat_value = args
-            return self._pullback_single_energy_transport_moment_from_inputs(
+        def _one_case_pullback(energy_index):
+            nu_hat_value = reference_nu_hat[energy_index]
+            epsi_hat_value = reference_epsi_hat[energy_index]
+            (
+                coefficients,
+                f1_full_value,
+                f3_full_value,
+                saved_lu_value,
+                saved_piv_value,
+                saved_lower_value,
+                saved_upper_value,
+            ) = _prepared_implicit_vjp_primal(
                 prepared,
+                nu_hat_value,
+                epsi_hat_value,
+            )
+            coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                coefficients,
                 drds_value=drds_value,
                 energy_index=energy_index,
-                nu_hat_value=nu_hat_value,
-                epsi_hat_value=epsi_hat_value,
-                reference_transport_moments_bar=reference_transport_moments_bar,
+                transport_moments_bar=reference_transport_moments_bar,
             )
+            ctx = _operator_context(
+                prepared.surface,
+                prepared.geometry,
+                prepared.grid,
+                nu_hat_value,
+                epsi_hat_value,
+            )
+            f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
+                prepared.geometry,
+                f1_full_value[:3],
+                f3_full_value[:3],
+                ctx.nu_hat,
+                coefficient_bar,
+            )
+            g1 = jnp.zeros_like(f1_full_value).at[:3].set(f1_bar_low)
+            g3 = jnp.zeros_like(f3_full_value).at[:3].set(f3_bar_low)
+            lambda1 = _solve_factorized_adjoint(
+                saved_lu_value,
+                saved_piv_value,
+                saved_lower_value,
+                saved_upper_value,
+                g1,
+            )
+            lambda3 = _solve_factorized_adjoint(
+                saved_lu_value,
+                saved_piv_value,
+                saved_lower_value,
+                saved_upper_value,
+                g3,
+            )
+            nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
+                prepared,
+                ctx,
+                f1_full_value,
+                f3_full_value,
+                lambda1,
+                lambda3,
+            )
+            nu_bar_total = nu_bar_direct + nu_bar_implicit
+            if _ntx_local_pullback_finite_debug_enabled():
+                def _tm_case_debug_callback(
+                    energy_idx,
+                    nu_value,
+                    epsi_value,
+                    coeff_bar_value,
+                    nu_direct_value,
+                    nu_implicit_value,
+                    nu_total_value,
+                    epsi_bar_value,
+                ):
+                    entries = [
+                        ("nu_hat_value", nu_value),
+                        ("epsi_hat_value", epsi_value),
+                        ("coefficient_bar", coeff_bar_value),
+                        ("nu_bar_direct", nu_direct_value),
+                        ("nu_bar_implicit", nu_implicit_value),
+                        ("nu_bar_total", nu_total_value),
+                        ("epsi_bar", epsi_bar_value),
+                    ]
+                    for name, value in entries:
+                        arr = np.asarray(value)
+                        if not np.issubdtype(arr.dtype, np.inexact):
+                            continue
+                        if not np.all(np.isfinite(arr)):
+                            finite_mask = np.isfinite(arr)
+                            if arr.ndim == 0:
+                                value_summary = f"value={arr!r}"
+                            else:
+                                value_summary = (
+                                    f"value={arr} "
+                                    f"finite_mask={finite_mask}"
+                                )
+                            print(
+                                "[autodiff-gate] ntx-transport-pullback-nonfinite "
+                                f"energy_index={int(np.asarray(energy_idx))} "
+                                f"name={name} shape={arr.shape} {value_summary}"
+                            )
+                            break
+
+                jax.debug.callback(
+                    _tm_case_debug_callback,
+                    energy_index,
+                    nu_hat_value,
+                    epsi_hat_value,
+                    coefficient_bar,
+                    nu_bar_direct,
+                    nu_bar_implicit,
+                    nu_bar_total,
+                    epsi_bar,
+                    ordered=True,
+                )
+            return nu_bar_total, epsi_bar
 
         nu_hat_bar, epsi_hat_bar = jax.lax.map(
             _one_case_pullback,
-            (energy_indices, reference_nu_hat, reference_epsi_hat),
+            energy_indices,
         )
         return nu_hat_bar, epsi_hat_bar
 
@@ -2629,37 +2617,22 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.energy_grid.v_norm * vth_a
         )
 
-        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
-
-        def _per_energy(args):
-            energy_index, nu_hat_value, epsi_hat_value, epsi_hat_tangent_value = args
-
-            def _transport_pullback_fn(nu_value, epsi_value):
-                return self._pullback_single_energy_transport_moment_from_inputs(
-                    prepared,
-                    drds_value=drds_value,
-                    energy_index=energy_index,
-                    nu_hat_value=nu_value,
-                    epsi_hat_value=epsi_value,
-                    reference_transport_moments_bar=dtransport_moments_d_er_bar,
-                )
-
-            (base_nu_bar, base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
-                _transport_pullback_fn,
-                (nu_hat_value, epsi_hat_value),
-                (
-                    jnp.asarray(0.0, dtype=nu_hat_value.dtype),
-                    epsi_hat_tangent_value,
-                ),
+        def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
+            return self._pullback_transport_moments_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=nu_hat_value,
+                reference_epsi_hat=epsi_hat_value,
+                reference_transport_moments_bar=dtransport_moments_d_er_bar,
             )
-            vth_a_bar = base_epsi_bar * (-epsi_hat_tangent_value / vth_a)
-            return nu_hat_bar, epsi_hat_bar, vth_a_bar
 
-        nu_hat_bar, epsi_hat_bar, vth_a_bar_by_energy = jax.lax.map(
-            _per_energy,
-            (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
+        (base_nu_bar, base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
+            _transport_pullback_fn,
+            (reference_nu_hat, reference_epsi_hat),
+            (jnp.zeros_like(reference_nu_hat), epsi_hat_tangent),
         )
-        return nu_hat_bar, epsi_hat_bar, jnp.sum(vth_a_bar_by_energy, axis=0)
+        vth_a_bar = jnp.sum(base_epsi_bar * (-epsi_hat_tangent / vth_a), axis=0)
+        return nu_hat_bar, epsi_hat_bar, vth_a_bar
 
     def _pullback_dtransport_moments_d_log_nu_star_from_scan_primitives(
         self,
@@ -2670,35 +2643,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         dtransport_moments_d_log_nu_star_bar,
     ):
-        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
-
-        def _per_energy(args):
-            energy_index, nu_hat_value, epsi_hat_value = args
-
-            def _transport_pullback_fn(nu_value, epsi_value):
-                return self._pullback_single_energy_transport_moment_from_inputs(
-                    prepared,
-                    drds_value=drds_value,
-                    energy_index=energy_index,
-                    nu_hat_value=nu_value,
-                    epsi_hat_value=epsi_value,
-                    reference_transport_moments_bar=dtransport_moments_d_log_nu_star_bar,
-                )
-
-            (base_nu_bar, _base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
-                _transport_pullback_fn,
-                (nu_hat_value, epsi_hat_value),
-                (
-                    nu_hat_value,
-                    jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
-                ),
+        def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
+            return self._pullback_transport_moments_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=nu_hat_value,
+                reference_epsi_hat=epsi_hat_value,
+                reference_transport_moments_bar=dtransport_moments_d_log_nu_star_bar,
             )
-            return nu_hat_bar + base_nu_bar, epsi_hat_bar
 
-        return jax.lax.map(
-            _per_energy,
-            (energy_indices, reference_nu_hat, reference_epsi_hat),
+        (base_nu_bar, _base_epsi_bar), (nu_hat_bar, epsi_hat_bar) = jax.jvp(
+            _transport_pullback_fn,
+            (reference_nu_hat, reference_epsi_hat),
+            (reference_nu_hat, jnp.zeros_like(reference_epsi_hat)),
         )
+        return nu_hat_bar + base_nu_bar, epsi_hat_bar
 
     def _pullback_log_nu_star_from_nu_hat(
         self,
