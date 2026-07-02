@@ -728,3 +728,94 @@ Split local-scan pullback attempt:
 - The first version incorrectly used `jax.linear_transpose` directly on nonlinear `nu_hat(T, n)`, which raised an `AssertionError` during reverse compilation.
 - Fixed by using `jax.vjp` for the nonlinear `nu_hat` submap while keeping the explicit `epsi_hat/vth` pullback.
 - Next test is the same 16-step reduced-cotangent command.
+
+2026-07-02 XLA allocation evidence and interpolated-response builder change:
+
+- XLA dump inspection for the 2-step reverse compile showed that the dominant `jit__lambda` module is not primarily a checkpoint-array issue.
+- The dominant preallocated temp was:
+  - `allocation 20123`, size about `1.66 GiB`.
+- The large live buffers were NTX coefficient/factorization tensors, including:
+  - `f64[33,3,4,105,105]`
+  - `f64[396,105,105]`
+  - `f64[3,4,3,105,105]`
+  - `f64[12,210,105]`
+- HLO metadata mapped these buffers to NTX factorization internals:
+  - `/home/exouser/NTX/src/ntx/_solver_factorization.py`, especially LU factorization/solve and scan dynamic-update-slice regions.
+  - The call chain included `vmap(jvp(vmap()))` and `vmap(jvp(vmap(jit(lu_factor/lu_solve))))`.
+- Interpretation:
+  - The remaining memory/compile problem is not mainly the Radau reduced-cotangent carrier.
+  - The largest graph comes from differentiating or linearizing batched NTX coefficient solves over the 33-point energy scan.
+  - Any real memory reduction now has to stop the reverse compile from materializing full `33 x ... x 105 x 105` NTX factorization arrays.
+
+Latest code change:
+
+- Changed `NTXExactLijRuntimeTransportModel._build_interpolated_moment_response_local`.
+- It no longer uses one full-scan `jax.linearize(...)` over:
+  - `_transport_moments_from_inputs(prepared, reference_nu_hat, reference_epsi_hat, ...)`
+- It now calls the existing reduced helper:
+  - `_interpolated_moment_reduced_local_outputs_from_primitives(...)`
+- The intent is to keep the same four interpolated-response outputs:
+  - `reference_log_nu_star`
+  - `reference_transport_moments`
+  - `dtransport_moments_d_er`
+  - `dtransport_moments_d_log_nu_star`
+- But the derivative fields should be built through the existing per-energy helpers rather than through a monolithic full-scan linearization.
+- This is solver-general and not benchmark-specific.
+
+Validation done locally:
+
+- No-write Python compile check passed:
+
+```bash
+python -c "from pathlib import Path; source=Path('NEOPAX/_transport_flux_models.py').read_text(); compile(source, 'NEOPAX/_transport_flux_models.py', 'exec'); print('compile-ok')"
+```
+
+- `python -m py_compile NEOPAX/_transport_flux_models.py` was not usable on Windows because writing `NEOPAX/__pycache__` failed with access denied.
+- `git status --short` shows only:
+  - `M NEOPAX/_transport_flux_models.py`
+
+Current caveat:
+
+- `NEOPAX/_transport_flux_models.py` also contains the previous split local-scan pullback work in `_pullback_local_scan_inputs_from_primitives`.
+- That change should be interpreted separately from the latest interpolated-response-builder change.
+- If the next benchmark fails, check whether the failure is from:
+  - the previous local-scan pullback path, or
+  - the new builder path.
+
+Next run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 2-step gradients:
+
+- `dsoftmax_Er/dn0 = -3.578617e-01`
+- `dsoftmax_Er/dT0 = 3.010300e-01`
+- `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+- `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+
+What to inspect after the run:
+
+- Correctness first:
+  - gradients should match the expected 2-step values above.
+- Compile/memory second:
+  - compare compile time against the recent 2-step reduced-cotangent baseline, roughly `6.5e+02 s` compile-plus-execute / about `7.3 s` warm execution.
+  - visually compare RAM plateau against the prior 2-step graphs, which reached roughly the same broad `35-45%` class.
+- If compile RAM/time does not improve, rerun the XLA dump and check whether `allocation 20123` still contains:
+  - `f64[33,3,4,105,105]`
+  - `source_file="/home/exouser/NTX/src/ntx/_solver_factorization.py"`
+- If those tensors are gone or reduced, the patch moved the right graph component.
+- If those tensors remain unchanged, the remaining source is likely the reverse pullback of derivative fields, especially:
+  - `_pullback_dtransport_moments_d_er_from_scan_primitives`
+  - `_pullback_dtransport_moments_d_log_nu_star_from_scan_primitives`
+  - both still use `jax.jvp` of `_pullback_transport_moments_from_scan_primitives`.
