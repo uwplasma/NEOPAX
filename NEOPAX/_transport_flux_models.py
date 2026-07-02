@@ -2258,17 +2258,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vthermal_local=vthermal_local,
             collisionality_kind=collisionality_kind,
         )
-        (
-            reference_log_nu_star,
-            reference_transport_moments,
-            dtransport_moments_d_er,
-            dtransport_moments_d_log_nu_star,
-        ) = self._interpolated_moment_reduced_local_outputs_from_primitives(
-            prepared,
-            drds_value=drds_value,
-            nu_hat_a=reference_nu_hat,
-            epsi_hat_a=reference_epsi_hat,
-            vth_a=vth_a,
+        reference_log_nu_star = self._log_nu_star_from_nu_hat(reference_nu_hat)
+        reference_transport_moments, transport_moment_pushforward = jax.linearize(
+            lambda nu_hat_a, epsi_hat_a: self._transport_moments_from_inputs(
+                prepared,
+                nu_hat_a,
+                epsi_hat_a,
+                drds_value=drds_value,
+                derivative_mode_override="direct",
+            ),
+            reference_nu_hat,
+            reference_epsi_hat,
+        )
+        v_new_a = self.energy_grid.v_norm * vth_a
+        zero_nu_tangent = jnp.zeros_like(reference_nu_hat)
+        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / v_new_a
+        zero_epsi_tangent = jnp.zeros_like(reference_epsi_hat)
+        dtransport_moments_d_er = transport_moment_pushforward(
+            zero_nu_tangent,
+            epsi_hat_tangent,
+        )
+        dtransport_moments_d_log_nu_star = transport_moment_pushforward(
+            reference_nu_hat,
+            zero_epsi_tangent,
         )
         return (
             reference_log_nu_star,

@@ -819,3 +819,33 @@ What to inspect after the run:
   - `_pullback_dtransport_moments_d_er_from_scan_primitives`
   - `_pullback_dtransport_moments_d_log_nu_star_from_scan_primitives`
   - both still use `jax.jvp` of `_pullback_transport_moments_from_scan_primitives`.
+
+2026-07-02 result of interpolated-response builder split:
+
+- The builder split was tested and should be treated as a failed optimization, not a keeper.
+- 2-step correctness was preserved:
+  - `dsoftmax_Er/dn0 = -3.578617e-01`
+  - `dsoftmax_Er/dT0 = 3.010300e-01`
+  - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+  - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+- But compile/runtime and XLA memory did not improve:
+  - `reverse_total_s = 6.901410e+02`
+  - `reverse_compile_plus_execute_s = 6.679523e+02`
+  - `reverse_execute_s_mean = 2.218874e+01`
+  - compile-only later showed `reverse_compile_s = 6.468943e+02`
+- XLA dump after the builder split still showed:
+  - `Total bytes used: 2782859927 (2.59GiB)`
+  - `allocation 19886: size 1.67GiB, preallocated-temp`
+  - metadata still pointing at `/home/exouser/NTX/src/ntx/_solver_factorization.py`
+  - remaining `vmap(jvp...)` / `transpose(jvp...)` paths through the NTX factorization and local scan regions.
+- Conclusion:
+  - Splitting `_build_interpolated_moment_response_local` through `_interpolated_moment_reduced_local_outputs_from_primitives` did not remove the dominant factorization graph.
+  - It made warm execution worse in the 2-step lane and did not solve RAM.
+  - The builder function was restored to the earlier `jax.linearize` implementation.
+- Next real target:
+  - Do not keep adding outer checkpoint/replay structure for this issue.
+  - The dominant problem is still the NTX coefficient/factorization derivative boundary.
+  - Focus on removing or replacing the remaining `jax.jvp` / `transpose(jvp)` routes that enter `_solver_factorization.py`, especially the derivative-field pullbacks:
+    - `_pullback_dtransport_moments_d_er_from_scan_primitives`
+    - `_pullback_dtransport_moments_d_log_nu_star_from_scan_primitives`
+  - The replacement must be solver-general, JAX-compatible, and not benchmark/TOML-specific.
