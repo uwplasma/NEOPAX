@@ -849,3 +849,49 @@ What to inspect after the run:
     - `_pullback_dtransport_moments_d_er_from_scan_primitives`
     - `_pullback_dtransport_moments_d_log_nu_star_from_scan_primitives`
   - The replacement must be solver-general, JAX-compatible, and not benchmark/TOML-specific.
+
+2026-07-03 NTX custom-JVP clarification:
+
+- Clean/current NTX `HEAD` at commit:
+  - `0e8443fa9e8efa9a8fba2a06bb89a188ab49df0a`
+- The committed NTX code has a custom VJP entry point:
+  - `solve_prepared_coefficient_vector_vjp`
+- The committed NTX code does **not** have a custom JVP entry point:
+  - `solve_prepared_coefficient_vector_jvp`
+- This was verified with:
+  - `git show HEAD:src/ntx/_solver_prepared.py`
+  - `git show HEAD:src/ntx/solver.py`
+  - `git show HEAD:src/ntx/__init__.py`
+- The `custom_jvp` symbol seen locally was from an uncommitted dirty patch in `D:\PostDocsProxima\Github_5\NTX`, not from clean NTX.
+- Dirty NTX files containing that experimental custom-JVP patch:
+  - `src/ntx/_solver_prepared.py`
+  - `src/ntx/solver.py`
+  - `src/ntx/__init__.py`
+  - `src/ntx/core/__init__.py`
+- The Linux runtime check confirmed clean NTX behavior:
+
+```text
+>>> import ntx
+>>> print(ntx.__file__)
+/home/exouser/NTX/src/ntx/__init__.py
+>>> print("public custom_jvp:", hasattr(ntx, "solve_prepared_coefficient_vector_jvp"))
+public custom_jvp: False
+>>> from ntx import _solver_prepared
+>>> print("private custom_jvp:", hasattr(_solver_prepared, "solve_prepared_coefficient_vector_jvp"))
+private custom_jvp: False
+>>> print("private file:", _solver_prepared.__file__)
+private file: /home/exouser/NTX/src/ntx/_solver_prepared.py
+```
+
+Interpretation:
+
+- Do not assume NTX currently provides a custom JVP rule.
+- `--ntx-exact-derivative-mode custom_jvp` cannot run against clean/current NTX unless the experimental NTX custom-JVP patch is intentionally applied.
+- The available clean NTX option is `custom_vjp`, but that is not equivalent to a custom JVP for the derivative-field paths that use JVP/tangent information.
+- The previous statement "NTX has custom_jvp" was incorrect unless explicitly referring to the dirty local NTX patch.
+
+Next-session guidance:
+
+- If the goal is to test whether a custom JVP reduces the reverse-AD compile/memory graph, first apply/sync the NTX custom-JVP patch deliberately, then run the `custom_jvp` benchmark.
+- If the goal is to stay on clean NTX, do not test `--ntx-exact-derivative-mode custom_jvp`; focus instead on a NEOPAX-side solution that does not require a missing NTX custom-JVP symbol.
+- In either case, keep the optimization solver-general and avoid benchmark/TOML-specific shortcuts.

@@ -578,6 +578,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-ntx-response-pullback-mode",
+        choices=("generic", "vjp_basis_derivatives"),
+        default="generic",
+        help=(
+            "NTX exact-runtime response derivative-field backend used by the reverse lane. "
+            "'generic' keeps the current derivative-field JVP path. "
+            "'vjp_basis_derivatives' builds the small six-moment derivative fields from "
+            "coefficient-level reverse-basis pullbacks instead of pushing a JVP through "
+            "the NTX factorization scan."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-cotangent-mode",
         choices=(
             "full",
@@ -760,6 +772,10 @@ def main() -> None:
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    if str(args.reverse_ntx_response_pullback_mode) != "generic":
+        config.setdefault("neoclassical", {})[
+            "ntx_exact_response_pullback_mode"
+        ] = str(args.reverse_ntx_response_pullback_mode)
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(
@@ -927,6 +943,7 @@ def main() -> None:
             "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
             "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
             "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+            "reverse_ntx_response_pullback_mode": str(args.reverse_ntx_response_pullback_mode),
             "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
             "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
             "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
@@ -952,6 +969,7 @@ def main() -> None:
             f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
             f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
             f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
+            f"reverse_ntx_response_pullback_mode={args.reverse_ntx_response_pullback_mode} "
             f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
             f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
             f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "
@@ -1020,6 +1038,7 @@ def main() -> None:
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+        "reverse_ntx_response_pullback_mode": str(args.reverse_ntx_response_pullback_mode),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
         "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
@@ -1049,6 +1068,7 @@ def main() -> None:
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
+        f"reverse_ntx_response_pullback_mode={args.reverse_ntx_response_pullback_mode} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "
         f"reverse_stage_adjoint_memory_mode={args.reverse_stage_adjoint_memory_mode} "

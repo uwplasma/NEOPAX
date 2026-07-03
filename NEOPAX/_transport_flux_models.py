@@ -1505,6 +1505,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     response_anchor_count: int | None = None
     use_remat: bool = False
     derivative_mode: str = "direct"
+    response_pullback_mode: str = "generic"
     er_v_floor: float | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
@@ -1573,6 +1574,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def with_derivative_mode(self, derivative_mode: str) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, derivative_mode=self._normalize_derivative_mode(derivative_mode))
 
+    def with_response_pullback_mode(self, response_pullback_mode: str | None) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(
+            self,
+            response_pullback_mode=self._normalize_response_pullback_mode(response_pullback_mode),
+        )
+
     def with_er_v_floor(self, er_v_floor: float | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if er_v_floor in (None, "", 0, "0") else float(er_v_floor)
         return dataclasses.replace(self, er_v_floor=normalized)
@@ -1614,6 +1621,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         mode = aliases.get(mode, mode)
         if mode not in {"direct", "custom_jvp", "custom_vjp"}:
             raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_jvp, custom_vjp")
+        return mode
+
+    @staticmethod
+    def _normalize_response_pullback_mode(response_pullback_mode: str | None) -> str:
+        mode = "generic" if response_pullback_mode in (None, "") else str(response_pullback_mode).strip().lower()
+        aliases = {
+            "default": "generic",
+            "direct": "generic",
+            "compact": "vjp_basis_derivatives",
+            "compact_vjp": "vjp_basis_derivatives",
+            "basis_vjp": "vjp_basis_derivatives",
+            "vjp_basis": "vjp_basis_derivatives",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"generic", "vjp_basis_derivatives"}:
+            raise ValueError(
+                "ntx_exact_response_pullback_mode must be one of: generic, vjp_basis_derivatives"
+            )
         return mode
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
@@ -2560,6 +2585,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a,
     ):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (self.energy_grid.v_norm * vth_a)
+        if self.response_pullback_mode == "vjp_basis_derivatives":
+            return self._transport_moment_directional_derivative_from_vjp_basis(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=nu_hat_a,
+                reference_epsi_hat=epsi_hat_a,
+                nu_hat_tangent=jnp.zeros_like(nu_hat_a),
+                epsi_hat_tangent=epsi_hat_tangent,
+            )
+
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
 
         def _per_energy(args):
@@ -2593,6 +2628,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         nu_hat_a,
         epsi_hat_a,
     ):
+        if self.response_pullback_mode == "vjp_basis_derivatives":
+            return self._transport_moment_directional_derivative_from_vjp_basis(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=nu_hat_a,
+                reference_epsi_hat=epsi_hat_a,
+                nu_hat_tangent=nu_hat_a,
+                epsi_hat_tangent=jnp.zeros_like(epsi_hat_a),
+            )
+
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
 
         def _per_energy(args):
@@ -2618,6 +2663,37 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             axis=0,
         )
 
+    def _transport_moment_directional_derivative_from_vjp_basis(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        nu_hat_tangent,
+        epsi_hat_tangent,
+    ):
+        """Build a six-output moment directional derivative using reverse bases.
+
+        Clean NTX currently exposes a prepared custom VJP but no prepared custom
+        JVP.  For the small six-moment output, reverse-basis rows let this path
+        use the coefficient-level implicit adjoint instead of pushing a tangent
+        through the full NTX factorization scan.
+        """
+        basis = jnp.eye(6, dtype=jnp.asarray(reference_nu_hat).dtype)
+
+        def _basis_component(moment_bar):
+            nu_bar, epsi_bar = self._pullback_transport_moments_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+                reference_transport_moments_bar=moment_bar,
+            )
+            return jnp.sum(nu_bar * nu_hat_tangent) + jnp.sum(epsi_bar * epsi_hat_tangent)
+
+        return jax.lax.map(_basis_component, basis)
+
     def _pullback_dtransport_moments_d_er_from_scan_primitives(
         self,
         prepared,
@@ -2631,6 +2707,27 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
             self.energy_grid.v_norm * vth_a
         )
+        if self.response_pullback_mode == "vjp_basis_derivatives":
+            def _derivative_field_from_primitives(nu_hat_value, epsi_hat_value, vth_value):
+                epsi_tangent_value = jnp.asarray(1.0e3, dtype=epsi_hat_value.dtype) / (
+                    self.energy_grid.v_norm * vth_value
+                )
+                return self._transport_moment_directional_derivative_from_vjp_basis(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=nu_hat_value,
+                    reference_epsi_hat=epsi_hat_value,
+                    nu_hat_tangent=jnp.zeros_like(nu_hat_value),
+                    epsi_hat_tangent=epsi_tangent_value,
+                )
+
+            _, derivative_field_pullback = jax.vjp(
+                _derivative_field_from_primitives,
+                reference_nu_hat,
+                reference_epsi_hat,
+                vth_a,
+            )
+            return derivative_field_pullback(dtransport_moments_d_er_bar)
 
         def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
             return self._pullback_transport_moments_from_scan_primitives(
@@ -2658,6 +2755,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         dtransport_moments_d_log_nu_star_bar,
     ):
+        if self.response_pullback_mode == "vjp_basis_derivatives":
+            def _derivative_field_from_primitives(nu_hat_value, epsi_hat_value):
+                return self._transport_moment_directional_derivative_from_vjp_basis(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=nu_hat_value,
+                    reference_epsi_hat=epsi_hat_value,
+                    nu_hat_tangent=nu_hat_value,
+                    epsi_hat_tangent=jnp.zeros_like(epsi_hat_value),
+                )
+
+            _, derivative_field_pullback = jax.vjp(
+                _derivative_field_from_primitives,
+                reference_nu_hat,
+                reference_epsi_hat,
+            )
+            return derivative_field_pullback(dtransport_moments_d_log_nu_star_bar)
+
         def _transport_pullback_fn(nu_hat_value, epsi_hat_value):
             return self._pullback_transport_moments_from_scan_primitives(
                 prepared,
@@ -4593,6 +4708,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
     ntx_exact_derivative_mode="direct",
+    ntx_exact_response_pullback_mode="generic",
     ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -4634,6 +4750,9 @@ def build_ntx_exact_lij_runtime_transport_model(
         use_remat=bool(ntx_exact_use_remat),
         derivative_mode=NTXExactLijRuntimeTransportModel._normalize_derivative_mode(
             ntx_exact_derivative_mode
+        ),
+        response_pullback_mode=NTXExactLijRuntimeTransportModel._normalize_response_pullback_mode(
+            ntx_exact_response_pullback_mode
         ),
         er_v_floor=(
             None
