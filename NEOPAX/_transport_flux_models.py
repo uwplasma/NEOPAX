@@ -1026,6 +1026,36 @@ def _import_ntx():
         return ntx
 
 
+def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):
+    if derivative_mode == "custom_jvp":
+        solver = getattr(ntx, "solve_prepared_coefficient_vector_jvp", None)
+        if solver is not None:
+            return solver
+        try:
+            from ntx._solver_prepared import solve_prepared_coefficient_vector_jvp
+
+            return solve_prepared_coefficient_vector_jvp
+        except ImportError as exc:
+            raise AttributeError(
+                "ntx_exact_derivative_mode='custom_jvp' requires NTX to provide "
+                "solve_prepared_coefficient_vector_jvp."
+            ) from exc
+    if derivative_mode == "custom_vjp":
+        solver = getattr(ntx, "solve_prepared_coefficient_vector_vjp", None)
+        if solver is not None:
+            return solver
+        try:
+            from ntx._solver_prepared import solve_prepared_coefficient_vector_vjp
+
+            return solve_prepared_coefficient_vector_vjp
+        except ImportError as exc:
+            raise AttributeError(
+                "ntx_exact_derivative_mode='custom_vjp' requires NTX to provide "
+                "solve_prepared_coefficient_vector_vjp."
+            ) from exc
+    return ntx.solve_prepared_coefficient_vector
+
+
 def _load_ntx_vmec_boozer_channels(wout_path: Path, boozmn_path: Path, rho: jax.Array) -> dict[str, jax.Array | float]:
     from netCDF4 import Dataset
     import numpy as np
@@ -1972,11 +2002,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             else self._normalize_derivative_mode(derivative_mode_override)
         )
         case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
-        if derivative_mode == "custom_jvp":
-            return ntx.solve_prepared_coefficient_vector_jvp(prepared, case)
-        if derivative_mode == "custom_vjp":
-            return ntx.solve_prepared_coefficient_vector_vjp(prepared, case)
-        return ntx.solve_prepared_coefficient_vector(prepared, case)
+        return _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode)(prepared, case)
 
     def _single_energy_transport_moment_from_inputs(
         self,
@@ -2088,14 +2114,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             if derivative_mode_override is None
             else self._normalize_derivative_mode(derivative_mode_override)
         )
+        solve_one_coefficient_vector = _ntx_prepared_coefficient_vector_solver(
+            ntx,
+            derivative_mode,
+        )
 
         def _solve_one(nu_hat_value, epsi_hat_value):
             case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
-            if derivative_mode == "custom_jvp":
-                return ntx.solve_prepared_coefficient_vector_jvp(prepared, case)
-            if derivative_mode == "custom_vjp":
-                return ntx.solve_prepared_coefficient_vector_vjp(prepared, case)
-            return ntx.solve_prepared_coefficient_vector(prepared, case)
+            return solve_one_coefficient_vector(prepared, case)
         batch_size = self.scan_batch_size
         case_count = int(nu_hat_a.shape[0])
         if batch_size is None or int(batch_size) <= 0 or int(batch_size) >= case_count:
