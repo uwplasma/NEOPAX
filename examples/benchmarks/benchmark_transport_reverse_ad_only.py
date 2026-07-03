@@ -35,6 +35,8 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _make_solver_state_transform,
     _project_flat_state_if_needed,
     _radau_adaptive_final_y_realized_schedule_vjp,
+    _radau_adaptive_final_y_realized_schedule_vjp_bwd,
+    _radau_adaptive_final_y_realized_schedule_vjp_fwd,
     _radau_adaptive_schedule_rollout,
     _radau_carry_from_step_state,
     _radau_debug_local_accepted_step_transpose,
@@ -339,6 +341,103 @@ def _reverse_objective_for_parameter_vector(
     )
     final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)[objective_index]
+
+
+def _reverse_initial_carry_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+):
+    state0 = _initial_state_for_parameter_vector(
+        parameter_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    return _reverse_initial_carry_from_state_with_static_setup(
+        solver=reverse_setup.solver,
+        state=state0,
+        solve_vector_field=reverse_setup.solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=reverse_setup.prepared_rollout,
+    )
+
+
+def _make_reverse_gradient_split_custom_vjp_fn(
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    objective_index: int,
+    reverse_setup: _ReverseStaticSetup,
+    jit_kernels: bool,
+):
+    """Build a reusable split custom-VJP gradient pipeline."""
+
+    def _carry_from_parameters(p):
+        return _reverse_initial_carry_for_parameter_vector(
+            p,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+    def _rollout_fwd(p):
+        initial_carry = _carry_from_parameters(p)
+        return _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+            reverse_setup.execution_context,
+            reverse_setup.max_total_steps,
+            reverse_setup.stop_after_accepted_steps,
+            reverse_setup.reverse_segment_length,
+            initial_carry,
+        )
+
+    def _objective_from_final_y(final_y):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
+        return _objective_vector(final_state, runtime)[objective_index]
+
+    def _rollout_bwd(residuals, final_y_bar):
+        (carry0_bar,) = _radau_adaptive_final_y_realized_schedule_vjp_bwd(
+            reverse_setup.execution_context,
+            reverse_setup.max_total_steps,
+            reverse_setup.stop_after_accepted_steps,
+            reverse_setup.reverse_segment_length,
+            residuals,
+            final_y_bar,
+        )
+        return carry0_bar
+
+    def _parameter_pullback(p, carry0_bar):
+        _, pullback = jax.vjp(_carry_from_parameters, p)
+        (parameter_bar,) = pullback(carry0_bar)
+        return parameter_bar
+
+    if jit_kernels:
+        rollout_fwd = jax.jit(_rollout_fwd)
+        objective_final_y_grad = jax.jit(jax.grad(_objective_from_final_y))
+        rollout_bwd = jax.jit(_rollout_bwd)
+        parameter_pullback = jax.jit(_parameter_pullback)
+    else:
+        rollout_fwd = _rollout_fwd
+        objective_final_y_grad = jax.grad(_objective_from_final_y)
+        rollout_bwd = _rollout_bwd
+        parameter_pullback = _parameter_pullback
+
+    def _compute(parameter_values):
+        final_y, residuals = rollout_fwd(parameter_values)
+        final_y = jax.block_until_ready(final_y)
+        final_y_bar = objective_final_y_grad(final_y)
+        final_y_bar = jax.block_until_ready(final_y_bar)
+        carry0_bar = rollout_bwd(residuals, final_y_bar)
+        carry0_bar = jax.block_until_ready(carry0_bar)
+        parameter_bar = parameter_pullback(parameter_values, carry0_bar)
+        return jax.block_until_ready(parameter_bar)
+
+    return _compute
 
 
 def _prepare_reverse_static_setup(
@@ -661,13 +760,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--timing-mode",
-        choices=("eager", "jit-warm", "jit-compile-only"),
+        choices=("eager", "jit-warm", "jit-compile-only", "split-vjp-warm"),
         default="eager",
         help=(
             "Timing harness. 'eager' preserves the original un-jitted grad timing; "
             "'jit-warm' reports first jit call and second warm execute call separately; "
             "'jit-compile-only' lowers and compiles the jitted gradient, then exits "
-            "without executing it."
+            "without executing it; 'split-vjp-warm' compiles the custom-VJP forward, "
+            "objective cotangent, rollout backward, and parameter pullback as separate "
+            "kernels instead of one monolithic jitted grad."
         ),
     )
     parser.add_argument(
@@ -972,6 +1073,27 @@ def main() -> None:
         for _ in range(max(1, int(args.warm_repeats))):
             t_execute_start = time.perf_counter()
             gradient_rev = grad_fn(baseline_values)
+            gradient_rev = jax.block_until_ready(gradient_rev)
+            reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
+        reverse_execute_s = float(np.mean(reverse_execute_times_s))
+        reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
+    elif args.timing_mode == "split-vjp-warm":
+        split_grad_fn = _make_reverse_gradient_split_custom_vjp_fn(
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            objective_index=objective_index,
+            reverse_setup=reverse_setup,
+            jit_kernels=True,
+        )
+        first_gradient = split_grad_fn(baseline_values)
+        first_gradient = jax.block_until_ready(first_gradient)
+        reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
+
+        gradient_rev = first_gradient
+        for _ in range(max(1, int(args.warm_repeats))):
+            t_execute_start = time.perf_counter()
+            gradient_rev = split_grad_fn(baseline_values)
             gradient_rev = jax.block_until_ready(gradient_rev)
             reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
         reverse_execute_s = float(np.mean(reverse_execute_times_s))
