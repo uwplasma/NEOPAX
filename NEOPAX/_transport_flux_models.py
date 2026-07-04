@@ -1066,6 +1066,19 @@ def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):
                 "ntx_exact_derivative_mode='iterative_vjp' requires NTX to provide "
                 "solve_prepared_coefficient_vector_iterative_vjp."
             ) from exc
+    if derivative_mode == "iterative_jvp":
+        solver = getattr(ntx, "solve_prepared_coefficient_vector_iterative_jvp", None)
+        if solver is not None:
+            return solver
+        try:
+            from ntx._solver_prepared import solve_prepared_coefficient_vector_iterative_jvp
+
+            return solve_prepared_coefficient_vector_iterative_jvp
+        except ImportError as exc:
+            raise AttributeError(
+                "ntx_exact_derivative_mode='iterative_jvp' requires NTX to provide "
+                "solve_prepared_coefficient_vector_iterative_jvp."
+            ) from exc
     return ntx.solve_prepared_coefficient_vector
 
 
@@ -1655,12 +1668,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "bicgstab": "iterative_vjp",
             "matrix-free": "iterative_vjp",
             "matrix_free": "iterative_vjp",
+            "iterative-jvp": "iterative_jvp",
+            "matrix-free-jvp": "iterative_jvp",
+            "matrix_free_jvp": "iterative_jvp",
         }
         mode = aliases.get(mode, mode)
-        if mode not in {"direct", "custom_jvp", "custom_vjp", "iterative_vjp"}:
+        if mode not in {"direct", "custom_jvp", "custom_vjp", "iterative_vjp", "iterative_jvp"}:
             raise ValueError(
                 "ntx_exact_derivative_mode must be one of: direct, custom_jvp, "
-                "custom_vjp, iterative_vjp"
+                "custom_vjp, iterative_vjp, iterative_jvp"
             )
         return mode
 
@@ -2687,6 +2703,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (self.energy_grid.v_norm * vth_a)
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        derivative_mode_override = (
+            "iterative_jvp"
+            if self._normalize_derivative_mode(self.derivative_mode) == "iterative_vjp"
+            else None
+        )
 
         def _per_energy(args):
             energy_index, nu_hat_value, epsi_hat_value, epsi_hat_tangent_value = args
@@ -2697,7 +2718,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     epsi_value,
                     drds_value=drds_value,
                     energy_index=energy_index,
-                    derivative_mode_override=None,
+                    derivative_mode_override=derivative_mode_override,
                 ),
                 (nu_hat_value, epsi_hat_value),
                 (jnp.asarray(0.0, dtype=nu_hat_value.dtype), epsi_hat_tangent_value),
@@ -2720,6 +2741,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_a,
     ):
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        derivative_mode_override = (
+            "iterative_jvp"
+            if self._normalize_derivative_mode(self.derivative_mode) == "iterative_vjp"
+            else None
+        )
 
         def _per_energy(args):
             energy_index, nu_hat_value, epsi_hat_value = args
@@ -2730,7 +2756,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     epsi_value,
                     drds_value=drds_value,
                     energy_index=energy_index,
-                    derivative_mode_override=None,
+                    derivative_mode_override=derivative_mode_override,
                 ),
                 (nu_hat_value, epsi_hat_value),
                 (nu_hat_value, jnp.asarray(0.0, dtype=epsi_hat_value.dtype)),

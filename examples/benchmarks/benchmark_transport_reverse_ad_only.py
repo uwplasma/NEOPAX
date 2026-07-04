@@ -694,7 +694,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_jvp", "custom_vjp", "iterative_vjp"),
+        choices=("direct", "custom_jvp", "custom_vjp", "iterative_vjp", "iterative_jvp"),
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
