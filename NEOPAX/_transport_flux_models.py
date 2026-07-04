@@ -3400,8 +3400,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         n_radius = int(state.Er.shape[0])
         radius_indices = jnp.arange(n_radius, dtype=jnp.int32)
         anchor_indices = self._response_anchor_indices(n_radius)
+        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
+        use_interpolated_response = (
+            int(anchor_indices.shape[0]) < n_radius
+            and derivative_mode not in {"iterative_vjp", "iterative_jvp"}
+        )
 
-        if int(anchor_indices.shape[0]) < n_radius:
+        if use_interpolated_response:
             target_rho = jnp.asarray(support.center_channels.rho, dtype=jnp.float64)
 
             def _per_anchor(radius_index):
@@ -3982,6 +3987,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return {"Gamma": gamma, "Q": q, "Upar": upar}
 
         radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+        derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
+        local_jvp_derivative_mode = (
+            "iterative_jvp"
+            if derivative_mode in {"iterative_vjp", "iterative_jvp"}
+            else "direct"
+        )
 
         def _transport_moment_tangent_per_radius(radius_index):
             prepared = jax.tree_util.tree_map(
@@ -4002,7 +4013,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         nu_hat_a,
                         epsi_hat_a,
                         drds_value=drds_value,
-                        derivative_mode_override="direct",
+                        derivative_mode_override=local_jvp_derivative_mode,
                     ),
                     (ref_nu_species, ref_epsi_species),
                     tuple(
