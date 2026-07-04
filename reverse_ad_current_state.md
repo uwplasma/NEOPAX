@@ -895,3 +895,177 @@ Next-session guidance:
 - If the goal is to test whether a custom JVP reduces the reverse-AD compile/memory graph, first apply/sync the NTX custom-JVP patch deliberately, then run the `custom_jvp` benchmark.
 - If the goal is to stay on clean NTX, do not test `--ntx-exact-derivative-mode custom_jvp`; focus instead on a NEOPAX-side solution that does not require a missing NTX custom-JVP symbol.
 - In either case, keep the optimization solver-general and avoid benchmark/TOML-specific shortcuts.
+
+## 2026-07-04 next plan: compact NTX reverse boundary
+
+Current conclusion:
+
+- The reverse AD gradients are correct in the reduced-cotangent/bicgstab lane.
+- Further outer checkpointing, static branch schedules, segment-call boundaries, and host-segment orchestration did not materially reduce compile memory or execution time.
+- `reverse_segment_length=1` with host-segment backward proved that the remaining heavy graph is already inside one accepted-step backward kernel.
+- Therefore, the next real memory/compile-time lever is not the outer Radau checkpoint structure.
+- The next target is the NTX response/factorization derivative boundary inside the accepted-step reverse kernel.
+
+Known correct baseline command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 16-step gradients:
+
+- `dsoftmax_Er/dn0 = -3.759631e+00`
+- `dsoftmax_Er/dT0 = 3.054047e+00`
+- `dsoftmax_Er/ddensity_shape_power = -8.518430e-02`
+- `dsoftmax_Er/dtemperature_shape_power = 3.214064e+00`
+
+Plan:
+
+1. Freeze the outer reverse structure.
+   - Keep the correct reduced-cotangent lane as the baseline.
+   - Do not keep trying checkpoint/segment variants as the main solution.
+   - Treat host-segment modes as diagnostics only, not as the final memory fix.
+
+2. Trace the exact NTX reverse call path.
+   - Start from `NEOPAX/_transport_flux_models.py`.
+   - Follow the path used by Radau stage/RHS reverse adjoints to build the NTX response pullback.
+   - Identify the remaining route that stages `jax.jvp`, `transpose(jvp)`, or generic VJP through NTX factorization internals.
+   - The XLA evidence to eliminate is the large NTX factorization allocation with shapes like:
+     - `f64[33,3,4,105,105]`
+     - `f64[396,105,105]`
+     - `f64[3,4,3,105,105]`
+     - `f64[12,210,105]`
+   - The source metadata previously pointed at `/home/exouser/NTX/src/ntx/_solver_factorization.py`.
+
+3. Replace the generic derivative route with a compact NTX reverse primitive.
+   - Use the clean NTX custom VJP path where possible, especially `solve_prepared_coefficient_vector_vjp`.
+   - Do not recreate the failed `vjp_basis_derivatives` approach; that expanded the graph and caused a large compile-memory warning.
+   - Do not use forward-AD tangent/JVP logic in the reverse lane.
+   - The new path should accept reverse cotangents and return cotangents for the relevant NTX inputs/coefficient-response quantities.
+
+4. Add a guarded mode only if needed.
+   - A possible flag name is:
+
+```bash
+--reverse-ntx-response-pullback-mode compact_vjp
+```
+
+   - The implementation must be solver-general and not tied to the benchmark TOML.
+   - If clean NTX does not expose enough API for the compact reverse pullback, add a small NTX-side helper instead of reimplementing NTX internals in NEOPAX.
+   - Keep any fallback explicit and easy to remove after verification.
+
+5. Validate in two stages.
+   - First run the 2-step correctness/memory probe:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+   - Expected 2-step gradients:
+     - `dsoftmax_Er/dn0 = -3.578617e-01`
+     - `dsoftmax_Er/dT0 = 3.010300e-01`
+     - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+     - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+   - Only run the 16-step benchmark after the 2-step compile graph or RAM improves.
+
+Success criteria:
+
+- Gradients remain unchanged.
+- XLA dump no longer shows the NTX factorization derivative tensors as the dominant allocation.
+- Compile RAM drops meaningfully before the GPU execution plateau.
+- Compile time improves or at least stops growing while preserving correctness.
+
+Hard constraints:
+
+- Do not mix the forward-AD tangent lane into reverse AD.
+- Do not add benchmark/TOML-specific shortcuts.
+- Do not solve this by saving full lagged-response/RHS structures at every step; that defeats checkpointing.
+- Do not return to static branch unrolling; it already caused host-memory blowup.
+- Do not keep failed diagnostic modes as default behavior.
+
+## 2026-07-04 implementation start: compact derivative-field pullback
+
+Implemented first compact NTX reverse-boundary attempt:
+
+- NEOPAX now has `ntx_exact_derivative_field_pullback_mode`.
+- Default remains `generic_jvp`.
+- New opt-in mode is `compact_vjp`.
+- The reverse benchmark exposes it as:
+
+```bash
+--ntx-exact-derivative-field-pullback-mode compact_vjp
+```
+
+What changed:
+
+- `NEOPAX/_transport_flux_models.py` routes derivative-field pullbacks for:
+  - `_pullback_dtransport_moments_d_er_from_scan_primitives`
+  - `_pullback_dtransport_moments_d_log_nu_star_from_scan_primitives`
+- The compact path calls an NTX helper:
+  - `solve_prepared_coefficient_vector_derivative_vjp`
+- NTX now exports that helper from:
+  - `src/ntx/_solver_prepared.py`
+  - `src/ntx/solver.py`
+  - `src/ntx/__init__.py`
+  - `src/ntx/core/__init__.py`
+
+Important caveat:
+
+- The current compact path still recomputes the primal coefficient vector once in NEOPAX to construct the transport-moment coefficient cotangent.
+- Therefore the first test is mainly a compile-memory probe.
+- If XLA compile memory improves but warm execution does not, the next optimization is to remove that duplicate solve.
+- If compile memory does not improve, the compact NTX helper did not cut the dominant factorization derivative graph and should be revised before 16-step testing.
+
+Local verification:
+
+- No-write syntax checks passed for the modified NEOPAX files.
+- No-write syntax checks passed for the modified NTX files.
+- `git diff --check` reported only line-ending warnings, no whitespace errors.
+- Top-level NTX import could not be checked in the Windows environment because `rich` is not installed there; the Linux benchmark environment should still test the actual import path.
+
+Next run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 2-step gradients:
+
+- `dsoftmax_Er/dn0 = -3.578617e-01`
+- `dsoftmax_Er/dT0 = 3.010300e-01`
+- `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+- `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+
+What to check:
+
+- First, confirm the gradients match the expected 2-step values.
+- Second, compare compile RAM and compile-plus-execute time against the recent 2-step reduced-cotangent baseline without `compact_vjp`.
+- Only move to the 16-step run if the 2-step compile-memory graph improves.

@@ -686,6 +686,16 @@ def main() -> None:
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
+        "--ntx-exact-derivative-field-pullback-mode",
+        default="generic_jvp",
+        choices=("generic_jvp", "compact_vjp"),
+        help=(
+            "Reverse-only NTX derivative-field pullback mode. 'generic_jvp' is the "
+            "current correct path. 'compact_vjp' requires NTX to provide a compact "
+            "second-order coefficient-solve VJP helper."
+        ),
+    )
+    parser.add_argument(
         "--radau-jacobian-reuse-mode",
         type=str,
         default=None,
@@ -927,6 +937,7 @@ def main() -> None:
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     runtime, baseline_state = build_runtime_context(config)
@@ -1089,6 +1100,7 @@ def main() -> None:
             "max_total_steps": int(reverse_setup.max_total_steps),
             "reverse_checkpoint_count": reverse_checkpoint_count,
             "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
             "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1113,6 +1125,7 @@ def main() -> None:
             f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
             f"parameters={list(PARAMETER_ORDER)} "
             f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+            f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
             f"max_total_steps={reverse_setup.max_total_steps} "
             f"reverse_checkpoint_count={reverse_checkpoint_count} "
             f"reverse_segment_length={reverse_segment_length} "
@@ -1203,6 +1216,7 @@ def main() -> None:
         "max_total_steps": int(reverse_setup.max_total_steps),
         "reverse_checkpoint_count": reverse_checkpoint_count,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
         "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1231,6 +1245,7 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "
