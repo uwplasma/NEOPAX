@@ -67,6 +67,18 @@ def _report_path(objective_name: str) -> Path:
     return outdir / f"transport_reverse_ad_only_{objective_name}.json"
 
 
+def _check_compact_ntx_derivative_pullback_available() -> None:
+    try:
+        from ntx._solver_prepared import solve_prepared_coefficient_vector_derivative_vjp  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "[autodiff-gate] --ntx-exact-derivative-field-pullback-mode compact_vjp "
+            "requires the matching NTX patch/export: "
+            "solve_prepared_coefficient_vector_derivative_vjp. Sync/apply the NTX "
+            "changes before running this mode."
+        ) from exc
+
+
 def _initial_state_for_parameter_vector(
     parameter_values,
     *,
@@ -682,7 +694,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_jvp", "custom_vjp"),
+        choices=("direct", "custom_jvp", "custom_vjp", "iterative_vjp"),
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
@@ -693,6 +705,17 @@ def main() -> None:
             "Reverse-only NTX derivative-field pullback mode. 'generic_jvp' is the "
             "current correct path. 'compact_vjp' requires NTX to provide a compact "
             "second-order coefficient-solve VJP helper."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-ntx-prepared-solve-boundary",
+        default="default",
+        choices=("default", "custom_vjp"),
+        help=(
+            "Reverse-only diagnostic boundary for the NTX prepared coefficient solve. "
+            "'default' preserves --ntx-exact-derivative-mode. 'custom_vjp' forces "
+            "the response solve through NTX's custom-VJP boundary without changing "
+            "the forward-AD lane."
         ),
     )
     parser.add_argument(
@@ -932,11 +955,21 @@ def main() -> None:
         if reverse_segment_length <= 0:
             raise SystemExit("[autodiff-gate] --reverse-segment-length must be positive when provided.")
     reverse_direct_stage_adjoint = not bool(args.reverse_transpose_fallback)
+    if str(args.ntx_exact_derivative_field_pullback_mode) == "compact_vjp":
+        _check_compact_ntx_derivative_pullback_available()
+    effective_ntx_exact_derivative_mode = str(args.ntx_exact_derivative_mode)
+    if str(args.reverse_ntx_prepared_solve_boundary) == "custom_vjp":
+        if str(args.ntx_exact_derivative_mode) not in {"direct", "custom_vjp"}:
+            raise SystemExit(
+                "[autodiff-gate] --reverse-ntx-prepared-solve-boundary custom_vjp "
+                "is only compatible with --ntx-exact-derivative-mode direct or custom_vjp."
+            )
+        effective_ntx_exact_derivative_mode = "custom_vjp"
 
     config = _prepare_benchmark_config(
         Path(args.config),
         device=args.device,
-        ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
         ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
@@ -1100,7 +1133,9 @@ def main() -> None:
             "max_total_steps": int(reverse_setup.max_total_steps),
             "reverse_checkpoint_count": reverse_checkpoint_count,
             "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
             "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+            "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
             "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1125,7 +1160,9 @@ def main() -> None:
             f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
             f"parameters={list(PARAMETER_ORDER)} "
             f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+            f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
             f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
+            f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
             f"max_total_steps={reverse_setup.max_total_steps} "
             f"reverse_checkpoint_count={reverse_checkpoint_count} "
             f"reverse_segment_length={reverse_segment_length} "
@@ -1216,7 +1253,9 @@ def main() -> None:
         "max_total_steps": int(reverse_setup.max_total_steps),
         "reverse_checkpoint_count": reverse_checkpoint_count,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
         "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
         "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1245,7 +1284,9 @@ def main() -> None:
         f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
         f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
+        f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "

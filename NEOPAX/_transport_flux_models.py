@@ -1053,6 +1053,19 @@ def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):
                 "ntx_exact_derivative_mode='custom_vjp' requires NTX to provide "
                 "solve_prepared_coefficient_vector_vjp."
             ) from exc
+    if derivative_mode == "iterative_vjp":
+        solver = getattr(ntx, "solve_prepared_coefficient_vector_iterative_vjp", None)
+        if solver is not None:
+            return solver
+        try:
+            from ntx._solver_prepared import solve_prepared_coefficient_vector_iterative_vjp
+
+            return solve_prepared_coefficient_vector_iterative_vjp
+        except ImportError as exc:
+            raise AttributeError(
+                "ntx_exact_derivative_mode='iterative_vjp' requires NTX to provide "
+                "solve_prepared_coefficient_vector_iterative_vjp."
+            ) from exc
     return ntx.solve_prepared_coefficient_vector
 
 
@@ -1637,10 +1650,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "customjvp": "custom_jvp",
             "implicit-jvp": "custom_jvp",
             "implicit_jvp": "custom_jvp",
+            "iterative": "iterative_vjp",
+            "iterative-vjp": "iterative_vjp",
+            "bicgstab": "iterative_vjp",
+            "matrix-free": "iterative_vjp",
+            "matrix_free": "iterative_vjp",
         }
         mode = aliases.get(mode, mode)
-        if mode not in {"direct", "custom_jvp", "custom_vjp"}:
-            raise ValueError("ntx_exact_derivative_mode must be one of: direct, custom_jvp, custom_vjp")
+        if mode not in {"direct", "custom_jvp", "custom_vjp", "iterative_vjp"}:
+            raise ValueError(
+                "ntx_exact_derivative_mode must be one of: direct, custom_jvp, "
+                "custom_vjp, iterative_vjp"
+            )
         return mode
 
     @staticmethod
