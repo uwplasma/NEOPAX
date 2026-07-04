@@ -9889,12 +9889,8 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             "reduced",
             "state_only",
             "final_state",
-            "reduced_cotangent_segment_call",
-            "segment_call",
-        }
-        reduced_segment_call_bwd = step_bwd_mode in {
-            "reduced_cotangent_segment_call",
-            "segment_call",
+            "reduced_cotangent_host_segments",
+            "host_segments",
         }
 
         def _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry):
@@ -9945,17 +9941,6 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
             def _segment_bwd_reduced(reduced_bar, xs):
                 segment_start_carry, segment_arrays = xs
-                if reduced_segment_call_bwd:
-                    return (
-                        _radau_segment_reduced_cotangent_bwd_call(
-                            execution_context,
-                            cotangent_mode,
-                            reduced_bar,
-                            segment_start_carry,
-                            segment_arrays,
-                        ),
-                        None,
-                    )
 
                 def _segment_collect_start_carries(carry, slot_xs):
                     next_carry, _ = _radau_replay_realized_accepted_slot(

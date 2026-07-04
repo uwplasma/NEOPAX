@@ -27,6 +27,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
+    _RadauAcceptedStepReducedCotangent,
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
     _extract_fixed_temperature_projection,
@@ -38,9 +39,11 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_final_y_realized_schedule_vjp_bwd,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
     _radau_adaptive_schedule_rollout,
+    _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
+    _radau_segment_reduced_cotangent_bwd_call,
 )
 
 
@@ -411,20 +414,83 @@ def _make_reverse_gradient_split_custom_vjp_fn(
         )
         return carry0_bar
 
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _full_carry_bar_from_reduced(carry_value, reduced_bar_value):
+        return dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry_value),
+            y=reduced_bar_value.y,
+            lagged_response_cache=reduced_bar_value.lagged_response_cache,
+            lagged_reference_y=reduced_bar_value.lagged_reference_y,
+        )
+
+    def _rollout_bwd_host_segments(residuals, final_y_bar):
+        (
+            carry0,
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+            segment_start_carries,
+            segmented_final_carry,
+            segmented_replay_arrays,
+        ) = residuals
+        if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+            raise ValueError("split-vjp segment host mode requires --reverse-segment-length.")
+        segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+        reduced_bar = _RadauAcceptedStepReducedCotangent(
+            y=final_y_bar,
+            lagged_response_cache=_radau_align_tangent_tree_to_primal(
+                None,
+                segmented_final_carry.lagged_response_cache,
+            ),
+            lagged_reference_y=jnp.zeros_like(segmented_final_carry.lagged_reference_y),
+        )
+        cotangent_mode = str(
+            getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+        ).strip().lower()
+        for segment_index in range(segment_count - 1, -1, -1):
+            segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+            segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+            reduced_bar = _radau_segment_reduced_cotangent_bwd_call(
+                reverse_setup.execution_context,
+                cotangent_mode,
+                reduced_bar,
+                segment_start_carry,
+                segment_arrays,
+            )
+            reduced_bar = jax.block_until_ready(reduced_bar)
+        return _full_carry_bar_from_reduced(carry0, reduced_bar)
+
     def _parameter_pullback(p, carry0_bar):
         _, pullback = jax.vjp(_carry_from_parameters, p)
         (parameter_bar,) = pullback(carry0_bar)
         return parameter_bar
 
+    use_host_segment_bwd = str(reverse_setup.reverse_segment_length) not in {"None", "0"} and str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower() in {"reduced_cotangent_host_segments", "host_segments"}
+
     if jit_kernels:
         rollout_fwd = jax.jit(_rollout_fwd)
         objective_final_y_grad = jax.jit(jax.grad(_objective_from_final_y))
-        rollout_bwd = jax.jit(_rollout_bwd)
+        rollout_bwd = _rollout_bwd_host_segments if use_host_segment_bwd else jax.jit(_rollout_bwd)
         parameter_pullback = jax.jit(_parameter_pullback)
     else:
         rollout_fwd = _rollout_fwd
         objective_final_y_grad = jax.grad(_objective_from_final_y)
-        rollout_bwd = _rollout_bwd
+        rollout_bwd = _rollout_bwd_host_segments if use_host_segment_bwd else _rollout_bwd
         parameter_pullback = _parameter_pullback
 
     def _compute(parameter_values):
@@ -716,7 +782,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-step-bwd-mode",
-        choices=("current", "manual_split", "reduced_cotangent", "reduced_cotangent_segment_call"),
+        choices=("current", "manual_split", "reduced_cotangent", "reduced_cotangent_host_segments"),
         default="current",
         help=(
             "Accepted-step backward implementation selector. 'current' keeps the "
@@ -724,9 +790,9 @@ def main() -> None:
             "split/manual accepted-step adjoint and currently routes through the "
             "same implementation while plumbing is validated. 'reduced_cotangent' "
             "uses a reduced final-state cotangent contract inside the segmented "
-            "accepted-step reverse scan. 'reduced_cotangent_segment_call' keeps "
-            "that reduced contract but puts each segment backward pass behind a "
-            "non-inlined compiled call boundary."
+            "accepted-step reverse scan. 'reduced_cotangent_host_segments' is only "
+            "for split-vjp timing and orchestrates segment backward kernels outside "
+            "the monolithic rollout-bwd JIT."
         ),
     )
     parser.add_argument(
