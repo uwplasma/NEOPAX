@@ -716,7 +716,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-step-bwd-mode",
-        choices=("current", "manual_split", "reduced_cotangent"),
+        choices=("current", "manual_split", "reduced_cotangent", "reduced_cotangent_segment_call"),
         default="current",
         help=(
             "Accepted-step backward implementation selector. 'current' keeps the "
@@ -724,7 +724,9 @@ def main() -> None:
             "split/manual accepted-step adjoint and currently routes through the "
             "same implementation while plumbing is validated. 'reduced_cotangent' "
             "uses a reduced final-state cotangent contract inside the segmented "
-            "accepted-step reverse scan."
+            "accepted-step reverse scan. 'reduced_cotangent_segment_call' keeps "
+            "that reduced contract but puts each segment backward pass behind a "
+            "non-inlined compiled call boundary."
         ),
     )
     parser.add_argument(
