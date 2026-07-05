@@ -3777,6 +3777,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         drds_value,
         reference_nu_hat,
         reference_epsi_hat,
+        base_transport_moments_bar,
         first_nu_hat_tangent,
         first_epsi_hat_tangent,
         first_transport_moments_bar,
@@ -3958,6 +3959,114 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 jnp.arange(1, mode_count, dtype=jnp.int32),
             )
             return contracted
+
+        def _base_pullback(
+            ctx,
+            mode_indices,
+            energy_index,
+            coefficients,
+            f1_full,
+            f3_full,
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+            transport_moments_bar,
+        ):
+            coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                coefficients,
+                drds_value=drds_value,
+                energy_index=energy_index,
+                transport_moments_bar=transport_moments_bar,
+            )
+            f1_bar_low, f3_bar_low, nu_bar_direct = _coefficient_mode_pullback(
+                prepared.geometry,
+                f1_full[:3],
+                f3_full[:3],
+                ctx.nu_hat,
+                coefficient_bar,
+            )
+            g1 = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low)
+            g3 = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low)
+
+            def _source_bar_matrix_for_mode(k):
+                return jnp.stack([_take_mode(g1, k), _take_mode(g3, k)], axis=-1)
+
+            def _parameter_source_matrix_for_mode(k):
+                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
+                diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
+                f1_k = _take_mode(f1_full, k)
+                f3_k = _take_mode(f3_full, k)
+                return jnp.stack(
+                    [
+                        jnp.stack([diagonal_nu @ f1_k, diagonal_nu @ f3_k], axis=-1),
+                        jnp.stack([diagonal_epsi @ f1_k, diagonal_epsi @ f3_k], axis=-1),
+                    ],
+                    axis=-1,
+                )
+
+            def _contract_factorized_parameter_sources_scan():
+                mode_count = saved_lu.shape[0]
+                last_index = mode_count - 1
+                mu_last = _source_bar_matrix_for_mode(jnp.asarray(last_index, dtype=jnp.int32))
+
+                def _backward_mu(mu_next, k):
+                    propagated = lu_solve(
+                        (
+                            _take_mode(saved_lu, k + 1),
+                            _take_mode(saved_piv, k + 1),
+                        ),
+                        mu_next,
+                        trans=1,
+                    )
+                    mu_k = _source_bar_matrix_for_mode(k) - _take_mode(
+                        saved_lower,
+                        k + 1,
+                    ).T @ propagated
+                    return mu_k, mu_k
+
+                _, mu_tail = jax.lax.scan(
+                    _backward_mu,
+                    mu_last,
+                    jnp.arange(last_index, dtype=jnp.int32),
+                    reverse=True,
+                )
+                mu = jnp.concatenate([mu_tail, mu_last[None, ...]], axis=0)
+                adjoint0 = lu_solve(
+                    (_take_mode(saved_lu, 0), _take_mode(saved_piv, 0)),
+                    _take_mode(mu, 0),
+                    trans=1,
+                )
+                source0 = _parameter_source_matrix_for_mode(jnp.asarray(0, dtype=jnp.int32))
+                contract0 = jnp.sum(adjoint0[..., None] * source0, axis=(0, 1))
+
+                def _forward_adjoint(carry, k):
+                    adjoint_prev, contract = carry
+                    rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                    adjoint_k = lu_solve(
+                        (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                        rhs,
+                        trans=1,
+                    )
+                    source_k = _parameter_source_matrix_for_mode(k)
+                    contract = contract + jnp.sum(adjoint_k[..., None] * source_k, axis=(0, 1))
+                    return (adjoint_k, contract), None
+
+                (_, contracted), _ = jax.lax.scan(
+                    _forward_adjoint,
+                    (adjoint0, contract0),
+                    jnp.arange(1, mode_count, dtype=jnp.int32),
+                )
+                return contracted
+
+            nu_bar_implicit, epsi_bar = -_contract_factorized_parameter_sources_scan()
+            return nu_bar_direct + nu_bar_implicit, epsi_bar
 
         def _one_direction_pullback(
             ctx,
@@ -4231,6 +4340,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hat_value,
                 epsi_hat_value,
             )
+            base = _base_pullback(
+                ctx,
+                mode_indices,
+                energy_index,
+                coefficients,
+                f1_full,
+                f3_full,
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                base_transport_moments_bar,
+            )
             first = _one_direction_pullback(
                 ctx,
                 mode_indices,
@@ -4261,7 +4383,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 second_epsi_dot,
                 second_transport_moments_bar,
             )
-            return (*first, *second)
+            return (*base, *first, *second)
 
         return jax.lax.map(
             _one_case_pullback,
@@ -4317,13 +4439,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_nu_hat,
             reference_log_nu_star_bar,
         )
-        transport_moments_nu_hat_bar, transport_moments_epsi_hat_bar = self._pullback_transport_moments_from_scan_primitives(
-            prepared,
-            drds_value=drds_value,
-            reference_nu_hat=reference_nu_hat,
-            reference_epsi_hat=reference_epsi_hat,
-            reference_transport_moments_bar=reference_transport_moments_bar,
-        )
         use_fused_lowdot_derivative_pullback = (
             self._normalize_derivative_field_pullback_mode(self.derivative_field_pullback_mode)
             == "compact_vjp"
@@ -4335,6 +4450,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 self.energy_grid.v_norm * vth_a
             )
             (
+                transport_moments_nu_hat_bar,
+                transport_moments_epsi_hat_bar,
                 _d_er_base_nu_hat_bar,
                 d_er_base_epsi_hat_bar,
                 dtransport_d_er_nu_hat_bar,
@@ -4348,6 +4465,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 drds_value=drds_value,
                 reference_nu_hat=reference_nu_hat,
                 reference_epsi_hat=reference_epsi_hat,
+                base_transport_moments_bar=reference_transport_moments_bar,
                 first_nu_hat_tangent=zero_nu_hat,
                 first_epsi_hat_tangent=epsi_hat_tangent,
                 first_transport_moments_bar=dtransport_moments_d_er_bar,
@@ -4382,6 +4500,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 reference_nu_hat=reference_nu_hat,
                 reference_epsi_hat=reference_epsi_hat,
                 dtransport_moments_d_log_nu_star_bar=dtransport_moments_d_log_nu_star_bar,
+            )
+            transport_moments_nu_hat_bar, transport_moments_epsi_hat_bar = self._pullback_transport_moments_from_scan_primitives(
+                prepared,
+                drds_value=drds_value,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+                reference_transport_moments_bar=reference_transport_moments_bar,
             )
 
         nu_hat_bar = (
