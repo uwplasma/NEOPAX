@@ -4183,20 +4183,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 adjoint_rhs1_dot_k, adjoint_rhs3_dot_k = _adjoint_rhs_dot_for_mode(k)
                 return jnp.stack([adjoint_rhs1_dot_k, adjoint_rhs3_dot_k], axis=-1)
 
-            adjoint_rhs_dot_matrix = jax.lax.map(
-                _adjoint_rhs_dot_matrix_for_mode,
-                mode_indices,
-            )
-            lambda_dot_matrix = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                adjoint_rhs_dot_matrix,
-            )
-            lambda1_dot = lambda_dot_matrix[..., 0]
-            lambda3_dot = lambda_dot_matrix[..., 1]
-
             def _accumulate_base_bars(carry, k):
                 nu_bar, epsi_bar = carry
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
@@ -4233,8 +4219,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 mode_indices,
             )
 
-            def _accumulate_lambda_dot_directional_bars(carry, k):
-                nu_bar_dot, epsi_bar_dot = carry
+            def _parameter_source_matrix_for_mode(k):
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
                     ctx,
                     k,
@@ -4245,29 +4230,71 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
                 f1_k = _take_mode(f1_full, k)
                 f3_k = _take_mode(f3_full, k)
-                lambda1_dot_k = _take_mode(lambda1_dot, k)
-                lambda3_dot_k = _take_mode(lambda3_dot, k)
-                nu_bar_dot = nu_bar_dot - (
-                    jnp.vdot(lambda1_dot_k, diagonal_nu @ f1_k)
-                    + jnp.vdot(lambda3_dot_k, diagonal_nu @ f3_k)
+                return jnp.stack(
+                    [
+                        jnp.stack([diagonal_nu @ f1_k, diagonal_nu @ f3_k], axis=-1),
+                        jnp.stack([diagonal_epsi @ f1_k, diagonal_epsi @ f3_k], axis=-1),
+                    ],
+                    axis=-1,
                 )
-                epsi_bar_dot = epsi_bar_dot - (
-                    jnp.vdot(lambda1_dot_k, diagonal_epsi @ f1_k)
-                    + jnp.vdot(lambda3_dot_k, diagonal_epsi @ f3_k)
-                )
-                return (nu_bar_dot, epsi_bar_dot), None
 
-            (
-                nu_bar_implicit_dot,
-                epsi_bar_dot,
-            ), _ = jax.lax.scan(
-                _accumulate_lambda_dot_directional_bars,
-                (
-                    jnp.asarray(0.0, dtype=prepared.grid.jax_dtype),
-                    jnp.asarray(0.0, dtype=prepared.grid.jax_dtype),
-                ),
-                mode_indices,
-            )
+            def _contract_adjoint_dot_parameter_sources_scan():
+                mode_count = saved_lu.shape[0]
+                last_index = mode_count - 1
+                mu_last = _adjoint_rhs_dot_matrix_for_mode(
+                    jnp.asarray(last_index, dtype=jnp.int32)
+                )
+
+                def _backward_mu(mu_next, k):
+                    propagated = lu_solve(
+                        (
+                            _take_mode(saved_lu, k + 1),
+                            _take_mode(saved_piv, k + 1),
+                        ),
+                        mu_next,
+                        trans=1,
+                    )
+                    mu_k = _adjoint_rhs_dot_matrix_for_mode(k) - _take_mode(
+                        saved_lower,
+                        k + 1,
+                    ).T @ propagated
+                    return mu_k, mu_k
+
+                _, mu_tail = jax.lax.scan(
+                    _backward_mu,
+                    mu_last,
+                    jnp.arange(last_index, dtype=jnp.int32),
+                    reverse=True,
+                )
+                mu = jnp.concatenate([mu_tail, mu_last[None, ...]], axis=0)
+                adjoint0 = lu_solve(
+                    (_take_mode(saved_lu, 0), _take_mode(saved_piv, 0)),
+                    _take_mode(mu, 0),
+                    trans=1,
+                )
+                source0 = _parameter_source_matrix_for_mode(jnp.asarray(0, dtype=jnp.int32))
+                contract0 = jnp.sum(adjoint0[..., None] * source0, axis=(0, 1))
+
+                def _forward_adjoint(carry, k):
+                    adjoint_prev, contract = carry
+                    rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                    adjoint_k = lu_solve(
+                        (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                        rhs,
+                        trans=1,
+                    )
+                    source_k = _parameter_source_matrix_for_mode(k)
+                    contract = contract + jnp.sum(adjoint_k[..., None] * source_k, axis=(0, 1))
+                    return (adjoint_k, contract), None
+
+                (_, contracted), _ = jax.lax.scan(
+                    _forward_adjoint,
+                    (adjoint0, contract0),
+                    jnp.arange(1, mode_count, dtype=jnp.int32),
+                )
+                return contracted
+
+            nu_bar_implicit_dot, epsi_bar_dot = -_contract_adjoint_dot_parameter_sources_scan()
 
             def _source_bar_pair_for_mode(lambdas, k):
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
