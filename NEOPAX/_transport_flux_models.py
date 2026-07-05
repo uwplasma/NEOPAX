@@ -2765,11 +2765,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _prepared_implicit_vjp_primal,
         )
         from ntx._solver_context import _operator_context
-        from ntx._solver_factorization import (
-            _solve_factorized_adjoint,
-            _solve_factorized_modes,
-        )
         from ntx.operators import parameter_derivative_blocks
+        from jax.scipy.linalg import lu_solve
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
@@ -2779,6 +2776,104 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         def _take_mode(values, k):
             return jax.lax.dynamic_index_in_dim(values, k, axis=0, keepdims=False)
+
+        def _solve_factorized_modes_scan(
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+            source,
+        ):
+            mode_count = source.shape[0]
+            last_index = mode_count - 1
+            y_last = lu_solve(
+                (_take_mode(saved_lu, last_index), _take_mode(saved_piv, last_index)),
+                _take_mode(source, last_index),
+            )
+
+            def _backward_y(y_next, k):
+                rhs = _take_mode(source, k) - _take_mode(saved_upper, k) @ y_next
+                y_k = lu_solve(
+                    (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                    rhs,
+                )
+                return y_k, y_k
+
+            _, y_tail = jax.lax.scan(
+                _backward_y,
+                y_last,
+                jnp.arange(last_index, dtype=jnp.int32),
+                reverse=True,
+            )
+            y = jnp.concatenate([y_tail, y_last[None, ...]], axis=0)
+            mode0 = _take_mode(y, 0)
+
+            def _forward_mode(mode_prev, k):
+                propagated = lu_solve(
+                    (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                    _take_mode(saved_lower, k) @ mode_prev,
+                )
+                mode_k = _take_mode(y, k) - propagated
+                return mode_k, mode_k
+
+            _, mode_tail = jax.lax.scan(
+                _forward_mode,
+                mode0,
+                jnp.arange(1, mode_count, dtype=jnp.int32),
+            )
+            return jnp.concatenate([mode0[None, ...], mode_tail], axis=0)
+
+        def _solve_factorized_adjoint_scan(
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+            source_bar,
+        ):
+            mode_count = source_bar.shape[0]
+            last_index = mode_count - 1
+            mu_last = _take_mode(source_bar, last_index)
+
+            def _backward_mu(mu_next, k):
+                propagated = lu_solve(
+                    (
+                        _take_mode(saved_lu, k + 1),
+                        _take_mode(saved_piv, k + 1),
+                    ),
+                    mu_next,
+                    trans=1,
+                )
+                mu_k = _take_mode(source_bar, k) - _take_mode(saved_lower, k + 1).T @ propagated
+                return mu_k, mu_k
+
+            _, mu_tail = jax.lax.scan(
+                _backward_mu,
+                mu_last,
+                jnp.arange(last_index, dtype=jnp.int32),
+                reverse=True,
+            )
+            mu = jnp.concatenate([mu_tail, mu_last[None, ...]], axis=0)
+            adjoint0 = lu_solve(
+                (_take_mode(saved_lu, 0), _take_mode(saved_piv, 0)),
+                _take_mode(mu, 0),
+                trans=1,
+            )
+
+            def _forward_adjoint(adjoint_prev, k):
+                rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                adjoint_k = lu_solve(
+                    (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                    rhs,
+                    trans=1,
+                )
+                return adjoint_k, adjoint_k
+
+            _, adjoint_tail = jax.lax.scan(
+                _forward_adjoint,
+                adjoint0,
+                jnp.arange(1, mode_count, dtype=jnp.int32),
+            )
+            return jnp.concatenate([adjoint0[None, ...], adjoint_tail], axis=0)
 
         def _one_case_pullback(args):
             energy_index, nu_hat_value, epsi_hat_value, nu_hat_dot, epsi_hat_dot = args
@@ -2827,14 +2922,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             source1_dot, source3_dot = jax.lax.map(_source_dot_for_mode, mode_indices)
-            f1_dot = _solve_factorized_modes(
+            f1_dot = _solve_factorized_modes_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
                 saved_upper,
                 source1_dot,
             )
-            f3_dot = _solve_factorized_modes(
+            f3_dot = _solve_factorized_modes_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
@@ -2870,14 +2965,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             g1_dot = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low_dot)
             g3_dot = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low_dot)
 
-            lambda1 = _solve_factorized_adjoint(
+            lambda1 = _solve_factorized_adjoint_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
                 saved_upper,
                 g1,
             )
-            lambda3 = _solve_factorized_adjoint(
+            lambda3 = _solve_factorized_adjoint_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
@@ -2904,14 +2999,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _adjoint_rhs_dot_for_mode,
                 mode_indices,
             )
-            lambda1_dot = _solve_factorized_adjoint(
+            lambda1_dot = _solve_factorized_adjoint_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
                 saved_upper,
                 adjoint_rhs1_dot,
             )
-            lambda3_dot = _solve_factorized_adjoint(
+            lambda3_dot = _solve_factorized_adjoint_scan(
                 saved_lu,
                 saved_piv,
                 saved_lower,
