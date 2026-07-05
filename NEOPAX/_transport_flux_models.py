@@ -2784,7 +2784,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             source_modes,
         )
         from ntx.transport import coefficients_from_modes
-        from jax.scipy.sparse.linalg import bicgstab
         from jax.scipy.linalg import lu_solve
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
@@ -3009,6 +3008,72 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             == "scalar_contract_matrix_free"
         )
 
+        def _safe_divide(numerator, denominator, dtype):
+            safe_denominator = jnp.where(
+                jnp.abs(denominator) > jnp.asarray(0.0, dtype=dtype),
+                denominator,
+                jnp.asarray(1.0, dtype=dtype),
+            )
+            return numerator / safe_denominator
+
+        def _bicgstab_fixed_iterations(matvec, b, *, tol=1.0e-10, maxiter=40):
+            dtype = b.dtype
+            b = jnp.asarray(b, dtype=dtype)
+            x0 = jnp.zeros_like(b)
+            r0 = b - matvec(x0)
+            r_hat = r0
+            zeros = jnp.zeros_like(b)
+            one = jnp.asarray(1.0, dtype=dtype)
+            zero = jnp.asarray(0.0, dtype=dtype)
+            norm_b = jnp.sqrt(jnp.maximum(jnp.vdot(b, b), zero))
+            threshold = jnp.asarray(tol, dtype=dtype) * jnp.maximum(norm_b, one)
+            initial_residual_norm = jnp.sqrt(jnp.maximum(jnp.vdot(r0, r0), zero))
+            initial_state = (
+                x0,
+                r0,
+                r_hat,
+                zeros,
+                zeros,
+                one,
+                one,
+                one,
+                initial_residual_norm <= threshold,
+            )
+
+            def _body(_idx, state):
+                x, r, r_shadow, p, v, rho_prev, alpha_prev, omega_prev, converged = state
+                rho = jnp.vdot(r_shadow, r)
+                beta = _safe_divide(rho, rho_prev, dtype) * _safe_divide(
+                    alpha_prev,
+                    omega_prev,
+                    dtype,
+                )
+                p_candidate = r + beta * (p - omega_prev * v)
+                v_candidate = matvec(p_candidate)
+                alpha = _safe_divide(rho, jnp.vdot(r_shadow, v_candidate), dtype)
+                s = r - alpha * v_candidate
+                t = matvec(s)
+                omega = _safe_divide(jnp.vdot(t, s), jnp.vdot(t, t), dtype)
+                x_candidate = x + alpha * p_candidate + omega * s
+                r_candidate = s - omega * t
+                residual_norm = jnp.sqrt(jnp.maximum(jnp.vdot(r_candidate, r_candidate), zero))
+                converged_candidate = residual_norm <= threshold
+                use_candidate = jnp.logical_not(converged)
+                return (
+                    jnp.where(use_candidate, x_candidate, x),
+                    jnp.where(use_candidate, r_candidate, r),
+                    r_shadow,
+                    jnp.where(use_candidate, p_candidate, p),
+                    jnp.where(use_candidate, v_candidate, v),
+                    jnp.where(use_candidate, rho, rho_prev),
+                    jnp.where(use_candidate, alpha, alpha_prev),
+                    jnp.where(use_candidate, omega, omega_prev),
+                    jnp.logical_or(converged, converged_candidate),
+                )
+
+            final_state = jax.lax.fori_loop(0, int(maxiter), _body, initial_state)
+            return final_state[0]
+
         def _matrix_free_block_operator_solve(ctx, source, *, transpose=False):
             mode_count = source.shape[0]
             last_index = mode_count - 1
@@ -3090,7 +3155,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return jax.lax.map(_row, jnp.arange(mode_count, dtype=jnp.int32))
 
             matvec = _apply_transpose if transpose else _apply_primal
-            solution, _info = bicgstab(
+            solution = _bicgstab_fixed_iterations(
                 matvec,
                 source,
                 tol=1.0e-10,
