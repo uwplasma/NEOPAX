@@ -720,6 +720,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ntx-exact-derivative-pullback-algebra",
+        default="ntx_helper",
+        choices=("ntx_helper", "scalar_contract"),
+        help=(
+            "Reverse-only algebra mode for compact NTX derivative-field "
+            "pullbacks. 'ntx_helper' uses NTX's current compact helper. "
+            "'scalar_contract' uses a NEOPAX-local scalar-contraction path "
+            "that avoids Python-unrolled mode loops where possible."
+        ),
+    )
+    parser.add_argument(
         "--reverse-ntx-prepared-solve-boundary",
         default="default",
         choices=("default", "custom_vjp"),
@@ -984,6 +995,7 @@ def main() -> None:
         ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
         ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
         ntx_exact_derivative_pullback_boundary=args.ntx_exact_derivative_pullback_boundary,
+        ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     runtime, baseline_state = build_runtime_context(config)
@@ -1149,6 +1161,7 @@ def main() -> None:
             "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
             "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
             "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
+            "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
             "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
@@ -1177,6 +1190,7 @@ def main() -> None:
             f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
             f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
             f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
+            f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
             f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
             f"max_total_steps={reverse_setup.max_total_steps} "
             f"reverse_checkpoint_count={reverse_checkpoint_count} "
@@ -1271,6 +1285,7 @@ def main() -> None:
         "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
         "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
         "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
+        "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
         "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
@@ -1303,6 +1318,7 @@ def main() -> None:
         f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
         f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
         f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
+        f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
         f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "

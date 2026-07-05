@@ -110,6 +110,7 @@ def _prepare_benchmark_config(
     ntx_exact_derivative_mode: str | None = None,
     ntx_exact_derivative_field_pullback_mode: str | None = None,
     ntx_exact_derivative_pullback_boundary: str | None = None,
+    ntx_exact_derivative_pullback_algebra: str | None = None,
     radau_jacobian_reuse_mode: str | None = None,
 ) -> dict[str, Any]:
     config = NEOPAX.prepare_config(config_path, device=device)
@@ -133,6 +134,10 @@ def _prepare_benchmark_config(
         config.setdefault("neoclassical", {})[
             "ntx_exact_derivative_pullback_boundary"
         ] = str(ntx_exact_derivative_pullback_boundary)
+    if ntx_exact_derivative_pullback_algebra is not None:
+        config.setdefault("neoclassical", {})[
+            "ntx_exact_derivative_pullback_algebra"
+        ] = str(ntx_exact_derivative_pullback_algebra)
     if radau_jacobian_reuse_mode is not None:
         solver_cfg["radau_jacobian_reuse_mode"] = str(radau_jacobian_reuse_mode)
     return config

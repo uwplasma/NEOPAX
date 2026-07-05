@@ -1069,3 +1069,240 @@ What to check:
 - First, confirm the gradients match the expected 2-step values.
 - Second, compare compile RAM and compile-plus-execute time against the recent 2-step reduced-cotangent baseline without `compact_vjp`.
 - Only move to the 16-step run if the 2-step compile-memory graph improves.
+
+## 2026-07-05 updated conclusion: graph-boundary attempts did not reduce GPU compile memory
+
+Recent 2-step tests preserved the expected gradients but did not reduce compile
+memory or compile time enough:
+
+- `compact_vjp` with the current NTX helper remained correct, but compile time
+  and RAM stayed in the same problematic band.
+- A NEOPAX-local fused derivative pullback that removed the duplicate coefficient
+  solve was also correct, but it made the compiled graph larger/slower. This was
+  reverted and should not be pursued further as the main optimization.
+- `ntx_exact_derivative_pullback_boundary=per_energy_jit` was active in the run
+  output, but it also made compile time worse and did not lower RAM. Nested
+  `jax.jit(..., inline=False)` is not an effective opaque boundary here.
+
+Latest negative `per_energy_jit` run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-boundary per_energy_jit \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Observed:
+
+- `reverse_compile_plus_execute_s = 8.511400e+02`
+- `reverse_execute_s_mean = 2.083876e+01`
+- gradients matched the expected 2-step values:
+  - `dsoftmax_Er/dn0 = -3.578617e-01`
+  - `dsoftmax_Er/dT0 = 3.010300e-01`
+  - `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+  - `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+- RAM still reached the same high compile-memory band.
+
+Conclusion:
+
+- The main problem is not one duplicate coefficient solve.
+- The main problem is that XLA sees too much of the NTX derivative-pullback
+  algebra inside the reverse kernel.
+- Nested JIT boundaries do not hide that algebra enough.
+- Further optimization should target the algebraic contract, not more inlining,
+  static branching, or nested JIT wrappers.
+
+## Next-session plan: bespoke GPU algebra for a narrow scalar reverse pullback
+
+Goal:
+
+- Keep the path GPU/JIT compatible.
+- Reduce the size and live state of the NTX derivative-pullback graph.
+- Preserve the reverse-lane semantics and the existing gradients.
+- Avoid benchmark/TOML-specific shortcuts.
+
+Core idea:
+
+- Stop exposing a generic "derivative of coefficient-solve VJP" object to the
+  reverse kernel.
+- Instead derive a NEOPAX-specific compact scalar pullback for the actual
+  transport-moment contribution:
+
+```text
+transport_moment_bar -> coefficient_bar -> nu_hat_bar, epsi_hat_bar
+```
+
+Target contract:
+
+```text
+inputs:
+  prepared, nu_hat, epsi_hat, drds, energy_index, transport_moments_bar
+
+outputs:
+  nu_hat_bar, epsi_hat_bar
+```
+
+For derivative-field pullbacks:
+
+```text
+inputs:
+  prepared, nu_hat, epsi_hat, nu_hat_dot, epsi_hat_dot,
+  drds, energy_index, transport_moments_bar
+
+outputs:
+  base_nu_hat_bar, base_epsi_hat_bar,
+  tangent_nu_hat_bar, tangent_epsi_hat_bar
+```
+
+But the implementation should avoid building large generic tangent/cotangent
+structures where possible. Accumulate scalar contractions directly.
+
+Implementation steps:
+
+1. Inspect NTX's current `solve_prepared_coefficient_vector_derivative_vjp`
+   algebra and mark which arrays are only needed as intermediate stacked
+   structures:
+   - `f1_dot`, `f3_dot`
+   - `g1_dot`, `g3_dot`
+   - `lambda1_dot`, `lambda3_dot`
+   - `source*_dot`
+   - `adjoint_rhs*_dot`
+
+2. Derive a smaller NEOPAX-side helper that contracts parameter-gradient terms
+   in the `k` loop instead of materializing more full stacked mode arrays than
+   necessary.
+
+3. Keep the D11 floor semantics exactly. The coefficient-bar still depends on
+   the actual coefficient vector because of the active floor mask.
+
+4. First implement this as an opt-in mode, e.g.
+
+```bash
+--ntx-exact-derivative-field-pullback-mode compact_scalar_vjp
+```
+
+or, if reusing the existing option is cleaner:
+
+```bash
+--ntx-exact-derivative-pullback-algebra scalar_contract
+```
+
+5. Test only 2 accepted steps first:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 2-step gradients remain:
+
+- `dsoftmax_Er/dn0 = -3.578617e-01`
+- `dsoftmax_Er/dT0 = 3.010300e-01`
+- `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+- `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+
+Success criteria:
+
+- gradients match the expected values,
+- compile memory drops visibly below the current high band,
+- compile-plus-execute time improves or at least does not worsen,
+- no reliance on host callbacks, Python loops outside JIT, or CPU-only fallback.
+
+Do not pursue next:
+
+- duplicate-solve fusion by inlining more NTX algebra into NEOPAX,
+- nested `per_energy_jit` as the main solution,
+- static reuse/rebuild branch specialization,
+- saving full lagged/RHS structures across checkpoints,
+- benchmark-specific assumptions about the active TOML or D11 floor branch.
+
+## Refined next-step plan: scalar-contract pullback
+
+This has not yet been tried. Previous attempts simplified nearby pieces, but
+they did not replace the generic derivative-of-VJP structure with a direct
+scalar-contract reverse rule.
+
+Plan:
+
+1. Freeze the target math from the current correct path:
+
+```text
+coefficient_vector -> coefficient_bar -> NTX derivative VJP -> scalar bars
+```
+
+2. Use the current compact path as the reference implementation. Preserve:
+
+- D11 floor behavior,
+- accepted/rejected step semantics,
+- reverse-lane-only implementation,
+- no benchmark/TOML-specific shortcuts.
+
+3. Inspect NTX `solve_prepared_coefficient_vector_derivative_vjp` and classify
+   the large intermediates:
+
+- `f1_dot`, `f3_dot`
+- `g1_dot`, `g3_dot`
+- `lambda1_dot`, `lambda3_dot`
+- `source*_dot`
+- `adjoint_rhs*_dot`
+
+4. Derive direct scalar contractions for the NEOPAX transport-moment pullback.
+   The goal is to avoid building a full generic derivative-pullback object when
+   only scalar bars for `nu_hat` and `epsi_hat` are needed.
+
+5. Implement as an opt-in mode, for example:
+
+```bash
+--ntx-exact-derivative-pullback-algebra scalar_contract
+```
+
+or equivalent local naming if it fits the code better.
+
+6. First benchmark command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 2-step gradients:
+
+- `dsoftmax_Er/dn0 = -3.578617e-01`
+- `dsoftmax_Er/dT0 = 3.010300e-01`
+- `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+- `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+
+Success criteria:
+
+- gradients match the expected values,
+- compile memory visibly drops,
+- compile-plus-execute time does not worsen,
+- no CPU fallback, host callback, or full lagged/RHS checkpointing.
