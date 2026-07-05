@@ -722,12 +722,14 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-pullback-algebra",
         default="ntx_helper",
-        choices=("ntx_helper", "scalar_contract"),
+        choices=("ntx_helper", "scalar_contract", "scalar_contract_lowdot"),
         help=(
             "Reverse-only algebra mode for compact NTX derivative-field "
             "pullbacks. 'ntx_helper' uses NTX's current compact helper. "
             "'scalar_contract' uses a NEOPAX-local scalar-contraction path "
-            "that avoids Python-unrolled mode loops where possible."
+            "that avoids Python-unrolled mode loops where possible. "
+            "'scalar_contract_lowdot' additionally avoids full tangent-mode "
+            "stacks for the field-bar contraction."
         ),
     )
     parser.add_argument(

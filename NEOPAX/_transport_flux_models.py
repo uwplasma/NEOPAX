@@ -1754,12 +1754,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar": "scalar_contract",
             "scalar-contract": "scalar_contract",
             "contract": "scalar_contract",
+            "lowdot": "scalar_contract_lowdot",
+            "scalar-lowdot": "scalar_contract_lowdot",
+            "scalar_contract_no_f_dot": "scalar_contract_lowdot",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized not in {"ntx_helper", "scalar_contract"}:
+        if normalized not in {
+            "ntx_helper",
+            "scalar_contract",
+            "scalar_contract_lowdot",
+        }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
-                "ntx_helper, scalar_contract"
+                "ntx_helper, scalar_contract, scalar_contract_lowdot"
             )
         return normalized
 
@@ -2875,18 +2882,65 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             return jnp.concatenate([adjoint0[None, ...], adjoint_tail], axis=0)
 
-        def _solve_factorized_adjoint_contract_scan(
+        def _solve_factorized_low_modes_scan(
             saved_lu,
             saved_piv,
             saved_lower,
             saved_upper,
-            source_bar,
-            modes,
-            ctx,
+            source_for_mode,
         ):
-            mode_count = source_bar.shape[0]
+            mode_count = saved_lu.shape[0]
             last_index = mode_count - 1
-            mu_last = _take_mode(source_bar, last_index)
+            source0 = source_for_mode(jnp.asarray(0, dtype=jnp.int32))
+            zero = jnp.zeros_like(source0)
+            y_last = lu_solve(
+                (_take_mode(saved_lu, last_index), _take_mode(saved_piv, last_index)),
+                source_for_mode(jnp.asarray(last_index, dtype=jnp.int32)),
+            )
+            y0 = jnp.where(last_index == 0, y_last, zero)
+            y1 = jnp.where(last_index == 1, y_last, zero)
+            y2 = jnp.where(last_index == 2, y_last, zero)
+
+            def _backward_y(carry, k):
+                y_next, y0_value, y1_value, y2_value = carry
+                rhs = source_for_mode(k) - _take_mode(saved_upper, k) @ y_next
+                y_k = lu_solve(
+                    (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
+                    rhs,
+                )
+                y0_value = jnp.where(k == 0, y_k, y0_value)
+                y1_value = jnp.where(k == 1, y_k, y1_value)
+                y2_value = jnp.where(k == 2, y_k, y2_value)
+                return (y_k, y0_value, y1_value, y2_value), None
+
+            (_, y0, y1, y2), _ = jax.lax.scan(
+                _backward_y,
+                (y_last, y0, y1, y2),
+                jnp.arange(last_index, dtype=jnp.int32),
+                reverse=True,
+            )
+            mode0 = y0
+            mode1 = y1 - lu_solve(
+                (_take_mode(saved_lu, 1), _take_mode(saved_piv, 1)),
+                _take_mode(saved_lower, 1) @ mode0,
+            )
+            mode2 = y2 - lu_solve(
+                (_take_mode(saved_lu, 2), _take_mode(saved_piv, 2)),
+                _take_mode(saved_lower, 2) @ mode1,
+            )
+            return jnp.stack([mode0, mode1, mode2], axis=0)
+
+        def _contract_factorized_source_bar_pair_scan(
+            saved_lu,
+            saved_piv,
+            saved_lower,
+            saved_upper,
+            source_for_mode,
+            source_bar_pair_for_mode,
+        ):
+            mode_count = saved_lu.shape[0]
+            last_index = mode_count - 1
+            mu_last = source_bar_pair_for_mode(jnp.asarray(last_index, dtype=jnp.int32))
 
             def _backward_mu(mu_next, k):
                 propagated = lu_solve(
@@ -2897,7 +2951,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     mu_next,
                     trans=1,
                 )
-                mu_k = _take_mode(source_bar, k) - _take_mode(saved_lower, k + 1).T @ propagated
+                mu_k = source_bar_pair_for_mode(k) - _take_mode(saved_lower, k + 1).T @ propagated
                 return mu_k, mu_k
 
             _, mu_tail = jax.lax.scan(
@@ -2907,46 +2961,37 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 reverse=True,
             )
             mu = jnp.concatenate([mu_tail, mu_last[None, ...]], axis=0)
-
-            def _contract(adjoint_k, k):
-                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
-                    ctx,
-                    k,
-                    prepared.d_theta,
-                    prepared.d_zeta,
-                )
-                diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
-                diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
-                mode_k = _take_mode(modes, k)
-                return (
-                    jnp.vdot(adjoint_k, diagonal_nu @ mode_k),
-                    jnp.vdot(adjoint_k, diagonal_epsi @ mode_k),
-                )
-
             adjoint0 = lu_solve(
                 (_take_mode(saved_lu, 0), _take_mode(saved_piv, 0)),
                 _take_mode(mu, 0),
                 trans=1,
             )
-            nu0, epsi0 = _contract(adjoint0, jnp.asarray(0, dtype=jnp.int32))
+            source0 = source_for_mode(jnp.asarray(0, dtype=jnp.int32))
+            contract0 = jnp.sum(adjoint0 * source0[:, None], axis=0)
 
             def _forward_adjoint(carry, k):
-                adjoint_prev, nu_acc, epsi_acc = carry
+                adjoint_prev, contract = carry
                 rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
                 adjoint_k = lu_solve(
                     (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                     rhs,
                     trans=1,
                 )
-                nu_k, epsi_k = _contract(adjoint_k, k)
-                return (adjoint_k, nu_acc + nu_k, epsi_acc + epsi_k), None
+                source_k = source_for_mode(k)
+                contract = contract + jnp.sum(adjoint_k * source_k[:, None], axis=0)
+                return (adjoint_k, contract), None
 
-            (_, nu_total, epsi_total), _ = jax.lax.scan(
+            (_, contracted), _ = jax.lax.scan(
                 _forward_adjoint,
-                (adjoint0, nu0, epsi0),
+                (adjoint0, contract0),
                 jnp.arange(1, mode_count, dtype=jnp.int32),
             )
-            return nu_total, epsi_total
+            return contracted
+
+        use_lowdot = (
+            self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
+            == "scalar_contract_lowdot"
+        )
 
         def _one_case_pullback(args):
             energy_index, nu_hat_value, epsi_hat_value, nu_hat_dot, epsi_hat_dot = args
@@ -2979,7 +3024,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             mode_indices = jnp.arange(prepared.grid.n_xi + 1, dtype=jnp.int32)
 
-            def _source_dot_for_mode(k):
+            def _source_dot_pair_for_mode(k):
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
                     ctx,
                     k,
@@ -2994,21 +3039,47 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     -(diagonal_dot @ _take_mode(f3_full, k)),
                 )
 
-            source1_dot, source3_dot = jax.lax.map(_source_dot_for_mode, mode_indices)
-            f1_dot = _solve_factorized_modes_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                source1_dot,
-            )
-            f3_dot = _solve_factorized_modes_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                source3_dot,
-            )
+            def _source1_dot_for_mode(k):
+                source1_dot_k, _ = _source_dot_pair_for_mode(k)
+                return source1_dot_k
+
+            def _source3_dot_for_mode(k):
+                _, source3_dot_k = _source_dot_pair_for_mode(k)
+                return source3_dot_k
+
+            if use_lowdot:
+                f1_dot_low = _solve_factorized_low_modes_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    _source1_dot_for_mode,
+                )
+                f3_dot_low = _solve_factorized_low_modes_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    _source3_dot_for_mode,
+                )
+            else:
+                source1_dot, source3_dot = jax.lax.map(_source_dot_pair_for_mode, mode_indices)
+                f1_dot = _solve_factorized_modes_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    source1_dot,
+                )
+                f3_dot = _solve_factorized_modes_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    source3_dot,
+                )
+                f1_dot_low = f1_dot[:3]
+                f3_dot_low = f3_dot[:3]
 
             def _coefficient_pullback(modes1, modes3, nu_value):
                 return _coefficient_mode_pullback(
@@ -3030,7 +3101,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ) = jax.jvp(
                 _coefficient_pullback,
                 (f1_full[:3], f3_full[:3], ctx.nu_hat),
-                (f1_dot[:3], f3_dot[:3], nu_hat_dot),
+                (f1_dot_low, f3_dot_low, nu_hat_dot),
             )
 
             g1 = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low)
@@ -3072,27 +3143,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _adjoint_rhs_dot_for_mode,
                 mode_indices,
             )
-            lambda1_dot_nu_contract, lambda1_dot_epsi_contract = (
-                _solve_factorized_adjoint_contract_scan(
-                    saved_lu,
-                    saved_piv,
-                    saved_lower,
-                    saved_upper,
-                    adjoint_rhs1_dot,
-                    f1_full,
-                    ctx,
-                )
+            lambda1_dot = _solve_factorized_adjoint_scan(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                adjoint_rhs1_dot,
             )
-            lambda3_dot_nu_contract, lambda3_dot_epsi_contract = (
-                _solve_factorized_adjoint_contract_scan(
-                    saved_lu,
-                    saved_piv,
-                    saved_lower,
-                    saved_upper,
-                    adjoint_rhs3_dot,
-                    f3_full,
-                    ctx,
-                )
+            lambda3_dot = _solve_factorized_adjoint_scan(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                adjoint_rhs3_dot,
             )
 
             def _accumulate_base_bars(carry, k):
@@ -3131,7 +3194,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 mode_indices,
             )
 
-            def _accumulate_directional_field_bars(carry, k):
+            def _accumulate_lambda_dot_directional_bars(carry, k):
                 nu_bar_dot, epsi_bar_dot = carry
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
                     ctx,
@@ -3141,42 +3204,100 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
                 diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
                 diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
-                f1_dot_k = _take_mode(f1_dot, k)
-                f3_dot_k = _take_mode(f3_dot, k)
-                lambda1_k = _take_mode(lambda1, k)
-                lambda3_k = _take_mode(lambda3, k)
+                f1_k = _take_mode(f1_full, k)
+                f3_k = _take_mode(f3_full, k)
+                lambda1_dot_k = _take_mode(lambda1_dot, k)
+                lambda3_dot_k = _take_mode(lambda3_dot, k)
                 nu_bar_dot = nu_bar_dot - (
-                    jnp.vdot(lambda1_k, diagonal_nu @ f1_dot_k)
-                    + jnp.vdot(lambda3_k, diagonal_nu @ f3_dot_k)
+                    jnp.vdot(lambda1_dot_k, diagonal_nu @ f1_k)
+                    + jnp.vdot(lambda3_dot_k, diagonal_nu @ f3_k)
                 )
                 epsi_bar_dot = epsi_bar_dot - (
-                    jnp.vdot(lambda1_k, diagonal_epsi @ f1_dot_k)
-                    + jnp.vdot(lambda3_k, diagonal_epsi @ f3_dot_k)
+                    jnp.vdot(lambda1_dot_k, diagonal_epsi @ f1_k)
+                    + jnp.vdot(lambda3_dot_k, diagonal_epsi @ f3_k)
                 )
                 return (nu_bar_dot, epsi_bar_dot), None
 
             (
-                nu_bar_field_dot,
-                epsi_bar_field_dot,
+                nu_bar_implicit_dot,
+                epsi_bar_dot,
             ), _ = jax.lax.scan(
-                _accumulate_directional_field_bars,
+                _accumulate_lambda_dot_directional_bars,
                 (
                     jnp.asarray(0.0, dtype=prepared.grid.jax_dtype),
                     jnp.asarray(0.0, dtype=prepared.grid.jax_dtype),
                 ),
                 mode_indices,
             )
-            nu_bar_implicit_dot = (
-                nu_bar_field_dot
-                - lambda1_dot_nu_contract
-                - lambda3_dot_nu_contract
-            )
-            epsi_bar_dot = (
-                epsi_bar_field_dot
-                - lambda1_dot_epsi_contract
-                - lambda3_dot_epsi_contract
-            )
 
+            def _source_bar_pair_for_mode(lambdas, k):
+                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
+                diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
+                lambda_k = _take_mode(lambdas, k)
+                return jnp.stack(
+                    [diagonal_nu.T @ lambda_k, diagonal_epsi.T @ lambda_k],
+                    axis=-1,
+                )
+
+            if use_lowdot:
+                f1_field_dot = _contract_factorized_source_bar_pair_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    _source1_dot_for_mode,
+                    lambda k: _source_bar_pair_for_mode(lambda1, k),
+                )
+                f3_field_dot = _contract_factorized_source_bar_pair_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    _source3_dot_for_mode,
+                    lambda k: _source_bar_pair_for_mode(lambda3, k),
+                )
+                nu_bar_implicit_dot = nu_bar_implicit_dot - f1_field_dot[0] - f3_field_dot[0]
+                epsi_bar_dot = epsi_bar_dot - f1_field_dot[1] - f3_field_dot[1]
+            else:
+
+                def _accumulate_full_dot_directional_bars(carry, k):
+                    nu_bar_dot, epsi_bar_dot = carry
+                    diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                        ctx,
+                        k,
+                        prepared.d_theta,
+                        prepared.d_zeta,
+                    )
+                    diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
+                    diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
+                    f1_dot_k = _take_mode(f1_dot, k)
+                    f3_dot_k = _take_mode(f3_dot, k)
+                    lambda1_k = _take_mode(lambda1, k)
+                    lambda3_k = _take_mode(lambda3, k)
+                    nu_bar_dot = nu_bar_dot - (
+                        jnp.vdot(lambda1_k, diagonal_nu @ f1_dot_k)
+                        + jnp.vdot(lambda3_k, diagonal_nu @ f3_dot_k)
+                    )
+                    epsi_bar_dot = epsi_bar_dot - (
+                        jnp.vdot(lambda1_k, diagonal_epsi @ f1_dot_k)
+                        + jnp.vdot(lambda3_k, diagonal_epsi @ f3_dot_k)
+                    )
+                    return (nu_bar_dot, epsi_bar_dot), None
+
+                (
+                    nu_bar_implicit_dot,
+                    epsi_bar_dot,
+                ), _ = jax.lax.scan(
+                    _accumulate_full_dot_directional_bars,
+                    (nu_bar_implicit_dot, epsi_bar_dot),
+                    mode_indices,
+                )
             return (
                 nu_bar_direct + nu_bar_implicit,
                 epsi_bar,
@@ -3295,7 +3416,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 if self._normalize_derivative_pullback_algebra(
                     self.derivative_pullback_algebra
                 )
-                == "scalar_contract"
+                in {"scalar_contract", "scalar_contract_lowdot"}
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
             (
@@ -3350,7 +3471,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 if self._normalize_derivative_pullback_algebra(
                     self.derivative_pullback_algebra
                 )
-                == "scalar_contract"
+                in {"scalar_contract", "scalar_contract_lowdot"}
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
             (
