@@ -2771,6 +2771,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         nu_hat_tangent,
         epsi_hat_tangent,
         reference_transport_moments_bar,
+        output_mode: str = "full",
+        base_epsi_weight=None,
     ):
         from ntx._solver_adjoint import (
             _coefficient_mode_pullback,
@@ -3561,16 +3563,52 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 epsi_bar_dot,
             )
 
-        return jax.lax.map(
-            _one_case_pullback,
-            (
+        map_inputs = (
+            energy_indices,
+            reference_nu_hat,
+            reference_epsi_hat,
+            nu_hat_tangent,
+            epsi_hat_tangent,
+        )
+        if output_mode == "full":
+            return jax.lax.map(_one_case_pullback, map_inputs)
+        if output_mode == "combine_base_nu":
+
+            def _combine_base_nu(args):
+                base_nu_bar, _base_epsi_bar, nu_hat_bar, epsi_hat_bar = _one_case_pullback(args)
+                return nu_hat_bar + base_nu_bar, epsi_hat_bar
+
+            return jax.lax.map(_combine_base_nu, map_inputs)
+        if output_mode == "weighted_base_epsi_sum":
+            if base_epsi_weight is None:
+                raise ValueError("base_epsi_weight is required for weighted_base_epsi_sum.")
+
+            weighted_inputs = (
                 energy_indices,
                 reference_nu_hat,
                 reference_epsi_hat,
                 nu_hat_tangent,
                 epsi_hat_tangent,
-            ),
-        )
+                base_epsi_weight,
+            )
+
+            def _accumulate_weighted_base_epsi(carry, args):
+                args_without_weight = args[:-1]
+                weight_value = args[-1]
+                _base_nu_bar, base_epsi_bar, nu_hat_bar, epsi_hat_bar = _one_case_pullback(
+                    args_without_weight
+                )
+                carry = carry + base_epsi_bar * weight_value
+                return carry, (nu_hat_bar, epsi_hat_bar)
+
+            weighted_base_epsi0 = jnp.asarray(0.0, dtype=reference_epsi_hat.dtype)
+            weighted_base_epsi, (nu_hat_bar, epsi_hat_bar) = jax.lax.scan(
+                _accumulate_weighted_base_epsi,
+                weighted_base_epsi0,
+                weighted_inputs,
+            )
+            return nu_hat_bar, epsi_hat_bar, weighted_base_epsi
+        raise ValueError(f"Unknown scalar-contract derivative pullback output_mode '{output_mode}'.")
 
     def _dtransport_moments_d_er_from_scan_primitives(
         self,
@@ -3667,20 +3705,33 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.derivative_field_pullback_mode
         )
         if derivative_field_pullback_mode == "compact_vjp":
+            use_scalar_contract_pullback = self._normalize_derivative_pullback_algebra(
+                self.derivative_pullback_algebra
+            ) in {
+                "scalar_contract",
+                "scalar_contract_lowdot",
+                "scalar_contract_matrix_free",
+            }
             derivative_pullback = (
                 self._scalar_contract_coefficient_derivative_pullback_from_scan_primitives
-                if self._normalize_derivative_pullback_algebra(
-                    self.derivative_pullback_algebra
-                )
-                in {
-                    "scalar_contract",
-                    "scalar_contract_lowdot",
-                    "scalar_contract_matrix_free",
-                }
+                if use_scalar_contract_pullback
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
+            if use_scalar_contract_pullback:
+                nu_hat_bar, epsi_hat_bar, vth_a_bar = derivative_pullback(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=reference_nu_hat,
+                    reference_epsi_hat=reference_epsi_hat,
+                    nu_hat_tangent=jnp.zeros_like(reference_nu_hat),
+                    epsi_hat_tangent=epsi_hat_tangent,
+                    reference_transport_moments_bar=dtransport_moments_d_er_bar,
+                    output_mode="weighted_base_epsi_sum",
+                    base_epsi_weight=-epsi_hat_tangent / vth_a,
+                )
+                return nu_hat_bar, epsi_hat_bar, vth_a_bar
             (
-                base_nu_bar,
+                _base_nu_bar,
                 base_epsi_bar,
                 nu_hat_bar,
                 epsi_hat_bar,
@@ -3726,18 +3777,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.derivative_field_pullback_mode
         )
         if derivative_field_pullback_mode == "compact_vjp":
+            use_scalar_contract_pullback = self._normalize_derivative_pullback_algebra(
+                self.derivative_pullback_algebra
+            ) in {
+                "scalar_contract",
+                "scalar_contract_lowdot",
+                "scalar_contract_matrix_free",
+            }
             derivative_pullback = (
                 self._scalar_contract_coefficient_derivative_pullback_from_scan_primitives
-                if self._normalize_derivative_pullback_algebra(
-                    self.derivative_pullback_algebra
-                )
-                in {
-                    "scalar_contract",
-                    "scalar_contract_lowdot",
-                    "scalar_contract_matrix_free",
-                }
+                if use_scalar_contract_pullback
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
+            if use_scalar_contract_pullback:
+                return derivative_pullback(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=reference_nu_hat,
+                    reference_epsi_hat=reference_epsi_hat,
+                    nu_hat_tangent=reference_nu_hat,
+                    epsi_hat_tangent=jnp.zeros_like(reference_epsi_hat),
+                    reference_transport_moments_bar=dtransport_moments_d_log_nu_star_bar,
+                    output_mode="combine_base_nu",
+                )
             (
                 base_nu_bar,
                 _base_epsi_bar,
