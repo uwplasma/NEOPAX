@@ -2393,55 +2393,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vth_a=vth_a,
         )
 
-    def _dtransport_moments_d_er_call_boundary(
-        self,
-        prepared,
-        *,
-        drds_value,
-        nu_hat_a,
-        epsi_hat_a,
-        vth_a,
-    ):
-        def _call(prepared_value, drds_value_value, nu_hat_value, epsi_hat_value, vth_value):
-            return self._dtransport_moments_d_er_from_scan_primitives(
-                prepared_value,
-                drds_value=drds_value_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
-                vth_a=vth_value,
-            )
-
-        return jax.jit(_call, inline=False)(
-            prepared,
-            drds_value,
-            nu_hat_a,
-            epsi_hat_a,
-            vth_a,
-        )
-
-    def _dtransport_moments_d_log_nu_star_call_boundary(
-        self,
-        prepared,
-        *,
-        drds_value,
-        nu_hat_a,
-        epsi_hat_a,
-    ):
-        def _call(prepared_value, drds_value_value, nu_hat_value, epsi_hat_value):
-            return self._dtransport_moments_d_log_nu_star_from_scan_primitives(
-                prepared_value,
-                drds_value=drds_value_value,
-                nu_hat_a=nu_hat_value,
-                epsi_hat_a=epsi_hat_value,
-            )
-
-        return jax.jit(_call, inline=False)(
-            prepared,
-            drds_value,
-            nu_hat_a,
-            epsi_hat_a,
-        )
-
     def _interpolated_moment_reduced_local_outputs_from_primitives(
         self,
         prepared,
@@ -2451,19 +2402,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_a,
         vth_a,
     ):
-        use_derivative_call_boundary = (
-            self._normalize_derivative_mode(self.derivative_mode) == "iterative_vjp"
-        )
-        dtransport_moments_d_er_fn = (
-            self._dtransport_moments_d_er_call_boundary
-            if use_derivative_call_boundary
-            else self._dtransport_moments_d_er_from_scan_primitives
-        )
-        dtransport_moments_d_log_nu_star_fn = (
-            self._dtransport_moments_d_log_nu_star_call_boundary
-            if use_derivative_call_boundary
-            else self._dtransport_moments_d_log_nu_star_from_scan_primitives
-        )
         return (
             self._log_nu_star_from_nu_hat(nu_hat_a),
             self._transport_moments_from_inputs(
@@ -2472,14 +2410,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 epsi_hat_a,
                 drds_value=drds_value,
             ),
-            dtransport_moments_d_er_fn(
+            self._dtransport_moments_d_er_from_scan_primitives(
                 prepared,
                 drds_value=drds_value,
                 nu_hat_a=nu_hat_a,
                 epsi_hat_a=epsi_hat_a,
                 vth_a=vth_a,
             ),
-            dtransport_moments_d_log_nu_star_fn(
+            self._dtransport_moments_d_log_nu_star_from_scan_primitives(
                 prepared,
                 drds_value=drds_value,
                 nu_hat_a=nu_hat_a,
