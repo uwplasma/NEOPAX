@@ -3047,21 +3047,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _, source3_dot_k = _source_dot_pair_for_mode(k)
                 return source3_dot_k
 
+            def _source_dot_matrix_for_mode(k):
+                source1_dot_k, source3_dot_k = _source_dot_pair_for_mode(k)
+                return jnp.stack([source1_dot_k, source3_dot_k], axis=-1)
+
             if use_lowdot:
-                f1_dot_low = _solve_factorized_low_modes_scan(
+                f_dot_low_matrix = _solve_factorized_low_modes_scan(
                     saved_lu,
                     saved_piv,
                     saved_lower,
                     saved_upper,
-                    _source1_dot_for_mode,
+                    _source_dot_matrix_for_mode,
                 )
-                f3_dot_low = _solve_factorized_low_modes_scan(
-                    saved_lu,
-                    saved_piv,
-                    saved_lower,
-                    saved_upper,
-                    _source3_dot_for_mode,
-                )
+                f1_dot_low = f_dot_low_matrix[..., 0]
+                f3_dot_low = f_dot_low_matrix[..., 1]
             else:
                 source1_dot, source3_dot = jax.lax.map(_source_dot_pair_for_mode, mode_indices)
                 f1_dot = _solve_factorized_modes_scan(
@@ -3109,20 +3108,31 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             g1_dot = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low_dot)
             g3_dot = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low_dot)
 
-            lambda1 = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                g1,
-            )
-            lambda3 = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                g3,
-            )
+            if use_lowdot:
+                lambda_matrix = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    jnp.stack([g1, g3], axis=-1),
+                )
+                lambda1 = lambda_matrix[..., 0]
+                lambda3 = lambda_matrix[..., 1]
+            else:
+                lambda1 = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    g1,
+                )
+                lambda3 = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    g3,
+                )
 
             def _adjoint_rhs_dot_for_mode(k):
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
@@ -3139,24 +3149,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     _take_mode(g3_dot, k) - diagonal_dot.T @ _take_mode(lambda3, k),
                 )
 
-            adjoint_rhs1_dot, adjoint_rhs3_dot = jax.lax.map(
-                _adjoint_rhs_dot_for_mode,
-                mode_indices,
-            )
-            lambda1_dot = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                adjoint_rhs1_dot,
-            )
-            lambda3_dot = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                adjoint_rhs3_dot,
-            )
+            if use_lowdot:
+
+                def _adjoint_rhs_dot_matrix_for_mode(k):
+                    adjoint_rhs1_dot_k, adjoint_rhs3_dot_k = _adjoint_rhs_dot_for_mode(k)
+                    return jnp.stack([adjoint_rhs1_dot_k, adjoint_rhs3_dot_k], axis=-1)
+
+                adjoint_rhs_dot_matrix = jax.lax.map(
+                    _adjoint_rhs_dot_matrix_for_mode,
+                    mode_indices,
+                )
+                lambda_dot_matrix = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    adjoint_rhs_dot_matrix,
+                )
+                lambda1_dot = lambda_dot_matrix[..., 0]
+                lambda3_dot = lambda_dot_matrix[..., 1]
+            else:
+                adjoint_rhs1_dot, adjoint_rhs3_dot = jax.lax.map(
+                    _adjoint_rhs_dot_for_mode,
+                    mode_indices,
+                )
+                lambda1_dot = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    adjoint_rhs1_dot,
+                )
+                lambda3_dot = _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    adjoint_rhs3_dot,
+                )
 
             def _accumulate_base_bars(carry, k):
                 nu_bar, epsi_bar = carry
