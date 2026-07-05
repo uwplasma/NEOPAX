@@ -699,23 +699,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--ntx-exact-derivative-field-pullback-mode",
-        default="generic_jvp",
+        default="compact_vjp",
         choices=("generic_jvp", "compact_vjp"),
         help=(
-            "Reverse-only NTX derivative-field pullback mode. 'generic_jvp' is the "
-            "current correct path. 'compact_vjp' requires NTX to provide a compact "
-            "second-order coefficient-solve VJP helper."
-        ),
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-field-build-mode",
-        default="jvp",
-        choices=("jvp", "vjp_basis"),
-        help=(
-            "Reverse-response derivative-field build mode. 'jvp' preserves the "
-            "existing directional-JVP construction. 'vjp_basis' contracts small "
-            "transport-moment basis cotangents through the handwritten NTX pullback "
-            "instead of forward-mode JVP through the NTX factorization path."
+            "Reverse-only NTX derivative-field pullback mode. 'compact_vjp' uses "
+            "the NTX compact second-order coefficient-solve VJP helper and is the "
+            "intended reverse-lane path. 'generic_jvp' keeps the older fallback "
+            "that can compile through NTX factorization JVPs."
         ),
     )
     parser.add_argument(
@@ -981,7 +971,6 @@ def main() -> None:
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
-        ntx_exact_derivative_field_build_mode=args.ntx_exact_derivative_field_build_mode,
         ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
@@ -1146,7 +1135,6 @@ def main() -> None:
             "reverse_checkpoint_count": reverse_checkpoint_count,
             "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
             "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
-            "ntx_exact_derivative_field_build_mode": str(args.ntx_exact_derivative_field_build_mode),
             "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
             "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
@@ -1174,7 +1162,6 @@ def main() -> None:
             f"parameters={list(PARAMETER_ORDER)} "
             f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
             f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
-            f"ntx_exact_derivative_field_build_mode={args.ntx_exact_derivative_field_build_mode} "
             f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
             f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
             f"max_total_steps={reverse_setup.max_total_steps} "
@@ -1268,7 +1255,6 @@ def main() -> None:
         "reverse_checkpoint_count": reverse_checkpoint_count,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
-        "ntx_exact_derivative_field_build_mode": str(args.ntx_exact_derivative_field_build_mode),
         "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
         "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
@@ -1300,7 +1286,6 @@ def main() -> None:
         f"parameters={list(PARAMETER_ORDER)} "
         f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
         f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
-        f"ntx_exact_derivative_field_build_mode={args.ntx_exact_derivative_field_build_mode} "
         f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
         f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
         f"max_total_steps={reverse_setup.max_total_steps} "
