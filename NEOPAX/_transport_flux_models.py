@@ -2629,41 +2629,186 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_tangent,
         reference_transport_moments_bar,
     ):
-        ntx = _import_ntx()
-        derivative_pullback = _ntx_prepared_coefficient_vector_derivative_pullback(ntx)
+        from ntx._solver_adjoint import (
+            _coefficient_mode_pullback,
+            _parameter_gradient_from_adjoint,
+            _prepared_implicit_vjp_primal,
+        )
+        from ntx._solver_context import _operator_context
+        from ntx._solver_factorization import (
+            _solve_factorized_adjoint,
+            _solve_factorized_modes,
+        )
+        from ntx._solver_prepared import (
+            _parameter_gradient_directional_from_adjoint,
+            _zero_first_row,
+        )
+        from ntx.operators import parameter_derivative_blocks
+
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
         def _one_case_pullback(args):
             energy_index, nu_hat_value, epsi_hat_value, nu_hat_dot, epsi_hat_dot = args
-            case = ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value)
-            case_dot = ntx.MonoenergeticCase(nu_hat=nu_hat_dot, epsi_hat=epsi_hat_dot)
-            coefficient_vector = self._single_coefficient_vector_from_inputs(
+            (
+                coefficients,
+                f1_full,
+                f3_full,
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+            ) = _prepared_implicit_vjp_primal(
                 prepared,
                 nu_hat_value,
                 epsi_hat_value,
-                derivative_mode_override="direct",
             )
             coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
-                coefficient_vector,
+                coefficients,
                 drds_value=drds_value,
                 energy_index=energy_index,
                 transport_moments_bar=reference_transport_moments_bar,
             )
-            base_case_bar, tangent_case_bar = derivative_pullback(
-                prepared,
-                case,
-                case_dot,
-                coefficient_bar,
+
+            ctx = _operator_context(
+                prepared.surface,
+                prepared.geometry,
+                prepared.grid,
+                nu_hat_value,
+                epsi_hat_value,
             )
+
+            source1_dot = []
+            source3_dot = []
+            for k in range(prepared.grid.n_xi + 1):
+                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                if k == 0:
+                    diagonal_nu = _zero_first_row(diagonal_nu)
+                    diagonal_epsi = _zero_first_row(diagonal_epsi)
+                diagonal_dot = nu_hat_dot * diagonal_nu + epsi_hat_dot * diagonal_epsi
+                source1_dot.append(-(diagonal_dot @ f1_full[k]))
+                source3_dot.append(-(diagonal_dot @ f3_full[k]))
+
+            f1_dot = _solve_factorized_modes(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                jnp.stack(source1_dot),
+            )
+            f3_dot = _solve_factorized_modes(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                jnp.stack(source3_dot),
+            )
+
+            def _coefficient_pullback(modes1, modes3, nu_value):
+                return _coefficient_mode_pullback(
+                    prepared.geometry,
+                    modes1,
+                    modes3,
+                    nu_value,
+                    coefficient_bar,
+                )
+
+            (
+                f1_bar_low,
+                f3_bar_low,
+                nu_bar_direct,
+            ), (
+                f1_bar_low_dot,
+                f3_bar_low_dot,
+                nu_bar_direct_dot,
+            ) = jax.jvp(
+                _coefficient_pullback,
+                (f1_full[:3], f3_full[:3], ctx.nu_hat),
+                (f1_dot[:3], f3_dot[:3], nu_hat_dot),
+            )
+
+            g1 = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low)
+            g3 = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low)
+            g1_dot = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low_dot)
+            g3_dot = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low_dot)
+
+            lambda1 = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                g1,
+            )
+            lambda3 = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                g3,
+            )
+
+            adjoint_rhs1_dot = []
+            adjoint_rhs3_dot = []
+            for k in range(prepared.grid.n_xi + 1):
+                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                if k == 0:
+                    diagonal_nu = _zero_first_row(diagonal_nu)
+                    diagonal_epsi = _zero_first_row(diagonal_epsi)
+                diagonal_dot = nu_hat_dot * diagonal_nu + epsi_hat_dot * diagonal_epsi
+                adjoint_rhs1_dot.append(g1_dot[k] - diagonal_dot.T @ lambda1[k])
+                adjoint_rhs3_dot.append(g3_dot[k] - diagonal_dot.T @ lambda3[k])
+
+            lambda1_dot = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                jnp.stack(adjoint_rhs1_dot),
+            )
+            lambda3_dot = _solve_factorized_adjoint(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                jnp.stack(adjoint_rhs3_dot),
+            )
+
+            nu_bar_implicit, epsi_bar = _parameter_gradient_from_adjoint(
+                prepared,
+                ctx,
+                f1_full,
+                f3_full,
+                lambda1,
+                lambda3,
+            )
+            nu_bar_implicit_dot, epsi_bar_dot = _parameter_gradient_directional_from_adjoint(
+                prepared,
+                ctx,
+                f1_full,
+                f3_full,
+                f1_dot,
+                f3_dot,
+                lambda1,
+                lambda3,
+                lambda1_dot,
+                lambda3_dot,
+            )
+            nu_bar = nu_bar_direct + nu_bar_implicit
+            nu_bar_dot = nu_bar_direct_dot + nu_bar_implicit_dot
             return (
-                base_case_bar.nu_hat,
-                jnp.zeros_like(epsi_hat_value)
-                if base_case_bar.epsi_hat is None
-                else base_case_bar.epsi_hat,
-                tangent_case_bar.nu_hat,
-                jnp.zeros_like(epsi_hat_value)
-                if tangent_case_bar.epsi_hat is None
-                else tangent_case_bar.epsi_hat,
+                nu_bar,
+                epsi_bar,
+                nu_bar_dot,
+                epsi_bar_dot,
             )
 
         return jax.lax.map(
