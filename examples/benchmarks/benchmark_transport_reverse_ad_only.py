@@ -763,6 +763,35 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ntx-radial-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Exact-runtime NTX radial batch size for this reverse-AD lane. "
+            "Unset/0 preserves the config default; values >1 enable the "
+            "runtime radial mapper selected by --ntx-radial-batch-mode."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-radial-batch-mode",
+        default=None,
+        choices=("simple", "lax_map", "vmap", "hybrid"),
+        help=(
+            "Exact-runtime NTX radial mapper override. 'hybrid' uses chunked "
+            "lax.map over radial batches with vmap inside each chunk."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-scan-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Exact-runtime NTX coefficient-scan batch size across energy-grid "
+            "cases. Unset/0 preserves the config default; values >1 chunk the "
+            "energy/collisionality scan."
+        ),
+    )
+    parser.add_argument(
         "--radau-jacobian-reuse-mode",
         type=str,
         default=None,
@@ -1043,6 +1072,13 @@ def main() -> None:
         ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    neoclassical_cfg = config.setdefault("neoclassical", {})
+    if args.ntx_radial_batch_size not in (None, 0):
+        neoclassical_cfg["ntx_exact_radial_batch_size"] = int(args.ntx_radial_batch_size)
+    if args.ntx_radial_batch_mode not in (None, ""):
+        neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
+    if args.ntx_scan_batch_size not in (None, 0):
+        neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(
@@ -1208,6 +1244,9 @@ def main() -> None:
             "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
             "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
             "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
+            "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
+            "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
+            "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
             "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1237,6 +1276,9 @@ def main() -> None:
             f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
             f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
             f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
+            f"ntx_exact_radial_batch_size={neoclassical_cfg.get('ntx_exact_radial_batch_size')} "
+            f"ntx_exact_radial_batch_mode={neoclassical_cfg.get('ntx_exact_radial_batch_mode', 'simple')} "
+            f"ntx_exact_scan_batch_size={neoclassical_cfg.get('ntx_exact_scan_batch_size')} "
             f"max_total_steps={reverse_setup.max_total_steps} "
             f"reverse_checkpoint_count={reverse_checkpoint_count} "
             f"reverse_segment_length={reverse_segment_length} "
@@ -1332,6 +1374,9 @@ def main() -> None:
         "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
         "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
         "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
+        "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
+        "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
+        "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
         "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1365,6 +1410,9 @@ def main() -> None:
         f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
         f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
         f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
+        f"ntx_exact_radial_batch_size={neoclassical_cfg.get('ntx_exact_radial_batch_size')} "
+        f"ntx_exact_radial_batch_mode={neoclassical_cfg.get('ntx_exact_radial_batch_mode', 'simple')} "
+        f"ntx_exact_scan_batch_size={neoclassical_cfg.get('ntx_exact_scan_batch_size')} "
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "
