@@ -1394,7 +1394,7 @@ def main() -> None:
                 for parameter_name in PARAMETER_ORDER:
                     print(
                         f"      d{objective_name}/d{parameter_name}: "
-                        f"rev={gradient_by_objective[objective_name][parameter_name]:.6e}"
+                        f"rev={gradient_by_objective[objective_name][parameter_name]:.16e}"
                     )
         outpath = _report_path("all")
         outpath.write_text(json.dumps(report, indent=2))
@@ -1661,7 +1661,7 @@ def main() -> None:
         )
     print("[autodiff-gate] reverse gradients:")
     for name, value in zip(PARAMETER_ORDER, grad_np.tolist()):
-        print(f"  - d{args.objective}/d{name}: rev={float(value):.6e}")
+        print(f"  - d{args.objective}/d{name}: rev={float(value):.16e}")
     outpath = _report_path(args.objective)
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
