@@ -4793,6 +4793,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         density_local,
         collisionality_kind,
         field_bars,
+        scan_species: bool = False,
     ):
         vthermal_local = get_v_thermal(self.species.mass, temperature_local)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
@@ -4833,6 +4834,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 reference_epsi_hat_bar=reference_epsi_hat_bar,
                 vth_a_bar=vth_a_bar,
             )
+
+        if scan_species:
+            field_bar_tuple = _interpolated_response_field_bar_tuple(field_bars)
+
+            def _accumulate_species(carry, species_index):
+                er_bar, temperature_bar, density_bar = carry
+                species_field_bars = tuple(
+                    jax.lax.dynamic_index_in_dim(
+                        field_bar,
+                        species_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    for field_bar in field_bar_tuple
+                )
+                (
+                    er_species_bar,
+                    temperature_species_bar,
+                    density_species_bar,
+                ) = _per_species_pullback(species_index, species_field_bars)
+                return (
+                    er_bar + er_species_bar,
+                    temperature_bar + temperature_species_bar,
+                    density_bar + density_species_bar,
+                ), None
+
+            (
+                er_bar,
+                temperature_bar,
+                density_bar,
+            ), _ = jax.lax.scan(
+                _accumulate_species,
+                (
+                    jnp.zeros_like(er_value),
+                    jnp.zeros_like(temperature_local),
+                    jnp.zeros_like(density_local),
+                ),
+                species_indices,
+            )
+            return er_bar, temperature_bar, density_bar
 
         er_species_bar, temperature_species_bar, density_species_bar = jax.vmap(
             _per_species_pullback,
@@ -5338,6 +5379,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "zero_rebuild_local_moments",
                 "rebuild_local_moment_pullback_zero",
             }
+            scan_local_moment_pullback = reverse_stage_cotangent_mode in {
+                "scan_rebuild_local_moment_pullback",
+                "scan_rebuild_local_moments",
+                "rebuild_local_moment_pullback_scan",
+            }
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
             def _pullback_one_anchor(anchor_pos):
@@ -5446,6 +5492,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             density_local=density_safe_local,
                             collisionality_kind=collisionality_kind,
                             field_bars=local_field_bars,
+                            scan_species=scan_local_moment_pullback,
                         )
 
                     pressure_local_bar = temperature_local_bar / density_safe_local
