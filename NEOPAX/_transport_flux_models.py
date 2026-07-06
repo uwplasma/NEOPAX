@@ -1780,8 +1780,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "lowdot_recompute": "scalar_contract_lowdot_recompute",
             "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
             "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
-            "ntx_scalar_pullback": "scalar_contract_ntx_pullback",
-            "scalar-ntx-pullback": "scalar_contract_ntx_pullback",
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
@@ -1792,14 +1790,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract",
             "scalar_contract_lowdot",
             "scalar_contract_lowdot_recompute",
-            "scalar_contract_ntx_pullback",
             "scalar_contract_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
-                "scalar_contract_lowdot_recompute, scalar_contract_ntx_pullback, "
-                "scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
             )
         return normalized
 
@@ -2588,43 +2584,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         reference_transport_moments_bar,
     ):
-        derivative_pullback_algebra = self._normalize_derivative_pullback_algebra(
-            self.derivative_pullback_algebra
-        )
-        if derivative_pullback_algebra == "scalar_contract_ntx_pullback":
-            from ntx import MonoenergeticCase
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_scalar_pullback
-
-            energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
-
-            def _one_case_pullback(energy_index):
-                nu_hat_value = reference_nu_hat[energy_index]
-                epsi_hat_value = reference_epsi_hat[energy_index]
-                coefficient_vector = self._single_coefficient_vector_from_inputs(
-                    prepared,
-                    nu_hat_value,
-                    epsi_hat_value,
-                    derivative_mode_override="direct",
-                )
-                coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
-                    coefficient_vector,
-                    drds_value=drds_value,
-                    energy_index=energy_index,
-                    transport_moments_bar=reference_transport_moments_bar,
-                )
-                case_bar = solve_prepared_coefficient_vector_scalar_pullback(
-                    prepared,
-                    MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
-                    coefficient_bar,
-                )
-                return case_bar.nu_hat, case_bar.epsi_hat
-
-            nu_hat_bar, epsi_hat_bar = jax.lax.map(
-                _one_case_pullback,
-                energy_indices,
-            )
-            return nu_hat_bar, epsi_hat_bar
-
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
         # stays on the NEOPAX side and never pushes a traced `prepared` through
         # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.
@@ -4157,6 +4116,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             nu_hat_dot,
             epsi_hat_dot,
             transport_moments_bar,
+            f1_dot_low,
+            f3_dot_low,
         ):
             coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
                 coefficients,
@@ -4187,20 +4148,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             def _source3_dot_for_mode(k):
                 _, source3_dot_k = _source_dot_pair_for_mode(k)
                 return source3_dot_k
-
-            def _source_dot_matrix_for_mode(k):
-                source1_dot_k, source3_dot_k = _source_dot_pair_for_mode(k)
-                return jnp.stack([source1_dot_k, source3_dot_k], axis=-1)
-
-            f_dot_low_matrix = _solve_factorized_low_modes_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                _source_dot_matrix_for_mode,
-            )
-            f1_dot_low = f_dot_low_matrix[..., 0]
-            f3_dot_low = f_dot_low_matrix[..., 1]
 
             def _coefficient_pullback(modes1, modes3, nu_value):
                 return _coefficient_mode_pullback(
@@ -4464,6 +4411,49 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 saved_upper,
                 base_transport_moments_bar,
             )
+
+            def _source_dot_pair_for_direction(k, nu_hat_dot, epsi_hat_dot):
+                diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                diagonal_nu = _zero_first_row_if_needed(diagonal_nu, k)
+                diagonal_epsi = _zero_first_row_if_needed(diagonal_epsi, k)
+                diagonal_dot = nu_hat_dot * diagonal_nu + epsi_hat_dot * diagonal_epsi
+                return (
+                    -(diagonal_dot @ _take_mode(f1_full, k)),
+                    -(diagonal_dot @ _take_mode(f3_full, k)),
+                )
+
+            def _packed_source_dot_matrix_for_mode(k):
+                first_source1, first_source3 = _source_dot_pair_for_direction(
+                    k,
+                    first_nu_dot,
+                    first_epsi_dot,
+                )
+                second_source1, second_source3 = _source_dot_pair_for_direction(
+                    k,
+                    second_nu_dot,
+                    second_epsi_dot,
+                )
+                return jnp.stack(
+                    [first_source1, first_source3, second_source1, second_source3],
+                    axis=-1,
+                )
+
+            packed_f_dot_low_matrix = _solve_factorized_low_modes_scan(
+                saved_lu,
+                saved_piv,
+                saved_lower,
+                saved_upper,
+                _packed_source_dot_matrix_for_mode,
+            )
+            first_f1_dot_low = packed_f_dot_low_matrix[..., 0]
+            first_f3_dot_low = packed_f_dot_low_matrix[..., 1]
+            second_f1_dot_low = packed_f_dot_low_matrix[..., 2]
+            second_f3_dot_low = packed_f_dot_low_matrix[..., 3]
             first = _one_direction_pullback(
                 ctx,
                 mode_indices,
@@ -4478,6 +4468,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 first_nu_dot,
                 first_epsi_dot,
                 first_transport_moments_bar,
+                first_f1_dot_low,
+                first_f3_dot_low,
             )
             second = _one_direction_pullback(
                 ctx,
@@ -4493,6 +4485,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 second_nu_dot,
                 second_epsi_dot,
                 second_transport_moments_bar,
+                second_f1_dot_low,
+                second_f3_dot_low,
             )
             return (*base, *first, *second)
 
