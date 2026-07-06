@@ -3607,9 +3607,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ):
         epsi_hat_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (self.energy_grid.v_norm * vth_a)
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        normalized_derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
         derivative_mode_override = (
             "iterative_jvp"
-            if self._normalize_derivative_mode(self.derivative_mode) == "iterative_vjp"
+            if normalized_derivative_mode == "iterative_vjp"
+            else "direct"
+            if normalized_derivative_mode == "recompute_vjp"
             else None
         )
 
@@ -3645,9 +3648,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_a,
     ):
         energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        normalized_derivative_mode = self._normalize_derivative_mode(self.derivative_mode)
         derivative_mode_override = (
             "iterative_jvp"
-            if self._normalize_derivative_mode(self.derivative_mode) == "iterative_vjp"
+            if normalized_derivative_mode == "iterative_vjp"
+            else "direct"
+            if normalized_derivative_mode == "recompute_vjp"
             else None
         )
 
