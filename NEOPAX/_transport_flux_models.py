@@ -1780,6 +1780,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "lowdot_recompute": "scalar_contract_lowdot_recompute",
             "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
             "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
+            "ntx_scalar_pullback": "scalar_contract_ntx_pullback",
+            "scalar-ntx-pullback": "scalar_contract_ntx_pullback",
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
@@ -1790,12 +1792,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract",
             "scalar_contract_lowdot",
             "scalar_contract_lowdot_recompute",
+            "scalar_contract_ntx_pullback",
             "scalar_contract_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
-                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_ntx_pullback, "
+                "scalar_contract_matrix_free"
             )
         return normalized
 
@@ -2584,6 +2588,43 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         reference_transport_moments_bar,
     ):
+        derivative_pullback_algebra = self._normalize_derivative_pullback_algebra(
+            self.derivative_pullback_algebra
+        )
+        if derivative_pullback_algebra == "scalar_contract_ntx_pullback":
+            from ntx import MonoenergeticCase
+            from ntx._solver_prepared import solve_prepared_coefficient_vector_scalar_pullback
+
+            energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+            def _one_case_pullback(energy_index):
+                nu_hat_value = reference_nu_hat[energy_index]
+                epsi_hat_value = reference_epsi_hat[energy_index]
+                coefficient_vector = self._single_coefficient_vector_from_inputs(
+                    prepared,
+                    nu_hat_value,
+                    epsi_hat_value,
+                    derivative_mode_override="direct",
+                )
+                coefficient_bar = self._pullback_transport_moments_from_single_coefficient_vector(
+                    coefficient_vector,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                    transport_moments_bar=reference_transport_moments_bar,
+                )
+                case_bar = solve_prepared_coefficient_vector_scalar_pullback(
+                    prepared,
+                    MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
+                    coefficient_bar,
+                )
+                return case_bar.nu_hat, case_bar.epsi_hat
+
+            nu_hat_bar, epsi_hat_bar = jax.lax.map(
+                _one_case_pullback,
+                energy_indices,
+            )
+            return nu_hat_bar, epsi_hat_bar
+
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
         # stays on the NEOPAX side and never pushes a traced `prepared` through
         # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.

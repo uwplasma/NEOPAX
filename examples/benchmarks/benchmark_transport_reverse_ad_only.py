@@ -734,6 +734,7 @@ def main() -> None:
             "scalar_contract",
             "scalar_contract_lowdot",
             "scalar_contract_lowdot_recompute",
+            "scalar_contract_ntx_pullback",
             "scalar_contract_matrix_free",
         ),
         help=(
