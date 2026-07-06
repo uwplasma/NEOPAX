@@ -1757,6 +1757,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "lowdot": "scalar_contract_lowdot",
             "scalar-lowdot": "scalar_contract_lowdot",
             "scalar_contract_no_f_dot": "scalar_contract_lowdot",
+            "lowdot_recompute": "scalar_contract_lowdot_recompute",
+            "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
+            "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
@@ -1766,12 +1769,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "ntx_helper",
             "scalar_contract",
             "scalar_contract_lowdot",
+            "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
-                "scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
             )
         return normalized
 
@@ -3794,6 +3798,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         from jax.scipy.linalg import lu_solve
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+        use_recompute_lowdot = (
+            self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
+            == "scalar_contract_lowdot_recompute"
+        )
 
         def _zero_first_row_if_needed(block, k):
             zeroed = block.at[0, :].set(jnp.zeros((block.shape[1],), dtype=block.dtype))
@@ -4154,13 +4162,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             g3 = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low)
             g1_dot = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low_dot)
             g3_dot = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low_dot)
-            lambda_matrix = _solve_factorized_adjoint_scan(
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-                jnp.stack([g1, g3], axis=-1),
-            )
+
+            def _solve_lambda_matrix():
+                return _solve_factorized_adjoint_scan(
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                    jnp.stack([g1, g3], axis=-1),
+                )
+
+            lambda_matrix = _solve_lambda_matrix()
             lambda1 = lambda_matrix[..., 0]
             lambda3 = lambda_matrix[..., 1]
 
@@ -4295,6 +4307,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return contracted
 
             nu_bar_implicit_dot, epsi_bar_dot = -_contract_adjoint_dot_parameter_sources_scan()
+
+            if use_recompute_lowdot:
+                lambda_matrix = _solve_lambda_matrix()
+                lambda1 = lambda_matrix[..., 0]
+                lambda3 = lambda_matrix[..., 1]
 
             def _source_bar_pair_for_mode(lambdas, k):
                 diagonal_nu, diagonal_epsi = parameter_derivative_blocks(
@@ -4470,7 +4487,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self._normalize_derivative_field_pullback_mode(self.derivative_field_pullback_mode)
             == "compact_vjp"
             and self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
-            == "scalar_contract_lowdot"
+            in {"scalar_contract_lowdot", "scalar_contract_lowdot_recompute"}
         )
         if use_fused_lowdot_derivative_pullback:
             epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
