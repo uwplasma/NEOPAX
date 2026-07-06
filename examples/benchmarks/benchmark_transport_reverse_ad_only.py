@@ -381,10 +381,10 @@ def _reverse_objective_vector_for_parameter_vector(
     )
     final_y = _radau_adaptive_final_y_realized_schedule_vjp(
         reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
         initial_carry,
-        stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
-        max_total_steps=reverse_setup.max_total_steps,
-        reverse_segment_length=reverse_setup.reverse_segment_length,
     )
     final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)

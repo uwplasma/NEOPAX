@@ -1306,3 +1306,173 @@ Success criteria:
 - compile memory visibly drops,
 - compile-plus-execute time does not worsen,
 - no CPU fallback, host callback, or full lagged/RHS checkpointing.
+
+## 2026-07-06 correction: scalar-contract and NTX-local variants are now tried
+
+Important correction:
+
+- The earlier note saying the scalar-contract pullback had not yet been tried
+  is now stale.
+- We have now tried several exact NTX/NEOPAX scalar-contract variants.
+- They preserved gradients, and some reduced compile time, but they did not
+  reduce the host RAM plateau enough to count as the memory solution.
+
+Recent correct 2-step reference command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected 2-step gradients:
+
+- `dsoftmax_Er/dn0 = -3.578617e-01`
+- `dsoftmax_Er/dT0 = 3.010300e-01`
+- `dsoftmax_Er/ddensity_shape_power = -7.886159e-03`
+- `dsoftmax_Er/dtemperature_shape_power = 1.779140e-01`
+
+Tried and should not be repeated as the main memory solution:
+
+- `scalar_contract`
+  - Correct direction, but not enough by itself.
+- `scalar_contract_lowdot`
+  - Best recent compile-time behavior in the 2-step lane.
+  - Still leaves RAM in the same broad high band.
+- `scalar_contract_lowdot_recompute`
+  - Did not reduce RAM meaningfully.
+- `scalar_contract_lowdot_ntx`
+  - NTX helper version with the same exact gradients.
+  - A packed two-direction version did not reduce RAM.
+  - A later direction-scan version also preserved gradients but still showed
+    the same RAM class:
+    - latest result: `reverse_total_s = 5.032938e+02`
+    - `reverse_compile_plus_execute_s = 4.832360e+02`
+    - `reverse_execute_s_mean = 2.005789e+01`
+  - Conclusion: the two derivative directions are not the dominant live-memory
+    source.
+- `scalar_contract_matrix_free`
+  - It reduced some compile/memory symptoms but changed gradients and depends
+    on iterative tolerance behavior.
+  - Do not use it as the correctness-preserving path.
+- `ntx_exact_scan_batch_size=1`
+  - Increased time/memory in the observed run.
+  - Do not use batching as the current target.
+- `recompute_vjp` prepared-solve boundary
+  - Preserved gradients and looked similar; not proven to solve memory.
+- `scan_rebuild_local_moment_pullback`, `scan_rebuild_anchor_pullback`,
+  `reduced_cotangent_lean_replay`, `reduced_cotangent_recompute_replay`
+  - Correct or near-correct local structural tests, but no decisive RAM drop.
+
+Current implementation note:
+
+- The working tree currently contains an experimental NTX helper path for
+  `scalar_contract_lowdot_ntx`.
+- It should be considered diagnostic, not the recommended production path,
+  unless later XLA dump evidence proves it reduces HLO allocation size.
+- The benchmark script also has `--objective all`, which computes all metric
+  derivatives with `jax.jacrev`. This is useful for derivative reporting, but
+  it is expected to be heavier than a single scalar objective and is not a
+  memory-reduction path.
+
+Updated conclusion:
+
+- The dominant memory is not caused by:
+  - two derivative-direction duplication,
+  - coefficient-solve boundary placement,
+  - local scan/replay cotangent packaging,
+  - NTX scan batching,
+  - or outer segment/host-call boundaries.
+- The RAM plateau is more consistent with large arrays made live by the
+  accepted-step reverse body and NTX factorization/pullback algebra as a whole.
+- The next useful work must be evidence-driven from XLA allocation reports, not
+  another nearby algebra variant.
+
+Next-session plan:
+
+1. First freeze the current best correctness/compile baseline.
+
+   Recommended baseline command:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+     --ntx-exact-derivative-mode direct \
+     --ntx-exact-derivative-field-pullback-mode compact_vjp \
+     --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot \
+     --objective softmax_Er \
+     --accepted-step-limit 2 \
+     --radau-jacobian-reuse-mode legacy \
+     --timing-mode jit-warm \
+     --reverse-segment-length 2 \
+     --reverse-stage-adjoint-solve-mode bicgstab \
+     --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+     --reverse-step-bwd-mode reduced_cotangent
+   ```
+
+2. Dump XLA for the baseline and inspect the biggest allocation names before
+   changing code again.
+
+   Do not guess from the RAM graph alone. Use the memory-usage report and grep
+   the largest allocation/user chain.
+
+3. If the largest allocations are still LU/factorization arrays from NTX:
+
+   - Do not try matrix-free/tolerance-dependent Krylov variants.
+   - Do not use scan batching yet.
+   - Instead prototype an exact factorization-storage reduction:
+     - avoid storing both LU and original dense blocks if both are live,
+     - check whether saved lower/upper coupling blocks can be recomputed
+       inside the reverse scan from smaller primitives,
+     - or split the factorized forward/backward triangular contractions so
+       only one mode block is live at a time.
+   - Success criterion is an XLA memory report reduction, not just wall-clock
+     variation.
+
+4. If the largest allocations are in the accepted-step/rebuild graph rather
+   than NTX LU arrays:
+
+   - Return to `_execute_radau_accepted_step_next_reduced_cotangent_bwd`.
+   - Target the rebuild branch body itself, not branch scheduling.
+   - Do not static-unroll realized branch schedules; that previously caused
+     host-memory blowup.
+
+5. Keep the all-metric derivative feature separate.
+
+   To get derivatives for every metric:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+     --ntx-exact-derivative-mode direct \
+     --ntx-exact-derivative-field-pullback-mode compact_vjp \
+     --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot \
+     --objective all \
+     --accepted-step-limit 2 \
+     --radau-jacobian-reuse-mode legacy \
+     --timing-mode jit-warm \
+     --reverse-segment-length 2 \
+     --reverse-stage-adjoint-solve-mode bicgstab \
+     --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+     --reverse-step-bwd-mode reduced_cotangent
+   ```
+
+   This is for derivative coverage, not for memory reduction.
+
+Do not pursue next:
+
+- more `scalar_contract_lowdot_ntx` direction-packing or direction-scan
+  variants,
+- `scalar_contract_ntx_pullback`,
+- matrix-free/tolerance-dependent algebra,
+- NTX scan batching,
+- static branch schedule/unroll,
+- more per-energy nested JIT wrappers,
+- host-segment orchestration as the final solution.
