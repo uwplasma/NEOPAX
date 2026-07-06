@@ -823,6 +823,7 @@ def main() -> None:
             "zero_rebuild_anchor_fields",
             "zero_rebuild_local_moment_pullback",
             "scan_rebuild_local_moment_pullback",
+            "scan_rebuild_anchor_pullback",
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
@@ -843,12 +844,15 @@ def main() -> None:
             "but skips the local NTX moment-response pullback; "
             "'scan_rebuild_local_moment_pullback' keeps the local NTX moment-response "
             "pullback exact but scans over species instead of materializing a species stack; "
+            "'scan_rebuild_anchor_pullback' additionally scans over rebuild anchors and "
+            "accumulates state bars directly; "
             "'zero_step_bwd' bypasses the accepted-step "
             "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Most non-full "
             "diagnostic modes intentionally change gradients unless the forced branch matches the "
             "realized primal branch for every accepted step; 'scan_rebuild_local_moment_pullback' "
-            "is intended to preserve gradients; 'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
+            "and 'scan_rebuild_anchor_pullback' are intended to preserve gradients; "
+            "'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
             "a non-inlined compiled call boundary."
         ),
     )

@@ -5383,6 +5383,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "scan_rebuild_local_moment_pullback",
                 "scan_rebuild_local_moments",
                 "rebuild_local_moment_pullback_scan",
+                "scan_rebuild_anchor_pullback",
+                "scan_rebuild_anchor_local_moment_pullback",
+            }
+            scan_anchor_pullback = reverse_stage_cotangent_mode in {
+                "scan_rebuild_anchor_pullback",
+                "scan_rebuild_anchor_local_moment_pullback",
+                "rebuild_anchor_pullback_scan",
             }
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
@@ -5521,6 +5528,37 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     _axis_anchor_zero_pullback,
                     _non_axis_anchor_pullback,
                     operand=None,
+                )
+
+            if scan_anchor_pullback:
+                def _accumulate_anchor(carry, anchor_pos):
+                    density_carry, pressure_carry, er_carry = carry
+                    (
+                        radius_index,
+                        density_local_bar,
+                        pressure_local_bar,
+                        er_local_bar,
+                    ) = _pullback_one_anchor(anchor_pos)
+                    return (
+                        density_carry.at[:, radius_index].add(density_local_bar),
+                        pressure_carry.at[:, radius_index].add(pressure_local_bar),
+                        er_carry.at[radius_index].add(er_local_bar),
+                    ), None
+
+                (
+                    density_bar,
+                    pressure_bar,
+                    er_bar,
+                ), _ = jax.lax.scan(
+                    _accumulate_anchor,
+                    (density_bar, pressure_bar, er_bar),
+                    anchor_positions,
+                )
+                return dataclasses.replace(
+                    state,
+                    density=density_bar,
+                    pressure=pressure_bar,
+                    Er=er_bar,
                 )
 
             (
