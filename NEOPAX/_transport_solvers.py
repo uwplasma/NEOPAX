@@ -5525,9 +5525,10 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
         r0 = b - matvec(x0)
         r_hat = r0
         zeros = jnp.zeros_like(b)
-        one = jnp.asarray(1.0, dtype=kernel_context.dtype)
         norm_b = jnp.sqrt(jnp.maximum(jnp.vdot(b, b), jnp.asarray(0.0, dtype=kernel_context.dtype)))
-        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * jnp.maximum(norm_b, one)
+        # Use a relative residual test.  The previous max(norm_b, 1) made
+        # small cotangent RHS values converge immediately at the zero guess.
+        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * norm_b
         initial_residual_norm = jnp.sqrt(
             jnp.maximum(jnp.vdot(r0, r0), jnp.asarray(0.0, dtype=kernel_context.dtype))
         )
