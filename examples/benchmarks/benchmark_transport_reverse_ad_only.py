@@ -863,6 +863,7 @@ def main() -> None:
             "manual_split",
             "reduced_cotangent",
             "reduced_cotangent_lean_replay",
+            "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",
         ),
         default="current",
@@ -874,6 +875,8 @@ def main() -> None:
             "uses a reduced final-state cotangent contract inside the segmented "
             "accepted-step reverse scan. 'reduced_cotangent_lean_replay' stores "
             "the per-slot replay tape after masking forward-only Radau cache fields. "
+            "'reduced_cotangent_recompute_replay' recomputes each slot start from "
+            "the segment checkpoint instead of storing the full per-slot carry tape. "
             "'reduced_cotangent_host_segments' is only "
             "for split-vjp timing and orchestrates segment backward kernels outside "
             "the monolithic rollout-bwd JIT."

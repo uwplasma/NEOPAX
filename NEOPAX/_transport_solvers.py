@@ -9887,7 +9887,9 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         reduced_cotangent_bwd = step_bwd_mode in {
             "reduced_cotangent",
             "reduced_cotangent_lean_replay",
+            "reduced_cotangent_recompute_replay",
             "lean_replay",
+            "recompute_replay",
             "reduced",
             "state_only",
             "final_state",
@@ -9897,6 +9899,10 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         lean_reduced_replay_tape = step_bwd_mode in {
             "reduced_cotangent_lean_replay",
             "lean_replay",
+        }
+        recompute_reduced_replay_tape = step_bwd_mode in {
+            "reduced_cotangent_recompute_replay",
+            "recompute_replay",
         }
 
         def _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry):
@@ -9947,6 +9953,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
 
             def _segment_bwd_reduced(reduced_bar, xs):
                 segment_start_carry, segment_arrays = xs
+                segment_slot_count = int(segment_arrays[0].shape[0])
 
                 def _segment_collect_start_carries(carry, slot_xs):
                     next_carry, _ = _radau_replay_realized_accepted_slot(
@@ -9961,17 +9968,56 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     )
                     return next_carry, stored_carry
 
-                _, step_start_carries = jax.lax.scan(
-                    _segment_collect_start_carries,
-                    segment_start_carry,
-                    segment_arrays,
-                )
+                def _take_segment_slot(slot_index):
+                    return jax.tree_util.tree_map(
+                        lambda value: jax.lax.dynamic_index_in_dim(
+                            value,
+                            slot_index,
+                            axis=0,
+                            keepdims=False,
+                        ),
+                        segment_arrays,
+                    )
+
+                def _replay_to_slot_start(slot_index):
+                    def _replay_body(carry, replay_index):
+                        slot_xs = _take_segment_slot(replay_index)
+                        next_carry, _ = _radau_replay_realized_accepted_slot(
+                            execution_context,
+                            carry,
+                            *slot_xs,
+                        )
+                        carry = jax.lax.cond(
+                            replay_index < slot_index,
+                            lambda _: next_carry,
+                            lambda _: carry,
+                            operand=None,
+                        )
+                        return carry, None
+
+                    carry_at_slot_start, _ = jax.lax.scan(
+                        _replay_body,
+                        segment_start_carry,
+                        jnp.arange(segment_slot_count, dtype=jnp.int32),
+                    )
+                    return _radau_carry_with_forward_only_jvp_fields(carry_at_slot_start)
+
+                if not recompute_reduced_replay_tape:
+                    _, step_start_carries = jax.lax.scan(
+                        _segment_collect_start_carries,
+                        segment_start_carry,
+                        segment_arrays,
+                    )
                 zero_step_bwd = cotangent_mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
                 force_reuse_bwd = cotangent_mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
                 force_rebuild_bwd = cotangent_mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
 
                 def _slot_bwd(slot_reduced_bar, slot_xs):
-                    step_start_carry, slot_arrays = slot_xs
+                    if recompute_reduced_replay_tape:
+                        slot_index, slot_arrays = slot_xs
+                        step_start_carry = _replay_to_slot_start(slot_index)
+                    else:
+                        step_start_carry, slot_arrays = slot_xs
                     if zero_step_bwd:
                         return _zero_reduced_cotangent_like(step_start_carry), None
 
@@ -10026,12 +10072,20 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                     step_start_reduced_bar = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
                     return step_start_reduced_bar, None
 
-                segment_start_reduced_bar, _ = jax.lax.scan(
-                    _slot_bwd,
-                    reduced_bar,
-                    (step_start_carries, segment_arrays),
-                    reverse=True,
-                )
+                if recompute_reduced_replay_tape:
+                    segment_start_reduced_bar, _ = jax.lax.scan(
+                        _slot_bwd,
+                        reduced_bar,
+                        (jnp.arange(segment_slot_count, dtype=jnp.int32), segment_arrays),
+                        reverse=True,
+                    )
+                else:
+                    segment_start_reduced_bar, _ = jax.lax.scan(
+                        _slot_bwd,
+                        reduced_bar,
+                        (step_start_carries, segment_arrays),
+                        reverse=True,
+                    )
                 return segment_start_reduced_bar, None
 
             carry0_reduced_bar, _ = jax.lax.scan(
