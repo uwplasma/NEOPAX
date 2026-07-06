@@ -3164,6 +3164,7 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     *,
     force_lagged_response_reuse: bool = False,
     lagged_response_branch: str | None = None,
+    allow_exact_lagged_cache_tangent: bool = False,
 ) -> _RadauAcceptedStepAttemptResult:
     """Compute the accepted-step tangent from an already computed primal result."""
     if force_lagged_response_reuse:
@@ -3304,6 +3305,26 @@ def _radau_accepted_step_attempt_tangent_from_primal(
     def _exact_lagged_cache_tangent(_):
         z_final = primal_result.stage_history
 
+        def _residual_wrt_z(z_flat):
+            f0_local = _radau_eval_rhs(
+                carry_in.t,
+                carry_in.y,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+            return _radau_stage_residual(
+                kernel_context,
+                physics_context,
+                flat_y=carry_in.y,
+                t_value=carry_in.t,
+                h_value=primal_result.trial_dt,
+                z_flat=z_flat,
+                f0=f0_local,
+                jacobian_ref=primal_result.jacobian_out,
+                lagged_response=lagged_response,
+            )
+
         def _residual_wrt_inputs(flat_y, h_scalar, lagged_response_value):
             f0_local = _radau_eval_rhs(
                 carry_in.t,
@@ -3359,7 +3380,10 @@ def _radau_accepted_step_attempt_tangent_from_primal(
                 )
             )
         tangent_result = jax.lax.cond(
-            jnp.logical_and(jnp.asarray(lagged_response is not None), lagged_cache_tangent_active),
+            jnp.logical_and(
+                jnp.asarray(bool(allow_exact_lagged_cache_tangent) and lagged_response is not None),
+                lagged_cache_tangent_active,
+            ),
             _exact_lagged_cache_tangent,
             _approximate_tangent,
             operand=None,
@@ -3400,6 +3424,7 @@ def _execute_radau_accepted_step_attempt_with_approx_tangent(
         carry_tangent,
         context,
         primal_result,
+        allow_exact_lagged_cache_tangent=True,
     )
     return primal_result, tangent_attempt
 
@@ -8998,6 +9023,7 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                     tangent_for_step,
                     execution_context.attempt_context,
                     primal_attempt_result,
+                    allow_exact_lagged_cache_tangent=True,
                 )
                 accepted_y = _project_flat_state_if_needed(
                     primal_attempt_result.trial_y,

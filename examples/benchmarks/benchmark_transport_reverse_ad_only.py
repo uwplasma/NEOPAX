@@ -1295,6 +1295,16 @@ def main() -> None:
             reverse_lagged_reuse_count = int(sum(bool(value) for value in reverse_lagged_branch_schedule))
             reverse_lagged_rebuild_count = int(len(reverse_lagged_branch_schedule) - reverse_lagged_reuse_count)
 
+        objective_values_by_name = None
+        if args.timing_mode != "jit-compile-only":
+            objective_values = objective_vector_fn(baseline_values)
+            objective_values = jax.block_until_ready(objective_values)
+            objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+            objective_values_by_name = {
+                objective_name: float(value)
+                for objective_name, value in zip(OBJECTIVE_LABELS, objective_values_np.tolist())
+            }
+
         gradient_by_objective = None
         if gradient_matrix is not None:
             gradient_np = np.asarray(jax.device_get(gradient_matrix), dtype=float)
@@ -1311,6 +1321,7 @@ def main() -> None:
             "config_path": str(Path(args.config)),
             "objective_name": "all",
             "objective_order": list(OBJECTIVE_LABELS),
+            "objective_values": objective_values_by_name,
             "parameter_order": list(PARAMETER_ORDER),
             "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
             "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
@@ -1373,6 +1384,10 @@ def main() -> None:
                 + ",".join(f"{float(value):.6e}" for value in reverse_execute_times_s)
             )
         if gradient_by_objective is not None:
+            if objective_values_by_name is not None:
+                print("[autodiff-gate] objective values:")
+                for objective_name in OBJECTIVE_LABELS:
+                    print(f"  - {objective_name}: value={objective_values_by_name[objective_name]:.6e}")
             print("[autodiff-gate] reverse gradients by objective:")
             for objective_name in OBJECTIVE_LABELS:
                 print(f"  - {objective_name}:")
