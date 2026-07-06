@@ -358,6 +358,38 @@ def _reverse_objective_for_parameter_vector(
     return _objective_vector(final_state, runtime)[objective_index]
 
 
+def _reverse_objective_vector_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+):
+    state0 = _initial_state_for_parameter_vector(
+        parameter_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    initial_carry = _reverse_initial_carry_from_state_with_static_setup(
+        solver=reverse_setup.solver,
+        state=state0,
+        solve_vector_field=reverse_setup.solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=reverse_setup.prepared_rollout,
+    )
+    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+        reverse_setup.execution_context,
+        initial_carry,
+        stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
+        max_total_steps=reverse_setup.max_total_steps,
+        reverse_segment_length=reverse_setup.reverse_segment_length,
+    )
+    final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
+    return _objective_vector(final_state, runtime)
+
+
 def _reverse_initial_carry_for_parameter_vector(
     parameter_values,
     *,
@@ -681,8 +713,11 @@ def main() -> None:
         "--objective",
         type=str,
         default="softmax_Er",
-        choices=OBJECTIVE_LABELS,
-        help="Scalar objective for reverse mode. One run returns all profile-parameter gradients.",
+        choices=tuple(OBJECTIVE_LABELS) + ("all",),
+        help=(
+            "Scalar objective for reverse mode. Use 'all' to return the "
+            "objective-by-parameter reverse derivative matrix for every metric."
+        ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument(
@@ -1088,7 +1123,7 @@ def main() -> None:
         [float(profile_cfg[name]) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
-    objective_index = OBJECTIVE_LABELS.index(args.objective)
+    objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
     reverse_setup = _prepare_reverse_static_setup(
         baseline_values,
         config=config,
@@ -1191,6 +1226,165 @@ def main() -> None:
             accepted_step_limit_override=args.accepted_step_limit,
         )
         baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
+
+    if args.objective == "all":
+        if args.timing_mode == "split-vjp-warm":
+            raise SystemExit(
+                "[autodiff-gate] --objective all is not supported with "
+                "--timing-mode split-vjp-warm yet; use jit-warm, jit-compile-only, "
+                "or eager for the full metric Jacobian."
+            )
+
+        objective_vector_fn = lambda p: _reverse_objective_vector_for_parameter_vector(  # noqa: E731
+            p,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+        print("[autodiff-gate] progress: running reverse custom-VJP for all objectives", flush=True)
+        reverse_compile_plus_execute_s = None
+        reverse_execute_s = None
+        reverse_execute_times_s: list[float] = []
+        t_reverse_start = time.perf_counter()
+        if args.timing_mode == "jit-compile-only":
+            jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
+            compiled_jac_fn = jac_fn.lower(baseline_values).compile()
+            del compiled_jac_fn
+            gradient_matrix = None
+            reverse_total_s = time.perf_counter() - t_reverse_start
+        elif args.timing_mode == "jit-warm":
+            jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
+            first_gradient_matrix = jac_fn(baseline_values)
+            first_gradient_matrix = jax.block_until_ready(first_gradient_matrix)
+            reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
+
+            gradient_matrix = first_gradient_matrix
+            for _ in range(max(1, int(args.warm_repeats))):
+                t_execute_start = time.perf_counter()
+                gradient_matrix = jac_fn(baseline_values)
+                gradient_matrix = jax.block_until_ready(gradient_matrix)
+                reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
+            reverse_execute_s = float(np.mean(reverse_execute_times_s))
+            reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
+        else:
+            gradient_matrix = jax.jacrev(objective_vector_fn)(baseline_values)
+            gradient_matrix = jax.block_until_ready(gradient_matrix)
+            reverse_total_s = time.perf_counter() - t_reverse_start
+
+        reverse_checkpoint_count = None
+        if reverse_segment_length is not None:
+            reverse_checkpoint_base = (
+                int(args.accepted_step_limit)
+                if args.accepted_step_limit is not None
+                else int(reverse_setup.max_total_steps)
+            )
+            reverse_checkpoint_count = int(
+                (reverse_checkpoint_base + int(reverse_segment_length) - 1)
+                // int(reverse_segment_length)
+            )
+        reverse_lagged_branch_schedule = getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_lagged_branch_schedule",
+            None,
+        )
+        reverse_lagged_reuse_count = None
+        reverse_lagged_rebuild_count = None
+        if reverse_lagged_branch_schedule is not None:
+            reverse_lagged_reuse_count = int(sum(bool(value) for value in reverse_lagged_branch_schedule))
+            reverse_lagged_rebuild_count = int(len(reverse_lagged_branch_schedule) - reverse_lagged_reuse_count)
+
+        gradient_by_objective = None
+        if gradient_matrix is not None:
+            gradient_np = np.asarray(jax.device_get(gradient_matrix), dtype=float)
+            gradient_by_objective = {
+                objective_name: {
+                    parameter_name: float(value)
+                    for parameter_name, value in zip(PARAMETER_ORDER, gradient_np[objective_i].tolist())
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            }
+
+        report = {
+            "mode": "transport_reverse_ad_only",
+            "config_path": str(Path(args.config)),
+            "objective_name": "all",
+            "objective_order": list(OBJECTIVE_LABELS),
+            "parameter_order": list(PARAMETER_ORDER),
+            "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
+            "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+            "max_total_steps": int(reverse_setup.max_total_steps),
+            "reverse_checkpoint_count": reverse_checkpoint_count,
+            "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
+            "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+            "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
+            "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
+            "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
+            "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
+            "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
+            "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
+            "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+            "reverse_segment_length": reverse_segment_length,
+            "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
+            "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
+            "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
+            "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+            "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+            "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+            "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+            "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+            "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+            "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
+            "reverse_transpose_fallback": bool(args.reverse_transpose_fallback),
+            "timing_mode": str(args.timing_mode),
+            "reverse_total_s": float(reverse_total_s),
+            "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
+            "reverse_execute_s": None if reverse_execute_s is None else float(reverse_execute_s),
+            "reverse_execute_times_s": [float(value) for value in reverse_execute_times_s],
+            "gradient_reverse_ad_by_objective": gradient_by_objective,
+            "rollout_path": {
+                "baseline": baseline_diag,
+            },
+        }
+
+        print(
+            f"[autodiff-gate] mode=transport_reverse_ad_only objective=all "
+            f"objectives={list(OBJECTIVE_LABELS)} "
+            f"parameters={list(PARAMETER_ORDER)} "
+            f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+            f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
+            f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
+            f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
+            f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
+            f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
+            f"reverse_total_s={reverse_total_s:.6e}"
+        )
+        if reverse_compile_plus_execute_s is not None:
+            print(
+                f"[autodiff-gate] timing reverse_compile_plus_execute_s={reverse_compile_plus_execute_s:.6e} "
+                f"reverse_execute_s_mean={reverse_execute_s:.6e} "
+                f"reverse_execute_s_min={min(reverse_execute_times_s):.6e} "
+                f"reverse_execute_repeats={len(reverse_execute_times_s)}"
+            )
+            print(
+                "[autodiff-gate] timing reverse_execute_times_s="
+                + ",".join(f"{float(value):.6e}" for value in reverse_execute_times_s)
+            )
+        if gradient_by_objective is not None:
+            print("[autodiff-gate] reverse gradients by objective:")
+            for objective_name in OBJECTIVE_LABELS:
+                print(f"  - {objective_name}:")
+                for parameter_name in PARAMETER_ORDER:
+                    print(
+                        f"      d{objective_name}/d{parameter_name}: "
+                        f"rev={gradient_by_objective[objective_name][parameter_name]:.6e}"
+                    )
+        outpath = _report_path("all")
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
 
     objective_fn = lambda p: _reverse_objective_for_parameter_vector(  # noqa: E731
         p,
