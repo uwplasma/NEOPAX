@@ -9886,11 +9886,17 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         ).strip().lower()
         reduced_cotangent_bwd = step_bwd_mode in {
             "reduced_cotangent",
+            "reduced_cotangent_lean_replay",
+            "lean_replay",
             "reduced",
             "state_only",
             "final_state",
             "reduced_cotangent_host_segments",
             "host_segments",
+        }
+        lean_reduced_replay_tape = step_bwd_mode in {
+            "reduced_cotangent_lean_replay",
+            "lean_replay",
         }
 
         def _mask_fixed_slot_input_cotangent_for_step(carry_bar_value, step_start_carry):
@@ -9948,7 +9954,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
                         carry,
                         *slot_xs,
                     )
-                    return next_carry, carry
+                    stored_carry = (
+                        _radau_carry_with_forward_only_jvp_fields(carry)
+                        if lean_reduced_replay_tape
+                        else carry
+                    )
+                    return next_carry, stored_carry
 
                 _, step_start_carries = jax.lax.scan(
                     _segment_collect_start_carries,

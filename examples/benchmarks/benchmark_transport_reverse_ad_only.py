@@ -858,7 +858,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-step-bwd-mode",
-        choices=("current", "manual_split", "reduced_cotangent", "reduced_cotangent_host_segments"),
+        choices=(
+            "current",
+            "manual_split",
+            "reduced_cotangent",
+            "reduced_cotangent_lean_replay",
+            "reduced_cotangent_host_segments",
+        ),
         default="current",
         help=(
             "Accepted-step backward implementation selector. 'current' keeps the "
@@ -866,7 +872,9 @@ def main() -> None:
             "split/manual accepted-step adjoint and currently routes through the "
             "same implementation while plumbing is validated. 'reduced_cotangent' "
             "uses a reduced final-state cotangent contract inside the segmented "
-            "accepted-step reverse scan. 'reduced_cotangent_host_segments' is only "
+            "accepted-step reverse scan. 'reduced_cotangent_lean_replay' stores "
+            "the per-slot replay tape after masking forward-only Radau cache fields. "
+            "'reduced_cotangent_host_segments' is only "
             "for split-vjp timing and orchestrates segment backward kernels outside "
             "the monolithic rollout-bwd JIT."
         ),
