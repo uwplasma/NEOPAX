@@ -694,7 +694,14 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_jvp", "custom_vjp", "iterative_vjp", "iterative_jvp"),
+        choices=(
+            "direct",
+            "custom_jvp",
+            "custom_vjp",
+            "recompute_vjp",
+            "iterative_vjp",
+            "iterative_jvp",
+        ),
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
@@ -745,12 +752,14 @@ def main() -> None:
     parser.add_argument(
         "--reverse-ntx-prepared-solve-boundary",
         default="default",
-        choices=("default", "custom_vjp"),
+        choices=("default", "custom_vjp", "recompute_vjp"),
         help=(
             "Reverse-only diagnostic boundary for the NTX prepared coefficient solve. "
             "'default' preserves --ntx-exact-derivative-mode. 'custom_vjp' forces "
             "the response solve through NTX's custom-VJP boundary without changing "
-            "the forward-AD lane."
+            "the forward-AD lane. 'recompute_vjp' uses an exact custom-VJP boundary "
+            "that rebuilds the NTX factorization in backward instead of saving it "
+            "in the forward residual."
         ),
     )
     parser.add_argument(
@@ -1012,13 +1021,18 @@ def main() -> None:
     if str(args.ntx_exact_derivative_field_pullback_mode) == "compact_vjp":
         _check_compact_ntx_derivative_pullback_available()
     effective_ntx_exact_derivative_mode = str(args.ntx_exact_derivative_mode)
-    if str(args.reverse_ntx_prepared_solve_boundary) == "custom_vjp":
-        if str(args.ntx_exact_derivative_mode) not in {"direct", "custom_vjp"}:
+    if str(args.reverse_ntx_prepared_solve_boundary) in {"custom_vjp", "recompute_vjp"}:
+        if str(args.ntx_exact_derivative_mode) not in {
+            "direct",
+            "custom_vjp",
+            "recompute_vjp",
+        }:
             raise SystemExit(
                 "[autodiff-gate] --reverse-ntx-prepared-solve-boundary custom_vjp "
-                "is only compatible with --ntx-exact-derivative-mode direct or custom_vjp."
+                "or recompute_vjp is only compatible with --ntx-exact-derivative-mode "
+                "direct, custom_vjp, or recompute_vjp."
             )
-        effective_ntx_exact_derivative_mode = "custom_vjp"
+        effective_ntx_exact_derivative_mode = str(args.reverse_ntx_prepared_solve_boundary)
 
     config = _prepare_benchmark_config(
         Path(args.config),
