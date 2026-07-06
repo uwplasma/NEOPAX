@@ -390,6 +390,45 @@ def _reverse_objective_vector_for_parameter_vector(
     return _objective_vector(final_state, runtime)
 
 
+def _reverse_final_y_objective_cotangent_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    objective_index: int,
+    reverse_setup: _ReverseStaticSetup,
+):
+    state0 = _initial_state_for_parameter_vector(
+        parameter_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    initial_carry = _reverse_initial_carry_from_state_with_static_setup(
+        solver=reverse_setup.solver,
+        state=state0,
+        solve_vector_field=reverse_setup.solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=reverse_setup.prepared_rollout,
+    )
+    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)[objective_index]
+
+    objective_value = _objective_from_final_y(final_y)
+    final_y_bar = jax.grad(_objective_from_final_y)(final_y)
+    return objective_value, final_y_bar
+
+
 def _reverse_initial_carry_for_parameter_vector(
     parameter_values,
     *,
@@ -1065,6 +1104,14 @@ def main() -> None:
         ),
         help="Optional output cotangent seed channel. Defaults to --local-transpose-diagnostic-seed-mode.",
     )
+    parser.add_argument(
+        "--diagnose-final-objective-cotangent",
+        action="store_true",
+        help=(
+            "For scalar objectives, also print the norm/max/nonzero count of "
+            "grad(objective(final_y)) before the realized-schedule reverse rule."
+        ),
+    )
     args = parser.parse_args()
     if int(args.reverse_stage_adjoint_iter_maxiter) <= 0:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-maxiter must be positive.")
@@ -1549,6 +1596,30 @@ def main() -> None:
         gradient_rev = jax.block_until_ready(gradient_rev)
         reverse_total_s = time.perf_counter() - t_reverse_start
     grad_np = np.asarray(jax.device_get(gradient_rev), dtype=float)
+    final_objective_cotangent_diagnostic = None
+    if bool(args.diagnose_final_objective_cotangent):
+        if args.objective == "all":
+            raise SystemExit("[autodiff-gate] --diagnose-final-objective-cotangent requires a scalar objective.")
+        final_cotangent_fn = jax.jit(
+            lambda p: _reverse_final_y_objective_cotangent_for_parameter_vector(  # noqa: E731
+                p,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                objective_index=objective_index,
+                reverse_setup=reverse_setup,
+            )
+        )
+        objective_value_diag, final_y_bar_diag = final_cotangent_fn(baseline_values)
+        objective_value_diag, final_y_bar_diag = jax.block_until_ready((objective_value_diag, final_y_bar_diag))
+        final_y_bar_np = np.asarray(jax.device_get(final_y_bar_diag), dtype=float)
+        final_objective_cotangent_diagnostic = {
+            "objective_value": float(jax.device_get(objective_value_diag)),
+            "final_y_bar_l2": float(np.linalg.norm(final_y_bar_np)),
+            "final_y_bar_linf": float(np.max(np.abs(final_y_bar_np))) if final_y_bar_np.size else 0.0,
+            "final_y_bar_nonzero_count": int(np.count_nonzero(final_y_bar_np)),
+            "final_y_bar_size": int(final_y_bar_np.size),
+        }
     reverse_checkpoint_count = None
     if reverse_segment_length is not None:
         reverse_checkpoint_base = (
@@ -1608,6 +1679,7 @@ def main() -> None:
         "reverse_execute_s": None if reverse_execute_s is None else float(reverse_execute_s),
         "reverse_execute_times_s": [float(value) for value in reverse_execute_times_s],
         "gradient_reverse_ad": grad_np.tolist(),
+        "final_objective_cotangent_diagnostic": final_objective_cotangent_diagnostic,
         "rollout_path": {
             "baseline": baseline_diag,
         },
@@ -1658,6 +1730,15 @@ def main() -> None:
             f"accepted_count={baseline_diag.get('accepted_count')} "
             f"completed={baseline_diag.get('completed')} failed={baseline_diag.get('failed')} "
             f"fail_code={baseline_diag.get('fail_code')}"
+        )
+    if final_objective_cotangent_diagnostic is not None:
+        print(
+            "[autodiff-gate] final objective cotangent: "
+            f"value={final_objective_cotangent_diagnostic['objective_value']:.16e} "
+            f"l2={final_objective_cotangent_diagnostic['final_y_bar_l2']:.16e} "
+            f"linf={final_objective_cotangent_diagnostic['final_y_bar_linf']:.16e} "
+            f"nonzero_count={final_objective_cotangent_diagnostic['final_y_bar_nonzero_count']}/"
+            f"{final_objective_cotangent_diagnostic['final_y_bar_size']}"
         )
     print("[autodiff-gate] reverse gradients:")
     for name, value in zip(PARAMETER_ORDER, grad_np.tolist()):
