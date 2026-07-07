@@ -2822,7 +2822,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             source_modes,
         )
         from ntx.transport import coefficients_from_modes
-        from jax.scipy.linalg import lu_solve
+        from jax.scipy.linalg import lu_factor, lu_solve
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
@@ -3914,14 +3914,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         from ntx._solver_adjoint import (
             _coefficient_mode_pullback,
             _prepared_implicit_vjp_primal,
-            _prepared_implicit_vjp_primal_lu_recompute_blocks,
         )
         from ntx._solver_context import _operator_context
         from ntx.operators import (
             apply_nullspace_condition,
             operator_blocks,
             parameter_derivative_blocks,
+            source_modes,
         )
+        from ntx.transport import coefficients_from_modes
         from jax.scipy.linalg import lu_solve
 
         use_recompute_lowdot = normalized_pullback_algebra == "scalar_contract_lowdot_recompute"
@@ -3962,6 +3963,79 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             if use_recompute_blocks_lowdot:
                 return _upper_block_for_mode(ctx, k)
             return _take_mode(saved_upper, k)
+
+        def _factorize_lu_modes(ctx):
+            n_xi = prepared.grid.n_xi
+            lower_terminal, delta_terminal, lower_next = operator_blocks(
+                ctx,
+                n_xi,
+                prepared.d_theta,
+                prepared.d_zeta,
+            )
+            lu_terminal, piv_terminal = lu_factor(delta_terminal)
+            x_prev = lu_solve((lu_terminal, piv_terminal), lower_next)
+
+            zeros_block = jnp.zeros_like(delta_terminal)
+            zeros_piv = jnp.zeros((delta_terminal.shape[0],), dtype=jnp.int32)
+            saved_lu = [zeros_block] * (n_xi + 1)
+            saved_piv = [zeros_piv] * (n_xi + 1)
+            saved_lu[n_xi] = lu_terminal
+            saved_piv[n_xi] = piv_terminal
+
+            for k in range(n_xi - 1, -1, -1):
+                lower, diagonal, upper = operator_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                if k == 0:
+                    diagonal_fixed, upper_fixed = apply_nullspace_condition(diagonal, upper)
+                    assert upper_fixed is not None
+                    diagonal = diagonal_fixed
+                    upper = upper_fixed
+                delta_k = diagonal - upper @ x_prev
+                lu_k, piv_k = lu_factor(delta_k)
+                saved_lu[k] = lu_k
+                saved_piv[k] = piv_k
+                if k > 0:
+                    x_prev = lu_solve((lu_k, piv_k), lower)
+
+            return jnp.stack(saved_lu), jnp.stack(saved_piv)
+
+        def _solve_lu_modes_recompute_blocks(ctx, saved_lu, saved_piv, source):
+            n_xi = source.shape[0] - 1
+            y = [jnp.zeros_like(source[0])] * (n_xi + 1)
+            y[n_xi] = lu_solve((saved_lu[n_xi], saved_piv[n_xi]), source[n_xi])
+            for k in range(n_xi - 1, -1, -1):
+                rhs = source[k] - _upper_block_for_mode(ctx, k) @ y[k + 1]
+                y[k] = lu_solve((saved_lu[k], saved_piv[k]), rhs)
+
+            modes = [y[0]]
+            for k in range(1, n_xi + 1):
+                propagated = lu_solve(
+                    (saved_lu[k], saved_piv[k]),
+                    _lower_block_for_mode(ctx, k) @ modes[k - 1],
+                )
+                modes.append(y[k] - propagated)
+            return jnp.stack(modes)
+
+        def _prepared_implicit_vjp_primal_lu_recompute_blocks(
+            ctx,
+        ):
+            s1, s3 = source_modes(ctx, prepared.grid.n_xi)
+            saved_lu, saved_piv = _factorize_lu_modes(ctx)
+            f1_full = _solve_lu_modes_recompute_blocks(ctx, saved_lu, saved_piv, s1)
+            f3_full = _solve_lu_modes_recompute_blocks(ctx, saved_lu, saved_piv, s3)
+            coefficients = jnp.stack(
+                coefficients_from_modes(
+                    prepared.geometry,
+                    f1_full[:3],
+                    f3_full[:3],
+                    ctx.nu_hat,
+                )
+            )
+            return coefficients, f1_full, f3_full, saved_lu, saved_piv
 
         def _solve_factorized_low_modes_scan(
             ctx,
@@ -4552,9 +4626,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     saved_lu,
                     saved_piv,
                 ) = _prepared_implicit_vjp_primal_lu_recompute_blocks(
-                    prepared,
-                    nu_hat_value,
-                    epsi_hat_value,
+                    ctx,
                 )
                 saved_lower = None
                 saved_upper = None
