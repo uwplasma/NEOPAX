@@ -1786,9 +1786,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "lowdot_recompute": "scalar_contract_lowdot_recompute",
             "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
             "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
-            "lowdot_boundary": "scalar_contract_lowdot_boundary",
-            "scalar-lowdot-boundary": "scalar_contract_lowdot_boundary",
-            "scalar_contract_lowdot_call": "scalar_contract_lowdot_boundary",
+            "lowdot_recompute_blocks": "scalar_contract_lowdot_recompute_blocks",
+            "scalar-lowdot-recompute-blocks": "scalar_contract_lowdot_recompute_blocks",
+            "scalar_contract_lowdot_lu_only": "scalar_contract_lowdot_recompute_blocks",
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
@@ -1801,15 +1801,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract_lowdot_sequential",
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
-            "scalar_contract_lowdot_boundary",
+            "scalar_contract_lowdot_recompute_blocks",
             "scalar_contract_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
                 "scalar_contract_lowdot_sequential, scalar_contract_lowdot_ntx, "
-                "scalar_contract_lowdot_recompute, scalar_contract_lowdot_boundary, "
-                "scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, "
+                "scalar_contract_lowdot_recompute_blocks, scalar_contract_matrix_free"
             )
         return normalized
 
@@ -3721,7 +3721,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot",
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
-                    "scalar_contract_lowdot_boundary",
+                    "scalar_contract_lowdot_recompute_blocks",
                     "scalar_contract_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
@@ -3783,7 +3783,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot",
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
-                    "scalar_contract_lowdot_boundary",
+                    "scalar_contract_lowdot_recompute_blocks",
                     "scalar_contract_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
@@ -3843,8 +3843,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         use_sequential_lowdot = (
             normalized_pullback_algebra == "scalar_contract_lowdot_sequential"
         )
-        use_boundary_lowdot = (
-            normalized_pullback_algebra == "scalar_contract_lowdot_boundary"
+        use_recompute_blocks_lowdot = (
+            normalized_pullback_algebra == "scalar_contract_lowdot_recompute_blocks"
         )
         if use_ntx_lowdot:
             ntx_module = _import_ntx()
@@ -3914,9 +3914,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         from ntx._solver_adjoint import (
             _coefficient_mode_pullback,
             _prepared_implicit_vjp_primal,
+            _prepared_implicit_vjp_primal_lu_recompute_blocks,
         )
         from ntx._solver_context import _operator_context
-        from ntx.operators import parameter_derivative_blocks
+        from ntx.operators import (
+            apply_nullspace_condition,
+            operator_blocks,
+            parameter_derivative_blocks,
+        )
         from jax.scipy.linalg import lu_solve
 
         use_recompute_lowdot = normalized_pullback_algebra == "scalar_contract_lowdot_recompute"
@@ -3928,7 +3933,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         def _take_mode(values, k):
             return jax.lax.dynamic_index_in_dim(values, k, axis=0, keepdims=False)
 
+        def _lower_block_for_mode(ctx, k):
+            lower, _, _ = operator_blocks(
+                ctx,
+                k,
+                prepared.d_theta,
+                prepared.d_zeta,
+            )
+            return lower
+
+        def _upper_block_for_mode(ctx, k):
+            _, diagonal, upper = operator_blocks(
+                ctx,
+                k,
+                prepared.d_theta,
+                prepared.d_zeta,
+            )
+            _, upper_fixed = apply_nullspace_condition(diagonal, upper)
+            assert upper_fixed is not None
+            return jnp.where(jnp.asarray(k) == 0, upper_fixed, upper)
+
+        def _factorized_lower_for_mode(ctx, saved_lower, k):
+            if use_recompute_blocks_lowdot:
+                return _lower_block_for_mode(ctx, k)
+            return _take_mode(saved_lower, k)
+
+        def _factorized_upper_for_mode(ctx, saved_upper, k):
+            if use_recompute_blocks_lowdot:
+                return _upper_block_for_mode(ctx, k)
+            return _take_mode(saved_upper, k)
+
         def _solve_factorized_low_modes_scan(
+            ctx,
             saved_lu,
             saved_piv,
             saved_lower,
@@ -3949,7 +3985,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _backward_y(carry, k):
                 y_next, y0_value, y1_value, y2_value = carry
-                rhs = source_for_mode(k) - _take_mode(saved_upper, k) @ y_next
+                rhs = source_for_mode(k) - _factorized_upper_for_mode(ctx, saved_upper, k) @ y_next
                 y_k = lu_solve(
                     (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                     rhs,
@@ -3968,15 +4004,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             mode0 = y0
             mode1 = y1 - lu_solve(
                 (_take_mode(saved_lu, 1), _take_mode(saved_piv, 1)),
-                _take_mode(saved_lower, 1) @ mode0,
+                _factorized_lower_for_mode(ctx, saved_lower, jnp.asarray(1, dtype=jnp.int32)) @ mode0,
             )
             mode2 = y2 - lu_solve(
                 (_take_mode(saved_lu, 2), _take_mode(saved_piv, 2)),
-                _take_mode(saved_lower, 2) @ mode1,
+                _factorized_lower_for_mode(ctx, saved_lower, jnp.asarray(2, dtype=jnp.int32)) @ mode1,
             )
             return jnp.stack([mode0, mode1, mode2], axis=0)
 
         def _solve_factorized_adjoint_scan(
+            ctx,
             saved_lu,
             saved_piv,
             saved_lower,
@@ -3996,7 +4033,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     mu_next,
                     trans=1,
                 )
-                mu_k = _take_mode(source_bar, k) - _take_mode(saved_lower, k + 1).T @ propagated
+                mu_k = _take_mode(source_bar, k) - _factorized_lower_for_mode(
+                    ctx,
+                    saved_lower,
+                    k + 1,
+                ).T @ propagated
                 return mu_k, mu_k
 
             _, mu_tail = jax.lax.scan(
@@ -4013,7 +4054,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
 
             def _forward_adjoint(adjoint_prev, k):
-                rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                rhs = _take_mode(mu, k) - _factorized_upper_for_mode(
+                    ctx,
+                    saved_upper,
+                    k - 1,
+                ).T @ adjoint_prev
                 adjoint_k = lu_solve(
                     (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                     rhs,
@@ -4029,6 +4074,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return jnp.concatenate([adjoint0[None, ...], adjoint_tail], axis=0)
 
         def _contract_factorized_source_bar_pair_scan(
+            ctx,
             saved_lu,
             saved_piv,
             saved_lower,
@@ -4049,7 +4095,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     mu_next,
                     trans=1,
                 )
-                mu_k = source_bar_pair_for_mode(k) - _take_mode(saved_lower, k + 1).T @ propagated
+                mu_k = source_bar_pair_for_mode(k) - _factorized_lower_for_mode(
+                    ctx,
+                    saved_lower,
+                    k + 1,
+                ).T @ propagated
                 return mu_k, mu_k
 
             _, mu_tail = jax.lax.scan(
@@ -4069,7 +4119,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _forward_adjoint(carry, k):
                 adjoint_prev, contract = carry
-                rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                rhs = _take_mode(mu, k) - _factorized_upper_for_mode(
+                    ctx,
+                    saved_upper,
+                    k - 1,
+                ).T @ adjoint_prev
                 adjoint_k = lu_solve(
                     (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                     rhs,
@@ -4151,7 +4205,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         mu_next,
                         trans=1,
                     )
-                    mu_k = _source_bar_matrix_for_mode(k) - _take_mode(
+                    mu_k = _source_bar_matrix_for_mode(k) - _factorized_lower_for_mode(
+                        ctx,
                         saved_lower,
                         k + 1,
                     ).T @ propagated
@@ -4174,7 +4229,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
                 def _forward_adjoint(carry, k):
                     adjoint_prev, contract = carry
-                    rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                    rhs = _take_mode(mu, k) - _factorized_upper_for_mode(
+                        ctx,
+                        saved_upper,
+                        k - 1,
+                    ).T @ adjoint_prev
                     adjoint_k = lu_solve(
                         (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                         rhs,
@@ -4271,6 +4330,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _solve_lambda_matrix():
                 return _solve_factorized_adjoint_scan(
+                    ctx,
                     saved_lu,
                     saved_piv,
                     saved_lower,
@@ -4372,7 +4432,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         mu_next,
                         trans=1,
                     )
-                    mu_k = _adjoint_rhs_dot_matrix_for_mode(k) - _take_mode(
+                    mu_k = _adjoint_rhs_dot_matrix_for_mode(k) - _factorized_lower_for_mode(
+                        ctx,
                         saved_lower,
                         k + 1,
                     ).T @ propagated
@@ -4395,7 +4456,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
                 def _forward_adjoint(carry, k):
                     adjoint_prev, contract = carry
-                    rhs = _take_mode(mu, k) - _take_mode(saved_upper, k - 1).T @ adjoint_prev
+                    rhs = _take_mode(mu, k) - _factorized_upper_for_mode(
+                        ctx,
+                        saved_upper,
+                        k - 1,
+                    ).T @ adjoint_prev
                     adjoint_k = lu_solve(
                         (_take_mode(saved_lu, k), _take_mode(saved_piv, k)),
                         rhs,
@@ -4435,6 +4500,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             f1_field_dot = _contract_factorized_source_bar_pair_scan(
+                ctx,
                 saved_lu,
                 saved_piv,
                 saved_lower,
@@ -4443,6 +4509,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 lambda k: _source_bar_pair_for_mode(lambda1, k),
             )
             f3_field_dot = _contract_factorized_source_bar_pair_scan(
+                ctx,
                 saved_lu,
                 saved_piv,
                 saved_lower,
@@ -4477,19 +4544,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 epsi_hat_value,
             )
             mode_indices = jnp.arange(prepared.grid.n_xi + 1, dtype=jnp.int32)
-            (
-                coefficients,
-                f1_full,
-                f3_full,
-                saved_lu,
-                saved_piv,
-                saved_lower,
-                saved_upper,
-            ) = _prepared_implicit_vjp_primal(
-                prepared,
-                nu_hat_value,
-                epsi_hat_value,
-            )
+            if use_recompute_blocks_lowdot:
+                (
+                    coefficients,
+                    f1_full,
+                    f3_full,
+                    saved_lu,
+                    saved_piv,
+                ) = _prepared_implicit_vjp_primal_lu_recompute_blocks(
+                    prepared,
+                    nu_hat_value,
+                    epsi_hat_value,
+                )
+                saved_lower = None
+                saved_upper = None
+            else:
+                (
+                    coefficients,
+                    f1_full,
+                    f3_full,
+                    saved_lu,
+                    saved_piv,
+                    saved_lower,
+                    saved_upper,
+                ) = _prepared_implicit_vjp_primal(
+                    prepared,
+                    nu_hat_value,
+                    epsi_hat_value,
+                )
             base = _base_pullback(
                 ctx,
                 mode_indices,
@@ -4536,6 +4618,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             packed_f_dot_low_matrix = _solve_factorized_low_modes_scan(
+                ctx,
                 saved_lu,
                 saved_piv,
                 saved_lower,
@@ -4609,27 +4692,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 outputs0,
             )
 
-        if use_boundary_lowdot:
-            # Keep the dense NTX factorization algebra in a separate call island
-            # so the outer reverse VJP cannot fuse all per-energy 105x105 solves
-            # into one large preallocated-temp arena.
-            one_case_pullback_boundary = jax.jit(
-                _one_case_pullback,
-                inline=False,
-            )
-            return jax.lax.map(
-                one_case_pullback_boundary,
-                (
-                    energy_indices,
-                    reference_nu_hat,
-                    reference_epsi_hat,
-                    first_nu_hat_tangent,
-                    first_epsi_hat_tangent,
-                    second_nu_hat_tangent,
-                    second_epsi_hat_tangent,
-                ),
-            )
-
         return jax.lax.map(
             _one_case_pullback,
             (
@@ -4693,7 +4755,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "scalar_contract_lowdot_sequential",
                 "scalar_contract_lowdot_ntx",
                 "scalar_contract_lowdot_recompute",
-                "scalar_contract_lowdot_boundary",
+                "scalar_contract_lowdot_recompute_blocks",
             }
         )
         if use_fused_lowdot_derivative_pullback:
