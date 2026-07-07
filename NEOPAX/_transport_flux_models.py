@@ -3923,7 +3923,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             source_modes,
         )
         from ntx.transport import coefficients_from_modes
-        from jax.scipy.linalg import lu_solve
+        from jax.scipy.linalg import lu_factor, lu_solve
 
         use_recompute_lowdot = normalized_pullback_algebra == "scalar_contract_lowdot_recompute"
 
