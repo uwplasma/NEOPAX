@@ -807,6 +807,7 @@ def main() -> None:
             "ntx_helper",
             "scalar_contract",
             "scalar_contract_lowdot",
+            "scalar_contract_lowdot_sequential",
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
@@ -818,6 +819,10 @@ def main() -> None:
             "that avoids Python-unrolled mode loops where possible. "
             "'scalar_contract_lowdot' additionally avoids full tangent-mode "
             "stacks for the field-bar contraction. "
+            "'scalar_contract_lowdot_sequential' keeps that exact algebra but "
+            "assembles the energy-scan bars with a sequential JAX loop to test "
+            "whether factorization temporaries stop being live across the full "
+            "energy axis. "
             "'scalar_contract_lowdot_ntx' moves the fused lowdot algebra into "
             "NTX while keeping NEOPAX's transport-moment cotangent mapping. "
             "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
