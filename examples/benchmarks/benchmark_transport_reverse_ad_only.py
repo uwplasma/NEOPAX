@@ -810,6 +810,7 @@ def main() -> None:
             "scalar_contract_lowdot_sequential",
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
+            "scalar_contract_lowdot_boundary",
             "scalar_contract_matrix_free",
         ),
         help=(
@@ -827,6 +828,10 @@ def main() -> None:
             "NTX while keeping NEOPAX's transport-moment cotangent mapping. "
             "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
             "before field-dot contractions to test peak-memory reduction. "
+            "'scalar_contract_lowdot_boundary' keeps the same lowdot algebra "
+            "but puts each one-energy NTX pullback behind a non-inlined call "
+            "boundary so dense 105x105 temporaries are not fused into the "
+            "outer reverse graph. "
             "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
             "using Krylov solves on the NTX block operator."
         ),

@@ -1786,6 +1786,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "lowdot_recompute": "scalar_contract_lowdot_recompute",
             "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
             "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
+            "lowdot_boundary": "scalar_contract_lowdot_boundary",
+            "scalar-lowdot-boundary": "scalar_contract_lowdot_boundary",
+            "scalar_contract_lowdot_call": "scalar_contract_lowdot_boundary",
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
@@ -1798,13 +1801,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract_lowdot_sequential",
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
+            "scalar_contract_lowdot_boundary",
             "scalar_contract_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
                 "scalar_contract_lowdot_sequential, scalar_contract_lowdot_ntx, "
-                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_lowdot_boundary, "
+                "scalar_contract_matrix_free"
             )
         return normalized
 
@@ -3716,6 +3721,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot",
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
+                    "scalar_contract_lowdot_boundary",
                     "scalar_contract_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
@@ -3777,6 +3783,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot",
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
+                    "scalar_contract_lowdot_boundary",
                     "scalar_contract_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
@@ -3835,6 +3842,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         use_ntx_lowdot = normalized_pullback_algebra == "scalar_contract_lowdot_ntx"
         use_sequential_lowdot = (
             normalized_pullback_algebra == "scalar_contract_lowdot_sequential"
+        )
+        use_boundary_lowdot = (
+            normalized_pullback_algebra == "scalar_contract_lowdot_boundary"
         )
         if use_ntx_lowdot:
             ntx_module = _import_ntx()
@@ -4599,6 +4609,27 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 outputs0,
             )
 
+        if use_boundary_lowdot:
+            # Keep the dense NTX factorization algebra in a separate call island
+            # so the outer reverse VJP cannot fuse all per-energy 105x105 solves
+            # into one large preallocated-temp arena.
+            one_case_pullback_boundary = jax.jit(
+                _one_case_pullback,
+                inline=False,
+            )
+            return jax.lax.map(
+                one_case_pullback_boundary,
+                (
+                    energy_indices,
+                    reference_nu_hat,
+                    reference_epsi_hat,
+                    first_nu_hat_tangent,
+                    first_epsi_hat_tangent,
+                    second_nu_hat_tangent,
+                    second_epsi_hat_tangent,
+                ),
+            )
+
         return jax.lax.map(
             _one_case_pullback,
             (
@@ -4662,6 +4693,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "scalar_contract_lowdot_sequential",
                 "scalar_contract_lowdot_ntx",
                 "scalar_contract_lowdot_recompute",
+                "scalar_contract_lowdot_boundary",
             }
         )
         if use_fused_lowdot_derivative_pullback:
