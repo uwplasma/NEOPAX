@@ -4468,6 +4468,119 @@ def _radau_segment_reduced_cotangent_bwd_call(
     return segment_start_reduced_bar
 
 
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_segment_reduced_cotangent_bwd_batched_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    segment_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    segment_start_carry: _RadauAcceptedStepCarry,
+    segment_arrays,
+) -> _RadauAcceptedStepReducedCotangent:
+    """One segment backward pass for multiple final-y cotangents.
+
+    The accepted-step replay and step-start carry collection are shared across
+    objective rows.  The mathematically scalar stage adjoint is still applied
+    independently to each row, preserving the existing reduced-cotangent rule.
+    """
+
+    def _zero_reduced_cotangent_like(carry_value):
+        objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+
+        def _zero_tree_for_one(_):
+            return _radau_align_tangent_tree_to_primal(None, carry_value.lagged_response_cache)
+
+        return _RadauAcceptedStepReducedCotangent(
+            y=jnp.zeros((objective_count,) + jnp.shape(carry_value.y), dtype=jnp.asarray(carry_value.y).dtype),
+            lagged_response_cache=jax.vmap(_zero_tree_for_one)(jnp.arange(objective_count)),
+            lagged_reference_y=jnp.zeros(
+                (objective_count,) + jnp.shape(carry_value.lagged_reference_y),
+                dtype=jnp.asarray(carry_value.lagged_reference_y).dtype,
+            ),
+        )
+
+    def _segment_collect_start_carries(carry, slot_xs):
+        next_carry, _ = _radau_replay_realized_accepted_slot(
+            execution_context,
+            carry,
+            *slot_xs,
+        )
+        return next_carry, carry
+
+    _, step_start_carries = jax.lax.scan(
+        _segment_collect_start_carries,
+        segment_start_carry,
+        segment_arrays,
+    )
+    mode = str(cotangent_mode).strip().lower()
+    zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+    force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
+    force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+
+    def _slot_bwd(slot_reduced_bars, slot_xs):
+        step_start_carry, slot_arrays = slot_xs
+        if zero_step_bwd:
+            return _zero_reduced_cotangent_like(step_start_carry), None
+
+        (
+            active,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = slot_arrays
+
+        def _do_step_bwd(_):
+            carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+            residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+
+            def _single_reuse(single_reduced_bar):
+                return _execute_radau_accepted_step_next_reduced_cotangent_bwd(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "reuse",
+                    residual_carry,
+                    single_reduced_bar,
+                )
+
+            def _single_rebuild(single_reduced_bar):
+                return _execute_radau_accepted_step_next_reduced_cotangent_bwd(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "rebuild",
+                    residual_carry,
+                    single_reduced_bar,
+                )
+
+            if force_reuse_bwd:
+                return jax.vmap(_single_reuse)(slot_reduced_bars)
+            if force_rebuild_bwd:
+                return jax.vmap(_single_rebuild)(slot_reduced_bars)
+            return jax.lax.cond(
+                residual_carry.lagged_response_valid,
+                lambda bars: jax.vmap(_single_reuse)(bars),
+                lambda bars: jax.vmap(_single_rebuild)(bars),
+                slot_reduced_bars,
+            )
+
+        def _skip_bwd(_):
+            return slot_reduced_bars
+
+        step_start_reduced_bars = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
+        return step_start_reduced_bars, None
+
+    segment_start_reduced_bars, _ = jax.lax.scan(
+        _slot_bwd,
+        segment_reduced_bars,
+        (step_start_carries, segment_arrays),
+        reverse=True,
+    )
+    return segment_start_reduced_bars
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
     kernel_context: _RadauAcceptedStepKernelContext,

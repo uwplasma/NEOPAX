@@ -50,6 +50,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
+    _radau_segment_reduced_cotangent_bwd_batched_call,
     _radau_segment_reduced_cotangent_bwd_call,
 )
 
@@ -543,6 +544,129 @@ def _reverse_all_objectives_vmap_pullback_for_parameter_vector(
     objective_basis = jnp.eye(len(OBJECTIVE_LABELS), dtype=jnp.asarray(objective_values).dtype)
     final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
     gradient_matrix = jax.vmap(lambda final_y_bar: final_y_pullback(final_y_bar)[0])(final_y_bars)
+    return objective_values, gradient_matrix
+
+
+def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+):
+    """Compute all objective rows with a shared segmented reduced reverse replay."""
+
+    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
+        raise ValueError("multi_rhs_reduced requires --reverse-segment-length.")
+    step_bwd_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower()
+    if step_bwd_mode not in {
+        "reduced_cotangent",
+        "reduced_cotangent_lean_replay",
+        "reduced_cotangent_recompute_replay",
+        "lean_replay",
+        "recompute_replay",
+        "reduced",
+        "state_only",
+        "final_state",
+    }:
+        raise ValueError("multi_rhs_reduced requires a reduced-cotangent reverse step bwd mode.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _carry_from_parameters(p):
+        return _reverse_initial_carry_for_parameter_vector(
+            p,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+    initial_carry, initial_carry_pullback = jax.vjp(_carry_from_parameters, parameter_values)
+    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_vector_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)
+
+    objective_values, objective_pullback = jax.vjp(_objective_vector_from_final_y, final_y)
+    objective_basis = jnp.eye(len(OBJECTIVE_LABELS), dtype=jnp.asarray(objective_values).dtype)
+    final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
+
+    (
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    ) = residuals
+    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+        raise ValueError("multi_rhs_reduced requires segmented reverse residuals.")
+
+    objective_count = int(len(OBJECTIVE_LABELS))
+
+    def _zero_lagged_response_for_one(_):
+        return _radau_align_tangent_tree_to_primal(
+            None,
+            segmented_final_carry.lagged_response_cache,
+        )
+
+    reduced_bars = _RadauAcceptedStepReducedCotangent(
+        y=final_y_bars,
+        lagged_response_cache=jax.vmap(_zero_lagged_response_for_one)(jnp.arange(objective_count)),
+        lagged_reference_y=jnp.zeros(
+            (objective_count,) + jnp.shape(segmented_final_carry.lagged_reference_y),
+            dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
+        ),
+    )
+    cotangent_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+    ).strip().lower()
+    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+        )
+
+    def _full_carry_bar_from_reduced(reduced_bar):
+        return dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry0),
+            y=reduced_bar.y,
+            lagged_response_cache=reduced_bar.lagged_response_cache,
+            lagged_reference_y=reduced_bar.lagged_reference_y,
+        )
+
+    carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
+    gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
     return objective_values, gradient_matrix
 
 
@@ -1208,15 +1332,14 @@ def main() -> None:
         "--reverse-all-objectives-mode",
         type=str,
         default="jacrev",
-        choices=("jacrev", "vmap_pullback"),
+        choices=("jacrev", "vmap_pullback", "multi_rhs_reduced"),
         help=(
             "Implementation used when --objective all. 'jacrev' preserves the "
             "current vector-objective reverse path. 'vmap_pullback' rolls out "
             "final_y once, builds one final-y cotangent per objective, and vmaps "
-            "the realized-schedule pullback over those cotangents. This is an "
-            "experimental probe; if the existing scalar custom-VJP backward does "
-            "not batch through vmap, the next step is a solver-level multi-RHS "
-            "adjoint carry."
+            "the realized-schedule pullback over those cotangents. "
+            "'multi_rhs_reduced' shares segmented replay across objective rows "
+            "and maps the existing reduced step adjoint inside each slot."
         ),
     )
     parser.add_argument(
@@ -1808,10 +1931,13 @@ def main() -> None:
         reverse_execute_times_s: list[float] = []
         objective_values = None
         t_reverse_start = time.perf_counter()
+        all_objectives_direct_fn = _reverse_all_objectives_vmap_pullback_for_parameter_vector
+        if args.reverse_all_objectives_mode == "multi_rhs_reduced":
+            all_objectives_direct_fn = _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector
         if args.timing_mode == "jit-compile-only":
-            if args.reverse_all_objectives_mode == "vmap_pullback":
+            if args.reverse_all_objectives_mode in {"vmap_pullback", "multi_rhs_reduced"}:
                 all_objectives_fn = jax.jit(
-                    lambda p: _reverse_all_objectives_vmap_pullback_for_parameter_vector(  # noqa: E731
+                    lambda p: all_objectives_direct_fn(  # noqa: E731
                         p,
                         runtime=runtime,
                         baseline_state=baseline_state,
@@ -1828,9 +1954,9 @@ def main() -> None:
             gradient_matrix = None
             reverse_total_s = time.perf_counter() - t_reverse_start
         elif args.timing_mode == "jit-warm":
-            if args.reverse_all_objectives_mode == "vmap_pullback":
+            if args.reverse_all_objectives_mode in {"vmap_pullback", "multi_rhs_reduced"}:
                 all_objectives_fn = jax.jit(
-                    lambda p: _reverse_all_objectives_vmap_pullback_for_parameter_vector(  # noqa: E731
+                    lambda p: all_objectives_direct_fn(  # noqa: E731
                         p,
                         runtime=runtime,
                         baseline_state=baseline_state,
@@ -1851,7 +1977,7 @@ def main() -> None:
             gradient_matrix = first_gradient_matrix
             for _ in range(max(1, int(args.warm_repeats))):
                 t_execute_start = time.perf_counter()
-                if args.reverse_all_objectives_mode == "vmap_pullback":
+                if args.reverse_all_objectives_mode in {"vmap_pullback", "multi_rhs_reduced"}:
                     objective_values, gradient_matrix = all_objectives_fn(baseline_values)
                     objective_values = jax.block_until_ready(objective_values)
                     gradient_matrix = jax.block_until_ready(gradient_matrix)
@@ -1862,8 +1988,8 @@ def main() -> None:
             reverse_execute_s = float(np.mean(reverse_execute_times_s))
             reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
         else:
-            if args.reverse_all_objectives_mode == "vmap_pullback":
-                objective_values, gradient_matrix = _reverse_all_objectives_vmap_pullback_for_parameter_vector(
+            if args.reverse_all_objectives_mode in {"vmap_pullback", "multi_rhs_reduced"}:
+                objective_values, gradient_matrix = all_objectives_direct_fn(
                     baseline_values,
                     runtime=runtime,
                     baseline_state=baseline_state,
