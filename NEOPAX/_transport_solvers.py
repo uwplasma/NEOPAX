@@ -5489,12 +5489,33 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
             else _stage_rhs_vjp
         )
 
-        jt_lambda_stages = jax.vmap(stage_rhs_vjp, in_axes=(0, 0, 0))(
-            stage_times,
-            stage_states,
-            lambda_stages,
-        )
-        coupled_jt_lambda = kernel_context.a.T @ jt_lambda_stages
+        if memory_mode in {"stream_rhs", "stream_matvec", "stream_stage_rhs"}:
+            def _accumulate_coupled_jt_lambda(coupled, stage_index):
+                jt_lambda = stage_rhs_vjp(
+                    jax.lax.dynamic_index_in_dim(stage_times, stage_index, axis=0, keepdims=False),
+                    jax.lax.dynamic_index_in_dim(stage_states, stage_index, axis=0, keepdims=False),
+                    jax.lax.dynamic_index_in_dim(lambda_stages, stage_index, axis=0, keepdims=False),
+                )
+                a_row = jax.lax.dynamic_index_in_dim(
+                    kernel_context.a,
+                    stage_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                return coupled + a_row[:, None] * jt_lambda[None, :], None
+
+            coupled_jt_lambda, _ = jax.lax.scan(
+                _accumulate_coupled_jt_lambda,
+                jnp.zeros_like(lambda_stages),
+                jnp.arange(kernel_context.num_stages, dtype=jnp.int32),
+            )
+        else:
+            jt_lambda_stages = jax.vmap(stage_rhs_vjp, in_axes=(0, 0, 0))(
+                stage_times,
+                stage_states,
+                lambda_stages,
+            )
+            coupled_jt_lambda = kernel_context.a.T @ jt_lambda_stages
         return (lambda_stages - primal_result.trial_dt * coupled_jt_lambda).reshape((-1,))
 
     def _preconditioner(vector):

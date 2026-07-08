@@ -810,7 +810,6 @@ def main() -> None:
             "scalar_contract_lowdot_sequential",
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
-            "scalar_contract_lowdot_recompute_blocks",
             "scalar_contract_matrix_free",
         ),
         help=(
@@ -828,8 +827,6 @@ def main() -> None:
             "NTX while keeping NEOPAX's transport-moment cotangent mapping. "
             "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
             "before field-dot contractions to test peak-memory reduction. "
-            "'scalar_contract_lowdot_recompute_blocks' keeps only NTX LU/pivot "
-            "factors and recomputes lower/upper blocks inside reverse scans. "
             "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
             "using Krylov solves on the NTX block operator."
         ),
@@ -1007,13 +1004,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-memory-mode",
-        choices=("default", "remat_matvec", "stage_call_boundary"),
+        choices=("default", "remat_matvec", "stream_rhs", "stage_call_boundary"),
         default="default",
         help=(
             "Memory strategy inside the exact reverse stage-adjoint matvec. "
             "'default' keeps the current graph. 'remat_matvec' checkpoints the "
             "per-stage RHS transpose inside the Krylov matvec while preserving "
-            "the outer lax.scan structure. 'stage_call_boundary' puts the "
+            "the outer lax.scan structure. 'stream_rhs' accumulates each stage "
+            "RHS transpose contribution into A.T @ J.T @ lambda without first "
+            "materializing the full per-stage stack. 'stage_call_boundary' puts the "
             "reduced-cotangent stage adjoint solve plus residual-input pullback "
             "behind a non-inlined JIT call boundary."
         ),

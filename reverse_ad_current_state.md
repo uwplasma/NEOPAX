@@ -1476,3 +1476,75 @@ Do not pursue next:
 - static branch schedule/unroll,
 - more per-energy nested JIT wrappers,
 - host-segment orchestration as the final solution.
+
+## 2026-07-07 immediate next-session update: target stage/RHS workspace, not more NTX algebra variants
+
+Latest correction:
+
+- The saved lower/upper NTX coupling-block recompute idea was tested and should
+  be treated as rejected.
+- It was expected to reduce memory only if those saved coupling blocks were the
+  dominant peak allocation.
+- The observed run showed more time and no memory reduction, and the XLA memory
+  report points instead to a dominant `preallocated-temp` allocation.
+- Therefore, the peak is more likely a live temporary workspace from the
+  accepted-step reverse body / stage-RHS transpose solve, not ordinary
+  persistent lower/upper arrays.
+
+Immediate next target:
+
+- Stop making new `scalar_contract_*` NTX derivative-algebra variants for now.
+- Work inside the reverse accepted-step body, especially:
+  - `_execute_radau_accepted_step_next_reduced_cotangent_bwd`
+  - `_radau_solve_exact_stage_residual_transpose_iterative`
+- The goal is to shorten the lifetime of stage residual / RHS transpose
+  temporaries and accumulate carry/parameter bars immediately instead of
+  keeping a broad stage-cotangent workspace live through the whole backward
+  step.
+
+Proposed first implementation:
+
+- Add an opt-in reverse step mode such as
+  `reduced_cotangent_stream_rhs`.
+- In that mode, stream the stage/RHS transpose contribution:
+  - solve/accumulate one RHS or cotangent component at a time,
+  - immediately add its contribution into reduced carry/parameter bars,
+  - avoid materializing or keeping the full stage residual cotangent workspace
+    live across the NTX derivative pullback.
+- This must stay reverse-only. Do not modify the production forward solver,
+  FD lane, or forward-AD lane.
+
+Success criteria:
+
+- Correctness first: match the current trusted `objective all` gradients from
+  `scalar_contract_lowdot` + `reduced_cotangent`.
+- Memory second: require a real drop in the XLA memory report, especially the
+  dominant `preallocated-temp` allocation, not only a visual RAM-graph change.
+- Runtime should not regress badly; if memory is unchanged and runtime worsens,
+  revert the mode like the rejected recompute-block path.
+
+First benchmark after implementation:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent_stream_rhs
+```
+
+Do not repeat as memory solutions:
+
+- `scalar_contract_lowdot_recompute_blocks`
+- additional `scalar_contract_lowdot_ntx` packing/scan variants
+- `scalar_contract_matrix_free`
+- `ntx_exact_scan_batch_size=1`
+- per-energy nested JIT boundaries
+- static branch schedules
