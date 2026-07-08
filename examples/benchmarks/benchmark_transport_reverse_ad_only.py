@@ -484,6 +484,68 @@ def _reverse_objective_vector_for_parameter_vector(
     return _objective_vector(final_state, runtime)
 
 
+def _reverse_final_y_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+):
+    state0 = _initial_state_for_parameter_vector(
+        parameter_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    initial_carry = _reverse_initial_carry_from_state_with_static_setup(
+        solver=reverse_setup.solver,
+        state=state0,
+        solve_vector_field=reverse_setup.solve_vector_field,
+        species=runtime.species,
+        prepared_rollout_static=reverse_setup.prepared_rollout,
+    )
+    return _radau_adaptive_final_y_realized_schedule_vjp(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+
+def _reverse_all_objectives_vmap_pullback_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+):
+    """Compute all objective rows by batching final-y cotangent pullbacks."""
+
+    def _final_y_from_parameters(parameter_values_value):
+        return _reverse_final_y_for_parameter_vector(
+            parameter_values_value,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+    final_y, final_y_pullback = jax.vjp(_final_y_from_parameters, parameter_values)
+
+    def _objective_vector_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)
+
+    objective_values, objective_pullback = jax.vjp(_objective_vector_from_final_y, final_y)
+    objective_basis = jnp.eye(len(OBJECTIVE_LABELS), dtype=jnp.asarray(objective_values).dtype)
+    final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
+    gradient_matrix = jax.vmap(lambda final_y_bar: final_y_pullback(final_y_bar)[0])(final_y_bars)
+    return objective_values, gradient_matrix
+
+
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
     parameter_values,
     *,
@@ -923,6 +985,11 @@ def _run_realtime_geometry_reverse_mode(
             "[autodiff-gate] --diagnose-final-objective-cotangent is only "
             "available for the profile-only static reverse setup."
         )
+    if str(args.reverse_all_objectives_mode) != "jacrev":
+        raise SystemExit(
+            "[autodiff-gate] --reverse-all-objectives-mode vmap_pullback is "
+            "currently implemented only for the profile-only static reverse setup."
+        )
     geometry_parameter = str(args.reverse_geometry_parameter)
     parameter_order = _reverse_geometry_parameter_order(geometry_parameter)
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
@@ -1135,6 +1202,21 @@ def main() -> None:
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
             "objective-by-parameter reverse derivative matrix for every metric."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-all-objectives-mode",
+        type=str,
+        default="jacrev",
+        choices=("jacrev", "vmap_pullback"),
+        help=(
+            "Implementation used when --objective all. 'jacrev' preserves the "
+            "current vector-objective reverse path. 'vmap_pullback' rolls out "
+            "final_y once, builds one final-y cotangent per objective, and vmaps "
+            "the realized-schedule pullback over those cotangents. This is an "
+            "experimental probe; if the existing scalar custom-VJP backward does "
+            "not batch through vmap, the next step is a solver-level multi-RHS "
+            "adjoint carry."
         ),
     )
     parser.add_argument(
@@ -1724,30 +1806,75 @@ def main() -> None:
         reverse_compile_plus_execute_s = None
         reverse_execute_s = None
         reverse_execute_times_s: list[float] = []
+        objective_values = None
         t_reverse_start = time.perf_counter()
         if args.timing_mode == "jit-compile-only":
-            jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
-            compiled_jac_fn = jac_fn.lower(baseline_values).compile()
-            del compiled_jac_fn
+            if args.reverse_all_objectives_mode == "vmap_pullback":
+                all_objectives_fn = jax.jit(
+                    lambda p: _reverse_all_objectives_vmap_pullback_for_parameter_vector(  # noqa: E731
+                        p,
+                        runtime=runtime,
+                        baseline_state=baseline_state,
+                        profile_cfg=profile_cfg,
+                        reverse_setup=reverse_setup,
+                    )
+                )
+                compiled_all_objectives_fn = all_objectives_fn.lower(baseline_values).compile()
+                del compiled_all_objectives_fn
+            else:
+                jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
+                compiled_jac_fn = jac_fn.lower(baseline_values).compile()
+                del compiled_jac_fn
             gradient_matrix = None
             reverse_total_s = time.perf_counter() - t_reverse_start
         elif args.timing_mode == "jit-warm":
-            jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
-            first_gradient_matrix = jac_fn(baseline_values)
-            first_gradient_matrix = jax.block_until_ready(first_gradient_matrix)
+            if args.reverse_all_objectives_mode == "vmap_pullback":
+                all_objectives_fn = jax.jit(
+                    lambda p: _reverse_all_objectives_vmap_pullback_for_parameter_vector(  # noqa: E731
+                        p,
+                        runtime=runtime,
+                        baseline_state=baseline_state,
+                        profile_cfg=profile_cfg,
+                        reverse_setup=reverse_setup,
+                    )
+                )
+                first_objective_values, first_gradient_matrix = all_objectives_fn(baseline_values)
+                first_objective_values = jax.block_until_ready(first_objective_values)
+                first_gradient_matrix = jax.block_until_ready(first_gradient_matrix)
+                objective_values = first_objective_values
+            else:
+                jac_fn = jax.jit(jax.jacrev(objective_vector_fn))
+                first_gradient_matrix = jac_fn(baseline_values)
+                first_gradient_matrix = jax.block_until_ready(first_gradient_matrix)
             reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
 
             gradient_matrix = first_gradient_matrix
             for _ in range(max(1, int(args.warm_repeats))):
                 t_execute_start = time.perf_counter()
-                gradient_matrix = jac_fn(baseline_values)
-                gradient_matrix = jax.block_until_ready(gradient_matrix)
+                if args.reverse_all_objectives_mode == "vmap_pullback":
+                    objective_values, gradient_matrix = all_objectives_fn(baseline_values)
+                    objective_values = jax.block_until_ready(objective_values)
+                    gradient_matrix = jax.block_until_ready(gradient_matrix)
+                else:
+                    gradient_matrix = jac_fn(baseline_values)
+                    gradient_matrix = jax.block_until_ready(gradient_matrix)
                 reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
             reverse_execute_s = float(np.mean(reverse_execute_times_s))
             reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
         else:
-            gradient_matrix = jax.jacrev(objective_vector_fn)(baseline_values)
-            gradient_matrix = jax.block_until_ready(gradient_matrix)
+            if args.reverse_all_objectives_mode == "vmap_pullback":
+                objective_values, gradient_matrix = _reverse_all_objectives_vmap_pullback_for_parameter_vector(
+                    baseline_values,
+                    runtime=runtime,
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    reverse_setup=reverse_setup,
+                )
+                objective_values = jax.block_until_ready(objective_values)
+                gradient_matrix = jax.block_until_ready(gradient_matrix)
+            else:
+                gradient_matrix = jax.jacrev(objective_vector_fn)(baseline_values)
+                gradient_matrix = jax.block_until_ready(gradient_matrix)
             reverse_total_s = time.perf_counter() - t_reverse_start
 
         reverse_checkpoint_count = None
@@ -1774,8 +1901,9 @@ def main() -> None:
 
         objective_values_by_name = None
         if args.timing_mode != "jit-compile-only":
-            objective_values = objective_vector_fn(baseline_values)
-            objective_values = jax.block_until_ready(objective_values)
+            if objective_values is None:
+                objective_values = objective_vector_fn(baseline_values)
+                objective_values = jax.block_until_ready(objective_values)
             objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
             objective_values_by_name = {
                 objective_name: float(value)
@@ -1798,6 +1926,7 @@ def main() -> None:
             "config_path": str(Path(args.config)),
             "objective_name": "all",
             "objective_order": list(OBJECTIVE_LABELS),
+            "reverse_all_objectives_mode": str(args.reverse_all_objectives_mode),
             "objective_values": objective_values_by_name,
             "parameter_order": list(PARAMETER_ORDER),
             "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
@@ -1840,6 +1969,7 @@ def main() -> None:
 
         print(
             f"[autodiff-gate] mode=transport_reverse_ad_only objective=all "
+            f"reverse_all_objectives_mode={args.reverse_all_objectives_mode} "
             f"objectives={list(OBJECTIVE_LABELS)} "
             f"parameters={list(PARAMETER_ORDER)} "
             f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
