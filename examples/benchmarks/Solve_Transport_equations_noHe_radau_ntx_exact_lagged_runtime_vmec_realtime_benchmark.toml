@@ -7,7 +7,7 @@ mode = "transport"
 
 [geometry]
 backend = "vmec_jax_booz_xform_jax"
-vmec_input_file = "./examples/inputs/input.QI_nfp2_newNT_opt_hires"
+vmec_input_file = "./examples/inputs/input.QI_nfp2_newNT_opt_hires_true"
 vmec_lane = "forward"
 vmec_param_family = "RBC"
 vmec_param_m = 1

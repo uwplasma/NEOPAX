@@ -69,6 +69,19 @@ def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
     return value
 
 
+def _resolve_vmec_attr_any(module, name: str, *, submodules: Sequence[str]):
+    errors = []
+    for submodule in submodules:
+        try:
+            return _resolve_vmec_attr(module, name, submodule=submodule)
+        except (AttributeError, ModuleNotFoundError) as exc:
+            errors.append(f"vmec_jax.{submodule}: {exc}")
+    raise AttributeError(
+        f"vmec_jax does not provide '{name}' in any of: {', '.join(submodules)}. "
+        f"Errors: {'; '.join(errors)}"
+    )
+
+
 def _build_vmec_fixed_context(vmec_jax, *, static, indata, boundary):
     initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
     eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
@@ -454,15 +467,15 @@ def _vmec_scalar_observables_from_state(
         "b_cartesian_from_state",
         submodule="field",
     )
-    smooth_reduce_max = _resolve_vmec_attr(
+    smooth_reduce_max = _resolve_vmec_attr_any(
         vmec_jax,
         "_smooth_reduce_max",
-        submodule="quasi_isodynamic",
+        submodules=("quasi_isodynamic", "quasi_isodynamic.objectives"),
     )
-    smooth_reduce_min = _resolve_vmec_attr(
+    smooth_reduce_min = _resolve_vmec_attr_any(
         vmec_jax,
         "_smooth_reduce_min",
-        submodule="quasi_isodynamic",
+        submodules=("quasi_isodynamic", "quasi_isodynamic.objectives"),
     )
 
     geom = eval_geom(state, context.static)
@@ -1547,8 +1560,14 @@ def _build_neopax_geometry_from_state(
     from NEOPAX._geometry_models import VmecBoozer
     from vmec_jax.energy import flux_profiles_from_indata
     from vmec_jax.integrals import cumrect_s_halfmesh
-    from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
-    from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
+    try:
+        from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
+    except ModuleNotFoundError:
+        from vmec_jax.kernels.forces import vmec_forces_rz_from_wout
+    try:
+        from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
+    except ModuleNotFoundError:
+        from vmec_jax.kernels.residue import vmec_force_norms_from_bcovar_dynamic
 
     rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
     if int(n_r) > 1:

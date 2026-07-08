@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import sys
@@ -55,6 +56,40 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 _REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+
+
+def _benchmark_device_context(config: dict[str, Any]):
+    general_cfg = config.get("general", {})
+    device = str(general_cfg.get("device", "auto")).strip().lower()
+    if device in {"", "none", "null", "auto"}:
+        return contextlib.nullcontext()
+    if device not in {"cpu", "gpu"}:
+        raise ValueError("general.device must be one of: auto, cpu, gpu")
+    try:
+        devices = jax.local_devices(backend=device)
+    except Exception as exc:
+        available = sorted({local_device.platform for local_device in jax.local_devices()})
+        raise ValueError(
+            f"Requested general.device={device!r}, but JAX could not query that backend. "
+            f"Available local platforms: {available}"
+        ) from exc
+    if not devices:
+        available = sorted({local_device.platform for local_device in jax.local_devices()})
+        raise ValueError(
+            f"Requested general.device={device!r}, but no local JAX devices were found. "
+            f"Available local platforms: {available}"
+        )
+    return jax.default_device(devices[0])
+
+
+def _array_device_summary(value) -> str:
+    try:
+        return str(value.device)
+    except Exception:
+        try:
+            return ",".join(str(device) for device in value.devices())
+        except Exception:
+            return "unknown"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -897,6 +932,13 @@ def _run_realtime_geometry_reverse_mode(
         + [float(geom_cfg.get("vmec_param_delta", 0.0))],
         dtype=jnp.float64,
     )
+    print(
+        "[autodiff-gate] realtime geometry device: "
+        f"default_backend={jax.default_backend()} "
+        f"baseline_values_device={_array_device_summary(baseline_values)} "
+        f"local_devices={[str(device) for device in jax.local_devices()]}",
+        flush=True,
+    )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
 
     objective_vector_fn = lambda p: _reverse_geometry_objective_vector_for_parameter_vector(  # noqa: E731
@@ -1543,13 +1585,14 @@ def main() -> None:
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)
     if args.reverse_parameter_mode == "profiles_plus_realtime_geometry":
-        _run_realtime_geometry_reverse_mode(
-            args=args,
-            config=config,
-            profile_cfg=profile_cfg,
-            effective_ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
-            neoclassical_cfg=neoclassical_cfg,
-        )
+        with _benchmark_device_context(config):
+            _run_realtime_geometry_reverse_mode(
+                args=args,
+                config=config,
+                profile_cfg=profile_cfg,
+                effective_ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
+                neoclassical_cfg=neoclassical_cfg,
+            )
         return
 
     runtime, baseline_state = build_runtime_context(config)
