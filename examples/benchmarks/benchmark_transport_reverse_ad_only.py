@@ -811,7 +811,6 @@ def main() -> None:
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
-            "scalar_contract_exact_matrix_free",
         ),
         help=(
             "Reverse-only algebra mode for compact NTX derivative-field "
@@ -829,9 +828,7 @@ def main() -> None:
             "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
             "before field-dot contractions to test peak-memory reduction. "
             "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
-            "using Krylov solves on the NTX block operator. "
-            "'scalar_contract_exact_matrix_free' recomputes exact "
-            "block-tridiagonal factors instead of carrying saved factor stacks."
+            "using Krylov solves on the NTX block operator."
         ),
     )
     parser.add_argument(
@@ -874,6 +871,17 @@ def main() -> None:
             "Exact-runtime NTX coefficient-scan batch size across energy-grid "
             "cases. Unset/0 preserves the config default; values >1 chunk the "
             "energy/collisionality scan."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-exact-preload-support",
+        choices=("config", "true", "false"),
+        default="config",
+        help=(
+            "Reverse-lane-only preload_support override for ntx_exact_lij_runtime. "
+            "'config' preserves the current orchestrator/config behavior. 'false' "
+            "tests whether preloaded NTX support arrays captured by the static "
+            "reverse custom-VJP context are driving compile-memory constants."
         ),
     )
     parser.add_argument(
@@ -1174,6 +1182,8 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
     if args.ntx_scan_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
+    if args.ntx_exact_preload_support != "config":
+        neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(
@@ -1393,6 +1403,7 @@ def main() -> None:
             "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
             "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
             "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
+            "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
             "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1427,6 +1438,7 @@ def main() -> None:
             f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
             f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
             f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
+            f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
             f"reverse_total_s={reverse_total_s:.6e}"
         )
         if reverse_compile_plus_execute_s is not None:
@@ -1516,6 +1528,7 @@ def main() -> None:
             "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
             "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
             "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
+            "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
             "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
             "reverse_segment_length": reverse_segment_length,
             "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1548,6 +1561,7 @@ def main() -> None:
             f"ntx_exact_radial_batch_size={neoclassical_cfg.get('ntx_exact_radial_batch_size')} "
             f"ntx_exact_radial_batch_mode={neoclassical_cfg.get('ntx_exact_radial_batch_mode', 'simple')} "
             f"ntx_exact_scan_batch_size={neoclassical_cfg.get('ntx_exact_scan_batch_size')} "
+            f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
             f"max_total_steps={reverse_setup.max_total_steps} "
             f"reverse_checkpoint_count={reverse_checkpoint_count} "
             f"reverse_segment_length={reverse_segment_length} "
@@ -1670,6 +1684,7 @@ def main() -> None:
         "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
         "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
         "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
+        "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_segment_length": reverse_segment_length,
         "reverse_lagged_reuse_count": reverse_lagged_reuse_count,
@@ -1707,6 +1722,7 @@ def main() -> None:
         f"ntx_exact_radial_batch_size={neoclassical_cfg.get('ntx_exact_radial_batch_size')} "
         f"ntx_exact_radial_batch_mode={neoclassical_cfg.get('ntx_exact_radial_batch_mode', 'simple')} "
         f"ntx_exact_scan_batch_size={neoclassical_cfg.get('ntx_exact_scan_batch_size')} "
+        f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
         f"max_total_steps={reverse_setup.max_total_steps} "
         f"reverse_checkpoint_count={reverse_checkpoint_count} "
         f"reverse_segment_length={reverse_segment_length} "

@@ -1789,9 +1789,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
-            "exact_matrix_free": "scalar_contract_exact_matrix_free",
-            "exact-matrix-free": "scalar_contract_exact_matrix_free",
-            "matrix_free_exact": "scalar_contract_exact_matrix_free",
         }
         normalized = aliases.get(normalized, normalized)
         if normalized not in {
@@ -1802,14 +1799,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
-            "scalar_contract_exact_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
                 "scalar_contract_lowdot_sequential, scalar_contract_lowdot_ntx, "
-                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free, "
-                "scalar_contract_exact_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
             )
         return normalized
 
@@ -3045,11 +3040,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
             == "scalar_contract_matrix_free"
         )
-        use_exact_matrix_free = (
-            self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
-            == "scalar_contract_exact_matrix_free"
-        )
-        use_operator_solve = use_matrix_free or use_exact_matrix_free
+        use_operator_solve = use_matrix_free
 
         def _safe_divide(numerator, denominator, dtype):
             safe_denominator = jnp.where(
@@ -3371,8 +3362,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return _solve_primal()
 
         def _block_operator_solve(ctx, source, *, transpose=False):
-            if use_exact_matrix_free:
-                return _exact_recompute_block_operator_solve(ctx, source, transpose=transpose)
             return _matrix_free_block_operator_solve(ctx, source, transpose=transpose)
 
         def _one_case_pullback(args):
@@ -3896,7 +3885,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
                     "scalar_contract_matrix_free",
-                    "scalar_contract_exact_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
@@ -3958,7 +3946,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
                     "scalar_contract_matrix_free",
-                    "scalar_contract_exact_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
