@@ -1804,9 +1804,20 @@ def build_ntx_exact_lij_support_from_vmec_state(
     import ntx
     from NEOPAX._transport_flux_models import NTXExactLijRuntimeSupport
 
+    def _surfaces_from_vmec_jax_state(**kwargs):
+        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
+        if surfaces_fn is None:
+            try:
+                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
+            except ImportError:
+                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
+                s_values = kwargs.pop("s_values")
+                return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
+        return surfaces_fn(**kwargs)
+
     rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
     rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
-    center_surfaces = ntx.surfaces_from_vmec_jax_state(
+    center_surfaces = _surfaces_from_vmec_jax_state(
         state=state,
         static=context.static,
         indata=context.indata,
@@ -1816,7 +1827,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         nboz=int(context.nboz),
         psi_p=float(jnp.asarray(geometry.Psia_value)),
     )
-    face_surfaces = ntx.surfaces_from_vmec_jax_state(
+    face_surfaces = _surfaces_from_vmec_jax_state(
         state=state,
         static=context.static,
         indata=context.indata,
