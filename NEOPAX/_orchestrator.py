@@ -112,6 +112,17 @@ def _as_string_list(value):
     return [value] if value else []
 
 
+def _optional_config_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null"}:
+            return None
+        return int(text)
+    return int(value)
+
+
 def _load_python_extension_file(path: Path) -> None:
     resolved = path.resolve()
     module_name = f"neopax_user_extension_{abs(hash(str(resolved)))}"
@@ -665,8 +676,8 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
             param_family=str(geom_cfg.get("vmec_param_family", "RBC")),
             param_m=int(geom_cfg.get("vmec_param_m", 1)),
             param_n=int(geom_cfg.get("vmec_param_n", 0)),
-            mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
-            nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+            mboz=_optional_config_int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz"))),
+            nboz=_optional_config_int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz"))),
         )
         lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
         param_delta = float(geom_cfg.get("vmec_param_delta", 0.0))

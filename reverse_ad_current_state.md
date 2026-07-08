@@ -1705,3 +1705,176 @@ Forward-AD companion plan:
 - Forward AD should remain a separate lane: profile parameters keep the current
   `--parameter n0|T0|...` behavior, while the first geometry extension should be
   an opt-in single-parameter form such as `--parameter vmec:RBC:1:0`.
+
+## 2026-07-08 Lane State Handoff
+
+This section records the current state after the all-objective reverse-AD and
+realtime-geometry discussions.  Use it as the first checkpoint in the next
+session.
+
+### Forward Solver Lane
+
+- Baseline production forward solver should remain independent from AD
+  experiments.
+- Frozen-geometry NTX forward solver TOMLs are still the reference for
+  profile-only transport behavior.
+- Realtime-geometry forward solver TOML exists for the VMEC/JAX +
+  Booz-xform/JAX path; VMEC/Booz should be built once for the runtime geometry,
+  while NTX is still called repeatedly during transport flux evaluations.
+- No reverse-AD multi-RHS changes should be allowed to change forward-solver
+  behavior.
+
+### Forward-AD Lane
+
+- `benchmark_transport_forward_ad_only.py` remains the reference forward-AD
+  lane for profile derivatives.
+- Known profile-only 16-step softmax reference values used for reverse
+  comparison:
+
+  ```text
+  dsoftmax_Er/dn0                     = -3.759631e+00
+  dsoftmax_Er/dT0                     =  3.054047e+00
+  dsoftmax_Er/ddensity_shape_power    = -8.518430e-02
+  dsoftmax_Er/dtemperature_shape_power=  3.214063e+00
+  ```
+
+- The forward-AD geometry extension should stay opt-in and use the already
+  tested geometry helpers:
+  `build_geometry_autodiff_context(...)` and
+  `build_runtime_context_for_geometry_param(...)`.
+- Do not import reverse-AD helpers into the forward-AD benchmark.
+
+### Reverse-AD Profile Lane
+
+- Correct profile-only reverse baseline for all objectives at 2 accepted steps
+  matches the forward-AD values, including the tiny `smooth_root_proxy`
+  derivatives when printed at high precision.
+- The correct 2-step all-objective reverse command is:
+
+  ```bash
+  python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+    --ntx-exact-derivative-mode direct \
+    --ntx-exact-derivative-field-pullback-mode compact_vjp \
+    --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+    --objective all \
+    --accepted-step-limit 2 \
+    --radau-jacobian-reuse-mode legacy \
+    --timing-mode jit-warm \
+    --reverse-segment-length 2 \
+    --reverse-stage-adjoint-solve-mode bicgstab \
+    --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+    --reverse-step-bwd-mode reduced_cotangent
+  ```
+
+- The 16-step all-objective baseline without the new multi-RHS mode was
+  expensive:
+
+  ```text
+  reverse_total_s                 = 2.305885e+03
+  reverse_compile_plus_execute_s  = 1.413693e+03
+  reverse_execute_s_mean          = 8.921922e+02
+  ```
+
+- This 16-step all-objective run produced the expected full gradient matrix and
+  should be treated as the current correctness reference for profile-only
+  reverse AD.
+
+### Reverse-AD All-Objective Multi-RHS Experiment
+
+- A new opt-in mode was added:
+
+  ```text
+  --reverse-all-objectives-mode multi_rhs_reduced
+  ```
+
+- The name `reduced` means reduced cotangent contract, not partial
+  implementation.  The reduced contract carries only:
+
+  ```text
+  y
+  lagged_response_cache
+  lagged_reference_y
+  ```
+
+- The intended call chain for the requested mode is:
+
+  ```text
+  _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector
+    -> _radau_segment_reduced_cotangent_bwd_batched_call
+    -> _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd
+    -> _radau_solve_exact_stage_residual_transpose_batched
+    -> _radau_solve_exact_stage_residual_transpose_batched_iterative
+  ```
+
+- This is intended to batch the objective RHS axis inside the reduced
+  stage-adjoint solve rather than only wrapping scalar objective pullbacks.
+- The batched BiCGSTAB keeps independent row scalars/convergence state for
+  each objective RHS while sharing the loop body and batched transpose matvec.
+- The 2-step test with this mode completed and matched the current correct
+  all-objective gradients:
+
+  ```text
+  reverse_all_objectives_mode      = multi_rhs_reduced
+  reverse_total_s                 = 4.780329e+02
+  reverse_compile_plus_execute_s  = 4.579891e+02
+  reverse_execute_s_mean          = 2.004384e+01
+  ```
+
+- The 2-step timing is not decisive for performance because compile and launch
+  overhead dominate.  The meaningful test is 16 accepted steps.
+
+Next command to run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+  --objective all \
+  --reverse-all-objectives-mode multi_rhs_reduced \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Success criteria for the 16-step multi-RHS test:
+
+- Gradients match the previous 16-step all-objective reverse reference.
+- `reverse_execute_s_mean` is materially below the previous
+  `8.921922e+02 s` if the multi-RHS path is reducing repeated reverse work.
+- If execution time remains close to the old value, the remaining duplicated
+  cost is likely inside the RHS transpose/pullback graph or XLA lowering of the
+  batched objective axis, not in the benchmark-level objective loop.
+
+### Reverse-AD Geometry Lane
+
+- The correctness-first reverse geometry path is separate from the optimized
+  profile-only realized-schedule custom VJP path.
+- The geometry path should use the pure-geometry-tested VMEC/JAX and
+  Booz-xform/JAX helpers.
+- Geometry differentiation should initially support a single opt-in VMEC
+  boundary parameter, for example:
+
+  ```text
+  --reverse-parameter-mode profiles_plus_realtime_geometry
+  --reverse-geometry-parameter RBC:1:0
+  ```
+
+- Do not mix geometry differentiation work with reverse profile memory
+  optimization in the same patch unless explicitly requested.
+
+### Guardrails For Next Session
+
+- Do not change NTX unless explicitly requested.
+- Do not change forward solver or forward-AD behavior while testing reverse
+  all-objective performance.
+- Do not treat `vmap` over scalar pullbacks as a completed multi-RHS adjoint.
+- If a new performance path does not improve a small test, do not assume the
+  16-step behavior without checking whether the small test is dominated by
+  compile/launch overhead.
+- If XLA dumps are needed, dump only memory reports or clean `/tmp` afterward;
+  previous full dumps risked filling disk.

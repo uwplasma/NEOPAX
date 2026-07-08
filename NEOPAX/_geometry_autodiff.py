@@ -194,14 +194,60 @@ def _vmec_default_ftol_from_indata(indata: Any) -> float | None:
     return None if value is None else float(value)
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null"}:
+            return None
+        return int(text)
+    return int(value)
+
+
+def _optional_static_int(static: Any, cfg: Any, name: str) -> int | None:
+    for owner in (static, getattr(static, "cfg", None), cfg):
+        if owner is None or not hasattr(owner, name):
+            continue
+        value = getattr(owner, name)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _resolve_booz_resolution_defaults(
+    *,
+    static: Any,
+    cfg: Any,
+    mboz: int | None,
+    nboz: int | None,
+) -> tuple[int, int]:
+    """Mirror the xbooz_xform-style auto resolution for unset Boozer modes."""
+    resolved_mboz = _optional_int(mboz)
+    resolved_nboz = _optional_int(nboz)
+
+    mpol = _optional_static_int(static, cfg, "mpol")
+    ntor = _optional_static_int(static, cfg, "ntor")
+
+    if resolved_mboz is None:
+        if mpol is None:
+            raise ValueError("mboz was not provided and VMEC mpol could not be inferred.")
+        resolved_mboz = max(2, 6 * int(mpol))
+    if resolved_nboz is None:
+        if ntor is None:
+            raise ValueError("nboz was not provided and VMEC ntor could not be inferred.")
+        resolved_nboz = max(0, 2 * int(ntor) - 1)
+    return int(resolved_mboz), int(resolved_nboz)
+
+
 def build_geometry_autodiff_context(
     input_path: str | Path,
     *,
     param_family: str,
     param_m: int,
     param_n: int,
-    mboz: int = 12,
-    nboz: int = 12,
+    mboz: int | None = None,
+    nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
 ) -> GeometryAutodiffContext:
     vmec_jax = _import_vmec_jax()
@@ -249,10 +295,16 @@ def build_geometry_autodiff_context(
     except Exception:
         s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
         surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in surface_s]
+    resolved_mboz, resolved_nboz = _resolve_booz_resolution_defaults(
+        static=static,
+        cfg=cfg,
+        mboz=mboz,
+        nboz=nboz,
+    )
     booz_constants, booz_grids = booz_api.prepare_booz_xform_constants_from_inputs(
         inputs=fixed_context["booz_inputs"],
-        mboz=int(mboz),
-        nboz=int(nboz),
+        mboz=resolved_mboz,
+        nboz=resolved_nboz,
         asym=bool(cfg.lasym),
     )
 
@@ -274,8 +326,8 @@ def build_geometry_autodiff_context(
         pressure=jnp.asarray(fixed_context["pressure"]),
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
-        mboz=int(mboz),
-        nboz=int(nboz),
+        mboz=resolved_mboz,
+        nboz=resolved_nboz,
         booz_constants=booz_constants,
         booz_grids=booz_grids,
         baseline_coefficient=float(boundary_array[boundary_index]),

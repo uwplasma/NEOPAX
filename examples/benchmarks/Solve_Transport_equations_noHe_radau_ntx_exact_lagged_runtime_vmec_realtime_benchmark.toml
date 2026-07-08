@@ -14,8 +14,7 @@ vmec_param_m = 1
 vmec_param_n = 0
 vmec_param_delta = 0.0
 n_radial = 51
-mboz = 12
-nboz = 12
+# Omit mboz/nboz to match xbooz_xform-style auto sizing from VMEC mpol/ntor.
 
 [neoclassical]
 flux_model = "ntx_exact_lij_runtime"

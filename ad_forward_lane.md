@@ -475,3 +475,61 @@ Do not do in the first pass:
   configs.
 - Do not add multiple geometry parameters until the single-parameter path is
   validated.
+
+## 2026-07-08 Forward AD 16-Step Profile References
+
+These values were produced with the profile-only forward AD benchmark at
+`--accepted-step-limit 16`, `--ntx-exact-derivative-mode direct`, and
+`--radau-jacobian-reuse-mode legacy`.
+
+Commands:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy
+
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter T0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy
+
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter density_shape_power \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy
+
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter temperature_shape_power \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy
+```
+
+Forward AD runtimes:
+
+| Parameter | Baseline value | `forward_ad_total_s` |
+|---|---:|---:|
+| `n0` | `4.210000e+00` | `1.304289e+03` |
+| `T0` | `1.780000e+01` | `1.305469e+03` |
+| `density_shape_power` | `1.000000e+01` | `1.312365e+03` |
+| `temperature_shape_power` | `2.000000e+00` | `1.305829e+03` |
+
+Forward AD derivatives:
+
+| Objective | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` |
+|---|---:|---:|---:|---:|
+| `softmax_Er` | `-3.763715e+00` | `3.057234e+00` | `-8.528369e-02` | `3.220282e+00` |
+| `smooth_root_proxy` | `4.214696e-04` | `-1.730687e-04` | `-3.686619e-06` | `1.672156e-02` |
+| `Er2_volume_average` | `-4.377065e+00` | `2.463177e+01` | `1.339075e+00` | `-3.204200e+01` |
+| `Er_volume_average` | `-1.738659e+00` | `8.214770e-01` | `-4.387205e-02` | `-4.177935e-01` |
+| `electron_temperature_volume_average_keV` | `3.187853e-03` | `3.504164e-01` | `-1.821264e-04` | `1.503562e+00` |
+| `total_pressure_volume_average` | `7.906522e+00` | `1.829334e+00` | `2.397771e-01` | `7.600936e+00` |
+| `alpha_power_volume_average_mw_m3` | `2.739043e-01` | `8.142878e-02` | `2.311157e-03` | `2.779267e-01` |
+
+These are the current forward-AD references for comparing against 16-step
+profile-only reverse AD.
