@@ -1329,6 +1329,7 @@ class NTXExactLijRuntimeSupport:
     grid: Any
     center_surfaces: Any = None
     face_surfaces: Any = None
+    center_surface_nfp: int | None = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -1547,6 +1548,11 @@ def build_ntx_exact_lij_runtime_support(
             else None
         ),
         face_surfaces=None,
+        center_surface_nfp=(
+            int(center_surfaces[0].nfp)
+            if bool(include_surfaces) and len(center_surfaces) > 0
+            else None
+        ),
     )
 
 
@@ -5674,13 +5680,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             ),
                             center_surfaces,
                         )
-                        if hasattr(surface_local, "nfp") and hasattr(center_surfaces, "nfp"):
-                            nfp_values = jnp.asarray(center_surfaces.nfp)
-                            if nfp_values.ndim > 0:
-                                surface_local = dataclasses.replace(
-                                    surface_local,
-                                    nfp=int(np.asarray(nfp_values[0])),
-                                )
+                        if hasattr(surface_local, "nfp") and support.center_surface_nfp is not None:
+                            surface_local = dataclasses.replace(
+                                surface_local,
+                                nfp=int(support.center_surface_nfp),
+                            )
                         prepared_local = ntx.prepare_monoenergetic_system(
                             surface_local,
                             support.grid,
