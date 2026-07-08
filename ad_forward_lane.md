@@ -332,3 +332,146 @@ The most likely next optimization target is
 `_radau_accepted_step_attempt_tangent_from_primal(...)`, specifically checking
 which lagged response, RHS, and stage-evaluation quantities are recomputed even
 though equivalent primal data already exists.
+
+## 2026-07-08 Next Plan: Add Realtime-Geometry Parameters to Forward AD
+
+Goal:
+
+- Extend the forward-AD transport benchmark so realtime VMEC/Boozer geometry
+  parameters can be differentiated in the full transport solve.
+- Keep the existing profile-parameter lane unchanged.
+- Reuse the geometry helper functions already tested by the pure geometry gate;
+  do not duplicate VMEC/Boozer derivative logic inside the transport benchmark.
+
+Current relevant code paths:
+
+- Pure geometry gate:
+  `examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py`
+- Geometry AD helpers:
+  `NEOPAX/_geometry_autodiff.py`
+  - `build_geometry_autodiff_context(...)`
+  - `solve_geometry_state_ad(...)`
+  - `build_runtime_context_for_geometry_param(...)`
+- Runtime entry point:
+  `NEOPAX/_orchestrator.py::build_runtime_context(config)`
+- Realtime geometry benchmark config:
+  `examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml`
+
+Implementation plan:
+
+1. Keep the profile-only forward-AD path unchanged.
+
+   Existing commands such as:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+     --ntx-exact-derivative-mode direct \
+     --parameter n0 \
+     --accepted-step-limit 2 \
+     --radau-jacobian-reuse-mode legacy
+   ```
+
+   must continue to use the current profile-only machinery and reproduce the
+   current values.
+
+2. Add an opt-in geometry parameter syntax for forward AD.
+
+   First-pass syntax:
+
+   ```text
+   --parameter vmec:RBC:1:0
+   ```
+
+   This keeps forward AD naturally directional: one `jax.jvp` direction per
+   run, exactly like the current `--parameter n0` / `--parameter T0` behavior.
+
+3. Require realtime geometry for `vmec:*` parameters.
+
+   Accept geometry parameters only when the config uses one of:
+
+   - `vmec_jax_booz_xform_jax`
+   - `vmec_runtime`
+   - `vmec_realtime`
+
+   Refuse ordinary frozen geometry configs with a clear error. A frozen VMEC
+   geometry file cannot produce derivatives with respect to VMEC boundary
+   coefficients inside the transport solve.
+
+4. Build the geometry AD context once outside the differentiated objective.
+
+   Use the same helper path as the pure geometry gate:
+
+   ```text
+   build_geometry_autodiff_context(...)
+   ```
+
+   The transport benchmark should not directly call low-level `vmec_jax` or
+   `booz_xform_jax` derivative internals.
+
+5. Inside the forward-AD objective, branch only on the parameter type.
+
+   Profile parameter path:
+
+   ```text
+   p -> current profile-state builder -> current forward AD transport objective
+   ```
+
+   Geometry parameter path:
+
+   ```text
+   delta
+     -> build_runtime_context_for_geometry_param(..., lane="ad")
+     -> use configured profile inputs on the new runtime geometry
+     -> current forward AD transport objective
+   ```
+
+   This composes the tested geometry AD lane with the tested transport forward
+   AD lane, instead of mixing reverse-AD helper code into forward AD.
+
+6. Use the same geometry helper for FD validation, but with the forward lane.
+
+   For geometry finite-difference checks:
+
+   ```text
+   delta +/- h
+     -> build_runtime_context_for_geometry_param(..., lane="forward")
+     -> transport objective
+   ```
+
+   This mirrors the pure geometry gate split: AD geometry for JVP, forward
+   geometry solves for FD perturbations.
+
+7. First test command after implementation:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+     --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+     --ntx-exact-derivative-mode direct \
+     --parameter vmec:RBC:1:0 \
+     --accepted-step-limit 2 \
+     --radau-jacobian-reuse-mode legacy
+   ```
+
+Success criteria:
+
+- `--parameter n0`, `--parameter T0`, and the other profile parameters remain
+  unchanged.
+- `--parameter vmec:RBC:1:0` runs only with realtime geometry configs.
+- The geometry tangent is produced through
+  `build_runtime_context_for_geometry_param(..., lane="ad")`.
+- A matching FD check uses
+  `build_runtime_context_for_geometry_param(..., lane="forward")`.
+- The solver-level geometry derivatives are nonzero for geometry-dependent
+  objectives and can be compared against a small FD perturbation before adding
+  more geometry parameters.
+
+Do not do in the first pass:
+
+- Do not edit `vmec_jax` or `booz_xform_jax`.
+- Do not make forward AD depend on reverse-AD helper code.
+- Do not duplicate pure-geometry derivative logic inside the transport
+  benchmark.
+- Do not silently treat frozen geometry configs as differentiable geometry
+  configs.
+- Do not add multiple geometry parameters until the single-parameter path is
+  validated.

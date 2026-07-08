@@ -6,6 +6,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,10 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _parameterized_profile_set,
     _prepare_benchmark_config,
 )
+from NEOPAX._geometry_autodiff import (  # noqa: E402
+    build_geometry_autodiff_context,
+    build_runtime_context_for_geometry_param,
+)
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
@@ -35,6 +40,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _make_radau_initial_step_state,
     _make_solver_state_transform,
     _project_flat_state_if_needed,
+    _radau_adaptive_final_state_rollout,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp_bwd,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
@@ -48,6 +54,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
+_REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +111,58 @@ def _initial_state_for_parameter_vector(
         density=density_state,
         pressure=pressure_state,
     )
+
+
+def _parse_reverse_geometry_parameter(parameter_name: str) -> tuple[str, int, int]:
+    parts = str(parameter_name).split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            "Reverse geometry parameters must use the syntax 'FAMILY:m:n', "
+            "for example 'RBC:1:0'."
+        )
+    family = parts[0].strip().upper()
+    try:
+        m = int(parts[1])
+        n = int(parts[2])
+    except ValueError as exc:
+        raise ValueError(
+            "Reverse geometry parameters must use integer m/n values, "
+            "for example 'RBC:1:0'."
+        ) from exc
+    if not family:
+        raise ValueError("Reverse geometry parameter family cannot be empty.")
+    return family, m, n
+
+
+def _format_reverse_geometry_parameter(parameter_name: str) -> str:
+    family, m, n = _parse_reverse_geometry_parameter(parameter_name)
+    return f"vmec:{family}:{m}:{n}"
+
+
+def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: str):
+    family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
+    geom_cfg = config.get("geometry", {})
+    backend = str(geom_cfg.get("backend", "")).strip().lower()
+    if backend not in _REALTIME_GEOMETRY_BACKENDS:
+        raise ValueError(
+            "Realtime geometry reverse parameters require geometry.backend to be one of "
+            f"{sorted(_REALTIME_GEOMETRY_BACKENDS)}; got backend={backend!r}."
+        )
+    vmec_input_file = geom_cfg.get("vmec_input_file")
+    if vmec_input_file is None:
+        raise ValueError("Realtime geometry reverse mode requires geometry.vmec_input_file.")
+    return build_geometry_autodiff_context(
+        vmec_input_file,
+        param_family=family,
+        param_m=m,
+        param_n=n,
+        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
+        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+    )
+
+
+def _reverse_geometry_parameter_order(geometry_parameter: str) -> tuple[str, ...]:
+    return (*PARAMETER_ORDER, _format_reverse_geometry_parameter(geometry_parameter))
 
 
 def _add_trees(lhs, rhs):
@@ -743,6 +802,284 @@ def _baseline_rollout_for_diagnostics(
     )
 
 
+def _reverse_geometry_objective_vector_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    geometry_context,
+    profile_cfg: dict,
+    geometry_parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+):
+    del geometry_parameter_name
+    profile_values = parameter_values[: len(PARAMETER_ORDER)]
+    geometry_delta = parameter_values[len(PARAMETER_ORDER)]
+    geom_cfg = config.get("geometry", {})
+    runtime, geometry_baseline_state = build_runtime_context_for_geometry_param(
+        config,
+        geometry_context,
+        geometry_delta,
+        lane="ad",
+        n_r=int(geom_cfg.get("n_radial", 51)),
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        step_size=geom_cfg.get("vmec_step_size"),
+        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+    )
+    state0 = _initial_state_for_parameter_vector(
+        profile_values,
+        baseline_state=geometry_baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solver = prepared_components["solver"]
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=solve_vector_field,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    if stop_after_accepted_steps is not None:
+        max_total_steps = min(
+            max_total_steps,
+            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+        )
+    rollout = _radau_adaptive_final_state_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    return _objective_vector(final_state, runtime)
+
+
+def _run_realtime_geometry_reverse_mode(
+    *,
+    args,
+    config: dict[str, Any],
+    profile_cfg: dict,
+    effective_ntx_exact_derivative_mode: str,
+    neoclassical_cfg: dict[str, Any],
+):
+    if args.timing_mode == "split-vjp-warm":
+        raise SystemExit(
+            "[autodiff-gate] realtime-geometry reverse mode does not support "
+            "--timing-mode split-vjp-warm. Use jit-warm, jit-compile-only, or eager."
+        )
+    if args.local_transpose_diagnostic_accepted_step is not None:
+        raise SystemExit(
+            "[autodiff-gate] local accepted-step transpose diagnostics are only "
+            "available for the profile-only static reverse setup."
+        )
+    if bool(args.diagnose_final_objective_cotangent):
+        raise SystemExit(
+            "[autodiff-gate] --diagnose-final-objective-cotangent is only "
+            "available for the profile-only static reverse setup."
+        )
+    geometry_parameter = str(args.reverse_geometry_parameter)
+    parameter_order = _reverse_geometry_parameter_order(geometry_parameter)
+    geometry_context = _geometry_context_from_config(config, geometry_parameter)
+    geom_cfg = config.get("geometry", {})
+    baseline_values = jnp.asarray(
+        [float(profile_cfg[name]) for name in PARAMETER_ORDER]
+        + [float(geom_cfg.get("vmec_param_delta", 0.0))],
+        dtype=jnp.float64,
+    )
+    objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
+
+    objective_vector_fn = lambda p: _reverse_geometry_objective_vector_for_parameter_vector(  # noqa: E731
+        p,
+        config=config,
+        geometry_context=geometry_context,
+        profile_cfg=profile_cfg,
+        geometry_parameter_name=geometry_parameter,
+        accepted_step_limit_override=args.accepted_step_limit,
+    )
+    objective_fn = (
+        objective_vector_fn
+        if args.objective == "all"
+        else lambda p: objective_vector_fn(p)[objective_index]  # noqa: E731
+    )
+
+    print(
+        "[autodiff-gate] progress: running reverse realtime-geometry AD"
+        + (" for all objectives" if args.objective == "all" else ""),
+        flush=True,
+    )
+    reverse_compile_plus_execute_s = None
+    reverse_execute_s = None
+    reverse_execute_times_s: list[float] = []
+    gradient = None
+    t_reverse_start = time.perf_counter()
+
+    if args.objective == "all":
+        if args.timing_mode == "jit-compile-only":
+            jac_fn = jax.jit(jax.jacrev(objective_fn))
+            compiled_jac_fn = jac_fn.lower(baseline_values).compile()
+            del compiled_jac_fn
+            reverse_total_s = time.perf_counter() - t_reverse_start
+        elif args.timing_mode == "jit-warm":
+            jac_fn = jax.jit(jax.jacrev(objective_fn))
+            first_gradient = jac_fn(baseline_values)
+            first_gradient = jax.block_until_ready(first_gradient)
+            reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
+            gradient = first_gradient
+            for _ in range(max(1, int(args.warm_repeats))):
+                t_execute_start = time.perf_counter()
+                gradient = jac_fn(baseline_values)
+                gradient = jax.block_until_ready(gradient)
+                reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
+            reverse_execute_s = float(np.mean(reverse_execute_times_s))
+            reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
+        else:
+            gradient = jax.jacrev(objective_fn)(baseline_values)
+            gradient = jax.block_until_ready(gradient)
+            reverse_total_s = time.perf_counter() - t_reverse_start
+    else:
+        if args.timing_mode == "jit-compile-only":
+            grad_fn = jax.jit(jax.grad(objective_fn))
+            compiled_grad_fn = grad_fn.lower(baseline_values).compile()
+            del compiled_grad_fn
+            reverse_total_s = time.perf_counter() - t_reverse_start
+        elif args.timing_mode == "jit-warm":
+            grad_fn = jax.jit(jax.grad(objective_fn))
+            first_gradient = grad_fn(baseline_values)
+            first_gradient = jax.block_until_ready(first_gradient)
+            reverse_compile_plus_execute_s = time.perf_counter() - t_reverse_start
+            gradient = first_gradient
+            for _ in range(max(1, int(args.warm_repeats))):
+                t_execute_start = time.perf_counter()
+                gradient = grad_fn(baseline_values)
+                gradient = jax.block_until_ready(gradient)
+                reverse_execute_times_s.append(time.perf_counter() - t_execute_start)
+            reverse_execute_s = float(np.mean(reverse_execute_times_s))
+            reverse_total_s = reverse_compile_plus_execute_s + float(np.sum(reverse_execute_times_s))
+        else:
+            gradient = jax.grad(objective_fn)(baseline_values)
+            gradient = jax.block_until_ready(gradient)
+            reverse_total_s = time.perf_counter() - t_reverse_start
+
+    objective_values_by_name = None
+    if args.timing_mode != "jit-compile-only":
+        objective_values = objective_vector_fn(baseline_values)
+        objective_values = jax.block_until_ready(objective_values)
+        objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+        objective_values_by_name = {
+            objective_name: float(value)
+            for objective_name, value in zip(OBJECTIVE_LABELS, objective_values_np.tolist())
+        }
+
+    gradient_payload = None
+    if gradient is not None:
+        gradient_np = np.asarray(jax.device_get(gradient), dtype=float)
+        if args.objective == "all":
+            gradient_payload = {
+                objective_name: {
+                    parameter_name: float(value)
+                    for parameter_name, value in zip(parameter_order, gradient_np[objective_i].tolist())
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            }
+        else:
+            gradient_payload = {
+                parameter_name: float(value)
+                for parameter_name, value in zip(parameter_order, gradient_np.tolist())
+            }
+
+    report = {
+        "mode": "transport_reverse_ad_only",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": args.objective,
+        "objective_order": list(OBJECTIVE_LABELS) if args.objective == "all" else None,
+        "objective_values": objective_values_by_name,
+        "parameter_order": list(parameter_order),
+        "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "effective_ntx_exact_derivative_mode": effective_ntx_exact_derivative_mode,
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "ntx_exact_derivative_pullback_boundary": str(args.ntx_exact_derivative_pullback_boundary),
+        "ntx_exact_derivative_pullback_algebra": str(args.ntx_exact_derivative_pullback_algebra),
+        "reverse_ntx_prepared_solve_boundary": str(args.reverse_ntx_prepared_solve_boundary),
+        "ntx_exact_radial_batch_size": neoclassical_cfg.get("ntx_exact_radial_batch_size"),
+        "ntx_exact_radial_batch_mode": neoclassical_cfg.get("ntx_exact_radial_batch_mode", "simple"),
+        "ntx_exact_scan_batch_size": neoclassical_cfg.get("ntx_exact_scan_batch_size"),
+        "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
+        "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
+        "reverse_geometry_parameter": str(args.reverse_geometry_parameter),
+        "timing_mode": str(args.timing_mode),
+        "reverse_total_s": float(reverse_total_s),
+        "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
+        "reverse_execute_s": None if reverse_execute_s is None else float(reverse_execute_s),
+        "reverse_execute_times_s": [float(value) for value in reverse_execute_times_s],
+        "gradient_reverse_ad": gradient_payload,
+    }
+
+    print(
+        f"[autodiff-gate] mode=transport_reverse_ad_only objective={args.objective} "
+        f"parameter_mode={args.reverse_parameter_mode} "
+        f"parameters={list(parameter_order)} "
+        f"radau_jacobian_reuse_mode={args.radau_jacobian_reuse_mode} "
+        f"effective_ntx_exact_derivative_mode={effective_ntx_exact_derivative_mode} "
+        f"ntx_exact_derivative_field_pullback_mode={args.ntx_exact_derivative_field_pullback_mode} "
+        f"ntx_exact_derivative_pullback_boundary={args.ntx_exact_derivative_pullback_boundary} "
+        f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
+        f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
+        f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
+        f"timing_mode={args.timing_mode} "
+        f"reverse_total_s={reverse_total_s:.6e}"
+    )
+    if reverse_compile_plus_execute_s is not None:
+        print(
+            f"[autodiff-gate] timing reverse_compile_plus_execute_s={reverse_compile_plus_execute_s:.6e} "
+            f"reverse_execute_s_mean={reverse_execute_s:.6e} "
+            f"reverse_execute_s_min={min(reverse_execute_times_s):.6e} "
+            f"reverse_execute_repeats={len(reverse_execute_times_s)}"
+        )
+        print(
+            "[autodiff-gate] timing reverse_execute_times_s="
+            + ",".join(f"{float(value):.6e}" for value in reverse_execute_times_s)
+        )
+    if gradient_payload is not None:
+        if args.objective == "all":
+            if objective_values_by_name is not None:
+                print("[autodiff-gate] objective values:")
+                for objective_name in OBJECTIVE_LABELS:
+                    print(f"  - {objective_name}: value={objective_values_by_name[objective_name]:.6e}")
+            print("[autodiff-gate] reverse gradients by objective:")
+            for objective_name in OBJECTIVE_LABELS:
+                print(f"  - {objective_name}:")
+                for parameter_name in parameter_order:
+                    print(
+                        f"      d{objective_name}/d{parameter_name}: "
+                        f"rev={gradient_payload[objective_name][parameter_name]:.16e}"
+                    )
+        else:
+            print("[autodiff-gate] reverse gradients:")
+            for parameter_name in parameter_order:
+                print(
+                    f"  - d{args.objective}/d{parameter_name}: "
+                    f"rev={gradient_payload[parameter_name]:.16e}"
+                )
+
+    outpath = _report_path(args.objective)
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Reverse-only adaptive benchmark lane using the current reverse-capable realized-schedule helper."
@@ -756,6 +1093,26 @@ def main() -> None:
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
             "objective-by-parameter reverse derivative matrix for every metric."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-parameter-mode",
+        type=str,
+        default="profiles",
+        choices=("profiles", "profiles_plus_realtime_geometry"),
+        help=(
+            "Differentiated parameter set. 'profiles' preserves the current "
+            "profile-only reverse lane. 'profiles_plus_realtime_geometry' adds "
+            "one realtime VMEC boundary parameter to the four profile parameters."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-geometry-parameter",
+        type=str,
+        default="RBC:1:0",
+        help=(
+            "Realtime VMEC geometry parameter used when --reverse-parameter-mode "
+            "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
@@ -1184,8 +1541,18 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
-    runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
+    if args.reverse_parameter_mode == "profiles_plus_realtime_geometry":
+        _run_realtime_geometry_reverse_mode(
+            args=args,
+            config=config,
+            profile_cfg=profile_cfg,
+            effective_ntx_exact_derivative_mode=effective_ntx_exact_derivative_mode,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
+
+    runtime, baseline_state = build_runtime_context(config)
     baseline_values = jnp.asarray(
         [float(profile_cfg[name]) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,

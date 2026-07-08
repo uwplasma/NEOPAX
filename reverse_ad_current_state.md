@@ -1548,3 +1548,160 @@ Do not repeat as memory solutions:
 - `ntx_exact_scan_batch_size=1`
 - per-energy nested JIT boundaries
 - static branch schedules
+
+## 2026-07-08 next plan: add realtime-geometry parameters to the reverse baseline
+
+Goal:
+
+- Extend the current reverse baseline so that, when a TOML uses realtime
+  geometry, the differentiated parameter vector can include VMEC boundary
+  geometry parameters in addition to the existing initial-profile parameters.
+- This is not a pure-geometry AD-vs-FD test. The pure `vmec_jax` and
+  `booz_xform_jax` derivative checks already exist.
+- The target is the transport reverse baseline using the solver/runtime path
+  that computes geometry through `vmec_jax -> booz_xform_jax`, analogous in
+  spirit to the existing lagged NTX runtime path.
+
+Current relevant code paths:
+
+- `NEOPAX._orchestrator.build_runtime_context(config)` already detects:
+
+  ```toml
+  [geometry]
+  backend = "vmec_jax_booz_xform_jax"
+  vmec_param_family = "RBC"
+  vmec_param_m = 1
+  vmec_param_n = 0
+  vmec_param_delta = 0.0
+  ```
+
+- For that backend it routes to:
+  - `build_geometry_autodiff_context(...)`
+  - `build_runtime_context_for_geometry_param(...)`
+- The realtime VMEC benchmark config is:
+  - `examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml`
+- The current reverse benchmark still hardcodes only profile parameters:
+
+  ```python
+  PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
+  ```
+
+- Therefore, even with realtime geometry in the TOML, the current reverse
+  benchmark differentiates profiles on a fixed already-built geometry.
+
+Implementation plan:
+
+1. Keep the profile-only reverse baseline unchanged.
+
+   - Do not change the meaning of the existing `PARAMETER_ORDER`.
+   - Do not change the non-realtime geometry path.
+   - Do not touch the production forward solver, forward-AD lane, or FD lane.
+
+2. Add an opt-in reverse benchmark mode for realtime geometry parameters.
+
+   Suggested CLI shape:
+
+   ```bash
+   --reverse-parameter-mode profiles_plus_realtime_geometry
+   --reverse-geometry-parameter RBC:1:0
+   ```
+
+   Initial implementation can support one geometry parameter only.
+
+3. Add a small parameter-spec layer in
+   `examples/benchmarks/benchmark_transport_reverse_ad_only.py`.
+
+   - Profile specs map to the existing four profile values.
+   - Geometry specs map to one scalar VMEC boundary perturbation delta.
+   - Printed/report parameter order should become, for example:
+
+     ```text
+     ["n0", "T0", "density_shape_power", "temperature_shape_power", "vmec:RBC:1:0"]
+     ```
+
+4. For realtime-geometry mode, build the geometry AD context once outside the
+   differentiated objective.
+
+   - Read the realtime config's `[geometry]` section.
+   - Use `build_geometry_autodiff_context(...)` with the requested
+     `family/m/n`.
+   - Validate that `geometry.backend` is one of:
+     - `vmec_jax_booz_xform_jax`
+     - `vmec_runtime`
+     - `vmec_realtime`
+   - Refuse the mode for ordinary frozen `vmec_booz` geometry configs.
+
+5. Inside the differentiated objective, split the parameter vector.
+
+   - Profile values continue to define the initial density/temperature
+     profiles, as today.
+   - The geometry value becomes `param_delta` for
+     `build_runtime_context_for_geometry_param(...)`.
+   - Then rebuild the profile initial state using the geometry from the
+     newly-built runtime.
+
+   Desired flow:
+
+   ```text
+   p -> profile_values, geometry_delta
+     -> runtime, baseline_state = build_runtime_context_for_geometry_param(...)
+     -> state0 = current profile-state builder(profile_values, runtime.geometry)
+     -> prepare reverse/static solver pieces for that runtime
+     -> run reverse objective
+   ```
+
+6. Start with a correctness-first path.
+
+   - The current optimized reverse custom-VJP setup precomputes
+     `reverse_setup.execution_context`.
+   - That precomputed setup assumes geometry/runtime are static and therefore
+     is not automatically valid for differentiating geometry.
+   - First implementation should prioritize a mathematically honest small test,
+     even if slower, before trying to fold geometry into the optimized
+     reduced-cotangent reverse path.
+
+7. First test command after implementation:
+
+   ```bash
+   python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+     --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+     --reverse-parameter-mode profiles_plus_realtime_geometry \
+     --reverse-geometry-parameter RBC:1:0 \
+     --ntx-exact-derivative-mode direct \
+     --ntx-exact-derivative-field-pullback-mode compact_vjp \
+     --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot \
+     --objective all \
+     --accepted-step-limit 2 \
+     --radau-jacobian-reuse-mode legacy \
+     --timing-mode jit-warm \
+     --reverse-segment-length 2 \
+     --reverse-stage-adjoint-solve-mode bicgstab \
+     --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+     --reverse-step-bwd-mode reduced_cotangent
+   ```
+
+Success criteria:
+
+- The report prints both profile and geometry parameters in `parameter_order`.
+- Profile derivatives remain consistent with the existing profile-only reverse
+  baseline when geometry delta is at zero.
+- The new geometry column is nonzero for objectives that depend on geometry.
+- The same config can still run without the new mode and reproduce the current
+  profile-only behavior.
+
+Do not do in the first pass:
+
+- Do not add multiple geometry parameters at once.
+- Do not try to optimize reverse memory in the same patch.
+- Do not reuse pure-geometry benchmark code as the final solver-level test.
+- Do not change `vmec_jax` or `booz_xform_jax`.
+
+Forward-AD companion plan:
+
+- The matching forward-AD geometry plan is recorded in `ad_forward_lane.md`.
+- Forward AD should use the same pure-geometry-tested helpers, especially
+  `build_geometry_autodiff_context(...)` and
+  `build_runtime_context_for_geometry_param(...)`.
+- Forward AD should remain a separate lane: profile parameters keep the current
+  `--parameter n0|T0|...` behavior, while the first geometry extension should be
+  an opt-in single-parameter form such as `--parameter vmec:RBC:1:0`.
