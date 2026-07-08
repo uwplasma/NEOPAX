@@ -811,6 +811,7 @@ def main() -> None:
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
+            "scalar_contract_exact_matrix_free",
         ),
         help=(
             "Reverse-only algebra mode for compact NTX derivative-field "
@@ -828,7 +829,9 @@ def main() -> None:
             "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
             "before field-dot contractions to test peak-memory reduction. "
             "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
-            "using Krylov solves on the NTX block operator."
+            "using Krylov solves on the NTX block operator. "
+            "'scalar_contract_exact_matrix_free' recomputes exact "
+            "block-tridiagonal factors instead of carrying saved factor stacks."
         ),
     )
     parser.add_argument(
@@ -944,7 +947,6 @@ def main() -> None:
             "zero_rebuild_local_moment_pullback",
             "scan_rebuild_local_moment_pullback",
             "scan_rebuild_anchor_pullback",
-            "local_prepare_pullback",
             "zero_step_bwd",
             "force_reuse_bwd",
             "force_rebuild_bwd",
@@ -966,16 +968,13 @@ def main() -> None:
             "'scan_rebuild_local_moment_pullback' keeps the local NTX moment-response "
             "pullback exact but scans over species instead of materializing a species stack; "
             "'scan_rebuild_anchor_pullback' additionally scans over rebuild anchors and "
-            "accumulates state bars directly; 'local_prepare_pullback' rebuilds the selected "
-            "local NTX prepared object inside the reverse rebuild pullback instead of indexing "
-            "the stacked prepared support; "
+            "accumulates state bars directly; "
             "'zero_step_bwd' bypasses the accepted-step "
             "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Most non-full "
             "diagnostic modes intentionally change gradients unless the forced branch matches the "
             "realized primal branch for every accepted step; 'scan_rebuild_local_moment_pullback' "
-            "'scan_rebuild_anchor_pullback', and 'local_prepare_pullback' are intended to "
-            "preserve gradients; "
+            "and 'scan_rebuild_anchor_pullback' are intended to preserve gradients; "
             "'dynamic_call_bwd' keeps the dynamic branch but puts each branch body behind "
             "a non-inlined compiled call boundary."
         ),
@@ -1175,12 +1174,6 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
     if args.ntx_scan_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
-    if str(args.reverse_stage_cotangent_mode).strip().lower() in {
-        "local_prepare_pullback",
-        "rebuild_local_prepare_pullback",
-        "recompute_local_prepared_pullback",
-    }:
-        neoclassical_cfg["ntx_exact_lij_support_include_surfaces"] = True
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(

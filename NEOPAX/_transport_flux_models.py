@@ -1327,9 +1327,6 @@ class NTXExactLijRuntimeSupport:
     center_prepared: Any
     face_prepared: Any
     grid: Any
-    center_surfaces: Any = None
-    face_surfaces: Any = None
-    center_surface_nfp: int | None = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -1507,7 +1504,6 @@ def build_ntx_exact_lij_runtime_support(
     n_theta=25,
     n_zeta=25,
     n_xi=64,
-    include_surfaces=False,
 ) -> NTXExactLijRuntimeSupport:
     ntx = _import_ntx()
     grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
@@ -1542,17 +1538,6 @@ def build_ntx_exact_lij_runtime_support(
         center_prepared=center_prepared,
         face_prepared=face_prepared,
         grid=grid_spec,
-        center_surfaces=(
-            jax.tree_util.tree_map(_stack_optional, *center_surfaces)
-            if bool(include_surfaces)
-            else None
-        ),
-        face_surfaces=None,
-        center_surface_nfp=(
-            int(center_surfaces[0].nfp)
-            if bool(include_surfaces) and len(center_surfaces) > 0
-            else None
-        ),
     )
 
 
@@ -1589,7 +1574,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         rho_face = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / a_b
         return rho_center, rho_face
 
-    def _static_support(self, *, include_surfaces: bool = False) -> NTXExactLijRuntimeSupport:
+    def _static_support(self) -> NTXExactLijRuntimeSupport:
         if self.support is not None:
             return self.support
         if self.vmec_file is None or self.boozer_file is None:
@@ -1604,13 +1589,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             n_theta=self.n_theta,
             n_zeta=self.n_zeta,
             n_xi=self.n_xi,
-            include_surfaces=bool(include_surfaces),
         )
 
-    def with_static_support(self, *, include_surfaces: bool = False) -> "NTXExactLijRuntimeTransportModel":
+    def with_static_support(self) -> "NTXExactLijRuntimeTransportModel":
         if self.support is not None:
             return self
-        return dataclasses.replace(self, support=self._static_support(include_surfaces=include_surfaces))
+        return dataclasses.replace(self, support=self._static_support())
 
     def with_transport_resolution(self, *, n_theta=None, n_zeta=None, n_xi=None) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(
@@ -1805,6 +1789,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "matrix_free": "scalar_contract_matrix_free",
             "matrix-free": "scalar_contract_matrix_free",
             "krylov": "scalar_contract_matrix_free",
+            "exact_matrix_free": "scalar_contract_exact_matrix_free",
+            "exact-matrix-free": "scalar_contract_exact_matrix_free",
+            "matrix_free_exact": "scalar_contract_exact_matrix_free",
         }
         normalized = aliases.get(normalized, normalized)
         if normalized not in {
@@ -1815,12 +1802,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "scalar_contract_lowdot_ntx",
             "scalar_contract_lowdot_recompute",
             "scalar_contract_matrix_free",
+            "scalar_contract_exact_matrix_free",
         }:
             raise ValueError(
                 "ntx_exact_derivative_pullback_algebra must be one of: "
                 "ntx_helper, scalar_contract, scalar_contract_lowdot, "
                 "scalar_contract_lowdot_sequential, scalar_contract_lowdot_ntx, "
-                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
+                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free, "
+                "scalar_contract_exact_matrix_free"
             )
         return normalized
 
@@ -3056,6 +3045,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
             == "scalar_contract_matrix_free"
         )
+        use_exact_matrix_free = (
+            self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
+            == "scalar_contract_exact_matrix_free"
+        )
+        use_operator_solve = use_matrix_free or use_exact_matrix_free
 
         def _safe_divide(numerator, denominator, dtype):
             safe_denominator = jnp.where(
@@ -3212,6 +3206,175 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             return solution
 
+        def _exact_recompute_block_operator_solve(ctx, source, *, transpose=False):
+            """Exact block-tridiagonal solve without saved factor stacks.
+
+            This keeps the dense per-mode block algebra from NTX's factorized
+            solve, but recomputes the Schur complement factor for a requested
+            mode instead of carrying the whole LU/lower/upper stack as live
+            arrays in the reverse graph.
+            """
+
+            source = jnp.asarray(source, dtype=prepared.grid.jax_dtype)
+            mode_count = source.shape[0]
+            last_index = mode_count - 1
+
+            def _fixed_blocks(k):
+                lower, diagonal, upper = operator_blocks(
+                    ctx,
+                    k,
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+
+                def _fix_nullspace(blocks):
+                    lower_in, diagonal_in, upper_in = blocks
+                    diagonal_fixed, upper_fixed = apply_nullspace_condition(
+                        diagonal_in,
+                        upper_in,
+                    )
+                    return lower_in, diagonal_fixed, upper_fixed
+
+                return jax.lax.cond(
+                    k == 0,
+                    _fix_nullspace,
+                    lambda blocks: blocks,
+                    (lower, diagonal, upper),
+                )
+
+            def _terminal_blocks():
+                lower, diagonal, _ = operator_blocks(
+                    ctx,
+                    jnp.asarray(last_index, dtype=jnp.int32),
+                    prepared.d_theta,
+                    prepared.d_zeta,
+                )
+                return lower, diagonal, lower
+
+            lower_terminal, delta_terminal, lower_next = _terminal_blocks()
+            lu_terminal, piv_terminal = lu_factor(delta_terminal)
+            x_terminal = lu_solve((lu_terminal, piv_terminal), lower_next)
+            zeros_block = jnp.zeros_like(delta_terminal)
+            zeros_piv = jnp.zeros((delta_terminal.shape[0],), dtype=jnp.int32)
+
+            def _factor_at(target_k):
+                target_k = jnp.asarray(target_k, dtype=jnp.int32)
+                terminal_selected = target_k == last_index
+                selected_lower = jnp.where(terminal_selected, lower_terminal, zeros_block)
+                selected_upper = zeros_block
+                selected_lu = jnp.where(terminal_selected, lu_terminal, zeros_block)
+                selected_piv = jnp.where(terminal_selected, piv_terminal, zeros_piv)
+
+                def _scan_factor(carry, k):
+                    x_prev, lower_sel, upper_sel, lu_sel, piv_sel = carry
+                    lower, diagonal, upper = _fixed_blocks(k)
+                    delta_k = diagonal - upper @ x_prev
+                    lu_k, piv_k = lu_factor(delta_k)
+                    is_target = k == target_k
+                    lower_sel = jnp.where(is_target, lower, lower_sel)
+                    upper_sel = jnp.where(is_target, upper, upper_sel)
+                    lu_sel = jnp.where(is_target, lu_k, lu_sel)
+                    piv_sel = jnp.where(is_target, piv_k, piv_sel)
+                    x_next = jax.lax.cond(
+                        k > 0,
+                        lambda _: lu_solve((lu_k, piv_k), lower),
+                        lambda _: x_prev,
+                        operand=None,
+                    )
+                    return (x_next, lower_sel, upper_sel, lu_sel, piv_sel), None
+
+                (_, selected_lower, selected_upper, selected_lu, selected_piv), _ = jax.lax.scan(
+                    _scan_factor,
+                    (x_terminal, selected_lower, selected_upper, selected_lu, selected_piv),
+                    jnp.arange(last_index - 1, -1, -1, dtype=jnp.int32),
+                )
+                return selected_lower, selected_lu, selected_piv, selected_upper
+
+            def _solve_primal():
+                y_terminal = lu_solve(
+                    (lu_terminal, piv_terminal),
+                    _take_mode(source, last_index),
+                )
+
+                def _backward_solve(carry, k):
+                    x_prev, y_next = carry
+                    lower, diagonal, upper = _fixed_blocks(k)
+                    delta_k = diagonal - upper @ x_prev
+                    lu_k, piv_k = lu_factor(delta_k)
+                    rhs = _take_mode(source, k) - upper @ y_next
+                    y_k = lu_solve((lu_k, piv_k), rhs)
+                    x_next = jax.lax.cond(
+                        k > 0,
+                        lambda _: lu_solve((lu_k, piv_k), lower),
+                        lambda _: x_prev,
+                        operand=None,
+                    )
+                    return (x_next, y_k), y_k
+
+                (_, _), y_desc = jax.lax.scan(
+                    _backward_solve,
+                    (x_terminal, y_terminal),
+                    jnp.arange(last_index - 1, -1, -1, dtype=jnp.int32),
+                )
+                y = jnp.concatenate([jnp.flip(y_desc, axis=0), y_terminal[None, ...]], axis=0)
+                mode0 = _take_mode(y, jnp.asarray(0, dtype=jnp.int32))
+
+                def _forward_mode(mode_prev, k):
+                    lower, lu_k, piv_k, _upper = _factor_at(k)
+                    mode_k = _take_mode(y, k) - lu_solve(
+                        (lu_k, piv_k),
+                        lower @ mode_prev,
+                    )
+                    return mode_k, mode_k
+
+                _, mode_tail = jax.lax.scan(
+                    _forward_mode,
+                    mode0,
+                    jnp.arange(1, mode_count, dtype=jnp.int32),
+                )
+                return jnp.concatenate([mode0[None, ...], mode_tail], axis=0)
+
+            def _solve_transpose():
+                mu_terminal = _take_mode(source, last_index)
+
+                def _backward_mu(mu_next, k):
+                    lower_next_k, lu_next, piv_next, _upper_next = _factor_at(k + 1)
+                    propagated = lu_solve((lu_next, piv_next), mu_next, trans=1)
+                    mu_k = _take_mode(source, k) - lower_next_k.T @ propagated
+                    return mu_k, mu_k
+
+                _, mu_desc = jax.lax.scan(
+                    _backward_mu,
+                    mu_terminal,
+                    jnp.arange(last_index - 1, -1, -1, dtype=jnp.int32),
+                )
+                mu = jnp.concatenate([jnp.flip(mu_desc, axis=0), mu_terminal[None, ...]], axis=0)
+                _lower0, lu0, piv0, _upper0 = _factor_at(jnp.asarray(0, dtype=jnp.int32))
+                adjoint0 = lu_solve((lu0, piv0), _take_mode(mu, 0), trans=1)
+
+                def _forward_adjoint(adjoint_prev, k):
+                    _lower, lu_k, piv_k, _upper = _factor_at(k)
+                    _lower_prev, _lu_prev, _piv_prev, upper_prev = _factor_at(k - 1)
+                    rhs = _take_mode(mu, k) - upper_prev.T @ adjoint_prev
+                    adjoint_k = lu_solve((lu_k, piv_k), rhs, trans=1)
+                    return adjoint_k, adjoint_k
+
+                _, adjoint_tail = jax.lax.scan(
+                    _forward_adjoint,
+                    adjoint0,
+                    jnp.arange(1, mode_count, dtype=jnp.int32),
+                )
+                return jnp.concatenate([adjoint0[None, ...], adjoint_tail], axis=0)
+
+            if transpose:
+                return _solve_transpose()
+            return _solve_primal()
+
+        def _block_operator_solve(ctx, source, *, transpose=False):
+            if use_exact_matrix_free:
+                return _exact_recompute_block_operator_solve(ctx, source, transpose=transpose)
+            return _matrix_free_block_operator_solve(ctx, source, transpose=transpose)
+
         def _one_case_pullback(args):
             energy_index, nu_hat_value, epsi_hat_value, nu_hat_dot, epsi_hat_dot = args
             ctx = _operator_context(
@@ -3222,9 +3385,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 epsi_hat_value,
             )
             mode_indices = jnp.arange(prepared.grid.n_xi + 1, dtype=jnp.int32)
-            if use_matrix_free:
+            if use_operator_solve:
                 source1, source3 = source_modes(ctx, prepared.grid.n_xi)
-                f_matrix = _matrix_free_block_operator_solve(
+                f_matrix = _block_operator_solve(
                     ctx,
                     jnp.stack([source1, source3], axis=-1),
                     transpose=False,
@@ -3287,12 +3450,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 source1_dot_k, source3_dot_k = _source_dot_pair_for_mode(k)
                 return jnp.stack([source1_dot_k, source3_dot_k], axis=-1)
 
-            if use_matrix_free:
+            if use_operator_solve:
                 source_dot_matrix = jax.lax.map(
                     _source_dot_matrix_for_mode,
                     mode_indices,
                 )
-                f_dot_matrix = _matrix_free_block_operator_solve(
+                f_dot_matrix = _block_operator_solve(
                     ctx,
                     source_dot_matrix,
                     transpose=False,
@@ -3358,8 +3521,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             g1_dot = jnp.zeros_like(f1_full).at[:3].set(f1_bar_low_dot)
             g3_dot = jnp.zeros_like(f3_full).at[:3].set(f3_bar_low_dot)
 
-            if use_matrix_free:
-                lambda_matrix = _matrix_free_block_operator_solve(
+            if use_operator_solve:
+                lambda_matrix = _block_operator_solve(
                     ctx,
                     jnp.stack([g1, g3], axis=-1),
                     transpose=True,
@@ -3407,7 +3570,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     _take_mode(g3_dot, k) - diagonal_dot.T @ _take_mode(lambda3, k),
                 )
 
-            if use_matrix_free:
+            if use_operator_solve:
 
                 def _adjoint_rhs_dot_matrix_for_mode(k):
                     adjoint_rhs1_dot_k, adjoint_rhs3_dot_k = _adjoint_rhs_dot_for_mode(k)
@@ -3417,7 +3580,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     _adjoint_rhs_dot_matrix_for_mode,
                     mode_indices,
                 )
-                lambda_dot_matrix = _matrix_free_block_operator_solve(
+                lambda_dot_matrix = _block_operator_solve(
                     ctx,
                     adjoint_rhs_dot_matrix,
                     transpose=True,
@@ -3733,6 +3896,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
                     "scalar_contract_matrix_free",
+                    "scalar_contract_exact_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
@@ -3794,6 +3958,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "scalar_contract_lowdot_sequential",
                     "scalar_contract_lowdot_ntx",
                     "scalar_contract_matrix_free",
+                    "scalar_contract_exact_matrix_free",
                 }
                 else self._compact_coefficient_derivative_pullback_from_scan_primitives
             )
@@ -5584,11 +5749,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "scan_rebuild_anchor_local_moment_pullback",
                 "rebuild_anchor_pullback_scan",
             }
-            local_prepare_pullback = reverse_stage_cotangent_mode in {
-                "local_prepare_pullback",
-                "rebuild_local_prepare_pullback",
-                "recompute_local_prepared_pullback",
-            }
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
             def _pullback_one_anchor(anchor_pos):
@@ -5663,37 +5823,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         keepdims=False,
                     )
 
-                    if local_prepare_pullback:
-                        ntx = _import_ntx()
-                        center_surfaces = support.center_surfaces
-                        if center_surfaces is None:
-                            raise ValueError(
-                                "local_prepare_pullback requires runtime support built with "
-                                "ntx_exact_lij_support_include_surfaces=True."
-                            )
-                        surface_local = jax.tree_util.tree_map(
-                            lambda arr: jax.lax.dynamic_index_in_dim(
-                                arr,
-                                radius_index,
-                                axis=0,
-                                keepdims=False,
-                            ),
-                            center_surfaces,
-                        )
-                        if hasattr(surface_local, "nfp") and support.center_surface_nfp is not None:
-                            surface_local = dataclasses.replace(
-                                surface_local,
-                                nfp=int(support.center_surface_nfp),
-                            )
-                        prepared_local = ntx.prepare_monoenergetic_system(
-                            surface_local,
-                            support.grid,
-                        )
-                    else:
-                        prepared_local = jax.tree_util.tree_map(
-                            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                            support.center_prepared,
-                        )
+                    prepared_local = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        support.center_prepared,
+                    )
                     drds_value_local = jax.lax.dynamic_index_in_dim(
                         support.center_channels.drds,
                         radius_index,
@@ -6716,7 +6849,6 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
-    ntx_exact_lij_support_include_surfaces=False,
     preload_support=False,
     collisionality_model="default",
     bc_density=None,
@@ -6777,9 +6909,7 @@ def build_ntx_exact_lij_runtime_transport_model(
         support=ntx_exact_lij_support,
     )
     if preload_support:
-        return model.with_static_support(
-            include_surfaces=bool(ntx_exact_lij_support_include_surfaces)
-        )
+        return model.with_static_support()
     return model
 
 
