@@ -1327,6 +1327,8 @@ class NTXExactLijRuntimeSupport:
     center_prepared: Any
     face_prepared: Any
     grid: Any
+    center_surfaces: Any = None
+    face_surfaces: Any = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -5568,6 +5570,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "scan_rebuild_anchor_local_moment_pullback",
                 "rebuild_anchor_pullback_scan",
             }
+            local_prepare_pullback = reverse_stage_cotangent_mode in {
+                "local_prepare_pullback",
+                "rebuild_local_prepare_pullback",
+                "recompute_local_prepared_pullback",
+            }
             anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
             def _pullback_one_anchor(anchor_pos):
@@ -5642,10 +5649,57 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         keepdims=False,
                     )
 
-                    prepared_local = jax.tree_util.tree_map(
-                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                        support.center_prepared,
-                    )
+                    if local_prepare_pullback:
+                        ntx = _import_ntx()
+                        center_surfaces = support.center_surfaces
+                        if center_surfaces is None:
+                            if self.vmec_file is None or self.boozer_file is None:
+                                raise ValueError(
+                                    "local_prepare_pullback requires vmec_file and boozer_file "
+                                    "when runtime support does not carry center_surfaces."
+                                )
+                            center_surfaces_tuple = build_ntx_runtime_surfaces(
+                                self.vmec_file,
+                                self.boozer_file,
+                                np.asarray(support.center_channels.rho, dtype=float),
+                                surface_backend=self.surface_backend,
+                            )
+
+                            def _stack_optional_surfaces(*values):
+                                first = values[0]
+                                if first is None:
+                                    return None
+                                return jnp.stack([jnp.asarray(value) for value in values], axis=0)
+
+                            center_surfaces = jax.tree_util.tree_map(
+                                _stack_optional_surfaces,
+                                *center_surfaces_tuple,
+                            )
+                        surface_local = jax.tree_util.tree_map(
+                            lambda arr: jax.lax.dynamic_index_in_dim(
+                                arr,
+                                radius_index,
+                                axis=0,
+                                keepdims=False,
+                            ),
+                            center_surfaces,
+                        )
+                        if hasattr(surface_local, "nfp") and hasattr(center_surfaces, "nfp"):
+                            nfp_values = jnp.asarray(center_surfaces.nfp)
+                            if nfp_values.ndim > 0:
+                                surface_local = dataclasses.replace(
+                                    surface_local,
+                                    nfp=int(np.asarray(nfp_values[0])),
+                                )
+                        prepared_local = ntx.prepare_monoenergetic_system(
+                            surface_local,
+                            support.grid,
+                        )
+                    else:
+                        prepared_local = jax.tree_util.tree_map(
+                            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                            support.center_prepared,
+                        )
                     drds_value_local = jax.lax.dynamic_index_in_dim(
                         support.center_channels.drds,
                         radius_index,
