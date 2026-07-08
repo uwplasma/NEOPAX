@@ -244,12 +244,13 @@ def main() -> None:
 
     print("[autodiff-gate] progress: running forward custom-JVP", flush=True)
     t_forward_ad_start = time.perf_counter()
-    _, gradient_ad = jax.jvp(
+    objective_values, gradient_ad = jax.jvp(
         objective_fn,
         (jnp.asarray(baseline_value),),
         (jnp.asarray(1.0),),
     )
 
+    objective_np = np.asarray(jax.device_get(objective_values), dtype=float)
     grad_np = np.asarray(jax.device_get(gradient_ad), dtype=float)
     forward_ad_total_s = time.perf_counter() - t_forward_ad_start
     report = {
@@ -264,6 +265,7 @@ def main() -> None:
         "forward_ad_fusion_mode": str(args.forward_ad_fusion_mode),
         "forward_ad_total_s": float(forward_ad_total_s),
         "objective_labels": OBJECTIVE_LABELS,
+        "objective_values": objective_np.tolist(),
         "gradient_forward_ad": grad_np.tolist(),
     }
 
@@ -276,6 +278,9 @@ def main() -> None:
         f"forward_ad_total_s={forward_ad_total_s:.6e}"
     )
     print("[autodiff-gate] objective values:")
+    for label, value in zip(OBJECTIVE_LABELS, _to_float_list(objective_values)):
+        print(f"  - {label}: value={float(value):.16e}")
+    print("[autodiff-gate] objective tangents:")
     for label, value in zip(OBJECTIVE_LABELS, _to_float_list(gradient_ad)):
         print(f"  - {label}: ad={float(value):.6e}")
 
