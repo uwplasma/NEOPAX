@@ -1175,6 +1175,12 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
     if args.ntx_scan_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
+    if str(args.reverse_stage_cotangent_mode).strip().lower() in {
+        "local_prepare_pullback",
+        "rebuild_local_prepare_pullback",
+        "recompute_local_prepared_pullback",
+    }:
+        neoclassical_cfg["ntx_exact_lij_support_include_surfaces"] = True
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
     baseline_values = jnp.asarray(

@@ -1506,6 +1506,7 @@ def build_ntx_exact_lij_runtime_support(
     n_theta=25,
     n_zeta=25,
     n_xi=64,
+    include_surfaces=False,
 ) -> NTXExactLijRuntimeSupport:
     ntx = _import_ntx()
     grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
@@ -1540,6 +1541,12 @@ def build_ntx_exact_lij_runtime_support(
         center_prepared=center_prepared,
         face_prepared=face_prepared,
         grid=grid_spec,
+        center_surfaces=(
+            jax.tree_util.tree_map(_stack_optional, *center_surfaces)
+            if bool(include_surfaces)
+            else None
+        ),
+        face_surfaces=None,
     )
 
 
@@ -1576,7 +1583,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         rho_face = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / a_b
         return rho_center, rho_face
 
-    def _static_support(self) -> NTXExactLijRuntimeSupport:
+    def _static_support(self, *, include_surfaces: bool = False) -> NTXExactLijRuntimeSupport:
         if self.support is not None:
             return self.support
         if self.vmec_file is None or self.boozer_file is None:
@@ -1591,12 +1598,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             n_theta=self.n_theta,
             n_zeta=self.n_zeta,
             n_xi=self.n_xi,
+            include_surfaces=bool(include_surfaces),
         )
 
-    def with_static_support(self) -> "NTXExactLijRuntimeTransportModel":
+    def with_static_support(self, *, include_surfaces: bool = False) -> "NTXExactLijRuntimeTransportModel":
         if self.support is not None:
             return self
-        return dataclasses.replace(self, support=self._static_support())
+        return dataclasses.replace(self, support=self._static_support(include_surfaces=include_surfaces))
 
     def with_transport_resolution(self, *, n_theta=None, n_zeta=None, n_xi=None) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(
@@ -5653,27 +5661,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         ntx = _import_ntx()
                         center_surfaces = support.center_surfaces
                         if center_surfaces is None:
-                            if self.vmec_file is None or self.boozer_file is None:
-                                raise ValueError(
-                                    "local_prepare_pullback requires vmec_file and boozer_file "
-                                    "when runtime support does not carry center_surfaces."
-                                )
-                            center_surfaces_tuple = build_ntx_runtime_surfaces(
-                                self.vmec_file,
-                                self.boozer_file,
-                                np.asarray(support.center_channels.rho, dtype=float),
-                                surface_backend=self.surface_backend,
-                            )
-
-                            def _stack_optional_surfaces(*values):
-                                first = values[0]
-                                if first is None:
-                                    return None
-                                return jnp.stack([jnp.asarray(value) for value in values], axis=0)
-
-                            center_surfaces = jax.tree_util.tree_map(
-                                _stack_optional_surfaces,
-                                *center_surfaces_tuple,
+                            raise ValueError(
+                                "local_prepare_pullback requires runtime support built with "
+                                "ntx_exact_lij_support_include_surfaces=True."
                             )
                         surface_local = jax.tree_util.tree_map(
                             lambda arr: jax.lax.dynamic_index_in_dim(
@@ -6722,6 +6712,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
     ntx_exact_lij_support=None,
+    ntx_exact_lij_support_include_surfaces=False,
     preload_support=False,
     collisionality_model="default",
     bc_density=None,
@@ -6782,7 +6773,9 @@ def build_ntx_exact_lij_runtime_transport_model(
         support=ntx_exact_lij_support,
     )
     if preload_support:
-        return model.with_static_support()
+        return model.with_static_support(
+            include_surfaces=bool(ntx_exact_lij_support_include_surfaces)
+        )
     return model
 
 
