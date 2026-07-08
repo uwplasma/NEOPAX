@@ -628,15 +628,22 @@ def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
 
     objective_count = int(len(OBJECTIVE_LABELS))
 
-    def _zero_lagged_response_for_one(_):
-        return _radau_align_tangent_tree_to_primal(
-            None,
-            segmented_final_carry.lagged_response_cache,
+    def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
+        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
         )
 
     reduced_bars = _RadauAcceptedStepReducedCotangent(
         y=final_y_bars,
-        lagged_response_cache=jax.vmap(_zero_lagged_response_for_one)(jnp.arange(objective_count)),
+        lagged_response_cache=_batched_zero_tangent_tree_like(
+            segmented_final_carry.lagged_response_cache,
+            objective_count,
+        ),
         lagged_reference_y=jnp.zeros(
             (objective_count,) + jnp.shape(segmented_final_carry.lagged_reference_y),
             dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,

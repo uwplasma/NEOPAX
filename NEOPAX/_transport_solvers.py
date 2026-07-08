@@ -4368,6 +4368,173 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd(
     )
 
 
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+) -> _RadauAcceptedStepReducedCotangent:
+    """Reduced accepted-step bwd with a leading objective/cotangent axis."""
+
+    if not bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
+        raise ValueError("batched reduced_cotangent reverse step bwd requires reverse_direct_stage_adjoint=True.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _batched_zero_tangent_tree_like(primal_tree, batch_size):
+        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
+        )
+
+    def _single_fallback(single_reduced_bar):
+        return _execute_radau_accepted_step_next_reduced_cotangent_bwd(
+            kernel_context,
+            physics_context,
+            context,
+            lagged_response_branch,
+            carry_in,
+            single_reduced_bar,
+        )
+
+    primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    carry_for_linear_map = dataclasses.replace(
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_for_linear_map,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+    if lagged_response is None:
+        return jax.vmap(_single_fallback)(next_reduced_bars)
+
+    def _add_tangent_trees(lhs, rhs, primal):
+        lhs_aligned = _radau_align_tangent_tree_to_primal(lhs, primal)
+        rhs_aligned = _radau_align_tangent_tree_to_primal(rhs, primal)
+        if lhs_aligned is None:
+            return rhs_aligned
+        if rhs_aligned is None:
+            return lhs_aligned
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
+
+    trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
+    if physics_context.project_flat is not None:
+        _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
+        trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
+
+    dz_bars = (
+        primal_result.trial_dt
+        * kernel_context.b[None, :, None]
+        * trial_y_bars[:, None, :]
+    )
+    memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
+    if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+        residual_bars = jax.vmap(
+            lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
+                rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+            )
+        )(dz_bars)
+    else:
+        residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
+        )
+
+    residual_y_bars, _, residual_lagged_bars = jax.vmap(
+        lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            residual_bar,
+            compute_dt_bar=False,
+        )
+    )(residual_bars)
+
+    y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
+    lagged_cache_bars = _add_tangent_trees(
+        residual_lagged_bars,
+        next_reduced_bars.lagged_response_cache,
+        carry_for_linear_map.lagged_response_cache,
+    )
+    lagged_reference_y_bars = jnp.asarray(
+        next_reduced_bars.lagged_reference_y,
+        dtype=kernel_context.dtype,
+    )
+
+    if lagged_response_branch == "rebuild":
+        if physics_context.pullback_build_lagged_response is None:
+            raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        zero_rebuild_pullback = cotangent_mode in {
+            "zero_rebuild_pullback",
+            "zero_lagged_rebuild",
+            "rebuild_pullback_zero",
+        }
+        if zero_rebuild_pullback:
+            rebuild_flat_bars = jnp.zeros_like(y_bars)
+        else:
+            projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+            rebuild_state = physics_context.unpack_flat(projected_y)
+            rebuild_state_bars = jax.vmap(
+                lambda lagged_cache_bar: physics_context.pullback_build_lagged_response(
+                    rebuild_state,
+                    lagged_cache_bar,
+                    reverse_stage_cotangent_mode=cotangent_mode,
+                )
+            )(lagged_cache_bars)
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
+        y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
+        lagged_cache_bars = _batched_zero_tangent_tree_like(
+            carry_in.lagged_response_cache,
+            y_bars.shape[0],
+        )
+        lagged_reference_y_bars = jnp.zeros(
+            (y_bars.shape[0],) + jnp.shape(carry_in.lagged_reference_y),
+            dtype=jnp.asarray(carry_in.lagged_reference_y).dtype,
+        )
+
+    return _RadauAcceptedStepReducedCotangent(
+        y=y_bars,
+        lagged_response_cache=lagged_cache_bars,
+        lagged_reference_y=lagged_reference_y_bars,
+    )
+
+
 @partial(jax.jit, static_argnums=(0, 1), inline=False)
 def _radau_segment_reduced_cotangent_bwd_call(
     execution_context: _RadauSolveExecutionContext,
@@ -4479,19 +4646,26 @@ def _radau_segment_reduced_cotangent_bwd_batched_call(
     """One segment backward pass for multiple final-y cotangents.
 
     The accepted-step replay and step-start carry collection are shared across
-    objective rows.  The mathematically scalar stage adjoint is still applied
-    independently to each row, preserving the existing reduced-cotangent rule.
+    objective rows.  The reduced step bwd keeps a leading objective axis and
+    routes the iterative stage-adjoint solve through a batched multi-RHS loop.
     """
 
     def _zero_reduced_cotangent_like(carry_value):
         objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
 
-        def _zero_tree_for_one(_):
-            return _radau_align_tangent_tree_to_primal(None, carry_value.lagged_response_cache)
+        def _batched_zero_tangent_tree_like(primal_tree):
+            zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+            return jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                ),
+                zero_tree,
+            )
 
         return _RadauAcceptedStepReducedCotangent(
             y=jnp.zeros((objective_count,) + jnp.shape(carry_value.y), dtype=jnp.asarray(carry_value.y).dtype),
-            lagged_response_cache=jax.vmap(_zero_tree_for_one)(jnp.arange(objective_count)),
+            lagged_response_cache=_batched_zero_tangent_tree_like(carry_value.lagged_response_cache),
             lagged_reference_y=jnp.zeros(
                 (objective_count,) + jnp.shape(carry_value.lagged_reference_y),
                 dtype=jnp.asarray(carry_value.lagged_reference_y).dtype,
@@ -4535,35 +4709,35 @@ def _radau_segment_reduced_cotangent_bwd_batched_call(
             carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
             residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
 
-            def _single_reuse(single_reduced_bar):
-                return _execute_radau_accepted_step_next_reduced_cotangent_bwd(
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     execution_context.attempt_context,
                     "reuse",
                     residual_carry,
-                    single_reduced_bar,
+                    slot_reduced_bars,
                 )
 
-            def _single_rebuild(single_reduced_bar):
-                return _execute_radau_accepted_step_next_reduced_cotangent_bwd(
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     execution_context.attempt_context,
                     "rebuild",
                     residual_carry,
-                    single_reduced_bar,
+                    slot_reduced_bars,
                 )
 
             if force_reuse_bwd:
-                return jax.vmap(_single_reuse)(slot_reduced_bars)
+                return _reuse_branch(None)
             if force_rebuild_bwd:
-                return jax.vmap(_single_rebuild)(slot_reduced_bars)
+                return _rebuild_branch(None)
             return jax.lax.cond(
                 residual_carry.lagged_response_valid,
-                lambda bars: jax.vmap(_single_reuse)(bars),
-                lambda bars: jax.vmap(_single_rebuild)(bars),
-                slot_reduced_bars,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
             )
 
         def _skip_bwd(_):
@@ -5748,6 +5922,252 @@ def _radau_solve_exact_stage_residual_transpose_iterative(
     return solution.reshape((-1,))
 
 
+def _radau_solve_exact_stage_residual_transpose_batched_iterative(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    method: str,
+):
+    """Batched exact stage-residual transpose solve with independent RHS scalars.
+
+    This keeps BiCGSTAB convergence state independent for each objective row
+    while sharing the loop body and batched transpose matvec.
+    """
+
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
+        (-1, kernel_context.num_stages * kernel_context.state_dim)
+    )
+    stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+    def _transpose_matvec(vectors):
+        lambda_stages = jnp.asarray(vectors, dtype=kernel_context.dtype).reshape(
+            (-1, kernel_context.num_stages, kernel_context.state_dim)
+        )
+        rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
+        zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
+        zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
+        zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
+
+        def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+            if zero_rhs_state_cotangent:
+                return jnp.zeros_like(y_eval)
+            if (
+                zero_rhs_direct_cotangent
+                and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_flux_state_pullback is not None
+            ):
+                return physics_context.flat_rhs_flux_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+            if (
+                zero_rhs_flux_cotangent
+                and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_direct_state_pullback is not None
+            ):
+                return physics_context.flat_rhs_direct_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+            if (
+                rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
+                and physics_context.flat_rhs_state_pullback is not None
+            ):
+                return physics_context.flat_rhs_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    lambda_eval,
+                )
+
+            def _rhs_at_stage(y_value):
+                return _radau_eval_rhs(
+                    t_eval,
+                    y_value,
+                    lagged_response,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )
+
+            _, rhs_pullback = jax.vjp(_rhs_at_stage, y_eval)
+            (jt_lambda,) = rhs_pullback(lambda_eval)
+            return jt_lambda
+
+        stage_rhs_vjp = (
+            jax.checkpoint(_stage_rhs_vjp)
+            if memory_mode in {"remat_matvec", "remat_rhs", "checkpoint_matvec", "checkpoint_rhs"}
+            else _stage_rhs_vjp
+        )
+
+        if memory_mode in {"stream_rhs", "stream_matvec", "stream_stage_rhs"}:
+            def _accumulate_coupled_jt_lambda(coupled, stage_index):
+                jt_lambda = jax.vmap(
+                    lambda lambda_for_rhs: stage_rhs_vjp(
+                        jax.lax.dynamic_index_in_dim(stage_times, stage_index, axis=0, keepdims=False),
+                        jax.lax.dynamic_index_in_dim(stage_states, stage_index, axis=0, keepdims=False),
+                        jax.lax.dynamic_index_in_dim(lambda_for_rhs, stage_index, axis=0, keepdims=False),
+                    )
+                )(lambda_stages)
+                a_row = jax.lax.dynamic_index_in_dim(
+                    kernel_context.a,
+                    stage_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                return coupled + a_row[None, :, None] * jt_lambda[:, None, :], None
+
+            coupled_jt_lambda, _ = jax.lax.scan(
+                _accumulate_coupled_jt_lambda,
+                jnp.zeros_like(lambda_stages),
+                jnp.arange(kernel_context.num_stages, dtype=jnp.int32),
+            )
+        else:
+            jt_lambda_stages = jax.vmap(
+                lambda lambda_for_rhs: jax.vmap(stage_rhs_vjp, in_axes=(0, 0, 0))(
+                    stage_times,
+                    stage_states,
+                    lambda_for_rhs,
+                )
+            )(lambda_stages)
+            coupled_jt_lambda = jnp.einsum("ij,bin->bjn", kernel_context.a, jt_lambda_stages)
+        return (lambda_stages - primal_result.trial_dt * coupled_jt_lambda).reshape(rhs_arr.shape)
+
+    def _preconditioner(vectors):
+        return jax.vmap(
+            lambda vector: _radau_apply_stage_linear_transpose_solve(
+                kernel_context,
+                rhs=vector,
+                real_lu_out=primal_result.real_lu_out,
+                real_piv_out=primal_result.real_piv_out,
+                complex_lu_out=primal_result.complex_lu_out,
+                complex_piv_out=primal_result.complex_piv_out,
+                skip_zero_rhs_shortcut=True,
+            )
+        )(vectors)
+
+    def _safe_divide(numerator, denominator):
+        denominator = jnp.asarray(denominator, dtype=kernel_context.dtype)
+        safe_denominator = jnp.where(
+            jnp.abs(denominator) > jnp.asarray(0.0, dtype=kernel_context.dtype),
+            denominator,
+            jnp.asarray(1.0, dtype=kernel_context.dtype),
+        )
+        return numerator / safe_denominator
+
+    def _row_vdot(lhs, rhs_value):
+        return jnp.einsum("bi,bi->b", jnp.conj(lhs), rhs_value)
+
+    def _bicgstab_fixed_iterations_batched(matvec, b, preconditioner, *, tol, maxiter):
+        b = jnp.asarray(b, dtype=kernel_context.dtype)
+        x0 = jnp.zeros_like(b)
+        r0 = b - matvec(x0)
+        r_hat = r0
+        zeros = jnp.zeros_like(b)
+        one = jnp.ones((b.shape[0],), dtype=kernel_context.dtype)
+        norm_b = jnp.sqrt(jnp.maximum(_row_vdot(b, b), jnp.asarray(0.0, dtype=kernel_context.dtype)))
+        threshold = jnp.asarray(tol, dtype=kernel_context.dtype) * norm_b
+        initial_residual_norm = jnp.sqrt(
+            jnp.maximum(_row_vdot(r0, r0), jnp.asarray(0.0, dtype=kernel_context.dtype))
+        )
+        initial_state = (
+            x0,
+            r0,
+            r_hat,
+            zeros,
+            zeros,
+            one,
+            one,
+            one,
+            initial_residual_norm <= threshold,
+        )
+
+        def _where_row(mask, lhs, rhs_value):
+            return jnp.where(mask[:, None], lhs, rhs_value)
+
+        def _body(_idx, state):
+            x, r, r_shadow, p, v, rho_prev, alpha_prev, omega_prev, converged = state
+            rho = _row_vdot(r_shadow, r)
+            beta = _safe_divide(rho, rho_prev) * _safe_divide(alpha_prev, omega_prev)
+            p_candidate = r + beta[:, None] * (p - omega_prev[:, None] * v)
+            p_hat = preconditioner(p_candidate)
+            v_candidate = matvec(p_hat)
+            alpha = _safe_divide(rho, _row_vdot(r_shadow, v_candidate))
+            s = r - alpha[:, None] * v_candidate
+            s_hat = preconditioner(s)
+            t = matvec(s_hat)
+            omega = _safe_divide(_row_vdot(t, s), _row_vdot(t, t))
+            x_candidate = x + alpha[:, None] * p_hat + omega[:, None] * s_hat
+            r_candidate = s - omega[:, None] * t
+            residual_norm = jnp.sqrt(
+                jnp.maximum(_row_vdot(r_candidate, r_candidate), jnp.asarray(0.0, dtype=kernel_context.dtype))
+            )
+            converged_candidate = residual_norm <= threshold
+            use_candidate = jnp.logical_not(converged)
+            return (
+                _where_row(use_candidate, x_candidate, x),
+                _where_row(use_candidate, r_candidate, r),
+                r_shadow,
+                _where_row(use_candidate, p_candidate, p),
+                _where_row(use_candidate, v_candidate, v),
+                jnp.where(use_candidate, rho, rho_prev),
+                jnp.where(use_candidate, alpha, alpha_prev),
+                jnp.where(use_candidate, omega, omega_prev),
+                jnp.logical_or(converged, converged_candidate),
+            )
+
+        final_state = jax.lax.fori_loop(0, int(maxiter), _body, initial_state)
+        return final_state[0]
+
+    iter_tol = float(getattr(physics_context, "reverse_stage_adjoint_iter_tol", 1.0e-10))
+    iter_maxiter = int(getattr(physics_context, "reverse_stage_adjoint_iter_maxiter", 40))
+    if method == "bicgstab":
+        rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+        if rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}:
+            solution = _bicgstab_fixed_iterations_batched(
+                _transpose_matvec,
+                -rhs_arr,
+                tol=iter_tol,
+                maxiter=iter_maxiter,
+                preconditioner=_preconditioner,
+            )
+        else:
+            solution = jax.vmap(
+                lambda rhs_row: jax.scipy.sparse.linalg.bicgstab(
+                    lambda vector: _transpose_matvec(vector[None, :])[0],
+                    -rhs_row,
+                    tol=iter_tol,
+                    atol=0.0,
+                    maxiter=iter_maxiter,
+                    M=lambda vector: _preconditioner(vector[None, :])[0],
+                )[0]
+            )(rhs_arr)
+    else:
+        solution = jax.vmap(
+            lambda rhs_row: jax.scipy.sparse.linalg.gmres(
+                lambda vector: _transpose_matvec(vector[None, :])[0],
+                -rhs_row,
+                tol=iter_tol,
+                atol=0.0,
+                restart=20,
+                maxiter=iter_maxiter,
+                M=lambda vector: _preconditioner(vector[None, :])[0],
+            )[0]
+        )(rhs_arr)
+    return solution.reshape(rhs_arr.shape)
+
+
 def _radau_solve_exact_stage_residual_transpose_block(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -5847,6 +6267,59 @@ def _radau_solve_exact_stage_residual_transpose(
         lagged_response,
         rhs=rhs,
     )
+
+
+def _radau_solve_exact_stage_residual_transpose_batched(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+):
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
+        (-1, kernel_context.num_stages * kernel_context.state_dim)
+    )
+    cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+    if cotangent_mode in {"zero_stage_solve", "stage_solve_zero", "zero_stage_adjoint"}:
+        return jnp.zeros_like(rhs_arr)
+
+    mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
+    if mode == "structured":
+        return -jax.vmap(
+            lambda rhs_row: _radau_apply_stage_linear_transpose_solve(
+                kernel_context,
+                rhs=rhs_row,
+                real_lu_out=primal_result.real_lu_out,
+                real_piv_out=primal_result.real_piv_out,
+                complex_lu_out=primal_result.complex_lu_out,
+                complex_piv_out=primal_result.complex_piv_out,
+                skip_zero_rhs_shortcut=True,
+            )
+        )(rhs_arr)
+    if mode in {"gmres", "bicgstab"}:
+        return _radau_solve_exact_stage_residual_transpose_batched_iterative(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            method=mode,
+        )
+    if mode != "block":
+        raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
+    return jax.vmap(
+        lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_row,
+        )
+    )(rhs_arr)
 
 
 def _radau_approximate_accepted_step_tangent(
