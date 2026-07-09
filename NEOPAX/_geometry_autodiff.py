@@ -1797,11 +1797,12 @@ def _build_neopax_geometry_from_state(
     )
 
 
-def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia):
+def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     from NEOPAX._transport_flux_models import NTXRuntimeScanChannels
 
     rho_arr = jnp.asarray(rho, dtype=jnp.float64)
     psia_value = float(jnp.asarray(psia))
+    r00_arr = jnp.asarray(r00, dtype=jnp.float64)
     b00 = jnp.asarray([jnp.asarray(surface.b0 if surface.b0 is not None else surface.b_cos[0], dtype=jnp.float64) for surface in surfaces])
     boozer_i = jnp.asarray([jnp.asarray(surface.b_theta, dtype=jnp.float64) for surface in surfaces])
     boozer_g = jnp.asarray([jnp.asarray(surface.b_zeta, dtype=jnp.float64) for surface in surfaces])
@@ -1817,12 +1818,15 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia):
     fac_sfincs_to_dkes_11 = 1.0 / (8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * jnp.sqrt(jnp.pi)))
     fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsi_drtilde / (boozer_g * jnp.sqrt(jnp.pi)))
     fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00 / (denom * jnp.sqrt(jnp.pi)))
+    epsilon_t = rho_arr * jnp.asarray(a_b, dtype=jnp.float64) / r00_arr
+    fac_dkes_to_d11star = -(8.0 / jnp.pi) * iota * r00_arr
+    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
         a_b=float(a_b),
         psia=psia_value,
         b00=b00,
-        r00=jnp.ones_like(rho_arr),
+        r00=r00_arr,
         boozer_i=boozer_i,
         boozer_g=boozer_g,
         iota=iota,
@@ -1835,8 +1839,8 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia):
         fac_sfincs_to_dkes_11=fac_sfincs_to_dkes_11,
         fac_sfincs_to_dkes_31=fac_sfincs_to_dkes_31,
         fac_sfincs_to_dkes_33=fac_sfincs_to_dkes_33,
-        fac_dkes_to_d11star=jnp.ones_like(rho_arr),
-        fac_dkes_to_d31star=jnp.ones_like(rho_arr),
+        fac_dkes_to_d11star=fac_dkes_to_d11star,
+        fac_dkes_to_d31star=fac_dkes_to_d31star,
         fac_dkes_to_d33star=jnp.ones_like(rho_arr),
     )
 
@@ -1907,6 +1911,14 @@ def build_ntx_exact_lij_support_from_vmec_state(
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
+    s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+    r00_interp = interpax.Interpolator1D(
+        jnp.sqrt(jnp.maximum(s_full, 0.0)),
+        jnp.asarray(state.Rcos, dtype=jnp.float64)[:, 0],
+        extrap=True,
+    )
+    r00_center = r00_interp(rho_center)
+    r00_face = r00_interp(rho_face)
     center_surfaces = _surfaces_from_vmec_jax_state(
         state=state,
         static=context.static,
@@ -1955,12 +1967,14 @@ def build_ntx_exact_lij_support_from_vmec_state(
             rho=rho_center,
             a_b=geometry.a_b,
             psia=ntx_psia,
+            r00=r00_center,
         ),
         face_channels=_build_ntx_runtime_channels_from_surfaces(
             face_surfaces,
             rho=rho_face,
             a_b=geometry.a_b,
             psia=ntx_psia,
+            r00=r00_face,
         ),
         center_prepared=center_prepared,
         face_prepared=face_prepared,
