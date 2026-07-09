@@ -1632,11 +1632,6 @@ def _build_neopax_geometry_from_state(
         )
     else:
         rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
-    # Match the frozen VmecBoozer path, which interpolates Boozer quantities on
-    # rho_half[1:] and therefore includes the outer surface rather than copying
-    # the last interior value to rho=1.
-    sample_rho = rho_grid[1:]
-
     wout_like = type(
         "WoutLike",
         (),
@@ -1669,6 +1664,9 @@ def _build_neopax_geometry_from_state(
         [jnp.zeros((1,), dtype=s_full.dtype), jnp.sqrt(jnp.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))],
         axis=0,
     )
+    # Match the frozen VmecBoozer path, which interpolates Boozer quantities on
+    # rho_half[1:] and then extrapolates to the transport grid.
+    sample_rho = rho_half[1:]
 
     flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
     phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
@@ -1725,41 +1723,20 @@ def _build_neopax_geometry_from_state(
     b0_samples = bmnc_b[:, mode00]
     sqrtg00_samples = gmnc_b[:, mode00]
     if mode10 is None:
-        b10_samples = jnp.zeros_like(b0_samples)
+        b10_raw_samples = jnp.zeros_like(b0_samples)
     else:
-        b10_samples = _safe_divide(bmnc_b[:, mode10], b0_samples)
+        b10_raw_samples = bmnc_b[:, mode10]
 
-    b0_surface = jnp.concatenate([b0_samples[:1], b0_samples], axis=0)
-    sqrtg00_surface = jnp.concatenate(
-        [sqrtg00_samples[:1], sqrtg00_samples],
-        axis=0,
-    )
-    b10_surface = jnp.concatenate(
-        [jnp.zeros((1,), dtype=b10_samples.dtype), b10_samples],
-        axis=0,
-    )
-    iota_surface = jnp.concatenate(
-        [iota_samples[:1], iota_samples],
-        axis=0,
-    )
-    i_value_surface = jnp.concatenate(
-        [i_value_samples[:1], i_value_samples],
-        axis=0,
-    )
-    g_value_surface = jnp.concatenate(
-        [g_value_samples[:1], g_value_samples],
-        axis=0,
-    )
+    b0_interp = interpax.Interpolator1D(sample_rho, b0_samples, extrap=True)
+    sqrtg00_interp = interpax.Interpolator1D(sample_rho, sqrtg00_samples, extrap=True)
+    b10_interp = interpax.Interpolator1D(sample_rho, b10_raw_samples, extrap=True)
+    iota_interp = interpax.Interpolator1D(sample_rho, iota_samples, extrap=True)
+    i_interp = interpax.Interpolator1D(sample_rho, i_value_samples, extrap=True)
+    g_interp = interpax.Interpolator1D(sample_rho, g_value_samples, extrap=True)
 
-    b0_interp = interpax.Interpolator1D(rho_grid, b0_surface, extrap=True)
-    sqrtg00_interp = interpax.Interpolator1D(rho_grid, sqrtg00_surface, extrap=True)
-    b10_interp = interpax.Interpolator1D(rho_grid, b10_surface, extrap=True)
-    iota_interp = interpax.Interpolator1D(rho_grid, iota_surface, extrap=True)
-    i_interp = interpax.Interpolator1D(rho_grid, i_value_surface, extrap=True)
-    g_interp = interpax.Interpolator1D(rho_grid, g_value_surface, extrap=True)
-
-    b0 = b0_interp(rho_grid)
-    b_10 = b10_interp(rho_grid)
+    b_00 = b0_interp(rho_grid)
+    b0 = b0_interp(r_grid)
+    b_10 = _safe_divide(b10_interp(rho_grid), b_00)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
