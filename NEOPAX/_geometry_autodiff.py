@@ -1745,7 +1745,11 @@ def _build_neopax_geometry_from_state(
     i_interp = interpax.Interpolator1D(rho_grid, i_value_surface, extrap=True)
     g_interp = interpax.Interpolator1D(rho_grid, g_value_surface, extrap=True)
 
-    b0 = b0_interp(rho_grid)
+    # Match the legacy file-backed VmecBoozer lane: B0 is evaluated with the
+    # minor-radius grid even though the Boozer profiles are rho-indexed there.
+    # Keeping this convention preserves solver parity while the frozen baseline
+    # remains unchanged.
+    b0 = b0_interp(r_grid)
     b_10 = b10_interp(rho_grid)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)

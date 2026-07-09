@@ -105,10 +105,23 @@ def _stats(lhs: Any, rhs: Any) -> dict[str, Any]:
     max_abs = float(np.max(np.abs(diff))) if diff.size else 0.0
     denom = max(float(np.linalg.norm(left)), 1.0e-30)
     rel_l2 = float(np.linalg.norm(diff) / denom)
+    finite = np.isfinite(left) & np.isfinite(right)
+    if np.any(finite):
+        finite_diff = diff[finite]
+        finite_left = left[finite]
+        finite_max_abs = float(np.max(np.abs(finite_diff)))
+        finite_denom = max(float(np.linalg.norm(finite_left)), 1.0e-30)
+        finite_rel_l2 = float(np.linalg.norm(finite_diff) / finite_denom)
+    else:
+        finite_max_abs = None
+        finite_rel_l2 = None
     return {
         "shape": list(left.shape),
         "max_abs": max_abs,
         "rel_l2": rel_l2,
+        "finite_count": int(np.sum(finite)),
+        "finite_rel_l2": finite_rel_l2,
+        "finite_max_abs": finite_max_abs,
         "frozen_first": float(left[0]) if left.size else None,
         "realtime_first": float(right[0]) if right.size else None,
         "frozen_last": float(left[-1]) if left.size else None,
@@ -126,9 +139,12 @@ def _print_section(title: str, rows: dict[str, dict[str, Any]], *, top: int) -> 
     ]
     sortable.sort(key=lambda item: (item[1]["rel_l2"], item[1]["max_abs"]), reverse=True)
     for name, row in sortable[:top]:
+        finite_rel = row.get("finite_rel_l2")
+        finite_rel_text = "nan" if finite_rel is None else f"{finite_rel:.6e}"
         print(
             f"{name:32s} "
             f"rel_l2={row['rel_l2']:.6e} "
+            f"finite_rel_l2={finite_rel_text} "
             f"max_abs={row['max_abs']:.6e} "
             f"first=({row['frozen_first']:.6e}, {row['realtime_first']:.6e}) "
             f"last=({row['frozen_last']:.6e}, {row['realtime_last']:.6e})"
