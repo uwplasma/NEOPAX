@@ -1665,8 +1665,10 @@ def _build_neopax_geometry_from_state(
         axis=0,
     )
     # Match the frozen VmecBoozer half-grid interpolation pattern without
-    # launching Boozer on every VMEC half-mesh surface.
-    sample_rho = rho_grid_half[1:]
+    # launching Boozer on every VMEC half-mesh surface.  The frozen Boozer file
+    # data are interior half-surface values; the edge is reached by
+    # extrapolation, not by anchoring a rho=1 Boozer transform.
+    sample_rho = rho_grid_half[1:-1]
 
     flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
     phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
@@ -1736,7 +1738,7 @@ def _build_neopax_geometry_from_state(
 
     b_00 = b0_interp(rho_grid)
     b0 = b0_interp(r_grid)
-    b_10 = _safe_divide(b10_interp(rho_grid), b_00)
+    b_10 = _safe_divide(b10_interp(rho_grid), b_00).at[0].set(0.0)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
