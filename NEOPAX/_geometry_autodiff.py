@@ -1632,7 +1632,10 @@ def _build_neopax_geometry_from_state(
         )
     else:
         rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
-    sample_rho = rho_grid[1:-1]
+    # Match the frozen VmecBoozer path, which interpolates Boozer quantities on
+    # rho_half[1:] and therefore includes the outer surface rather than copying
+    # the last interior value to rho=1.
+    sample_rho = rho_grid[1:]
 
     wout_like = type(
         "WoutLike",
@@ -1726,25 +1729,25 @@ def _build_neopax_geometry_from_state(
     else:
         b10_samples = _safe_divide(bmnc_b[:, mode10], b0_samples)
 
-    b0_surface = jnp.concatenate([b0_samples[:1], b0_samples, b0_samples[-1:]], axis=0)
+    b0_surface = jnp.concatenate([b0_samples[:1], b0_samples], axis=0)
     sqrtg00_surface = jnp.concatenate(
-        [sqrtg00_samples[:1], sqrtg00_samples, sqrtg00_samples[-1:]],
+        [sqrtg00_samples[:1], sqrtg00_samples],
         axis=0,
     )
     b10_surface = jnp.concatenate(
-        [jnp.zeros((1,), dtype=b10_samples.dtype), b10_samples, b10_samples[-1:]],
+        [jnp.zeros((1,), dtype=b10_samples.dtype), b10_samples],
         axis=0,
     )
     iota_surface = jnp.concatenate(
-        [iota_samples[:1], iota_samples, iota_samples[-1:]],
+        [iota_samples[:1], iota_samples],
         axis=0,
     )
     i_value_surface = jnp.concatenate(
-        [i_value_samples[:1], i_value_samples, i_value_samples[-1:]],
+        [i_value_samples[:1], i_value_samples],
         axis=0,
     )
     g_value_surface = jnp.concatenate(
-        [g_value_samples[:1], g_value_samples, g_value_samples[-1:]],
+        [g_value_samples[:1], g_value_samples],
         axis=0,
     )
 
