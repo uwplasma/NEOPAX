@@ -1603,6 +1603,15 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
         return jnp.asarray(surface_indices, dtype=jnp.int32)
 
 
+def _boozer_surface_indices_and_rho(static, rho_values):
+    s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
+    surface_indices = jnp.unique(_surface_indices_for_s_values(static, s_values))
+    s_full = jnp.asarray(static.s, dtype=jnp.float64)
+    s_half = 0.5 * (s_full[:-1] + s_full[1:])
+    sample_rho = jnp.sqrt(jnp.maximum(s_half[surface_indices], 0.0))
+    return surface_indices, sample_rho
+
+
 def _build_neopax_geometry_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1665,10 +1674,21 @@ def _build_neopax_geometry_from_state(
         axis=0,
     )
     # Match the frozen VmecBoozer half-grid interpolation pattern without
-    # launching Boozer on every VMEC half-mesh surface.  The frozen Boozer file
-    # data are interior half-surface values; the edge is reached by
-    # extrapolation, not by anchoring a rho=1 Boozer transform.
-    sample_rho = rho_grid_half[1:-1]
+    # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
+    # half-mesh points at the axis and edge so extrapolated quantities such as
+    # B0(r_grid) use a frozen-like local slope.
+    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
+    requested_sample_rho = jnp.unique(
+        jnp.concatenate(
+            [
+                rho_grid_half[1:-1],
+                rho_half[1 : 1 + edge_count],
+                edge_rho,
+            ],
+            axis=0,
+        )
+    )
 
     flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
     phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
@@ -1697,10 +1717,7 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
-    surface_indices = _surface_indices_for_s_values(
-        context.static,
-        tuple(float(rho_value**2) for rho_value in sample_rho),
-    )
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=context.booz_constants,

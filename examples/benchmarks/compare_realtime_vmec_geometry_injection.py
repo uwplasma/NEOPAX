@@ -23,11 +23,11 @@ from netCDF4 import Dataset
 
 from NEOPAX._geometry_autodiff import (
     _build_neopax_geometry_from_state,
+    _boozer_surface_indices_and_rho,
     _find_boozer_mode_index,
     _import_booz_xform_jax_api,
     _import_vmec_jax,
     _solve_state_for_single_param,
-    _surface_indices_for_s_values,
     build_geometry_autodiff_context,
     build_ntx_exact_lij_support_from_vmec_state,
 )
@@ -258,10 +258,26 @@ def _raw_boozer_mode_rows(
             jnp.array([1.0], dtype=rho_grid.dtype),
         ]
     )
-    sample_rho = rho_grid_half[1:-1]
-    surface_indices = _surface_indices_for_s_values(
+    s_full = jnp.asarray(realtime_context.static.s, dtype=jnp.float64)
+    rho_half = jnp.concatenate(
+        [jnp.zeros((1,), dtype=s_full.dtype), jnp.sqrt(jnp.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))],
+        axis=0,
+    )
+    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
+    requested_sample_rho = jnp.unique(
+        jnp.concatenate(
+            [
+                rho_grid_half[1:-1],
+                rho_half[1 : 1 + edge_count],
+                edge_rho,
+            ],
+            axis=0,
+        )
+    )
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(
         realtime_context.static,
-        tuple(float(rho_value**2) for rho_value in sample_rho),
+        requested_sample_rho,
     )
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
