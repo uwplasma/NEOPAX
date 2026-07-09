@@ -1664,9 +1664,9 @@ def _build_neopax_geometry_from_state(
         [jnp.zeros((1,), dtype=s_full.dtype), jnp.sqrt(jnp.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))],
         axis=0,
     )
-    # Match the frozen VmecBoozer path, which interpolates Boozer quantities on
-    # rho_half[1:] and then extrapolates to the transport grid.
-    sample_rho = rho_half[1:]
+    # Match the frozen VmecBoozer half-grid interpolation pattern without
+    # launching Boozer on every VMEC half-mesh surface.
+    sample_rho = rho_grid_half[1:]
 
     flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
     phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
