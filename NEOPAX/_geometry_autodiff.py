@@ -1696,18 +1696,6 @@ def _build_neopax_geometry_from_state(
     # while the frozen wout-backed transport lane uses wout.phi[-1].
     psia = jnp.abs(phi[-1]) * (2.0 * jnp.pi)
 
-    r0_value = jnp.asarray(state.Rcos)[-1, 0]
-    a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
-    r_grid = rho_grid * a_b
-    r_grid_half = rho_grid_half * a_b
-    dr = r_grid[1] - r_grid[0] if int(n_r) > 1 else jnp.asarray(0.0, dtype=r_grid.dtype)
-
-    dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
-    volume_scale = (2.0 * jnp.pi) ** 2
-    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
-    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
-    over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
-
     booz_api = _import_booz_xform_jax_api()
     vmec_jax = _import_vmec_jax()
     inputs = vmec_jax.booz_xform_inputs_from_state(
@@ -1728,13 +1716,28 @@ def _build_neopax_geometry_from_state(
     bmnc_b = jnp.asarray(out["bmnc_b"])
     if "gmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing gmnc_b.")
+    if "rmnc_b" not in out:
+        raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
     gmnc_b = jnp.asarray(out["gmnc_b"])
+    rmnc_b = jnp.asarray(out["rmnc_b"])
     ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
     ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
     mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (0,0) mode.")
     mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+
+    r0_value = rmnc_b[-1, mode00]
+    a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
+    r_grid = rho_grid * a_b
+    r_grid_half = rho_grid_half * a_b
+    dr = r_grid[1] - r_grid[0] if int(n_r) > 1 else jnp.asarray(0.0, dtype=r_grid.dtype)
+
+    dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
+    volume_scale = (2.0 * jnp.pi) ** 2
+    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
+    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
+    over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
 
     iota_samples = jnp.asarray(out["iota_b"])
     i_value_samples = jnp.asarray(out["buco_b"])

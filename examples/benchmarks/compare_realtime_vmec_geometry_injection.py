@@ -241,6 +241,7 @@ def _raw_boozer_mode_rows(
         frozen_s_half[0] = 0.0
         frozen_rho_support = np.sqrt(frozen_s_half)[1:]
         frozen_bmnc_b = np.asarray(bfile.variables["bmnc_b"][:].filled(), dtype=float)
+        frozen_rmnc_b = np.asarray(bfile.variables["rmnc_b"][:].filled(), dtype=float)
         frozen_gmnc_b = np.asarray(bfile.variables["gmn_b"][:].filled(), dtype=float)
         frozen_ixm_b = np.asarray(bfile.variables["ixm_b"][:].filled(), dtype=int)
         frozen_ixn_b = np.asarray(bfile.variables["ixn_b"][:].filled(), dtype=int)
@@ -296,6 +297,7 @@ def _raw_boozer_mode_rows(
         jit=True,
     )
     realtime_bmnc_b = np.asarray(jnp.asarray(out["bmnc_b"]), dtype=float)
+    realtime_rmnc_b = np.asarray(jnp.asarray(out["rmnc_b"]), dtype=float)
     realtime_gmnc_b = np.asarray(jnp.asarray(out["gmnc_b"]), dtype=float)
     realtime_ixm_b = np.asarray(jnp.asarray(out["ixm_b"]), dtype=int)
     realtime_ixn_b = np.asarray(jnp.asarray(out["ixn_b"]), dtype=int)
@@ -307,6 +309,8 @@ def _raw_boozer_mode_rows(
     realtime_b00 = _safe_mode_column(realtime_bmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
     frozen_b10 = _safe_mode_column(frozen_bmnc_b, frozen_ixm_b, frozen_ixn_b, m=1, n=0)
     realtime_b10 = _safe_mode_column(realtime_bmnc_b, realtime_ixm_b, realtime_ixn_b, m=1, n=0)
+    frozen_r00 = _safe_mode_column(frozen_rmnc_b, frozen_ixm_b, frozen_ixn_b, m=0, n=0)
+    realtime_r00 = _safe_mode_column(realtime_rmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
     frozen_g00 = _safe_mode_column(frozen_gmnc_b, frozen_ixm_b, frozen_ixn_b, m=0, n=0)
     realtime_g00 = _safe_mode_column(realtime_gmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
     realtime_rho_support = np.asarray(sample_rho, dtype=float)
@@ -318,6 +322,7 @@ def _raw_boozer_mode_rows(
 
     frozen_b00_at_realtime = _interp_frozen_to_realtime(frozen_b00)
     frozen_b10_at_realtime = _interp_frozen_to_realtime(frozen_b10)
+    frozen_r00_at_realtime = _interp_frozen_to_realtime(frozen_r00)
     frozen_g00_at_realtime = _interp_frozen_to_realtime(frozen_g00)
     frozen_buco_at_realtime = _interp_frozen_to_realtime(frozen_buco_b)
     frozen_bvco_at_realtime = _interp_frozen_to_realtime(frozen_bvco_b)
@@ -325,6 +330,7 @@ def _raw_boozer_mode_rows(
 
     rows = {
         "raw_b00_interp_to_realtime": _optional_stats(frozen_b00_at_realtime, realtime_b00),
+        "raw_rmnc00_interp_to_realtime": _optional_stats(frozen_r00_at_realtime, realtime_r00),
         "raw_gmn00_interp_to_realtime": _optional_stats(frozen_g00_at_realtime, realtime_g00),
         "raw_buco_interp_to_realtime": _stats(frozen_buco_at_realtime, realtime_buco_b),
         "raw_bvco_interp_to_realtime": _stats(frozen_bvco_at_realtime, realtime_bvco_b),
