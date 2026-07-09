@@ -3411,7 +3411,9 @@ def _truncate_rollout_trace_by_accepted_steps(trace, accepted_step_limit: int | 
     accepted_mask = jnp.asarray(trace.accepted_mask, dtype=bool)
     active_mask = jnp.asarray(trace.active_mask, dtype=bool)
     accepted_prefix_count = jnp.cumsum(accepted_mask.astype(jnp.int32))
-    keep_mask = jnp.logical_and(active_mask, accepted_prefix_count <= accepted_step_limit)
+    before_limit = accepted_prefix_count < accepted_step_limit
+    limit_accept = jnp.logical_and(accepted_mask, accepted_prefix_count == accepted_step_limit)
+    keep_mask = jnp.logical_and(active_mask, jnp.logical_or(before_limit, limit_accept))
     return dataclasses.replace(
         trace,
         active_mask=keep_mask,
