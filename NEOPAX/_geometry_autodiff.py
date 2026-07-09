@@ -1780,6 +1780,7 @@ def _build_neopax_geometry_from_state(
     i_value_samples = jnp.asarray(out["buco_b"])
     g_value_samples = jnp.asarray(out["bvco_b"])
     b0_samples = bmnc_b[:, mode00]
+    r00_samples = rmnc_b[:, mode00]
     sqrtg00_samples = gmnc_b[:, mode00]
     if mode10 is None:
         b10_raw_samples = jnp.zeros_like(b0_samples)
@@ -1787,6 +1788,7 @@ def _build_neopax_geometry_from_state(
         b10_raw_samples = bmnc_b[:, mode10]
 
     b0_interp = interpax.Interpolator1D(sample_rho, b0_samples, extrap=True)
+    r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
     sqrtg00_interp = interpax.Interpolator1D(sample_rho, sqrtg00_samples, extrap=True)
     b10_interp = interpax.Interpolator1D(sample_rho, b10_raw_samples, extrap=True)
     iota_interp = interpax.Interpolator1D(sample_rho, iota_samples, extrap=True)
@@ -1799,7 +1801,9 @@ def _build_neopax_geometry_from_state(
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
-    epsilon_t = rho_grid * a_b / r0_value
+    # Match frozen VmecBoozer: epsilon_t uses the Boozer R00 profile, not the
+    # edge major radius used to define a_b.
+    epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
     curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
     enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
     b0prime = jax.vmap(jax.grad(lambda r: b0_interp(r)))(r_grid)
@@ -1813,7 +1817,7 @@ def _build_neopax_geometry_from_state(
         * (
             1.0
             + 3.4229 * jnp.power(epsilon_t, 3.6) * (1.0 - 2.5766 * jnp.power(jnp.abs(iota), 1.6))
-            - 0.6039 * jnp.power(epsilon_t, 2.0) * (jnp.square(curvature) - 1.0)
+            - 0.6039 * jnp.power(epsilon_t, 2.0) * (1.0 - jnp.square(curvature))
         )
     )
 
