@@ -1669,7 +1669,9 @@ def _build_neopax_geometry_from_state(
 
     flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
     phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
-    psia = jnp.abs(phi[-1])
+    # VMEC/JAX gives the toroidal-flux integral per field period/radian here,
+    # while the frozen wout-backed transport lane uses wout.phi[-1].
+    psia = jnp.abs(phi[-1]) * (2.0 * jnp.pi)
 
     r0_value = jnp.asarray(state.Rcos)[-1, 0]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
@@ -1839,6 +1841,39 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia):
     )
 
 
+def _ntx_surface_iota_targets(geometry, rho_values):
+    rho_grid = jnp.asarray(geometry.rho_grid, dtype=jnp.float64)
+    iota_grid = jnp.asarray(geometry.iota, dtype=jnp.float64)
+    iota_for_sign = iota_grid
+    if int(iota_grid.shape[0]) > 1:
+        iota_for_sign = iota_for_sign.at[0].set(iota_grid[1])
+    return jnp.interp(
+        jnp.asarray(rho_values, dtype=jnp.float64),
+        rho_grid,
+        iota_for_sign,
+    )
+
+
+def _align_ntx_surface_iota_convention(surface, target_iota):
+    surface_iota = jnp.asarray(surface.iota, dtype=jnp.float64)
+    target = jnp.asarray(target_iota, dtype=jnp.float64)
+    should_flip = jnp.logical_and(surface_iota * target < 0.0, jnp.abs(target) > 0.0)
+
+    def _maybe_flip(value):
+        if value is None:
+            return None
+        value_arr = jnp.asarray(value, dtype=jnp.float64)
+        return jnp.where(should_flip, -value_arr, value_arr)
+
+    updates = {
+        "iota": _maybe_flip(surface.iota),
+        "b_theta": _maybe_flip(surface.b_theta),
+    }
+    if surface.chi_p is not None:
+        updates["chi_p"] = _maybe_flip(surface.chi_p)
+    return dataclasses.replace(surface, **updates)
+
+
 def build_ntx_exact_lij_support_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -1888,6 +1923,16 @@ def build_ntx_exact_lij_support_from_vmec_state(
         mboz=int(context.mboz),
         nboz=int(context.nboz),
         psi_p=float(jnp.asarray(geometry.Psia_value)),
+    )
+    center_iota_targets = _ntx_surface_iota_targets(geometry, rho_center)
+    face_iota_targets = _ntx_surface_iota_targets(geometry, rho_face)
+    center_surfaces = tuple(
+        _align_ntx_surface_iota_convention(surface, center_iota_targets[index])
+        for index, surface in enumerate(center_surfaces)
+    )
+    face_surfaces = tuple(
+        _align_ntx_surface_iota_convention(surface, face_iota_targets[index])
+        for index, surface in enumerate(face_surfaces)
     )
     grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
 
