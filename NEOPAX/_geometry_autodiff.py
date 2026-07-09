@@ -1904,6 +1904,9 @@ def build_ntx_exact_lij_support_from_vmec_state(
 
     rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
     rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
+    # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
+    ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
     center_surfaces = _surfaces_from_vmec_jax_state(
         state=state,
         static=context.static,
@@ -1912,7 +1915,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float)),
         mboz=int(context.mboz),
         nboz=int(context.nboz),
-        psi_p=float(jnp.asarray(geometry.Psia_value)),
+        psi_p=float(ntx_psia),
     )
     face_surfaces = _surfaces_from_vmec_jax_state(
         state=state,
@@ -1922,7 +1925,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float)),
         mboz=int(context.mboz),
         nboz=int(context.nboz),
-        psi_p=float(jnp.asarray(geometry.Psia_value)),
+        psi_p=float(ntx_psia),
     )
     center_iota_targets = _ntx_surface_iota_targets(geometry, rho_center)
     face_iota_targets = _ntx_surface_iota_targets(geometry, rho_face)
@@ -1951,13 +1954,13 @@ def build_ntx_exact_lij_support_from_vmec_state(
             center_surfaces,
             rho=rho_center,
             a_b=geometry.a_b,
-            psia=geometry.Psia_value,
+            psia=ntx_psia,
         ),
         face_channels=_build_ntx_runtime_channels_from_surfaces(
             face_surfaces,
             rho=rho_face,
             a_b=geometry.a_b,
-            psia=geometry.Psia_value,
+            psia=ntx_psia,
         ),
         center_prepared=center_prepared,
         face_prepared=face_prepared,
