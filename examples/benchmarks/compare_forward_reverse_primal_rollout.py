@@ -29,6 +29,9 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _objective_vector,
     _prepare_benchmark_config,
 )
+from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
+    _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp,
+)
 from benchmark_transport_reverse_ad_only import (  # noqa: E402
     PARAMETER_ORDER,
     _prepare_reverse_static_setup,
@@ -111,6 +114,23 @@ def main() -> None:
     )
     forward_objectives = jax.block_until_ready(forward_objectives)
 
+    fused_forward_objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(  # noqa: E731
+        p,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=PARAMETER_ORDER[0],
+        accepted_step_limit_override=args.accepted_step_limit,
+    )
+    fused_forward_objectives, fused_forward_tangents = jax.jvp(
+        fused_forward_objective_fn,
+        (baseline_values[0],),
+        (jnp.asarray(1.0, dtype=baseline_values.dtype),),
+    )
+    fused_forward_objectives = jax.block_until_ready(fused_forward_objectives)
+    fused_forward_tangents = jax.block_until_ready(fused_forward_tangents)
+
     reverse_setup = _prepare_reverse_static_setup(
         baseline_values,
         config=config,
@@ -152,8 +172,12 @@ def main() -> None:
 
     rows_vjp = _objective_stats(forward_objectives, reverse_objectives_vjp)
     rows_plain = _objective_stats(forward_objectives, reverse_objectives_plain)
+    rows_fused_vjp = _objective_stats(fused_forward_objectives, reverse_objectives_vjp)
+    rows_fused_plain = _objective_stats(fused_forward_objectives, reverse_objectives_plain)
     max_rel_vjp = max(row["relative_delta"] for row in rows_vjp)
     max_rel_plain = max(row["relative_delta"] for row in rows_plain)
+    max_rel_fused_vjp = max(row["relative_delta"] for row in rows_fused_vjp)
+    max_rel_fused_plain = max(row["relative_delta"] for row in rows_fused_plain)
 
     print("[compare] forward realized-schedule primal vs reverse VJP primal")
     for row in rows_vjp:
@@ -171,6 +195,25 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
+    print("[compare] fused forward custom-JVP primal vs reverse VJP primal")
+    for row in rows_fused_vjp:
+        print(
+            f"  - {row['objective']}: fused_forward={row['forward_primal']:.16e} "
+            f"reverse_vjp={row['reverse_primal']:.16e} "
+            f"delta={row['delta_reverse_minus_forward']:.6e} "
+            f"rel={row['relative_delta']:.6e}"
+        )
+    print("[compare] fused forward custom-JVP primal vs reverse plain primal")
+    for row in rows_fused_plain:
+        print(
+            f"  - {row['objective']}: fused_forward={row['forward_primal']:.16e} "
+            f"reverse_plain={row['reverse_primal']:.16e} "
+            f"delta={row['delta_reverse_minus_forward']:.6e} "
+            f"rel={row['relative_delta']:.6e}"
+        )
+    print("[compare] fused forward n0 tangents")
+    for label, value in zip(OBJECTIVE_LABELS, np.asarray(jax.device_get(fused_forward_tangents), dtype=float)):
+        print(f"  - {label}: tangent={float(value):.16e}")
 
     payload = {
         "config_path": str(Path(args.config)),
@@ -181,8 +224,13 @@ def main() -> None:
         "reverse_stop_after_accepted_steps": reverse_setup.stop_after_accepted_steps,
         "forward_vs_reverse_vjp": rows_vjp,
         "forward_vs_reverse_plain": rows_plain,
+        "fused_forward_vs_reverse_vjp": rows_fused_vjp,
+        "fused_forward_vs_reverse_plain": rows_fused_plain,
+        "fused_forward_tangent_n0": np.asarray(jax.device_get(fused_forward_tangents), dtype=float).tolist(),
         "max_relative_delta_vjp": float(max_rel_vjp),
         "max_relative_delta_plain": float(max_rel_plain),
+        "max_relative_delta_fused_vjp": float(max_rel_fused_vjp),
+        "max_relative_delta_fused_plain": float(max_rel_fused_plain),
     }
     out_path = Path(args.json_output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
