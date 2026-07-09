@@ -170,7 +170,13 @@ def _resolve_input_path(config: dict[str, Any], value: str | Path) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
-    return (Path(config["_config_dir"]) / path).resolve()
+    cwd_relative = path.resolve()
+    if cwd_relative.exists():
+        return cwd_relative
+    config_relative = (Path(config["_config_dir"]) / path).resolve()
+    if config_relative.exists():
+        return config_relative
+    return cwd_relative
 
 
 def _build_realtime_state_and_geometry(config: dict[str, Any]):
