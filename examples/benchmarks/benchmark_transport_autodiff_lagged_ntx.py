@@ -1627,6 +1627,7 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
     parameter_name: str,
     frozen_trace,
     replay_mode: str = "attempt",
+    use_ad_lane: bool = False,
 ):
     replay_mode_key = str(replay_mode).strip().lower()
     if replay_mode_key == "accepted":
@@ -1642,7 +1643,7 @@ def _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace
         )
     prepare_fn = (
         _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane
-        if replay_mode_key == "accepted"
+        if use_ad_lane
         else _forward_benchmark_prepare_realized_schedule_scalar_rollout
     )
     (

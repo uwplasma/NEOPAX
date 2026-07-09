@@ -373,6 +373,12 @@ def main() -> None:
         help="Run adaptive AD only, frozen FD only, or both.",
     )
     parser.add_argument(
+        "--fd-replay-lane",
+        default="ad",
+        choices=("ad", "plain"),
+        help="Lane used to generate and replay the frozen FD trace.",
+    )
+    parser.add_argument(
         "--ad-local-nan-debug",
         action="store_true",
         help="When AD returns nonfinite values, run lane-local primal/final-state diagnostics in this benchmark entrypoint.",
@@ -417,7 +423,7 @@ def main() -> None:
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             parameter_name=args.parameter,
-            use_realized_schedule_jvp=False,
+            use_realized_schedule_jvp=str(args.fd_replay_lane).strip().lower() == "ad",
             use_schedule_trace_only=True,
         )
         baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
@@ -570,6 +576,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_ad_lane=str(args.fd_replay_lane).strip().lower() == "ad",
         )
         if str(args.replay_mode).strip().lower() == "accepted":
             accepted_time_list = _accepted_time_list_from_trace(replay_trace)
@@ -592,6 +599,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_ad_lane=str(args.fd_replay_lane).strip().lower() == "ad",
         )
         print(f"[autodiff-gate] progress: running frozen fd_plus replay ({args.replay_mode})", flush=True)
         objectives_plus, plus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
@@ -603,6 +611,7 @@ def main() -> None:
             parameter_name=args.parameter,
             frozen_trace=replay_trace,
             replay_mode=args.replay_mode,
+            use_ad_lane=str(args.fd_replay_lane).strip().lower() == "ad",
         )
         gradient_fd = (objectives_plus - objectives_minus) / (2.0 * fd_step)
         minus_diag_local = _replay_diagnostics(minus_replay, objectives_minus)
@@ -647,6 +656,7 @@ def main() -> None:
         "baseline_value": baseline_value,
         "fd_step": float(fd_step),
         "replay_mode": str(args.replay_mode),
+        "fd_replay_lane": str(args.fd_replay_lane),
         "adaptive_derivative_mode": str(args.adaptive_derivative_mode),
         "run_mode": str(args.run_mode),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),

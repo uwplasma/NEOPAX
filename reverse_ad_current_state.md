@@ -1878,3 +1878,94 @@ Success criteria for the 16-step multi-RHS test:
   compile/launch overhead.
 - If XLA dumps are needed, dump only memory reports or clean `/tmp` afterward;
   previous full dumps risked filling disk.
+
+## 2026-07-09: Profile Reverse AD, Forward AD, And FD Trace State
+
+Current profile-only reverse AD baseline command for all objectives at 16
+accepted steps:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Latest reverse run used `reverse_all_objectives_mode=jacrev` and reported:
+
+| Timing | Value |
+|---|---:|
+| `reverse_total_s` | `2.289904e+03` |
+| `reverse_compile_plus_execute_s` | `1.395459e+03` |
+| `reverse_execute_s_mean` | `8.944451e+02` |
+
+Latest reverse 16-step gradients:
+
+| Objective | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` |
+|---|---:|---:|---:|---:|
+| `softmax_Er` | `-3.7596310226172802e+00` | `3.0540468749022844e+00` | `-8.5184303176153636e-02` | `3.2140636924368615e+00` |
+| `smooth_root_proxy` | `4.8792550932823947e-04` | `-1.7940595936161225e-04` | `-8.3536017747148126e-06` | `1.7962929118689044e-02` |
+| `Er2_volume_average` | `-4.3482590469415534e+00` | `2.4602122740846760e+01` | `1.3374406622306281e+00` | `-3.2083840582997361e+01` |
+| `Er_volume_average` | `-1.7368746602804679e+00` | `8.2053365692759939e-01` | `-4.3801264628593156e-02` | `-4.1902415244173707e-01` |
+| `electron_temperature_volume_average_keV` | `3.1848844709979965e-03` | `3.5041382074642197e-01` | `-1.8160988923259945e-04` | `1.5035492692713084e+00` |
+| `total_pressure_volume_average` | `7.9065130127052745e+00` | `1.8293319419864902e+00` | `2.3977706000108417e-01` | `7.6009325304638091e+00` |
+| `alpha_power_volume_average_mw_m3` | `2.7390490116182176e-01` | `8.1429102705099329e-02` | `2.3111658399500357e-03` | `2.7792821656363359e-01` |
+
+Known-good primal check:
+
+```bash
+python ./examples/benchmarks/compare_forward_reverse_primal_rollout.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+This reported exact equality between forward realized-schedule primal,
+reverse-VJP primal, and reverse plain primal for all objectives. Therefore the
+current forward/reverse discrepancy is not a primal rollout mismatch.
+
+FD diagnostic state:
+
+- `_truncate_rollout_trace_by_accepted_steps()` was fixed so the frozen trace
+  stops at the Nth accepted attempt instead of keeping later rejected attempts.
+- The FD diagnostic was then found to use the plain forward lane for frozen
+  replay while the AD comparisons use the AD realized-schedule lane.
+- `benchmark_transport_adaptive_ad_vs_frozen_fd.py` now has
+  `--fd-replay-lane {ad,plain}`, defaulting to `ad`.
+- `benchmark_transport_autodiff_lagged_ntx.py` now lets frozen-trace objective
+  replay opt into the AD lane through `use_ad_lane=True`.
+- Reproduce old behavior with `--fd-replay-lane plain` if needed.
+
+Next FD command to run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --run-mode fd \
+  --fd-rel-step 3e-8 \
+  --fd-abs-step 1e-10
+```
+
+Expected next interpretation:
+
+- The JSON/output should show `fd_replay_lane=ad`.
+- If the frozen replay baseline objectives move to the forward/reverse AD
+  primal values, the previous FD mismatch was a lane mismatch.
+- If they do not move, the remaining difference is a real frozen-trace FD
+  sensitivity issue rather than a plain-vs-AD replay issue.

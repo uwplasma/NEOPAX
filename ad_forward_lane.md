@@ -533,3 +533,100 @@ Forward AD derivatives:
 
 These are the current forward-AD references for comparing against 16-step
 profile-only reverse AD.
+
+## 2026-07-09: Realtime VMEC/Boozer Geometry Injection State
+
+Goal: the realtime VMEC/JAX plus Booz-xform/JAX geometry path should mimic the
+frozen `wout/boozermn` geometry path, with the same solver/profile settings
+except for the geometry block.
+
+Current comparison command:
+
+```bash
+python ./examples/benchmarks/compare_realtime_vmec_geometry_injection.py \
+  --json-output outputs/realtime_geometry_injection_compare_after_b0_interior_halfgrid.json
+```
+
+Important patches/state so far:
+
+- `_build_neopax_geometry_from_state()` uses public
+  `booz_xform_from_inputs(... )["gmnc_b"]` instead of the private NTX
+  `_booz_xform_gmnc_from_inputs()` helper, because the private helper no longer
+  matches the current `booz_xform_jax._surface_transform()` signature.
+- Axis extension for `iota`, `I_value`, and `G_value` now uses the first
+  surface sample instead of zero-axis padding.
+- Current best local bridge variant uses transport interior half-grid support:
+  `sample_rho = rho_grid_half[1:-1]`.
+- Current local bridge uses `B0 = b0_interp(r_grid)`.
+- Current `B_10` handling uses raw `B10/B00` with axis set to zero.
+
+Latest frozen-vs-realtime geometry comparison, using the current interior
+half-grid variant:
+
+| Quantity | `rel_l2` | `max_abs` | Note |
+|---|---:|---:|---|
+| `curvature` | `2.393569e-01` | `3.469863e-01` | Still large |
+| `B0` | `2.132623e-02` | `1.038158e+00` | Last point differs strongly |
+| `Bsqav` | `3.721296e-02` | `1.838360e-01` | Still too large |
+| `B_10` | `1.017722e-02` | `6.629283e-04` | Much closer than before |
+| `epsilon_t` | `1.327986e-02` | n/a | Still non-negligible |
+| `R0` | `5.403005e-03` | n/a | Small but visible |
+| `Vprime`, `Vprime_half`, `r_grid`, `a_b` | about `2.7e-03` | n/a | Similar small mismatch |
+
+NTX center/face channels are mostly close:
+
+- `iota` is about `1.8e-04` relative.
+- `fac_reference_to_sfincs_11` is about `1.4e-05` relative.
+- `a_b` is about `2.7e-03` relative.
+- `r00` is about `5.25e-03` relative.
+- `boozer_i` shows huge relative error only because the absolute values are
+  around `1e-15`; this is not currently suspected to be the main error source.
+- `fac_dkes_to_d33star` still has a shape mismatch (`[1]` versus `[51]` or
+  `[52]`), but this is not currently suspected to drive the electric-field
+  mismatch.
+- `drds`/`dr_tildeds` have axis-related `inf`/`nan` in relative metrics, but
+  finite relative values are around `2.7e-03`.
+
+Current interpretation:
+
+- The realtime bridge is not solved yet.
+- Do not continue blind interpolation tweaks until the raw Boozer diagnostic is
+  run.
+- The strongest current hypothesis is radial support mismatch: frozen
+  `VmecBoozer` uses VMEC/Boozer half-mesh support from the file, while the
+  realtime bridge currently uses a transport half-grid support. This can make
+  the first Boozer surface differ substantially, for example frozen support
+  near `rho ~= sqrt(s_half)` while realtime transport half-grid starts much
+  closer to the axis.
+- If raw Boozer coefficients differ on matched support, the remaining issue is
+  in Booz-xform/JAX inputs, resolution, or normalization rather than NEOPAX
+  interpolation.
+
+New opt-in raw Boozer diagnostic:
+
+```bash
+python ./examples/benchmarks/compare_realtime_vmec_geometry_injection.py \
+  --json-output outputs/realtime_geometry_injection_compare_raw_boozer.json \
+  --raw-boozer-diagnostics
+```
+
+The diagnostic compares:
+
+- `raw_b00`
+- `raw_gmn00`
+- `raw_buco`
+- `raw_bvco`
+- `raw_iota`
+- `raw_b10`
+- `raw_b10_over_b00`
+- `boozer_support_rho`
+
+Decision rule for the next session:
+
+- If `boozer_support_rho` differs strongly, fix the realtime Boozer support
+  mapping so it mirrors the frozen VMEC/Boozer support without building too
+  many surfaces and OOMing.
+- If `boozer_support_rho` matches but raw Boozer coefficients differ, inspect
+  Booz-xform/JAX inputs, resolution, normalization, and VMEC/JAX state fields.
+- If raw coefficients match but NEOPAX geometry fields differ, focus only on
+  `_build_neopax_geometry_from_state()` interpolation/formulas.
