@@ -659,8 +659,8 @@ def _forward_benchmark_adaptive_final_y_realized_schedule_jvp(
             accepted_dts,
         )
 
-    primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
-    return primal_out, tangent_out
+    _replay_primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
+    return rollout.final_carry.y, tangent_out
 
 
 def _adaptive_rollout_objectives_for_parameter(
