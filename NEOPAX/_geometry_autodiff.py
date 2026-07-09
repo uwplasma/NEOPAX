@@ -1736,15 +1736,15 @@ def _build_neopax_geometry_from_state(
         axis=0,
     )
     iota_surface = jnp.concatenate(
-        [jnp.zeros((1,), dtype=iota_samples.dtype), iota_samples, iota_samples[-1:]],
+        [iota_samples[:1], iota_samples, iota_samples[-1:]],
         axis=0,
     )
     i_value_surface = jnp.concatenate(
-        [jnp.zeros((1,), dtype=i_value_samples.dtype), i_value_samples, i_value_samples[-1:]],
+        [i_value_samples[:1], i_value_samples, i_value_samples[-1:]],
         axis=0,
     )
     g_value_surface = jnp.concatenate(
-        [jnp.zeros((1,), dtype=g_value_samples.dtype), g_value_samples, g_value_samples[-1:]],
+        [g_value_samples[:1], g_value_samples, g_value_samples[-1:]],
         axis=0,
     )
 
