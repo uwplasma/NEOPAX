@@ -612,6 +612,162 @@ def _forward_benchmark_replay_realized_accepted_final_y(
     return final_carry.y
 
 
+def _forward_benchmark_replay_realized_trace_final_y_and_tangent(
+    execution_context,
+    carry0,
+    carry0_dot,
+    trace,
+):
+    """Replay the frozen adaptive trace with explicit tangent updates.
+
+    Accepted attempts update both primal and tangent. Rejected attempts update
+    only frozen primal/controller bookkeeping; their tangent contribution is
+    exactly the incoming tangent.
+    """
+
+    active_mask = jax.lax.stop_gradient(trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
+
+    kernel_context = execution_context.kernel_context
+    physics_context = execution_context.physics_context
+    dtype = kernel_context.dtype
+
+    def _accepted_attempt(carry_value, xs):
+        (
+            _active,
+            _accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
+        carry_for_step = dataclasses.replace(carry_value, dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            kernel_context,
+            physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        project_flat = physics_context.project_flat
+        accepted_y = project_flat(attempt_result.trial_y) if project_flat is not None else attempt_result.trial_y
+        return dataclasses.replace(
+            attempt_result.carry_after_attempt,
+            t=carry_value.t + dt_value,
+            y=accepted_y,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(
+                attempt_result.err_norm,
+                jnp.asarray(1.0e-12, dtype=dtype),
+            ),
+            prev_stages=attempt_result.stage_history,
+            prev_dt=dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+            jacobian=attempt_result.jacobian_out,
+            cache_valid=attempt_result.cache_valid_out,
+            cache_dt=attempt_result.cache_dt_out,
+            cache_age=attempt_result.cache_age_out,
+            real_lu=attempt_result.real_lu_out,
+            real_piv=attempt_result.real_piv_out,
+            complex_lu=attempt_result.complex_lu_out,
+            complex_piv=attempt_result.complex_piv_out,
+            prev_theta_final=attempt_result.theta_final,
+            prev_newton_iter_count=attempt_result.newton_iter_count,
+        )
+
+    def _rejected_attempt(carry_value, xs):
+        (
+            _active,
+            _accepted,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
+        carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
+        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+            kernel_context,
+            physics_context,
+            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
+            execution_context.attempt_context,
+        )
+        return dataclasses.replace(
+            carry_value,
+            dt=next_dt_value,
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
+            lagged_response_valid=lagged_response_valid_value,
+            lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
+            jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
+            cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
+            cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
+            cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
+            real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
+            real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
+            complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
+            complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
+            prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
+            prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
+        )
+
+    def _scan_body(scan_state, xs):
+        carry, carry_dot = scan_state
+        active, accepted = xs[0], xs[1]
+
+        def _run_step(state_value):
+            carry_value, carry_dot_value = state_value
+
+            def _run_accepted(_):
+                return jax.jvp(
+                    lambda c: _accepted_attempt(c, xs),
+                    (carry_value,),
+                    (carry_dot_value,),
+                )
+
+            def _run_rejected(_):
+                return _rejected_attempt(carry_value, xs), carry_dot_value
+
+            return jax.lax.cond(
+                accepted,
+                _run_accepted,
+                _run_rejected,
+                operand=None,
+            )
+
+        next_state = jax.lax.cond(active, _run_step, lambda s: s, scan_state)
+        return next_state, None
+
+    (final_carry, final_carry_dot), _ = jax.lax.scan(
+        _scan_body,
+        (carry0, carry0_dot),
+        (
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ),
+    )
+    return final_carry.y, final_carry_dot.y
+
+
 @partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2))
 def _forward_benchmark_adaptive_final_y_realized_schedule(
     execution_context,
@@ -646,20 +802,13 @@ def _forward_benchmark_adaptive_final_y_realized_schedule_jvp(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    accepted_mask = jax.lax.stop_gradient(
-        jnp.logical_and(rollout.trace.active_mask, rollout.trace.accepted_mask)
+
+    _replay_primal_out, tangent_out = _forward_benchmark_replay_realized_trace_final_y_and_tangent(
+        execution_context,
+        carry0,
+        carry0_dot,
+        rollout.trace,
     )
-    accepted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-
-    def _replay(carry_value):
-        return _forward_benchmark_replay_realized_accepted_final_y(
-            execution_context,
-            carry_value,
-            accepted_mask,
-            accepted_dts,
-        )
-
-    _replay_primal_out, tangent_out = jax.jvp(_replay, (carry0,), (carry0_dot,))
     return rollout.final_carry.y, tangent_out
 
 
