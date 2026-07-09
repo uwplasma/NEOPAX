@@ -1612,6 +1612,43 @@ def _boozer_surface_indices_and_rho(static, rho_values):
     return surface_indices, sample_rho
 
 
+def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
+    """Return Boozer R(m=0,n=0) on requested rho values.
+
+    The frozen NTX path derives r00 from boozermn rmnc_b on VMEC half-mesh
+    support.  The realtime path must use the same Boozer convention rather
+    than full-grid VMEC Rcos[:, 0], otherwise NTX normalization factors see a
+    different major-radius profile from the geometry object.
+    """
+    rho_arr = jnp.asarray(rho_values, dtype=jnp.float64)
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_arr)
+    vmec_jax = _import_vmec_jax()
+    booz_api = _import_booz_xform_jax_api()
+    inputs = vmec_jax.booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    out = booz_api.booz_xform_from_inputs(
+        inputs=inputs,
+        constants=context.booz_constants,
+        grids=context.booz_grids,
+        surface_indices=surface_indices,
+        jit=True,
+    )
+    if "rmnc_b" not in out:
+        raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    if mode00 is None:
+        raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
+    rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
+    return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
+
+
 def _build_neopax_geometry_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1923,12 +1960,9 @@ def build_ntx_exact_lij_support_from_vmec_state(
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
-    s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
-    r00_interp = interpax.Interpolator1D(
-        jnp.sqrt(jnp.maximum(s_full, 0.0)),
-        jnp.asarray(state.Rcos, dtype=jnp.float64)[:, 0],
-        extrap=True,
-    )
+    r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
+    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
+    r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
     center_surfaces = _surfaces_from_vmec_jax_state(

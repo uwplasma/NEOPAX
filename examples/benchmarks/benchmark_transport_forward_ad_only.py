@@ -19,10 +19,13 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     ALLOWED_PARAMETERS,
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
-    _adaptive_rollout_objectives_realized_schedule_only_for_parameter,
+    _adaptive_rollout_objectives_realized_schedule_only_for_parameter as _forward_fd_lane_realized_schedule_objectives,
     _baseline_profile_cfg,
     _objective_vector,
     _prepare_benchmark_config,
+)
+from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
+    _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
@@ -216,16 +219,27 @@ def main() -> None:
         profile_cfg = _baseline_profile_cfg(config)
         baseline_value = float(profile_cfg[args.parameter])
 
-        objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
-            p,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=args.parameter,
-            accepted_step_limit_override=args.accepted_step_limit,
-            derivative_mode="jvp_step" if args.forward_ad_fusion_mode == "step" else "jvp",
-        )
+        if args.forward_ad_fusion_mode == "replay":
+            objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(  # noqa: E731
+                p,
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                accepted_step_limit_override=args.accepted_step_limit,
+            )
+        else:
+            objective_fn = lambda p: _forward_fd_lane_realized_schedule_objectives(  # noqa: E731
+                p,
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                accepted_step_limit_override=args.accepted_step_limit,
+                derivative_mode="jvp_step",
+            )
     else:
         if args.forward_ad_fusion_mode != "replay":
             raise ValueError(
