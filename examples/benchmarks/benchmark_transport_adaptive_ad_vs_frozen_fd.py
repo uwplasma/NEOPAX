@@ -76,6 +76,16 @@ def _scalar_objectives_finite(values) -> bool:
     return bool(np.all(np.isfinite(arr)))
 
 
+def _trace_diagnostics(trace) -> dict[str, Any]:
+    accepted_mask = np.asarray(jax.device_get(trace.accepted_mask), dtype=bool)
+    active_mask = np.asarray(jax.device_get(trace.active_mask), dtype=bool)
+    active_accepted = np.logical_and(active_mask, accepted_mask)
+    return {
+        "attempt_count": int(np.sum(active_mask)),
+        "accepted_count": int(np.sum(active_accepted)),
+    }
+
+
 def _ad_lane_local_nan_diagnostics(
     *,
     baseline_value: float,
@@ -159,12 +169,19 @@ def _print_summary(report: dict[str, Any]) -> None:
     diag = report["rollout_path"].get("baseline")
     if diag is not None:
         print(
-            f"[autodiff-gate] rollout baseline: "
+            f"[autodiff-gate] rollout source baseline: "
             f"attempt_count={diag.get('attempt_count')} "
             f"accepted_count={diag.get('accepted_count')} "
             f"completed={diag.get('completed')} "
             f"failed={diag.get('failed')} "
             f"fail_code={diag.get('fail_code')}"
+        )
+    replay_trace_diag = report["rollout_path"].get("replay_trace")
+    if replay_trace_diag is not None:
+        print(
+            "[autodiff-gate] frozen replay trace: "
+            f"attempt_count={replay_trace_diag.get('attempt_count')} "
+            f"accepted_count={replay_trace_diag.get('accepted_count')}"
         )
     grad_ad = report.get("gradient_autodiff")
     grad_fd = report.get("gradient_fd")
@@ -191,6 +208,21 @@ def _print_summary(report: dict[str, Any]) -> None:
             print(f"  - {label}: fd={float(fd):.6e}")
     frozen_diag = report.get("frozen_replay", {})
     if frozen_diag:
+        baseline_attempt = frozen_diag.get("baseline_attempt", {})
+        if baseline_attempt:
+            print(
+                "[autodiff-gate] frozen replay baseline: "
+                f"objectives_finite={baseline_attempt.get('objectives_finite')} "
+                f"final_state_finite={baseline_attempt.get('final_state_finite')} "
+                f"final_carry_finite={baseline_attempt.get('final_carry_finite')} "
+                f"completed={baseline_attempt.get('completed')} failed={baseline_attempt.get('failed')} "
+                f"fail_code={baseline_attempt.get('fail_code')}"
+            )
+            baseline_values = frozen_diag.get("baseline_objectives")
+            if baseline_values is not None:
+                print("[autodiff-gate] frozen replay baseline objectives:")
+                for label, value in zip(report["objective_labels"], baseline_values):
+                    print(f"  - {label}: value={float(value):.16e}")
         baseline_fixed = frozen_diag.get("baseline_fixed_dt", {})
         if baseline_fixed:
             print(
@@ -518,6 +550,8 @@ def main() -> None:
 
     objectives_minus = None
     objectives_plus = None
+    baseline_replay_objectives = None
+    baseline_replay = None
     minus_replay = None
     plus_replay = None
     baseline_fixed_dt_replay = None
@@ -526,6 +560,17 @@ def main() -> None:
     minus_nonfinite_debug = None
     plus_nonfinite_debug = None
     if args.run_mode in ("both", "fd"):
+        print(f"[autodiff-gate] progress: running frozen baseline replay ({args.replay_mode})", flush=True)
+        baseline_replay_objectives, baseline_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
+            jnp.asarray(baseline_value),
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=args.parameter,
+            frozen_trace=replay_trace,
+            replay_mode=args.replay_mode,
+        )
         if str(args.replay_mode).strip().lower() == "accepted":
             accepted_time_list = _accepted_time_list_from_trace(replay_trace)
             baseline_fixed_dt_objectives, baseline_fixed_dt_replay = _adaptive_rollout_objectives_for_parameter_on_time_list(
@@ -631,10 +676,17 @@ def main() -> None:
         "passed": passed,
         "rollout_path": {
             "baseline": baseline_diag,
+            "replay_trace": None if replay_trace is None else _trace_diagnostics(replay_trace),
             "frozen_fd_minus_state_finite": None if minus_replay is None else _tree_all_finite(minus_replay["final_state"]),
             "frozen_fd_plus_state_finite": None if plus_replay is None else _tree_all_finite(plus_replay["final_state"]),
         },
         "frozen_replay": None if minus_replay is None or plus_replay is None else {
+            "baseline_objectives": None if baseline_replay_objectives is None else _to_float_list(baseline_replay_objectives),
+            "baseline_attempt": (
+                {}
+                if baseline_replay is None
+                else _replay_diagnostics(baseline_replay, baseline_replay_objectives)
+            ),
             "baseline_fixed_dt": (
                 {}
                 if baseline_fixed_dt_replay is None
