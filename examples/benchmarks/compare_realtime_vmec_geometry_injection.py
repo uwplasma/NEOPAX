@@ -19,10 +19,15 @@ from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
+from netCDF4 import Dataset
 
 from NEOPAX._geometry_autodiff import (
     _build_neopax_geometry_from_state,
+    _find_boozer_mode_index,
+    _import_booz_xform_jax_api,
+    _import_vmec_jax,
     _solve_state_for_single_param,
+    _surface_indices_for_s_values,
     build_geometry_autodiff_context,
     build_ntx_exact_lij_support_from_vmec_state,
 )
@@ -161,6 +166,13 @@ def _resolve_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     return config_path, config
 
 
+def _resolve_input_path(config: dict[str, Any], value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (Path(config["_config_dir"]) / path).resolve()
+
+
 def _build_realtime_state_and_geometry(config: dict[str, Any]):
     geom_cfg = dict(config.get("geometry", {}))
     context = build_geometry_autodiff_context(
@@ -187,6 +199,107 @@ def _build_realtime_state_and_geometry(config: dict[str, Any]):
         n_r=int(geom_cfg.get("n_radial", 51)),
     )
     return context, state, geometry
+
+
+def _safe_mode_column(array: np.ndarray, ixm_b: np.ndarray, ixn_b: np.ndarray, *, m: int, n: int):
+    mode = _find_boozer_mode_index(jnp.asarray(ixm_b), jnp.asarray(ixn_b), m_value=m, n_value=n)
+    if mode is None:
+        return None
+    return np.asarray(array[:, int(mode)], dtype=float)
+
+
+def _optional_stats(lhs: Any, rhs: Any) -> dict[str, Any]:
+    if lhs is None or rhs is None:
+        return {
+            "shape_frozen": None if lhs is None else list(np.asarray(lhs).reshape(-1).shape),
+            "shape_realtime": None if rhs is None else list(np.asarray(rhs).reshape(-1).shape),
+            "max_abs": None,
+            "rel_l2": None,
+            "status": "missing",
+        }
+    return _stats(lhs, rhs)
+
+
+def _raw_boozer_mode_rows(
+    frozen_config: dict[str, Any],
+    realtime_config: dict[str, Any],
+    realtime_context,
+    realtime_state,
+) -> dict[str, dict[str, Any]]:
+    frozen_geometry_cfg = frozen_config["geometry"]
+    frozen_vmec_path = _resolve_input_path(frozen_config, frozen_geometry_cfg["vmec_file"])
+    frozen_boozer_path = _resolve_input_path(frozen_config, frozen_geometry_cfg["boozer_file"])
+    with Dataset(frozen_vmec_path, mode="r") as vfile, Dataset(frozen_boozer_path, mode="r") as bfile:
+        ns = int(np.asarray(vfile.variables["ns"][:]).reshape(()))
+        frozen_s_half = np.asarray([(i - 0.5) / (ns - 1) for i in range(ns)], dtype=float)
+        frozen_s_half[0] = 0.0
+        frozen_rho_support = np.sqrt(frozen_s_half)[1:]
+        frozen_bmnc_b = np.asarray(bfile.variables["bmnc_b"][:].filled(), dtype=float)
+        frozen_gmnc_b = np.asarray(bfile.variables["gmn_b"][:].filled(), dtype=float)
+        frozen_ixm_b = np.asarray(bfile.variables["ixm_b"][:].filled(), dtype=int)
+        frozen_ixn_b = np.asarray(bfile.variables["ixn_b"][:].filled(), dtype=int)
+        frozen_buco_b = np.asarray(bfile.variables["buco_b"][:].filled(), dtype=float)[1:]
+        frozen_bvco_b = np.asarray(bfile.variables["bvco_b"][:].filled(), dtype=float)[1:]
+        frozen_iota = np.asarray(vfile.variables["iotas"][:].filled(), dtype=float)[1:]
+
+    geom_cfg = dict(realtime_config.get("geometry", {}))
+    n_r = int(geom_cfg.get("n_radial", 51))
+    rho_grid = jnp.linspace(0.0, 1.0, n_r)
+    rho_grid_half = jnp.concatenate(
+        [
+            jnp.array([0.0], dtype=rho_grid.dtype),
+            0.5 * (rho_grid[:-1] + rho_grid[1:]),
+            jnp.array([1.0], dtype=rho_grid.dtype),
+        ]
+    )
+    sample_rho = rho_grid_half[1:-1]
+    surface_indices = _surface_indices_for_s_values(
+        realtime_context.static,
+        tuple(float(rho_value**2) for rho_value in sample_rho),
+    )
+    vmec_jax = _import_vmec_jax()
+    booz_api = _import_booz_xform_jax_api()
+    inputs = vmec_jax.booz_xform_inputs_from_state(
+        state=realtime_state,
+        static=realtime_context.static,
+        indata=realtime_context.indata,
+        signgs=realtime_context.signgs,
+        flux=realtime_context.flux,
+    )
+    out = booz_api.booz_xform_from_inputs(
+        inputs=inputs,
+        constants=realtime_context.booz_constants,
+        grids=realtime_context.booz_grids,
+        surface_indices=surface_indices,
+        jit=True,
+    )
+    realtime_bmnc_b = np.asarray(jnp.asarray(out["bmnc_b"]), dtype=float)
+    realtime_gmnc_b = np.asarray(jnp.asarray(out["gmnc_b"]), dtype=float)
+    realtime_ixm_b = np.asarray(jnp.asarray(out["ixm_b"]), dtype=int)
+    realtime_ixn_b = np.asarray(jnp.asarray(out["ixn_b"]), dtype=int)
+    realtime_buco_b = np.asarray(jnp.asarray(out["buco_b"]), dtype=float)
+    realtime_bvco_b = np.asarray(jnp.asarray(out["bvco_b"]), dtype=float)
+    realtime_iota = np.asarray(jnp.asarray(out["iota_b"]), dtype=float)
+
+    frozen_b00 = _safe_mode_column(frozen_bmnc_b, frozen_ixm_b, frozen_ixn_b, m=0, n=0)
+    realtime_b00 = _safe_mode_column(realtime_bmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
+    frozen_b10 = _safe_mode_column(frozen_bmnc_b, frozen_ixm_b, frozen_ixn_b, m=1, n=0)
+    realtime_b10 = _safe_mode_column(realtime_bmnc_b, realtime_ixm_b, realtime_ixn_b, m=1, n=0)
+    frozen_g00 = _safe_mode_column(frozen_gmnc_b, frozen_ixm_b, frozen_ixn_b, m=0, n=0)
+    realtime_g00 = _safe_mode_column(realtime_gmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
+
+    rows = {
+        "raw_b00": _optional_stats(frozen_b00, realtime_b00),
+        "raw_gmn00": _optional_stats(frozen_g00, realtime_g00),
+        "raw_buco": _stats(frozen_buco_b, realtime_buco_b),
+        "raw_bvco": _stats(frozen_bvco_b, realtime_bvco_b),
+        "raw_iota": _stats(frozen_iota, realtime_iota),
+        "boozer_support_rho": _stats(frozen_rho_support, np.asarray(sample_rho)),
+    }
+    if frozen_b10 is not None and realtime_b10 is not None:
+        rows["raw_b10"] = _stats(frozen_b10, realtime_b10)
+        rows["raw_b10_over_b00"] = _stats(frozen_b10 / frozen_b00, realtime_b10 / realtime_b00)
+    return rows
 
 
 def _build_supports(frozen_config: dict[str, Any], realtime_config: dict[str, Any], frozen_geometry, realtime_context, realtime_state, realtime_geometry):
@@ -227,6 +340,11 @@ def main() -> None:
     parser.add_argument("--realtime-config", default=DEFAULT_REALTIME_CONFIG)
     parser.add_argument("--top", type=int, default=12, help="Rows to print per section.")
     parser.add_argument("--json-output", type=str, default=None, help="Optional compact JSON report path.")
+    parser.add_argument(
+        "--raw-boozer-diagnostics",
+        action="store_true",
+        help="Also compare raw frozen boozermn modes against raw realtime booz_xform_jax modes.",
+    )
     args = parser.parse_args()
 
     frozen_path, frozen_config = _resolve_config(args.frozen_config)
@@ -257,10 +375,20 @@ def main() -> None:
         field: _stats(getattr(frozen_support.face_channels, field), getattr(realtime_support.face_channels, field))
         for field in CHANNEL_FIELDS
     }
+    raw_boozer_rows = None
+    if args.raw_boozer_diagnostics:
+        raw_boozer_rows = _raw_boozer_mode_rows(
+            frozen_config,
+            realtime_config,
+            realtime_context,
+            realtime_state,
+        )
 
     _print_section("geometry frozen vs realtime", geometry_rows, top=int(args.top))
     _print_section("NTX center channels frozen vs realtime", center_rows, top=int(args.top))
     _print_section("NTX face channels frozen vs realtime", face_rows, top=int(args.top))
+    if raw_boozer_rows is not None:
+        _print_section("raw Boozer modes frozen vs realtime", raw_boozer_rows, top=int(args.top))
 
     if args.json_output:
         out_path = Path(args.json_output)
@@ -271,6 +399,7 @@ def main() -> None:
             "geometry": geometry_rows,
             "ntx_center_channels": center_rows,
             "ntx_face_channels": face_rows,
+            "raw_boozer_modes": raw_boozer_rows,
         }
         out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         print(f"\n[compare] wrote {out_path}")
