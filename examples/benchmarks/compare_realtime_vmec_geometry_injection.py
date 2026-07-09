@@ -226,11 +226,35 @@ def _optional_stats(lhs: Any, rhs: Any) -> dict[str, Any]:
     return _stats(lhs, rhs)
 
 
+def _interp_linear_extrap(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    """One-dimensional linear interpolation with endpoint-slope extrapolation."""
+
+    x = np.asarray(x, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    x_new = np.asarray(x_new, dtype=float)
+    if x.size != y.size:
+        raise ValueError("x and y must have matching lengths.")
+    if x.size < 2:
+        return np.full_like(x_new, y[0] if y.size else np.nan, dtype=float)
+    out = np.interp(x_new, x, y)
+    left = x_new < x[0]
+    if np.any(left):
+        slope_left = (y[1] - y[0]) / (x[1] - x[0])
+        out[left] = y[0] + slope_left * (x_new[left] - x[0])
+    right = x_new > x[-1]
+    if np.any(right):
+        slope_right = (y[-1] - y[-2]) / (x[-1] - x[-2])
+        out[right] = y[-1] + slope_right * (x_new[right] - x[-1])
+    return out
+
+
 def _raw_boozer_mode_rows(
     frozen_config: dict[str, Any],
     realtime_config: dict[str, Any],
     realtime_context,
     realtime_state,
+    frozen_geometry,
+    realtime_geometry,
 ) -> dict[str, dict[str, Any]]:
     frozen_geometry_cfg = frozen_config["geometry"]
     frozen_vmec_path = _resolve_input_path(frozen_config, frozen_geometry_cfg["vmec_file"])
@@ -318,7 +342,12 @@ def _raw_boozer_mode_rows(
     def _interp_frozen_to_realtime(values):
         if values is None:
             return None
-        return np.interp(realtime_rho_support, frozen_rho_support, np.asarray(values, dtype=float))
+        return _interp_linear_extrap(frozen_rho_support, np.asarray(values, dtype=float), realtime_rho_support)
+
+    def _interp_to_target(support, values, target):
+        if values is None:
+            return None
+        return _interp_linear_extrap(np.asarray(support, dtype=float), np.asarray(values, dtype=float), np.asarray(target, dtype=float))
 
     frozen_b00_at_realtime = _interp_frozen_to_realtime(frozen_b00)
     frozen_b10_at_realtime = _interp_frozen_to_realtime(frozen_b10)
@@ -347,6 +376,19 @@ def _raw_boozer_mode_rows(
             "status": "support-shape-mismatch",
         },
     }
+    if frozen_b00 is not None and realtime_b00 is not None:
+        frozen_r_target = np.asarray(frozen_geometry.r_grid, dtype=float) / float(frozen_geometry.a_b)
+        realtime_r_target = np.asarray(realtime_geometry.r_grid, dtype=float) / float(realtime_geometry.a_b)
+        frozen_rho_target = np.asarray(frozen_geometry.rho_grid, dtype=float)
+        realtime_rho_target = np.asarray(realtime_geometry.rho_grid, dtype=float)
+        rows["raw_b00_on_r_grid_target"] = _stats(
+            _interp_to_target(frozen_rho_support, frozen_b00, frozen_r_target),
+            _interp_to_target(realtime_rho_support, realtime_b00, realtime_r_target),
+        )
+        rows["raw_b00_on_rho_grid_target"] = _stats(
+            _interp_to_target(frozen_rho_support, frozen_b00, frozen_rho_target),
+            _interp_to_target(realtime_rho_support, realtime_b00, realtime_rho_target),
+        )
     if frozen_b10_at_realtime is not None and realtime_b10 is not None:
         rows["raw_b10_interp_to_realtime"] = _stats(frozen_b10_at_realtime, realtime_b10)
     if (
@@ -442,6 +484,8 @@ def main() -> None:
             realtime_config,
             realtime_context,
             realtime_state,
+            frozen_geometry,
+            realtime_geometry,
         )
 
     _print_section("geometry frozen vs realtime", geometry_rows, top=int(args.top))
