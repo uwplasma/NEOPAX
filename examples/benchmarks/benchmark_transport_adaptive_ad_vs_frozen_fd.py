@@ -143,7 +143,9 @@ def _print_summary(report: dict[str, Any]) -> None:
         f"parameter={report['parameter_name']} "
         f"baseline_value={report['baseline_value']:.6e} "
         f"fd_step={report['fd_step']:.6e} "
-        f"replay_mode={report['replay_mode']}"
+        f"replay_mode={report['replay_mode']} "
+        f"fd_replay_lane={report.get('fd_replay_lane')} "
+        f"radau_jacobian_reuse_mode={report.get('radau_jacobian_reuse_mode')}"
     )
     solver_settings = report.get("solver_settings")
     if solver_settings is not None:
@@ -361,6 +363,12 @@ def main() -> None:
         help="NTX exact-runtime derivative mode. Use direct for this forward-mode benchmark.",
     )
     parser.add_argument(
+        "--radau-jacobian-reuse-mode",
+        type=str,
+        default=None,
+        help="Optional Radau Jacobian reuse mode override, e.g. legacy or retry_only.",
+    )
+    parser.add_argument(
         "--adaptive-derivative-mode",
         default="jvp",
         choices=("jvp", "vjp"),
@@ -402,6 +410,7 @@ def main() -> None:
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     runtime, baseline_state = build_runtime_context(config)
     profile_cfg = _baseline_profile_cfg(config)
@@ -661,6 +670,7 @@ def main() -> None:
         "run_mode": str(args.run_mode),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "solver_settings": {
             "backend": solver_cfg.get("transport_solver_backend"),
             "integrator": solver_cfg.get("integrator"),
