@@ -1705,20 +1705,10 @@ def _build_neopax_geometry_from_state(
         surface_indices=surface_indices,
         jit=True,
     )
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
-    from ntx._neopax_vmec_jax_boozer import _booz_xform_gmnc_from_inputs
-
     bmnc_b = jnp.asarray(out["bmnc_b"])
-    gmnc_b_full = _booz_xform_gmnc_from_inputs(
-        inputs=inputs,
-        mboz=int(context.mboz),
-        nboz=int(context.nboz),
-        asym=bool(context.static.cfg.lasym),
-    )
-    gmnc_b = jnp.take(jnp.asarray(gmnc_b_full), surface_indices, axis=0)
+    if "gmnc_b" not in out:
+        raise ValueError("booz_xform_from_inputs output is missing gmnc_b.")
+    gmnc_b = jnp.asarray(out["gmnc_b"])
     ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
     ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
     mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
