@@ -293,18 +293,50 @@ def _raw_boozer_mode_rows(
     realtime_b10 = _safe_mode_column(realtime_bmnc_b, realtime_ixm_b, realtime_ixn_b, m=1, n=0)
     frozen_g00 = _safe_mode_column(frozen_gmnc_b, frozen_ixm_b, frozen_ixn_b, m=0, n=0)
     realtime_g00 = _safe_mode_column(realtime_gmnc_b, realtime_ixm_b, realtime_ixn_b, m=0, n=0)
+    realtime_rho_support = np.asarray(sample_rho, dtype=float)
+
+    def _interp_frozen_to_realtime(values):
+        if values is None:
+            return None
+        return np.interp(realtime_rho_support, frozen_rho_support, np.asarray(values, dtype=float))
+
+    frozen_b00_at_realtime = _interp_frozen_to_realtime(frozen_b00)
+    frozen_b10_at_realtime = _interp_frozen_to_realtime(frozen_b10)
+    frozen_g00_at_realtime = _interp_frozen_to_realtime(frozen_g00)
+    frozen_buco_at_realtime = _interp_frozen_to_realtime(frozen_buco_b)
+    frozen_bvco_at_realtime = _interp_frozen_to_realtime(frozen_bvco_b)
+    frozen_iota_at_realtime = _interp_frozen_to_realtime(frozen_iota)
 
     rows = {
-        "raw_b00": _optional_stats(frozen_b00, realtime_b00),
-        "raw_gmn00": _optional_stats(frozen_g00, realtime_g00),
-        "raw_buco": _stats(frozen_buco_b, realtime_buco_b),
-        "raw_bvco": _stats(frozen_bvco_b, realtime_bvco_b),
-        "raw_iota": _stats(frozen_iota, realtime_iota),
-        "boozer_support_rho": _stats(frozen_rho_support, np.asarray(sample_rho)),
+        "raw_b00_interp_to_realtime": _optional_stats(frozen_b00_at_realtime, realtime_b00),
+        "raw_gmn00_interp_to_realtime": _optional_stats(frozen_g00_at_realtime, realtime_g00),
+        "raw_buco_interp_to_realtime": _stats(frozen_buco_at_realtime, realtime_buco_b),
+        "raw_bvco_interp_to_realtime": _stats(frozen_bvco_at_realtime, realtime_bvco_b),
+        "raw_iota_interp_to_realtime": _stats(frozen_iota_at_realtime, realtime_iota),
+        "boozer_support_rho_file_vs_realtime": {
+            "shape_frozen": list(np.asarray(frozen_rho_support).reshape(-1).shape),
+            "shape_realtime": list(realtime_rho_support.reshape(-1).shape),
+            "frozen_first": float(frozen_rho_support[0]) if frozen_rho_support.size else None,
+            "realtime_first": float(realtime_rho_support[0]) if realtime_rho_support.size else None,
+            "frozen_last": float(frozen_rho_support[-1]) if frozen_rho_support.size else None,
+            "realtime_last": float(realtime_rho_support[-1]) if realtime_rho_support.size else None,
+            "max_abs": None,
+            "rel_l2": None,
+            "status": "support-shape-mismatch",
+        },
     }
-    if frozen_b10 is not None and realtime_b10 is not None:
-        rows["raw_b10"] = _stats(frozen_b10, realtime_b10)
-        rows["raw_b10_over_b00"] = _stats(frozen_b10 / frozen_b00, realtime_b10 / realtime_b00)
+    if frozen_b10_at_realtime is not None and realtime_b10 is not None:
+        rows["raw_b10_interp_to_realtime"] = _stats(frozen_b10_at_realtime, realtime_b10)
+    if (
+        frozen_b10_at_realtime is not None
+        and frozen_b00_at_realtime is not None
+        and realtime_b10 is not None
+        and realtime_b00 is not None
+    ):
+        rows["raw_b10_over_b00_interp_to_realtime"] = _stats(
+            frozen_b10_at_realtime / frozen_b00_at_realtime,
+            realtime_b10 / realtime_b00,
+        )
     return rows
 
 
