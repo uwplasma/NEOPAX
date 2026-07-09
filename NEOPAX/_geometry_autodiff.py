@@ -1714,7 +1714,7 @@ def _build_neopax_geometry_from_state(
     # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
     # half-mesh points at the axis and edge so extrapolated quantities such as
     # B0(r_grid) use a frozen-like local slope.
-    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_count = min(32, max(int(rho_half.shape[0]) - 1, 0))
     edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
     requested_sample_rho = jnp.unique(
         jnp.concatenate(
