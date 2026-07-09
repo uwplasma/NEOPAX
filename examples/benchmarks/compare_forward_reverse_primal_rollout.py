@@ -123,6 +123,8 @@ def main() -> None:
         parameter_name=PARAMETER_ORDER[0],
         accepted_step_limit_override=args.accepted_step_limit,
     )
+    fused_forward_plain_objectives = fused_forward_objective_fn(baseline_values[0])
+    fused_forward_plain_objectives = jax.block_until_ready(fused_forward_plain_objectives)
     fused_forward_objectives, fused_forward_tangents = jax.jvp(
         fused_forward_objective_fn,
         (baseline_values[0],),
@@ -174,6 +176,7 @@ def main() -> None:
     rows_plain = _objective_stats(forward_objectives, reverse_objectives_plain)
     rows_fused_vjp = _objective_stats(fused_forward_objectives, reverse_objectives_vjp)
     rows_fused_plain = _objective_stats(fused_forward_objectives, reverse_objectives_plain)
+    rows_fused_plain_call = _objective_stats(fused_forward_plain_objectives, fused_forward_objectives)
     max_rel_vjp = max(row["relative_delta"] for row in rows_vjp)
     max_rel_plain = max(row["relative_delta"] for row in rows_plain)
     max_rel_fused_vjp = max(row["relative_delta"] for row in rows_fused_vjp)
@@ -203,6 +206,14 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
+    print("[compare] fused forward wrapper plain-call primal vs JVP primal")
+    for row in rows_fused_plain_call:
+        print(
+            f"  - {row['objective']}: plain_call={row['forward_primal']:.16e} "
+            f"jvp_primal={row['reverse_primal']:.16e} "
+            f"delta={row['delta_reverse_minus_forward']:.6e} "
+            f"rel={row['relative_delta']:.6e}"
+        )
     print("[compare] fused forward custom-JVP primal vs reverse plain primal")
     for row in rows_fused_plain:
         print(
@@ -226,6 +237,7 @@ def main() -> None:
         "forward_vs_reverse_plain": rows_plain,
         "fused_forward_vs_reverse_vjp": rows_fused_vjp,
         "fused_forward_vs_reverse_plain": rows_fused_plain,
+        "fused_forward_plain_call_vs_jvp_primal": rows_fused_plain_call,
         "fused_forward_tangent_n0": np.asarray(jax.device_get(fused_forward_tangents), dtype=float).tolist(),
         "max_relative_delta_vjp": float(max_rel_vjp),
         "max_relative_delta_plain": float(max_rel_plain),
