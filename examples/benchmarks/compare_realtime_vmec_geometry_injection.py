@@ -150,8 +150,8 @@ def _build_realtime_state_and_geometry(config: dict[str, Any]):
     context = build_geometry_autodiff_context(
         geom_cfg.get("vmec_input_file"),
         param_family=str(geom_cfg.get("vmec_param_family", "RBC")),
-        m_index=int(geom_cfg.get("vmec_m_index", 0)),
-        n_index=int(geom_cfg.get("vmec_n_index", 0)),
+        param_m=int(geom_cfg.get("vmec_m_index", 0)),
+        param_n=int(geom_cfg.get("vmec_n_index", 0)),
         mboz=geom_cfg.get("mboz", geom_cfg.get("vmec_mboz")),
         nboz=geom_cfg.get("nboz", geom_cfg.get("vmec_nboz")),
     )
