@@ -1103,7 +1103,7 @@ def _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
     parameter_name: str,
     accepted_step_limit_override: int | None = None,
 ):
-    """Forward-owned scalar AD prepare helper using the prepared initial carry directly."""
+    """Forward-owned scalar AD prepare helper aligned with the realized-schedule lane."""
 
     state0 = _parameterized_initial_state(
         baseline_state=baseline_state,
@@ -1134,13 +1134,13 @@ def _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
-        solver=solver,
+    solve_vector_field = solve_vector_field_static
+    initial_carry = _initial_carry_from_state_with_static_setup(
         state=state0,
-        vector_field=solve_vector_field,
+        solver=solver,
+        solve_vector_field=solve_vector_field,
         species=runtime.species,
+        prepared_rollout_static=prepared_rollout_static,
     )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     stop_after_accepted_steps = (
@@ -1150,12 +1150,12 @@ def _forward_benchmark_prepare_realized_schedule_scalar_rollout_ad_lane(
     )
     return (
         execution_context,
-        prepared_rollout,
-        prepared_rollout.initial_carry,
+        prepared_rollout_static,
+        initial_carry,
         max_total_steps,
         stop_after_accepted_steps,
         solver,
-        solve_vector_field,
+        solve_vector_field_static,
     )
 
 
