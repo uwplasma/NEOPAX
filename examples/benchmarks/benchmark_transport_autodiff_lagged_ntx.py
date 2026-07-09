@@ -55,6 +55,7 @@ from NEOPAX._transport_solvers import (
     _make_radau_initial_step_state,
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
+    _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_apply_accepted_step_map,
