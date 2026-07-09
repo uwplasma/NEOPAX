@@ -1796,7 +1796,7 @@ def _build_neopax_geometry_from_state(
     g_interp = interpax.Interpolator1D(sample_rho, g_value_samples, extrap=True)
 
     b_00 = b0_interp(rho_grid)
-    b0 = b0_interp(r_grid)
+    b0 = b_00
     b_10 = _safe_divide(b10_interp(rho_grid), b_00).at[0].set(0.0)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
@@ -1806,7 +1806,9 @@ def _build_neopax_geometry_from_state(
     epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
     curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
     enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
-    b0prime = jax.vmap(jax.grad(lambda r: b0_interp(r)))(r_grid)
+    # b0_interp is tabulated against rho; B0prime follows the frozen geometry
+    # convention of dB0/dr, so convert dB00/drho by drho/dr = 1 / a_b.
+    b0prime = jax.vmap(jax.grad(lambda rho: b0_interp(rho)))(rho_grid) / a_b
     sqrtg00_value = sqrtg00_interp(rho_grid)
     bsqav = _safe_divide(g_value + iota * i_value, sqrtg00_value * jnp.maximum(jnp.square(b0), 1.0e-30))
     iota_safe = jnp.where(jnp.abs(iota) > 0.0, jnp.abs(iota), 1.0)

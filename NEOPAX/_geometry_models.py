@@ -142,8 +142,9 @@ class VmecBoozer(GeometryModelBase):
         self.epsilon_t = self.rho_grid*self.a_b/R00(self.rho_grid)
         B_00 = B00(self.rho_grid)
         self.B_10 = B10(self.rho_grid)/B_00
-        self.B0prime = jax.vmap(jax.grad(lambda r : B00(r)), in_axes=0)(self.r_grid)
-        self.B0 = B00(self.r_grid)
+        self.B0 = B_00
+        # B00 is tabulated against rho, while B0prime is used as dB0/dr.
+        self.B0prime = jax.vmap(jax.grad(lambda rho : B00(rho)), in_axes=0)(self.rho_grid) / self.a_b
         self.curvature = jnp.absolute(self.B_10)/self.epsilon_t
         self.curvature = self.curvature.at[0].set(0.0)
         self.enlogation = jnp.square(self.epsilon_t/self.B_10)
