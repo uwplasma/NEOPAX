@@ -1694,17 +1694,31 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
+    surface_indices = _surface_indices_for_s_values(
+        context.static,
+        tuple(float(rho_value**2) for rho_value in sample_rho),
+    )
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=context.booz_constants,
         grids=context.booz_grids,
-        surface_indices=_surface_indices_for_s_values(
-            context.static,
-            tuple(float(rho_value**2) for rho_value in sample_rho),
-        ),
+        surface_indices=surface_indices,
         jit=True,
     )
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    from ntx._neopax_vmec_jax_boozer import _booz_xform_gmnc_from_inputs
+
     bmnc_b = jnp.asarray(out["bmnc_b"])
+    gmnc_b_full = _booz_xform_gmnc_from_inputs(
+        inputs=inputs,
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        asym=bool(context.static.cfg.lasym),
+    )
+    gmnc_b = jnp.take(jnp.asarray(gmnc_b_full), surface_indices, axis=0)
     ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
     ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
     mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
@@ -1716,12 +1730,17 @@ def _build_neopax_geometry_from_state(
     i_value_samples = jnp.asarray(out["buco_b"])
     g_value_samples = jnp.asarray(out["bvco_b"])
     b0_samples = bmnc_b[:, mode00]
+    sqrtg00_samples = gmnc_b[:, mode00]
     if mode10 is None:
         b10_samples = jnp.zeros_like(b0_samples)
     else:
         b10_samples = _safe_divide(bmnc_b[:, mode10], b0_samples)
 
     b0_surface = jnp.concatenate([b0_samples[:1], b0_samples, b0_samples[-1:]], axis=0)
+    sqrtg00_surface = jnp.concatenate(
+        [sqrtg00_samples[:1], sqrtg00_samples, sqrtg00_samples[-1:]],
+        axis=0,
+    )
     b10_surface = jnp.concatenate(
         [jnp.zeros((1,), dtype=b10_samples.dtype), b10_samples, b10_samples[-1:]],
         axis=0,
@@ -1740,16 +1759,13 @@ def _build_neopax_geometry_from_state(
     )
 
     b0_interp = interpax.Interpolator1D(rho_grid, b0_surface, extrap=True)
+    sqrtg00_interp = interpax.Interpolator1D(rho_grid, sqrtg00_surface, extrap=True)
     b10_interp = interpax.Interpolator1D(rho_grid, b10_surface, extrap=True)
     iota_interp = interpax.Interpolator1D(rho_grid, iota_surface, extrap=True)
     i_interp = interpax.Interpolator1D(rho_grid, i_value_surface, extrap=True)
     g_interp = interpax.Interpolator1D(rho_grid, g_value_surface, extrap=True)
 
-    # Match the legacy file-backed VmecBoozer lane: B0 is evaluated with the
-    # minor-radius grid even though the Boozer profiles are rho-indexed there.
-    # Keeping this convention preserves solver parity while the frozen baseline
-    # remains unchanged.
-    b0 = b0_interp(r_grid)
+    b0 = b0_interp(rho_grid)
     b_10 = b10_interp(rho_grid)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
@@ -1758,7 +1774,7 @@ def _build_neopax_geometry_from_state(
     curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
     enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
     b0prime = jax.vmap(jax.grad(lambda r: b0_interp(r)))(r_grid)
-    sqrtg00_value = _safe_divide(g_value + iota * i_value, jnp.maximum(jnp.square(b0), 1.0e-30))
+    sqrtg00_value = sqrtg00_interp(rho_grid)
     bsqav = _safe_divide(g_value + iota * i_value, sqrtg00_value * jnp.maximum(jnp.square(b0), 1.0e-30))
     iota_safe = jnp.where(jnp.abs(iota) > 0.0, jnp.abs(iota), 1.0)
     g_ps = (
