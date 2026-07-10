@@ -2117,7 +2117,9 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     r_hat = float(aminor_p * r_n)
     dpsi_hat_dr_hat = float(2.0 * psi_a_hat * r_n / aminor_p)
     if dpsi_hat_dr_hat == 0.0:
-        raise ValueError("VMEC transport normalization produced dpsi_hat/dr_hat = 0")
+        # The frozen benchmark path also prepares an axis entry.  Match that
+        # axis-safe behavior while keeping the non-axis frozen-style sampling.
+        dpsi_hat_dr_hat = 1.0
     include = np.abs(b_interp / b0) >= 0.0
     include[0] = True
 
