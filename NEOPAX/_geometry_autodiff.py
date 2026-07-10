@@ -1924,6 +1924,62 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     )
 
 
+def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
+    from NEOPAX._transport_flux_models import NTXRuntimeScanChannels
+
+    rho_arr = jnp.asarray(rho, dtype=jnp.float64)
+    rho_grid = jnp.asarray(geometry.rho_grid, dtype=jnp.float64)
+
+    def _interp_geometry_field(name):
+        values = jnp.asarray(getattr(geometry, name), dtype=jnp.float64)
+        return interpax.Interpolator1D(rho_grid, values, extrap=True)(rho_arr)
+
+    a_b = jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    psia_value = float(jnp.asarray(psia))
+    r00_arr = jnp.asarray(r00, dtype=jnp.float64)
+    b00 = _interp_geometry_field("B0")
+    boozer_i = _interp_geometry_field("I_value")
+    boozer_g = _interp_geometry_field("G_value")
+    iota = _interp_geometry_field("iota")
+    drds = jnp.where(rho_arr > 0.0, a_b / (2.0 * rho_arr), 0.0)
+    dpsi_drtilde = rho_arr * a_b * b00
+    dr_tildedr = 2.0 * psia_value / (a_b**2 * b00)
+    dr_tildeds = dr_tildedr * drds
+    denom = boozer_g + iota * boozer_i
+    sqrt_pi = jnp.sqrt(jnp.pi)
+    fac_reference_to_sfincs_11 = 8.0 * denom * b00 * psia_value**2 / (sqrt_pi * boozer_g**2)
+    fac_reference_to_sfincs_31 = 4.0 * b00 * psia_value / (sqrt_pi * boozer_g)
+    fac_reference_to_sfincs_33 = -2.0 * b00 / (denom * sqrt_pi)
+    fac_sfincs_to_dkes_11 = 1.0 / (8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * sqrt_pi))
+    fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsi_drtilde / (boozer_g * sqrt_pi))
+    fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00 / (denom * sqrt_pi))
+    epsilon_t = rho_arr * a_b / r00_arr
+    fac_dkes_to_d11star = -(8.0 / jnp.pi) * iota * r00_arr
+    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
+    return NTXRuntimeScanChannels(
+        rho=rho_arr,
+        a_b=float(a_b),
+        psia=psia_value,
+        b00=b00,
+        r00=r00_arr,
+        boozer_i=boozer_i,
+        boozer_g=boozer_g,
+        iota=iota,
+        drds=drds,
+        dr_tildedr=dr_tildedr,
+        dr_tildeds=dr_tildeds,
+        fac_reference_to_sfincs_11=fac_reference_to_sfincs_11,
+        fac_reference_to_sfincs_31=fac_reference_to_sfincs_31,
+        fac_reference_to_sfincs_33=fac_reference_to_sfincs_33,
+        fac_sfincs_to_dkes_11=fac_sfincs_to_dkes_11,
+        fac_sfincs_to_dkes_31=fac_sfincs_to_dkes_31,
+        fac_sfincs_to_dkes_33=fac_sfincs_to_dkes_33,
+        fac_dkes_to_d11star=fac_dkes_to_d11star,
+        fac_dkes_to_d31star=fac_dkes_to_d31star,
+        fac_dkes_to_d33star=jnp.asarray(1.0, dtype=jnp.float64),
+    )
+
+
 def _ntx_surface_iota_targets(geometry, rho_values):
     rho_grid = jnp.asarray(geometry.rho_grid, dtype=jnp.float64)
     iota_grid = jnp.asarray(geometry.iota, dtype=jnp.float64)
@@ -2086,17 +2142,15 @@ def build_ntx_exact_lij_support_from_vmec_state(
     center_prepared = jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
     face_prepared = jax.tree_util.tree_map(_stack_optional, *face_prepared_tuple)
     return NTXExactLijRuntimeSupport(
-        center_channels=_build_ntx_runtime_channels_from_surfaces(
-            center_surfaces,
+        center_channels=_build_ntx_runtime_channels_from_geometry(
+            geometry,
             rho=rho_center,
-            a_b=geometry.a_b,
             psia=ntx_psia,
             r00=r00_center,
         ),
-        face_channels=_build_ntx_runtime_channels_from_surfaces(
-            face_surfaces,
+        face_channels=_build_ntx_runtime_channels_from_geometry(
+            geometry,
             rho=rho_face,
-            a_b=geometry.a_b,
             psia=ntx_psia,
             r00=r00_face,
         ),
