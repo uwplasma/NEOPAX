@@ -1969,3 +1969,142 @@ Expected next interpretation:
   primal values, the previous FD mismatch was a lane mismatch.
 - If they do not move, the remaining difference is a real frozen-trace FD
   sensitivity issue rather than a plain-vs-AD replay issue.
+
+## 2026-07-10: Realtime Geometry To AD State
+
+Current issue:
+
+- Frozen transport benchmark uses the VMEC WOUT file path for NTX surfaces:
+  `ntx_exact_surface_backend = "vmec"` in
+  `examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_benchmark.toml`.
+- That frozen path calls
+  `ntx.surface_from_vmec_jax_vmec_wout_file(vmec_file, s=rho**2)`.
+- Realtime geometry path currently builds a vmec_jax `WoutData` object through
+  `vmec_jax.wout.wout_minimal_from_fixed_boundary(...)`, then calls
+  `ntx.surface_from_vmec_jax_vmec_wout(wout, s=rho**2)`.
+- The public vmec_jax WOUT writer path is not a separate complete VMEC2000
+  writer: `write_wout_from_fixed_boundary_run(...)` routes through
+  `wout_from_fixed_boundary_run(...)`, which routes through
+  `wout_minimal_from_fixed_boundary(...)`.
+- Therefore, writing the realtime vmec_jax WOUT to NetCDF and reading it back
+  through NTX should test whether the mismatch is already present in the
+  vmec_jax reconstructed WOUT data, rather than being introduced by NEOPAX's
+  in-memory injection.
+
+Important guardrails:
+
+- Do not change NTX for this diagnostic.
+- Do not change reverse AD or forward AD profile baselines while debugging
+  realtime geometry injection.
+- The frozen VMEC-WOUT backend remains the historical profile-only transport
+  baseline until a deliberate backend migration is approved.
+
+New diagnostic added:
+
+```bash
+python ./examples/benchmarks/compare_realtime_vmec_initial_ambipolarity.py \
+  --json-output outputs/realtime_initial_ambipolarity_roundtrip_wout_compare.json \
+  --residual-curve-indices 0,29 \
+  --residual-curve-er-min -40 \
+  --residual-curve-er-max 25 \
+  --residual-curve-count 81 \
+  --raw-vmec-surface-diagnostics \
+  --roundtrip-realtime-wout-diagnostics \
+  --roundtrip-realtime-wout-output outputs/realtime_vmec_jax_minimal_wout_roundtrip.nc
+```
+
+What to inspect:
+
+- In the printed output and JSON, compare
+  `realtime_direct_vs_roundtrip` against `frozen_vs_realtime_roundtrip`.
+- If `realtime_direct_vs_roundtrip` is tiny while
+  `frozen_vs_realtime_roundtrip` remains at the same level as the raw
+  frozen-vs-realtime mismatch, then NEOPAX is not losing information during
+  in-memory injection; the mismatch is already in the vmec_jax reconstructed
+  WOUT fields.
+- If `realtime_direct_vs_roundtrip` is not tiny, then the issue is in WOUT
+  writing/reading conventions and should be debugged before transport tests.
+
+Known previous evidence before this roundtrip check:
+
+- Initial ambipolar Er mismatch was already visible before transport time
+  integration.
+- Pressure and density matched to near roundoff.
+- Raw NTX VMEC surface comparison showed the largest mismatch in
+  `b_sup_theta_cos` / contravariant magnetic-field coefficients.
+- This points to VMEC-WOUT Nyquist magnetic-field reconstruction, not to
+  profile values, transport stepping, or reverse AD.
+
+## 2026-07-10: Forward AD `exact` Mode Primal Correction
+
+Observed run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode exact
+```
+
+Before the latest patch, this still printed the wrong exact-mode primal
+objectives, for example:
+
+- `softmax_Er: value=2.0695082896894014e+01`
+- `smooth_root_proxy: value=9.0006241686889227e-03`
+- `Er2_volume_average: value=2.4368404307592147e+02`
+- `Er_volume_average: value=-3.4299625917040317e+00`
+
+These are the same wrong-primal signature seen earlier for the `exact` path.
+The expected reverse/FD realized-schedule primal for this 16-step case is
+closer to:
+
+- `softmax_Er ~= 2.069247668676e+01`
+- `smooth_root_proxy ~= 8.907308004081e-03`
+- `Er2_volume_average ~= 2.437187070410e+02`
+- `Er_volume_average ~= -3.430424752652e+00`
+
+Cause:
+
+- `--forward-ad-fusion-mode exact` does **not** dispatch to the standard
+  replay custom-JVP path.
+- It dispatches through
+  `_radau_adaptive_final_y_realized_schedule_exact_jvp(...)`.
+- Its custom-JVP rule called
+  `_radau_adaptive_final_y_realized_schedule_fused_jvp(...,
+  raw_attempt_jvp=True)` and returned that fused-loop primal output.
+- That fused-loop primal was not the trusted realized-schedule primal.
+
+Patch applied:
+
+- In `NEOPAX/_transport_solvers.py`,
+  `_radau_adaptive_final_y_realized_schedule_exact_jvp_rule(...)` now computes
+  `primal_rollout = _radau_adaptive_schedule_rollout(...)` and returns
+  `primal_rollout.final_carry.y` as `primal_out`.
+- The exact tangent is still produced by
+  `_radau_adaptive_final_y_realized_schedule_fused_jvp(...,
+  raw_attempt_jvp=True)`.
+- This is deliberately narrow: it fixes the `exact` mode printed objective
+  values first, without changing reverse AD or the standard forward-AD replay
+  lane.
+
+Next command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode exact
+```
+
+Expected interpretation:
+
+- If objective values move to the reverse/FD realized-schedule primal, the
+  `exact` mode primal-return bug is fixed.
+- If tangents still disagree, the remaining issue is isolated to the
+  raw-attempt exact tangent propagation, not to the primal rollout.
+- Do not change reverse AD for this; reverse already matched FD much better for
+  this 16-step profile case.

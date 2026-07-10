@@ -10435,7 +10435,13 @@ def _radau_adaptive_final_y_realized_schedule_exact_jvp_rule(
 ):
     (carry0,) = primals
     (carry0_dot,) = tangents
-    primal_out, tangent_out = _radau_adaptive_final_y_realized_schedule_fused_jvp(
+    primal_rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    _primal_out, tangent_out = _radau_adaptive_final_y_realized_schedule_fused_jvp(
         execution_context,
         carry0,
         carry0_dot,
@@ -10443,6 +10449,7 @@ def _radau_adaptive_final_y_realized_schedule_exact_jvp_rule(
         stop_after_accepted_steps=stop_after_accepted_steps,
         raw_attempt_jvp=True,
     )
+    primal_out = primal_rollout.final_carry.y
     return primal_out, tangent_out
 
 

@@ -79,8 +79,15 @@ def _stats(left, right) -> dict[str, Any]:
     }
 
 
-def _load_for_initial_ambipolarity(path: Path, *, initialize_er: bool = True):
+def _load_for_initial_ambipolarity(
+    path: Path,
+    *,
+    initialize_er: bool = True,
+    vmec_file_override: Path | None = None,
+):
     config = load_config(path)
+    if vmec_file_override is not None:
+        config.setdefault("geometry", {})["vmec_file"] = str(vmec_file_override)
     # Keep this diagnostic read-only with respect to benchmark plot outputs.
     amb_cfg = config.setdefault("ambipolarity", {})
     amb_cfg["er_ambipolar_plot"] = False
@@ -92,8 +99,12 @@ def _load_for_initial_ambipolarity(path: Path, *, initialize_er: bool = True):
     return config, runtime, state
 
 
-def _ambipolar_root_diagnostics(path: Path):
-    config, runtime, state = _load_for_initial_ambipolarity(path, initialize_er=False)
+def _ambipolar_root_diagnostics(path: Path, *, vmec_file_override: Path | None = None):
+    config, runtime, state = _load_for_initial_ambipolarity(
+        path,
+        initialize_er=False,
+        vmec_file_override=vmec_file_override,
+    )
     amb_cfg = dict(config.get("ambipolarity", {}))
     model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
     entropy_model_name = config.get("neoclassical", {}).get(
@@ -229,10 +240,15 @@ def _vmec_surface_rows(
     runtime,
     *,
     indices: list[int],
+    frozen_vmec_file: Path | None = None,
 ) -> dict[str, Any]:
     frozen_config = load_config(frozen_config_path)
     frozen_geometry_cfg = dict(frozen_config.get("geometry", {}))
-    frozen_vmec_path = _resolve_input_path(frozen_config_path, frozen_geometry_cfg["vmec_file"])
+    frozen_vmec_path = (
+        Path(frozen_vmec_file).expanduser().resolve()
+        if frozen_vmec_file is not None
+        else _resolve_input_path(frozen_config_path, frozen_geometry_cfg["vmec_file"])
+    )
     realtime_wout = _build_realtime_vmec_wout(realtime_config_path)
 
     import ntx
@@ -272,6 +288,89 @@ def _vmec_surface_rows(
             "rho": rho,
             "s": s_value,
             "fields": surface_rows,
+        }
+    return rows
+
+
+def _vmec_wout_roundtrip_surface_rows(
+    frozen_config_path: Path,
+    realtime_config_path: Path,
+    runtime,
+    *,
+    indices: list[int],
+    output_path: Path,
+    frozen_vmec_file: Path | None = None,
+) -> dict[str, Any]:
+    frozen_config = load_config(frozen_config_path)
+    frozen_geometry_cfg = dict(frozen_config.get("geometry", {}))
+    frozen_vmec_path = (
+        Path(frozen_vmec_file).expanduser().resolve()
+        if frozen_vmec_file is not None
+        else _resolve_input_path(frozen_config_path, frozen_geometry_cfg["vmec_file"])
+    )
+    realtime_wout = _build_realtime_vmec_wout(realtime_config_path)
+
+    from vmec_jax.wout import write_wout
+
+    output_path = Path(output_path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_wout(output_path, realtime_wout, overwrite=True)
+
+    import ntx
+
+    surface_from_file = getattr(ntx, "surface_from_vmec_jax_vmec_wout_file")
+    surface_from_wout = getattr(ntx, "surface_from_vmec_jax_vmec_wout")
+    rho_grid = np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float)
+    fields = (
+        "iota",
+        "b_cos",
+        "jacobian_cos",
+        "b_sub_theta_cos",
+        "b_sub_zeta_cos",
+        "b_sup_theta_cos",
+        "b_sup_zeta_cos",
+        "b0",
+        "psi_a_hat",
+        "phi_edge",
+        "aminor_p",
+    )
+    rows: dict[str, Any] = {"roundtrip_wout_path": str(output_path), "surfaces": {}}
+    for index in indices:
+        rho = float(rho_grid[int(index)])
+        s_value = float(rho * rho)
+        frozen_surface = surface_from_file(frozen_vmec_path, s=s_value)
+        realtime_direct_surface = surface_from_wout(
+            realtime_wout,
+            s=s_value,
+            source_path=getattr(realtime_wout, "path", frozen_vmec_path),
+        )
+        realtime_roundtrip_surface = surface_from_file(output_path, s=s_value)
+        field_rows = {}
+        for name in fields:
+            if not (
+                hasattr(frozen_surface, name)
+                and hasattr(realtime_direct_surface, name)
+                and hasattr(realtime_roundtrip_surface, name)
+            ):
+                continue
+            field_rows[name] = {
+                "frozen_vs_realtime_direct": _stats(
+                    getattr(frozen_surface, name),
+                    getattr(realtime_direct_surface, name),
+                ),
+                "frozen_vs_realtime_roundtrip": _stats(
+                    getattr(frozen_surface, name),
+                    getattr(realtime_roundtrip_surface, name),
+                ),
+                "realtime_direct_vs_roundtrip": _stats(
+                    getattr(realtime_direct_surface, name),
+                    getattr(realtime_roundtrip_surface, name),
+                ),
+            }
+        rows["surfaces"][str(index)] = {
+            "rho": rho,
+            "s": s_value,
+            "fields": field_rows,
         }
     return rows
 
@@ -593,6 +692,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frozen-config", default=str(DEFAULT_FROZEN_CONFIG))
     parser.add_argument("--realtime-config", default=str(DEFAULT_REALTIME_CONFIG))
+    parser.add_argument(
+        "--frozen-vmec-file",
+        default=None,
+        help=(
+            "Override the frozen config geometry.vmec_file for diagnostics. "
+            "Useful for comparing the realtime VMEC input against a specific "
+            "saved WOUT without creating a duplicate TOML."
+        ),
+    )
     parser.add_argument("--json-output", default=None)
     parser.add_argument("--top", type=int, default=12)
     parser.add_argument(
@@ -613,18 +721,44 @@ def main() -> None:
         action="store_true",
         help="Compare frozen and realtime NTX VMEC surface fields before NTX preparation.",
     )
+    parser.add_argument(
+        "--roundtrip-realtime-wout-diagnostics",
+        action="store_true",
+        help=(
+            "Write the realtime vmec_jax WOUT object to NetCDF and compare NTX surfaces from "
+            "that file against both frozen and in-memory realtime surfaces."
+        ),
+    )
+    parser.add_argument(
+        "--roundtrip-realtime-wout-output",
+        default="outputs/realtime_vmec_jax_minimal_wout_roundtrip.nc",
+        help="Output path for --roundtrip-realtime-wout-diagnostics.",
+    )
     args = parser.parse_args()
 
     frozen_path = Path(args.frozen_config).resolve()
     realtime_path = Path(args.realtime_config).resolve()
+    frozen_vmec_override = (
+        Path(args.frozen_vmec_file).expanduser().resolve()
+        if args.frozen_vmec_file is not None
+        else None
+    )
     print(f"[compare] frozen config:  {frozen_path}")
+    if frozen_vmec_override is not None:
+        print(f"[compare] frozen vmec override: {frozen_vmec_override}")
     print(f"[compare] realtime config:{realtime_path}")
     print("[compare] building frozen initial runtime/state")
-    _, frozen_runtime, frozen_state = _load_for_initial_ambipolarity(frozen_path)
+    _, frozen_runtime, frozen_state = _load_for_initial_ambipolarity(
+        frozen_path,
+        vmec_file_override=frozen_vmec_override,
+    )
     print("[compare] building realtime initial runtime/state")
     _, realtime_runtime, realtime_state = _load_for_initial_ambipolarity(realtime_path)
     print("[compare] solving frozen ambipolar root branches without transport")
-    frozen_roots = _ambipolar_root_diagnostics(frozen_path)
+    frozen_roots = _ambipolar_root_diagnostics(
+        frozen_path,
+        vmec_file_override=frozen_vmec_override,
+    )
     print("[compare] solving realtime ambipolar root branches without transport")
     realtime_roots = _ambipolar_root_diagnostics(realtime_path)
 
@@ -664,6 +798,7 @@ def main() -> None:
     flux_probe_rows = None
     ntx_support_rows = None
     raw_vmec_surface_rows = None
+    roundtrip_vmec_surface_rows = None
     residual_indices = _parse_index_list(args.residual_curve_indices)
     if residual_indices:
         er_grid = np.linspace(
@@ -733,6 +868,7 @@ def main() -> None:
                 realtime_path,
                 frozen_runtime,
                 indices=residual_indices,
+                frozen_vmec_file=frozen_vmec_override,
             )
             print("[compare] raw NTX VMEC surface fields frozen vs realtime")
             for index, group in raw_vmec_surface_rows.items():
@@ -749,9 +885,39 @@ def main() -> None:
                         f"left=[{row['left_min']:.6e}, {row['left_max']:.6e}] "
                         f"right=[{row['right_min']:.6e}, {row['right_max']:.6e}]"
                     )
+        if args.roundtrip_realtime_wout_diagnostics:
+            roundtrip_vmec_surface_rows = _vmec_wout_roundtrip_surface_rows(
+                frozen_path,
+                realtime_path,
+                frozen_runtime,
+                indices=residual_indices,
+                output_path=Path(args.roundtrip_realtime_wout_output),
+                frozen_vmec_file=frozen_vmec_override,
+            )
+            print(
+                "[compare] realtime vmec_jax WOUT roundtrip NTX surface check: "
+                f"wout={roundtrip_vmec_surface_rows['roundtrip_wout_path']}"
+            )
+            for index, group in roundtrip_vmec_surface_rows["surfaces"].items():
+                print(f"  - i={index}: rho={group['rho']:.6e} s={group['s']:.6e}")
+                sorted_rows = sorted(
+                    group["fields"].items(),
+                    key=lambda item: item[1]["frozen_vs_realtime_roundtrip"]["rel_l2"],
+                    reverse=True,
+                )
+                for name, row in sorted_rows[:12]:
+                    direct_vs_file = row["realtime_direct_vs_roundtrip"]
+                    frozen_vs_file = row["frozen_vs_realtime_roundtrip"]
+                    print(
+                        f"      {name}: frozen_vs_roundtrip rel_l2={frozen_vs_file['rel_l2']:.6e} "
+                        f"max_abs={frozen_vs_file['max_abs']:.6e}; "
+                        f"direct_vs_roundtrip rel_l2={direct_vs_file['rel_l2']:.6e} "
+                        f"max_abs={direct_vs_file['max_abs']:.6e}"
+                    )
 
     payload = {
         "frozen_config": str(frozen_path),
+        "frozen_vmec_file_override": str(frozen_vmec_override) if frozen_vmec_override is not None else None,
         "realtime_config": str(realtime_path),
         "initial_state": state_rows,
         "geometry": geometry_rows,
@@ -765,6 +931,8 @@ def main() -> None:
         payload["ntx_support_diagnostics"] = ntx_support_rows
     if raw_vmec_surface_rows is not None:
         payload["raw_vmec_surface_diagnostics"] = raw_vmec_surface_rows
+    if roundtrip_vmec_surface_rows is not None:
+        payload["roundtrip_realtime_wout_diagnostics"] = roundtrip_vmec_surface_rows
     if args.json_output:
         out = Path(args.json_output)
         out.parent.mkdir(parents=True, exist_ok=True)
