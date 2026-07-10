@@ -9705,7 +9705,40 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
             return replay_next, tangent_next
 
         def _keep_tangent(_):
-            return replay_carry, tangent_carry
+            def _zero_tangent_like(x):
+                arr = jnp.asarray(x)
+                if jnp.issubdtype(arr.dtype, jnp.inexact):
+                    return jnp.zeros_like(arr)
+                return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+            def _rejected_primal_cache_update(__):
+                rejected_replay_carry = _radau_carry_from_step_state(next_step_state)
+                rejected_tangent_carry = jax.tree_util.tree_map(
+                    _zero_tangent_like,
+                    rejected_replay_carry,
+                )
+                return rejected_replay_carry, dataclasses.replace(
+                    rejected_tangent_carry,
+                    y=tangent_carry.y,
+                    dt=jnp.zeros_like(tangent_carry.dt),
+                    prev_error=jnp.zeros_like(tangent_carry.prev_error),
+                    prev_dt=jnp.zeros_like(tangent_carry.prev_dt),
+                    lagged_reference_y=_radau_align_tangent_tree_to_primal(
+                        tangent_carry.lagged_reference_y,
+                        rejected_replay_carry.lagged_reference_y,
+                    ),
+                    lagged_response_cache=_radau_align_tangent_tree_to_primal(
+                        tangent_carry.lagged_response_cache,
+                        rejected_replay_carry.lagged_response_cache,
+                    ),
+                )
+
+            return jax.lax.cond(
+                active,
+                _rejected_primal_cache_update,
+                lambda _: (replay_carry, tangent_carry),
+                operand=None,
+            )
 
         replay_carry_next, tangent_carry_next = jax.lax.cond(
             accepted_active,
