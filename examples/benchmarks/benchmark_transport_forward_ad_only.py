@@ -189,6 +189,32 @@ def main() -> None:
         help="NTX exact-runtime derivative mode.",
     )
     parser.add_argument(
+        "--ntx-exact-derivative-field-pullback-mode",
+        default=None,
+        choices=("generic_jvp", "compact_vjp"),
+        help="Optional NTX derivative-field pullback mode, forwarded for parity with reverse benchmarks.",
+    )
+    parser.add_argument(
+        "--ntx-exact-derivative-pullback-boundary",
+        default=None,
+        choices=("inline", "per_energy_jit"),
+        help="Optional NTX compact-pullback boundary mode, forwarded for parity with reverse benchmarks.",
+    )
+    parser.add_argument(
+        "--ntx-exact-derivative-pullback-algebra",
+        default=None,
+        choices=(
+            "ntx_helper",
+            "scalar_contract",
+            "scalar_contract_lowdot",
+            "scalar_contract_lowdot_sequential",
+            "scalar_contract_lowdot_ntx",
+            "scalar_contract_lowdot_recompute",
+            "scalar_contract_matrix_free",
+        ),
+        help="Optional NTX compact-pullback algebra mode, forwarded for parity with reverse benchmarks.",
+    )
+    parser.add_argument(
         "--radau-jacobian-reuse-mode",
         type=str,
         default=None,
@@ -212,6 +238,9 @@ def main() -> None:
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
+        ntx_exact_derivative_pullback_boundary=args.ntx_exact_derivative_pullback_boundary,
+        ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     vmec_parameter = _parse_vmec_parameter(args.parameter)
@@ -287,6 +316,21 @@ def main() -> None:
         "baseline_value": baseline_value,
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": (
+            None
+            if args.ntx_exact_derivative_field_pullback_mode is None
+            else str(args.ntx_exact_derivative_field_pullback_mode)
+        ),
+        "ntx_exact_derivative_pullback_boundary": (
+            None
+            if args.ntx_exact_derivative_pullback_boundary is None
+            else str(args.ntx_exact_derivative_pullback_boundary)
+        ),
+        "ntx_exact_derivative_pullback_algebra": (
+            None
+            if args.ntx_exact_derivative_pullback_algebra is None
+            else str(args.ntx_exact_derivative_pullback_algebra)
+        ),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "forward_ad_fusion_mode": str(args.forward_ad_fusion_mode),
         "forward_ad_total_s": float(forward_ad_total_s),
