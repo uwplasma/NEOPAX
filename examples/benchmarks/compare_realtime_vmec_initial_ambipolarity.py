@@ -210,6 +210,154 @@ def _ambipolar_residual_curves(path: Path, *, indices: list[int], er_grid: np.nd
     return {str(index): _evaluate_for_index(index) for index in indices}
 
 
+def _local_flux_probes(path: Path, *, probes_by_index: dict[int, dict[str, float]]) -> dict[str, Any]:
+    _config, runtime, state = _load_for_initial_ambipolarity(path, initialize_er=False)
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+    if local_particle_flux is None:
+        raise ValueError("Flux model did not provide a local particle-flux evaluator.")
+
+    rows: dict[str, Any] = {}
+    for index, probes in probes_by_index.items():
+        index_value = jnp.asarray(index, dtype=jnp.int32)
+        probe_rows: dict[str, Any] = {}
+        for name, er_value in probes.items():
+            gamma = local_particle_flux(index_value, jnp.asarray(er_value, dtype=state.Er.dtype))
+            gamma_np = np.asarray(jax.device_get(gamma), dtype=float)
+            residual = float(jax.device_get(jnp.sum(charge_qp * gamma)))
+            entropy = float(jax.device_get(jnp.sum(jnp.abs(gamma))))
+            probe_rows[str(name)] = {
+                "Er": float(er_value),
+                "Gamma": gamma_np.tolist(),
+                "residual": residual,
+                "entropy": entropy,
+            }
+        rows[str(index)] = probe_rows
+    return rows
+
+
+def _flux_probe_rows(frozen: dict[str, Any], realtime: dict[str, Any]) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for index, frozen_index_rows in frozen.items():
+        realtime_index_rows = realtime[index]
+        probe_rows = {}
+        for probe_name, frozen_probe in frozen_index_rows.items():
+            realtime_probe = realtime_index_rows[probe_name]
+            frozen_gamma = np.asarray(frozen_probe["Gamma"], dtype=float)
+            realtime_gamma = np.asarray(realtime_probe["Gamma"], dtype=float)
+            gamma_delta = realtime_gamma - frozen_gamma
+            probe_rows[probe_name] = {
+                "Er": frozen_probe["Er"],
+                "frozen": frozen_probe,
+                "realtime": realtime_probe,
+                "gamma_delta": gamma_delta.tolist(),
+                "gamma_delta_linf": float(np.max(np.abs(gamma_delta))) if gamma_delta.size else float("nan"),
+                "residual_delta": float(realtime_probe["residual"] - frozen_probe["residual"]),
+                "entropy_delta": float(realtime_probe["entropy"] - frozen_probe["entropy"]),
+            }
+        rows[index] = probe_rows
+    return rows
+
+
+def _path_to_name(path_entry) -> str:
+    parts = []
+    for item in path_entry:
+        key = getattr(item, "key", None)
+        idx = getattr(item, "idx", None)
+        name = getattr(item, "name", None)
+        if key is not None:
+            parts.append(str(key))
+        elif idx is not None:
+            parts.append(str(idx))
+        elif name is not None:
+            parts.append(str(name))
+        else:
+            parts.append(str(item))
+    return ".".join(parts) if parts else "<root>"
+
+
+def _selected_array(arr, indices: list[int]):
+    arr_np = np.asarray(jax.device_get(arr), dtype=float)
+    if arr_np.ndim > 0 and arr_np.shape[0] > max(indices):
+        return arr_np[np.asarray(indices, dtype=int)]
+    return arr_np
+
+
+def _tree_selected_stats(left_tree, right_tree, *, indices: list[int], max_rows: int = 40) -> dict[str, Any]:
+    left_flat, left_def = jax.tree_util.tree_flatten_with_path(left_tree)
+    right_flat, right_def = jax.tree_util.tree_flatten_with_path(right_tree)
+    if left_def != right_def:
+        return {
+            "tree_structure_equal": False,
+            "worst": [],
+        }
+
+    rows = []
+    for (path_entry, left_leaf), (_right_path, right_leaf) in zip(left_flat, right_flat, strict=True):
+        if left_leaf is None or right_leaf is None:
+            continue
+        try:
+            left_np = _selected_array(left_leaf, indices)
+            right_np = _selected_array(right_leaf, indices)
+        except Exception:
+            continue
+        if left_np.shape != right_np.shape:
+            rows.append(
+                {
+                    "name": _path_to_name(path_entry),
+                    "shape": [list(left_np.shape), list(right_np.shape)],
+                    "rel_l2": float("inf"),
+                    "max_abs": float("inf"),
+                }
+            )
+            continue
+        diff = right_np - left_np
+        finite_diff = diff[np.isfinite(diff)]
+        denom = max(float(np.linalg.norm(np.nan_to_num(left_np, nan=0.0))), 1.0e-30)
+        rows.append(
+            {
+                "name": _path_to_name(path_entry),
+                "shape": list(left_np.shape),
+                "rel_l2": float(np.linalg.norm(np.nan_to_num(diff, nan=0.0)) / denom),
+                "max_abs": float(np.max(np.abs(finite_diff))) if finite_diff.size else float("nan"),
+                "left_min": float(np.nanmin(left_np)) if left_np.size else float("nan"),
+                "left_max": float(np.nanmax(left_np)) if left_np.size else float("nan"),
+                "right_min": float(np.nanmin(right_np)) if right_np.size else float("nan"),
+                "right_max": float(np.nanmax(right_np)) if right_np.size else float("nan"),
+            }
+        )
+    rows.sort(key=lambda row: (not np.isfinite(row["rel_l2"]), row["rel_l2"]), reverse=True)
+    return {
+        "tree_structure_equal": True,
+        "worst": rows[:max_rows],
+    }
+
+
+def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -> dict[str, Any]:
+    def _support(runtime):
+        model = runtime.models.flux
+        model = getattr(model, "neoclassical_model", model)
+        support_fn = getattr(model, "_static_support", None)
+        if support_fn is None:
+            raise ValueError("Neoclassical model does not expose _static_support().")
+        return support_fn()
+
+    frozen_support = _support(frozen_runtime)
+    realtime_support = _support(realtime_runtime)
+    return {
+        "center_channels": _tree_selected_stats(
+            frozen_support.center_channels,
+            realtime_support.center_channels,
+            indices=indices,
+        ),
+        "center_prepared": _tree_selected_stats(
+            frozen_support.center_prepared,
+            realtime_support.center_prepared,
+            indices=indices,
+        ),
+    }
+
+
 def _residual_curve_rows(
     frozen: dict[str, Any],
     realtime: dict[str, Any],
@@ -260,6 +408,11 @@ def main() -> None:
     parser.add_argument("--residual-curve-er-min", type=float, default=-60.0)
     parser.add_argument("--residual-curve-er-max", type=float, default=30.0)
     parser.add_argument("--residual-curve-count", type=int, default=121)
+    parser.add_argument(
+        "--skip-ntx-support-diagnostics",
+        action="store_true",
+        help="Do not compare selected NTX center channel/prepared-system leaves.",
+    )
     args = parser.parse_args()
 
     frozen_path = Path(args.frozen_config).resolve()
@@ -308,6 +461,8 @@ def main() -> None:
         )
 
     residual_curve_rows = None
+    flux_probe_rows = None
+    ntx_support_rows = None
     residual_indices = _parse_index_list(args.residual_curve_indices)
     if residual_indices:
         er_grid = np.linspace(
@@ -331,6 +486,41 @@ def main() -> None:
                 f"frozen_range=[{row['frozen']['residual_min']:.6e}, {row['frozen']['residual_max']:.6e}] "
                 f"realtime_range=[{row['realtime']['residual_min']:.6e}, {row['realtime']['residual_max']:.6e}]"
             )
+        probes_by_index = {
+            int(index): {
+                "Er0": 0.0,
+                "frozen_best": float(frozen_roots["best_roots"][int(index)]),
+                "realtime_best": float(realtime_roots["best_roots"][int(index)]),
+            }
+            for index in residual_indices
+        }
+        frozen_flux_probes = _local_flux_probes(frozen_path, probes_by_index=probes_by_index)
+        realtime_flux_probes = _local_flux_probes(realtime_path, probes_by_index=probes_by_index)
+        flux_probe_rows = _flux_probe_rows(frozen_flux_probes, realtime_flux_probes)
+        print("[compare] local particle-flux probes frozen vs realtime")
+        for key, probe_set in flux_probe_rows.items():
+            for probe_name, row in probe_set.items():
+                print(
+                    f"  - i={key} {probe_name}: Er={row['Er']:.6e} "
+                    f"residual_delta={row['residual_delta']:.6e} "
+                    f"gamma_delta_linf={row['gamma_delta_linf']:.6e} "
+                    f"frozen_residual={row['frozen']['residual']:.6e} "
+                    f"realtime_residual={row['realtime']['residual']:.6e}"
+                )
+        if not args.skip_ntx_support_diagnostics:
+            ntx_support_rows = _ntx_support_rows(
+                frozen_runtime,
+                realtime_runtime,
+                indices=residual_indices,
+            )
+            print("[compare] selected NTX support diffs frozen vs realtime")
+            for group_name, group in ntx_support_rows.items():
+                print(f"  - {group_name}: tree_structure_equal={group['tree_structure_equal']}")
+                for row in group["worst"][:12]:
+                    print(
+                        f"      {row['name']}: rel_l2={row['rel_l2']:.6e} "
+                        f"max_abs={row['max_abs']:.6e} shape={row['shape']}"
+                    )
 
     payload = {
         "frozen_config": str(frozen_path),
@@ -341,6 +531,10 @@ def main() -> None:
     }
     if residual_curve_rows is not None:
         payload["ambipolar_residual_curves"] = residual_curve_rows
+    if flux_probe_rows is not None:
+        payload["local_particle_flux_probes"] = flux_probe_rows
+    if ntx_support_rows is not None:
+        payload["ntx_support_diagnostics"] = ntx_support_rows
     if args.json_output:
         out = Path(args.json_output)
         out.parent.mkdir(parents=True, exist_ok=True)
