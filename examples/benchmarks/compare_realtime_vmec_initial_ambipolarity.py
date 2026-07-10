@@ -26,6 +26,7 @@ from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial  # noqa: E402
 from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _solve_state_for_single_param,
+    _wout_from_vmec_state,
     build_geometry_autodiff_context,
 )
 from NEOPAX._orchestrator import build_runtime_context, load_config  # noqa: E402
@@ -218,20 +219,7 @@ def _build_realtime_vmec_wout(config_path: Path):
         step_size=geom_cfg.get("vmec_step_size"),
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
     )
-    from vmec_jax.wout import wout_minimal_from_fixed_boundary
-
-    return wout_minimal_from_fixed_boundary(
-        path=context.input_path,
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=int(context.signgs),
-        fsqr=0.0,
-        fsqz=0.0,
-        fsql=0.0,
-        converged=True,
-        flux_override=context.flux,
-    )
+    return _wout_from_vmec_state(context, state)
 
 
 def _vmec_surface_rows(
@@ -310,7 +298,10 @@ def _vmec_wout_roundtrip_surface_rows(
     )
     realtime_wout = _build_realtime_vmec_wout(realtime_config_path)
 
-    from vmec_jax.wout import write_wout
+    try:
+        from vmec_jax.wout import write_wout
+    except ModuleNotFoundError:
+        from vmec_jax.core.wout import write_wout
 
     output_path = Path(output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

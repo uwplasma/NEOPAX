@@ -155,8 +155,20 @@ def main() -> None:
         run_kwargs["solver"] = args.driver_solver
     if args.driver_solver_mode is not None:
         run_kwargs["solver_mode"] = args.driver_solver_mode
-    print(f"[compare] running vmec_jax.run_fixed_boundary with kwargs={run_kwargs}")
-    driver_run = vj.run_fixed_boundary(input_path, **run_kwargs)
+    if hasattr(vj, "run_fixed_boundary"):
+        print(f"[compare] running vmec_jax.run_fixed_boundary with kwargs={run_kwargs}")
+        driver_run = vj.run_fixed_boundary(input_path, **run_kwargs)
+    else:
+        solve_kwargs: dict[str, Any] = {"verbose": False}
+        if args.solver_device is not None:
+            solve_kwargs["device"] = args.solver_device
+        if args.driver_solver_mode is not None:
+            solve_kwargs["mode"] = args.driver_solver_mode
+        if args.driver_solver is not None:
+            print("[compare] --driver-solver is ignored by the current vmec_jax.solve API")
+        inp = vj.VmecInput.from_file(input_path)
+        print(f"[compare] running vmec_jax.solve with kwargs={solve_kwargs}")
+        driver_run = vj.solve(inp, **solve_kwargs)
     driver_state = driver_run.state
 
     rows = _compare_states(neopax_state, driver_state)

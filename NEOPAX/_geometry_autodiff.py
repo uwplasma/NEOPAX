@@ -4,6 +4,7 @@ import dataclasses
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import jax
@@ -37,14 +38,23 @@ def _import_vmec_jax():
 
 def _import_vmec_jax_implicit():
     _ensure_local_stack_on_path()
-    import vmec_jax.implicit as implicit
+    try:
+        import vmec_jax.implicit as implicit
+    except ModuleNotFoundError:
+        import vmec_jax.core.implicit as implicit
 
     return implicit
 
 
 def _import_vmec_jax_optimization():
     _ensure_local_stack_on_path()
-    import vmec_jax.optimization as optimization
+    try:
+        import vmec_jax.optimization as optimization
+    except ModuleNotFoundError:
+        try:
+            import vmec_jax.optimize as optimization
+        except ModuleNotFoundError:
+            import vmec_jax.core.optimize as optimization
 
     return optimization
 
@@ -80,6 +90,163 @@ def _resolve_vmec_attr_any(module, name: str, *, submodules: Sequence[str]):
         f"vmec_jax does not provide '{name}' in any of: {', '.join(submodules)}. "
         f"Errors: {'; '.join(errors)}"
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _VmecStaticCompat:
+    """Old NEOPAX-facing static view backed by the current vmec_jax runtime."""
+
+    cfg: Any
+    setup: Any
+    resolution: Any
+    runtime: Any
+
+    @property
+    def modes(self):
+        return self.runtime.modes
+
+    @property
+    def grid(self):
+        return self.runtime.trig
+
+    @property
+    def trig_vmec(self):
+        return self.runtime.trig
+
+    @property
+    def s(self):
+        return self.setup.s_full
+
+
+def _vmec_input_get(indata: Any, name: str, default: Any = None) -> Any:
+    if hasattr(indata, "get"):
+        try:
+            return indata.get(name, default)
+        except Exception:
+            pass
+    attr = str(name).strip().lower()
+    return getattr(indata, attr, default)
+
+
+def _vmec_input_get_int(indata: Any, name: str, default: int) -> int:
+    if hasattr(indata, "get_int"):
+        try:
+            return int(indata.get_int(name, default))
+        except Exception:
+            pass
+    return int(_vmec_input_get(indata, name, default))
+
+
+def _vmec_input_get_float(indata: Any, name: str, default: float | None) -> float | None:
+    if hasattr(indata, "get_float"):
+        try:
+            return indata.get_float(name, default)
+        except Exception:
+            pass
+    value = _vmec_input_get(indata, name, default)
+    return None if value is None else float(value)
+
+
+def _build_current_vmec_jax_context(vmec_jax, vmec_input: Path):
+    VmecInput = _resolve_vmec_attr(vmec_jax, "VmecInput")
+    inp = VmecInput.from_file(vmec_input)
+    from vmec_jax.core.setup import boundary_from_input
+    from vmec_jax.core.solver import prepare_runtime, resolution_from_input
+
+    resolution = resolution_from_input(inp)
+    runtime = prepare_runtime(inp, resolution)
+    static = _VmecStaticCompat(
+        cfg=inp,
+        setup=runtime.setup,
+        resolution=resolution,
+        runtime=runtime,
+    )
+    boundary = boundary_from_input(inp, modes=runtime.modes, trig=runtime.trig, lconm1=True)
+    fixed_context = {
+        "signgs": int(runtime.setup.signgs),
+        "flux": SimpleNamespace(
+            phips=runtime.setup.phips,
+            chips=runtime.setup.chips,
+            iotas=runtime.setup.iotas,
+            icurv=runtime.setup.icurv,
+            mass=runtime.setup.mass,
+            phipf=runtime.setup.phipf,
+            chipf=runtime.setup.chipf,
+            iotaf=runtime.setup.iotaf,
+            lamscale=runtime.setup.lamscale,
+        ),
+        "pressure": jnp.asarray(runtime.setup.mass),
+        "booz_inputs": None,
+    }
+    return inp, inp, static, boundary, fixed_context
+
+
+def _using_current_vmec_jax_context(context: "GeometryAutodiffContext") -> bool:
+    return isinstance(context.static, _VmecStaticCompat)
+
+
+def _input_boundary_array_name_for_kind(kind: str) -> str:
+    if kind == "rc":
+        return "rbc"
+    if kind == "zs":
+        return "zbs"
+    raise ValueError(f"Unsupported boundary kind '{kind}'.")
+
+
+def _input_with_boundary_delta(context: "GeometryAutodiffContext", param_delta):
+    field_name = _input_boundary_array_name_for_kind(context.boundary_kind)
+    base = jnp.asarray(getattr(context.indata, field_name), dtype=jnp.float64)
+    n_offset = int(context.static.resolution.ntor) + int(context.param_n)
+    m_index = int(context.param_m)
+    updated = base.at[n_offset, m_index].add(jnp.asarray(param_delta, dtype=jnp.float64))
+    return dataclasses.replace(context.indata, **{field_name: updated})
+
+
+def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", implicit, param_delta):
+    params = implicit.params_from_input(context.indata)
+    field_name = _input_boundary_array_name_for_kind(context.boundary_kind)
+    base = jnp.asarray(getattr(params, field_name), dtype=jnp.float64)
+    n_offset = int(context.static.resolution.ntor) + int(context.param_n)
+    m_index = int(context.param_m)
+    updated = base.at[n_offset, m_index].add(jnp.asarray(param_delta, dtype=jnp.float64))
+    return dataclasses.replace(params, **{field_name: updated})
+
+
+def _wout_from_vmec_state(
+    context: "GeometryAutodiffContext",
+    state,
+    *,
+    fsqr: float = 0.0,
+    fsqz: float = 0.0,
+    fsql: float = 0.0,
+):
+    try:
+        from vmec_jax.wout import wout_minimal_from_fixed_boundary
+
+        return wout_minimal_from_fixed_boundary(
+            path=context.input_path,
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+            fsqr=fsqr,
+            fsqz=fsqz,
+            fsql=fsql,
+            converged=True,
+            flux_override=context.flux,
+        )
+    except ModuleNotFoundError:
+        from vmec_jax.core.wout import wout_from_state
+
+        return wout_from_state(
+            inp=context.indata,
+            state=state,
+            fsqr=fsqr,
+            fsqz=fsqz,
+            fsql=fsql,
+            converged=True,
+            input_extension=str(context.input_path),
+        )
 
 
 def _build_vmec_fixed_context(vmec_jax, *, static, indata, boundary):
@@ -157,7 +324,7 @@ def _boundary_array_name_for_kind(kind: str) -> str:
 
 
 def _vmec_default_max_iter_from_indata(indata: Any) -> int:
-    niter_array = indata.get("NITER_ARRAY", None)
+    niter_array = _vmec_input_get(indata, "NITER_ARRAY", None)
     if niter_array is not None:
         try:
             values = [int(v) for v in niter_array]
@@ -166,20 +333,20 @@ def _vmec_default_max_iter_from_indata(indata: Any) -> int:
         except Exception:
             pass
     try:
-        return int(indata.get_int("NITER", 100))
+        return _vmec_input_get_int(indata, "NITER", 100)
     except Exception:
         return 100
 
 
 def _vmec_default_step_size_from_indata(indata: Any) -> float:
     try:
-        return float(indata.get_float("DELT", 1.0))
+        return float(_vmec_input_get_float(indata, "DELT", 1.0))
     except Exception:
         return 1.0
 
 
 def _vmec_default_ftol_from_indata(indata: Any) -> float | None:
-    ftol_array = indata.get("FTOL_ARRAY", None)
+    ftol_array = _vmec_input_get(indata, "FTOL_ARRAY", None)
     if ftol_array is not None:
         try:
             values = [float(v) for v in ftol_array]
@@ -188,7 +355,7 @@ def _vmec_default_ftol_from_indata(indata: Any) -> float | None:
         except Exception:
             pass
     try:
-        value = indata.get_float("FTOL", None)
+        value = _vmec_input_get_float(indata, "FTOL", None)
     except Exception:
         value = None
     return None if value is None else float(value)
@@ -254,9 +421,13 @@ def build_geometry_autodiff_context(
     booz_api = _import_booz_xform_jax_api()
 
     vmec_input = Path(input_path).expanduser().resolve()
-    cfg, indata = vmec_jax.load_input(str(vmec_input))
-    static = vmec_jax.build_static(cfg)
-    boundary = vmec_jax.boundary_from_indata(indata, static.modes)
+    if all(hasattr(vmec_jax, name) for name in ("load_input", "build_static", "boundary_from_indata")):
+        cfg, indata = vmec_jax.load_input(str(vmec_input))
+        static = vmec_jax.build_static(cfg)
+        boundary = vmec_jax.boundary_from_indata(indata, static.modes)
+        fixed_context = None
+    else:
+        cfg, indata, static, boundary, fixed_context = _build_current_vmec_jax_context(vmec_jax, vmec_input)
 
     kind = _boundary_kind_for_family(param_family)
     m_arr = jnp.asarray(static.modes.m)
@@ -273,22 +444,23 @@ def build_geometry_autodiff_context(
         )
     boundary_index = int(match_indices[0])
 
-    try:
-        prepare_fixed_boundary_context = _resolve_vmec_attr(vmec_jax, "prepare_fixed_boundary_context")
-        fixed_context_obj = prepare_fixed_boundary_context(
-            static=static,
-            indata=indata,
-            boundary=boundary,
-            vmec_project=False,
-        )
-        fixed_context = {
-            "signgs": int(fixed_context_obj.signgs),
-            "flux": fixed_context_obj.flux,
-            "pressure": jnp.asarray(fixed_context_obj.pressure),
-            "booz_inputs": fixed_context_obj.booz_inputs,
-        }
-    except Exception:
-        fixed_context = _build_vmec_fixed_context(vmec_jax, static=static, indata=indata, boundary=boundary)
+    if fixed_context is None:
+        try:
+            prepare_fixed_boundary_context = _resolve_vmec_attr(vmec_jax, "prepare_fixed_boundary_context")
+            fixed_context_obj = prepare_fixed_boundary_context(
+                static=static,
+                indata=indata,
+                boundary=boundary,
+                vmec_project=False,
+            )
+            fixed_context = {
+                "signgs": int(fixed_context_obj.signgs),
+                "flux": fixed_context_obj.flux,
+                "pressure": jnp.asarray(fixed_context_obj.pressure),
+                "booz_inputs": fixed_context_obj.booz_inputs,
+            }
+        except Exception:
+            fixed_context = _build_vmec_fixed_context(vmec_jax, static=static, indata=indata, boundary=boundary)
     try:
         surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
         surface_indices, _ = surface_indices_from_static(static, list(surface_s))
@@ -301,12 +473,15 @@ def build_geometry_autodiff_context(
         mboz=mboz,
         nboz=nboz,
     )
-    booz_constants, booz_grids = booz_api.prepare_booz_xform_constants_from_inputs(
-        inputs=fixed_context["booz_inputs"],
-        mboz=resolved_mboz,
-        nboz=resolved_nboz,
-        asym=bool(cfg.lasym),
-    )
+    if fixed_context.get("booz_inputs") is None:
+        booz_constants, booz_grids = None, None
+    else:
+        booz_constants, booz_grids = booz_api.prepare_booz_xform_constants_from_inputs(
+            inputs=fixed_context["booz_inputs"],
+            mboz=resolved_mboz,
+            nboz=resolved_nboz,
+            asym=bool(cfg.lasym),
+        )
 
     boundary_array = jnp.asarray(getattr(boundary, _boundary_array_name_for_kind(kind)))
 
@@ -347,6 +522,36 @@ def _solve_state_for_single_param(
     jacobian_penalty: float = 1.0e3,
 ) -> Any:
     vmec_jax = _import_vmec_jax()
+    if _using_current_vmec_jax_context(context):
+        lane_key = str(lane).strip().lower()
+        if lane_key not in {"forward", "ad"}:
+            raise ValueError("lane must be 'forward' or 'ad'.")
+        max_iter_value = int(context.vmec_default_max_iter if max_iter is None else max_iter)
+        ftol_value = context.vmec_default_ftol
+        if lane_key == "forward":
+            input_eff = _input_with_boundary_delta(context, param_delta)
+            return vmec_jax.solve(
+                input_eff,
+                context.static.resolution,
+                ftol=ftol_value,
+                max_iterations=max_iter_value,
+                time_step=context.vmec_default_step_size if step_size is None else float(step_size),
+                mode="cli",
+                verbose=False,
+            ).state
+
+        del jacobian_penalty
+        implicit = _import_vmec_jax_implicit()
+        params = _implicit_params_with_boundary_delta(context, implicit, param_delta)
+        cfg = implicit.make_config(
+            context.indata,
+            ns=int(context.static.resolution.ns),
+            ftol=ftol_value,
+            max_iterations=max_iter_value,
+            mode="cli",
+        )
+        return implicit.solve_implicit(params, cfg)
+
     initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
     solve_fixed_boundary_residual_iter = _resolve_vmec_attr(vmec_jax, "solve_fixed_boundary_residual_iter", submodule="solve")
 
@@ -2076,22 +2281,9 @@ def build_ntx_exact_lij_support_from_vmec_state(
     vmec_wout_cache = None
 
     def _vmec_surfaces_from_state(*, s_values):
-        from vmec_jax.wout import wout_minimal_from_fixed_boundary
-
         nonlocal vmec_wout_cache
         if vmec_wout_cache is None:
-            vmec_wout_cache = wout_minimal_from_fixed_boundary(
-                path=context.input_path,
-                state=state,
-                static=context.static,
-                indata=context.indata,
-                signgs=int(context.signgs),
-                fsqr=0.0,
-                fsqz=0.0,
-                fsql=0.0,
-                converged=True,
-                flux_override=context.flux,
-            )
+            vmec_wout_cache = _wout_from_vmec_state(context, state)
         return tuple(
             _vmec_jax_wout_surface_with_frozen_sampling(
                 vmec_wout_cache,
