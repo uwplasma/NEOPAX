@@ -1855,12 +1855,34 @@ def _build_neopax_geometry_from_state(
 def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     from NEOPAX._transport_flux_models import NTXRuntimeScanChannels
 
+    def _surface_zero_mode_value(surface, field_name):
+        values = jnp.asarray(getattr(surface, field_name), dtype=jnp.float64)
+        mode_mask = (jnp.asarray(surface.m) == 0) & (jnp.asarray(surface.n) == 0)
+        index = jnp.argmax(mode_mask.astype(jnp.int32))
+        return jnp.take(values, index)
+
+    def _surface_b00(surface):
+        b0 = getattr(surface, "b0", None)
+        if b0 is not None:
+            return jnp.asarray(b0, dtype=jnp.float64)
+        return _surface_zero_mode_value(surface, "b_cos")
+
+    def _surface_boozer_i(surface):
+        if hasattr(surface, "b_theta"):
+            return jnp.asarray(surface.b_theta, dtype=jnp.float64)
+        return _surface_zero_mode_value(surface, "b_sub_theta_cos")
+
+    def _surface_boozer_g(surface):
+        if hasattr(surface, "b_zeta"):
+            return jnp.asarray(surface.b_zeta, dtype=jnp.float64)
+        return _surface_zero_mode_value(surface, "b_sub_zeta_cos")
+
     rho_arr = jnp.asarray(rho, dtype=jnp.float64)
     psia_value = float(jnp.asarray(psia))
     r00_arr = jnp.asarray(r00, dtype=jnp.float64)
-    b00 = jnp.asarray([jnp.asarray(surface.b0 if surface.b0 is not None else surface.b_cos[0], dtype=jnp.float64) for surface in surfaces])
-    boozer_i = jnp.asarray([jnp.asarray(surface.b_theta, dtype=jnp.float64) for surface in surfaces])
-    boozer_g = jnp.asarray([jnp.asarray(surface.b_zeta, dtype=jnp.float64) for surface in surfaces])
+    b00 = jnp.asarray([_surface_b00(surface) for surface in surfaces])
+    boozer_i = jnp.asarray([_surface_boozer_i(surface) for surface in surfaces])
+    boozer_g = jnp.asarray([_surface_boozer_g(surface) for surface in surfaces])
     iota = jnp.asarray([jnp.asarray(surface.iota, dtype=jnp.float64) for surface in surfaces])
     drds = jnp.where(rho_arr > 0.0, jnp.asarray(a_b, dtype=jnp.float64) / (2.0 * rho_arr), 0.0)
     dpsi_drtilde = rho_arr * jnp.asarray(a_b, dtype=jnp.float64) * b00
@@ -1914,6 +1936,8 @@ def _ntx_surface_iota_targets(geometry, rho_values):
 
 
 def _align_ntx_surface_iota_convention(surface, target_iota):
+    if not hasattr(surface, "b_theta"):
+        return surface
     surface_iota = jnp.asarray(surface.iota, dtype=jnp.float64)
     target = jnp.asarray(target_iota, dtype=jnp.float64)
     should_flip = jnp.logical_and(surface_iota * target < 0.0, jnp.abs(target) > 0.0)
@@ -1941,6 +1965,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
     n_theta: int,
     n_zeta: int,
     n_xi: int,
+    surface_backend: str = "booz",
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -1961,6 +1986,35 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
         return surfaces_fn(**kwargs)
 
+    vmec_wout_cache = None
+
+    def _vmec_surfaces_from_state(*, s_values):
+        from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout
+        from vmec_jax.wout import wout_minimal_from_fixed_boundary
+
+        nonlocal vmec_wout_cache
+        if vmec_wout_cache is None:
+            vmec_wout_cache = wout_minimal_from_fixed_boundary(
+                path=context.input_path,
+                state=state,
+                static=context.static,
+                indata=context.indata,
+                signgs=int(context.signgs),
+                fsqr=0.0,
+                fsqz=0.0,
+                fsql=0.0,
+                converged=True,
+                flux_override=context.flux,
+            )
+        return tuple(
+            surface_from_vmec_jax_vmec_wout(
+                vmec_wout_cache,
+                s=float(s_value),
+                source_path=context.input_path,
+            )
+            for s_value in s_values
+        )
+
     rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
     rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
@@ -1971,26 +2025,38 @@ def build_ntx_exact_lij_support_from_vmec_state(
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
-    center_surfaces = _surfaces_from_vmec_jax_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float)),
-        mboz=int(context.mboz),
-        nboz=int(context.nboz),
-        psi_p=float(ntx_psia),
-    )
-    face_surfaces = _surfaces_from_vmec_jax_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        s_values=tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float)),
-        mboz=int(context.mboz),
-        nboz=int(context.nboz),
-        psi_p=float(ntx_psia),
-    )
+    center_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float))
+    face_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float))
+    surface_backend_key = str(surface_backend).strip().lower()
+    if surface_backend_key in {"vmec", "vmec_jax"}:
+        center_surfaces = _vmec_surfaces_from_state(s_values=center_s_values)
+        face_surfaces = _vmec_surfaces_from_state(s_values=face_s_values)
+    elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
+        center_surfaces = _surfaces_from_vmec_jax_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            s_values=center_s_values,
+            mboz=int(context.mboz),
+            nboz=int(context.nboz),
+            psi_p=float(ntx_psia),
+        )
+        face_surfaces = _surfaces_from_vmec_jax_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            s_values=face_s_values,
+            mboz=int(context.mboz),
+            nboz=int(context.nboz),
+            psi_p=float(ntx_psia),
+        )
+    else:
+        raise ValueError(
+            "ntx_exact_surface_backend for realtime geometry must be one of "
+            "'vmec', 'booz', or 'auto'."
+        )
     center_iota_targets = _ntx_surface_iota_targets(geometry, rho_center)
     face_iota_targets = _ntx_surface_iota_targets(geometry, rho_face)
     center_surfaces = tuple(
@@ -2106,6 +2172,7 @@ def build_runtime_context_for_geometry_param(
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
             n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         )
         neoclassical_cfg["preload_support"] = False
         neoclassical_cfg["vmec_file"] = None
