@@ -84,6 +84,16 @@ def main() -> None:
     parser.add_argument("--reverse-rhs-transpose-mode", type=str, default="explicit_ntx_interpolated")
     parser.add_argument("--reverse-step-bwd-mode", type=str, default="reduced_cotangent")
     parser.add_argument(
+        "--forward-ad-fusion-mode",
+        type=str,
+        default="replay",
+        choices=("replay", "step"),
+        help=(
+            "Forward custom-JVP tangent path to diagnose. 'replay' is the recovered "
+            "reference replay helper; 'step' uses the step-fused accepted-step path."
+        ),
+    )
+    parser.add_argument(
         "--json-output",
         type=str,
         default=str(ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "forward_reverse_primal_compare.json"),
@@ -114,15 +124,27 @@ def main() -> None:
     )
     forward_objectives = jax.block_until_ready(forward_objectives)
 
-    fused_forward_objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(  # noqa: E731
-        p,
-        config=config,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        parameter_name=PARAMETER_ORDER[0],
-        accepted_step_limit_override=args.accepted_step_limit,
-    )
+    if args.forward_ad_fusion_mode == "replay":
+        fused_forward_objective_fn = lambda p: _forward_benchmark_adaptive_rollout_objectives_realized_schedule_only_for_parameter_jvp(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=PARAMETER_ORDER[0],
+            accepted_step_limit_override=args.accepted_step_limit,
+        )
+    else:
+        fused_forward_objective_fn = lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=PARAMETER_ORDER[0],
+            accepted_step_limit_override=args.accepted_step_limit,
+            derivative_mode="jvp_step",
+        )
     fused_forward_plain_objectives = fused_forward_objective_fn(baseline_values[0])
     fused_forward_plain_objectives = jax.block_until_ready(fused_forward_plain_objectives)
     fused_forward_objectives, fused_forward_tangents = jax.jvp(
@@ -198,7 +220,7 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
-    print("[compare] fused forward custom-JVP primal vs reverse VJP primal")
+    print(f"[compare] fused forward custom-JVP primal vs reverse VJP primal ({args.forward_ad_fusion_mode})")
     for row in rows_fused_vjp:
         print(
             f"  - {row['objective']}: fused_forward={row['forward_primal']:.16e} "
@@ -206,7 +228,7 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
-    print("[compare] fused forward wrapper plain-call primal vs JVP primal")
+    print(f"[compare] fused forward wrapper plain-call primal vs JVP primal ({args.forward_ad_fusion_mode})")
     for row in rows_fused_plain_call:
         print(
             f"  - {row['objective']}: plain_call={row['forward_primal']:.16e} "
@@ -214,7 +236,7 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
-    print("[compare] fused forward custom-JVP primal vs reverse plain primal")
+    print(f"[compare] fused forward custom-JVP primal vs reverse plain primal ({args.forward_ad_fusion_mode})")
     for row in rows_fused_plain:
         print(
             f"  - {row['objective']}: fused_forward={row['forward_primal']:.16e} "
@@ -222,7 +244,7 @@ def main() -> None:
             f"delta={row['delta_reverse_minus_forward']:.6e} "
             f"rel={row['relative_delta']:.6e}"
         )
-    print("[compare] fused forward n0 tangents")
+    print(f"[compare] fused forward n0 tangents ({args.forward_ad_fusion_mode})")
     for label, value in zip(OBJECTIVE_LABELS, np.asarray(jax.device_get(fused_forward_tangents), dtype=float)):
         print(f"  - {label}: tangent={float(value):.16e}")
 
@@ -233,6 +255,7 @@ def main() -> None:
         "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
         "reverse_max_total_steps": int(reverse_setup.max_total_steps),
         "reverse_stop_after_accepted_steps": reverse_setup.stop_after_accepted_steps,
+        "forward_ad_fusion_mode": str(args.forward_ad_fusion_mode),
         "forward_vs_reverse_vjp": rows_vjp,
         "forward_vs_reverse_plain": rows_plain,
         "fused_forward_vs_reverse_vjp": rows_fused_vjp,
