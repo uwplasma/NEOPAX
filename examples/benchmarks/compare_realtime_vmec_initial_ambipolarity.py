@@ -24,6 +24,10 @@ if str(ROOT) not in sys.path:
 
 from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial  # noqa: E402
 from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
+from NEOPAX._geometry_autodiff import (  # noqa: E402
+    _solve_state_for_single_param,
+    build_geometry_autodiff_context,
+)
 from NEOPAX._orchestrator import build_runtime_context, load_config  # noqa: E402
 
 
@@ -169,6 +173,107 @@ def _parse_index_list(value: str | None) -> list[int]:
     if value is None or str(value).strip() == "":
         return []
     return [int(part.strip()) for part in str(value).split(",") if part.strip()]
+
+
+def _resolve_input_path(config_path: Path, value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    cwd_relative = path.resolve()
+    if cwd_relative.exists():
+        return cwd_relative
+    config_relative = (config_path.parent / path).resolve()
+    if config_relative.exists():
+        return config_relative
+    return cwd_relative
+
+
+def _build_realtime_vmec_wout(config_path: Path):
+    config = load_config(config_path)
+    geom_cfg = dict(config.get("geometry", {}))
+    context = build_geometry_autodiff_context(
+        geom_cfg.get("vmec_input_file"),
+        param_family=str(geom_cfg.get("vmec_param_family", "RBC")),
+        param_m=int(geom_cfg.get("vmec_m_index", 0)),
+        param_n=int(geom_cfg.get("vmec_n_index", 0)),
+        mboz=geom_cfg.get("mboz", geom_cfg.get("vmec_mboz")),
+        nboz=geom_cfg.get("nboz", geom_cfg.get("vmec_nboz")),
+    )
+    state = _solve_state_for_single_param(
+        context,
+        jnp.asarray(float(geom_cfg.get("vmec_param_delta", 0.0)), dtype=jnp.float64),
+        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        step_size=geom_cfg.get("vmec_step_size"),
+        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+    )
+    from vmec_jax.wout import wout_minimal_from_fixed_boundary
+
+    return wout_minimal_from_fixed_boundary(
+        path=context.input_path,
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+        fsqr=0.0,
+        fsqz=0.0,
+        fsql=0.0,
+        converged=True,
+        flux_override=context.flux,
+    )
+
+
+def _vmec_surface_rows(
+    frozen_config_path: Path,
+    realtime_config_path: Path,
+    runtime,
+    *,
+    indices: list[int],
+) -> dict[str, Any]:
+    frozen_config = load_config(frozen_config_path)
+    frozen_geometry_cfg = dict(frozen_config.get("geometry", {}))
+    frozen_vmec_path = _resolve_input_path(frozen_config_path, frozen_geometry_cfg["vmec_file"])
+    realtime_wout = _build_realtime_vmec_wout(realtime_config_path)
+
+    import ntx
+
+    surface_from_file = getattr(ntx, "surface_from_vmec_jax_vmec_wout_file")
+    surface_from_wout = getattr(ntx, "surface_from_vmec_jax_vmec_wout")
+    rho_grid = np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float)
+    fields = (
+        "iota",
+        "b_cos",
+        "jacobian_cos",
+        "b_sub_theta_cos",
+        "b_sub_zeta_cos",
+        "b_sup_theta_cos",
+        "b_sup_zeta_cos",
+        "b0",
+        "psi_a_hat",
+        "phi_edge",
+        "aminor_p",
+    )
+    rows: dict[str, Any] = {}
+    for index in indices:
+        rho = float(rho_grid[int(index)])
+        s_value = float(rho * rho)
+        frozen_surface = surface_from_file(frozen_vmec_path, s=s_value)
+        realtime_surface = surface_from_wout(
+            realtime_wout,
+            s=s_value,
+            source_path=getattr(realtime_wout, "path", frozen_vmec_path),
+        )
+        surface_rows = {
+            name: _stats(getattr(frozen_surface, name), getattr(realtime_surface, name))
+            for name in fields
+            if hasattr(frozen_surface, name) and hasattr(realtime_surface, name)
+        }
+        rows[str(index)] = {
+            "rho": rho,
+            "s": s_value,
+            "fields": surface_rows,
+        }
+    return rows
 
 
 def _ambipolar_residual_curves(path: Path, *, indices: list[int], er_grid: np.ndarray) -> dict[str, Any]:
@@ -503,6 +608,11 @@ def main() -> None:
         action="store_true",
         help="Do not compare selected NTX center channel/prepared-system leaves.",
     )
+    parser.add_argument(
+        "--raw-vmec-surface-diagnostics",
+        action="store_true",
+        help="Compare frozen and realtime NTX VMEC surface fields before NTX preparation.",
+    )
     args = parser.parse_args()
 
     frozen_path = Path(args.frozen_config).resolve()
@@ -553,6 +663,7 @@ def main() -> None:
     residual_curve_rows = None
     flux_probe_rows = None
     ntx_support_rows = None
+    raw_vmec_surface_rows = None
     residual_indices = _parse_index_list(args.residual_curve_indices)
     if residual_indices:
         er_grid = np.linspace(
@@ -616,6 +727,28 @@ def main() -> None:
                         f"      {row['name']}: rel_l2={row['rel_l2']:.6e} "
                         f"max_abs={row['max_abs']:.6e} shape={row['shape']}"
                     )
+        if args.raw_vmec_surface_diagnostics:
+            raw_vmec_surface_rows = _vmec_surface_rows(
+                frozen_path,
+                realtime_path,
+                frozen_runtime,
+                indices=residual_indices,
+            )
+            print("[compare] raw NTX VMEC surface fields frozen vs realtime")
+            for index, group in raw_vmec_surface_rows.items():
+                print(f"  - i={index}: rho={group['rho']:.6e} s={group['s']:.6e}")
+                sorted_rows = sorted(
+                    group["fields"].items(),
+                    key=lambda item: item[1]["rel_l2"],
+                    reverse=True,
+                )
+                for name, row in sorted_rows[:12]:
+                    print(
+                        f"      {name}: rel_l2={row['rel_l2']:.6e} "
+                        f"max_abs={row['max_abs']:.6e} "
+                        f"left=[{row['left_min']:.6e}, {row['left_max']:.6e}] "
+                        f"right=[{row['right_min']:.6e}, {row['right_max']:.6e}]"
+                    )
 
     payload = {
         "frozen_config": str(frozen_path),
@@ -630,6 +763,8 @@ def main() -> None:
         payload["local_particle_flux_probes"] = flux_probe_rows
     if ntx_support_rows is not None:
         payload["ntx_support_diagnostics"] = ntx_support_rows
+    if raw_vmec_surface_rows is not None:
+        payload["raw_vmec_surface_diagnostics"] = raw_vmec_surface_rows
     if args.json_output:
         out = Path(args.json_output)
         out.parent.mkdir(parents=True, exist_ok=True)

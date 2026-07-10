@@ -337,7 +337,7 @@ def build_geometry_autodiff_context(
     )
 
 
-def _solve_state_and_result_for_single_param(
+def _solve_state_for_single_param(
     context: GeometryAutodiffContext,
     param_delta,
     *,
@@ -382,13 +382,13 @@ def _solve_state_and_result_for_single_param(
             jit_forces="auto",
             use_scan=True,
         )
-        return result.state, result
+        return result.state
 
     # AD lane: keep the implicit residual solve separate so we can add a
     # reverse-mode path later without changing the forward lane contract.
     del jacobian_penalty
     implicit = _import_vmec_jax_implicit()
-    state = implicit.solve_fixed_boundary_state_implicit_vmec_residual(
+    return implicit.solve_fixed_boundary_state_implicit_vmec_residual(
         state0,
         context.static,
         indata=context.indata,
@@ -401,27 +401,6 @@ def _solve_state_and_result_for_single_param(
         edge_Zcos=state0.Zcos[-1, :],
         edge_Zsin=state0.Zsin[-1, :],
     )
-    return state, None
-
-
-def _solve_state_for_single_param(
-    context: GeometryAutodiffContext,
-    param_delta,
-    *,
-    lane: str = "ad",
-    max_iter: int | None = None,
-    step_size: float | None = None,
-    jacobian_penalty: float = 1.0e3,
-) -> Any:
-    state, _result = _solve_state_and_result_for_single_param(
-        context,
-        param_delta,
-        lane=lane,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
-    return state
 
 
 def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) -> int | None:
@@ -2074,7 +2053,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
     n_zeta: int,
     n_xi: int,
     surface_backend: str = "booz",
-    vmec_result: Any | None = None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -2102,9 +2080,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
 
         nonlocal vmec_wout_cache
         if vmec_wout_cache is None:
-            force_payload_override = None
-            if vmec_result is not None:
-                force_payload_override = getattr(vmec_result, "_final_force_payload", None)
             vmec_wout_cache = wout_minimal_from_fixed_boundary(
                 path=context.input_path,
                 state=state,
@@ -2116,7 +2091,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 fsql=0.0,
                 converged=True,
                 flux_override=context.flux,
-                force_payload_override=force_payload_override,
             )
         return tuple(
             _vmec_jax_wout_surface_with_frozen_sampling(
@@ -2250,7 +2224,7 @@ def build_runtime_context_for_geometry_param(
     )
     from NEOPAX._source_models import build_source_models_from_config
 
-    state_vmec, vmec_result = _solve_state_and_result_for_single_param(
+    state_vmec = _solve_state_for_single_param(
         context,
         param_delta,
         lane=lane,
@@ -2277,7 +2251,6 @@ def build_runtime_context_for_geometry_param(
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
             n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
             surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
-            vmec_result=vmec_result,
         )
         neoclassical_cfg["preload_support"] = False
         neoclassical_cfg["vmec_file"] = None
