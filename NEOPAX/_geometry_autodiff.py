@@ -1862,10 +1862,12 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
         return jnp.take(values, index)
 
     def _surface_b00(surface):
+        if hasattr(surface, "b_cos"):
+            return _surface_zero_mode_value(surface, "b_cos")
         b0 = getattr(surface, "b0", None)
         if b0 is not None:
             return jnp.asarray(b0, dtype=jnp.float64)
-        return _surface_zero_mode_value(surface, "b_cos")
+        raise AttributeError("NTX surface is missing both b_cos and b0.")
 
     def _surface_boozer_i(surface):
         if hasattr(surface, "b_theta"):
@@ -1918,7 +1920,7 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
         fac_sfincs_to_dkes_33=fac_sfincs_to_dkes_33,
         fac_dkes_to_d11star=fac_dkes_to_d11star,
         fac_dkes_to_d31star=fac_dkes_to_d31star,
-        fac_dkes_to_d33star=jnp.ones_like(rho_arr),
+        fac_dkes_to_d33star=jnp.asarray(1.0, dtype=jnp.float64),
     )
 
 
