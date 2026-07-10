@@ -1936,11 +1936,15 @@ def _ntx_surface_iota_targets(geometry, rho_values):
 
 
 def _align_ntx_surface_iota_convention(surface, target_iota):
-    if not hasattr(surface, "b_theta"):
-        return surface
     surface_iota = jnp.asarray(surface.iota, dtype=jnp.float64)
     target = jnp.asarray(target_iota, dtype=jnp.float64)
     should_flip = jnp.logical_and(surface_iota * target < 0.0, jnp.abs(target) > 0.0)
+
+    if not hasattr(surface, "b_theta"):
+        return dataclasses.replace(
+            surface,
+            iota=jnp.where(should_flip, -surface_iota, surface_iota),
+        )
 
     def _maybe_flip(value):
         if value is None:
