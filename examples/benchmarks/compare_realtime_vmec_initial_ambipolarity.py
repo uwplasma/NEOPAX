@@ -287,8 +287,14 @@ def _tree_selected_stats(left_tree, right_tree, *, indices: list[int], max_rows:
     left_flat, left_def = jax.tree_util.tree_flatten_with_path(left_tree)
     right_flat, right_def = jax.tree_util.tree_flatten_with_path(right_tree)
     if left_def != right_def:
+        left_leaves, left_plain_def = jax.tree_util.tree_flatten(left_tree)
+        right_leaves, right_plain_def = jax.tree_util.tree_flatten(right_tree)
         return {
             "tree_structure_equal": False,
+            "left_treedef": str(left_plain_def),
+            "right_treedef": str(right_plain_def),
+            "left_leaf_count": len(left_leaves),
+            "right_leaf_count": len(right_leaves),
             "worst": [],
         }
 
@@ -344,6 +350,8 @@ def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -
 
     frozen_support = _support(frozen_runtime)
     realtime_support = _support(realtime_runtime)
+    frozen_center_prepared = frozen_support.center_prepared
+    realtime_center_prepared = realtime_support.center_prepared
     return {
         "center_channels": _tree_selected_stats(
             frozen_support.center_channels,
@@ -351,8 +359,23 @@ def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -
             indices=indices,
         ),
         "center_prepared": _tree_selected_stats(
-            frozen_support.center_prepared,
-            realtime_support.center_prepared,
+            frozen_center_prepared,
+            realtime_center_prepared,
+            indices=indices,
+        ),
+        "center_prepared_geometry": _tree_selected_stats(
+            frozen_center_prepared.geometry,
+            realtime_center_prepared.geometry,
+            indices=indices,
+        ),
+        "center_prepared_d_theta": _tree_selected_stats(
+            frozen_center_prepared.d_theta,
+            realtime_center_prepared.d_theta,
+            indices=indices,
+        ),
+        "center_prepared_d_zeta": _tree_selected_stats(
+            frozen_center_prepared.d_zeta,
+            realtime_center_prepared.d_zeta,
             indices=indices,
         ),
     }
@@ -516,6 +539,11 @@ def main() -> None:
             print("[compare] selected NTX support diffs frozen vs realtime")
             for group_name, group in ntx_support_rows.items():
                 print(f"  - {group_name}: tree_structure_equal={group['tree_structure_equal']}")
+                if not group["tree_structure_equal"]:
+                    print(
+                        "      "
+                        f"leaf_count={group.get('left_leaf_count')}->{group.get('right_leaf_count')}"
+                    )
                 for row in group["worst"][:12]:
                     print(
                         f"      {row['name']}: rel_l2={row['rel_l2']:.6e} "
