@@ -9593,10 +9593,15 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                     if raw_attempt_jvp
                     else _execute_radau_accepted_step_attempt_autodiff
                 )
+                carry_for_attempt = (
+                    carry_value
+                    if raw_attempt_jvp
+                    else _radau_carry_with_forward_only_jvp_fields(carry_value)
+                )
                 attempt_result = attempt_fn(
                     execution_context.kernel_context,
                     execution_context.physics_context,
-                    _radau_carry_with_forward_only_jvp_fields(carry_value),
+                    carry_for_attempt,
                     execution_context.attempt_context,
                 )
                 accepted_y = _project_flat_state_if_needed(
