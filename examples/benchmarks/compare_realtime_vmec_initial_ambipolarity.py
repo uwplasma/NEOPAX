@@ -8,12 +8,14 @@ Er initialization, but it does not run the transport time integrator.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -163,6 +165,75 @@ def _root_branch_rows(frozen: dict[str, np.ndarray], realtime: dict[str, np.ndar
     }
 
 
+def _parse_index_list(value: str | None) -> list[int]:
+    if value is None or str(value).strip() == "":
+        return []
+    return [int(part.strip()) for part in str(value).split(",") if part.strip()]
+
+
+def _ambipolar_residual_curves(path: Path, *, indices: list[int], er_grid: np.ndarray) -> dict[str, Any]:
+    config, runtime, state = _load_for_initial_ambipolarity(path, initialize_er=False)
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+    er_grid_jax = jnp.asarray(er_grid, dtype=jnp.float64)
+    state_er = jnp.asarray(state.Er)
+
+    def _evaluate_for_index(index: int):
+        index_value = jnp.asarray(index, dtype=jnp.int32)
+
+        def _evaluate_er(er_value):
+            if local_particle_flux is not None:
+                gamma = local_particle_flux(index_value, er_value)
+            else:
+                er_vec = state_er.at[index_value].set(jnp.asarray(er_value, dtype=state_er.dtype))
+                fluxes = runtime.models.flux(dataclasses.replace(state, Er=er_vec))
+                gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
+                if gamma is None:
+                    raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
+                gamma = gamma[:, index_value]
+            residual = jnp.sum(charge_qp * gamma)
+            entropy = jnp.sum(jnp.abs(gamma))
+            return residual, entropy
+
+        residual, entropy = jax.vmap(_evaluate_er)(er_grid_jax)
+        residual_np = np.asarray(jax.device_get(residual), dtype=float)
+        entropy_np = np.asarray(jax.device_get(entropy), dtype=float)
+        finite_residual = residual_np[np.isfinite(residual_np)]
+        return {
+            "residual": residual_np.tolist(),
+            "entropy": entropy_np.tolist(),
+            "residual_min": float(np.min(finite_residual)) if finite_residual.size else float("nan"),
+            "residual_max": float(np.max(finite_residual)) if finite_residual.size else float("nan"),
+            "residual_linf": float(np.max(np.abs(finite_residual))) if finite_residual.size else float("nan"),
+        }
+
+    return {str(index): _evaluate_for_index(index) for index in indices}
+
+
+def _residual_curve_rows(
+    frozen: dict[str, Any],
+    realtime: dict[str, Any],
+    *,
+    er_grid: np.ndarray,
+) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for key, frozen_row in frozen.items():
+        realtime_row = realtime[key]
+        frozen_residual = np.asarray(frozen_row["residual"], dtype=float)
+        realtime_residual = np.asarray(realtime_row["residual"], dtype=float)
+        delta = realtime_residual - frozen_residual
+        finite_delta = delta[np.isfinite(delta)]
+        denom = max(float(np.linalg.norm(np.nan_to_num(frozen_residual, nan=0.0))), 1.0e-30)
+        rows[key] = {
+            "er_grid": er_grid.tolist(),
+            "frozen": frozen_row,
+            "realtime": realtime_row,
+            "residual_delta_linf": float(np.max(np.abs(finite_delta))) if finite_delta.size else float("nan"),
+            "residual_delta_rel_l2": float(np.linalg.norm(np.nan_to_num(delta, nan=0.0)) / denom),
+        }
+    return rows
+
+
 def _print_top(title: str, rows: dict[str, dict[str, Any]], *, top: int) -> None:
     print(f"[compare] {title}")
     sorted_rows = sorted(rows.items(), key=lambda item: item[1]["rel_l2"], reverse=True)
@@ -181,6 +252,14 @@ def main() -> None:
     parser.add_argument("--realtime-config", default=str(DEFAULT_REALTIME_CONFIG))
     parser.add_argument("--json-output", default=None)
     parser.add_argument("--top", type=int, default=12)
+    parser.add_argument(
+        "--residual-curve-indices",
+        default=None,
+        help="Optional comma-separated radial indices for ambipolar residual curve diagnostics.",
+    )
+    parser.add_argument("--residual-curve-er-min", type=float, default=-60.0)
+    parser.add_argument("--residual-curve-er-max", type=float, default=30.0)
+    parser.add_argument("--residual-curve-count", type=int, default=121)
     args = parser.parse_args()
 
     frozen_path = Path(args.frozen_config).resolve()
@@ -228,6 +307,31 @@ def main() -> None:
             f"n_roots={row['frozen_n_roots']}->{row['realtime_n_roots']}"
         )
 
+    residual_curve_rows = None
+    residual_indices = _parse_index_list(args.residual_curve_indices)
+    if residual_indices:
+        er_grid = np.linspace(
+            float(args.residual_curve_er_min),
+            float(args.residual_curve_er_max),
+            int(args.residual_curve_count),
+            dtype=float,
+        )
+        print(
+            "[compare] ambipolar residual curves frozen vs realtime: "
+            f"indices={residual_indices} er=[{er_grid[0]:.6e}, {er_grid[-1]:.6e}] "
+            f"n={er_grid.size}"
+        )
+        frozen_curves = _ambipolar_residual_curves(frozen_path, indices=residual_indices, er_grid=er_grid)
+        realtime_curves = _ambipolar_residual_curves(realtime_path, indices=residual_indices, er_grid=er_grid)
+        residual_curve_rows = _residual_curve_rows(frozen_curves, realtime_curves, er_grid=er_grid)
+        for key, row in residual_curve_rows.items():
+            print(
+                f"  - i={key}: residual_delta_rel_l2={row['residual_delta_rel_l2']:.6e} "
+                f"residual_delta_linf={row['residual_delta_linf']:.6e} "
+                f"frozen_range=[{row['frozen']['residual_min']:.6e}, {row['frozen']['residual_max']:.6e}] "
+                f"realtime_range=[{row['realtime']['residual_min']:.6e}, {row['realtime']['residual_max']:.6e}]"
+            )
+
     payload = {
         "frozen_config": str(frozen_path),
         "realtime_config": str(realtime_path),
@@ -235,6 +339,8 @@ def main() -> None:
         "geometry": geometry_rows,
         "ambipolar_roots": root_rows,
     }
+    if residual_curve_rows is not None:
+        payload["ambipolar_residual_curves"] = residual_curve_rows
     if args.json_output:
         out = Path(args.json_output)
         out.parent.mkdir(parents=True, exist_ok=True)
