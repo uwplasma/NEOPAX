@@ -339,6 +339,45 @@ def _tree_selected_stats(left_tree, right_tree, *, indices: list[int], max_rows:
     }
 
 
+def _named_field_selected_stats(
+    left_obj,
+    right_obj,
+    field_names: tuple[str, ...],
+    *,
+    indices: list[int],
+    max_rows: int = 40,
+) -> dict[str, Any]:
+    rows = []
+    for name in field_names:
+        if not hasattr(left_obj, name) or not hasattr(right_obj, name):
+            continue
+        left_value = getattr(left_obj, name)
+        right_value = getattr(right_obj, name)
+        field_stats = _tree_selected_stats(left_value, right_value, indices=indices, max_rows=max_rows)
+        if not field_stats["tree_structure_equal"]:
+            rows.append(
+                {
+                    "name": name,
+                    "shape": [
+                        field_stats.get("left_leaf_count"),
+                        field_stats.get("right_leaf_count"),
+                    ],
+                    "rel_l2": float("inf"),
+                    "max_abs": float("inf"),
+                }
+            )
+            continue
+        for row in field_stats["worst"]:
+            row = dict(row)
+            row["name"] = name if row["name"] == "<root>" else f"{name}.{row['name']}"
+            rows.append(row)
+    rows.sort(key=lambda row: (not np.isfinite(row["rel_l2"]), row["rel_l2"]), reverse=True)
+    return {
+        "tree_structure_equal": True,
+        "worst": rows[:max_rows],
+    }
+
+
 def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -> dict[str, Any]:
     def _support(runtime):
         model = runtime.models.flux
@@ -352,6 +391,28 @@ def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -
     realtime_support = _support(realtime_runtime)
     frozen_center_prepared = frozen_support.center_prepared
     realtime_center_prepared = realtime_support.center_prepared
+    geometry_field_names = (
+        "nfp",
+        "iota",
+        "psi_p",
+        "transport_psi_scale",
+        "coefficient_psi_scale",
+        "grid",
+        "theta_2d",
+        "zeta_2d",
+        "b",
+        "d_b_dtheta",
+        "d_b_dzeta",
+        "jacobian",
+        "b_sub_theta",
+        "b_sub_zeta",
+        "b_sup_theta",
+        "b_sup_zeta",
+        "volume_prime",
+        "b2_mean",
+        "radial_drift_spatial",
+        "b0",
+    )
     return {
         "center_channels": _tree_selected_stats(
             frozen_support.center_channels,
@@ -366,6 +427,12 @@ def _ntx_support_rows(frozen_runtime, realtime_runtime, *, indices: list[int]) -
         "center_prepared_geometry": _tree_selected_stats(
             frozen_center_prepared.geometry,
             realtime_center_prepared.geometry,
+            indices=indices,
+        ),
+        "center_prepared_geometry_fields": _named_field_selected_stats(
+            frozen_center_prepared.geometry,
+            realtime_center_prepared.geometry,
+            geometry_field_names,
             indices=indices,
         ),
         "center_prepared_d_theta": _tree_selected_stats(
