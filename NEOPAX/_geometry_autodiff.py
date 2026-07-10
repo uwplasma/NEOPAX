@@ -526,29 +526,31 @@ def _solve_state_for_single_param(
         lane_key = str(lane).strip().lower()
         if lane_key not in {"forward", "ad"}:
             raise ValueError("lane must be 'forward' or 'ad'.")
-        max_iter_value = int(context.vmec_default_max_iter if max_iter is None else max_iter)
-        ftol_value = context.vmec_default_ftol
         if lane_key == "forward":
             input_eff = _input_with_boundary_delta(context, param_delta)
+            solve_kwargs = {"mode": "cli", "verbose": False}
+            if max_iter is not None:
+                solve_kwargs["max_iterations"] = int(max_iter)
+            if step_size is not None:
+                solve_kwargs["time_step"] = float(step_size)
             return vmec_jax.solve(
                 input_eff,
                 context.static.resolution,
-                ftol=ftol_value,
-                max_iterations=max_iter_value,
-                time_step=context.vmec_default_step_size if step_size is None else float(step_size),
-                mode="cli",
-                verbose=False,
+                **solve_kwargs,
             ).state
 
         del jacobian_penalty
         implicit = _import_vmec_jax_implicit()
         params = _implicit_params_with_boundary_delta(context, implicit, param_delta)
+        config_kwargs = {
+            "ns": int(context.static.resolution.ns),
+            "mode": "cli",
+        }
+        if max_iter is not None:
+            config_kwargs["max_iterations"] = int(max_iter)
         cfg = implicit.make_config(
             context.indata,
-            ns=int(context.static.resolution.ns),
-            ftol=ftol_value,
-            max_iterations=max_iter_value,
-            mode="cli",
+            **config_kwargs,
         )
         return implicit.solve_implicit(params, cfg)
 

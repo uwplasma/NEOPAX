@@ -159,7 +159,14 @@ def main() -> None:
         print(f"[compare] running vmec_jax.run_fixed_boundary with kwargs={run_kwargs}")
         driver_run = vj.run_fixed_boundary(input_path, **run_kwargs)
     else:
-        solve_kwargs: dict[str, Any] = {"verbose": False}
+        solve_kwargs: dict[str, Any] = {
+            "mode": "cli",
+            "verbose": False,
+        }
+        if geom_cfg.get("vmec_max_iter") is not None:
+            solve_kwargs["max_iterations"] = int(geom_cfg.get("vmec_max_iter"))
+        if geom_cfg.get("vmec_step_size") is not None:
+            solve_kwargs["time_step"] = float(geom_cfg.get("vmec_step_size"))
         if args.solver_device is not None:
             solve_kwargs["device"] = args.solver_device
         if args.driver_solver_mode is not None:
@@ -168,7 +175,7 @@ def main() -> None:
             print("[compare] --driver-solver is ignored by the current vmec_jax.solve API")
         inp = vj.VmecInput.from_file(input_path)
         print(f"[compare] running vmec_jax.solve with kwargs={solve_kwargs}")
-        driver_run = vj.solve(inp, **solve_kwargs)
+        driver_run = vj.solve(inp, context.static.resolution, **solve_kwargs)
     driver_state = driver_run.state
 
     rows = _compare_states(neopax_state, driver_state)
