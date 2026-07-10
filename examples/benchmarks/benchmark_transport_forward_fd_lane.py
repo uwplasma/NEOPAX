@@ -641,12 +641,13 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
-    initial_carry = _initial_carry_from_state_with_static_setup(
+    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    solve_vector_field = prepared_components["solve_vector_field"]
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
         solver=solver,
         state=state0,
-        solve_vector_field=solve_vector_field_static,
+        vector_field=solve_vector_field,
         species=runtime.species,
-        prepared_rollout_static=prepared_rollout_static,
     )
     stop_after_accepted_steps = (
         int(accepted_step_limit_override)
@@ -667,28 +668,28 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            initial_carry,
+            prepared_rollout.initial_carry,
         )
     elif derivative_mode_key == "jvp_step":
         final_y = _radau_adaptive_final_y_realized_schedule_step_fused(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            initial_carry,
+            prepared_rollout.initial_carry,
         )
     elif derivative_mode_key in {"jvp_exact", "exact", "direct"}:
         final_y = _radau_adaptive_final_y_realized_schedule_exact_jvp(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            initial_carry,
+            prepared_rollout.initial_carry,
         )
     else:
         raise NotImplementedError(
             "The scratch forward benchmark lane supports derivative_mode='jvp' "
             "derivative_mode='jvp_step', or derivative_mode='jvp_exact' only."
         )
-    final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 
 
