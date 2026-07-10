@@ -2032,126 +2032,15 @@ def _ntx_frozen_interp_mode_columns(interpolated_value, x_nodes, values, xq):
 def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     """Build an NTX VMEC surface using the same sampling convention as NTX's frozen loader."""
 
-    from ntx.geometry import VmecSurface
-    from ntx.vmec import _interpolated_value
+    import ntx
 
-    nfp = int(wout.nfp)
-    ns = int(wout.ns)
-    mpol = int(wout.mpol)
-    ntor = int(wout.ntor)
-    phi = np.asarray(wout.phi, dtype=np.float64)
-    psi_n_grid = phi / float(phi[-1])
-    radial_grid = psi_n_grid[1:]
-    target_psi_n = float(s)
-
-    base_mode_m = np.asarray(wout.xm, dtype=np.int32)
-    base_mode_n = np.asarray(wout.xn, dtype=np.int32)
-    coeff_mode_m = np.asarray(getattr(wout, "xm_nyq", wout.xm), dtype=np.int32)
-    selected_indices = np.arange(base_mode_m.size, dtype=np.int32)
-    selected_mode_m = base_mode_m
-    selected_mode_n = base_mode_n
-    if coeff_mode_m.shape[0] < base_mode_m.shape[0]:
-        raise ValueError("VMEC Nyquist coefficient table is smaller than the reduced mode table")
-
-    def _mode_major(values):
-        array = np.asarray(values, dtype=np.float64)
-        if array.ndim != 2:
-            raise ValueError("expected a 2D `(radius, mode)` array from vmec_jax")
-        return array.T
-
-    bmnc = _mode_major(wout.bmnc)
-    gmnc = _mode_major(wout.gmnc)
-    bsubumnc = _mode_major(wout.bsubumnc)
-    bsubvmnc = _mode_major(wout.bsubvmnc)
-    bsupumnc = _mode_major(wout.bsupumnc)
-    bsupvmnc = _mode_major(wout.bsupvmnc)
-    if hasattr(wout, "iotaf"):
-        iota_source = wout.iotaf
-    elif hasattr(wout, "iotas"):
-        iota_source = wout.iotas
-    else:
-        raise ValueError("vmec_jax wout data does not provide an iota profile")
-    iota_full = np.asarray(iota_source, dtype=np.float64)
-
-    b_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value, radial_grid, bmnc[selected_indices, 1:], target_psi_n
-    )
-    g_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value, radial_grid, gmnc[selected_indices, 1:], target_psi_n
-    )
-    b_sub_theta_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value,
-        radial_grid,
-        bsubumnc[selected_indices, 1:],
-        target_psi_n,
-    )
-    b_sub_zeta_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value,
-        radial_grid,
-        bsubvmnc[selected_indices, 1:],
-        target_psi_n,
-    )
-    b_sup_theta_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value,
-        radial_grid,
-        bsupumnc[selected_indices, 1:],
-        target_psi_n,
-    )
-    b_sup_zeta_interp = _ntx_frozen_interp_mode_columns(
-        _interpolated_value,
-        radial_grid,
-        bsupvmnc[selected_indices, 1:],
-        target_psi_n,
-    )
-    iota = -_interpolated_value(radial_grid, iota_full[1:], target_psi_n, order=2)
-
-    if selected_mode_m[0] != 0 or selected_mode_n[0] != 0:
-        raise ValueError("expected the first VMEC mode to be (m,n)=(0,0)")
-    b0 = float(b_interp[0])
-    if b0 == 0.0:
-        raise ValueError("VMEC mode (0,0) has zero magnetic-field strength")
-
-    aminor_p = float(np.asarray(wout.Aminor_p).reshape(()))
-    psi_a_hat = float(phi[-1]) / (2.0 * np.pi)
-    r_n = float(np.sqrt(target_psi_n))
-    r_hat = float(aminor_p * r_n)
-    dpsi_hat_dr_hat = float(2.0 * psi_a_hat * r_n / aminor_p)
-    if dpsi_hat_dr_hat == 0.0:
-        # The frozen benchmark path also prepares an axis entry.  Match that
-        # axis-safe behavior while keeping the non-axis frozen-style sampling.
-        dpsi_hat_dr_hat = 1.0
-    include = np.abs(b_interp / b0) >= 0.0
-    include[0] = True
-
-    return VmecSurface(
-        path=Path(source_path).expanduser(),
-        requested_psi_n=target_psi_n,
-        psi_n=target_psi_n,
-        nfp=nfp,
-        ns=ns,
-        mpol=mpol,
-        ntor=ntor,
-        total_mode_count=int(selected_mode_m.size),
-        loaded_mode_count=int(np.count_nonzero(include)),
-        iota=float(iota),
-        m=jnp.asarray(selected_mode_m[include], dtype=jnp.int32),
-        n=jnp.asarray(np.rint(-selected_mode_n[include] / nfp).astype(np.int32), dtype=jnp.int32),
-        b_cos=jnp.asarray(b_interp[include], dtype=jnp.float64),
-        jacobian_cos=jnp.asarray(g_interp[include], dtype=jnp.float64),
-        b_sub_theta_cos=jnp.asarray(b_sub_theta_interp[include], dtype=jnp.float64),
-        b_sub_zeta_cos=jnp.asarray(b_sub_zeta_interp[include], dtype=jnp.float64),
-        b_sup_theta_cos=jnp.asarray(b_sup_theta_interp[include], dtype=jnp.float64),
-        b_sup_zeta_cos=jnp.asarray(b_sup_zeta_interp[include], dtype=jnp.float64),
-        b0=b0,
-        psi_a_hat=psi_a_hat,
-        phi_edge=float(phi[-1]),
-        r_n=r_n,
-        r_hat=r_hat,
-        dpsi_hat_dr_hat=dpsi_hat_dr_hat,
-        dr_hat_dpsi_hat=float(1.0 / dpsi_hat_dr_hat),
-        aminor_p=aminor_p,
-        psi_p=None,
-        transport_psi_scale=dpsi_hat_dr_hat,
+    surface_fn = getattr(ntx, "surface_from_vmec_jax_vmec_wout", None)
+    if surface_fn is None:
+        from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout as surface_fn
+    return surface_fn(
+        wout,
+        s=float(s),
+        source_path=Path(source_path).expanduser(),
     )
 
 
