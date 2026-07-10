@@ -126,6 +126,56 @@ def _objective_stats(lhs, rhs) -> list[dict[str, Any]]:
     return rows
 
 
+def _objective_values_from_reference_payload(payload: dict[str, Any]) -> dict[str, float]:
+    raw_values = payload.get("objective_values")
+    if not isinstance(raw_values, dict):
+        raw_values = payload.get("objective_values_by_objective")
+    if isinstance(raw_values, dict):
+        return {
+            str(label): float(value)
+            for label, value in raw_values.items()
+            if label in OBJECTIVE_LABELS and value is not None
+        }
+    if isinstance(raw_values, list):
+        return {
+            label: float(value)
+            for label, value in zip(OBJECTIVE_LABELS, raw_values)
+            if value is not None
+        }
+    return {}
+
+
+def _reference_objective_consistency_rows(
+    reference_objective_values: dict[str, float],
+    live_objectives,
+) -> tuple[list[dict[str, Any]], float, float]:
+    live_np = np.asarray(jax.device_get(live_objectives), dtype=float)
+    rows = []
+    for label, live_value in zip(OBJECTIVE_LABELS, live_np.tolist()):
+        if label not in reference_objective_values:
+            continue
+        reference_value = float(reference_objective_values[label])
+        delta = float(live_value - reference_value)
+        rows.append(
+            {
+                "objective": label,
+                "reference_value": reference_value,
+                "live_reverse_primal": float(live_value),
+                "delta_live_minus_reference": delta,
+                "relative_delta": float(
+                    abs(delta) / max(abs(float(live_value)), abs(reference_value), 1.0e-30)
+                ),
+            }
+        )
+    if not rows:
+        return rows, float("nan"), float("nan")
+    return (
+        rows,
+        max(abs(row["delta_live_minus_reference"]) for row in rows),
+        max(row["relative_delta"] for row in rows),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
@@ -311,8 +361,42 @@ def main() -> None:
 
     forward_fusion_tangent_compare = None
     reference_reverse_n0 = None
+    reference_objective_consistency = None
     if args.reference_gradient_json is not None:
         ref_payload = json.loads(Path(args.reference_gradient_json).read_text(encoding="utf-8"))
+        reference_objective_values = _objective_values_from_reference_payload(ref_payload)
+        if reference_objective_values:
+            consistency_rows, max_reference_abs, max_reference_rel = _reference_objective_consistency_rows(
+                reference_objective_values,
+                reverse_objectives_vjp,
+            )
+            reference_objective_consistency = {
+                "rows": consistency_rows,
+                "max_absolute_delta": float(max_reference_abs),
+                "max_relative_delta": float(max_reference_rel),
+                "warning": bool(max_reference_abs > 1.0e-8 or max_reference_rel > 1.0e-8),
+            }
+            print(
+                "[compare] reference-gradient JSON primal consistency: "
+                f"max_abs={max_reference_abs:.6e} max_rel={max_reference_rel:.6e}"
+            )
+            if reference_objective_consistency["warning"]:
+                print(
+                    "[compare] WARNING reference-gradient JSON objective values do not match "
+                    "the live reverse primal; tangent-vs-reverse comparisons may be stale."
+                )
+        else:
+            reference_objective_consistency = {
+                "rows": [],
+                "max_absolute_delta": None,
+                "max_relative_delta": None,
+                "warning": True,
+                "message": "reference JSON has no objective_values block to validate against live primal",
+            }
+            print(
+                "[compare] WARNING reference-gradient JSON has no objective_values block; "
+                "cannot verify whether gradient comparisons are from the current primal."
+            )
         gradient_by_objective = ref_payload.get(
             "gradient_reverse_ad_by_objective",
             ref_payload.get("gradient_by_objective", {}),
@@ -408,6 +492,7 @@ def main() -> None:
         "fused_forward_plain_call_vs_jvp_primal": rows_fused_plain_call,
         "fused_forward_tangent_n0": np.asarray(jax.device_get(fused_forward_tangents), dtype=float).tolist(),
         "reference_gradient_json": args.reference_gradient_json,
+        "reference_objective_consistency": reference_objective_consistency,
         "forward_fusion_tangent_compare_n0": forward_fusion_tangent_compare,
         "max_relative_delta_vjp": float(max_rel_vjp),
         "max_relative_delta_plain": float(max_rel_plain),
