@@ -153,7 +153,10 @@ def _build_current_vmec_jax_context(vmec_jax, vmec_input: Path):
     from vmec_jax.core.setup import boundary_from_input
     from vmec_jax.core.solver import prepare_runtime, resolution_from_input
 
-    resolution = resolution_from_input(inp)
+    ns_array = np.atleast_1d(np.asarray(inp.ns_array, dtype=np.int64)).ravel()
+    ns_array = ns_array[ns_array > 0]
+    final_ns = int(ns_array[-1]) if ns_array.size else None
+    resolution = resolution_from_input(inp, ns=final_ns)
     runtime = prepare_runtime(inp, resolution)
     static = _VmecStaticCompat(
         cfg=inp,
@@ -528,14 +531,17 @@ def _solve_state_for_single_param(
             raise ValueError("lane must be 'forward' or 'ad'.")
         if lane_key == "forward":
             input_eff = _input_with_boundary_delta(context, param_delta)
+            from vmec_jax.core.multigrid import solve_multigrid
+
             solve_kwargs = {"mode": "cli", "verbose": False}
             if max_iter is not None:
-                solve_kwargs["max_iterations"] = int(max_iter)
+                niter_array = np.asarray(input_eff.niter_array, dtype=np.int64).copy()
+                niter_array[-1] = int(max_iter)
+                solve_kwargs["niter_array"] = niter_array
             if step_size is not None:
                 solve_kwargs["time_step"] = float(step_size)
-            return vmec_jax.solve(
+            return solve_multigrid(
                 input_eff,
-                context.static.resolution,
                 **solve_kwargs,
             ).state
 
@@ -545,6 +551,7 @@ def _solve_state_for_single_param(
         config_kwargs = {
             "ns": int(context.static.resolution.ns),
             "mode": "cli",
+            "multigrid": True,
         }
         if max_iter is not None:
             config_kwargs["max_iterations"] = int(max_iter)

@@ -2,7 +2,7 @@
 
 This diagnostic deliberately stops before WOUT, NTX, Boozer, and transport.
 It answers the primitive question: does NEOPAX's realtime geometry path build
-the same VMEC state as `vmec_jax.run_fixed_boundary(...)` from the same input?
+the same VMEC state as the public vmec_jax multigrid driver from the same input?
 """
 
 from __future__ import annotations
@@ -163,8 +163,11 @@ def main() -> None:
             "mode": "cli",
             "verbose": False,
         }
+        inp = vj.VmecInput.from_file(input_path)
         if geom_cfg.get("vmec_max_iter") is not None:
-            solve_kwargs["max_iterations"] = int(geom_cfg.get("vmec_max_iter"))
+            niter_array = np.asarray(inp.niter_array, dtype=np.int64).copy()
+            niter_array[-1] = int(geom_cfg.get("vmec_max_iter"))
+            solve_kwargs["niter_array"] = niter_array
         if geom_cfg.get("vmec_step_size") is not None:
             solve_kwargs["time_step"] = float(geom_cfg.get("vmec_step_size"))
         if args.solver_device is not None:
@@ -173,9 +176,10 @@ def main() -> None:
             solve_kwargs["mode"] = args.driver_solver_mode
         if args.driver_solver is not None:
             print("[compare] --driver-solver is ignored by the current vmec_jax.solve API")
-        inp = vj.VmecInput.from_file(input_path)
-        print(f"[compare] running vmec_jax.solve with kwargs={solve_kwargs}")
-        driver_run = vj.solve(inp, context.static.resolution, **solve_kwargs)
+        from vmec_jax.core.multigrid import solve_multigrid
+
+        print(f"[compare] running vmec_jax.solve_multigrid with kwargs={solve_kwargs}")
+        driver_run = solve_multigrid(inp, **solve_kwargs)
     driver_state = driver_run.state
 
     rows = _compare_states(neopax_state, driver_state)
