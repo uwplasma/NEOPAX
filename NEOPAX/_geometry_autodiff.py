@@ -2119,16 +2119,10 @@ def build_ntx_exact_lij_support_from_vmec_state(
             "ntx_exact_surface_backend for realtime geometry must be one of "
             "'vmec', 'booz', or 'auto'."
         )
-    center_iota_targets = _ntx_surface_iota_targets(geometry, rho_center)
-    face_iota_targets = _ntx_surface_iota_targets(geometry, rho_face)
-    center_surfaces = tuple(
-        _align_ntx_surface_iota_convention(surface, center_iota_targets[index])
-        for index, surface in enumerate(center_surfaces)
-    )
-    face_surfaces = tuple(
-        _align_ntx_surface_iota_convention(surface, face_iota_targets[index])
-        for index, surface in enumerate(face_surfaces)
-    )
+    # Keep the prepared NTX surfaces in NTX's file-backed Boozer convention.
+    # The runtime scan channels below are built separately from NEOPAX geometry
+    # so they can mirror the frozen-file channel convention without forcing the
+    # prepared monoenergetic geometry to flip away from NTX's convention.
     grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
 
     def _stack_optional(*values):
