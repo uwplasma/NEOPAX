@@ -22,11 +22,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from NEOPAX._config import load_config  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _solve_state_for_single_param,
     build_geometry_autodiff_context,
 )
+from NEOPAX._orchestrator import load_config  # noqa: E402
 
 DEFAULT_REALTIME_CONFIG = (
     ROOT
