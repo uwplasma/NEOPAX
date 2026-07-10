@@ -601,6 +601,33 @@ def _initial_carry_from_state_with_static_setup(
     return _radau_carry_from_step_state(step_state0)
 
 
+def _realized_schedule_step_limit(
+    *,
+    solver,
+    execution_context,
+    initial_carry,
+    stop_after_accepted_steps: int | None,
+) -> int:
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    if stop_after_accepted_steps is None:
+        return max_total_steps
+    max_total_steps = min(
+        max_total_steps,
+        max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+    )
+    schedule_probe = _radau_adaptive_schedule_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
+    return min(
+        max_total_steps,
+        max(actual_attempt_count + 2, int(stop_after_accepted_steps)),
+    )
+
+
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
     parameter_value,
     *,
@@ -641,55 +668,52 @@ def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
+    initial_carry = _initial_carry_from_state_with_static_setup(
         solver=solver,
         state=state0,
-        vector_field=solve_vector_field,
+        solve_vector_field=solve_vector_field_static,
         species=runtime.species,
+        prepared_rollout_static=prepared_rollout_static,
     )
     stop_after_accepted_steps = (
         int(accepted_step_limit_override)
         if accepted_step_limit_override is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
-    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-    if stop_after_accepted_steps is not None:
-        # Prefix AD tests should not materialize the full production max-step
-        # trace. Keep enough room for rejected attempts while bounding memory.
-        max_total_steps = min(
-            max_total_steps,
-            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
-        )
+    max_total_steps = _realized_schedule_step_limit(
+        solver=solver,
+        execution_context=execution_context,
+        initial_carry=prepared_rollout_static.initial_carry,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
     derivative_mode_key = str(derivative_mode).strip().lower()
     if derivative_mode_key == "jvp":
         final_y = _radau_adaptive_final_y_realized_schedule(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     elif derivative_mode_key == "jvp_step":
         final_y = _radau_adaptive_final_y_realized_schedule_step_fused(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     elif derivative_mode_key in {"jvp_exact", "exact", "direct"}:
         final_y = _radau_adaptive_final_y_realized_schedule_exact_jvp(
             execution_context,
             max_total_steps,
             stop_after_accepted_steps,
-            prepared_rollout.initial_carry,
+            initial_carry,
         )
     else:
         raise NotImplementedError(
             "The scratch forward benchmark lane supports derivative_mode='jvp' "
             "derivative_mode='jvp_step', or derivative_mode='jvp_exact' only."
         )
-    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    final_state = prepared_rollout_static.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 
 
