@@ -74,6 +74,17 @@ def _fused_forward_objective_fn_for_mode(
             accepted_step_limit_override=accepted_step_limit_override,
             derivative_mode="jvp_step",
         )
+    if mode == "exact":
+        return lambda p: _adaptive_rollout_objectives_realized_schedule_only_for_parameter(  # noqa: E731
+            p,
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            parameter_name=PARAMETER_ORDER[0],
+            accepted_step_limit_override=accepted_step_limit_override,
+            derivative_mode="jvp_exact",
+        )
     raise ValueError(f"Unknown forward AD fusion mode: {mode}")
 
 
@@ -201,10 +212,11 @@ def main() -> None:
         "--forward-ad-fusion-mode",
         type=str,
         default="replay",
-        choices=("replay", "step"),
+        choices=("replay", "step", "exact"),
         help=(
             "Forward custom-JVP tangent path to diagnose. 'replay' is the recovered "
-            "reference replay helper; 'step' uses the step-fused accepted-step path."
+            "reference replay helper; 'step' uses the step-fused accepted-step path; "
+            "'exact' differentiates raw accepted-step attempts on the frozen realized schedule."
         ),
     )
     parser.add_argument(
@@ -215,7 +227,7 @@ def main() -> None:
     parser.add_argument(
         "--compare-forward-fusion-modes",
         action="store_true",
-        help="Also run replay and step forward custom-JVP tangent paths and print their tangent deltas.",
+        help="Also run replay, step, and exact forward custom-JVP tangent paths and print their tangent deltas.",
     )
     parser.add_argument(
         "--reference-gradient-json",
@@ -426,20 +438,42 @@ def main() -> None:
             baseline_value=baseline_values[0],
             accepted_step_limit_override=args.accepted_step_limit,
         )
+        _, exact_objectives, exact_tangents = _forward_tangents_for_mode(
+            "exact",
+            config=config,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            baseline_value=baseline_values[0],
+            accepted_step_limit_override=args.accepted_step_limit,
+        )
         replay_np = np.asarray(jax.device_get(replay_tangents), dtype=float)
         step_np = np.asarray(jax.device_get(step_tangents), dtype=float)
+        exact_np = np.asarray(jax.device_get(exact_tangents), dtype=float)
         objective_rows = _objective_stats(replay_objectives, step_objectives)
+        exact_objective_rows = _objective_stats(replay_objectives, exact_objectives)
         forward_fusion_tangent_compare = []
         print("[compare] forward custom-JVP n0 tangent mode comparison")
-        for label, replay_value, step_value in zip(OBJECTIVE_LABELS, replay_np.tolist(), step_np.tolist()):
+        for label, replay_value, step_value, exact_value in zip(
+            OBJECTIVE_LABELS,
+            replay_np.tolist(),
+            step_np.tolist(),
+            exact_np.tolist(),
+        ):
             delta_step_minus_replay = float(step_value - replay_value)
+            delta_exact_minus_replay = float(exact_value - replay_value)
             row = {
                 "objective": label,
                 "replay_tangent": float(replay_value),
                 "step_tangent": float(step_value),
+                "exact_tangent": float(exact_value),
                 "delta_step_minus_replay": delta_step_minus_replay,
+                "delta_exact_minus_replay": delta_exact_minus_replay,
                 "relative_delta_step_vs_replay": float(
                     abs(delta_step_minus_replay) / max(abs(float(replay_value)), 1.0e-30)
+                ),
+                "relative_delta_exact_vs_replay": float(
+                    abs(delta_exact_minus_replay) / max(abs(float(replay_value)), 1.0e-30)
                 ),
             }
             if reference_reverse_n0 is not None and label in reference_reverse_n0:
@@ -447,24 +481,34 @@ def main() -> None:
                 row["reverse_n0"] = reverse_value
                 row["delta_replay_minus_reverse"] = float(replay_value - reverse_value)
                 row["delta_step_minus_reverse"] = float(step_value - reverse_value)
+                row["delta_exact_minus_reverse"] = float(exact_value - reverse_value)
                 row["relative_delta_replay_vs_reverse"] = float(
                     abs(float(replay_value) - reverse_value) / max(abs(reverse_value), 1.0e-30)
                 )
                 row["relative_delta_step_vs_reverse"] = float(
                     abs(float(step_value) - reverse_value) / max(abs(reverse_value), 1.0e-30)
                 )
+                row["relative_delta_exact_vs_reverse"] = float(
+                    abs(float(exact_value) - reverse_value) / max(abs(reverse_value), 1.0e-30)
+                )
                 print(
                     f"  - {label}: replay={float(replay_value):.16e} "
-                    f"step={float(step_value):.16e} reverse={reverse_value:.16e} "
+                    f"step={float(step_value):.16e} "
+                    f"exact={float(exact_value):.16e} "
+                    f"reverse={reverse_value:.16e} "
                     f"step-replay={delta_step_minus_replay:.6e} "
+                    f"exact-replay={delta_exact_minus_replay:.6e} "
                     f"replay-rev={row['delta_replay_minus_reverse']:.6e} "
-                    f"step-rev={row['delta_step_minus_reverse']:.6e}"
+                    f"step-rev={row['delta_step_minus_reverse']:.6e} "
+                    f"exact-rev={row['delta_exact_minus_reverse']:.6e}"
                 )
             else:
                 print(
                     f"  - {label}: replay={float(replay_value):.16e} "
                     f"step={float(step_value):.16e} "
+                    f"exact={float(exact_value):.16e} "
                     f"step-replay={delta_step_minus_replay:.6e} "
+                    f"exact-replay={delta_exact_minus_replay:.6e} "
                     f"rel={row['relative_delta_step_vs_replay']:.6e}"
                 )
             forward_fusion_tangent_compare.append(row)
@@ -473,6 +517,14 @@ def main() -> None:
             print(
                 f"  - {row['objective']}: replay={row['forward_primal']:.16e} "
                 f"step={row['reverse_primal']:.16e} "
+                f"delta={row['delta_reverse_minus_forward']:.6e} "
+                f"rel={row['relative_delta']:.6e}"
+            )
+        print("[compare] forward custom-JVP replay primal vs exact primal")
+        for row in exact_objective_rows:
+            print(
+                f"  - {row['objective']}: replay={row['forward_primal']:.16e} "
+                f"exact={row['reverse_primal']:.16e} "
                 f"delta={row['delta_reverse_minus_forward']:.6e} "
                 f"rel={row['relative_delta']:.6e}"
             )

@@ -198,10 +198,11 @@ def main() -> None:
         "--forward-ad-fusion-mode",
         type=str,
         default="replay",
-        choices=("replay", "step"),
+        choices=("replay", "step", "exact"),
         help=(
             "Forward AD implementation. 'replay' is the recovered reference; "
-            "'step' is the experimental shared primal/tangent accepted-step path."
+            "'step' is the experimental shared primal/tangent accepted-step path; "
+            "'exact' differentiates raw accepted-step attempts on the frozen realized schedule."
         ),
     )
     args = parser.parse_args()
@@ -229,7 +230,7 @@ def main() -> None:
                 parameter_name=args.parameter,
                 accepted_step_limit_override=args.accepted_step_limit,
             )
-        else:
+        elif args.forward_ad_fusion_mode == "step":
             objective_fn = lambda p: _forward_fd_lane_realized_schedule_objectives(  # noqa: E731
                 p,
                 config=config,
@@ -239,6 +240,17 @@ def main() -> None:
                 parameter_name=args.parameter,
                 accepted_step_limit_override=args.accepted_step_limit,
                 derivative_mode="jvp_step",
+            )
+        else:
+            objective_fn = lambda p: _forward_fd_lane_realized_schedule_objectives(  # noqa: E731
+                p,
+                config=config,
+                runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                parameter_name=args.parameter,
+                accepted_step_limit_override=args.accepted_step_limit,
+                derivative_mode="jvp_exact",
             )
     else:
         if args.forward_ad_fusion_mode != "replay":

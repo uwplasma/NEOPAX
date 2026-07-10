@@ -9410,6 +9410,7 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
     max_total_steps: int,
     stop_after_accepted_steps: int | None = None,
     shared_primal_attempt: bool = False,
+    raw_attempt_jvp: bool = False,
 ):
     """Run primal adaptive control and accepted-step tangent propagation together.
 
@@ -9587,7 +9588,12 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
             )
 
             def _accepted_map(carry_value):
-                attempt_result = _execute_radau_accepted_step_attempt_autodiff(
+                attempt_fn = (
+                    _execute_radau_accepted_step_attempt
+                    if raw_attempt_jvp
+                    else _execute_radau_accepted_step_attempt_autodiff
+                )
+                attempt_result = attempt_fn(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     _radau_carry_with_forward_only_jvp_fields(carry_value),
@@ -10383,6 +10389,50 @@ def _radau_adaptive_final_y_realized_schedule_step_fused_jvp(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
         shared_primal_attempt=True,
+    )
+    return primal_out, tangent_out
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2))
+def _radau_adaptive_final_y_realized_schedule_exact_jvp(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    """Forward-AD diagnostic path using raw accepted-step JVPs.
+
+    The adaptive schedule remains frozen exactly as in the realized-schedule
+    lane. Only accepted attempts propagate tangent information; rejected
+    attempts update primal/controller cache state with zero tangent.
+    """
+
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return rollout.final_carry.y
+
+
+@_radau_adaptive_final_y_realized_schedule_exact_jvp.defjvp
+def _radau_adaptive_final_y_realized_schedule_exact_jvp_rule(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    primals,
+    tangents,
+):
+    (carry0,) = primals
+    (carry0_dot,) = tangents
+    primal_out, tangent_out = _radau_adaptive_final_y_realized_schedule_fused_jvp(
+        execution_context,
+        carry0,
+        carry0_dot,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+        raw_attempt_jvp=True,
     )
     return primal_out, tangent_out
 
