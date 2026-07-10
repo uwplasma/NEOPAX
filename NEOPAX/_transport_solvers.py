@@ -9509,6 +9509,10 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
             )
 
         def _run_primal(_):
+            if not shared_primal_attempt:
+                next_state, info = _radau_step_fn(execution_context, step_state, None)
+                return next_state, info, _inactive_attempt_result(next_state)
+
             status = step_state.status
             fail_code = status[1]
             n_accepted = status[2]
