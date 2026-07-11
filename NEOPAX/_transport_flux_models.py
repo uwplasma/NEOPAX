@@ -1014,15 +1014,19 @@ def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
 
 def _import_ntx():
     _install_vmec_jax_api_compat_for_ntx()
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate_srcs = (
+        repo_root.parent / "NTX" / "src",
+        repo_root / "NTX" / "src",
+    )
+    for ntx_src in candidate_srcs:
+        if ntx_src.is_dir() and str(ntx_src) not in sys.path:
+            sys.path.insert(0, str(ntx_src))
     try:
         import ntx
 
         return ntx
     except ImportError:
-        repo_root = Path(__file__).resolve().parents[2]
-        ntx_src = repo_root / "NTX" / "src"
-        if ntx_src.is_dir() and str(ntx_src) not in sys.path:
-            sys.path.insert(0, str(ntx_src))
         import ntx
 
         return ntx
