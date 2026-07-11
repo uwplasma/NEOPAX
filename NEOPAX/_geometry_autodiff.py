@@ -685,10 +685,10 @@ def _solve_state_for_single_param(
         max_iter=max_iter_value,
         step_size=step_size_value,
         ftol=context.vmec_default_ftol,
-        edge_Rcos=state0.Rcos[-1, :],
-        edge_Rsin=state0.Rsin[-1, :],
-        edge_Zcos=state0.Zcos[-1, :],
-        edge_Zsin=state0.Zsin[-1, :],
+        edge_Rcos=_vmec_state_field(state0, "Rcos", "R_cos")[-1, :],
+        edge_Rsin=_vmec_state_field(state0, "Rsin", "R_sin")[-1, :],
+        edge_Zcos=_vmec_state_field(state0, "Zcos", "Z_cos")[-1, :],
+        edge_Zsin=_vmec_state_field(state0, "Zsin", "Z_sin")[-1, :],
     )
 
 
@@ -696,6 +696,12 @@ def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) 
     matches = jnp.where((ixm_b == int(m)) & (ixn_b == int(n)), size=1, fill_value=-1)[0]
     match = int(matches[0])
     return None if match < 0 else match
+
+
+def _vmec_state_field(state, legacy_name: str, current_name: str):
+    if hasattr(state, current_name):
+        return getattr(state, current_name)
+    return getattr(state, legacy_name)
 
 
 def _smooth_negative_part_penalty(values: jnp.ndarray, *, softness: float = 1.0e-3) -> jnp.ndarray:
@@ -907,7 +913,7 @@ def _vmec_scalar_observables_from_state(
         "dmerc_objective_mid": jnp.asarray(dmerc_objective_samples[1], dtype=jnp.float64),
         "dmerc_objective_hi": jnp.asarray(dmerc_objective_samples[2], dtype=jnp.float64),
         "mirror_ratio_objective": jnp.asarray(mirror_ratio_objective, dtype=jnp.float64),
-        "edge_r00": jnp.asarray(state.Rcos[-1, 0]),
+        "edge_r00": jnp.asarray(_vmec_state_field(state, "Rcos", "R_cos")[-1, 0]),
     }
 
 
@@ -1014,7 +1020,7 @@ def _vmec_booz_scalar_observables_from_state(
         "dmerc_objective_lo": jnp.asarray(dmerc_objective_samples[0], dtype=jnp.float64),
         "dmerc_objective_mid": jnp.asarray(dmerc_objective_samples[1], dtype=jnp.float64),
         "dmerc_objective_hi": jnp.asarray(dmerc_objective_samples[2], dtype=jnp.float64),
-        "aspect_proxy": jnp.asarray(state.Rcos[-1, mode00]),
+        "aspect_proxy": jnp.asarray(_vmec_state_field(state, "Rcos", "R_cos")[-1, mode00]),
     }
     if mode10 is not None:
         b10 = bmnc_b[:, mode10]
@@ -1132,7 +1138,6 @@ def _interp_radial_grid(values_full: jnp.ndarray, s_full: jnp.ndarray, s_query: 
 
 
 def _vmec_state_for_custom_grid(vmec_jax, state, static):
-    VMECState = _resolve_vmec_attr(vmec_jax, "VMECState", submodule="state")
     vmec_m1_internal_to_physical_signed = _resolve_vmec_attr(
         vmec_jax,
         "vmec_m1_internal_to_physical_signed",
@@ -1145,23 +1150,29 @@ def _vmec_state_for_custom_grid(vmec_jax, state, static):
     if not (lconm1 and (lthreed or lasym) and int(getattr(cfg, "mpol", 0)) > 1):
         return state
     Rcos, Zsin, Rsin, Zcos = vmec_m1_internal_to_physical_signed(
-        Rcos=state.Rcos,
-        Zsin=state.Zsin,
-        Rsin=state.Rsin,
-        Zcos=state.Zcos,
+        Rcos=_vmec_state_field(state, "Rcos", "R_cos"),
+        Zsin=_vmec_state_field(state, "Zsin", "Z_sin"),
+        Rsin=_vmec_state_field(state, "Rsin", "R_sin"),
+        Zcos=_vmec_state_field(state, "Zcos", "Z_cos"),
         modes=static.modes,
         lthreed=lthreed,
         lasym=lasym,
         lconm1=lconm1,
     )
-    return VMECState(
-        layout=state.layout,
+    if hasattr(state, "R_cos"):
+        return dataclasses.replace(
+            state,
+            R_cos=Rcos,
+            R_sin=Rsin,
+            Z_cos=Zcos,
+            Z_sin=Zsin,
+        )
+    return dataclasses.replace(
+        state,
         Rcos=Rcos,
         Rsin=Rsin,
         Zcos=Zcos,
         Zsin=Zsin,
-        Lcos=state.Lcos,
-        Lsin=state.Lsin,
     )
 
 
