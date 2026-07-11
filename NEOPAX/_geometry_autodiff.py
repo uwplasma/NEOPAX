@@ -256,14 +256,28 @@ def _build_vmec_fixed_context(vmec_jax, *, static, indata, boundary):
     initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
     eval_geom = _resolve_vmec_attr(vmec_jax, "eval_geom", submodule="geom")
     signgs_from_sqrtg = _resolve_vmec_attr(vmec_jax, "signgs_from_sqrtg", submodule="field")
-    flux_profiles_from_indata = _resolve_vmec_attr(vmec_jax, "flux_profiles_from_indata", submodule="energy")
     eval_profiles = _resolve_vmec_attr(vmec_jax, "eval_profiles", submodule="profiles")
     booz_xform_inputs_from_state = _resolve_vmec_attr(vmec_jax, "booz_xform_inputs_from_state", submodule="booz_input")
 
     st_guess = initial_guess_from_boundary(static, boundary, indata, vmec_project=False)
     geom = eval_geom(st_guess, static)
     signgs = int(signgs_from_sqrtg(np.asarray(geom.sqrtg), axis_index=1))
-    flux = flux_profiles_from_indata(indata, jnp.asarray(static.s), signgs=signgs)
+    try:
+        flux_profiles_from_indata = _resolve_vmec_attr(vmec_jax, "flux_profiles_from_indata", submodule="energy")
+        flux = flux_profiles_from_indata(indata, jnp.asarray(static.s), signgs=signgs)
+    except (AttributeError, ModuleNotFoundError):
+        from vmec_jax.core.setup import flux_profiles, radial_grids
+
+        grids = radial_grids(int(jnp.asarray(static.s).shape[0]), dtype=jnp.asarray(static.s).dtype)
+        flux = SimpleNamespace(
+            **flux_profiles(
+                indata,
+                grids,
+                r00=getattr(boundary, "r00", jnp.asarray(1.0, dtype=jnp.asarray(static.s).dtype)),
+                signgs=signgs,
+                lflip=bool(getattr(boundary, "lflip", False)),
+            )
+        )
     prof = eval_profiles(indata, jnp.asarray(static.s))
     pressure = jnp.asarray(prof.get("pressure", jnp.zeros_like(jnp.asarray(static.s))))
     booz_inputs = booz_xform_inputs_from_state(
@@ -1870,8 +1884,6 @@ def _build_neopax_geometry_from_state(
     n_r: int,
 ):
     from NEOPAX._geometry_models import VmecBoozer
-    from vmec_jax.energy import flux_profiles_from_indata
-    from vmec_jax.integrals import cumrect_s_halfmesh
     try:
         from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
     except ModuleNotFoundError:
@@ -1941,8 +1953,14 @@ def _build_neopax_geometry_from_state(
         )
     )
 
-    flux = flux_profiles_from_indata(context.indata, s_full, signgs=int(context.signgs))
-    phi = cumrect_s_halfmesh(jnp.asarray(flux.phipf), s_full)
+    phipf = jnp.asarray(context.flux.phipf)
+    phi = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=phipf.dtype),
+            jnp.cumsum(phipf[1:] * (s_full[1:] - s_full[:-1])),
+        ],
+        axis=0,
+    )
     # VMEC/JAX gives the toroidal-flux integral per field period/radian here,
     # while the frozen wout-backed transport lane uses wout.phi[-1].
     psia = jnp.abs(phi[-1]) * (2.0 * jnp.pi)
