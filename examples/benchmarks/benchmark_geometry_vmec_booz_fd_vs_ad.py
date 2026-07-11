@@ -213,6 +213,17 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6, help="Relative FD step.")
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-8, help="Absolute FD step.")
     parser.add_argument(
+        "--fd-lane",
+        type=str,
+        default="forward",
+        choices=("forward", "ad"),
+        help=(
+            "Lane used for centered finite differences. 'forward' preserves the "
+            "historical solve_multigrid/run_fixed_boundary comparison; 'ad' "
+            "finite-differences the same implicit primal map used by reverse AD."
+        ),
+    )
+    parser.add_argument(
         "--ad-backend",
         type=str,
         default="exact_optimizer",
@@ -291,7 +302,8 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
     )
     print(
         "[geometry-fd-ad] "
-        f"vmec forward_lane=run_fixed_boundary ad_backend={args.ad_backend} max_iter={resolved_max_iter} "
+        f"vmec forward_lane=run_fixed_boundary fd_lane={args.fd_lane} "
+        f"ad_backend={args.ad_backend} max_iter={resolved_max_iter} "
         f"step_size={resolved_step_size:.6e} mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
@@ -308,7 +320,7 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
     )
     reverse_jacobian = None if args.skip_reverse_check else _implicit_reverse_jacobian(ad_func, len(param_specs))
 
-    print("[geometry-fd-ad] progress: running forward-lane centered finite differences per parameter", flush=True)
+    print(f"[geometry-fd-ad] progress: running {args.fd_lane}-lane centered finite differences per parameter", flush=True)
     fd_by_param = []
     for i, (param_family, param_m, param_n) in enumerate(param_specs):
         single_context = build_geometry_autodiff_context(
@@ -323,7 +335,7 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         fd_func = _observable_function(
             args,
             single_context,
-            lane="forward",
+            lane=args.fd_lane,
             resolved_max_iter=resolved_max_iter,
             resolved_step_size=resolved_step_size,
         )
@@ -369,7 +381,7 @@ def _run_single_parameter(args, *, param_family: str, param_m: int, param_n: int
     fd_func = _observable_function(
         args,
         context,
-        lane="forward",
+        lane=args.fd_lane,
         resolved_max_iter=resolved_max_iter,
         resolved_step_size=resolved_step_size,
     )
@@ -396,12 +408,12 @@ def _run_single_parameter(args, *, param_family: str, param_m: int, param_n: int
             "[geometry-fd-ad] progress: skipping forward JVP because implicit solve is custom_vjp-only",
             flush=True,
         )
-    print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
+    print(f"[geometry-fd-ad] progress: running {args.fd_lane}-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
 
     fd_five = None
     if args.with_five_point:
-        print("[geometry-fd-ad] progress: running forward-lane five-point finite difference", flush=True)
+        print(f"[geometry-fd-ad] progress: running {args.fd_lane}-lane five-point finite difference", flush=True)
         fd_five = five_point_fd_single_param(fd_func, h, minus=minus, plus=plus)
 
     reverse_ad = None
