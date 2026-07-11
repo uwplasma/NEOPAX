@@ -1884,14 +1884,6 @@ def _build_neopax_geometry_from_state(
     n_r: int,
 ):
     from NEOPAX._geometry_models import VmecBoozer
-    try:
-        from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
-    except ModuleNotFoundError:
-        from vmec_jax.kernels.forces import vmec_forces_rz_from_wout
-    try:
-        from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
-    except ModuleNotFoundError:
-        from vmec_jax.kernels.residue import vmec_force_norms_from_bcovar_dynamic
 
     rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
     if int(n_r) > 1:
@@ -1904,31 +1896,76 @@ def _build_neopax_geometry_from_state(
         )
     else:
         rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
-    wout_like = type(
-        "WoutLike",
-        (),
-        {
-            "nfp": int(context.static.cfg.nfp),
-            "mpol": int(context.static.cfg.mpol),
-            "ntor": int(context.static.cfg.ntor),
-            "lasym": bool(context.static.cfg.lasym),
-            "signgs": int(context.signgs),
-        },
-    )()
-    kernels = vmec_forces_rz_from_wout(
-        state=state,
-        static=context.static,
-        wout=wout_like,
-        indata=context.indata,
-        use_vmec_synthesis=True,
-        trig=context.static.trig_vmec,
-    )
-    norms = vmec_force_norms_from_bcovar_dynamic(
-        bc=kernels.bc,
-        trig=context.static.trig_vmec,
-        s=jnp.asarray(context.static.s),
-        signgs=int(context.signgs),
-    )
+    try:
+        from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
+        from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
+    except ModuleNotFoundError:
+        try:
+            from vmec_jax.kernels.forces import vmec_forces_rz_from_wout
+            from vmec_jax.kernels.residue import vmec_force_norms_from_bcovar_dynamic
+        except ModuleNotFoundError:
+            vmec_forces_rz_from_wout = None
+            vmec_force_norms_from_bcovar_dynamic = None
+
+    if vmec_forces_rz_from_wout is not None and vmec_force_norms_from_bcovar_dynamic is not None:
+        wout_like = type(
+            "WoutLike",
+            (),
+            {
+                "nfp": int(context.static.cfg.nfp),
+                "mpol": int(context.static.cfg.mpol),
+                "ntor": int(context.static.cfg.ntor),
+                "lasym": bool(context.static.cfg.lasym),
+                "signgs": int(context.signgs),
+            },
+        )()
+        kernels = vmec_forces_rz_from_wout(
+            state=state,
+            static=context.static,
+            wout=wout_like,
+            indata=context.indata,
+            use_vmec_synthesis=True,
+            trig=context.static.trig_vmec,
+        )
+        norms = vmec_force_norms_from_bcovar_dynamic(
+            bc=kernels.bc,
+            trig=context.static.trig_vmec,
+            s=jnp.asarray(context.static.s),
+            signgs=int(context.signgs),
+        )
+    else:
+        from vmec_jax.core.fields import energies_and_force_norms, magnetic_fields, metric_elements
+        from vmec_jax.core.geometry import half_mesh_jacobian
+        from vmec_jax.core.solver import _geometry
+
+        rt = context.static.runtime
+        setup = rt.setup
+        _, real_space = _geometry(state, rt)
+        jacobian = half_mesh_jacobian(real_space, s=setup.s_full)
+        metrics = metric_elements(real_space, s=setup.s_full)
+        fields = magnetic_fields(
+            geometry=real_space,
+            jacobian=jacobian,
+            metrics=metrics,
+            trig=rt.trig,
+            s=setup.s_full,
+            phips=setup.phips,
+            phipf=setup.phipf,
+            chips=setup.chips,
+            signgs=setup.signgs,
+            gamma=rt.gamma,
+            mass=setup.mass,
+            ncurr=setup.ncurr,
+            enclosed_current=setup.icurv,
+        )
+        norms = energies_and_force_norms(
+            jacobian=jacobian,
+            metrics=metrics,
+            fields=fields,
+            trig=rt.trig,
+            s=setup.s_full,
+            signgs=setup.signgs,
+        )
     volume_p = jnp.abs(jnp.asarray(norms.volume)) * (4.0 * jnp.pi**2)
     vp = jnp.abs(jnp.asarray(norms.vp))
     s_full = jnp.asarray(context.static.s)
