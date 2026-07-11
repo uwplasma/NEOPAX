@@ -59,12 +59,49 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
     )
     print(
         "[geometry-fd-ad] "
-        f"vmec forward_lane=run_fixed_boundary/exact accepted-point matrix-free Jv/J^T w max_iter={resolved_max_iter} "
+        f"vmec forward_lane=run_fixed_boundary ad_backend={args.ad_backend} max_iter={resolved_max_iter} "
         f"step_size={resolved_step_size:.6e} exact_solver_device={args.exact_solver_device} "
         f"mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
         flush=True,
     )
+
+
+def _observable_function(args, context, *, lane: str, resolved_max_iter: int, resolved_step_size: float):
+    if args.mode == "vmec_scalar_observables":
+        return lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
+            context,
+            delta,
+            lane=lane,
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+    return lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
+        context,
+        delta,
+        lane=lane,
+        max_iter=resolved_max_iter,
+        step_size=resolved_step_size,
+    )
+
+
+def _implicit_forward_jvp(func):
+    _values, tangents = jax.jvp(
+        func,
+        (jnp.asarray(0.0, dtype=jnp.float64),),
+        (jnp.asarray(1.0, dtype=jnp.float64),),
+    )
+    return tangents
+
+
+def _implicit_reverse_gradients(func):
+    baseline = func(jnp.asarray(0.0, dtype=jnp.float64))
+    gradients = {}
+    for name in baseline:
+        gradients[name] = jax.grad(
+            lambda delta, observable_name=name: jnp.asarray(func(delta)[observable_name], dtype=jnp.float64).reshape(())
+        )(jnp.asarray(0.0, dtype=jnp.float64))
+    return gradients
 
 
 def main() -> None:
@@ -111,9 +148,19 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=1.0e-6, help="Relative FD step.")
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-8, help="Absolute FD step.")
     parser.add_argument(
+        "--ad-backend",
+        type=str,
+        default="exact_optimizer",
+        choices=("exact_optimizer", "implicit"),
+        help=(
+            "'exact_optimizer' keeps the legacy accepted-point matrix-free benchmark. "
+            "'implicit' compares FD against forward/reverse AD through the current vmec_jax implicit lane."
+        ),
+    )
+    parser.add_argument(
         "--skip-reverse-check",
         action="store_true",
-        help="Skip exact reverse-mode observable derivative recovery against the exact forward path.",
+        help="Skip reverse-mode observable derivative recovery.",
     )
     parser.add_argument(
         "--exact-solver-device",
@@ -144,31 +191,33 @@ def main() -> None:
     _print_header(args, context, h, resolved_max_iter=resolved_max_iter, resolved_step_size=resolved_step_size)
 
     observable_kind = args.mode
-    if args.mode == "vmec_scalar_observables":
-        fd_func = lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-    else:
-        fd_func = lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane="forward",
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-
-    print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
-    ad = exact_forward_scalar_observable_derivatives(
+    fd_func = _observable_function(
+        args,
         context,
-        observable_kind=observable_kind,
-        max_iter=resolved_max_iter,
-        step_size=resolved_step_size,
-        solver_device=args.exact_solver_device,
+        lane="forward",
+        resolved_max_iter=resolved_max_iter,
+        resolved_step_size=resolved_step_size,
     )
+    ad_func = _observable_function(
+        args,
+        context,
+        lane="ad",
+        resolved_max_iter=resolved_max_iter,
+        resolved_step_size=resolved_step_size,
+    )
+
+    if args.ad_backend == "implicit":
+        print("[geometry-fd-ad] progress: running implicit-lane forward JVP", flush=True)
+        forward_ad = _implicit_forward_jvp(ad_func)
+    else:
+        print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
+        forward_ad = exact_forward_scalar_observable_derivatives(
+            context,
+            observable_kind=observable_kind,
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+            solver_device=args.exact_solver_device,
+        )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
 
@@ -177,42 +226,48 @@ def main() -> None:
         print("[geometry-fd-ad] progress: running forward-lane five-point finite difference", flush=True)
         fd_five = five_point_fd_single_param(fd_func, h, minus=minus, plus=plus)
 
-    reverse = None
+    reverse_ad = None
     if not args.skip_reverse_check:
-        print("[geometry-fd-ad] progress: running exact accepted-point matrix-free reverse J^T w recovery", flush=True)
-        reverse = exact_reverse_scalar_observable_derivatives(
-            context,
-            observable_kind=observable_kind,
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-            solver_device=args.exact_solver_device,
-        )
+        if args.ad_backend == "implicit":
+            print("[geometry-fd-ad] progress: running implicit-lane reverse gradients", flush=True)
+            reverse_ad = _implicit_reverse_gradients(ad_func)
+        else:
+            print("[geometry-fd-ad] progress: running exact accepted-point matrix-free reverse J^T w recovery", flush=True)
+            reverse_ad = exact_reverse_scalar_observable_derivatives(
+                context,
+                observable_kind=observable_kind,
+                max_iter=resolved_max_iter,
+                step_size=resolved_step_size,
+                solver_device=args.exact_solver_device,
+            )
 
-    print("[geometry-fd-ad] observable errors:")
-    for name in ad:
-        ad_value = ad[name]
+    print("[geometry-fd-ad] observable comparison:")
+    for name in forward_ad:
+        forward_ad_value = forward_ad[name]
         center_value = fd_center[name]
-        center_err = rel_error(ad_value, center_value)
+        forward_fd_err = rel_error(forward_ad_value, center_value)
         line = (
-            f"  - {name}: ad={float(jnp.asarray(ad_value)):.6e} "
+            f"  - {name}: forward_ad={float(jnp.asarray(forward_ad_value)):.6e} "
             f"fd_center={float(jnp.asarray(center_value)):.6e} "
-            f"ad_vs_center_rel_err={center_err:.6e}"
+            f"forward_vs_fd_rel_err={forward_fd_err:.6e}"
         )
         if fd_five is not None:
             five_value = fd_five[name]
-            five_err = rel_error(ad_value, five_value)
+            five_err = rel_error(forward_ad_value, five_value)
             center_vs_five = rel_error(center_value, five_value)
             line += (
                 f" fd_five_point={float(jnp.asarray(five_value)):.6e}"
-                f" ad_vs_five_rel_err={five_err:.6e}"
+                f" forward_vs_five_rel_err={five_err:.6e}"
                 f" center_vs_five_rel_err={center_vs_five:.6e}"
             )
-        if reverse is not None:
-            reverse_value = reverse[name]
-            reverse_err = rel_error(reverse_value, ad_value)
+        if reverse_ad is not None:
+            reverse_value = reverse_ad[name]
+            reverse_err = rel_error(reverse_value, forward_ad_value)
+            reverse_fd_err = rel_error(reverse_value, center_value)
             line += (
-                f" reverse={float(jnp.asarray(reverse_value)):.6e}"
+                f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
                 f" reverse_vs_forward_rel_err={reverse_err:.6e}"
+                f" reverse_vs_fd_rel_err={reverse_fd_err:.6e}"
             )
         print(line, flush=True)
 

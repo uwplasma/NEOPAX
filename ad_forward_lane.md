@@ -630,3 +630,89 @@ Decision rule for the next session:
   Booz-xform/JAX inputs, resolution, normalization, and VMEC/JAX state fields.
 - If raw coefficients match but NEOPAX geometry fields differ, focus only on
   `_build_neopax_geometry_from_state()` interpolation/formulas.
+
+## 2026-07-11: Forward AD `exact` Fusion Next Step
+
+Current command under discussion:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_forward_ad_only.py \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --forward-ad-fusion-mode exact
+```
+
+Latest `n0` profile result with `--forward-ad-fusion-mode exact`:
+
+| Objective | Forward AD `exact` tangent |
+|---|---:|
+| `softmax_Er` | `-3.770213e+00` |
+| `smooth_root_proxy` | `4.274729e-04` |
+| `Er2_volume_average` | `-4.419701e+00` |
+| `Er_volume_average` | `-1.741342e+00` |
+| `electron_temperature_volume_average_keV` | `3.191177e-03` |
+| `total_pressure_volume_average` | `7.906533e+00` |
+| `alpha_power_volume_average_mw_m3` | `2.739037e-01` |
+
+Expected `n0` reverse/FD realized-schedule target is approximately:
+
+| Objective | Reverse/FD target |
+|---|---:|
+| `softmax_Er` | `-3.75963e+00` |
+| `smooth_root_proxy` | `4.7e-04` order, FD-step sensitive |
+| `Er2_volume_average` | `-4.348e+00` to `-4.349e+00` |
+| `Er_volume_average` | `-1.7369e+00` |
+| `electron_temperature_volume_average_keV` | `3.1849e-03` |
+| `total_pressure_volume_average` | `7.90651e+00` |
+| `alpha_power_volume_average_mw_m3` | `2.73905e-01` |
+
+Diagnosis:
+
+- This is not an NTX pullback-algebra issue.
+- Reverse AD and frozen FD remain the reference for the profile-only
+  realized-schedule target.
+- `--forward-ad-fusion-mode exact` currently dispatches through
+  `derivative_mode="jvp_exact"`.
+- That reaches `_radau_adaptive_final_y_realized_schedule_exact_jvp(...)`.
+- Its JVP rule calls
+  `_radau_adaptive_final_y_realized_schedule_fused_jvp(...,
+  raw_attempt_jvp=True)`.
+- Therefore the current `exact` mode is a **raw-attempt JVP** diagnostic, not
+  the accepted-map fused JVP needed to match reverse/FD.
+- The needed fused lane must differentiate the same realized accepted-step map
+  as reverse/FD, including:
+  - accepted-only tangent propagation,
+  - zero tangent contribution from rejected attempts,
+  - the same projected accepted-step state update,
+  - the same forward-only treatment of controller/cache/Jacobian/LU fields,
+  - the same final carry/state used by the trusted realized-schedule primal.
+
+Next implementation target:
+
+1. Do not change reverse AD.
+2. Do not change the recovered `replay` mode reference.
+3. Add a new explicit forward mode, for example
+   `--forward-ad-fusion-mode accepted_exact`, instead of overloading the current
+   raw-attempt `exact` diagnostic.
+4. Implement `accepted_exact` by making the JVP tangent use the same accepted
+   replay slot/map as reverse's realized accepted-step replay, not
+   `raw_attempt_jvp=True`.
+5. Validate only `n0`, `accepted-step-limit 16`, `radau_jacobian_reuse_mode=legacy`
+   first.
+6. Only after `n0` matches reverse/FD should the other profile parameters be
+   rerun.
+
+Acceptance criterion for the next pass:
+
+- `accepted_exact` objective values must match the trusted reverse/FD
+  realized-schedule primal for the 16-step case.
+- `accepted_exact` tangents for `n0` should move from the current raw-attempt
+  values toward the reverse/FD targets above, especially `softmax_Er`,
+  `Er2_volume_average`, and `Er_volume_average`.
+- If pressure and alpha stay close but the electric-field objectives remain
+  off, inspect the accepted-step projection and lagged-response/cache tangent
+  threading inside the fused accepted-map replay.
