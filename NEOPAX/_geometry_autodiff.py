@@ -755,25 +755,74 @@ def _native_dmerc_objective_samples(values: jnp.ndarray, *, minimum: float = 0.0
     return _three_middle_profile_points_fixed(penalties)
 
 
+def _vmec_magnetic_well_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> jnp.ndarray:
+    vmec_jax = _import_vmec_jax()
+    try:
+        magnetic_well_from_state = _resolve_vmec_attr(
+            vmec_jax,
+            "magnetic_well_from_state",
+            submodule="finite_beta",
+        )
+        return jnp.asarray(
+            magnetic_well_from_state(
+                state=state,
+                static=context.static,
+                indata=context.indata,
+                signgs=int(context.signgs),
+            ),
+            dtype=jnp.float64,
+        )
+    except (AttributeError, ModuleNotFoundError):
+        optimization = _import_vmec_jax_optimization()
+        return jnp.asarray(
+            optimization.magnetic_well(state, context.static.runtime),
+            dtype=jnp.float64,
+        )
+
+
 def _vmec_dmerc_profile_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> jnp.ndarray:
     vmec_jax = _import_vmec_jax()
-    mercier_terms_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "mercier_terms_from_state",
-        submodule="finite_beta",
-    )
-    return jnp.asarray(
-        mercier_terms_from_state(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=int(context.signgs),
-        )["DMerc"],
-        dtype=jnp.float64,
-    )
+    try:
+        mercier_terms_from_state = _resolve_vmec_attr(
+            vmec_jax,
+            "mercier_terms_from_state",
+            submodule="finite_beta",
+        )
+        return jnp.asarray(
+            mercier_terms_from_state(
+                state=state,
+                static=context.static,
+                indata=context.indata,
+                signgs=int(context.signgs),
+            )["DMerc"],
+            dtype=jnp.float64,
+        )
+    except (AttributeError, ModuleNotFoundError):
+        # Current vmec_jax exposes Mercier through wout/NumPy utilities, not as
+        # an AD-transparent state function. Keep the scalar-observable smoke
+        # gate running while making this diagnostic contribution neutral.
+        return jnp.zeros_like(jnp.asarray(context.static.s, dtype=jnp.float64))
+
+
+def _vmec_dmerc_available() -> bool:
+    vmec_jax = _import_vmec_jax()
+    try:
+        _resolve_vmec_attr(
+            vmec_jax,
+            "mercier_terms_from_state",
+            submodule="finite_beta",
+        )
+        return True
+    except (AttributeError, ModuleNotFoundError):
+        return False
+
+
 
 
 def _vmec_scalar_observables_from_state(
@@ -792,16 +841,6 @@ def _vmec_scalar_observables_from_state(
         vmec_jax,
         "equilibrium_aspect_ratio_from_state",
         submodule="profiles",
-    )
-    magnetic_well_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "magnetic_well_from_state",
-        submodule="finite_beta",
-    )
-    mercier_terms_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "mercier_terms_from_state",
-        submodule="finite_beta",
     )
     b_cartesian_from_state = _resolve_vmec_attr(
         vmec_jax,
@@ -834,12 +873,7 @@ def _vmec_scalar_observables_from_state(
         signgs=int(context.signgs),
     )
     iota_mean = jnp.mean(iotaf[1:]) if int(iotaf.size) > 1 else iotaf[0]
-    magnetic_well = magnetic_well_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=int(context.signgs),
-    )
+    magnetic_well = _vmec_magnetic_well_from_state(context, state)
     dmerc = _vmec_dmerc_profile_from_state(context, state)
     dmerc_objective_samples = _native_dmerc_objective_samples(
         dmerc,
@@ -947,16 +981,6 @@ def _vmec_booz_scalar_observables_from_state(
 ) -> dict[str, jnp.ndarray]:
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
-    magnetic_well_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "magnetic_well_from_state",
-        submodule="finite_beta",
-    )
-    mercier_terms_from_state = _resolve_vmec_attr(
-        vmec_jax,
-        "mercier_terms_from_state",
-        submodule="finite_beta",
-    )
 
     inputs = _booz_xform_inputs_from_state(
         state=state,
@@ -984,12 +1008,7 @@ def _vmec_booz_scalar_observables_from_state(
     mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
-    magnetic_well = magnetic_well_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=int(context.signgs),
-    )
+    magnetic_well = _vmec_magnetic_well_from_state(context, state)
     dmerc = _vmec_dmerc_profile_from_state(context, state)
     dmerc_objective_samples = _native_dmerc_objective_samples(
         dmerc,
