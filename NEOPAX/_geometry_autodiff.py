@@ -1298,6 +1298,40 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     }
 
 
+def _vmec_booz_qi_scalar_objective_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    optimization = _import_vmec_jax_optimization()
+    booz_api = _import_booz_xform_jax_api()
+
+    inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    booz = booz_api.booz_xform_from_inputs(
+        inputs=inputs,
+        constants=booz_constants,
+        grids=booz_grids,
+        surface_indices=context.surface_indices,
+        jit=True,
+    )
+    qi = optimization.quasi_isodynamic_residual(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["ixm_b"],
+        xn_b=booz["ixn_b"],
+        iota_b=booz["iota_b"],
+        nfp=int(context.cfg.nfp),
+    )
+    return {
+        "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
+    }
+
+
 def _geometry_full_ad_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1306,7 +1340,7 @@ def _geometry_full_ad_objectives_from_state(
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
     boozer_scalars = _vmec_booz_scalar_observables_from_state(context, state)
-    qi_maxj = _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
+    qi = _vmec_booz_qi_scalar_objective_from_state(context, state)
 
     out = {f"vmec_{name}": jnp.asarray(value, dtype=jnp.float64) for name, value in vmec_scalars.items()}
     for name, value in boozer_scalars.items():
@@ -1315,7 +1349,7 @@ def _geometry_full_ad_objectives_from_state(
         if name.startswith("dmerc_") or name == "magnetic_well_objective":
             continue
         out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
-    out["boozer_qi_objective"] = jnp.asarray(qi_maxj["qi_objective"], dtype=jnp.float64)
+    out["boozer_qi_objective"] = jnp.asarray(qi["qi_objective"], dtype=jnp.float64)
     return out
 
 
