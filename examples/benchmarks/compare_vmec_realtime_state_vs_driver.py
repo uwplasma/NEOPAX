@@ -118,6 +118,12 @@ def main() -> None:
     parser.add_argument("--solver-device", default=None)
     parser.add_argument("--driver-solver", default=None)
     parser.add_argument("--driver-solver-mode", default=None)
+    parser.add_argument(
+        "--neopax-lane",
+        choices=("forward", "ad"),
+        default=None,
+        help="Override geometry.vmec_lane for the NEOPAX state build. Use 'ad' to test the implicit VMEC lane.",
+    )
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--json-output", default=None)
     args = parser.parse_args()
@@ -136,11 +142,12 @@ def main() -> None:
     input_path = Path(context.input_path).expanduser().resolve()
     print(f"[compare] input:           {input_path}")
     print(f"[compare] realtime config: {realtime_config}")
-    print("[compare] building NEOPAX realtime VMEC state")
+    neopax_lane = str(args.neopax_lane or geom_cfg.get("vmec_lane", "forward")).strip().lower()
+    print(f"[compare] building NEOPAX realtime VMEC state lane={neopax_lane}")
     neopax_state = _solve_state_for_single_param(
         context,
         jnp.asarray(float(geom_cfg.get("vmec_param_delta", 0.0)), dtype=jnp.float64),
-        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
+        lane=neopax_lane,
         max_iter=geom_cfg.get("vmec_max_iter"),
         step_size=geom_cfg.get("vmec_step_size"),
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
@@ -201,6 +208,7 @@ def main() -> None:
     payload = {
         "input_path": str(input_path),
         "realtime_config": str(realtime_config),
+        "neopax_lane": neopax_lane,
         "driver_kwargs": run_kwargs,
         "state_variables": rows,
     }
