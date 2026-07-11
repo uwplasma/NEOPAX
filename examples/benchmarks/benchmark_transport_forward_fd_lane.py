@@ -43,6 +43,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _execute_radau_accepted_step_attempt_autodiff,
     _radau_forward_fd_fixed_dt_accepted_rollout,
     _radau_forward_solver_fixed_dt_schedule_rollout,
+    _radau_replay_realized_attempt_rollout,
     _radau_solve_on_fixed_time_map_final_state_only,
     _radau_step_fn_forward_solver,
     _radau_step_state_from_carry,
@@ -702,40 +703,17 @@ def _forward_fd_lane_replay_realized_trace_final_y_and_tangent(
         (
             _active,
             _accepted,
-            dt_value,
-            next_dt_value,
-            recent_reject_count_value,
-            regrowth_cooldown_value,
-            easy_growth_streak_value,
-            lagged_response_valid_value,
+            _dt_value,
+            _next_dt_value,
+            _recent_reject_count_value,
+            _regrowth_cooldown_value,
+            _easy_growth_streak_value,
+            _lagged_response_valid_value,
         ) = xs
-        carry_for_step = dataclasses.replace(jax.lax.stop_gradient(carry_value), dt=dt_value)
-        attempt_result = _execute_radau_accepted_step_attempt_autodiff(
-            kernel_context,
-            physics_context,
-            _radau_carry_with_forward_only_jvp_fields(carry_for_step),
-            execution_context.attempt_context,
-        )
-        return dataclasses.replace(
-            carry_value,
-            dt=next_dt_value,
-            recent_reject_count=recent_reject_count_value,
-            regrowth_cooldown=regrowth_cooldown_value,
-            easy_growth_streak=easy_growth_streak_value,
-            lagged_response_cache=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_response_cache),
-            lagged_response_valid=lagged_response_valid_value,
-            lagged_reference_y=jax.lax.stop_gradient(attempt_result.carry_after_attempt.lagged_reference_y),
-            jacobian=jax.lax.stop_gradient(attempt_result.jacobian_out),
-            cache_valid=jax.lax.stop_gradient(attempt_result.cache_valid_out),
-            cache_dt=jax.lax.stop_gradient(attempt_result.cache_dt_out),
-            cache_age=jax.lax.stop_gradient(attempt_result.cache_age_out),
-            real_lu=jax.lax.stop_gradient(attempt_result.real_lu_out),
-            real_piv=jax.lax.stop_gradient(attempt_result.real_piv_out),
-            complex_lu=jax.lax.stop_gradient(attempt_result.complex_lu_out),
-            complex_piv=jax.lax.stop_gradient(attempt_result.complex_piv_out),
-            prev_theta_final=jax.lax.stop_gradient(attempt_result.theta_final),
-            prev_newton_iter_count=jax.lax.stop_gradient(attempt_result.newton_iter_count),
-        )
+        # Rejected attempts only select the primal adaptive trace. The AD replay
+        # lane must not advance cache/Jacobian state through rejected attempts,
+        # matching the reverse replay semantics.
+        return carry_value
 
     def _scan_body(scan_state, xs):
         carry, carry_dot = scan_state
@@ -789,7 +767,19 @@ def _forward_fd_lane_final_y_accepted_replay(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    return rollout.final_carry.y
+    replay = _radau_replay_realized_attempt_rollout(
+        execution_context,
+        carry0,
+        jax.lax.stop_gradient(rollout.trace.active_mask),
+        jax.lax.stop_gradient(rollout.trace.accepted_mask),
+        jax.lax.stop_gradient(rollout.trace.attempted_dts),
+        jax.lax.stop_gradient(rollout.trace.next_dts),
+        jax.lax.stop_gradient(rollout.trace.next_recent_reject_count),
+        jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown),
+        jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak),
+        jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid),
+    )
+    return replay.final_carry.y
 
 
 @_forward_fd_lane_final_y_accepted_replay.defjvp
@@ -808,13 +798,13 @@ def _forward_fd_lane_final_y_accepted_replay_jvp(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    _primal_replay, tangent_out = _forward_fd_lane_replay_realized_trace_final_y_and_tangent(
+    primal_replay, tangent_out = _forward_fd_lane_replay_realized_trace_final_y_and_tangent(
         execution_context,
         carry0,
         carry0_dot,
         rollout.trace,
     )
-    return rollout.final_carry.y, tangent_out
+    return primal_replay, tangent_out
 
 
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter(
