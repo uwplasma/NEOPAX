@@ -36,6 +36,26 @@ def _fd_step(base_value: float, *, fd_rel_step: float, fd_abs_step: float) -> fl
     return max(abs(float(base_value)) * float(fd_rel_step), float(fd_abs_step))
 
 
+def _parse_param_specs(text: str | None, *, default_family: str, default_m: int, default_n: int) -> tuple[tuple[str, int, int], ...]:
+    if text is None or not str(text).strip():
+        return ((str(default_family).strip().upper(), int(default_m), int(default_n)),)
+    specs = []
+    for raw_spec in str(text).split(","):
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        parts = [part.strip() for part in spec.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"Parameter spec {spec!r} must have form FAMILY:m:n, e.g. RBC:1:0.")
+        family = parts[0].upper()
+        if family not in {"RBC", "ZBS"}:
+            raise ValueError(f"Parameter spec {spec!r} has unsupported family {family!r}; use RBC or ZBS.")
+        specs.append((family, int(parts[1]), int(parts[2])))
+    if not specs:
+        raise ValueError("--param-specs did not contain any valid specs.")
+    return tuple(specs)
+
+
 def _resolved_max_iter(context, user_value: int | None) -> int:
     return int(context.vmec_default_max_iter if user_value is None else user_value)
 
@@ -131,6 +151,16 @@ def main() -> None:
     parser.add_argument("--param-m", type=int, default=1, help="VMEC coefficient m index.")
     parser.add_argument("--param-n", type=int, default=0, help="VMEC coefficient n index.")
     parser.add_argument(
+        "--param-specs",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of geometry parameters FAMILY:m:n. "
+            "Example: RBC:1:0,RBC:2:0,ZBS:1:0,ZBS:2:0. "
+            "If omitted, --param-family/--param-m/--param-n are used."
+        ),
+    )
+    parser.add_argument(
         "--surface-s",
         type=str,
         default="0.25,0.5,0.75",
@@ -176,14 +206,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    param_specs = _parse_param_specs(
+        args.param_specs,
+        default_family=args.param_family,
+        default_m=args.param_m,
+        default_n=args.param_n,
+    )
+    surface_s = _parse_surface_s(args.surface_s)
+    for param_index, (param_family, param_m, param_n) in enumerate(param_specs, start=1):
+        if len(param_specs) > 1:
+            print(
+                f"[geometry-fd-ad] parameter {param_index}/{len(param_specs)}: "
+                f"{param_family}:{param_m}:{param_n}",
+                flush=True,
+            )
+        _run_single_parameter(args, param_family=param_family, param_m=param_m, param_n=param_n, surface_s=surface_s)
+
+
+def _run_single_parameter(args, *, param_family: str, param_m: int, param_n: int, surface_s: tuple[float, ...]) -> None:
     context = build_geometry_autodiff_context(
         args.vmec_input,
-        param_family=args.param_family,
-        param_m=args.param_m,
-        param_n=args.param_n,
+        param_family=param_family,
+        param_m=param_m,
+        param_n=param_n,
         mboz=args.mboz,
         nboz=args.nboz,
-        surface_s=_parse_surface_s(args.surface_s),
+        surface_s=surface_s,
     )
     h = _fd_step(context.baseline_coefficient, fd_rel_step=args.fd_rel_step, fd_abs_step=args.fd_abs_step)
     resolved_max_iter = _resolved_max_iter(context, args.vmec_max_iter)

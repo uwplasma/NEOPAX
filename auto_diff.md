@@ -5821,3 +5821,78 @@ This should be treated as temporary glue.  Once NTX is updated to import
 `read_wout` from the current `vmec_jax` API directly, remove the NEOPAX shim
 (`_install_vmec_jax_api_compat_for_ntx`) and the `types` import that supports
 it.
+
+## 2026-07-11 geometry reverse AD multi-dof gate
+
+Current geometry AD direction:
+
+- We are focusing on reverse AD through the current `vmec_jax` implicit
+  custom-VJP lane.
+- Forward-mode AD through that lane is not available because
+  `solve_implicit(...)` is a `custom_vjp`; `jax.jvp(...)` through it raises
+  `TypeError: can't apply forward-mode autodiff (jvp) to a custom_vjp
+  function`.
+- Therefore the relevant gate for transport reverse AD with geometry
+  parameters is:
+
+```text
+forward-lane finite difference  vs  reverse AD through implicit VMEC/Boozer
+```
+
+Do not interpret this as "there is no forward solver". The forward solve lane
+still exists and is used for FD. The missing piece is only forward-mode AD
+through the implicit custom-VJP solve.
+
+Immediate benchmark request:
+
+- Test four geometry harmonics:
+  - `RBC:1:0`
+  - `RBC:2:0`
+  - `ZBS:1:0`
+  - `ZBS:2:0`
+
+Current simple smoke-test support:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode vmec_booz_scalar_observables \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,RBC:2:0,ZBS:1:0,ZBS:2:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit
+```
+
+This loops over the four scalar dofs one-by-one. That is useful as a smoke
+test, but it is not the efficient reverse-mode structure.
+
+Next implementation target:
+
+- Add a true multi-dof reverse-mode geometry gate.
+- Build one parameter vector:
+
+```text
+p = [RBC(1,0), RBC(2,0), ZBS(1,0), ZBS(2,0)]
+```
+
+- For each scalar observable, compute:
+
+```text
+jax.grad(lambda p: observable(p))(p0)
+```
+
+so one reverse pass gives all four geometry partial derivatives for that
+observable.
+
+- Compare each reverse-gradient column against finite differences where only
+one component of `p` is perturbed at a time.
+
+Why this matters:
+
+- Reverse AD should get all geometry dofs for one scalar objective in one
+reverse pass.
+- The current `--param-specs` loop repeats the whole single-dof reverse test
+  four times, which is acceptable for a correctness smoke test but not the
+  intended scalable path.
+- The eventual transport reverse-AD geometry path should mirror the multi-dof
+  vector structure, combined with the existing profile parameters.

@@ -6426,6 +6426,22 @@ def _radau_carry_with_forward_only_jvp_fields(
     )
 
 
+def _radau_reduce_realized_schedule_tangent_carry(
+    tangent: _RadauAcceptedStepCarry,
+    primal: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepCarry:
+    """Match the realized-schedule forward JVP state to the reverse contract."""
+
+    tangent_aligned = _radau_align_tangent_tree_to_primal(tangent, primal)
+    zero_tangent = _radau_align_tangent_tree_to_primal(None, primal)
+    return dataclasses.replace(
+        zero_tangent,
+        y=tangent_aligned.y,
+        lagged_response_cache=tangent_aligned.lagged_response_cache,
+        lagged_reference_y=tangent_aligned.lagged_reference_y,
+    )
+
+
 def _radau_step_state_with_forward_only_controller_fields(
     step_state: _RadauStepState,
 ) -> _RadauStepState:
@@ -9714,9 +9730,11 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                     prev_theta_final=tangent_attempt.theta_final,
                     prev_newton_iter_count=tangent_attempt.newton_iter_count,
                 )
+                tangent_next = _radau_reduce_realized_schedule_tangent_carry(tangent_next, replay_next)
                 return replay_next, tangent_next
 
             replay_next, tangent_next = jax.jvp(_accepted_map, (carry_for_step,), (tangent_for_step,))
+            tangent_next = _radau_reduce_realized_schedule_tangent_carry(tangent_next, replay_next)
             return replay_next, tangent_next
 
         def _keep_tangent(_):
