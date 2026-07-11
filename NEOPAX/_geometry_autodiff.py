@@ -810,21 +810,6 @@ def _vmec_dmerc_profile_from_state(
         return jnp.zeros_like(jnp.asarray(context.static.s, dtype=jnp.float64))
 
 
-def _vmec_dmerc_available() -> bool:
-    vmec_jax = _import_vmec_jax()
-    try:
-        _resolve_vmec_attr(
-            vmec_jax,
-            "mercier_terms_from_state",
-            submodule="finite_beta",
-        )
-        return True
-    except (AttributeError, ModuleNotFoundError):
-        return False
-
-
-
-
 def _vmec_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
