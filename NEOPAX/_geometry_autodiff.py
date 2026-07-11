@@ -1196,9 +1196,15 @@ def _vmec_booz_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> dict[str, jnp.ndarray]:
-    vmec_jax = _import_vmec_jax()
-    booz_api = _import_booz_xform_jax_api()
+    out = _boozer_output_from_state(context, state)
+    return _vmec_booz_scalar_observables_from_boozer(context, state, out)
 
+
+def _boozer_output_from_state(
+    context: GeometryAutodiffContext,
+    state,
+):
+    booz_api = _import_booz_xform_jax_api()
     inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
@@ -1215,6 +1221,12 @@ def _vmec_booz_scalar_observables_from_state(
         jit=True,
     )
 
+
+def _vmec_booz_scalar_observables_from_boozer(
+    context: GeometryAutodiffContext,
+    state,
+    out,
+) -> dict[str, jnp.ndarray]:
     bmnc_b = jnp.asarray(out["bmnc_b"])
     ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
     ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
@@ -1259,26 +1271,9 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     state,
 ) -> dict[str, jnp.ndarray]:
     optimization = _import_vmec_jax_optimization()
-    booz_api = _import_booz_xform_jax_api()
     from balloon_jax.objectives import maximum_j_residual_from_boozer_output
 
-    inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    booz = dict(
-        booz_api.booz_xform_from_inputs(
-            inputs=inputs,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=context.surface_indices,
-            jit=True,
-        )
-    )
+    booz = dict(_boozer_output_from_state(context, state))
     booz["surfaces"] = jnp.asarray(context.surface_s, dtype=jnp.float64)
 
     qi = optimization.quasi_isodynamic_residual(
@@ -1301,31 +1296,39 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
 def _vmec_booz_qi_scalar_objective_from_state(
     context: GeometryAutodiffContext,
     state,
+    *,
+    nphi: int = 51,
+    nalpha: int = 17,
+    n_bounce: int = 17,
+) -> dict[str, jnp.ndarray]:
+    booz = _boozer_output_from_state(context, state)
+    return _vmec_booz_qi_scalar_objective_from_boozer(
+        context,
+        booz,
+        nphi=nphi,
+        nalpha=nalpha,
+        n_bounce=n_bounce,
+    )
+
+
+def _vmec_booz_qi_scalar_objective_from_boozer(
+    context: GeometryAutodiffContext,
+    booz,
+    *,
+    nphi: int = 51,
+    nalpha: int = 17,
+    n_bounce: int = 17,
 ) -> dict[str, jnp.ndarray]:
     optimization = _import_vmec_jax_optimization()
-    booz_api = _import_booz_xform_jax_api()
-
-    inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    booz = booz_api.booz_xform_from_inputs(
-        inputs=inputs,
-        constants=booz_constants,
-        grids=booz_grids,
-        surface_indices=context.surface_indices,
-        jit=True,
-    )
     qi = optimization.quasi_isodynamic_residual(
         bmnc_b=booz["bmnc_b"],
         xm_b=booz["ixm_b"],
         xn_b=booz["ixn_b"],
         iota_b=booz["iota_b"],
         nfp=int(context.cfg.nfp),
+        nphi=int(nphi),
+        nalpha=int(nalpha),
+        n_bounce=int(n_bounce),
     )
     return {
         "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
@@ -1339,8 +1342,9 @@ def _geometry_full_ad_objectives_from_state(
     """One AD gate vector for VMEC scalars, Boozer scalars, and Boozer QI."""
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
-    boozer_scalars = _vmec_booz_scalar_observables_from_state(context, state)
-    qi = _vmec_booz_qi_scalar_objective_from_state(context, state)
+    booz = _boozer_output_from_state(context, state)
+    boozer_scalars = _vmec_booz_scalar_observables_from_boozer(context, state, booz)
+    qi = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
 
     out = {f"vmec_{name}": jnp.asarray(value, dtype=jnp.float64) for name, value in vmec_scalars.items()}
     for name, value in boozer_scalars.items():
