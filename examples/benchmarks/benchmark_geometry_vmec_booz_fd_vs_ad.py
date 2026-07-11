@@ -18,11 +18,9 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     exact_forward_scalar_observable_derivatives,
     exact_reverse_scalar_observable_derivatives,
     five_point_fd_single_param,
+    geometry_observable_kind_from_param_vector,
+    geometry_observable_kind_from_single_param,
     rel_error,
-    vmec_booz_scalar_observables_from_param_vector,
-    vmec_booz_scalar_observables_from_single_param,
-    vmec_scalar_observables_from_param_vector,
-    vmec_scalar_observables_from_single_param,
 )
 
 DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires"
@@ -91,17 +89,10 @@ def _print_header(args, context, h: float, *, resolved_max_iter: int, resolved_s
 
 
 def _observable_function(args, context, *, lane: str, resolved_max_iter: int, resolved_step_size: float):
-    if args.mode == "vmec_scalar_observables":
-        return lambda delta: vmec_scalar_observables_from_single_param(  # noqa: E731
-            context,
-            delta,
-            lane=lane,
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-    return lambda delta: vmec_booz_scalar_observables_from_single_param(  # noqa: E731
+    return lambda delta: geometry_observable_kind_from_single_param(  # noqa: E731
         context,
         delta,
+        observable_kind=args.mode,
         lane=lane,
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
@@ -128,19 +119,11 @@ def _implicit_reverse_gradients(func):
 
 
 def _observable_vector_function(args, context, param_specs, *, lane: str, resolved_max_iter: int, resolved_step_size: float):
-    if args.mode == "vmec_scalar_observables":
-        return lambda deltas: vmec_scalar_observables_from_param_vector(  # noqa: E731
-            context,
-            deltas,
-            param_specs,
-            lane=lane,
-            max_iter=resolved_max_iter,
-            step_size=resolved_step_size,
-        )
-    return lambda deltas: vmec_booz_scalar_observables_from_param_vector(  # noqa: E731
+    return lambda deltas: geometry_observable_kind_from_param_vector(  # noqa: E731
         context,
         deltas,
         param_specs,
+        observable_kind=args.mode,
         lane=lane,
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
@@ -166,9 +149,25 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         type=str,
-        default="vmec_booz_scalar_observables",
-        choices=("vmec_scalar_observables", "vmec_booz_scalar_observables"),
-        help="Run the VMEC-only scalar gate or the VMEC -> Boozer scalar gate.",
+        default="geometry_full_ad_objectives",
+        choices=(
+            "geometry_full_ad_objectives",
+            "vmec_core_scalar_objectives",
+            "vmec_scalar_observables",
+            "vmec_iotaf_scalar_observables",
+            "vmec_booz_scalar_observables",
+            "vmec_qi_maxj_scalar_objectives",
+            "vmec_booz_qi_maxj_scalar_objectives",
+            "vmec_dmerc_objectives",
+        ),
+        help=(
+            "Observable group to compare. 'geometry_full_ad_objectives' is the "
+            "combined gate: current vmec_jax.core.optimize scalars, Boozer "
+            "reduced quantities, and Boozer QI in one reverse Jacobian. "
+            "Max-J is kept only in the explicit QI/max-J diagnostic mode for now. "
+            "'vmec_dmerc_objectives' intentionally errors until DMerc has a "
+            "pure-JAX state-level implementation."
+        ),
     )
     parser.add_argument(
         "--vmec-input",

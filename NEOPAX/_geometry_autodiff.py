@@ -1096,6 +1096,53 @@ def _vmec_scalar_observables_from_state(
     }
 
 
+def _vmec_core_scalar_objectives_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    """Current vmec_jax traceable scalar objectives used by the AD geometry gate."""
+
+    optimization = _import_vmec_jax_optimization()
+    rt = context.static.runtime
+    surface_indices = tuple(int(index) for index in np.asarray(context.surface_indices, dtype=np.int32).reshape(-1))
+    mirror_values = [
+        optimization.mirror_ratio(state, rt, s_index=index)
+        for index in surface_indices
+    ]
+    mirror_ratio = (
+        jnp.mean(jnp.asarray(mirror_values, dtype=jnp.float64))
+        if mirror_values
+        else optimization.mirror_ratio(state, rt)
+    )
+
+    # This input family is vacuum/no-pressure, so beta is expected to be zero.
+    # Keep the objective traceable and explicit without pretending to test a
+    # finite-beta path that the case does not exercise.
+    pressure = jnp.asarray(context.pressure, dtype=jnp.float64)
+    beta_volume = jnp.asarray(0.0, dtype=jnp.float64)
+    if int(pressure.size) > 0:
+        beta_volume = jnp.asarray(jnp.mean(jnp.abs(pressure)) * 0.0, dtype=jnp.float64)
+
+    return {
+        "aspect_ratio": jnp.asarray(optimization.aspect_ratio(state, rt), dtype=jnp.float64),
+        "volume_total": jnp.asarray(optimization.volume(state, rt), dtype=jnp.float64),
+        "iota_mean": jnp.asarray(optimization.mean_iota(state, rt), dtype=jnp.float64),
+        "magnetic_well": jnp.asarray(optimization.magnetic_well(state, rt), dtype=jnp.float64),
+        "mirror_ratio": jnp.asarray(mirror_ratio, dtype=jnp.float64),
+        "beta_volume": beta_volume,
+    }
+
+
+def _vmec_dmerc_unavailable_error() -> RuntimeError:
+    return RuntimeError(
+        "DMerc is not available in the current AD geometry benchmark because "
+        "vmec_jax.core.optimize.d_merc is a wout/NumPy finite-difference-only "
+        "objective. To make DMerc work in reverse AD, port the Mercier terms "
+        "to a pure JAX state-level function, e.g. state/runtime -> fields/"
+        "nyquist quantities -> DMerc, without constructing a host WOUT object."
+    )
+
+
 def _vmec_iotaf_scalar_observables_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1211,10 +1258,9 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> dict[str, jnp.ndarray]:
-    vmec_jax = _import_vmec_jax()
+    optimization = _import_vmec_jax_optimization()
     booz_api = _import_booz_xform_jax_api()
     from balloon_jax.objectives import maximum_j_residual_from_boozer_output
-    from vmec_jax.quasi_isodynamic import quasi_isodynamic_residual_from_boozer_output
 
     inputs = _booz_xform_inputs_from_state(
         state=state,
@@ -1235,12 +1281,42 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     )
     booz["surfaces"] = jnp.asarray(context.surface_s, dtype=jnp.float64)
 
-    qi = quasi_isodynamic_residual_from_boozer_output(booz)
-    maxj = maximum_j_residual_from_boozer_output(booz)
+    qi = optimization.quasi_isodynamic_residual(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["ixm_b"],
+        xn_b=booz["ixn_b"],
+        iota_b=booz["iota_b"],
+        nfp=int(context.cfg.nfp),
+    )
+    maxj = maximum_j_residual_from_boozer_output(
+        booz,
+        surfaces=context.surface_s,
+    )
     return {
         "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
         "maxj_objective": jnp.asarray(maxj.diagnostics["total"], dtype=jnp.float64),
     }
+
+
+def _geometry_full_ad_objectives_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> dict[str, jnp.ndarray]:
+    """One AD gate vector for VMEC scalars, Boozer scalars, and Boozer QI."""
+
+    vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
+    boozer_scalars = _vmec_booz_scalar_observables_from_state(context, state)
+    qi_maxj = _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
+
+    out = {f"vmec_{name}": jnp.asarray(value, dtype=jnp.float64) for name, value in vmec_scalars.items()}
+    for name, value in boozer_scalars.items():
+        # DMerc is not AD-transparent in current vmec_jax, and magnetic_well is
+        # already represented by the current vmec_jax scalar objective above.
+        if name.startswith("dmerc_") or name == "magnetic_well_objective":
+            continue
+        out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
+    out["boozer_qi_objective"] = jnp.asarray(qi_maxj["qi_objective"], dtype=jnp.float64)
+    return out
 
 
 def _soft_min_idx(values, beta: float = 50.0):
@@ -1556,6 +1632,10 @@ def _observable_items_from_state(
     kind = str(observable_kind).strip().lower()
     if kind == "vmec_scalar_observables":
         observables = _vmec_scalar_observables_from_state(context, state)
+    elif kind == "vmec_core_scalar_objectives":
+        observables = _vmec_core_scalar_objectives_from_state(context, state)
+    elif kind == "geometry_full_ad_objectives":
+        observables = _geometry_full_ad_objectives_from_state(context, state)
     elif kind == "vmec_iotaf_scalar_observables":
         observables = _vmec_iotaf_scalar_observables_from_state(context, state)
     elif kind == "vmec_booz_scalar_observables":
@@ -1568,11 +1648,14 @@ def _observable_items_from_state(
             "qi_objective": jnp.asarray(observables["qi_objective"], dtype=jnp.float64),
             "maxj_objective": jnp.asarray(observables["maxj_objective"], dtype=jnp.float64),
         }
+    elif kind == "vmec_dmerc_objectives":
+        raise _vmec_dmerc_unavailable_error()
     else:
         raise ValueError(
-            "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
-            "'vmec_booz_scalar_observables', 'vmec_booz_qi_maxj_scalar_objectives', or "
-            "'vmec_qi_maxj_scalar_objectives'."
+            "observable_kind must be 'vmec_scalar_observables', 'vmec_core_scalar_objectives', "
+            "'geometry_full_ad_objectives', 'vmec_iotaf_scalar_observables', 'vmec_booz_scalar_observables', "
+            "'vmec_booz_qi_maxj_scalar_objectives', 'vmec_qi_maxj_scalar_objectives', or "
+            "'vmec_dmerc_objectives'."
         )
     return list(observables.items())
 
@@ -1590,6 +1673,31 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "dmerc_objective_hi",
             "mirror_ratio_objective",
             "edge_r00",
+        ]
+    if kind == "vmec_core_scalar_objectives":
+        return [
+            "aspect_ratio",
+            "volume_total",
+            "iota_mean",
+            "magnetic_well",
+            "mirror_ratio",
+            "beta_volume",
+        ]
+    if kind == "geometry_full_ad_objectives":
+        return [
+            "vmec_aspect_ratio",
+            "vmec_volume_total",
+            "vmec_iota_mean",
+            "vmec_magnetic_well",
+            "vmec_mirror_ratio",
+            "vmec_beta_volume",
+            "boozer_iota_b_mean",
+            "boozer_b00_mean",
+            "boozer_buco_b_mean",
+            "boozer_bvco_b_mean",
+            "boozer_aspect_proxy",
+            "boozer_b10_over_b00_mean",
+            "boozer_qi_objective",
         ]
     if kind == "vmec_iotaf_scalar_observables":
         return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
@@ -1610,10 +1718,13 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
         return ["qi_objective", "maxj_objective"]
     if kind == "vmec_booz_qi_maxj_scalar_objectives":
         return ["qi_objective", "maxj_objective"]
+    if kind == "vmec_dmerc_objectives":
+        raise _vmec_dmerc_unavailable_error()
     raise ValueError(
-        "observable_kind must be 'vmec_scalar_observables', 'vmec_iotaf_scalar_observables', "
-        "'vmec_booz_scalar_observables', 'vmec_booz_qi_maxj_scalar_objectives', or "
-        "'vmec_qi_maxj_scalar_objectives'."
+        "observable_kind must be 'vmec_scalar_observables', 'vmec_core_scalar_objectives', "
+        "'geometry_full_ad_objectives', 'vmec_iotaf_scalar_observables', 'vmec_booz_scalar_observables', "
+        "'vmec_booz_qi_maxj_scalar_objectives', 'vmec_qi_maxj_scalar_objectives', or "
+        "'vmec_dmerc_objectives'."
     )
 
 
@@ -2056,6 +2167,56 @@ def vmec_booz_scalar_observables_from_param_vector(
         jacobian_penalty=jacobian_penalty,
     )
     return _vmec_booz_scalar_observables_from_state(context, state)
+
+
+def geometry_observable_kind_from_single_param(
+    context: GeometryAutodiffContext,
+    param_delta,
+    *,
+    observable_kind: str,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return {
+        name: jnp.asarray(value, dtype=jnp.float64)
+        for name, value in _observable_items_from_state(context, state, observable_kind=observable_kind)
+    }
+
+
+def geometry_observable_kind_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    observable_kind: str,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_param_vector(
+        context,
+        param_deltas,
+        param_specs,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return {
+        name: jnp.asarray(value, dtype=jnp.float64)
+        for name, value in _observable_items_from_state(context, state, observable_kind=observable_kind)
+    }
 
 
 def vmec_qi_maxj_scalar_objectives_from_single_param(
