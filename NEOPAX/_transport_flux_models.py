@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import interpax
 import numpy as np
 import sys
+import types
 from pathlib import Path
 from ._cell_variable import (
     get_gradient_density,
@@ -1012,6 +1013,7 @@ def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
 
 
 def _import_ntx():
+    _install_vmec_jax_api_compat_for_ntx()
     try:
         import ntx
 
@@ -1024,6 +1026,37 @@ def _import_ntx():
         import ntx
 
         return ntx
+
+
+def _install_vmec_jax_api_compat_for_ntx() -> None:
+    """Provide the legacy `vmec_jax.api.read_wout` import expected by NTX.
+
+    Newer vmec_jax versions export `read_wout` at the package top level instead
+    of through `vmec_jax.api`.  Keep the compatibility local to the NEOPAX
+    process so the NTX checkout itself remains untouched.
+    """
+
+    if "vmec_jax.api" in sys.modules:
+        return
+    try:
+        import vmec_jax
+    except ImportError:
+        return
+
+    read_wout = getattr(vmec_jax, "read_wout", None)
+    if read_wout is None:
+        try:
+            from vmec_jax.core.wout import read_wout as read_wout
+        except ImportError:
+            return
+
+    api_module = types.ModuleType("vmec_jax.api")
+    api_module.read_wout = read_wout
+    sys.modules["vmec_jax.api"] = api_module
+    try:
+        setattr(vmec_jax, "api", api_module)
+    except Exception:
+        pass
 
 
 def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):

@@ -5797,3 +5797,27 @@ python ./examples/benchmarks/benchmark_transport_adaptive_ad_vs_frozen_fd.py --n
 
 3. Compare those results against the trusted saved `T0` values in the compact
    table above, not only against each other.
+
+## 2026-07-11 realtime VMEC / NTX compatibility note
+
+The frozen transport TOML failed after the local `vmec_jax` update because NTX
+still imports:
+
+```python
+from vmec_jax.api import read_wout
+```
+
+while the updated `vmec_jax` exposes `read_wout` through the package-level
+API / `vmec_jax.core.wout`.
+
+Current local workaround:
+
+- keep NTX unchanged
+- install a NEOPAX-local, process-only `vmec_jax.api` compatibility module in
+  `NEOPAX/_transport_flux_models.py` before importing NTX
+- expose only the `read_wout` symbol needed by the frozen WOUT surface loader
+
+This should be treated as temporary glue.  Once NTX is updated to import
+`read_wout` from the current `vmec_jax` API directly, remove the NEOPAX shim
+(`_install_vmec_jax_api_compat_for_ntx`) and the `types` import that supports
+it.
