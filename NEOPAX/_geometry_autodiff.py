@@ -1220,6 +1220,7 @@ def _boozer_output_from_state(
         surface_indices=context.surface_indices,
         jit=True,
     )
+    return out
 
 
 def _vmec_booz_scalar_observables_from_boozer(
