@@ -154,7 +154,7 @@ def main() -> None:
         choices=("exact_optimizer", "implicit"),
         help=(
             "'exact_optimizer' keeps the legacy accepted-point matrix-free benchmark. "
-            "'implicit' compares FD against forward/reverse AD through the current vmec_jax implicit lane."
+            "'implicit' compares FD against reverse AD through the current vmec_jax implicit custom-VJP lane."
         ),
     )
     parser.add_argument(
@@ -206,10 +206,8 @@ def main() -> None:
         resolved_step_size=resolved_step_size,
     )
 
-    if args.ad_backend == "implicit":
-        print("[geometry-fd-ad] progress: running implicit-lane forward JVP", flush=True)
-        forward_ad = _implicit_forward_jvp(ad_func)
-    else:
+    forward_ad = None
+    if args.ad_backend == "exact_optimizer":
         print("[geometry-fd-ad] progress: running exact accepted-point matrix-free forward Jv", flush=True)
         forward_ad = exact_forward_scalar_observable_derivatives(
             context,
@@ -217,6 +215,11 @@ def main() -> None:
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
             solver_device=args.exact_solver_device,
+        )
+    else:
+        print(
+            "[geometry-fd-ad] progress: skipping forward JVP because implicit solve is custom_vjp-only",
+            flush=True,
         )
     print("[geometry-fd-ad] progress: running forward-lane centered finite difference", flush=True)
     fd_center, minus, plus = central_fd_single_param(fd_func, h)
@@ -242,33 +245,33 @@ def main() -> None:
             )
 
     print("[geometry-fd-ad] observable comparison:")
-    for name in forward_ad:
-        forward_ad_value = forward_ad[name]
+    names = reverse_ad.keys() if forward_ad is None and reverse_ad is not None else forward_ad.keys()
+    for name in names:
         center_value = fd_center[name]
-        forward_fd_err = rel_error(forward_ad_value, center_value)
-        line = (
-            f"  - {name}: forward_ad={float(jnp.asarray(forward_ad_value)):.6e} "
-            f"fd_center={float(jnp.asarray(center_value)):.6e} "
-            f"forward_vs_fd_rel_err={forward_fd_err:.6e}"
-        )
+        line = f"  - {name}: fd_center={float(jnp.asarray(center_value)):.6e}"
+        if forward_ad is not None:
+            forward_ad_value = forward_ad[name]
+            forward_fd_err = rel_error(forward_ad_value, center_value)
+            line += (
+                f" forward_ad={float(jnp.asarray(forward_ad_value)):.6e}"
+                f" forward_vs_fd_rel_err={forward_fd_err:.6e}"
+            )
         if fd_five is not None:
             five_value = fd_five[name]
-            five_err = rel_error(forward_ad_value, five_value)
             center_vs_five = rel_error(center_value, five_value)
-            line += (
-                f" fd_five_point={float(jnp.asarray(five_value)):.6e}"
-                f" forward_vs_five_rel_err={five_err:.6e}"
-                f" center_vs_five_rel_err={center_vs_five:.6e}"
-            )
+            line += f" fd_five_point={float(jnp.asarray(five_value)):.6e}"
+            if forward_ad is not None:
+                five_err = rel_error(forward_ad[name], five_value)
+                line += f" forward_vs_five_rel_err={five_err:.6e}"
+            line += f" center_vs_five_rel_err={center_vs_five:.6e}"
         if reverse_ad is not None:
             reverse_value = reverse_ad[name]
-            reverse_err = rel_error(reverse_value, forward_ad_value)
             reverse_fd_err = rel_error(reverse_value, center_value)
-            line += (
-                f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
-                f" reverse_vs_forward_rel_err={reverse_err:.6e}"
-                f" reverse_vs_fd_rel_err={reverse_fd_err:.6e}"
-            )
+            line += f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
+            if forward_ad is not None:
+                reverse_err = rel_error(reverse_value, forward_ad[name])
+                line += f" reverse_vs_forward_rel_err={reverse_err:.6e}"
+            line += f" reverse_vs_fd_rel_err={reverse_fd_err:.6e}"
         print(line, flush=True)
 
 
