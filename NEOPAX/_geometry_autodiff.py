@@ -1297,9 +1297,9 @@ def _vmec_booz_qi_scalar_objective_from_state(
     context: GeometryAutodiffContext,
     state,
     *,
-    nphi: int = 51,
-    nalpha: int = 17,
-    n_bounce: int = 17,
+    nphi: int = 151,
+    nalpha: int = 31,
+    n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
     booz = _boozer_output_from_state(context, state)
     return _vmec_booz_qi_scalar_objective_from_boozer(
@@ -1315,9 +1315,9 @@ def _vmec_booz_qi_scalar_objective_from_boozer(
     context: GeometryAutodiffContext,
     booz,
     *,
-    nphi: int = 51,
-    nalpha: int = 17,
-    n_bounce: int = 17,
+    nphi: int = 151,
+    nalpha: int = 31,
+    n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
     optimization = _import_vmec_jax_optimization()
     qi = optimization.quasi_isodynamic_residual(
@@ -1678,6 +1678,8 @@ def _observable_items_from_state(
         observables = _vmec_iotaf_scalar_observables_from_state(context, state)
     elif kind == "vmec_booz_scalar_observables":
         observables = _vmec_booz_scalar_observables_from_state(context, state)
+    elif kind == "vmec_booz_qi_scalar_objectives":
+        observables = _vmec_booz_qi_scalar_objective_from_state(context, state)
     elif kind == "vmec_booz_qi_maxj_scalar_objectives":
         observables = _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
     elif kind == "vmec_qi_maxj_scalar_objectives":
@@ -1692,8 +1694,8 @@ def _observable_items_from_state(
         raise ValueError(
             "observable_kind must be 'vmec_scalar_observables', 'vmec_core_scalar_objectives', "
             "'geometry_full_ad_objectives', 'vmec_iotaf_scalar_observables', 'vmec_booz_scalar_observables', "
-            "'vmec_booz_qi_maxj_scalar_objectives', 'vmec_qi_maxj_scalar_objectives', or "
-            "'vmec_dmerc_objectives'."
+            "'vmec_booz_qi_scalar_objectives', 'vmec_booz_qi_maxj_scalar_objectives', "
+            "'vmec_qi_maxj_scalar_objectives', or 'vmec_dmerc_objectives'."
         )
     return list(observables.items())
 
@@ -1754,6 +1756,8 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
         ]
     if kind == "vmec_qi_maxj_scalar_objectives":
         return ["qi_objective", "maxj_objective"]
+    if kind == "vmec_booz_qi_scalar_objectives":
+        return ["qi_objective"]
     if kind == "vmec_booz_qi_maxj_scalar_objectives":
         return ["qi_objective", "maxj_objective"]
     if kind == "vmec_dmerc_objectives":
@@ -1761,8 +1765,8 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
     raise ValueError(
         "observable_kind must be 'vmec_scalar_observables', 'vmec_core_scalar_objectives', "
         "'geometry_full_ad_objectives', 'vmec_iotaf_scalar_observables', 'vmec_booz_scalar_observables', "
-        "'vmec_booz_qi_maxj_scalar_objectives', 'vmec_qi_maxj_scalar_objectives', or "
-        "'vmec_dmerc_objectives'."
+        "'vmec_booz_qi_scalar_objectives', 'vmec_booz_qi_maxj_scalar_objectives', "
+        "'vmec_qi_maxj_scalar_objectives', or 'vmec_dmerc_objectives'."
     )
 
 

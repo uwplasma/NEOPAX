@@ -157,6 +157,7 @@ def main() -> None:
             "vmec_iotaf_scalar_observables",
             "vmec_booz_scalar_observables",
             "vmec_qi_maxj_scalar_objectives",
+            "vmec_booz_qi_scalar_objectives",
             "vmec_booz_qi_maxj_scalar_objectives",
             "vmec_dmerc_objectives",
         ),
@@ -164,6 +165,8 @@ def main() -> None:
             "Observable group to compare. 'geometry_full_ad_objectives' is the "
             "combined gate: current vmec_jax.core.optimize scalars, Boozer "
             "reduced quantities, and Boozer QI in one reverse Jacobian. "
+            "'vmec_booz_qi_scalar_objectives' tests the Boozer/QI path without "
+            "requiring balloon_jax/Max-J. "
             "Max-J is kept only in the explicit QI/max-J diagnostic mode for now. "
             "'vmec_dmerc_objectives' intentionally errors until DMerc has a "
             "pure-JAX state-level implementation."
@@ -197,11 +200,11 @@ def main() -> None:
     parser.add_argument(
         "--surface-s",
         type=str,
-        default="0.25,0.5,0.75",
+        default="0.1,0.28,0.46,0.64,0.82,1.0",
         help="Comma-separated Boozer surfaces in normalized toroidal flux s.",
     )
-    parser.add_argument("--mboz", type=int, default=12, help="Boozer mboz.")
-    parser.add_argument("--nboz", type=int, default=12, help="Boozer nboz.")
+    parser.add_argument("--mboz", type=int, default=18, help="Boozer mboz.")
+    parser.add_argument("--nboz", type=int, default=18, help="Boozer nboz.")
     parser.add_argument("--vmec-max-iter", type=int, default=None, help="Override VMEC iterations. Default: from input file.")
     parser.add_argument(
         "--vmec-step-size",
