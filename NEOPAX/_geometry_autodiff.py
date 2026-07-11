@@ -66,6 +66,67 @@ def _import_booz_xform_jax_api():
     return jax_api
 
 
+def _booz_xform_inputs_from_state(
+    *,
+    state,
+    static,
+    indata,
+    signgs,
+    flux,
+):
+    vmec_jax = _import_vmec_jax()
+    try:
+        booz_xform_inputs_from_state = _resolve_vmec_attr(
+            vmec_jax,
+            "booz_xform_inputs_from_state",
+            submodule="booz_input",
+        )
+        return booz_xform_inputs_from_state(
+            state=state,
+            static=static,
+            indata=indata,
+            signgs=signgs,
+            flux=flux,
+        )
+    except (AttributeError, ModuleNotFoundError):
+        from vmec_jax.core.boozer_tables import boozer_input_tables
+
+        rt = static.runtime
+        ns = int(jnp.asarray(rt.setup.s_full).shape[0])
+        tables = [boozer_input_tables(state, rt, j) for j in range(1, ns)]
+
+        def stack(name: str):
+            return jnp.stack([jnp.asarray(table[name]) for table in tables], axis=0)
+
+        first = tables[0]
+        return SimpleNamespace(
+            nfp=jnp.asarray(int(rt.resolution.nfp), dtype=jnp.int32),
+            xm=jnp.asarray(first["xm"], dtype=jnp.int32),
+            xn=jnp.asarray(first["xn"], dtype=jnp.int32),
+            xm_nyq=jnp.asarray(first["xm"], dtype=jnp.int32),
+            xn_nyq=jnp.asarray(first["xn"], dtype=jnp.int32),
+            rmnc=stack("rmnc"),
+            zmns=stack("zmns"),
+            lmns=stack("lmns"),
+            bmnc=stack("bmnc"),
+            bsubumnc=stack("bsubumnc"),
+            bsubvmnc=stack("bsubvmnc"),
+            iota=stack("iota"),
+        )
+
+
+def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inputs):
+    if context.booz_constants is not None and context.booz_grids is not None:
+        return context.booz_constants, context.booz_grids
+    booz_api = _import_booz_xform_jax_api()
+    return booz_api.prepare_booz_xform_constants_from_inputs(
+        inputs=inputs,
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        asym=bool(context.cfg.lasym),
+    )
+
+
 def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
     value = getattr(module, name, None)
     if value is not None:
@@ -897,17 +958,18 @@ def _vmec_booz_scalar_observables_from_state(
         submodule="finite_beta",
     )
 
-    inputs = vmec_jax.booz_xform_inputs_from_state(
+    inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
         signgs=context.signgs,
         flux=context.flux,
     )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
-        constants=context.booz_constants,
-        grids=context.booz_grids,
+        constants=booz_constants,
+        grids=booz_grids,
         surface_indices=context.surface_indices,
         jit=True,
     )
@@ -965,18 +1027,19 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     from balloon_jax.objectives import maximum_j_residual_from_boozer_output
     from vmec_jax.quasi_isodynamic import quasi_isodynamic_residual_from_boozer_output
 
-    inputs = vmec_jax.booz_xform_inputs_from_state(
+    inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
         signgs=context.signgs,
         flux=context.flux,
     )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     booz = dict(
         booz_api.booz_xform_from_inputs(
             inputs=inputs,
-            constants=context.booz_constants,
-            grids=context.booz_grids,
+            constants=booz_constants,
+            grids=booz_grids,
             surface_indices=context.surface_indices,
             jit=True,
         )
@@ -1715,17 +1778,18 @@ def geometry_observables_from_single_param(
     )
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
-    inputs = vmec_jax.booz_xform_inputs_from_state(
+    inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
         signgs=context.signgs,
         flux=context.flux,
     )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
-        constants=context.booz_constants,
-        grids=context.booz_grids,
+        constants=booz_constants,
+        grids=booz_grids,
         surface_indices=context.surface_indices,
         jit=True,
     )
@@ -1852,17 +1916,18 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_arr)
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
-    inputs = vmec_jax.booz_xform_inputs_from_state(
+    inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
         signgs=context.signgs,
         flux=context.flux,
     )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
-        constants=context.booz_constants,
-        grids=context.booz_grids,
+        constants=booz_constants,
+        grids=booz_grids,
         surface_indices=surface_indices,
         jit=True,
     )
@@ -2004,7 +2069,7 @@ def _build_neopax_geometry_from_state(
 
     booz_api = _import_booz_xform_jax_api()
     vmec_jax = _import_vmec_jax()
-    inputs = vmec_jax.booz_xform_inputs_from_state(
+    inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
         indata=context.indata,
@@ -2012,10 +2077,11 @@ def _build_neopax_geometry_from_state(
         flux=context.flux,
     )
     surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
-        constants=context.booz_constants,
-        grids=context.booz_grids,
+        constants=booz_constants,
+        grids=booz_grids,
         surface_indices=surface_indices,
         jit=True,
     )
