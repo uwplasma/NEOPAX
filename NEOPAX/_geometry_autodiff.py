@@ -276,6 +276,93 @@ def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", imp
     return dataclasses.replace(params, **{field_name: updated})
 
 
+def _boundary_param_entry(context: "GeometryAutodiffContext", param_family: str, param_m: int, param_n: int) -> dict[str, Any]:
+    kind = _boundary_kind_for_family(param_family)
+    m_arr = jnp.asarray(context.static.modes.m)
+    n_arr = jnp.asarray(context.static.modes.n)
+    matches = jnp.where((m_arr == int(param_m)) & (n_arr == int(param_n)), size=2, fill_value=-1)[0]
+    match_indices = [int(idx) for idx in np.asarray(matches) if int(idx) >= 0]
+    if not match_indices:
+        raise ValueError(
+            f"Could not find a {param_family} coefficient with (m, n)=({param_m}, {param_n}) in {context.input_path}."
+        )
+    if len(match_indices) > 1:
+        raise ValueError(
+            f"Found multiple matches for {param_family}({param_m}, {param_n}); expected exactly one."
+        )
+    boundary_index = int(match_indices[0])
+    boundary_array = jnp.asarray(getattr(context.boundary, _boundary_array_name_for_kind(kind)))
+    return {
+        "family": str(param_family).strip().upper(),
+        "kind": kind,
+        "m": int(param_m),
+        "n": int(param_n),
+        "boundary_index": boundary_index,
+        "input_field": _input_boundary_array_name_for_kind(kind),
+        "boundary_field": _boundary_array_name_for_kind(kind),
+        "n_offset": int(context.static.resolution.ntor) + int(param_n),
+        "m_index": int(param_m),
+        "baseline_coefficient": float(boundary_array[boundary_index]),
+    }
+
+
+def boundary_param_entries(
+    context: "GeometryAutodiffContext",
+    param_specs: Sequence[tuple[str, int, int]],
+) -> tuple[dict[str, Any], ...]:
+    return tuple(_boundary_param_entry(context, family, m, n) for family, m, n in param_specs)
+
+
+def _input_with_boundary_deltas(
+    context: "GeometryAutodiffContext",
+    param_deltas,
+    param_entries: Sequence[dict[str, Any]],
+):
+    updates: dict[str, Any] = {}
+    deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    for i, entry in enumerate(param_entries):
+        field_name = entry["input_field"]
+        base = updates.get(field_name)
+        if base is None:
+            base = jnp.asarray(getattr(context.indata, field_name), dtype=jnp.float64)
+        updates[field_name] = base.at[int(entry["n_offset"]), int(entry["m_index"])].add(deltas[i])
+    return dataclasses.replace(context.indata, **updates)
+
+
+def _implicit_params_with_boundary_deltas(
+    context: "GeometryAutodiffContext",
+    implicit,
+    param_deltas,
+    param_entries: Sequence[dict[str, Any]],
+):
+    params = implicit.params_from_input(context.indata)
+    updates: dict[str, Any] = {}
+    deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    for i, entry in enumerate(param_entries):
+        field_name = entry["input_field"]
+        base = updates.get(field_name)
+        if base is None:
+            base = jnp.asarray(getattr(params, field_name), dtype=jnp.float64)
+        updates[field_name] = base.at[int(entry["n_offset"]), int(entry["m_index"])].add(deltas[i])
+    return dataclasses.replace(params, **updates)
+
+
+def _boundary_with_boundary_deltas(
+    context: "GeometryAutodiffContext",
+    param_deltas,
+    param_entries: Sequence[dict[str, Any]],
+):
+    updates: dict[str, Any] = {}
+    deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    for i, entry in enumerate(param_entries):
+        field_name = entry["boundary_field"]
+        base = updates.get(field_name)
+        if base is None:
+            base = jnp.asarray(getattr(context.boundary, field_name), dtype=jnp.float64)
+        updates[field_name] = base.at[int(entry["boundary_index"])].add(deltas[i])
+    return dataclasses.replace(context.boundary, **updates)
+
+
 def _wout_from_vmec_state(
     context: "GeometryAutodiffContext",
     state,
@@ -675,6 +762,98 @@ def _solve_state_for_single_param(
 
     # AD lane: keep the implicit residual solve separate so we can add a
     # reverse-mode path later without changing the forward lane contract.
+    del jacobian_penalty
+    implicit = _import_vmec_jax_implicit()
+    return implicit.solve_fixed_boundary_state_implicit_vmec_residual(
+        state0,
+        context.static,
+        indata=context.indata,
+        signgs=int(context.signgs),
+        max_iter=max_iter_value,
+        step_size=step_size_value,
+        ftol=context.vmec_default_ftol,
+        edge_Rcos=_vmec_state_field(state0, "Rcos", "R_cos")[-1, :],
+        edge_Rsin=_vmec_state_field(state0, "Rsin", "R_sin")[-1, :],
+        edge_Zcos=_vmec_state_field(state0, "Zcos", "Z_cos")[-1, :],
+        edge_Zsin=_vmec_state_field(state0, "Zsin", "Z_sin")[-1, :],
+    )
+
+
+def _solve_state_for_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> Any:
+    param_entries = boundary_param_entries(context, param_specs)
+    vmec_jax = _import_vmec_jax()
+    if _using_current_vmec_jax_context(context):
+        lane_key = str(lane).strip().lower()
+        if lane_key not in {"forward", "ad"}:
+            raise ValueError("lane must be 'forward' or 'ad'.")
+        if lane_key == "forward":
+            input_eff = _input_with_boundary_deltas(context, param_deltas, param_entries)
+            from vmec_jax.core.multigrid import solve_multigrid
+
+            solve_kwargs = {"mode": "cli", "verbose": False}
+            if max_iter is not None:
+                niter_array = np.asarray(input_eff.niter_array, dtype=np.int64).copy()
+                niter_array[-1] = int(max_iter)
+                solve_kwargs["niter_array"] = niter_array
+            if step_size is not None:
+                solve_kwargs["time_step"] = float(step_size)
+            return solve_multigrid(input_eff, **solve_kwargs).state
+
+        del jacobian_penalty
+        implicit = _import_vmec_jax_implicit()
+        params = _implicit_params_with_boundary_deltas(context, implicit, param_deltas, param_entries)
+        config_kwargs = {
+            "ns": int(context.static.resolution.ns),
+            "mode": "cli",
+            "multigrid": True,
+        }
+        if max_iter is not None:
+            config_kwargs["max_iterations"] = int(max_iter)
+        cfg = implicit.make_config(context.indata, **config_kwargs)
+        return implicit.solve_implicit(params, cfg)
+
+    initial_guess_from_boundary = _resolve_vmec_attr(vmec_jax, "initial_guess_from_boundary", submodule="init_guess")
+    solve_fixed_boundary_residual_iter = _resolve_vmec_attr(vmec_jax, "solve_fixed_boundary_residual_iter", submodule="solve")
+
+    lane_key = str(lane).strip().lower()
+    if lane_key not in {"forward", "ad"}:
+        raise ValueError("lane must be 'forward' or 'ad'.")
+
+    max_iter_value = int(context.vmec_default_max_iter if max_iter is None else max_iter)
+    step_size_value = float(context.vmec_default_step_size if step_size is None else step_size)
+    boundary = _boundary_with_boundary_deltas(context, param_deltas, param_entries)
+    state0 = initial_guess_from_boundary(context.static, boundary, context.indata, vmec_project=True)
+
+    if lane_key == "forward":
+        result = solve_fixed_boundary_residual_iter(
+            state0,
+            context.static,
+            indata=context.indata,
+            signgs=int(context.signgs),
+            ftol=context.vmec_default_ftol,
+            max_iter=max_iter_value,
+            step_size=step_size_value,
+            vmec2000_control=True,
+            strict_update=True,
+            backtracking=False,
+            limit_dt_from_force=False,
+            limit_update_rms=False,
+            verbose=False,
+            verbose_vmec2000_table=False,
+            jit_forces="auto",
+            use_scan=True,
+        )
+        return result.state
+
     del jacobian_penalty
     implicit = _import_vmec_jax_implicit()
     return implicit.solve_fixed_boundary_state_implicit_vmec_residual(
@@ -1754,6 +1933,28 @@ def vmec_scalar_observables_from_single_param(
     return _vmec_scalar_observables_from_state(context, state)
 
 
+def vmec_scalar_observables_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_param_vector(
+        context,
+        param_deltas,
+        param_specs,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _vmec_scalar_observables_from_state(context, state)
+
+
 def vmec_iotaf_scalar_observables_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
@@ -1827,6 +2028,28 @@ def vmec_booz_scalar_observables_from_single_param(
     state = _solve_state_for_single_param(
         context,
         param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return _vmec_booz_scalar_observables_from_state(context, state)
+
+
+def vmec_booz_scalar_observables_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> dict[str, jnp.ndarray]:
+    state = _solve_state_for_param_vector(
+        context,
+        param_deltas,
+        param_specs,
         lane=lane,
         max_iter=max_iter,
         step_size=step_size,
