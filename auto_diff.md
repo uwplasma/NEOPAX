@@ -6129,8 +6129,8 @@ Expected success signal:
   FD-vs-AD diagnosis because the QI-only scalar benchmark currently mismatches
   FD.
 
-To print the full per-objective FD-vs-reverse table through the explicit
-cotangent-contracted custom VJP boundary, use:
+To print the full per-objective FD-vs-reverse table in the same style as the
+profile reverse benchmark, use:
 
 ```bash
 python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
@@ -6141,19 +6141,26 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --fd-abs-step 1e-10 \
   --ad-backend implicit \
   --fd-lane ad \
-  --reverse-derivative-mode custom_vjp
+  --reverse-derivative-mode objective_table
 ```
 
 This is the main rule-refactor benchmark mode:
 
-- the primal returns the objective vector,
-- the custom VJP backward receives an objective cotangent vector,
-- the backward contracts the cotangent via
-  `grad_theta dot(cotangent, objectives(theta))`,
-- the printed table is recovered through that custom VJP boundary rather than
-  through raw objective-graph autodiff.
-- the custom VJP wrapper is intentionally restricted to the AD / implicit
-  geometry lane, so it should not be used to alter the forward solver lane.
+- the benchmark prints objective values first,
+- then it prints reverse gradients grouped by objective,
+- each row is recovered by the already-working scalar weighted-cotangent rule:
+
+```text
+grad_theta dot(onehot(objective), objectives(theta))
+```
+
+- this avoids raw vector-output `jax.jacrev(objective_vector)`,
+- it does not change VMEC, Boozer, or QI derivative rules.
+
+This is a correctness/diagnostic benchmark table, not yet the final
+transport-coupled all-objective geometry rule. The final coupled transport path
+should consume the scalar cotangent supplied by the transport objective/loss
+directly, like the existing profile reverse output path.
 
 Diagnostic modes:
 

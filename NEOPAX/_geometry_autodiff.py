@@ -2337,64 +2337,6 @@ def geometry_observable_weighted_sum_from_param_vector(
     return jnp.sum(weights * values)
 
 
-def geometry_observable_vector_custom_vjp_from_param_vector(
-    context: GeometryAutodiffContext,
-    param_deltas,
-    param_specs: Sequence[tuple[str, int, int]],
-    *,
-    observable_kind: str,
-    objective_names: Sequence[str] | None = None,
-    lane: str = "ad",
-    max_iter: int | None = None,
-    step_size: float | None = None,
-    jacobian_penalty: float = 1.0e3,
-) -> jnp.ndarray:
-    if str(lane).strip().lower() != "ad":
-        raise ValueError("geometry_observable_vector_custom_vjp_from_param_vector only supports lane='ad'.")
-    names = tuple(objective_names) if objective_names is not None else geometry_observable_names_for_kind(observable_kind)
-
-    def _plain(deltas):
-        values = geometry_observable_kind_from_param_vector(
-            context,
-            deltas,
-            param_specs,
-            observable_kind=observable_kind,
-            lane=lane,
-            max_iter=max_iter,
-            step_size=step_size,
-            jacobian_penalty=jacobian_penalty,
-        )
-        return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in names])
-
-    @jax.custom_vjp
-    def _vector(deltas):
-        return _plain(deltas)
-
-    def _vector_fwd(deltas):
-        return _plain(deltas), deltas
-
-    def _vector_bwd(deltas, objective_cotangent):
-        weights = jnp.asarray(objective_cotangent, dtype=jnp.float64).reshape((-1,))
-        grad = jax.grad(
-            lambda d: geometry_observable_weighted_sum_from_param_vector(
-                context,
-                d,
-                param_specs,
-                weights,
-                observable_kind=observable_kind,
-                objective_names=names,
-                lane=lane,
-                max_iter=max_iter,
-                step_size=step_size,
-                jacobian_penalty=jacobian_penalty,
-            )
-        )(deltas)
-        return (grad,)
-
-    _vector.defvjp(_vector_fwd, _vector_bwd)
-    return _vector(param_deltas)
-
-
 def vmec_qi_maxj_scalar_objectives_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
