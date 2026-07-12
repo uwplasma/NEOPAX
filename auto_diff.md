@@ -6144,52 +6144,52 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --reverse-derivative-mode objective_table
 ```
 
-This is now wired to the geometry objective-vector custom VJP:
+This is now wired to the first NEOPAX multi-RHS geometry pullback helper:
 
 - the benchmark prints objective values first,
 - then it prints reverse gradients grouped by objective,
-- the objective vector has a custom reverse rule whose backward pass contracts
-  the incoming objective cotangent before differentiating:
+- the benchmark passes the full cotangent matrix to one helper call:
 
 ```text
-cotangent -> grad_theta dot(cotangent, objectives(theta))
+geometry_observable_multi_rhs_pullback_from_param_vector(..., W)
 ```
 
 - this avoids `jax.jacrev(...)` in the benchmark table path,
+- this avoids benchmark-layer `vmap(pullback)`,
 - it avoids the explicit Python one-objective-at-a-time fallback,
 - it keeps VMEC, Boozer, and QI derivative rules unchanged.
 
-### Implemented reverse custom-VJP objective table
+### Implemented initial multi-RHS geometry table
 
 The reusable helper is:
 
 ```text
-geometry_observable_vector_custom_vjp_from_param_vector(...)
+geometry_observable_multi_rhs_pullback_from_param_vector(...)
 ```
 
-It wraps the objective vector:
+It accepts:
 
 ```text
-objectives(theta)
+W.shape = (n_rhs, n_objectives)
 ```
 
-with a backward rule equivalent to the working scalar weighted path:
+and returns:
 
 ```text
-g(theta, w) = dot(w, objectives(theta))
-dtheta = grad_theta g(theta, w)
+values_by_name
+gradient_matrix.shape = (n_rhs, n_geometry_parameters)
 ```
 
-The benchmark table now uses:
+The current first implementation keeps the row traversal inside the helper:
 
 ```text
-values, pullback = jax.vjp(geometry_observable_vector_custom_vjp_from_param_vector, theta0)
-table = vmap(pullback)(eye(n_objectives))
+scan over cotangent rows:
+    grad_theta dot(W[row], objectives(theta))
 ```
 
-so JAX sees a vector-valued objective, but each reverse row is routed through
-the custom VJP backward that contracts the objective cotangent into a scalar
-before taking the geometry reverse gradient.
+This is not the final block-GMRES/multi-RHS VMEC adjoint yet, but it moves the
+multi-RHS API below the benchmark layer and should avoid the previous
+benchmark-level `vmap(pullback)` memory blow-up.
 
 The previous raw contracted-vector helper remains only as a diagnostic mode:
 
@@ -6203,8 +6203,9 @@ That mode OOMed for the full QI geometry objective because JAX lowered it as
 Important limitation:
 
 - `objective_table` is reverse-mode again, not parameter-direction forward AD,
-- it still uses one pullback row per output objective because the current
-  VMEC/Boozer/QI lower-level rules do not expose a true multi-RHS transpose,
+- internally it still scans scalar reverse contractions because the current
+  VMEC/Boozer/QI lower-level rules do not expose a true block multi-RHS
+  transpose,
 - the next real implementation step is a lower-level multi-RHS geometry
   pullback, not another benchmark wrapper and not a forward-AD substitution.
 
@@ -6258,6 +6259,526 @@ Validation order:
 3. Only after this works should the same helper be wired into the
    transport-realtime geometry path.
 
+### Plan: true multi-RHS geometry reverse rule to remove OOM
+
+The current reverse table is still not equivalent to the profile transport
+custom rule. It avoids generic raw-objective `jacrev`, but it still evaluates
+one pullback row per objective:
+
+```text
+values, pullback = vjp(objectives_custom_vjp, theta0)
+table = vmap(pullback)(eye(n_objectives))
+```
+
+The true target is:
+
+```text
+values, multi_rhs_pullback = geometry_objectives_multi_rhs_fwd(theta0)
+table = multi_rhs_pullback(W)
+```
+
+with:
+
+```text
+W.shape     = (n_rhs, n_objectives)
+table.shape = (n_rhs, n_geometry_parameters)
+```
+
+This must be implemented below the benchmark layer. The benchmark should only
+call the rule, not synthesize the rule with `jacrev`, `vmap(pullback)`, or
+forward AD.
+
+#### Phase 1: split geometry objective graph into reusable intermediates
+
+Add an internal forward helper in `_geometry_autodiff.py`:
+
+```text
+_geometry_full_ad_objectives_fwd(context, theta, param_specs, ...)
+```
+
+It should return:
+
+```text
+objective_values
+residual = {
+  state,
+  booz,
+  vmec_scalar_intermediates if needed,
+  boozer_scalar_intermediates if needed,
+  qi_intermediates or enough inputs to recompute QI cheaply,
+}
+```
+
+The important part is that VMEC and Boozer are computed once for the geometry
+parameter vector. Do not rebuild the full VMEC/Boozer/QI graph per objective
+row.
+
+#### Phase 2: objective-level multi-RHS transpose
+
+Implement:
+
+```text
+_geometry_full_ad_objectives_multi_rhs_bwd(context, residual, W)
+```
+
+This should contract objective cotangents into cotangents for shared
+intermediates:
+
+```text
+W_vmec_scalars
+W_boozer_scalars
+W_qi
+```
+
+Then accumulate:
+
+```text
+state_bar_batch
+booz_bar_batch
+```
+
+without materializing the full repeated QI graph. For the QI part, the first
+safe implementation can be:
+
+```text
+for or scan over RHS inside the custom rule only for QI_bar
+```
+
+but the public benchmark path must remain one multi-RHS rule call. If QI still
+dominates memory, add a QI-specific cotangent-contracted pullback that consumes
+`W_qi` directly before constructing the large `bmag` grid adjoints.
+
+#### Phase 3: Boozer multi-RHS pullback
+
+`booz_xform_jax` currently appears to be pure JAX, not an explicit custom VJP.
+For one cotangent this is fine. For the table path we need one of:
+
+```text
+booz_pullback_multi_rhs(booz_bar_batch) -> state_bar_batch
+```
+
+or a controlled internal batching strategy over Boozer cotangents that does not
+rebuild VMEC/QI intermediates. This should live in NEOPAX first as a wrapper
+around the Boozer output function; only move upstream later if needed.
+
+#### Phase 4: VMEC implicit multi-RHS adjoint
+
+Local `vmec_jax.core.implicit.solve_implicit` already has a custom VJP:
+
+```text
+solve_implicit(params, cfg)
+```
+
+but its backward currently accepts one state cotangent tree:
+
+```text
+_solve_implicit_bwd(cfg, res, gbar)
+```
+
+and solves one adjoint system:
+
+```text
+(dF/dz)^T lambda = P gbar
+```
+
+The multi-RHS geometry rule needs:
+
+```text
+_solve_implicit_bwd_multi_rhs(cfg, res, gbar_batch)
+```
+
+with:
+
+```text
+(dF/dz)^T Lambda = P gbar_batch
+```
+
+Then:
+
+```text
+params_bar_batch = -Lambda^T dF/dp + direct_edge_path_batch
+```
+
+Initial implementation options:
+
+1. Use `jax.vmap(_adjoint_solve)` inside a named multi-RHS helper, keeping the
+   batching contained below the geometry custom rule.
+2. If memory is still too high, implement a block GMRES / block linear solve
+   for multiple RHS.
+3. Keep this isolated from profile transport reverse AD and frozen geometry
+   solver lanes.
+
+#### Phase 5: expose one NEOPAX geometry table API
+
+Add:
+
+```text
+geometry_observable_multi_rhs_pullback_from_param_vector(
+    context,
+    param_deltas,
+    param_specs,
+    objective_cotangents,
+    *,
+    observable_kind,
+    objective_names,
+    lane="ad",
+    max_iter=None,
+    step_size=None,
+)
+```
+
+Return:
+
+```text
+values_by_name
+gradient_matrix
+```
+
+This API is the geometry analogue of the profile reverse output table. The
+benchmark `--reverse-derivative-mode objective_table` should call this API
+directly.
+
+#### Validation ladder
+
+Use the same command shape throughout:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode objective_table
+```
+
+Check in this order:
+
+1. VMEC-only objectives, no Boozer/QI.
+2. VMEC + light Boozer scalar objectives, no QI.
+3. QI-only objective with `W = ones[1, :]`.
+4. Full objective table with QI included.
+5. Compare row sums against `--reverse-derivative-mode weighted
+   --cotangent-weights ones`.
+6. Compare table rows against FD.
+
+Stop condition:
+
+- If a phase OOMs, do not switch to forward AD.
+- Do not hide the issue behind benchmark-level `jacrev`.
+- Fix the lowest layer whose transpose is being repeated or materialized too
+  broadly.
+
+### Revised final target: no row loop over objective cotangents
+
+The current helper:
+
+```text
+geometry_observable_multi_rhs_pullback_from_param_vector(...)
+```
+
+is only an intermediate diagnostic if it scans over cotangent rows:
+
+```text
+for each row w_i in W:
+    grad_theta dot(w_i, objectives(theta))
+```
+
+Even if that loop is hidden inside `jax.lax.scan`, it is not the final rule.
+The final geometry reverse path must push the cotangent matrix through the
+geometry graph as a batch:
+
+```text
+W:                  (n_rhs, n_objectives)
+objective_bar_batch -> Boozer/VMEC state cotangent batch
+state_bar_batch:    pytree with leading n_rhs axis
+theta_grad_batch:   (n_rhs, n_geometry_parameters)
+```
+
+No final implementation should use:
+
+```text
+jax.jacrev(objective_vector)
+jax.vmap(pullback)(eye)
+jax.lax.scan(objective_cotangent_rows)
+parameter-direction forward AD
+```
+
+These are only diagnostics.
+
+#### A. Objective batching contract
+
+Define one canonical multi-RHS pullback API:
+
+```text
+geometry_observable_multi_rhs_pullback_from_param_vector(
+    context,
+    param_deltas,
+    param_specs,
+    objective_cotangents,
+    *,
+    observable_kind,
+    objective_names,
+    lane="ad",
+    max_iter=None,
+    step_size=None,
+)
+```
+
+The helper must treat `objective_cotangents` as a matrix:
+
+```text
+objective_cotangents.shape == (n_rhs, n_objectives)
+```
+
+and return:
+
+```text
+values_by_name
+gradient_matrix.shape == (n_rhs, n_geometry_parameters)
+```
+
+This helper is the only function the benchmark and future transport-coupled
+geometry path should call for full objective tables.
+
+#### B. Split values and transpose at the objective layer
+
+Refactor:
+
+```text
+_geometry_full_ad_objectives_from_state(context, state)
+```
+
+into:
+
+```text
+_geometry_full_ad_objectives_fwd(context, state)
+```
+
+returning:
+
+```text
+values_vector
+residual = {
+    state,
+    booz,
+    objective_names,
+    vmec_value_data,
+    boozer_value_data,
+    qi_value_data,
+}
+```
+
+Then implement:
+
+```text
+_geometry_full_ad_objectives_multi_rhs_bwd(context, residual, W)
+```
+
+which accumulates batched cotangents for shared intermediates:
+
+```text
+state_bar_batch
+booz_bar_batch
+```
+
+The goal is to contract all objective cotangents into shared intermediate
+cotangents before calling Boozer or VMEC transposes.
+
+#### C. VMEC scalar objectives batched transpose
+
+VMEC scalar objectives such as aspect ratio, volume, iota mean, magnetic well,
+mirror ratio, and beta should produce a batched state cotangent directly:
+
+```text
+W_vmec_scalars -> state_bar_batch
+```
+
+This can be implemented with explicit formulas where simple, or with a local
+batched VJP of the small scalar-objective layer. This layer is small compared
+with QI and VMEC solve; the key is that it outputs one batched state cotangent
+pytree, not one full geometry pullback per scalar.
+
+#### D. Boozer scalar and QI batched transpose
+
+For Boozer scalar objectives:
+
+```text
+W_boozer_scalars -> booz_bar_batch
+```
+
+For QI:
+
+```text
+W_qi -> booz_bar_batch
+```
+
+The QI rule is the memory-critical part. The current OOM happens in:
+
+```text
+quasi_isodynamic_residual -> _qi_grid -> bmag = sum(bmnc_b * cos(angle))
+```
+
+The QI multi-RHS rule must avoid materializing one large QI graph per objective
+row. Since QI is a scalar in `geometry_full_ad_objectives`, it should contribute
+only one row of `W`. The first true batched implementation can special-case QI:
+
+```text
+if W_qi has nonzero rows:
+    compute one QI cotangent-contracted booz_bar contribution
+    scatter/add it into booz_bar_batch rows where W_qi != 0
+```
+
+Do not build a full `n_objectives` batch through `_qi_grid`.
+
+#### E. Boozer transform batched transpose
+
+Once `booz_bar_batch` is available, propagate it to VMEC state:
+
+```text
+booz_bar_batch -> state_bar_batch_from_boozer
+```
+
+Implementation route:
+
+1. Build a Boozer output function:
+
+```text
+booz_from_state(state) -> booz
+```
+
+2. Derive a single linear transpose:
+
+```text
+_, booz_pullback = jax.vjp(booz_from_state, state)
+```
+
+3. Add a batched transpose helper:
+
+```text
+booz_pullback_multi_rhs(booz_bar_batch)
+```
+
+Preferred final form is a true batched transpose through Boozer primitives. If
+initially this uses internal batching, keep it isolated here and do not expose
+it as the benchmark-level solution.
+
+#### F. VMEC implicit multi-RHS adjoint
+
+This is the essential profile-reverse-equivalent missing piece.
+
+Current `vmec_jax.core.implicit.solve_implicit` backward handles:
+
+```text
+gbar: one state cotangent pytree
+(dF/dz)^T lambda = P gbar
+params_bar = -lambda^T dF/dp + direct_edge_path
+```
+
+Add a NEOPAX-side helper first, before changing upstream VMEC if possible:
+
+```text
+solve_implicit_multi_rhs_pullback(params, cfg, state, mask, gbar_batch)
+```
+
+with:
+
+```text
+gbar_batch: state cotangent pytree with leading n_rhs axis
+```
+
+It should compute:
+
+```text
+B = P(gbar_batch)
+(dF/dz)^T Lambda = B
+params_bar_batch = -Lambda^T dF/dp + direct_edge_path_batch
+```
+
+First implementation can use a block linear operator and a block Krylov solve.
+If block GMRES is too much for the first patch, implement a contained
+multi-RHS solve helper under this VMEC layer, not in the benchmark:
+
+```text
+_adjoint_solve_multi_rhs(A_T, B, cfg)
+```
+
+The key difference from the current bad implementation is that VMEC residual
+linearization, projector, masks, and direct-edge VJP setup are built once and
+then applied to a batch of RHS.
+
+#### G. Benchmark mode after final implementation
+
+After the true rule exists:
+
+```text
+--reverse-derivative-mode objective_table
+```
+
+should do only:
+
+```text
+W = eye(n_objectives)
+values_by_name, gradient_matrix =
+    geometry_observable_multi_rhs_pullback_from_param_vector(..., W)
+```
+
+The code path must not contain:
+
+```text
+jax.jacrev
+jax.vmap(pullback)
+jax.lax.scan over objective rows
+```
+
+in the benchmark or geometry objective-table helper.
+
+#### H. Validation ladder for the true rule
+
+1. `geometry_full_ad_objectives` without QI:
+
+```text
+VMEC scalar + light Boozer scalar objectives only
+```
+
+Expected: no OOM, table matches one-hot weighted reverse and FD.
+
+2. QI-only:
+
+```text
+objective_names = ["boozer_qi_objective"]
+W = [[1.0]]
+```
+
+Expected: matches existing scalar weighted reverse and FD.
+
+3. Full objective table:
+
+```text
+W = eye(n_objectives)
+```
+
+Expected: no QI `_qi_grid` OOM.
+
+4. Row-sum check:
+
+```text
+sum_rows(gradient_matrix)
+```
+
+must match:
+
+```bash
+--reverse-derivative-mode weighted --cotangent-weights ones
+```
+
+5. Transport coupling:
+
+Use the same helper with transport-supplied geometry objective cotangents
+instead of `eye(n_objectives)`.
+
 If this table path fails or OOMs, the explicit fallback remains:
 
 ```bash
@@ -6285,3 +6806,63 @@ is a compatibility alias for the same `objective_table` implementation.
 ```
 
 repeats one scalar cotangent pullback per objective.
+
+#### I. Current implementation checkpoint
+
+Implemented in this session:
+
+```text
+geometry_full_ad_objective_table_pullback_from_param_vector(...)
+```
+
+and wired it into:
+
+```text
+benchmark_geometry_vmec_booz_fd_vs_ad.py
+  --mode geometry_full_ad_objectives
+  --reverse-derivative-mode objective_table
+```
+
+What this implementation fixes:
+
+```text
+1. The benchmark no longer routes the full geometry objective table through
+   plain jacrev(objective_vector).
+2. The benchmark no longer uses the rejected objective-row lax.scan helper for
+   geometry_full_ad_objectives.
+3. The expensive Boozer-QI pullback is evaluated once as a unit scalar
+   cotangent and then scaled into the requested objective-cotangent rows.
+4. VMEC scalar objectives and light Boozer scalar objectives are pulled back as
+   separate state-level groups, so non-QI rows do not build the QI graph.
+```
+
+What is still missing for the final profile-style geometry reverse rule:
+
+```text
+The final state-cotangent batch is still propagated through the current
+vmec_jax implicit solve VJP, whose backward rule is single-RHS:
+
+    _solve_implicit_bwd(cfg, res, gbar)
+
+The next real efficiency step is a VMEC implicit multi-RHS adjoint helper that
+accepts a batched state cotangent pytree and solves/applies:
+
+    (dF/dz)^T Lambda = P(gbar_batch)
+
+with residual linearization, masks, projector, and direct boundary-path VJP
+setup built once for the whole batch.
+```
+
+Run next:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode objective_table
+```

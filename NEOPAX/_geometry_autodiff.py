@@ -2442,6 +2442,208 @@ def geometry_observable_vector_custom_vjp_from_param_vector(
     return objective_vector_custom(param_deltas)
 
 
+def _tree_weighted_basis_sum(basis_tree, weights: jnp.ndarray):
+    weights = jnp.asarray(weights, dtype=jnp.float64)
+    return jax.tree.map(
+        lambda leaf: jnp.tensordot(weights, jnp.asarray(leaf), axes=((1,), (0,))),
+        basis_tree,
+    )
+
+
+def _tree_scale_unit_cotangent(unit_tree, weights: jnp.ndarray):
+    weights = jnp.asarray(weights, dtype=jnp.float64).reshape((-1,))
+
+    def _scale(leaf):
+        leaf = jnp.asarray(leaf)
+        shape = (int(weights.shape[0]),) + (1,) * int(leaf.ndim)
+        return weights.reshape(shape) * leaf
+
+    return jax.tree.map(_scale, unit_tree)
+
+
+def _tree_add_all(*trees):
+    if not trees:
+        raise ValueError("_tree_add_all requires at least one tree.")
+    out = trees[0]
+    for tree in trees[1:]:
+        out = jax.tree.map(jnp.add, out, tree)
+    return out
+
+
+def geometry_full_ad_objective_table_pullback_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    objective_cotangents,
+    *,
+    objective_names: Sequence[str] | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
+    """Return geometry objective values and W @ d(objectives)/d(params).
+
+    This is the memory-conscious table path for the combined geometry gate.
+    It avoids the generic ``jacrev(objective_vector)`` path because that path
+    pushes every objective basis cotangent through the expensive Boozer-QI
+    residual graph.  Instead, it builds state-level cotangents by objective
+    group and applies the QI pullback once, then scales that cotangent into the
+    requested output rows.
+    """
+
+    param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    cotangents = jnp.asarray(objective_cotangents, dtype=jnp.float64)
+    if cotangents.ndim == 1:
+        cotangents = cotangents[None, :]
+    names = tuple(objective_names) if objective_names is not None else geometry_observable_names_for_kind(
+        "geometry_full_ad_objectives"
+    )
+    expected_names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    if names != expected_names:
+        raise ValueError(
+            "geometry_full_ad_objective_table_pullback_from_param_vector currently expects the "
+            f"standard geometry_full_ad_objectives ordering: {expected_names}; got {names}."
+        )
+    if int(cotangents.shape[1]) != len(names):
+        raise ValueError(
+            f"Expected objective cotangents with {len(names)} columns for geometry_full_ad_objectives; "
+            f"got {int(cotangents.shape[1])}."
+        )
+
+    def solve_state(theta):
+        return _solve_state_for_param_vector(
+            context,
+            theta,
+            param_specs,
+            lane=lane,
+            max_iter=max_iter,
+            step_size=step_size,
+            jacobian_penalty=jacobian_penalty,
+        )
+
+    state, state_pullback = jax.vjp(solve_state, param_deltas)
+
+    # Values are still evaluated through the public combined-objective helper so
+    # printed baselines match the normal objective path exactly.
+    values_map = _geometry_full_ad_objectives_from_state(context, state)
+    values_by_name = {name: jnp.asarray(values_map[name], dtype=jnp.float64).reshape(()) for name in names}
+
+    vmec_names = (
+        "aspect_ratio",
+        "volume_total",
+        "iota_mean",
+        "magnetic_well",
+        "mirror_ratio",
+        "beta_volume",
+    )
+    vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
+
+    def vmec_vector(state_inner):
+        values = _vmec_core_scalar_objectives_from_state(context, state_inner)
+        return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
+
+    _vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
+    vmec_basis = jax.vmap(lambda cot: vmec_state_pullback(cot)[0])(
+        jnp.eye(len(vmec_names), dtype=jnp.float64)
+    )
+    vmec_state_bar = _tree_weighted_basis_sum(vmec_basis, cotangents[:, vmec_indices])
+
+    boozer_light_names = (
+        "iota_b_mean",
+        "b00_mean",
+        "buco_b_mean",
+        "bvco_b_mean",
+        "aspect_proxy",
+        "b10_over_b00_mean",
+    )
+    boozer_light_indices = tuple(names.index(f"boozer_{name}") for name in boozer_light_names)
+
+    def boozer_light_vector(state_inner):
+        booz = _boozer_output_from_state(context, state_inner)
+        values = _vmec_booz_light_scalar_observables_from_boozer(context, state_inner, booz)
+        return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in boozer_light_names])
+
+    _boozer_values, boozer_state_pullback = jax.vjp(boozer_light_vector, state)
+    boozer_basis = jax.vmap(lambda cot: boozer_state_pullback(cot)[0])(
+        jnp.eye(len(boozer_light_names), dtype=jnp.float64)
+    )
+    boozer_state_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
+
+    qi_index = names.index("boozer_qi_objective")
+
+    def qi_scalar(state_inner):
+        booz = _boozer_output_from_state(context, state_inner)
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
+        return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
+
+    _qi_value, qi_state_pullback = jax.vjp(qi_scalar, state)
+    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_state_bar = _tree_scale_unit_cotangent(qi_unit_state_bar, cotangents[:, qi_index])
+
+    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, qi_state_bar)
+    gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
+    return values_by_name, gradient_matrix
+
+
+def geometry_observable_multi_rhs_pullback_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    objective_cotangents,
+    *,
+    observable_kind: str,
+    objective_names: Sequence[str] | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
+    """Return objective values and a multi-RHS reverse table for geometry params."""
+    param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    cotangents = jnp.asarray(objective_cotangents, dtype=jnp.float64)
+    if cotangents.ndim == 1:
+        cotangents = cotangents[None, :]
+    names = tuple(objective_names) if objective_names is not None else geometry_observable_names_for_kind(observable_kind)
+    if int(cotangents.shape[1]) != len(names):
+        raise ValueError(
+            f"Expected objective cotangents with {len(names)} columns for {observable_kind}; "
+            f"got {int(cotangents.shape[1])}."
+        )
+
+    def objective_vector(theta):
+        state = _solve_state_for_param_vector(
+            context,
+            theta,
+            param_specs,
+            lane=lane,
+            max_iter=max_iter,
+            step_size=step_size,
+            jacobian_penalty=jacobian_penalty,
+        )
+        items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+        observables = {name: jnp.asarray(value, dtype=jnp.float64).reshape(()) for name, value in items}
+        missing = [name for name in names if name not in observables]
+        if missing:
+            raise ValueError(f"Unknown objective names for {observable_kind}: {missing}")
+        return jnp.stack([observables[name] for name in names])
+
+    values = objective_vector(param_deltas)
+
+    def single_rhs_grad(cotangent):
+        def contracted(theta):
+            return jnp.vdot(cotangent, objective_vector(theta))
+
+        return jax.grad(contracted)(param_deltas)
+
+    def scan_body(_carry, cotangent):
+        return _carry, single_rhs_grad(cotangent)
+
+    _carry, gradient_matrix = jax.lax.scan(scan_body, None, cotangents)
+    values_by_name = {name: values[i] for i, name in enumerate(names)}
+    return values_by_name, gradient_matrix
+
+
 def vmec_qi_maxj_scalar_objectives_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,

@@ -20,9 +20,10 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     geometry_observable_names_for_kind,
     five_point_fd_single_param,
     geometry_observable_batched_cotangent_pullback_from_param_vector,
+    geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_kind_from_param_vector,
     geometry_observable_kind_from_single_param,
-    geometry_observable_vector_custom_vjp_from_param_vector,
+    geometry_observable_multi_rhs_pullback_from_param_vector,
     geometry_observable_weighted_sum_from_param_vector,
     rel_error,
 )
@@ -319,21 +320,29 @@ def _custom_vjp_reverse_table(
     resolved_step_size: float,
 ):
     zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
-    value_fn = lambda deltas: geometry_observable_vector_custom_vjp_from_param_vector(  # noqa: E731
+    objective_cotangents = jnp.eye(len(objective_names), dtype=jnp.float64)
+    if args.mode == "geometry_full_ad_objectives":
+        return geometry_full_ad_objective_table_pullback_from_param_vector(
+            context,
+            zeros,
+            param_specs,
+            objective_cotangents,
+            objective_names=objective_names,
+            lane="ad",
+            max_iter=resolved_max_iter,
+            step_size=resolved_step_size,
+        )
+    return geometry_observable_multi_rhs_pullback_from_param_vector(
         context,
-        deltas,
+        zeros,
         param_specs,
+        objective_cotangents,
         observable_kind=args.mode,
         objective_names=objective_names,
         lane="ad",
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
     )
-    values, pullback = jax.vjp(value_fn, zeros)
-    objective_cotangents = jnp.eye(len(objective_names), dtype=jnp.float64)
-    jacobian_matrix = jax.vmap(lambda cotangent: pullback(cotangent)[0])(objective_cotangents)
-    values_by_name = {name: values[i] for i, name in enumerate(objective_names)}
-    return values_by_name, jacobian_matrix
 
 
 def _batched_cotangent_reverse_table(
@@ -474,7 +483,7 @@ def main() -> None:
         choices=("jacrev", "objective_table", "custom_vjp", "weighted", "cotangent_jacfwd", "onehot_sweep", "batched_cotangent"),
         help=(
             "Multi-parameter implicit reverse path. 'jacrev' reconstructs the full objective Jacobian. "
-            "'objective_table' prints a profile-style table through a cotangent-contracted custom VJP. "
+            "'objective_table' prints a profile-style table through the multi-RHS geometry pullback helper. "
             "'custom_vjp' and 'cotangent_jacfwd' are compatibility aliases for that path. "
             "'weighted' computes one contracted scalar reverse derivative. "
             "'batched_cotangent' is the previous raw contracted-vector diagnostic. "
@@ -641,7 +650,7 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
     if args.reverse_derivative_mode in {"objective_table", "custom_vjp", "cotangent_jacfwd", "batched_cotangent"}:
         objective_names = geometry_observable_names_for_kind(args.mode)
         zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
-        print("[geometry-fd-ad] progress: running full objective table through reverse custom-VJP", flush=True)
+        print("[geometry-fd-ad] progress: running grouped reverse objective table", flush=True)
         baseline_values = None
         reverse_jacobian_matrix = None
         if not args.skip_reverse_check:
