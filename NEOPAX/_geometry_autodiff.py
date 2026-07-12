@@ -2543,7 +2543,48 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     state, state_pullback = jax.vjp(solve_state, param_deltas)
-    booz, booz_state_pullback = jax.vjp(lambda state_inner: _boozer_output_from_state(context, state_inner), state)
+    booz_api = _import_booz_xform_jax_api()
+    booz_inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
+    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
+    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
+    booz_float_keys = (
+        "iota_b",
+        "buco_b",
+        "bvco_b",
+        "bmnc_b",
+    )
+
+    def booz_float_output_from_state(state_inner):
+        inputs_inner = _booz_xform_inputs_from_state(
+            state=state_inner,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        out = booz_api.booz_xform_from_inputs(
+            inputs=inputs_inner,
+            constants=booz_constants,
+            grids=booz_grids,
+            surface_indices=context.surface_indices,
+            jit=True,
+        )
+        return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
+
+    def booz_with_modes(booz_float):
+        out = dict(booz_float)
+        out["ixm_b"] = ixm_b
+        out["ixn_b"] = ixn_b
+        return out
+
+    booz, booz_state_pullback = jax.vjp(booz_float_output_from_state, state)
     values_by_name: dict[str, jnp.ndarray] = {}
 
     vmec_names = (
@@ -2577,7 +2618,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_light_indices = tuple(names.index(f"boozer_{name}") for name in boozer_light_names)
 
     def boozer_light_vector(booz_inner):
-        values = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz_inner)
+        values = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz_with_modes(booz_inner))
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in boozer_light_names])
 
     boozer_values, boozer_pullback = jax.vjp(boozer_light_vector, booz)
@@ -2588,8 +2629,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
 
     mode00 = _find_mode_index(
-        jnp.asarray(booz["ixm_b"], dtype=jnp.int32),
-        jnp.asarray(booz["ixn_b"], dtype=jnp.int32),
+        ixm_b,
+        ixn_b,
         m=0,
         n=0,
     )
@@ -2611,7 +2652,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     qi_index = names.index("boozer_qi_objective")
 
     def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_inner)
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
     qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
