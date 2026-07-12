@@ -21,6 +21,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     five_point_fd_single_param,
     geometry_observable_kind_from_param_vector,
     geometry_observable_kind_from_single_param,
+    geometry_observable_vector_custom_vjp_from_param_vector,
     geometry_observable_weighted_sum_from_param_vector,
     rel_error,
 )
@@ -175,6 +176,28 @@ def _weighted_observable_function(
         deltas,
         param_specs,
         objective_weights,
+        observable_kind=args.mode,
+        objective_names=objective_names,
+        lane=lane,
+        max_iter=resolved_max_iter,
+        step_size=resolved_step_size,
+    )
+
+
+def _custom_vjp_observable_vector_function(
+    args,
+    context,
+    param_specs,
+    *,
+    objective_names: tuple[str, ...],
+    lane: str,
+    resolved_max_iter: int,
+    resolved_step_size: float,
+):
+    return lambda deltas: geometry_observable_vector_custom_vjp_from_param_vector(  # noqa: E731
+        context,
+        deltas,
+        param_specs,
         observable_kind=args.mode,
         objective_names=objective_names,
         lane=lane,
@@ -346,13 +369,12 @@ def main() -> None:
         "--reverse-derivative-mode",
         type=str,
         default="jacrev",
-        choices=("jacrev", "weighted", "cotangent_jacfwd", "onehot_sweep"),
+        choices=("jacrev", "custom_vjp", "weighted", "cotangent_jacfwd", "onehot_sweep"),
         help=(
             "Multi-parameter implicit reverse path. 'jacrev' reconstructs the full objective Jacobian. "
-            "'weighted' computes one cotangent-contracted weighted objective gradient and is the intended "
-            "memory-safe gate for many geometry objectives. 'cotangent_jacfwd' differentiates the "
-            "cotangent-to-geometry-gradient map to recover the full table from the weighted pullback. "
-            "'onehot_sweep' repeats the weighted path with one objective at a time as a slow fallback."
+            "'custom_vjp' is the intended rule-refactor benchmark: it reconstructs the full table through "
+            "the explicit cotangent-contracted objective VJP. 'weighted', 'cotangent_jacfwd', and "
+            "'onehot_sweep' are diagnostic fallback modes."
         ),
     )
     parser.add_argument(
@@ -510,6 +532,68 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
                     f" reverse_vs_fd_rel_err={rel_error(reverse_value, fd_by_param[i]):.6e}"
                 )
             print(line, flush=True)
+        return
+
+    if args.reverse_derivative_mode == "custom_vjp":
+        objective_names = geometry_observable_names_for_kind(args.mode)
+        zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
+        print(
+            "[geometry-fd-ad] progress: running full objective table through jacrev(custom cotangent-contracted VJP)",
+            flush=True,
+        )
+        custom_ad_func = _custom_vjp_observable_vector_function(
+            args,
+            context,
+            param_specs,
+            objective_names=objective_names,
+            lane="ad",
+            resolved_max_iter=resolved_max_iter,
+            resolved_step_size=resolved_step_size,
+        )
+        baseline_vector = custom_ad_func(zeros)
+        reverse_jacobian_matrix = None
+        if not args.skip_reverse_check:
+            reverse_jacobian_matrix = jax.jacrev(custom_ad_func)(zeros)
+
+        print(
+            f"[geometry-fd-ad] progress: running {args.fd_lane}-lane vector finite differences per parameter",
+            flush=True,
+        )
+        fd_func = _observable_vector_function(
+            args,
+            context,
+            param_specs,
+            lane=args.fd_lane,
+            resolved_max_iter=resolved_max_iter,
+            resolved_step_size=resolved_step_size,
+        )
+        fd_by_param = []
+        for i, h in enumerate(h_values):
+            fd_center, _minus, _plus = central_fd_single_param(
+                lambda delta, i=i: fd_func(zeros.at[i].set(delta)),
+                h,
+            )
+            fd_by_param.append(fd_center)
+
+        print("[geometry-fd-ad] objective comparison:")
+        for objective_index, objective_name in enumerate(objective_names):
+            print(
+                f"  - {objective_name}: value={float(jnp.asarray(baseline_vector[objective_index])):.16e}",
+                flush=True,
+            )
+            for i, (param_family, param_m, param_n) in enumerate(param_specs):
+                fd_value = fd_by_param[i][objective_name]
+                line = (
+                    f"      d/d{param_family}:{param_m}:{param_n}: "
+                    f"fd_center={float(jnp.asarray(fd_value)):.6e}"
+                )
+                if reverse_jacobian_matrix is not None:
+                    reverse_value = reverse_jacobian_matrix[objective_index, i]
+                    line += (
+                        f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
+                        f" reverse_vs_fd_rel_err={rel_error(reverse_value, fd_value):.6e}"
+                    )
+                print(line, flush=True)
         return
 
     if args.reverse_derivative_mode == "cotangent_jacfwd":

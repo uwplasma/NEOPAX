@@ -6129,8 +6129,8 @@ Expected success signal:
   FD-vs-AD diagnosis because the QI-only scalar benchmark currently mismatches
   FD.
 
-To print the full per-objective FD-vs-reverse table using the
-cotangent-contracted rule, use:
+To print the full per-objective FD-vs-reverse table through the explicit
+cotangent-contracted custom VJP boundary, use:
 
 ```bash
 python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
@@ -6141,24 +6141,36 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --fd-abs-step 1e-10 \
   --ad-backend implicit \
   --fd-lane ad \
-  --reverse-derivative-mode cotangent_jacfwd
+  --reverse-derivative-mode custom_vjp
 ```
 
 This is the main rule-refactor benchmark mode:
 
-- it computes one vector primal / FD pass for all objectives,
-- it differentiates the cotangent-to-geometry-gradient map
-  `w -> grad_theta dot(w, objectives(theta))`,
-- it prints one table entry per objective and per geometry parameter,
-- it avoids the generic vector-output `jacrev` over the objective graph.
+- the primal returns the objective vector,
+- the custom VJP backward receives an objective cotangent vector,
+- the backward contracts the cotangent via
+  `grad_theta dot(cotangent, objectives(theta))`,
+- the printed table is recovered through that custom VJP boundary rather than
+  through raw objective-graph autodiff.
+- the custom VJP wrapper is intentionally restricted to the AD / implicit
+  geometry lane, so it should not be used to alter the forward solver lane.
 
-If this mode fails because JAX cannot differentiate through the current
-implicit pullback implementation with respect to the cotangent weights, the
-fallback diagnostic is:
+Diagnostic modes:
+
+```bash
+--reverse-derivative-mode weighted
+```
+
+computes one contracted derivative of `dot(weights, objectives)`.
+
+```bash
+--reverse-derivative-mode cotangent_jacfwd
+```
+
+differentiates the weighted pullback map with respect to cotangent weights.
 
 ```bash
 --reverse-derivative-mode onehot_sweep
 ```
 
-That fallback is slower because it repeats one scalar cotangent pullback per
-objective.
+repeats one scalar cotangent pullback per objective.
