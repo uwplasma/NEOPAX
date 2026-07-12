@@ -271,25 +271,26 @@ def _weighted_objective_table(
             _value, gradient = _implicit_weighted_reverse_gradient(weighted_ad_func, len(param_specs))
             reverse_jacobian[objective_name] = gradient
 
-    print(
-        f"[geometry-fd-ad] progress: running {args.fd_lane}-lane vector finite differences per parameter",
-        flush=True,
-    )
-    fd_func = _observable_vector_function(
-        args,
-        context,
-        param_specs,
-        lane=args.fd_lane,
-        resolved_max_iter=resolved_max_iter,
-        resolved_step_size=resolved_step_size,
-    )
     fd_by_param = []
-    for i, h in enumerate(h_values):
-        fd_center, _minus, _plus = central_fd_single_param(
-            lambda delta, i=i: fd_func(zeros.at[i].set(delta)),
-            h,
+    if not args.skip_fd_check:
+        print(
+            f"[geometry-fd-ad] progress: running {args.fd_lane}-lane vector finite differences per parameter",
+            flush=True,
         )
-        fd_by_param.append(fd_center)
+        fd_func = _observable_vector_function(
+            args,
+            context,
+            param_specs,
+            lane=args.fd_lane,
+            resolved_max_iter=resolved_max_iter,
+            resolved_step_size=resolved_step_size,
+        )
+        for i, h in enumerate(h_values):
+            fd_center, _minus, _plus = central_fd_single_param(
+                lambda delta, i=i: fd_func(zeros.at[i].set(delta)),
+                h,
+            )
+            fd_by_param.append(fd_center)
 
     print("[geometry-fd-ad] objective values:")
     for objective_name in objective_names:
@@ -299,14 +300,16 @@ def _weighted_objective_table(
         print(f"  - {objective_name}:", flush=True)
         for i, (param_family, param_m, param_n) in enumerate(param_specs):
             parameter_name = f"{param_family}:{param_m}:{param_n}"
-            fd_value = fd_by_param[i][objective_name]
-            line = f"      d{objective_name}/d{parameter_name}: fd={float(jnp.asarray(fd_value)):.16e}"
+            line = f"      d{objective_name}/d{parameter_name}:"
+            fd_value = None
+            if fd_by_param:
+                fd_value = fd_by_param[i][objective_name]
+                line += f" fd={float(jnp.asarray(fd_value)):.16e}"
             if reverse_jacobian is not None:
                 reverse_value = reverse_jacobian[objective_name][i]
-                line += (
-                    f" rev={float(jnp.asarray(reverse_value)):.16e}"
-                    f" rel_err={rel_error(reverse_value, fd_value):.6e}"
-                )
+                line += f" rev={float(jnp.asarray(reverse_value)):.16e}"
+                if fd_value is not None:
+                    line += f" rel_err={rel_error(reverse_value, fd_value):.6e}"
             print(line, flush=True)
 
 
@@ -469,6 +472,11 @@ def main() -> None:
         help="Skip reverse-mode observable derivative recovery.",
     )
     parser.add_argument(
+        "--skip-fd-check",
+        action="store_true",
+        help="Skip centered finite differences and print reverse derivatives only.",
+    )
+    parser.add_argument(
         "--reverse-objective-block-size",
         type=int,
         default=0,
@@ -616,28 +624,29 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
             if args.skip_reverse_check
             else _implicit_weighted_reverse_gradient(weighted_ad_func, len(param_specs))
         )
-        print(
-            f"[geometry-fd-ad] progress: running {args.fd_lane}-lane weighted finite differences per parameter",
-            flush=True,
-        )
-        weighted_fd_func = _weighted_observable_function(
-            args,
-            context,
-            param_specs,
-            objective_names=objective_names,
-            objective_weights=objective_weights,
-            lane=args.fd_lane,
-            resolved_max_iter=resolved_max_iter,
-            resolved_step_size=resolved_step_size,
-        )
         zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
         fd_by_param = []
-        for i, h in enumerate(h_values):
-            fd_center, _minus, _plus = central_fd_single_param(
-                lambda delta, i=i: weighted_fd_func(zeros.at[i].set(delta)),
-                h,
+        if not args.skip_fd_check:
+            print(
+                f"[geometry-fd-ad] progress: running {args.fd_lane}-lane weighted finite differences per parameter",
+                flush=True,
             )
-            fd_by_param.append(fd_center)
+            weighted_fd_func = _weighted_observable_function(
+                args,
+                context,
+                param_specs,
+                objective_names=objective_names,
+                objective_weights=objective_weights,
+                lane=args.fd_lane,
+                resolved_max_iter=resolved_max_iter,
+                resolved_step_size=resolved_step_size,
+            )
+            for i, h in enumerate(h_values):
+                fd_center, _minus, _plus = central_fd_single_param(
+                    lambda delta, i=i: weighted_fd_func(zeros.at[i].set(delta)),
+                    h,
+                )
+                fd_by_param.append(fd_center)
         if weighted_reverse_value is not None:
             print(
                 "[geometry-fd-ad] weighted objective baseline: "
@@ -647,15 +656,15 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         for i, (param_family, param_m, param_n) in enumerate(param_specs):
             line = (
                 f"[geometry-fd-ad] weighted parameter {i + 1}/{len(param_specs)}: "
-                f"{param_family}:{param_m}:{param_n} fd_step={h_values[i]:.6e} "
-                f"fd_center={float(jnp.asarray(fd_by_param[i])):.6e}"
+                f"{param_family}:{param_m}:{param_n}"
             )
+            if fd_by_param:
+                line += f" fd_step={h_values[i]:.6e} fd_center={float(jnp.asarray(fd_by_param[i])):.6e}"
             if weighted_reverse_gradient is not None:
                 reverse_value = weighted_reverse_gradient[i]
-                line += (
-                    f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
-                    f" reverse_vs_fd_rel_err={rel_error(reverse_value, fd_by_param[i]):.6e}"
-                )
+                line += f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
+                if fd_by_param:
+                    line += f" reverse_vs_fd_rel_err={rel_error(reverse_value, fd_by_param[i]):.6e}"
             print(line, flush=True)
         return
 
@@ -695,25 +704,26 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
             )
             baseline_values = ad_func(zeros)
 
-        print(
-            f"[geometry-fd-ad] progress: running {args.fd_lane}-lane vector finite differences per parameter",
-            flush=True,
-        )
-        fd_func = _observable_vector_function(
-            args,
-            context,
-            param_specs,
-            lane=args.fd_lane,
-            resolved_max_iter=resolved_max_iter,
-            resolved_step_size=resolved_step_size,
-        )
         fd_by_param = []
-        for i, h in enumerate(h_values):
-            fd_center, _minus, _plus = central_fd_single_param(
-                lambda delta, i=i: fd_func(zeros.at[i].set(delta)),
-                h,
+        if not args.skip_fd_check:
+            print(
+                f"[geometry-fd-ad] progress: running {args.fd_lane}-lane vector finite differences per parameter",
+                flush=True,
             )
-            fd_by_param.append(fd_center)
+            fd_func = _observable_vector_function(
+                args,
+                context,
+                param_specs,
+                lane=args.fd_lane,
+                resolved_max_iter=resolved_max_iter,
+                resolved_step_size=resolved_step_size,
+            )
+            for i, h in enumerate(h_values):
+                fd_center, _minus, _plus = central_fd_single_param(
+                    lambda delta, i=i: fd_func(zeros.at[i].set(delta)),
+                    h,
+                )
+                fd_by_param.append(fd_center)
 
         print("[geometry-fd-ad] objective values:")
         for objective_index, objective_name in enumerate(objective_names):
@@ -726,17 +736,18 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         for objective_index, objective_name in enumerate(objective_names):
             print(f"  - {objective_name}:", flush=True)
             for i, (param_family, param_m, param_n) in enumerate(param_specs):
-                fd_value = fd_by_param[i][objective_name]
                 line = (
                     f"      d{objective_name}/d{param_family}:{param_m}:{param_n}: "
-                    f"fd={float(jnp.asarray(fd_value)):.6e}"
                 )
+                fd_value = None
+                if fd_by_param:
+                    fd_value = fd_by_param[i][objective_name]
+                    line += f"fd={float(jnp.asarray(fd_value)):.6e}"
                 if reverse_jacobian_matrix is not None:
                     ad_value = reverse_jacobian_matrix[objective_index, i]
-                    line += (
-                        f" ad={float(jnp.asarray(ad_value)):.6e}"
-                        f" rel_err={rel_error(ad_value, fd_value):.6e}"
-                    )
+                    line += f" ad={float(jnp.asarray(ad_value)):.6e}"
+                    if fd_value is not None:
+                        line += f" rel_err={rel_error(ad_value, fd_value):.6e}"
                 print(line, flush=True)
         return
 

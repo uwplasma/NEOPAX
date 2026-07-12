@@ -6144,6 +6144,67 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --reverse-derivative-mode objective_table
 ```
 
+#### J. FD reference for reverse-only geometry table iteration
+
+The following FD values are from the standard two-parameter geometry table
+test above, using:
+
+```text
+param_specs = RBC:1:0,ZBS:1:0
+fd_rel_step = 3e-7
+fd_abs_step = 1e-10
+fd_lane = ad
+ad_backend = implicit
+mboz = 18
+nboz = 18
+surface_s = 0.100,0.280,0.460,0.640,0.820,1.000
+```
+
+Use these as the comparison target when running faster reverse-only checks with:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode objective_table \
+  --skip-fd-check
+```
+
+FD derivative reference:
+
+| Objective | d/dRBC:1:0 FD | d/dZBS:1:0 FD |
+|---|---:|---:|
+| `vmec_aspect_ratio` | `-5.400678e+00` | `-5.522689e+00` |
+| `vmec_volume_total` | `3.849962e+02` | `3.674347e+02` |
+| `vmec_iota_mean` | `-2.540018e-01` | `1.980859e-02` |
+| `vmec_magnetic_well` | `1.732787e+00` | `4.264011e-01` |
+| `vmec_mirror_ratio` | `-2.595075e+00` | `-2.559265e-01` |
+| `vmec_beta_volume` | `0.000000e+00` | `0.000000e+00` |
+| `boozer_iota_b_mean` | `-1.469958e+00` | `-3.379723e-01` |
+| `boozer_b00_mean` | `-1.149100e+01` | `-7.283792e+00` |
+| `boozer_buco_b_mean` | `-1.324738e-11` | `-7.447667e-11` |
+| `boozer_bvco_b_mean` | `-1.665580e+02` | `-1.239814e+02` |
+| `boozer_aspect_proxy` | `0.000000e+00` | `0.000000e+00` |
+| `boozer_b10_over_b00_mean` | `-1.238979e-01` | `-1.001224e-02` |
+| `boozer_qi_objective` | `5.909044e-01` | `1.387811e-01` |
+
+Current interpretation:
+
+- Matching rows in the grouped reverse table have been `vmec_aspect_ratio`,
+  `vmec_volume_total`, `vmec_beta_volume`, `boozer_bvco_b_mean` to close
+  tolerance.
+- Large mismatches remain for composed/interior-field rows such as
+  `vmec_iota_mean`, `vmec_magnetic_well`, `vmec_mirror_ratio`,
+  `boozer_iota_b_mean`, `boozer_b10_over_b00_mean`, and
+  `boozer_qi_objective`.
+- Use `--skip-fd-check` while iterating the reverse cotangent propagation so
+  the run only recomputes reverse derivatives and objective values.
+
 This is now wired to the first NEOPAX multi-RHS geometry pullback helper:
 
 - the benchmark prints objective values first,
