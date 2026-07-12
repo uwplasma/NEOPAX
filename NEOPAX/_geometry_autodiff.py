@@ -2444,8 +2444,16 @@ def geometry_observable_vector_custom_vjp_from_param_vector(
 
 def _tree_weighted_basis_sum(basis_tree, weights: jnp.ndarray):
     weights = jnp.asarray(weights, dtype=jnp.float64)
+
+    def _combine(leaf):
+        leaf = jnp.asarray(leaf)
+        if leaf.dtype == jax.dtypes.float0:
+            shape = (int(weights.shape[0]),) + tuple(leaf.shape[1:])
+            return jnp.broadcast_to(leaf[0], shape)
+        return jnp.tensordot(weights, leaf, axes=((1,), (0,)))
+
     return jax.tree.map(
-        lambda leaf: jnp.tensordot(weights, jnp.asarray(leaf), axes=((1,), (0,))),
+        _combine,
         basis_tree,
     )
 
@@ -2455,6 +2463,9 @@ def _tree_scale_unit_cotangent(unit_tree, weights: jnp.ndarray):
 
     def _scale(leaf):
         leaf = jnp.asarray(leaf)
+        if leaf.dtype == jax.dtypes.float0:
+            shape = (int(weights.shape[0]),) + tuple(leaf.shape)
+            return jnp.broadcast_to(leaf, shape)
         shape = (int(weights.shape[0]),) + (1,) * int(leaf.ndim)
         return weights.reshape(shape) * leaf
 
@@ -2466,7 +2477,16 @@ def _tree_add_all(*trees):
         raise ValueError("_tree_add_all requires at least one tree.")
     out = trees[0]
     for tree in trees[1:]:
-        out = jax.tree.map(jnp.add, out, tree)
+        def _add(left, right):
+            left = jnp.asarray(left)
+            right = jnp.asarray(right)
+            if left.dtype == jax.dtypes.float0:
+                return left
+            if right.dtype == jax.dtypes.float0:
+                return right
+            return left + right
+
+        out = jax.tree.map(_add, out, tree)
     return out
 
 
