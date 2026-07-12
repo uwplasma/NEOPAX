@@ -73,6 +73,7 @@ def _booz_xform_inputs_from_state(
     indata,
     signgs,
     flux,
+    runtime=None,
 ):
     vmec_jax = _import_vmec_jax()
     try:
@@ -91,7 +92,7 @@ def _booz_xform_inputs_from_state(
     except (AttributeError, ModuleNotFoundError):
         from vmec_jax.core.boozer_tables import boozer_input_tables
 
-        rt = static.runtime
+        rt = static.runtime if runtime is None else runtime
         ns = int(jnp.asarray(rt.setup.s_full).shape[0])
         tables = [boozer_input_tables(state, rt, j) for j in range(1, ns)]
 
@@ -2595,13 +2596,28 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             )
 
         state, state_pullback = jax.vjp(solve_state, param_deltas)
+    objective_runtime = (
+        implicit.runtime_from_params(implicit_params, implicit_cfg)
+        if use_current_multi_rhs
+        else context.static.runtime
+    )
+    objective_static = (
+        dataclasses.replace(context.static, runtime=objective_runtime)
+        if dataclasses.is_dataclass(context.static)
+        else context.static
+    )
+    objective_context = dataclasses.replace(
+        context,
+        static=objective_static,
+    )
     booz_api = _import_booz_xform_jax_api()
     booz_inputs = _booz_xform_inputs_from_state(
         state=state,
-        static=context.static,
+        static=objective_context.static,
         indata=context.indata,
         signgs=context.signgs,
         flux=context.flux,
+        runtime=objective_runtime,
     )
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
     ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
@@ -2616,10 +2632,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     def booz_float_output_from_state(state_inner):
         inputs_inner = _booz_xform_inputs_from_state(
             state=state_inner,
-            static=context.static,
+            static=objective_context.static,
             indata=context.indata,
             signgs=context.signgs,
             flux=context.flux,
+            runtime=objective_runtime,
         )
         out = booz_api.booz_xform_from_inputs(
             inputs=inputs_inner,
@@ -2650,7 +2667,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
-        values = _vmec_core_scalar_objectives_from_state(context, state_inner)
+        values = _vmec_core_scalar_objectives_from_state(objective_context, state_inner)
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
@@ -2670,7 +2687,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_light_indices = tuple(names.index(f"boozer_{name}") for name in boozer_light_names)
 
     def boozer_light_vector(booz_inner):
-        values = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz_with_modes(booz_inner))
+        values = _vmec_booz_light_scalar_observables_from_boozer(objective_context, state, booz_with_modes(booz_inner))
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in boozer_light_names])
 
     boozer_values, boozer_pullback = jax.vjp(boozer_light_vector, booz)
@@ -2704,7 +2721,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     qi_index = names.index("boozer_qi_objective")
 
     def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
+        values = _vmec_booz_qi_scalar_objective_from_boozer(objective_context, booz_with_modes(booz_inner))
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
     qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
