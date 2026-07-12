@@ -6128,3 +6128,37 @@ Expected success signal:
 - If QI is included in the weights, QI correctness still needs a separate
   FD-vs-AD diagnosis because the QI-only scalar benchmark currently mismatches
   FD.
+
+To print the full per-objective FD-vs-reverse table using the
+cotangent-contracted rule, use:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode cotangent_jacfwd
+```
+
+This is the main rule-refactor benchmark mode:
+
+- it computes one vector primal / FD pass for all objectives,
+- it differentiates the cotangent-to-geometry-gradient map
+  `w -> grad_theta dot(w, objectives(theta))`,
+- it prints one table entry per objective and per geometry parameter,
+- it avoids the generic vector-output `jacrev` over the objective graph.
+
+If this mode fails because JAX cannot differentiate through the current
+implicit pullback implementation with respect to the cotangent weights, the
+fallback diagnostic is:
+
+```bash
+--reverse-derivative-mode onehot_sweep
+```
+
+That fallback is slower because it repeats one scalar cotangent pullback per
+objective.
