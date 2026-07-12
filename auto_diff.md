@@ -6837,6 +6837,11 @@ What this implementation fixes:
 5. The table helper now shares one `state -> Boozer` VJP. Light Boozer
    objectives and the QI scalar are pulled back to a combined Boozer cotangent,
    and that combined cotangent is propagated back to the VMEC state once.
+6. The final VMEC state-cotangent-to-parameter pullback is intentionally
+   sequential for now. `vmec_jax.solve_implicit` has a single-RHS custom VJP,
+   so batching that VJP with `vmap` can change the adjoint solve semantics.
+   Replace this sequential final map only after adding a true VMEC multi-RHS
+   implicit adjoint.
 ```
 
 What is still missing for the final profile-style geometry reverse rule:
