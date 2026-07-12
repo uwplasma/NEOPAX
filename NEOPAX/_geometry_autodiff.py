@@ -2337,6 +2337,57 @@ def geometry_observable_weighted_sum_from_param_vector(
     return jnp.sum(weights * values)
 
 
+def geometry_observable_batched_cotangent_pullback_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    objective_cotangents,
+    *,
+    observable_kind: str,
+    objective_names: Sequence[str] | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
+    """Return objective values and W @ d(objectives)/d(param_deltas)."""
+    param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    cotangents = jnp.asarray(objective_cotangents, dtype=jnp.float64)
+    if cotangents.ndim == 1:
+        cotangents = cotangents[None, :]
+    names = tuple(objective_names) if objective_names is not None else geometry_observable_names_for_kind(observable_kind)
+    if int(cotangents.shape[1]) != len(names):
+        raise ValueError(
+            f"Expected objective cotangents with {len(names)} columns for {observable_kind}; "
+            f"got {int(cotangents.shape[1])}."
+        )
+
+    def objective_vector(theta):
+        state = _solve_state_for_param_vector(
+            context,
+            theta,
+            param_specs,
+            lane=lane,
+            max_iter=max_iter,
+            step_size=step_size,
+            jacobian_penalty=jacobian_penalty,
+        )
+        items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+        observables = {name: jnp.asarray(value, dtype=jnp.float64).reshape(()) for name, value in items}
+        missing = [name for name in names if name not in observables]
+        if missing:
+            raise ValueError(f"Unknown objective names for {observable_kind}: {missing}")
+        return jnp.stack([observables[name] for name in names])
+
+    def contracted_objectives_with_aux(theta):
+        values = objective_vector(theta)
+        return cotangents @ values, values
+
+    gradient_matrix, values = jax.jacrev(contracted_objectives_with_aux, has_aux=True)(param_deltas)
+    values_by_name = {name: values[i] for i, name in enumerate(names)}
+    return values_by_name, gradient_matrix
+
+
 def vmec_qi_maxj_scalar_objectives_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,

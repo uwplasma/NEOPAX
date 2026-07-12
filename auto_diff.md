@@ -6144,23 +6144,131 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --reverse-derivative-mode objective_table
 ```
 
-This is the main rule-refactor benchmark mode:
+This is now wired to the batched geometry cotangent helper:
 
 - the benchmark prints objective values first,
 - then it prints reverse gradients grouped by objective,
-- each row is recovered by the already-working scalar weighted-cotangent rule:
+- the benchmark passes the full objective-basis cotangent matrix at once:
 
 ```text
-grad_theta dot(onehot(objective), objectives(theta))
+W = eye(n_objectives)
+G = W @ J_objectives_theta
 ```
 
-- this avoids raw vector-output `jax.jacrev(objective_vector)`,
-- it does not change VMEC, Boozer, or QI derivative rules.
+- this avoids the benchmark-level objective-basis loop,
+- it avoids the explicit Python one-objective-at-a-time fallback,
+- it keeps VMEC, Boozer, and QI derivative rules unchanged.
 
-This is a correctness/diagnostic benchmark table, not yet the final
-transport-coupled all-objective geometry rule. The final coupled transport path
-should consume the scalar cotangent supplied by the transport objective/loss
-directly, like the existing profile reverse output path.
+### Implemented batched geometry cotangent pullback
+
+The reusable helper is:
+
+```text
+geometry_observable_batched_cotangent_pullback_from_param_vector(...)
+```
+
+It generalizes the working scalar weighted path:
+
+```text
+g(theta, w) = dot(w, objectives(theta))
+dtheta = grad_theta g(theta, w)
+```
+
+to:
+
+```text
+G(theta, W) = W @ J_objectives_theta
+```
+
+The implementation builds:
+
+```text
+values = stack(objectives(theta))
+contracted = W @ values
+```
+
+and differentiates the contracted vector with respect to geometry parameters,
+returning:
+
+```text
+values_by_name
+gradient_matrix.shape == (n_cotangents, n_geometry_params)
+```
+
+The current benchmark uses:
+
+```text
+W = eye(n_objectives)
+```
+
+so the output is a full profile-style objective-by-parameter table.
+
+Important limitation:
+
+- this removes the benchmark-level objective loop,
+- but it still relies on JAX to lower the contracted vector reverse pass
+  efficiently,
+- if XLA still expands this into an expensive output-basis transpose internally,
+  the next fix belongs inside this helper / lower-level VMEC-Boozer-QI pullback,
+  not in the benchmark loop.
+
+For the final transport-coupled path:
+
+```text
+W = transport-supplied objective cotangent rows
+G = geometry part of the transport reverse gradient
+```
+
+The same helper can be reused there after this benchmark passes.
+
+The benchmark output should match the profile reverse style:
+
+```text
+[geometry-fd-ad] objective values:
+  - vmec_aspect_ratio: value=...
+...
+[geometry-fd-ad] reverse gradients by objective:
+  - vmec_aspect_ratio:
+      dvmec_aspect_ratio/dRBC:1:0: fd=... rev=... rel_err=...
+      dvmec_aspect_ratio/dZBS:1:0: fd=... rev=... rel_err=...
+```
+
+Keep the other modes only as diagnostics:
+
+```text
+--reverse-derivative-mode weighted
+```
+
+for one scalar cotangent contraction.
+
+```text
+--reverse-derivative-mode onehot_sweep
+```
+
+for explicit slow objective-by-objective fallback.
+
+```text
+--reverse-derivative-mode jacrev
+```
+
+for the old raw vector-output path, expected to OOM for the full geometry/QI
+case.
+
+Validation order:
+
+1. Compare the batched helper with the already working scalar weighted
+   `--cotangent-weights ones` result using `W = ones[None, :]`.
+2. Compare the `objective_table` result with FD using `W = eye(n_objectives)`.
+3. Only after this works should the same helper be wired into the
+   transport-realtime geometry path.
+
+If this table path fails or OOMs, the explicit fallback remains:
+
+```bash
+--reverse-derivative-mode onehot_sweep
+```
+
+That fallback is intentionally one objective at a time.
 
 Diagnostic modes:
 
@@ -6174,7 +6282,7 @@ computes one contracted derivative of `dot(weights, objectives)`.
 --reverse-derivative-mode cotangent_jacfwd
 ```
 
-differentiates the weighted pullback map with respect to cotangent weights.
+is a compatibility alias for the same `objective_table` implementation.
 
 ```bash
 --reverse-derivative-mode onehot_sweep
