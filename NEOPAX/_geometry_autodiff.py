@@ -2747,38 +2747,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
-    boozer_direct_gradient_matrix = None
-    if use_current_multi_rhs:
-        def booz_float_output_from_params(params_inner):
-            rt_inner = implicit.runtime_from_params(params_inner, implicit_cfg)
-            static_inner = (
-                dataclasses.replace(context.static, runtime=rt_inner)
-                if dataclasses.is_dataclass(context.static)
-                else context.static
-            )
-            inputs_inner = _booz_xform_inputs_from_state(
-                state=state,
-                static=static_inner,
-                indata=context.indata,
-                signgs=context.signgs,
-                flux=context.flux,
-                runtime=rt_inner,
-            )
-            out = booz_api.booz_xform_from_inputs(
-                inputs=inputs_inner,
-                constants=booz_constants,
-                grids=booz_grids,
-                surface_indices=context.surface_indices,
-                jit=True,
-            )
-            return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
-
-        _, booz_params_pullback = jax.vjp(booz_float_output_from_params, implicit_params)
-        booz_param_grads = jax.vmap(lambda cot: booz_params_pullback(cot)[0])(booz_bar)
-        boozer_direct_gradient_matrix = _param_vector_gradient_from_implicit_param_grads(
-            booz_param_grads,
-            param_entries,
-        )
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if use_current_multi_rhs:
@@ -2792,8 +2760,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_grads, param_entries)
         if vmec_direct_gradient_matrix is not None:
             gradient_matrix = gradient_matrix + vmec_direct_gradient_matrix
-        if boozer_direct_gradient_matrix is not None:
-            gradient_matrix = gradient_matrix + boozer_direct_gradient_matrix
     elif final_mode in {"lax_map", "sequential"}:
         gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
     elif final_mode == "vmap":
