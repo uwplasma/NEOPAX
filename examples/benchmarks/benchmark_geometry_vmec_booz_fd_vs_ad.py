@@ -331,6 +331,7 @@ def _custom_vjp_reverse_table(
             lane="ad",
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
+            final_vmec_pullback_mode=args.final_vmec_pullback_mode,
         )
     return geometry_observable_multi_rhs_pullback_from_param_vector(
         context,
@@ -497,6 +498,17 @@ def main() -> None:
         help=(
             "Weights for --reverse-derivative-mode weighted. Use 'ones', 'onehot:objective_name', "
             "comma-separated numeric weights, or objective=value entries."
+        ),
+    )
+    parser.add_argument(
+        "--final-vmec-pullback-mode",
+        type=str,
+        default="vmap",
+        choices=("vmap", "lax_map", "sequential"),
+        help=(
+            "Diagnostic only for geometry_full_ad_objectives objective_table. "
+            "'vmap' keeps the vectorized final VMEC pullback; 'lax_map' applies "
+            "the current single-RHS vmec_jax implicit VJP one row at a time."
         ),
     )
     parser.add_argument(

@@ -2501,6 +2501,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    final_vmec_pullback_mode: str = "vmap",
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return geometry objective values and W @ d(objectives)/d(params).
 
@@ -2664,11 +2665,13 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
-    # vmec_jax.solve_implicit currently exposes a single-RHS custom VJP.  Do not
-    # vmap that rule here: batching the custom-VJP backward can change the
-    # matrix-free adjoint solve semantics.  Keep this final VMEC pullback
-    # sequential until vmec_jax grows a real multi-RHS implicit adjoint.
-    gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
+    final_mode = str(final_vmec_pullback_mode).strip().lower()
+    if final_mode in {"lax_map", "sequential"}:
+        gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
+    elif final_mode == "vmap":
+        gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
+    else:
+        raise ValueError("final_vmec_pullback_mode must be 'vmap' or 'lax_map'.")
     return values_by_name, gradient_matrix
 
 
