@@ -6144,73 +6144,69 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --reverse-derivative-mode objective_table
 ```
 
-This is now wired to the batched geometry cotangent helper:
+This is now wired to the geometry objective-vector custom VJP:
 
 - the benchmark prints objective values first,
 - then it prints reverse gradients grouped by objective,
-- the benchmark passes the full objective-basis cotangent matrix at once:
+- the objective vector has a custom reverse rule whose backward pass contracts
+  the incoming objective cotangent before differentiating:
 
 ```text
-W = eye(n_objectives)
-G = W @ J_objectives_theta
+cotangent -> grad_theta dot(cotangent, objectives(theta))
 ```
 
-- this avoids the benchmark-level objective-basis loop,
+- this avoids `jax.jacrev(...)` in the benchmark table path,
 - it avoids the explicit Python one-objective-at-a-time fallback,
 - it keeps VMEC, Boozer, and QI derivative rules unchanged.
 
-### Implemented batched geometry cotangent pullback
+### Implemented reverse custom-VJP objective table
 
 The reusable helper is:
 
 ```text
-geometry_observable_batched_cotangent_pullback_from_param_vector(...)
+geometry_observable_vector_custom_vjp_from_param_vector(...)
 ```
 
-It generalizes the working scalar weighted path:
+It wraps the objective vector:
+
+```text
+objectives(theta)
+```
+
+with a backward rule equivalent to the working scalar weighted path:
 
 ```text
 g(theta, w) = dot(w, objectives(theta))
 dtheta = grad_theta g(theta, w)
 ```
 
-to:
+The benchmark table now uses:
 
 ```text
-G(theta, W) = W @ J_objectives_theta
+values, pullback = jax.vjp(geometry_observable_vector_custom_vjp_from_param_vector, theta0)
+table = vmap(pullback)(eye(n_objectives))
 ```
 
-The implementation builds:
+so JAX sees a vector-valued objective, but each reverse row is routed through
+the custom VJP backward that contracts the objective cotangent into a scalar
+before taking the geometry reverse gradient.
+
+The previous raw contracted-vector helper remains only as a diagnostic mode:
 
 ```text
-values = stack(objectives(theta))
-contracted = W @ values
+--reverse-derivative-mode batched_cotangent
 ```
 
-and differentiates the contracted vector with respect to geometry parameters,
-returning:
-
-```text
-values_by_name
-gradient_matrix.shape == (n_cotangents, n_geometry_params)
-```
-
-The current benchmark uses:
-
-```text
-W = eye(n_objectives)
-```
-
-so the output is a full profile-style objective-by-parameter table.
+That mode OOMed for the full QI geometry objective because JAX lowered it as
+`vmap(pullback)(_std_basis(y))` through the raw QI graph.
 
 Important limitation:
 
-- this removes the benchmark-level objective loop,
-- but it still relies on JAX to lower the contracted vector reverse pass
-  efficiently,
-- if XLA still expands this into an expensive output-basis transpose internally,
-  the next fix belongs inside this helper / lower-level VMEC-Boozer-QI pullback,
-  not in the benchmark loop.
+- `objective_table` is reverse-mode again, not parameter-direction forward AD,
+- it still uses one pullback row per output objective because the current
+  VMEC/Boozer/QI lower-level rules do not expose a true multi-RHS transpose,
+- the next real implementation step is a lower-level multi-RHS geometry
+  pullback, not another benchmark wrapper and not a forward-AD substitution.
 
 For the final transport-coupled path:
 
@@ -6256,9 +6252,9 @@ case.
 
 Validation order:
 
-1. Compare the batched helper with the already working scalar weighted
-   `--cotangent-weights ones` result using `W = ones[None, :]`.
-2. Compare the `objective_table` result with FD using `W = eye(n_objectives)`.
+1. Compare the custom-VJP table with the already working scalar weighted
+   `--cotangent-weights ones` result by summing the printed table rows.
+2. Compare the `objective_table` result with FD.
 3. Only after this works should the same helper be wired into the
    transport-realtime geometry path.
 

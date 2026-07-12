@@ -22,6 +22,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     geometry_observable_batched_cotangent_pullback_from_param_vector,
     geometry_observable_kind_from_param_vector,
     geometry_observable_kind_from_single_param,
+    geometry_observable_vector_custom_vjp_from_param_vector,
     geometry_observable_weighted_sum_from_param_vector,
     rel_error,
 )
@@ -308,7 +309,34 @@ def _weighted_objective_table(
             print(line, flush=True)
 
 
-def _batched_cotangent_table(
+def _custom_vjp_reverse_table(
+    args,
+    context,
+    param_specs,
+    *,
+    objective_names: tuple[str, ...],
+    resolved_max_iter: int,
+    resolved_step_size: float,
+):
+    zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
+    value_fn = lambda deltas: geometry_observable_vector_custom_vjp_from_param_vector(  # noqa: E731
+        context,
+        deltas,
+        param_specs,
+        observable_kind=args.mode,
+        objective_names=objective_names,
+        lane="ad",
+        max_iter=resolved_max_iter,
+        step_size=resolved_step_size,
+    )
+    values, pullback = jax.vjp(value_fn, zeros)
+    objective_cotangents = jnp.eye(len(objective_names), dtype=jnp.float64)
+    jacobian_matrix = jax.vmap(lambda cotangent: pullback(cotangent)[0])(objective_cotangents)
+    values_by_name = {name: values[i] for i, name in enumerate(objective_names)}
+    return values_by_name, jacobian_matrix
+
+
+def _batched_cotangent_reverse_table(
     args,
     context,
     param_specs,
@@ -443,12 +471,13 @@ def main() -> None:
         "--reverse-derivative-mode",
         type=str,
         default="jacrev",
-        choices=("jacrev", "objective_table", "custom_vjp", "weighted", "cotangent_jacfwd", "onehot_sweep"),
+        choices=("jacrev", "objective_table", "custom_vjp", "weighted", "cotangent_jacfwd", "onehot_sweep", "batched_cotangent"),
         help=(
             "Multi-parameter implicit reverse path. 'jacrev' reconstructs the full objective Jacobian. "
-            "'objective_table' prints a profile-style table by applying the scalar cotangent-contracted "
-            "reverse rule to a full cotangent matrix. 'custom_vjp' and 'cotangent_jacfwd' are compatibility "
-            "aliases for that path. 'weighted' computes one contracted scalar derivative. "
+            "'objective_table' prints a profile-style table through a cotangent-contracted custom VJP. "
+            "'custom_vjp' and 'cotangent_jacfwd' are compatibility aliases for that path. "
+            "'weighted' computes one contracted scalar reverse derivative. "
+            "'batched_cotangent' is the previous raw contracted-vector diagnostic. "
             "'onehot_sweep' is the explicit one-objective-at-a-time fallback."
         ),
     )
@@ -609,21 +638,31 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
             print(line, flush=True)
         return
 
-    if args.reverse_derivative_mode in {"objective_table", "custom_vjp", "cotangent_jacfwd"}:
+    if args.reverse_derivative_mode in {"objective_table", "custom_vjp", "cotangent_jacfwd", "batched_cotangent"}:
         objective_names = geometry_observable_names_for_kind(args.mode)
         zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
-        print("[geometry-fd-ad] progress: running full objective table through batched cotangent matrix", flush=True)
+        print("[geometry-fd-ad] progress: running full objective table through reverse custom-VJP", flush=True)
         baseline_values = None
         reverse_jacobian_matrix = None
         if not args.skip_reverse_check:
-            baseline_values, reverse_jacobian_matrix = _batched_cotangent_table(
-                args,
-                context,
-                param_specs,
-                objective_names=objective_names,
-                resolved_max_iter=resolved_max_iter,
-                resolved_step_size=resolved_step_size,
-            )
+            if args.reverse_derivative_mode == "batched_cotangent":
+                baseline_values, reverse_jacobian_matrix = _batched_cotangent_reverse_table(
+                    args,
+                    context,
+                    param_specs,
+                    objective_names=objective_names,
+                    resolved_max_iter=resolved_max_iter,
+                    resolved_step_size=resolved_step_size,
+                )
+            else:
+                baseline_values, reverse_jacobian_matrix = _custom_vjp_reverse_table(
+                    args,
+                    context,
+                    param_specs,
+                    objective_names=objective_names,
+                    resolved_max_iter=resolved_max_iter,
+                    resolved_step_size=resolved_step_size,
+                )
         else:
             ad_func = _observable_vector_function(
                 args,
@@ -672,10 +711,10 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
                     f"fd={float(jnp.asarray(fd_value)):.6e}"
                 )
                 if reverse_jacobian_matrix is not None:
-                    reverse_value = reverse_jacobian_matrix[objective_index, i]
+                    ad_value = reverse_jacobian_matrix[objective_index, i]
                     line += (
-                        f" rev={float(jnp.asarray(reverse_value)):.6e}"
-                        f" rel_err={rel_error(reverse_value, fd_value):.6e}"
+                        f" ad={float(jnp.asarray(ad_value)):.6e}"
+                        f" rel_err={rel_error(ad_value, fd_value):.6e}"
                     )
                 print(line, flush=True)
         return

@@ -2388,6 +2388,60 @@ def geometry_observable_batched_cotangent_pullback_from_param_vector(
     return values_by_name, gradient_matrix
 
 
+def geometry_observable_vector_custom_vjp_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    observable_kind: str,
+    objective_names: Sequence[str] | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> jnp.ndarray:
+    """Return objectives with a cotangent-contracted reverse rule."""
+    param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    names = tuple(objective_names) if objective_names is not None else geometry_observable_names_for_kind(observable_kind)
+
+    def objective_vector(theta):
+        state = _solve_state_for_param_vector(
+            context,
+            theta,
+            param_specs,
+            lane=lane,
+            max_iter=max_iter,
+            step_size=step_size,
+            jacobian_penalty=jacobian_penalty,
+        )
+        items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+        observables = {name: jnp.asarray(value, dtype=jnp.float64).reshape(()) for name, value in items}
+        missing = [name for name in names if name not in observables]
+        if missing:
+            raise ValueError(f"Unknown objective names for {observable_kind}: {missing}")
+        return jnp.stack([observables[name] for name in names])
+
+    @jax.custom_vjp
+    def objective_vector_custom(theta):
+        return objective_vector(theta)
+
+    def objective_vector_fwd(theta):
+        values = objective_vector(theta)
+        return values, theta
+
+    def objective_vector_bwd(theta, cotangent):
+        cotangent = jnp.asarray(cotangent, dtype=jnp.float64)
+
+        def contracted(theta_inner):
+            values = objective_vector(theta_inner)
+            return jnp.vdot(cotangent, values)
+
+        return (jax.grad(contracted)(theta),)
+
+    objective_vector_custom.defvjp(objective_vector_fwd, objective_vector_bwd)
+    return objective_vector_custom(param_deltas)
+
+
 def vmec_qi_maxj_scalar_objectives_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,
