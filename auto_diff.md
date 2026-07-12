@@ -6834,6 +6834,9 @@ What this implementation fixes:
    cotangent and then scaled into the requested objective-cotangent rows.
 4. VMEC scalar objectives and light Boozer scalar objectives are pulled back as
    separate state-level groups, so non-QI rows do not build the QI graph.
+5. The table helper now shares one `state -> Boozer` VJP. Light Boozer
+   objectives and the QI scalar are pulled back to a combined Boozer cotangent,
+   and that combined cotangent is propagated back to the VMEC state once.
 ```
 
 What is still missing for the final profile-style geometry reverse rule:

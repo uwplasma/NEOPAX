@@ -2523,11 +2523,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     state, state_pullback = jax.vjp(solve_state, param_deltas)
-
-    # Values are still evaluated through the public combined-objective helper so
-    # printed baselines match the normal objective path exactly.
-    values_map = _geometry_full_ad_objectives_from_state(context, state)
-    values_by_name = {name: jnp.asarray(values_map[name], dtype=jnp.float64).reshape(()) for name in names}
+    booz, booz_state_pullback = jax.vjp(lambda state_inner: _boozer_output_from_state(context, state_inner), state)
+    values_by_name: dict[str, jnp.ndarray] = {}
 
     vmec_names = (
         "aspect_ratio",
@@ -2543,7 +2540,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
-    _vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
+    vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
+    values_by_name.update({f"vmec_{name}": vmec_values[i] for i, name in enumerate(vmec_names)})
     vmec_basis = jax.vmap(lambda cot: vmec_state_pullback(cot)[0])(
         jnp.eye(len(vmec_names), dtype=jnp.float64)
     )
@@ -2554,34 +2552,57 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "b00_mean",
         "buco_b_mean",
         "bvco_b_mean",
-        "aspect_proxy",
         "b10_over_b00_mean",
     )
     boozer_light_indices = tuple(names.index(f"boozer_{name}") for name in boozer_light_names)
 
-    def boozer_light_vector(state_inner):
-        booz = _boozer_output_from_state(context, state_inner)
-        values = _vmec_booz_light_scalar_observables_from_boozer(context, state_inner, booz)
+    def boozer_light_vector(booz_inner):
+        values = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz_inner)
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in boozer_light_names])
 
-    _boozer_values, boozer_state_pullback = jax.vjp(boozer_light_vector, state)
-    boozer_basis = jax.vmap(lambda cot: boozer_state_pullback(cot)[0])(
+    boozer_values, boozer_pullback = jax.vjp(boozer_light_vector, booz)
+    values_by_name.update({f"boozer_{name}": boozer_values[i] for i, name in enumerate(boozer_light_names)})
+    boozer_basis = jax.vmap(lambda cot: boozer_pullback(cot)[0])(
         jnp.eye(len(boozer_light_names), dtype=jnp.float64)
     )
-    boozer_state_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
+    boozer_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
+
+    mode00 = _find_mode_index(
+        jnp.asarray(booz["ixm_b"], dtype=jnp.int32),
+        jnp.asarray(booz["ixn_b"], dtype=jnp.int32),
+        m=0,
+        n=0,
+    )
+    if mode00 is None:
+        raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
+    aspect_proxy_index = names.index("boozer_aspect_proxy")
+
+    def boozer_aspect_proxy(state_inner):
+        return jnp.asarray(_vmec_state_field(state_inner, "Rcos", "R_cos")[-1, mode00], dtype=jnp.float64).reshape(())
+
+    aspect_proxy_value, aspect_proxy_state_pullback = jax.vjp(boozer_aspect_proxy, state)
+    values_by_name["boozer_aspect_proxy"] = aspect_proxy_value
+    aspect_proxy_unit_state_bar = aspect_proxy_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    aspect_proxy_state_bar = _tree_scale_unit_cotangent(
+        aspect_proxy_unit_state_bar,
+        cotangents[:, aspect_proxy_index],
+    )
 
     qi_index = names.index("boozer_qi_objective")
 
-    def qi_scalar(state_inner):
-        booz = _boozer_output_from_state(context, state_inner)
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
+    def qi_scalar(booz_inner):
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_inner)
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
-    _qi_value, qi_state_pullback = jax.vjp(qi_scalar, state)
-    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    qi_state_bar = _tree_scale_unit_cotangent(qi_unit_state_bar, cotangents[:, qi_index])
+    qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
+    values_by_name["boozer_qi_objective"] = qi_value
+    qi_unit_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_boozer_bar = _tree_scale_unit_cotangent(qi_unit_boozer_bar, cotangents[:, qi_index])
 
-    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, qi_state_bar)
+    booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
+    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
+
+    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
     return values_by_name, gradient_matrix
 
