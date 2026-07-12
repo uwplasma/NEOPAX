@@ -5896,3 +5896,235 @@ reverse pass.
   intended scalable path.
 - The eventual transport reverse-AD geometry path should mirror the multi-dof
   vector structure, combined with the existing profile parameters.
+
+## 2026-07-12 geometry objective derivative efficiency plan
+
+Current problem:
+
+- We need to benchmark geometry objective derivatives efficiently, not by
+  repeating the full VMEC/Boozer/QI graph objective-by-objective.
+- The current generic vector-output `jax.jacrev(...)` path can OOM for
+  `geometry_full_ad_objectives` at standard Boozer/QI resolution.
+- The QI-only benchmark can run at the standard settings:
+
+```text
+mboz=18 nboz=18 surfaces=0.100,0.280,0.460,0.640,0.820,1.000
+```
+
+but the current QI-only reverse-vs-FD numbers still do not agree, so QI
+correctness is a separate gate from memory efficiency.
+
+Observed standard-resolution QI-only result:
+
+```text
+mode=vmec_booz_qi_scalar_objectives
+params=RBC:1:0,ZBS:1:0
+RBC:1:0  qi_objective fd=5.909044e-01 reverse_ad=8.785892e-03 rel_err=9.851314e-01
+ZBS:1:0  qi_objective fd=1.387811e-01 reverse_ad=-2.939785e-02 rel_err=1.211829e+00
+```
+
+This means the geometry AD benchmark currently has two independent issues:
+
+- Efficiency: full all-objective `jacrev` materializes too much intermediate
+  structure through Boozer/QI.
+- Correctness: QI reverse AD must be checked against the exact FD lane before
+  it is allowed into the transport geometry derivative gate.
+
+Important constraint:
+
+- Objective blocking is only a diagnostic fallback. It can be used to get
+  numbers when a full graph OOMs, but it is not the intended final solution.
+- The intended solution should behave like the profile reverse lane: one primal
+  graph, one reverse rule, and cotangent-contracted adjoints instead of
+  materializing one full graph per output basis vector.
+
+Target architecture:
+
+```text
+theta_geo
+  -> VMEC implicit solve
+  -> Boozer transform
+  -> geometry objective vector
+  -> cotangent-contracted custom pullback
+  -> gradients with respect to all requested geometry parameters
+```
+
+The custom rule should accept an objective cotangent vector and contract it
+before expanding through the expensive Boozer/QI grid. This avoids the generic
+`jacrev` pattern:
+
+```text
+vmap(pullback)(standard_basis(objective_vector))
+```
+
+which is what creates the memory pressure for many objectives.
+
+Implementation milestones:
+
+1. Add a benchmark-level weighted-sum geometry objective helper.
+
+```text
+weighted_objective(theta_geo, weights)
+    = dot(weights, geometry_objective_vector(theta_geo))
+```
+
+This is the simplest way to force cotangent contraction before the reverse
+pass. It should use one VMEC solve and one Boozer transform for the requested
+geometry parameter vector.
+
+2. Validate the weighted-sum pullback before making it a custom rule.
+
+- Use one-hot `weights` to reproduce single-objective reverse gradients.
+- Use random or fixed nontrivial `weights` to verify that all objectives are
+  being contracted in one reverse pass.
+- Compare against FD directional derivatives:
+
+```text
+d/dtheta dot(weights, objectives(theta))
+```
+
+not only against individual objective columns.
+
+3. Convert the validated helper into an explicit cotangent-pullback API.
+
+Desired benchmark API:
+
+```text
+names, values, pullback = geometry_objective_vjp(theta_geo)
+geometry_grad = pullback(objective_cotangent)
+```
+
+This is the geometry analogue of the transport profile custom-VJP reverse
+sweep. It should not use objective blocks by default.
+
+4. Keep VMEC/Boozer work shared.
+
+- One VMEC implicit solve per geometry primal evaluation.
+- One Boozer transform per geometry primal evaluation.
+- VMEC core scalars, Boozer scalars, and QI should all read from the same
+  state/Boozer output.
+- No repeated `booz_xform_from_inputs(...)` per objective.
+
+5. Fix or isolate QI correctness.
+
+Before coupling QI into transport:
+
+- run QI-only FD with several FD steps,
+- compare the current QI helper with the standard `vmec_jax` QI objective path,
+- confirm whether the mismatch is from FD step sensitivity, surface/grid
+  convention, Boozer coefficient indexing, or the implicit reverse rule.
+
+Until this is resolved, use VMEC core and light Boozer scalar objectives as the
+main all-objective memory benchmark, and keep QI as a separately reported gate.
+
+6. Couple into transport only after the geometry rule passes.
+
+Final transport target:
+
+```text
+profiles + theta_geo
+  -> realtime VMEC/Boozer geometry
+  -> NTX support / fluxes
+  -> transport rollout objectives
+  -> reverse gradients for profile parameters and geometry parameters
+```
+
+The geometry parameters should include the same VMEC boundary dofs used in the
+geometry benchmark, initially for example:
+
+```text
+RBC:1:0, ZBS:1:0
+```
+
+then extend to larger `RBC/RBS/ZBC/ZBS` sets.
+
+Guardrails:
+
+- Do not change the profile reverse-AD lane while implementing this.
+- Do not change the profile forward-AD lane while implementing this.
+- Do not change the frozen-geometry forward solver baseline.
+- Keep `--reverse-objective-block-size` as an opt-in diagnostic only.
+- Keep standard Boozer/QI benchmark resolution unless a command explicitly
+  requests a reduced diagnostic resolution.
+
+Immediate next implementation step:
+
+- Add the weighted-sum geometry objective helper and benchmark mode first.
+- Test it with `RBC:1:0,ZBS:1:0` and a small set of weights.
+- If weighted-sum reverse avoids the OOM while matching FD directional
+  derivatives for non-QI objectives, promote that path into the reusable
+  geometry cotangent-pullback rule.
+
+Reference commands:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad
+```
+
+If this OOMs, do not treat objective blocking as the solution. Implement the
+weighted cotangent-contracted path above.
+
+Implementation status:
+
+- Added a reusable weighted geometry objective helper:
+
+```text
+geometry_observable_weighted_sum_from_param_vector(...)
+```
+
+- Added a benchmark path:
+
+```text
+--reverse-derivative-mode weighted
+--cotangent-weights ...
+```
+
+This computes:
+
+```text
+grad_theta dot(cotangent_weights, geometry_objectives(theta))
+```
+
+in one reverse pass over all requested geometry parameters. This is the first
+cotangent-contracted gate and should be used before trying any more
+full-output `jacrev` runs through the QI graph.
+
+First command to run:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode weighted \
+  --cotangent-weights ones
+```
+
+Useful single-objective cotangent probes:
+
+```bash
+--cotangent-weights onehot:vmec_aspect_ratio
+--cotangent-weights onehot:boozer_b00_mean
+--cotangent-weights onehot:boozer_qi_objective
+```
+
+Expected success signal:
+
+- The run prints `weighted objective baseline`.
+- It prints one `weighted parameter ...` line per geometry parameter.
+- It does not enter `reverse objective block ...`; blocks remain diagnostic
+  only.
+- If QI is included in the weights, QI correctness still needs a separate
+  FD-vs-AD diagnosis because the QI-only scalar benchmark currently mismatches
+  FD.

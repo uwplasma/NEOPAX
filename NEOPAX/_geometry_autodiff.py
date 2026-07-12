@@ -1264,6 +1264,46 @@ def _vmec_booz_scalar_observables_from_boozer(
     if mode10 is not None:
         b10 = bmnc_b[:, mode10]
         reduced["b10_over_b00_mean"] = jnp.mean(b10 / b00)
+    else:
+        reduced["b10_over_b00_mean"] = jnp.asarray(0.0, dtype=b00.dtype)
+    return reduced
+
+
+def _vmec_booz_light_scalar_observables_from_boozer(
+    context: GeometryAutodiffContext,
+    state,
+    out,
+) -> dict[str, jnp.ndarray]:
+    """Reduced Boozer scalars for the combined AD gate.
+
+    The historical Boozer scalar helper also computes DMerc and a magnetic
+    well penalty.  The combined gate already uses the current vmec_jax magnetic
+    well scalar and intentionally excludes DMerc, so computing those hidden
+    branches only bloats the reverse graph.
+    """
+
+    bmnc_b = jnp.asarray(out["bmnc_b"])
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+
+    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
+    if mode00 is None:
+        raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
+    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
+
+    b00 = bmnc_b[:, mode00]
+    reduced = {
+        "iota_b_mean": jnp.mean(jnp.asarray(out["iota_b"])),
+        "b00_mean": jnp.mean(b00),
+        "buco_b_mean": jnp.mean(jnp.asarray(out["buco_b"])),
+        "bvco_b_mean": jnp.mean(jnp.asarray(out["bvco_b"])),
+        "aspect_proxy": jnp.asarray(_vmec_state_field(state, "Rcos", "R_cos")[-1, mode00]),
+    }
+    if mode10 is not None:
+        b10 = bmnc_b[:, mode10]
+        reduced["b10_over_b00_mean"] = jnp.mean(b10 / b00)
+    else:
+        reduced["b10_over_b00_mean"] = jnp.asarray(0.0, dtype=b00.dtype)
     return reduced
 
 
@@ -1344,15 +1384,11 @@ def _geometry_full_ad_objectives_from_state(
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
     booz = _boozer_output_from_state(context, state)
-    boozer_scalars = _vmec_booz_scalar_observables_from_boozer(context, state, booz)
+    boozer_scalars = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz)
     qi = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
 
     out = {f"vmec_{name}": jnp.asarray(value, dtype=jnp.float64) for name, value in vmec_scalars.items()}
     for name, value in boozer_scalars.items():
-        # DMerc is not AD-transparent in current vmec_jax, and magnetic_well is
-        # already represented by the current vmec_jax scalar objective above.
-        if name.startswith("dmerc_") or name == "magnetic_well_objective":
-            continue
         out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
     out["boozer_qi_objective"] = jnp.asarray(qi["qi_objective"], dtype=jnp.float64)
     return out
@@ -1769,6 +1805,10 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
         "'vmec_booz_qi_scalar_objectives', 'vmec_booz_qi_maxj_scalar_objectives', "
         "'vmec_qi_maxj_scalar_objectives', or 'vmec_dmerc_objectives'."
     )
+
+
+def geometry_observable_names_for_kind(observable_kind: str) -> tuple[str, ...]:
+    return tuple(_observable_names_for_kind(observable_kind))
 
 
 def _single_param_boundary_spec(context: GeometryAutodiffContext):
@@ -2260,6 +2300,41 @@ def geometry_observable_kind_from_param_vector(
         name: jnp.asarray(value, dtype=jnp.float64)
         for name, value in _observable_items_from_state(context, state, observable_kind=observable_kind)
     }
+
+
+def geometry_observable_weighted_sum_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    objective_weights,
+    *,
+    observable_kind: str,
+    objective_names: Sequence[str] | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+) -> jnp.ndarray:
+    state = _solve_state_for_param_vector(
+        context,
+        param_deltas,
+        param_specs,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    items = _observable_items_from_state(context, state, observable_kind=observable_kind)
+    observables = {name: jnp.asarray(value, dtype=jnp.float64).reshape(()) for name, value in items}
+    names = tuple(objective_names) if objective_names is not None else tuple(name for name, _value in items)
+    missing = [name for name in names if name not in observables]
+    if missing:
+        raise ValueError(f"Unknown objective names for {observable_kind}: {missing}")
+    weights = jnp.asarray(objective_weights, dtype=jnp.float64).reshape((-1,))
+    if int(weights.shape[0]) != len(names):
+        raise ValueError(f"Expected {len(names)} objective weights for {observable_kind}; got {int(weights.shape[0])}.")
+    values = jnp.stack([observables[name] for name in names])
+    return jnp.sum(weights * values)
 
 
 def vmec_qi_maxj_scalar_objectives_from_single_param(

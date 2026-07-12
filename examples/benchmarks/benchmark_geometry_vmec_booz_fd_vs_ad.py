@@ -17,9 +17,11 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     central_fd_single_param,
     exact_forward_scalar_observable_derivatives,
     exact_reverse_scalar_observable_derivatives,
+    geometry_observable_names_for_kind,
     five_point_fd_single_param,
     geometry_observable_kind_from_param_vector,
     geometry_observable_kind_from_single_param,
+    geometry_observable_weighted_sum_from_param_vector,
     rel_error,
 )
 
@@ -55,6 +57,33 @@ def _parse_param_specs(text: str | None, *, default_family: str, default_m: int,
     if not specs:
         raise ValueError("--param-specs did not contain any valid specs.")
     return tuple(specs)
+
+
+def _parse_cotangent_weights(text: str | None, names: tuple[str, ...]) -> jnp.ndarray:
+    raw = "ones" if text is None else str(text).strip()
+    if raw == "" or raw.lower() == "ones":
+        return jnp.ones((len(names),), dtype=jnp.float64)
+    if raw.lower().startswith("onehot:"):
+        target = raw.split(":", 1)[1].strip()
+        if target not in names:
+            raise ValueError(f"Unknown onehot objective {target!r}; choices are {', '.join(names)}.")
+        return jnp.asarray([1.0 if name == target else 0.0 for name in names], dtype=jnp.float64)
+    if "=" in raw:
+        values = {name: 0.0 for name in names}
+        for item in raw.split(","):
+            if not item.strip():
+                continue
+            if "=" not in item:
+                raise ValueError("--cotangent-weights name/value entries must have form objective=value.")
+            key, value = [part.strip() for part in item.split("=", 1)]
+            if key not in values:
+                raise ValueError(f"Unknown objective {key!r}; choices are {', '.join(names)}.")
+            values[key] = float(value)
+        return jnp.asarray([values[name] for name in names], dtype=jnp.float64)
+    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+    if len(values) != len(names):
+        raise ValueError(f"Expected {len(names)} comma-separated cotangent weights; got {len(values)}.")
+    return jnp.asarray(values, dtype=jnp.float64)
 
 
 def _resolved_max_iter(context, user_value: int | None) -> int:
@@ -130,16 +159,66 @@ def _observable_vector_function(args, context, param_specs, *, lane: str, resolv
     )
 
 
-def _implicit_reverse_jacobian(func, n_params: int):
+def _weighted_observable_function(
+    args,
+    context,
+    param_specs,
+    *,
+    objective_names: tuple[str, ...],
+    objective_weights,
+    lane: str,
+    resolved_max_iter: int,
+    resolved_step_size: float,
+):
+    return lambda deltas: geometry_observable_weighted_sum_from_param_vector(  # noqa: E731
+        context,
+        deltas,
+        param_specs,
+        objective_weights,
+        observable_kind=args.mode,
+        objective_names=objective_names,
+        lane=lane,
+        max_iter=resolved_max_iter,
+        step_size=resolved_step_size,
+    )
+
+
+def _implicit_reverse_jacobian(func, n_params: int, *, objective_block_size: int):
     baseline = func(jnp.zeros((n_params,), dtype=jnp.float64))
     names = tuple(baseline.keys())
+    zeros = jnp.zeros((n_params,), dtype=jnp.float64)
 
-    def stacked_observables(deltas):
+    def stacked_observables(deltas, selected_names=names):
         values = func(deltas)
-        return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in names])
+        return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in selected_names])
 
-    jacobian_matrix = jax.jacrev(stacked_observables)(jnp.zeros((n_params,), dtype=jnp.float64))
-    return {name: jacobian_matrix[i, :] for i, name in enumerate(names)}
+    if int(objective_block_size) <= 0 or int(objective_block_size) >= len(names):
+        jacobian_matrix = jax.jacrev(stacked_observables)(zeros)
+        return {name: jacobian_matrix[i, :] for i, name in enumerate(names)}
+
+    out = {}
+    block_size = max(1, int(objective_block_size))
+    for start in range(0, len(names), block_size):
+        selected_names = names[start : start + block_size]
+        print(
+            "[geometry-fd-ad] progress: reverse objective block "
+            f"{start // block_size + 1}/{(len(names) + block_size - 1) // block_size}: "
+            f"{','.join(selected_names)}",
+            flush=True,
+        )
+        block_jacobian = jax.jacrev(
+            lambda deltas, selected_names=selected_names: stacked_observables(deltas, selected_names)
+        )(zeros)
+        for i, name in enumerate(selected_names):
+            out[name] = block_jacobian[i, :]
+    return out
+
+
+def _implicit_weighted_reverse_gradient(func, n_params: int):
+    zeros = jnp.zeros((n_params,), dtype=jnp.float64)
+    value = func(zeros)
+    gradient = jax.grad(lambda deltas: jnp.asarray(func(deltas), dtype=jnp.float64).reshape(()))(zeros)
+    return value, gradient
 
 
 def main() -> None:
@@ -241,6 +320,35 @@ def main() -> None:
         help="Skip reverse-mode observable derivative recovery.",
     )
     parser.add_argument(
+        "--reverse-objective-block-size",
+        type=int,
+        default=0,
+        help=(
+            "Number of scalar objectives per reverse jacrev block in the multi-parameter implicit lane. "
+            "Default 0 keeps the simultaneous vector-output jacrev. Use 1 only as a low-memory diagnostic fallback."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-derivative-mode",
+        type=str,
+        default="jacrev",
+        choices=("jacrev", "weighted"),
+        help=(
+            "Multi-parameter implicit reverse path. 'jacrev' reconstructs the full objective Jacobian. "
+            "'weighted' computes one cotangent-contracted weighted objective gradient and is the intended "
+            "memory-safe gate for many geometry objectives."
+        ),
+    )
+    parser.add_argument(
+        "--cotangent-weights",
+        type=str,
+        default="ones",
+        help=(
+            "Weights for --reverse-derivative-mode weighted. Use 'ones', 'onehot:objective_name', "
+            "comma-separated numeric weights, or objective=value entries."
+        ),
+    )
+    parser.add_argument(
         "--exact-solver-device",
         type=str,
         default="cpu",
@@ -307,11 +415,88 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         f"vmec forward_lane=run_fixed_boundary fd_lane={args.fd_lane} "
         f"ad_backend={args.ad_backend} max_iter={resolved_max_iter} "
         f"step_size={resolved_step_size:.6e} mboz={args.mboz} nboz={args.nboz} "
-        f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)}",
+        f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)} "
+        f"reverse_derivative_mode={args.reverse_derivative_mode} "
+        f"reverse_objective_block_size={args.reverse_objective_block_size}",
         flush=True,
     )
 
-    print("[geometry-fd-ad] progress: running one implicit-lane reverse Jacobian for all geometry parameters", flush=True)
+    if args.reverse_derivative_mode == "weighted":
+        objective_names = geometry_observable_names_for_kind(args.mode)
+        objective_weights = _parse_cotangent_weights(args.cotangent_weights, objective_names)
+        nonzero = [
+            f"{name}={float(weight):.6e}"
+            for name, weight in zip(objective_names, objective_weights)
+            if float(jnp.asarray(weight)) != 0.0
+        ]
+        print(
+            "[geometry-fd-ad] progress: running implicit-lane weighted reverse gradient for all geometry parameters",
+            flush=True,
+        )
+        print(
+            "[geometry-fd-ad] cotangent weights: "
+            + (", ".join(nonzero) if nonzero else "all zero"),
+            flush=True,
+        )
+        weighted_ad_func = _weighted_observable_function(
+            args,
+            context,
+            param_specs,
+            objective_names=objective_names,
+            objective_weights=objective_weights,
+            lane="ad",
+            resolved_max_iter=resolved_max_iter,
+            resolved_step_size=resolved_step_size,
+        )
+        weighted_reverse_value, weighted_reverse_gradient = (
+            (None, None)
+            if args.skip_reverse_check
+            else _implicit_weighted_reverse_gradient(weighted_ad_func, len(param_specs))
+        )
+        print(
+            f"[geometry-fd-ad] progress: running {args.fd_lane}-lane weighted finite differences per parameter",
+            flush=True,
+        )
+        weighted_fd_func = _weighted_observable_function(
+            args,
+            context,
+            param_specs,
+            objective_names=objective_names,
+            objective_weights=objective_weights,
+            lane=args.fd_lane,
+            resolved_max_iter=resolved_max_iter,
+            resolved_step_size=resolved_step_size,
+        )
+        zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
+        fd_by_param = []
+        for i, h in enumerate(h_values):
+            fd_center, _minus, _plus = central_fd_single_param(
+                lambda delta, i=i: weighted_fd_func(zeros.at[i].set(delta)),
+                h,
+            )
+            fd_by_param.append(fd_center)
+        if weighted_reverse_value is not None:
+            print(
+                "[geometry-fd-ad] weighted objective baseline: "
+                f"value={float(jnp.asarray(weighted_reverse_value)):.16e}",
+                flush=True,
+            )
+        for i, (param_family, param_m, param_n) in enumerate(param_specs):
+            line = (
+                f"[geometry-fd-ad] weighted parameter {i + 1}/{len(param_specs)}: "
+                f"{param_family}:{param_m}:{param_n} fd_step={h_values[i]:.6e} "
+                f"fd_center={float(jnp.asarray(fd_by_param[i])):.6e}"
+            )
+            if weighted_reverse_gradient is not None:
+                reverse_value = weighted_reverse_gradient[i]
+                line += (
+                    f" reverse_ad={float(jnp.asarray(reverse_value)):.6e}"
+                    f" reverse_vs_fd_rel_err={rel_error(reverse_value, fd_by_param[i]):.6e}"
+                )
+            print(line, flush=True)
+        return
+
+    print("[geometry-fd-ad] progress: running implicit-lane reverse Jacobian for all geometry parameters", flush=True)
     ad_func = _observable_vector_function(
         args,
         context,
@@ -320,7 +505,15 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         resolved_max_iter=resolved_max_iter,
         resolved_step_size=resolved_step_size,
     )
-    reverse_jacobian = None if args.skip_reverse_check else _implicit_reverse_jacobian(ad_func, len(param_specs))
+    reverse_jacobian = (
+        None
+        if args.skip_reverse_check
+        else _implicit_reverse_jacobian(
+            ad_func,
+            len(param_specs),
+            objective_block_size=args.reverse_objective_block_size,
+        )
+    )
 
     print(f"[geometry-fd-ad] progress: running {args.fd_lane}-lane centered finite differences per parameter", flush=True)
     fd_by_param = []
