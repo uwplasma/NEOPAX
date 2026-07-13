@@ -6193,6 +6193,43 @@ FD derivative reference:
 | `boozer_b10_over_b00_mean` | `-1.238979e-01` | `-1.001224e-02` |
 | `boozer_qi_objective` | `5.909044e-01` | `1.387811e-01` |
 
+Smaller-step FD check:
+
+```text
+fd_rel_step = 3e-8
+fd_abs_step = 1e-11
+```
+
+This run used the same objective table settings and produced:
+
+| Objective | d/dRBC:1:0 FD, smaller step | d/dZBS:1:0 FD, smaller step |
+|---|---:|---:|
+| `vmec_aspect_ratio` | `-5.400678e+00` | `-5.522689e+00` |
+| `vmec_volume_total` | `3.849962e+02` | `3.674347e+02` |
+| `vmec_iota_mean` | `-5.311164e-01` | `-3.042342e-01` |
+| `vmec_magnetic_well` | `3.350680e+00` | `2.132898e+00` |
+| `vmec_mirror_ratio` | `-5.863992e+00` | `-3.780607e+00` |
+| `vmec_beta_volume` | `0.000000e+00` | `0.000000e+00` |
+| `boozer_iota_b_mean` | `-3.180406e+00` | `-2.164719e+00` |
+| `boozer_b00_mean` | `-1.020039e+01` | `-5.920773e+00` |
+| `boozer_buco_b_mean` | `3.060350e-10` | `-4.285721e-10` |
+| `boozer_bvco_b_mean` | `-1.664545e+02` | `-1.238752e+02` |
+| `boozer_aspect_proxy` | `0.000000e+00` | `0.000000e+00` |
+| `boozer_b10_over_b00_mean` | `-1.995110e-01` | `-8.734958e-02` |
+| `boozer_qi_objective` | `1.264737e+00` | `8.723924e-01` |
+
+Smaller-step interpretation:
+
+- `vmec_aspect_ratio`, `vmec_volume_total`, `vmec_beta_volume`, and
+  `boozer_bvco_b_mean` remain stable across the two FD step choices.
+- The composed/interior-field rows change substantially when the FD step is
+  reduced by 10x. This includes `iota`, magnetic well, mirror ratio, Boozer
+  iota, `b10/b00`, and QI.
+- Therefore, while the reverse table still has a real cotangent-propagation
+  problem for these rows, the FD reference for the composed rows is also
+  step-sensitive and should not be treated as a single exact number until a
+  step sweep identifies a stable window.
+
 Current interpretation:
 
 - Matching rows in the grouped reverse table have been `vmec_aspect_ratio`,
