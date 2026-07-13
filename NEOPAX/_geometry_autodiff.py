@@ -2849,10 +2849,10 @@ def _safe_reciprocal(values):
 
 
 def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int | None:
-    matches = (jnp.asarray(ixm_b) == int(m_value)) & (jnp.asarray(ixn_b) == int(n_value))
-    if not bool(jnp.any(matches)):
-        return None
-    return int(jnp.argmax(matches))
+    ixm_np = np.asarray(ixm_b, dtype=np.int32).reshape(-1)
+    ixn_np = np.asarray(ixn_b, dtype=np.int32).reshape(-1)
+    matches = np.nonzero((ixm_np == int(m_value)) & (ixn_np == int(n_value)))[0]
+    return None if matches.size == 0 else int(matches[0])
 
 
 def _surface_indices_for_s_values(static, s_values: Sequence[float]):
@@ -2860,21 +2860,19 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
     try:
         surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
         surface_indices, _ = surface_indices_from_static(static, list(s_values))
-        return jnp.asarray(surface_indices, dtype=jnp.int32)
+        return np.asarray(surface_indices, dtype=np.int32)
     except Exception:
         ns = int(jnp.asarray(static.s).shape[0])
         s_full = np.linspace(0.0, 1.0, ns, dtype=float)
         s_half = 0.5 * (s_full[:-1] + s_full[1:])
         surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
-        return jnp.asarray(surface_indices, dtype=jnp.int32)
+        return np.asarray(surface_indices, dtype=np.int32)
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
     rho_np = np.asarray(rho_values, dtype=float)
     s_values = tuple(float(rho_value**2) for rho_value in rho_np.reshape(-1))
-    surface_indices_np = np.unique(
-        np.asarray(_surface_indices_for_s_values(static, s_values), dtype=np.int32)
-    )
+    surface_indices_np = np.unique(_surface_indices_for_s_values(static, s_values))
     surface_indices = jnp.asarray(surface_indices_np, dtype=jnp.int32)
     s_full = jnp.asarray(static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
@@ -2912,9 +2910,7 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     )
     if "rmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
     rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
@@ -3078,12 +3074,10 @@ def _build_neopax_geometry_from_state(
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
     gmnc_b = jnp.asarray(out["gmnc_b"])
     rmnc_b = jnp.asarray(out["rmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (0,0) mode.")
-    mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
 
     r0_value = rmnc_b[-1, mode00]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
@@ -3404,7 +3398,10 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     # tracing through dynamic boolean indexing.
     nfp = int(wout.nfp)
     mode_count = int(xm_nyq_np.size)
-    aminor_p = jnp.asarray(wout.Aminor_p, dtype=jnp.float64).reshape(())
+    aminor_raw = getattr(wout, "Aminor_p", None)
+    if aminor_raw is None:
+        aminor_raw = getattr(wout, "aminor_p")
+    aminor_p = jnp.asarray(aminor_raw, dtype=jnp.float64).reshape(())
     r_n = jnp.sqrt(s_query)
     r_hat = aminor_p * r_n
     phi = jnp.asarray(wout.phi, dtype=jnp.float64)
