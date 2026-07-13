@@ -3471,6 +3471,240 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path, static)
     )
 
 
+def _traceable_vmec_field_tables_from_state(context: GeometryAutodiffContext, state):
+    """Build the NTX-needed VMEC Nyquist tables without materializing WOUT."""
+
+    from vmec_jax.core.fields import magnetic_fields, metric_elements
+    from vmec_jax.core.geometry import half_mesh_jacobian
+    from vmec_jax.core.solver import _geometry
+    from vmec_jax.core.fourier import mode_table
+
+    if bool(context.cfg.lasym):
+        raise NotImplementedError("traceable realtime VMEC NTX surfaces currently support stellarator symmetry only")
+
+    rt = context.static.runtime
+    setup = rt.setup
+    s_full = jnp.asarray(setup.s_full, dtype=jnp.float64)
+    _, real_space = _geometry(state, rt)
+    jacobian = half_mesh_jacobian(real_space, s=s_full)
+    metrics = metric_elements(real_space, s=s_full)
+    fields = magnetic_fields(
+        geometry=real_space,
+        jacobian=jacobian,
+        metrics=metrics,
+        trig=rt.trig,
+        s=s_full,
+        phips=setup.phips,
+        phipf=setup.phipf,
+        chips=setup.chips,
+        signgs=setup.signgs,
+        gamma=rt.gamma,
+        mass=setup.mass,
+        ncurr=setup.ncurr,
+        enclosed_current=setup.icurv,
+    )
+
+    trig = rt.trig
+    ntheta2 = int(trig.ntheta2)
+    nzeta = int(np.asarray(trig.cosnv).shape[0])
+    mnyq = max(ntheta2 - 1, 0)
+    nnyq = max(nzeta // 2, 0)
+    modes = mode_table(max(mnyq, max(int(context.static.resolution.mpol) - 1, 0)) + 1, max(nnyq, int(context.static.resolution.ntor)))
+    xm_nyq_np = np.asarray(modes.m, dtype=np.int32)
+    xn_nyq_np = np.asarray(modes.n, dtype=np.int32) * int(context.static.resolution.nfp)
+
+    nzeta_safe = max(nzeta, 1)
+    dnorm = 1.0 / (nzeta_safe * max(ntheta2 - 1, 1))
+    cosmui_np = dnorm * np.asarray(trig.cosmu, dtype=float)[:ntheta2, :].copy()
+    sinmui_np = dnorm * np.asarray(trig.sinmu, dtype=float)[:ntheta2, :].copy()
+    cosmui_np[0, :] *= 0.5
+    cosmui_np[ntheta2 - 1, :] *= 0.5
+    if mnyq > 0:
+        cosmui_np[:, mnyq] *= 0.5
+    cosnv_np = np.asarray(trig.cosnv, dtype=float).copy()
+    sinnv_np = np.asarray(trig.sinnv, dtype=float)
+    if nnyq > 0:
+        cosnv_np[:, nnyq] *= 0.5
+
+    m_modes = np.asarray(modes.m, dtype=np.int32)
+    n_modes = np.asarray(modes.n, dtype=np.int32)
+    dmult_np = np.asarray(trig.mscale, dtype=float)[m_modes] * np.asarray(trig.nscale, dtype=float)[np.abs(n_modes)] * 0.5
+    dmult_np = np.where((m_modes == 0) | (n_modes == 0), 2.0 * dmult_np, dmult_np)
+
+    cosmui = jnp.asarray(cosmui_np, dtype=jnp.float64)
+    sinmui = jnp.asarray(sinmui_np, dtype=jnp.float64)
+    cosnv = jnp.asarray(cosnv_np, dtype=jnp.float64)
+    sinnv = jnp.asarray(sinnv_np, dtype=jnp.float64)
+    dmult = jnp.asarray(dmult_np, dtype=jnp.float64)
+    m_index = jnp.asarray(m_modes, dtype=jnp.int32)
+    n_abs_index = jnp.asarray(np.abs(n_modes), dtype=jnp.int32)
+    n_sign = jnp.asarray(np.where(n_modes < 0, -1.0, 1.0), dtype=jnp.float64)
+
+    def wrout_cos_coeffs_jax(f):
+        f_red = jnp.asarray(f, dtype=jnp.float64)[:, :ntheta2, :]
+        f_theta_cos = jnp.einsum("sik,im->smk", f_red, cosmui)
+        f_theta_sin = jnp.einsum("sik,im->smk", f_red, sinmui)
+        cos_zeta = jnp.einsum("smk,kn->smn", f_theta_cos, cosnv)
+        sin_zeta = jnp.einsum("smk,kn->smn", f_theta_sin, sinnv)
+        coeff = cos_zeta[:, m_index, n_abs_index] + n_sign[None, :] * sin_zeta[:, m_index, n_abs_index]
+        return coeff * dmult[None, :]
+
+    mmax_force = max(int(context.static.resolution.mpol) - 1, 0)
+    nmax_force = int(context.static.resolution.ntor)
+    cosmui_filter = jnp.asarray(dnorm * np.asarray(trig.cosmu, dtype=float)[:ntheta2, : mmax_force + 1], dtype=jnp.float64)
+    sinmui_filter = jnp.asarray(dnorm * np.asarray(trig.sinmu, dtype=float)[:ntheta2, : mmax_force + 1], dtype=jnp.float64)
+    cosmui_filter = cosmui_filter.at[0, :].multiply(0.5).at[ntheta2 - 1, :].multiply(0.5)
+    cosmu_filter = jnp.asarray(np.asarray(trig.cosmu, dtype=float)[:ntheta2, : mmax_force + 1], dtype=jnp.float64)
+    sinmu_filter = jnp.asarray(np.asarray(trig.sinmu, dtype=float)[:ntheta2, : mmax_force + 1], dtype=jnp.float64)
+    cosnv_filter = jnp.asarray(np.asarray(trig.cosnv, dtype=float)[:, : nmax_force + 1], dtype=jnp.float64)
+    sinnv_filter = jnp.asarray(np.asarray(trig.sinnv, dtype=float)[:, : nmax_force + 1], dtype=jnp.float64)
+    dmult_filter_np = np.ones((mmax_force + 1, nmax_force + 1), dtype=float)
+    if mnyq > 0 and mnyq <= mmax_force:
+        dmult_filter_np[mnyq, :] *= 0.5
+    if nnyq > 0 and nnyq <= nmax_force:
+        dmult_filter_np[:, nnyq] *= 0.5
+    dmult_filter = jnp.asarray(dmult_filter_np, dtype=jnp.float64)
+
+    def filter_covariant_jax(f):
+        f_red = jnp.asarray(f, dtype=jnp.float64)[:, :ntheta2, :]
+        f_theta_cos = jnp.einsum("sik,im->smk", f_red, cosmui_filter)
+        f_theta_sin = jnp.einsum("sik,im->smk", f_red, sinmui_filter)
+        c1 = jnp.einsum("smk,kn->smn", f_theta_cos, cosnv_filter) * dmult_filter[None, :, :]
+        c2 = jnp.einsum("smk,kn->smn", f_theta_sin, sinnv_filter) * dmult_filter[None, :, :]
+        tmp_cos = jnp.einsum("smn,im->sin", c1, cosmu_filter)
+        tmp_sin = jnp.einsum("smn,im->sin", c2, sinmu_filter)
+        return jnp.einsum("sin,kn->sik", tmp_cos, cosnv_filter) + jnp.einsum("sin,kn->sik", tmp_sin, sinnv_filter)
+
+    bsubu_out = filter_covariant_jax(fields.bsubu)
+    bsubv_out = filter_covariant_jax(fields.bsubv)
+    bmag = jnp.sqrt(2.0 * jnp.abs(jnp.asarray(fields.total_pressure) - jnp.asarray(fields.pressure)[:, None, None]))
+    gmnc = wrout_cos_coeffs_jax(jacobian.sqrt_g)
+    bmnc = wrout_cos_coeffs_jax(bmag)
+    bsupumnc = wrout_cos_coeffs_jax(fields.bsupu)
+    bsupvmnc = wrout_cos_coeffs_jax(fields.bsupv)
+    bsubumnc = wrout_cos_coeffs_jax(bsubu_out)
+    bsubvmnc = wrout_cos_coeffs_jax(bsubv_out)
+
+    def zero_axis(arr):
+        return jnp.asarray(arr, dtype=jnp.float64).at[0, :].set(0.0)
+
+    iotas_half = (
+        jnp.asarray(fields.chips) / jnp.where(jnp.asarray(setup.phips) != 0.0, jnp.asarray(setup.phips), 1.0)
+        if int(setup.ncurr) == 1
+        else jnp.asarray(setup.iotas)
+    )
+    if int(iotas_half.shape[0]) >= 2:
+        iotaf = jnp.empty_like(iotas_half)
+        iotaf = iotaf.at[0].set(1.5 * iotas_half[1] - 0.5 * iotas_half[2] if int(iotas_half.shape[0]) >= 3 else iotas_half[1])
+        iotaf = iotaf.at[1:-1].set(0.5 * (iotas_half[1:-1] + iotas_half[2:]))
+        iotaf = iotaf.at[-1].set(1.5 * iotas_half[-1] - 0.5 * iotas_half[-2])
+    else:
+        iotaf = iotas_half
+
+    phipf = jnp.asarray(context.flux.phipf, dtype=jnp.float64)
+    phi = jnp.concatenate([jnp.zeros((1,), dtype=phipf.dtype), jnp.cumsum(phipf[1:] * (s_full[1:] - s_full[:-1]))])
+    sqrts_edge = jnp.asarray(rt.setup.sqrts, dtype=jnp.float64)[-1]
+    rb = jnp.asarray(real_space.R_even)[-1] + sqrts_edge * jnp.asarray(real_space.R_odd)[-1]
+    zub = jnp.asarray(real_space.dZ_dtheta_even)[-1] + sqrts_edge * jnp.asarray(real_space.dZ_dtheta_odd)[-1]
+    wint = jnp.asarray(rt.trig.wint, dtype=jnp.float64)
+    area = 2.0 * jnp.pi * jnp.abs(jnp.sum(rb * zub * wint))
+    aminor_p = jnp.sqrt(jnp.where(area != 0.0, area, 1.0) / jnp.pi)
+
+    return SimpleNamespace(
+        xm_nyq=xm_nyq_np,
+        xn_nyq=xn_nyq_np,
+        gmnc=zero_axis(gmnc),
+        bmnc=zero_axis(bmnc),
+        bsupumnc=zero_axis(bsupumnc),
+        bsupvmnc=zero_axis(bsupvmnc),
+        bsubumnc=zero_axis(bsubumnc),
+        bsubvmnc=zero_axis(bsubvmnc),
+        iotaf=iotaf,
+        phi=phi,
+        aminor_p=aminor_p,
+    )
+
+
+def _traceable_vmec_surface_from_tables(tables, *, s, source_path, static):
+    from ntx.geometry import VmecSurface
+
+    s_value = float(s)
+    ns = int(static.resolution.ns)
+    s_full_np = np.linspace(0.0, 1.0, ns, dtype=np.float64)
+    hs = 1.0 / (ns - 1)
+    s_half_np = s_full_np[:-1] + 0.5 * hs
+    s_full = jnp.asarray(s_full_np, dtype=jnp.float64)
+    s_half = jnp.asarray(s_half_np, dtype=jnp.float64)
+    s_query = jnp.asarray(s_value, dtype=jnp.float64)
+
+    def interp_half(values):
+        return interpax.interp1d(s_query, s_half, jnp.asarray(values, dtype=jnp.float64)[1:, :], method="cubic", extrap=True)
+
+    def interp_full(values):
+        return interpax.interp1d(s_query, s_full, jnp.asarray(values, dtype=jnp.float64), method="cubic", extrap=True)
+
+    bmnc = interp_half(tables.bmnc)
+    gmnc = interp_half(tables.gmnc)
+    bsupumnc = interp_half(tables.bsupumnc)
+    bsupvmnc = interp_half(tables.bsupvmnc)
+    bsubumnc = interp_half(tables.bsubumnc)
+    bsubvmnc = interp_half(tables.bsubvmnc)
+    iota = -interp_full(tables.iotaf)
+
+    nfp = int(static.resolution.nfp)
+    mode_count = int(np.asarray(tables.xm_nyq).size)
+    aminor_p = jnp.asarray(tables.aminor_p, dtype=jnp.float64).reshape(())
+    r_n = jnp.sqrt(s_query)
+    r_hat = aminor_p * r_n
+    phi_edge = jnp.asarray(tables.phi[-1], dtype=jnp.float64)
+    psi_a_hat = phi_edge / (2.0 * jnp.pi)
+    dpsi_hat_dr_hat = 2.0 * psi_a_hat * r_n / aminor_p
+
+    return VmecSurface(
+        path=Path(source_path).expanduser(),
+        requested_psi_n=s_value,
+        psi_n=s_value,
+        nfp=nfp,
+        ns=ns,
+        mpol=int(static.resolution.mpol),
+        ntor=int(static.resolution.ntor),
+        total_mode_count=mode_count,
+        loaded_mode_count=mode_count,
+        iota=iota,
+        m=jnp.asarray(tables.xm_nyq, dtype=jnp.int32),
+        n=jnp.asarray(np.rint(-np.asarray(tables.xn_nyq) / nfp).astype(np.int32), dtype=jnp.int32),
+        b_cos=jnp.asarray(bmnc, dtype=jnp.float64),
+        jacobian_cos=jnp.asarray(gmnc, dtype=jnp.float64),
+        b_sub_theta_cos=jnp.asarray(bsubumnc, dtype=jnp.float64),
+        b_sub_zeta_cos=jnp.asarray(bsubvmnc, dtype=jnp.float64),
+        b_sup_theta_cos=jnp.asarray(bsupumnc, dtype=jnp.float64),
+        b_sup_zeta_cos=jnp.asarray(bsupvmnc, dtype=jnp.float64),
+        b0=jnp.max(jnp.abs(bmnc)),
+        psi_a_hat=psi_a_hat,
+        phi_edge=phi_edge,
+        r_n=r_n,
+        r_hat=r_hat,
+        dpsi_hat_dr_hat=dpsi_hat_dr_hat,
+        dr_hat_dpsi_hat=1.0 / dpsi_hat_dr_hat,
+        aminor_p=aminor_p,
+        psi_p=None,
+        transport_psi_scale=dpsi_hat_dr_hat,
+    )
+
+
+def _traceable_vmec_surfaces_from_state(context: GeometryAutodiffContext, state, *, s_values):
+    tables = _traceable_vmec_field_tables_from_state(context, state)
+    return tuple(
+        _traceable_vmec_surface_from_tables(
+            tables,
+            s=s_value,
+            source_path=context.input_path,
+            static=context.static,
+        )
+        for s_value in s_values
+    )
+
+
 def build_ntx_exact_lij_support_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -3499,22 +3733,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 s_values = kwargs.pop("s_values")
                 return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
         return surfaces_fn(**kwargs)
-
-    vmec_wout_cache = None
-
-    def _vmec_surfaces_from_state(*, s_values):
-        nonlocal vmec_wout_cache
-        if vmec_wout_cache is None:
-            vmec_wout_cache = _wout_from_vmec_state(context, state)
-        return tuple(
-            _vmec_jax_wout_surface_with_frozen_sampling(
-                vmec_wout_cache,
-                s=float(s_value),
-                source_path=context.input_path,
-                static=context.static,
-            )
-            for s_value in s_values
-        )
 
     n_center = int(geometry.rho_grid.shape[0])
     n_face = int(geometry.rho_grid_half.shape[0])
@@ -3553,8 +3771,16 @@ def build_ntx_exact_lij_support_from_vmec_state(
     face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_np)
     surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
-        center_surfaces = _vmec_surfaces_from_state(s_values=center_s_values)
-        face_surfaces = _vmec_surfaces_from_state(s_values=face_s_values)
+        center_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=center_s_values,
+        )
+        face_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=face_s_values,
+        )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
