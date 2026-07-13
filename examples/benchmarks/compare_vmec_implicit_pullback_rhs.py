@@ -98,9 +98,61 @@ def _relative_error(value: float, reference: float | None) -> float:
     return abs(value - reference) / max(abs(reference), 1.0e-300)
 
 
+def _tree_l2_and_max(tree) -> tuple[float, float]:
+    leaves = [jnp.ravel(jnp.asarray(x)) for x in jax.tree.leaves(tree)]
+    if not leaves:
+        return 0.0, 0.0
+    vec = jnp.concatenate(leaves)
+    return float(jax.device_get(jnp.linalg.norm(vec))), float(jax.device_get(jnp.max(jnp.abs(vec))))
+
+
 def _objective_value(objective_name: str, state: im.SpectralState, params: im.ImplicitParams, cfg: im.ImplicitConfig):
     rt = im.runtime_from_params(params, cfg)
     return jnp.asarray(OBJECTIVE_FUNCS[objective_name](state, rt), dtype=jnp.float64).reshape(())
+
+
+def _manual_implicit_forward_state_tangent(
+    *,
+    params: im.ImplicitParams,
+    param_tangent: im.ImplicitParams,
+    cfg: im.ImplicitConfig,
+    x_star: im.SpectralState,
+    dof_mask: im.SpectralState,
+    formulation: str,
+):
+    frozen = jax.lax.stop_gradient(x_star)
+    edge_mask = im._edge_mask(cfg)
+    P = im._dof_projector(cfg, dof_mask)
+    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
+    z_star = P(x_star)
+
+    def F_z(z):
+        return F(z, params)
+
+    def F_p(prm):
+        return F(z_star, prm)
+
+    rhs = jax.tree.map(
+        jnp.negative,
+        jax.jvp(F_p, (params,), (param_tangent,))[1],
+    )
+    dz, _ = im._adjoint_solve(lambda v: jax.jvp(F_z, (z_star,), (v,))[1], rhs, cfg)
+
+    def assemble_from_z_params(z, prm):
+        return im._assemble(
+            z,
+            im.runtime_from_params(prm, cfg),
+            frozen,
+            P,
+            edge_mask,
+        )
+
+    state_tangent = jax.jvp(
+        assemble_from_z_params,
+        (z_star, params),
+        (dz, param_tangent),
+    )[1]
+    return dz, state_tangent
 
 
 def _manual_implicit_pullback(
@@ -172,44 +224,59 @@ def _manual_implicit_forward_jvp(
     dof_mask: im.SpectralState,
     formulation: str,
 ):
-    frozen = jax.lax.stop_gradient(x_star)
-    edge_mask = im._edge_mask(cfg)
-    P = im._dof_projector(cfg, dof_mask)
-    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
-    z_star = P(x_star)
-
-    def F_z(z):
-        return F(z, params)
-
-    def F_p(prm):
-        return F(z_star, prm)
-
-    rhs = jax.tree.map(
-        jnp.negative,
-        jax.jvp(F_p, (params,), (param_tangent,))[1],
+    _dz, state_tangent = _manual_implicit_forward_state_tangent(
+        params=params,
+        param_tangent=param_tangent,
+        cfg=cfg,
+        x_star=x_star,
+        dof_mask=dof_mask,
+        formulation=formulation,
     )
-    dz, _ = im._adjoint_solve(lambda v: jax.jvp(F_z, (z_star,), (v,))[1], rhs, cfg)
-
-    def assemble_from_z_params(z, prm):
-        return im._assemble(
-            z,
-            im.runtime_from_params(prm, cfg),
-            frozen,
-            P,
-            edge_mask,
-        )
-
-    state_tangent = jax.jvp(
-        assemble_from_z_params,
-        (z_star, params),
-        (dz, param_tangent),
-    )[1]
     value, objective_tangent = jax.jvp(
         lambda state, prm: _objective_value(objective_name, state, prm, cfg),
         (x_star, params),
         (state_tangent, param_tangent),
     )
     return value, objective_tangent
+
+
+def _manual_residual_consistency_check(
+    *,
+    params: im.ImplicitParams,
+    param_tangent: im.ImplicitParams,
+    cfg: im.ImplicitConfig,
+    x_star: im.SpectralState,
+    dof_mask: im.SpectralState,
+    formulation: str,
+    steps: tuple[float, ...],
+):
+    frozen = jax.lax.stop_gradient(x_star)
+    P = im._dof_projector(cfg, dof_mask)
+    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
+    z_star = P(x_star)
+    dz, _state_tangent = _manual_implicit_forward_state_tangent(
+        params=params,
+        param_tangent=param_tangent,
+        cfg=cfg,
+        x_star=x_star,
+        dof_mask=dof_mask,
+        formulation=formulation,
+    )
+    base_l2, base_max = _tree_l2_and_max(F(z_star, params))
+    rows = [("base", 0.0, base_l2, base_max, float("nan"), float("nan"))]
+    for step in steps:
+        step_arr = jnp.asarray(step, dtype=jnp.float64)
+        p_step = jax.tree.map(lambda p, t: p + step_arr * t, params, param_tangent)
+        z_no_state = z_star
+        z_plus = jax.tree.map(lambda z, t: z + step_arr * t, z_star, dz)
+        z_minus = jax.tree.map(lambda z, t: z - step_arr * t, z_star, dz)
+        no_l2, no_max = _tree_l2_and_max(F(z_no_state, p_step))
+        plus_l2, plus_max = _tree_l2_and_max(F(z_plus, p_step))
+        minus_l2, minus_max = _tree_l2_and_max(F(z_minus, p_step))
+        rows.append(("no_state", step, no_l2, no_max, no_l2 / max(abs(step), 1.0e-300), no_max / max(abs(step), 1.0e-300)))
+        rows.append(("+dz", step, plus_l2, plus_max, plus_l2 / max(abs(step) ** 2, 1.0e-300), plus_max / max(abs(step) ** 2, 1.0e-300)))
+        rows.append(("-dz", step, minus_l2, minus_max, minus_l2 / max(abs(step) ** 2, 1.0e-300), minus_max / max(abs(step) ** 2, 1.0e-300)))
+    return rows
 
 
 def main() -> None:
@@ -232,6 +299,16 @@ def main() -> None:
         "--forward-jvp-only",
         action="store_true",
         help="Run only the manual implicit forward tangent diagnostic, skipping reverse pullbacks.",
+    )
+    parser.add_argument(
+        "--residual-check-only",
+        action="store_true",
+        help="Run only the implicit residual consistency check for the selected parameter tangent.",
+    )
+    parser.add_argument(
+        "--residual-check-steps",
+        default="1e-5,1e-6",
+        help="Comma-separated h values for --residual-check-only.",
     )
     parser.add_argument("--ns", type=int, default=None)
     parser.add_argument("--ftol", type=float, default=None)
@@ -332,6 +409,45 @@ def main() -> None:
             f"[vmec-pullback-rhs] forward_jvp={tangent_float:.16e} "
             f"rel_err_vs_fd={_relative_error(tangent_float, fd):.6e} "
             f"elapsed_s={time.perf_counter() - t_jvp:.3f}",
+            flush=True,
+        )
+        print(f"[vmec-pullback-rhs] total_elapsed_s={time.perf_counter() - t0:.3f}", flush=True)
+        return
+
+    if args.residual_check_only:
+        print("[vmec-pullback-rhs] progress: implicit residual consistency check", flush=True)
+        tangent = _param_unit_tangent_like(params0, family, row, col)
+        steps = tuple(
+            float(raw.strip())
+            for raw in str(args.residual_check_steps).split(",")
+            if raw.strip()
+        )
+        t_res = time.perf_counter()
+        rows = _manual_residual_consistency_check(
+            params=params0,
+            param_tangent=tangent,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            formulation=args.formulation,
+            steps=steps,
+        )
+        for label, step, l2, max_abs, scaled_l2, scaled_max in rows:
+            if label == "base":
+                print(
+                    f"[vmec-pullback-rhs] residual {label}: l2={l2:.6e} max={max_abs:.6e}",
+                    flush=True,
+                )
+            else:
+                scale_label = "over_h" if label == "no_state" else "over_h2"
+                print(
+                    f"[vmec-pullback-rhs] residual h={step:.1e} {label}: "
+                    f"l2={l2:.6e} max={max_abs:.6e} "
+                    f"l2_{scale_label}={scaled_l2:.6e} max_{scale_label}={scaled_max:.6e}",
+                    flush=True,
+                )
+        print(
+            f"[vmec-pullback-rhs] residual_check_elapsed_s={time.perf_counter() - t_res:.3f}",
             flush=True,
         )
         print(f"[vmec-pullback-rhs] total_elapsed_s={time.perf_counter() - t0:.3f}", flush=True)
