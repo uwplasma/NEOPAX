@@ -3891,6 +3891,7 @@ def build_runtime_context_for_geometry_param(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    initialize_er: bool = True,
 ):
     from NEOPAX._orchestrator import (
         Models,
@@ -3953,7 +3954,7 @@ def build_runtime_context_for_geometry_param(
         models=models,
     )
     mode = str(config_eff.get("general", {}).get("mode", config_eff.get("mode", "transport"))).strip().lower()
-    if mode != "ambipolarity":
+    if initialize_er and mode != "ambipolarity":
         state = _maybe_initialize_er_from_ambipolarity(config_eff, runtime, state)
     state = _apply_configured_er_dirichlet_boundaries(config_eff, state)
     return runtime, state

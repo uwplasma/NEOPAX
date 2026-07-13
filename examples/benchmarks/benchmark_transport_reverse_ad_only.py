@@ -1052,6 +1052,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
         max_iter=geom_cfg.get("vmec_max_iter"),
         step_size=geom_cfg.get("vmec_step_size"),
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        initialize_er=False,
     )
     state0 = _initial_state_for_parameter_vector(
         profile_values,
