@@ -3515,20 +3515,38 @@ def _traceable_vmec_field_tables_from_state(context: GeometryAutodiffContext, st
 
     nzeta_safe = max(nzeta, 1)
     dnorm = 1.0 / (nzeta_safe * max(ntheta2 - 1, 1))
-    cosmui_np = dnorm * np.asarray(trig.cosmu, dtype=float)[:ntheta2, :].copy()
-    sinmui_np = dnorm * np.asarray(trig.sinmu, dtype=float)[:ntheta2, :].copy()
+    ntheta1 = int(trig.ntheta1)
+    mscale_np = np.ones((mnyq + 1,), dtype=float)
+    nscale_np = np.ones((nnyq + 1,), dtype=float)
+    if mnyq >= 1:
+        mscale_np[1:] = np.sqrt(2.0)
+    if nnyq >= 1:
+        nscale_np[1:] = np.sqrt(2.0)
+    theta_index = np.arange(ntheta2, dtype=float)
+    m_table = np.arange(mnyq + 1, dtype=float)
+    theta_arg = (2.0 * np.pi) * theta_index[:, None] * m_table[None, :] / float(ntheta1)
+    cosmu_np = np.cos(theta_arg) * mscale_np[None, :]
+    sinmu_np = np.sin(theta_arg) * mscale_np[None, :]
+    endpoint_sign = np.where((np.arange(mnyq + 1) % 2) == 0, 1.0, -1.0)
+    cosmu_np[ntheta2 - 1, :] = endpoint_sign * mscale_np
+    sinmu_np[ntheta2 - 1, :] = 0.0
+    cosmui_np = dnorm * cosmu_np
+    sinmui_np = dnorm * sinmu_np
     cosmui_np[0, :] *= 0.5
     cosmui_np[ntheta2 - 1, :] *= 0.5
     if mnyq > 0:
         cosmui_np[:, mnyq] *= 0.5
-    cosnv_np = np.asarray(trig.cosnv, dtype=float).copy()
-    sinnv_np = np.asarray(trig.sinnv, dtype=float)
+    zeta_index = np.arange(nzeta, dtype=float)
+    n_table = np.arange(nnyq + 1, dtype=float)
+    zeta_arg = (2.0 * np.pi) * zeta_index[:, None] * n_table[None, :] / float(nzeta_safe)
+    cosnv_np = np.cos(zeta_arg) * nscale_np[None, :]
+    sinnv_np = np.sin(zeta_arg) * nscale_np[None, :]
     if nnyq > 0:
         cosnv_np[:, nnyq] *= 0.5
 
     m_modes = np.asarray(modes.m, dtype=np.int32)
     n_modes = np.asarray(modes.n, dtype=np.int32)
-    dmult_np = np.asarray(trig.mscale, dtype=float)[m_modes] * np.asarray(trig.nscale, dtype=float)[np.abs(n_modes)] * 0.5
+    dmult_np = mscale_np[m_modes] * nscale_np[np.abs(n_modes)] * 0.5
     dmult_np = np.where((m_modes == 0) | (n_modes == 0), 2.0 * dmult_np, dmult_np)
 
     cosmui = jnp.asarray(cosmui_np, dtype=jnp.float64)
