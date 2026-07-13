@@ -74,6 +74,20 @@ def _param_component(params: im.ImplicitParams, family: str, row: int, col: int)
     return float(jax.device_get(getattr(params, family)[row, col]))
 
 
+def _param_unit_tangent_like(
+    params: im.ImplicitParams,
+    family: str,
+    row: int,
+    col: int,
+) -> im.ImplicitParams:
+    leaves = {
+        field.name: jnp.zeros_like(getattr(params, field.name))
+        for field in dataclasses.fields(params)
+    }
+    leaves[family] = leaves[family].at[row, col].set(1.0)
+    return dataclasses.replace(params, **leaves)
+
+
 def _fd_step(base_value: float, *, rel_step: float, abs_step: float) -> float:
     return max(abs(float(base_value)) * float(rel_step), float(abs_step))
 
@@ -148,6 +162,56 @@ def _manual_implicit_pullback(
     )
 
 
+def _manual_implicit_forward_jvp(
+    *,
+    objective_name: str,
+    params: im.ImplicitParams,
+    param_tangent: im.ImplicitParams,
+    cfg: im.ImplicitConfig,
+    x_star: im.SpectralState,
+    dof_mask: im.SpectralState,
+    formulation: str,
+):
+    frozen = jax.lax.stop_gradient(x_star)
+    edge_mask = im._edge_mask(cfg)
+    P = im._dof_projector(cfg, dof_mask)
+    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
+    z_star = P(x_star)
+
+    def F_z(z):
+        return F(z, params)
+
+    def F_p(prm):
+        return F(z_star, prm)
+
+    rhs = jax.tree.map(
+        jnp.negative,
+        jax.jvp(F_p, (params,), (param_tangent,))[1],
+    )
+    dz, _ = im._adjoint_solve(lambda v: jax.jvp(F_z, (z_star,), (v,))[1], rhs, cfg)
+
+    def assemble_from_z_params(z, prm):
+        return im._assemble(
+            z,
+            im.runtime_from_params(prm, cfg),
+            frozen,
+            P,
+            edge_mask,
+        )
+
+    state_tangent = jax.jvp(
+        assemble_from_z_params,
+        (z_star, params),
+        (dz, param_tangent),
+    )[1]
+    value, objective_tangent = jax.jvp(
+        lambda state, prm: _objective_value(objective_name, state, prm, cfg),
+        (x_star, params),
+        (state_tangent, param_tangent),
+    )
+    return value, objective_tangent
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -164,6 +228,11 @@ def main() -> None:
     parser.add_argument("--skip-fd", action="store_true")
     parser.add_argument("--reference-fd", type=float, default=None)
     parser.add_argument("--run-builtin-grad", action="store_true")
+    parser.add_argument(
+        "--forward-jvp-only",
+        action="store_true",
+        help="Run only the manual implicit forward tangent diagnostic, skipping reverse pullbacks.",
+    )
     parser.add_argument("--ns", type=int, default=None)
     parser.add_argument("--ftol", type=float, default=None)
     parser.add_argument("--max-iterations", type=int, default=None)
@@ -244,6 +313,29 @@ def main() -> None:
         print(f"[vmec-pullback-rhs] reference_fd={fd:.16e}", flush=True)
     else:
         print("[vmec-pullback-rhs] fd skipped", flush=True)
+
+    if args.forward_jvp_only:
+        print("[vmec-pullback-rhs] progress: manual implicit forward JVP", flush=True)
+        tangent = _param_unit_tangent_like(params0, family, row, col)
+        t_jvp = time.perf_counter()
+        _value, tangent_value = _manual_implicit_forward_jvp(
+            objective_name=args.objective,
+            params=params0,
+            param_tangent=tangent,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            formulation=args.formulation,
+        )
+        tangent_float = float(jax.device_get(tangent_value))
+        print(
+            f"[vmec-pullback-rhs] forward_jvp={tangent_float:.16e} "
+            f"rel_err_vs_fd={_relative_error(tangent_float, fd):.6e} "
+            f"elapsed_s={time.perf_counter() - t_jvp:.3f}",
+            flush=True,
+        )
+        print(f"[vmec-pullback-rhs] total_elapsed_s={time.perf_counter() - t0:.3f}", flush=True)
+        return
 
     print("[vmec-pullback-rhs] progress: objective cotangent wrt (state, params)", flush=True)
     (_, pullback) = jax.vjp(
