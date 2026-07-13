@@ -120,6 +120,9 @@ def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inp
         return context.booz_constants, context.booz_grids
     booz_api = _import_booz_xform_jax_api()
     nfp_static = int(context.static.resolution.nfp)
+    mboz_static = int(context.mboz)
+    nboz_static = int(context.nboz)
+    asym_static = bool(context.cfg.lasym)
     mpol_static = int(context.static.resolution.mpol)
     ntor_static = int(context.static.resolution.ntor)
     ntheta1 = int(getattr(context.static.resolution, "ntheta1", context.static.resolution.ntheta))
@@ -128,16 +131,42 @@ def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inp
     nmax_non = max(ntor_static, 0)
     mmax_nyq = max(ntheta1 // 2, mmax_non)
     nmax_nyq = max(nzeta // 2, nmax_non)
-    return booz_api.prepare_booz_xform_constants(
+
+    ntheta_full = 2 * (2 * mboz_static + 1)
+    nzeta_full = 2 * (2 * nboz_static + 1) if nboz_static > 0 else 1
+    nu2_b = ntheta_full // 2 + 1
+    nu3_b = ntheta_full if asym_static else nu2_b
+    theta_vals = np.arange(nu3_b, dtype=np.float64) * (2.0 * np.pi / ntheta_full)
+    zeta_vals = np.arange(nzeta_full, dtype=np.float64) * (2.0 * np.pi / (nfp_static * nzeta_full))
+
+    xm_b: list[int] = []
+    xn_b: list[int] = []
+    for m_value in range(mboz_static):
+        n_min = 0 if m_value == 0 else -nboz_static
+        for n_value in range(n_min, nboz_static + 1):
+            xm_b.append(m_value)
+            xn_b.append(n_value * nfp_static)
+
+    constants = booz_api.BoozXformConstants(
         nfp=nfp_static,
-        mboz=int(context.mboz),
-        nboz=int(context.nboz),
-        asym=bool(context.cfg.lasym),
-        xm=np.asarray([0, mmax_non], dtype=np.int32),
-        xn=np.asarray([0, nmax_non * nfp_static], dtype=np.int32),
-        xm_nyq=np.asarray([0, mmax_nyq], dtype=np.int32),
-        xn_nyq=np.asarray([0, nmax_nyq * nfp_static], dtype=np.int32),
+        mboz=mboz_static,
+        nboz=nboz_static,
+        asym=asym_static,
+        ntheta=ntheta_full,
+        nzeta=nzeta_full,
+        nu2_b=nu2_b,
+        mmax_non=mmax_non,
+        nmax_non=nmax_non,
+        mmax_nyq=mmax_nyq,
+        nmax_nyq=nmax_nyq,
     )
+    grids = booz_api.BoozXformGrids(
+        theta_grid=np.repeat(theta_vals, nzeta_full),
+        zeta_grid=np.tile(zeta_vals, nu3_b),
+        xm_b=np.asarray(xm_b, dtype=np.int32),
+        xn_b=np.asarray(xn_b, dtype=np.int32),
+    )
+    return constants, grids
 
 
 def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
