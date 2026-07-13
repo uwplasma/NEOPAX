@@ -1038,6 +1038,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
     profile_cfg: dict,
     geometry_parameter_name: str,
     accepted_step_limit_override: int | None = None,
+    solver_override=None,
 ):
     del geometry_parameter_name
     profile_values = parameter_values[: len(PARAMETER_ORDER)]
@@ -1060,7 +1061,12 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
         profile_cfg=profile_cfg,
         runtime=runtime,
     )
-    prepared_components = prepare_transport_solver_components(config, runtime, state0)
+    prepared_components = prepare_transport_solver_components(
+        config,
+        runtime,
+        state0,
+        solver_override=solver_override,
+    )
     solver = prepared_components["solver"]
     solve_vector_field = prepared_components["solve_vector_field"]
     prepared_rollout = _build_prepared_radau_accepted_rollout(
@@ -1131,6 +1137,26 @@ def _run_realtime_geometry_reverse_mode(
         + [float(geom_cfg.get("vmec_param_delta", 0.0))],
         dtype=jnp.float64,
     )
+    baseline_geometry_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
+    baseline_runtime, baseline_state = build_runtime_context_for_geometry_param(
+        config,
+        geometry_context,
+        baseline_geometry_delta,
+        lane="ad",
+        n_r=int(geom_cfg.get("n_radial", 51)),
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        step_size=geom_cfg.get("vmec_step_size"),
+        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        initialize_er=False,
+    )
+    baseline_profile_state = _initial_state_for_parameter_vector(
+        baseline_values[: len(PARAMETER_ORDER)],
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=baseline_runtime,
+    )
+    baseline_components = prepare_transport_solver_components(config, baseline_runtime, baseline_profile_state)
+    static_solver = baseline_components["solver"]
     print(
         "[autodiff-gate] realtime geometry device: "
         f"default_backend={jax.default_backend()} "
@@ -1147,6 +1173,7 @@ def _run_realtime_geometry_reverse_mode(
         profile_cfg=profile_cfg,
         geometry_parameter_name=geometry_parameter,
         accepted_step_limit_override=args.accepted_step_limit,
+        solver_override=static_solver,
     )
     objective_fn = (
         objective_vector_fn

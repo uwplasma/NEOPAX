@@ -727,6 +727,8 @@ def prepare_transport_solver_components(
     config: dict,
     runtime: RuntimeContext,
     state: TransportState,
+    *,
+    solver_override: Any = None,
 ) -> dict[str, Any]:
     """Build the reusable transport solve components without executing solve.
 
@@ -829,7 +831,7 @@ def prepare_transport_solver_components(
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
     )
-    solver = build_time_solver(solver_cfg)
+    solver = build_time_solver(solver_cfg, solver_override=solver_override)
     return {
         "bc": bc,
         "equations_to_evolve": equations_to_evolve,
