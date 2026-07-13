@@ -120,17 +120,23 @@ def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inp
         return context.booz_constants, context.booz_grids
     booz_api = _import_booz_xform_jax_api()
     nfp_static = int(context.static.resolution.nfp)
-    if dataclasses.is_dataclass(inputs):
-        inputs_for_constants = dataclasses.replace(inputs, nfp=nfp_static)
-    elif hasattr(inputs, "_replace"):
-        inputs_for_constants = inputs._replace(nfp=nfp_static)
-    else:
-        inputs_for_constants = SimpleNamespace(**vars(inputs), nfp=nfp_static)
-    return booz_api.prepare_booz_xform_constants_from_inputs(
-        inputs=inputs_for_constants,
+    mpol_static = int(context.static.resolution.mpol)
+    ntor_static = int(context.static.resolution.ntor)
+    ntheta1 = int(getattr(context.static.resolution, "ntheta1", context.static.resolution.ntheta))
+    nzeta = int(getattr(context.static.resolution, "nzeta", 0))
+    mmax_non = max(mpol_static - 1, 0)
+    nmax_non = max(ntor_static, 0)
+    mmax_nyq = max(ntheta1 // 2, mmax_non)
+    nmax_nyq = max(nzeta // 2, nmax_non)
+    return booz_api.prepare_booz_xform_constants(
+        nfp=nfp_static,
         mboz=int(context.mboz),
         nboz=int(context.nboz),
         asym=bool(context.cfg.lasym),
+        xm=np.asarray([0, mmax_non], dtype=np.int32),
+        xn=np.asarray([0, nmax_non * nfp_static], dtype=np.int32),
+        xm_nyq=np.asarray([0, mmax_nyq], dtype=np.int32),
+        xn_nyq=np.asarray([0, nmax_nyq * nfp_static], dtype=np.int32),
     )
 
 
@@ -909,9 +915,10 @@ def _solve_state_for_param_vector(
 
 
 def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) -> int | None:
-    matches = jnp.where((ixm_b == int(m)) & (ixn_b == int(n)), size=1, fill_value=-1)[0]
-    match = int(matches[0])
-    return None if match < 0 else match
+    ixm_np = np.asarray(ixm_b, dtype=np.int32).reshape(-1)
+    ixn_np = np.asarray(ixn_b, dtype=np.int32).reshape(-1)
+    matches = np.nonzero((ixm_np == int(m)) & (ixn_np == int(n)))[0]
+    return None if matches.size == 0 else int(matches[0])
 
 
 def _vmec_state_field(state, legacy_name: str, current_name: str):
@@ -1257,6 +1264,9 @@ def _boozer_output_from_state(
         surface_indices=context.surface_indices,
         jit=True,
     )
+    out = dict(out)
+    out["_mode00"] = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    out["_mode10"] = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
     return out
 
 
@@ -1266,13 +1276,14 @@ def _vmec_booz_scalar_observables_from_boozer(
     out,
 ) -> dict[str, jnp.ndarray]:
     bmnc_b = jnp.asarray(out["bmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-
-    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
+    mode00 = out.get("_mode00")
+    if mode00 is None:
+        mode00 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=0, n=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
-    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
+    mode10 = out.get("_mode10")
+    if mode10 is None:
+        mode10 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
     magnetic_well = _vmec_magnetic_well_from_state(context, state)
@@ -1320,13 +1331,14 @@ def _vmec_booz_light_scalar_observables_from_boozer(
     """
 
     bmnc_b = jnp.asarray(out["bmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-
-    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
+    mode00 = out.get("_mode00")
+    if mode00 is None:
+        mode00 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=0, n=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
-    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
+    mode10 = out.get("_mode10")
+    if mode10 is None:
+        mode10 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
     reduced = {
@@ -1615,18 +1627,26 @@ def _vmec_surface_line_data_from_state(
     s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     phips_half = jnp.asarray(context.flux.phips, dtype=jnp.float64)[1:]
-    target_indices = jnp.asarray(context.surface_indices, dtype=jnp.int32)
-    neighbor_minus = jnp.clip(target_indices - 1, 0, int(s_half.shape[0]) - 1)
-    neighbor_plus = jnp.clip(target_indices + 1, 0, int(s_half.shape[0]) - 1)
-    extended_indices = jnp.unique(jnp.concatenate([neighbor_minus, target_indices, neighbor_plus], axis=0))
+    target_indices_np = np.asarray(context.surface_indices, dtype=np.int32).reshape(-1)
+    half_count = int(s_half.shape[0])
+    neighbor_minus_np = np.clip(target_indices_np - 1, 0, half_count - 1)
+    neighbor_plus_np = np.clip(target_indices_np + 1, 0, half_count - 1)
+    extended_indices_np = np.unique(np.concatenate([neighbor_minus_np, target_indices_np, neighbor_plus_np], axis=0))
+    surface_map = {int(idx): pos for pos, idx in enumerate(extended_indices_np)}
+    target_positions_np = np.asarray([surface_map[int(idx)] for idx in target_indices_np], dtype=np.int32)
+    minus_positions_np = np.asarray([surface_map[int(idx)] for idx in neighbor_minus_np], dtype=np.int32)
+    plus_positions_np = np.asarray([surface_map[int(idx)] for idx in neighbor_plus_np], dtype=np.int32)
+    target_indices = jnp.asarray(target_indices_np, dtype=jnp.int32)
+    neighbor_minus = jnp.asarray(neighbor_minus_np, dtype=jnp.int32)
+    neighbor_plus = jnp.asarray(neighbor_plus_np, dtype=jnp.int32)
+    extended_indices = jnp.asarray(extended_indices_np, dtype=jnp.int32)
     extended_s = s_half[extended_indices]
     bmag_half = _interp_radial_grid(bmag_grid_full, s_full, extended_s)
     dl_half = _interp_radial_grid(dl_grid_full, s_full, extended_s)
     iota_surface = jnp.asarray(iotas_half, dtype=jnp.float64)[extended_indices]
-    surface_map = {int(idx): pos for pos, idx in enumerate(np.asarray(extended_indices, dtype=int))}
-    target_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(target_indices)], dtype=jnp.int32)
-    minus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_minus)], dtype=jnp.int32)
-    plus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_plus)], dtype=jnp.int32)
+    target_positions = jnp.asarray(target_positions_np, dtype=jnp.int32)
+    minus_positions = jnp.asarray(minus_positions_np, dtype=jnp.int32)
+    plus_positions = jnp.asarray(plus_positions_np, dtype=jnp.int32)
     db_ds = (bmag_half[plus_positions] - bmag_half[minus_positions]) / jnp.maximum(
         (s_half[neighbor_plus] - s_half[neighbor_minus])[:, None, None],
         1.0e-12,
@@ -2223,27 +2243,10 @@ def geometry_observables_from_single_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
-    vmec_jax = _import_vmec_jax()
-    booz_api = _import_booz_xform_jax_api()
-    inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    out = booz_api.booz_xform_from_inputs(
-        inputs=inputs,
-        constants=booz_constants,
-        grids=booz_grids,
-        surface_indices=context.surface_indices,
-        jit=True,
-    )
     observables = _vmec_booz_scalar_observables_from_state(context, state)
     full = {name: jnp.asarray(value) for name, value in observables.items()}
     full["surface_indices"] = context.surface_indices.astype(jnp.float64)
-    full["nfp"] = jnp.asarray([float(jnp.asarray(out["nfp_b"]).reshape(()))], dtype=jnp.float64)
+    full["nfp"] = jnp.asarray([float(context.static.resolution.nfp)], dtype=jnp.float64)
     return full
 
 
@@ -2613,6 +2616,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
     ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
     ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
     booz_float_keys = (
         "iota_b",
         "buco_b",
@@ -2641,6 +2646,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         out = dict(booz_float)
         out["ixm_b"] = ixm_b
         out["ixn_b"] = ixn_b
+        out["_mode00"] = mode00
+        out["_mode10"] = mode10
         return out
 
     booz, booz_state_pullback = jax.vjp(booz_float_output_from_state, state)
@@ -2687,12 +2694,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
     boozer_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
 
-    mode00 = _find_mode_index(
-        ixm_b,
-        ixn_b,
-        m=0,
-        n=0,
-    )
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
     aspect_proxy_index = names.index("boozer_aspect_proxy")
@@ -3345,7 +3346,7 @@ def _ntx_frozen_interp_mode_columns(interpolated_value, x_nodes, values, xq):
     )
 
 
-def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
+def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path, static):
     """Build an NTX VMEC surface using the same sampling convention as NTX's frozen loader."""
 
     from ntx.geometry import VmecSurface
@@ -3354,7 +3355,7 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     if not 0.0 <= s_value <= 1.0:
         raise ValueError("s must be between 0 and 1")
 
-    ns = int(wout.ns)
+    ns = int(static.resolution.ns)
     if ns < 2:
         raise ValueError("VMEC input must contain at least two radial surfaces")
 
@@ -3397,7 +3398,7 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     # For the realtime AD path keep a fixed-size mode set. The current calls use
     # min_bmn_to_load=0, so this matches the all-mode frozen loader without
     # tracing through dynamic boolean indexing.
-    nfp = int(wout.nfp)
+    nfp = int(static.resolution.nfp)
     mode_count = int(xm_nyq_np.size)
     aminor_raw = getattr(wout, "Aminor_p", None)
     if aminor_raw is None:
@@ -3415,8 +3416,8 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
         psi_n=s_value,
         nfp=nfp,
         ns=ns,
-        mpol=int(wout.mpol),
-        ntor=int(wout.ntor),
+        mpol=int(static.resolution.mpol),
+        ntor=int(static.resolution.ntor),
         total_mode_count=mode_count,
         loaded_mode_count=mode_count,
         iota=iota,
@@ -3481,6 +3482,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 vmec_wout_cache,
                 s=float(s_value),
                 source_path=context.input_path,
+                static=context.static,
             )
             for s_value in s_values
         )
