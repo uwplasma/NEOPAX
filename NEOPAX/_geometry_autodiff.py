@@ -2856,17 +2856,11 @@ def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int 
 
 
 def _surface_indices_for_s_values(static, s_values: Sequence[float]):
-    vmec_jax = _import_vmec_jax()
-    try:
-        surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
-        surface_indices, _ = surface_indices_from_static(static, list(s_values))
-        return np.asarray(surface_indices, dtype=np.int32)
-    except Exception:
-        ns = int(jnp.asarray(static.s).shape[0])
-        s_full = np.linspace(0.0, 1.0, ns, dtype=float)
-        s_half = 0.5 * (s_full[:-1] + s_full[1:])
-        surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
-        return np.asarray(surface_indices, dtype=np.int32)
+    ns = int(jnp.asarray(static.s).shape[0])
+    s_full = np.linspace(0.0, 1.0, ns, dtype=float)
+    s_half = 0.5 * (s_full[:-1] + s_full[1:])
+    surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
+    return np.asarray(surface_indices, dtype=np.int32)
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
