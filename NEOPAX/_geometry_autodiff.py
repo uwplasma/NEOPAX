@@ -2868,8 +2868,12 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
-    s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
-    surface_indices = jnp.unique(_surface_indices_for_s_values(static, s_values))
+    rho_np = np.asarray(rho_values, dtype=float)
+    s_values = tuple(float(rho_value**2) for rho_value in rho_np.reshape(-1))
+    surface_indices_np = np.unique(
+        np.asarray(_surface_indices_for_s_values(static, s_values), dtype=np.int32)
+    )
+    surface_indices = jnp.asarray(surface_indices_np, dtype=jnp.int32)
     s_full = jnp.asarray(static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     sample_rho = jnp.sqrt(jnp.maximum(s_half[surface_indices], 0.0))
@@ -3016,15 +3020,18 @@ def _build_neopax_geometry_from_state(
     # B0(r_grid) use a frozen-like local slope.
     edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
     edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
-    requested_sample_rho = jnp.unique(
-        jnp.concatenate(
-            [
-                rho_grid_half[1:-1],
-                rho_half[1 : 1 + edge_count],
-                edge_rho,
-            ],
-            axis=0,
-        )
+    requested_sample_rho = jnp.asarray(
+        np.unique(
+            np.concatenate(
+                [
+                    np.asarray(rho_grid_half[1:-1], dtype=float),
+                    np.asarray(rho_half[1 : 1 + edge_count], dtype=float),
+                    np.asarray(edge_rho, dtype=float),
+                ],
+                axis=0,
+            )
+        ),
+        dtype=rho_grid_half.dtype,
     )
 
     phipf = jnp.asarray(context.flux.phipf)
@@ -3395,12 +3402,23 @@ def build_ntx_exact_lij_support_from_vmec_state(
             for s_value in s_values
         )
 
-    rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
-    rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    rho_center = jnp.asarray(geometry.rho_grid, dtype=jnp.float64)
+    rho_face = jnp.asarray(geometry.rho_grid_half, dtype=jnp.float64)
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
-    r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
+    r00_support_rho = jnp.asarray(
+        np.unique(
+            np.concatenate(
+                [
+                    np.asarray(geometry.rho_grid, dtype=float),
+                    np.asarray(geometry.rho_grid_half, dtype=float),
+                ],
+                axis=0,
+            )
+        ),
+        dtype=jnp.float64,
+    )
     r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
