@@ -6973,3 +6973,438 @@ python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
   --fd-lane ad \
   --reverse-derivative-mode objective_table
 ```
+
+#### J. Geometry AD correctness update: full nonlinear FD is not the right oracle for sensitive VMEC/Boozer/QI rows
+
+Follow-up diagnostics showed that the previous interpretation above was too
+strong. The mismatching rows in the full geometry objective table do not, by
+themselves, prove that the VMEC/Boozer/QI AD rule is wrong.
+
+The important distinction is:
+
+```text
+full nonlinear re-solve FD:
+    solve VMEC again at p + h and p - h
+    then difference objectives
+
+local implicit AD / frozen-linearized FD:
+    solve baseline VMEC once
+    freeze the converged fixed point and implicit linearization
+    compute dz/dp from (dF/dz) dz + (dF/dp) dp = 0
+    evaluate objectives at state +/- h * dz, p +/- h * dp
+```
+
+The implicit AD lane differentiates the local fixed-point equation, not the
+entire nonlinear solver iteration history. For sensitive interior quantities,
+the full nonlinear re-solve FD can measure solver-path / branch / convergence
+noise instead of the local fixed-point derivative.
+
+New diagnostic scripts added:
+
+```text
+examples/benchmarks/compare_vmec_implicit_pullback_rhs.py
+examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py
+```
+
+These are diagnostic-only scripts. They do not modify `vmec_jax`, the normal
+NEOPAX geometry path, or the transport AD lanes.
+
+##### VMEC-only mean-iota check
+
+The failing full FD reference for `mean_iota / RBC:1:0` was:
+
+```text
+full nonlinear FD reference = -2.5514981795273567e-01
+```
+
+The frozen-linearized diagnostic was:
+
+```bash
+python ./examples/benchmarks/compare_vmec_implicit_pullback_rhs.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective mean_iota \
+  --reference-fd=-2.5514981795273567e-01 \
+  --multigrid \
+  --mode cli \
+  --frozen-linearized-fd-only
+```
+
+Observed:
+
+```text
+baseline value          = -5.9365259966101458e-01
+frozen_linearized_fd    =  2.4329673477811442e-01
+forward_jvp             =  2.4329673583246753e-01
+rel_err_linfd_vs_jvp    =  4.333610e-09
+rel_err_vs_full_FD      =  1.953545e+00
+```
+
+Conclusion:
+
+```text
+The VMEC objective JVP and the frozen-linearized finite difference agree.
+The disagreement is between local implicit sensitivity and full nonlinear
+re-solve FD, not between objective postprocessing and the implicit tangent.
+```
+
+##### Boozer-QI check
+
+The failing full FD reference for `boozer_qi_objective / RBC:1:0` was:
+
+```text
+full nonlinear FD reference = 5.909044e-01
+```
+
+The frozen-linearized diagnostic was:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --reference-fd=5.909044e-01 \
+  --multigrid
+```
+
+Observed:
+
+```text
+baseline value          = 9.1572857090824709e-03
+frozen_linearized_fd    = 6.9347388178851192e-03
+forward_jvp             = 6.9347871114079501e-03
+rel_err_linfd_vs_jvp    = 6.963952e-06
+rel_err_vs_full_FD      = 9.882642e-01
+```
+
+Conclusion:
+
+```text
+Boozer/QI objective postprocessing is also consistent along the local implicit
+tangent. The large discrepancy is again with full nonlinear re-solve FD.
+```
+
+##### Which lane should be used
+
+For geometry AD correctness:
+
+```text
+Use the implicit AD lane / local fixed-point derivative as the intended
+geometry derivative.
+
+Use frozen-linearized FD and residual-consistency diagnostics as the
+correctness oracle for sensitive interior VMEC, Boozer, and QI objectives.
+
+Do not use full nonlinear re-solve FD as the sole correctness oracle for:
+    vmec_iota_mean
+    vmec_magnetic_well
+    vmec_mirror_ratio
+    boozer_iota_b_mean
+    boozer_b10_over_b00_mean
+    boozer_qi_objective
+```
+
+Full nonlinear re-solve FD remains useful for stable/global sanity checks:
+
+```text
+vmec_aspect_ratio
+vmec_volume_total
+vmec_beta_volume
+boozer_bvco_b_mean
+```
+
+For the future realtime-geometry transport coupling:
+
+```text
+Use the VMEC/Boozer implicit AD-compatible lane.
+The derivative target is the local equilibrium fixed-point map:
+
+    geometry parameters
+    -> VMEC fixed point
+    -> Boozer / NTX geometry support
+    -> transport objectives
+
+Full re-solve FD can be reported as a stress test, but not as the primary
+pass/fail criterion for sensitive geometry objectives.
+```
+
+##### What remains open
+
+The correctness issue is largely settled for the rule we were using:
+
+```text
+local implicit AD == frozen-linearized FD
+```
+
+The remaining issue is efficiency, not correctness:
+
+```text
+The profile-style geometry reverse table still needs an efficient multi-RHS
+geometry pullback so that multiple objective cotangents are propagated without
+rebuilding or materializing the expensive VMEC/Boozer/QI graph per objective.
+```
+
+Keep the previous multi-RHS implementation plan, but reinterpret the benchmark
+target:
+
+```text
+Match frozen-linearized / local implicit derivative diagnostics for sensitive
+geometry objectives.
+
+Use full nonlinear FD only as a supplemental diagnostic and expect it to be
+unstable for iota/well/mirror/QI rows.
+```
+
+#### K. Plan: couple realtime geometry parameters into transport reverse objectives
+
+Goal:
+
+```text
+When the transport TOML uses realtime VMEC/Boozer geometry, reverse AD should
+return gradients of the same transport objectives with respect to:
+
+    profile parameters:
+        n0
+        T0
+        density_shape_power
+        temperature_shape_power
+
+    geometry parameters:
+        VMEC boundary harmonics such as RBC:1:0, ZBS:1:0, ...
+```
+
+The derivative target is:
+
+```text
+(profile params, geometry params)
+    -> VMEC implicit fixed point
+    -> Boozer / NTX support built from that fixed point
+    -> initial transport state and runtime
+    -> accepted-step transport solve
+    -> transport objective vector
+```
+
+Correctness reference:
+
+```text
+For geometry parameters, compare against local implicit / frozen-linearized
+diagnostics, not full nonlinear VMEC re-solve FD for sensitive geometry rows.
+
+For the final transport objectives, the primary internal consistency check is
+that profile-only gradients remain unchanged when no geometry parameters are
+active, and geometry-gradient directional checks use the realtime implicit
+geometry lane.
+```
+
+Current foothold in the code:
+
+```text
+examples/benchmarks/benchmark_transport_reverse_ad_only.py already has a
+single-geometry-parameter realtime mode:
+
+    --reverse-geometry-parameter RBC:1:0
+
+Key helpers:
+
+    _parse_reverse_geometry_parameter(...)
+    _geometry_context_from_config(...)
+    _reverse_geometry_parameter_order(...)
+    _reverse_geometry_objective_vector_for_parameter_vector(...)
+    _run_realtime_geometry_reverse_mode(...)
+
+The current implementation appends one geometry scalar to the four profile
+parameters:
+
+    [n0, T0, density_shape_power, temperature_shape_power, geometry_delta]
+
+and rebuilds:
+
+    build_runtime_context_for_geometry_param(config, geometry_context, geometry_delta, ...)
+
+inside the differentiated objective.
+```
+
+##### Phase 1: stabilize and document the existing single-geometry-parameter path
+
+Use the existing mode as the first integration target. The initial command
+should be a small accepted-step count:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode compact_vjp \
+  --ntx-exact-derivative-pullback-algebra scalar_contract_lowdot_ntx \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --reverse-geometry-parameter RBC:1:0
+```
+
+Expected output shape:
+
+```text
+parameters=[
+  n0,
+  T0,
+  density_shape_power,
+  temperature_shape_power,
+  vmec:RBC:1:0
+]
+```
+
+Acceptance criteria:
+
+```text
+1. The profile gradients still print and remain comparable to the
+   profile-only realtime/frozen baseline when geometry_delta = 0.
+2. The geometry gradient column is finite for all transport objectives.
+3. The primal objective values match the realtime-geometry forward transport
+   run at the same accepted-step limit.
+4. The run uses the VMEC/Boozer AD-compatible realtime lane and does not fall
+   back to frozen WOUT files.
+```
+
+##### Phase 2: support multiple geometry harmonics in one run
+
+Generalize the current single-parameter interface:
+
+```text
+old:
+    --reverse-geometry-parameter RBC:1:0
+
+new:
+    --reverse-geometry-parameters RBC:1:0,ZBS:1:0,RBC:2:0,ZBS:2:0
+```
+
+Implementation outline:
+
+```text
+1. Add a parser returning tuple[(family, m, n)].
+2. Add a multi-parameter geometry context or a vectorized wrapper around the
+   existing context construction.
+3. Replace the scalar geometry_delta with geometry_deltas:
+
+       parameter_values =
+           [profile_0, profile_1, profile_2, profile_3,
+            geo_delta_0, geo_delta_1, ...]
+
+4. Build the VMEC input/ImplicitParams by applying all geometry deltas before
+   the VMEC solve.
+5. Return parameter names:
+
+       vmec:RBC:1:0
+       vmec:ZBS:1:0
+       ...
+```
+
+Important: do not build one VMEC/Boozer/NTX runtime per geometry parameter.
+For one transport objective evaluation, all geometry deltas must be applied
+to the same VMEC parameter object and only one realtime geometry/runtime should
+be built.
+
+##### Phase 3: make runtime construction reusable for parameter vectors
+
+The current helper is scalar:
+
+```text
+build_runtime_context_for_geometry_param(context, param_delta)
+```
+
+Add a vector version without changing the scalar helper:
+
+```text
+build_runtime_context_for_geometry_param_vector(
+    config,
+    context,
+    param_specs,
+    param_deltas,
+    ...
+)
+```
+
+Responsibilities:
+
+```text
+1. Solve VMEC once for all geometry deltas.
+2. Build NEOPAX geometry once from the VMEC state.
+3. Build Boozer/NTX support once from that VMEC/Boozer state.
+4. Build the runtime/state pair used by transport.
+```
+
+The scalar helper can become a thin wrapper around the vector helper with one
+parameter, but only after the vector helper is validated.
+
+##### Phase 4: keep profile-only reverse baseline intact
+
+Do not modify the existing profile-only static reverse path while bringing up
+realtime geometry gradients.
+
+Keep these lanes separate:
+
+```text
+profile-only frozen/static geometry reverse:
+    current optimized custom-VJP/reduced-cotangent profile lane
+
+realtime geometry reverse:
+    correctness-first path through VMEC/Boozer/NTX realtime geometry
+```
+
+The realtime geometry path may be slower initially. It should not poison:
+
+```text
+benchmark_transport_reverse_ad_only.py without --reverse-geometry-parameter(s)
+normal frozen-geometry forward solver TOMLs
+profile-only forward/reverse AD benchmarks
+```
+
+##### Phase 5: verification ladder
+
+Run in this order:
+
+```text
+1. VMEC/Boozer geometry local diagnostics
+   - already settled for mean_iota and boozer_qi_objective via
+     frozen-linearized FD.
+
+2. Realtime geometry primal transport check
+   - frozen and realtime WOUT/object comparison should be close when using the
+     same input/resolution.
+   - transport objective primal values should be reproducible.
+
+3. One transport accepted step, one geometry parameter
+   - objective all
+   - accepted-step-limit 1 or 2
+   - check finite geometry column.
+
+4. More accepted steps, one geometry parameter
+   - accepted-step-limit 16 after the small case is stable.
+
+5. Multiple geometry parameters
+   - RBC:1:0,ZBS:1:0 first.
+   - then add RBC:2:0,ZBS:2:0.
+
+6. Combine profile and geometry gradient table
+   - output should resemble profile reverse table, but with extra VMEC columns.
+```
+
+##### Phase 6: efficiency work after correctness
+
+Only after the correctness ladder passes:
+
+```text
+1. Avoid rebuilding static VMEC/Boozer/NTX structures unnecessarily across
+   objective cotangents.
+2. Reuse one VMEC/Boozer/NTX build per primal evaluation.
+3. Introduce the multi-RHS geometry pullback for the objective table.
+4. Consider a VMEC implicit multi-RHS adjoint helper if geometry objective
+   tables or transport objective cotangent batches become memory/time limited.
+```
+
+Do not optimize memory by changing the mathematical lane before the small
+correctness tests pass.
