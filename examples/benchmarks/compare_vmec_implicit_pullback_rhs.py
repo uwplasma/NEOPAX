@@ -279,6 +279,41 @@ def _manual_residual_consistency_check(
     return rows
 
 
+def _manual_frozen_linearized_fd(
+    *,
+    objective_name: str,
+    params: im.ImplicitParams,
+    param_tangent: im.ImplicitParams,
+    cfg: im.ImplicitConfig,
+    x_star: im.SpectralState,
+    dof_mask: im.SpectralState,
+    formulation: str,
+    step: float,
+):
+    _dz, state_tangent = _manual_implicit_forward_state_tangent(
+        params=params,
+        param_tangent=param_tangent,
+        cfg=cfg,
+        x_star=x_star,
+        dof_mask=dof_mask,
+        formulation=formulation,
+    )
+    step_arr = jnp.asarray(step, dtype=jnp.float64)
+    p_minus = jax.tree.map(lambda p, t: p - step_arr * t, params, param_tangent)
+    p_plus = jax.tree.map(lambda p, t: p + step_arr * t, params, param_tangent)
+    state_minus = jax.tree.map(lambda x, t: x - step_arr * t, x_star, state_tangent)
+    state_plus = jax.tree.map(lambda x, t: x + step_arr * t, x_star, state_tangent)
+    minus = _objective_value(objective_name, state_minus, p_minus, cfg)
+    plus = _objective_value(objective_name, state_plus, p_plus, cfg)
+    fd = (plus - minus) / (2.0 * step_arr)
+    _value, jvp = jax.jvp(
+        lambda state, prm: _objective_value(objective_name, state, prm, cfg),
+        (x_star, params),
+        (state_tangent, param_tangent),
+    )
+    return minus, plus, fd, jvp
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -309,6 +344,17 @@ def main() -> None:
         "--residual-check-steps",
         default="1e-5,1e-6",
         help="Comma-separated h values for --residual-check-only.",
+    )
+    parser.add_argument(
+        "--frozen-linearized-fd-only",
+        action="store_true",
+        help="Evaluate centered FD along the frozen implicit tangent path, without perturbed VMEC solves.",
+    )
+    parser.add_argument(
+        "--frozen-linearized-fd-step",
+        type=float,
+        default=None,
+        help="Step used for --frozen-linearized-fd-only; defaults to the normal FD step.",
     )
     parser.add_argument("--ns", type=int, default=None)
     parser.add_argument("--ftol", type=float, default=None)
@@ -448,6 +494,41 @@ def main() -> None:
                 )
         print(
             f"[vmec-pullback-rhs] residual_check_elapsed_s={time.perf_counter() - t_res:.3f}",
+            flush=True,
+        )
+        print(f"[vmec-pullback-rhs] total_elapsed_s={time.perf_counter() - t0:.3f}", flush=True)
+        return
+
+    if args.frozen_linearized_fd_only:
+        print("[vmec-pullback-rhs] progress: frozen linearized FD along implicit tangent", flush=True)
+        tangent = _param_unit_tangent_like(params0, family, row, col)
+        step = h if args.frozen_linearized_fd_step is None else float(args.frozen_linearized_fd_step)
+        t_lin = time.perf_counter()
+        minus, plus, lin_fd, jvp = _manual_frozen_linearized_fd(
+            objective_name=args.objective,
+            params=params0,
+            param_tangent=tangent,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            formulation=args.formulation,
+            step=step,
+        )
+        minus_f = float(jax.device_get(minus))
+        plus_f = float(jax.device_get(plus))
+        lin_fd_f = float(jax.device_get(lin_fd))
+        jvp_f = float(jax.device_get(jvp))
+        print(
+            f"[vmec-pullback-rhs] frozen_linearized_fd_step={step:.6e} "
+            f"minus={minus_f:.16e} plus={plus_f:.16e}",
+            flush=True,
+        )
+        print(
+            f"[vmec-pullback-rhs] frozen_linearized_fd={lin_fd_f:.16e} "
+            f"forward_jvp={jvp_f:.16e} "
+            f"rel_err_linfd_vs_jvp={_relative_error(lin_fd_f, jvp_f):.6e} "
+            f"rel_err_linfd_vs_reference_fd={_relative_error(lin_fd_f, fd):.6e} "
+            f"elapsed_s={time.perf_counter() - t_lin:.3f}",
             flush=True,
         )
         print(f"[vmec-pullback-rhs] total_elapsed_s={time.perf_counter() - t0:.3f}", flush=True)
