@@ -248,7 +248,10 @@ def _build_state(config: dict, geometry, species: Species):
         return None
     profile_cfg = dict(config.get("profiles", {}))
     if profile_cfg.get("charge_qp") is None:
-        profile_cfg["charge_qp"] = tuple(float(v) for v in jnp.asarray(species.charge_qp))
+        species_cfg = config.get("species", {})
+        profile_cfg["charge_qp"] = tuple(
+            float(v) for v in species_cfg.get("charge_qp", [-1.0, 1.0, 1.0])
+        )
     profile_set = build_profiles(profile_cfg, geometry, species.number_species)
     density_state = profile_set.density / 1.0e20
     temperature_state = profile_set.temperature / 1.0e3

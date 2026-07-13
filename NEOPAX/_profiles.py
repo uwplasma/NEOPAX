@@ -69,11 +69,12 @@ class AnalyticalProfileModel(ProfileModel):
         charge_qp = None
         electron_index = -1
         if self.charge_qp is not None:
-            charge_qp = jnp.asarray(self.charge_qp, dtype=float)
+            charge_qp_values = tuple(float(value) for value in self.charge_qp)
+            charge_qp = jnp.asarray(charge_qp_values, dtype=float)
             if charge_qp.shape[0] >= n_species:
                 charge_qp = charge_qp[:n_species]
-                eidx = int(jnp.argmin(charge_qp))
-                if float(charge_qp[eidx]) < 0.0:
+                eidx = min(range(n_species), key=lambda idx: charge_qp_values[idx])
+                if charge_qp_values[eidx] < 0.0:
                     electron_index = eidx
 
         def _expand_species_values(raw, default, include_electron):
