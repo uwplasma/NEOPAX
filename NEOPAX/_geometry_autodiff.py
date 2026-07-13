@@ -119,8 +119,15 @@ def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inp
     if context.booz_constants is not None and context.booz_grids is not None:
         return context.booz_constants, context.booz_grids
     booz_api = _import_booz_xform_jax_api()
+    nfp_static = int(context.static.resolution.nfp)
+    if dataclasses.is_dataclass(inputs):
+        inputs_for_constants = dataclasses.replace(inputs, nfp=nfp_static)
+    elif hasattr(inputs, "_replace"):
+        inputs_for_constants = inputs._replace(nfp=nfp_static)
+    else:
+        inputs_for_constants = SimpleNamespace(**vars(inputs), nfp=nfp_static)
     return booz_api.prepare_booz_xform_constants_from_inputs(
-        inputs=inputs,
+        inputs=inputs_for_constants,
         mboz=int(context.mboz),
         nboz=int(context.nboz),
         asym=bool(context.cfg.lasym),
