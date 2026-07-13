@@ -3535,19 +3535,17 @@ def build_ntx_exact_lij_support_from_vmec_state(
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
-    r00_support_rho = jnp.asarray(
-        np.unique(
-            np.concatenate(
-                [
-                    rho_center_np,
-                    rho_face_np,
-                ],
-                axis=0,
-            )
-        ),
-        dtype=jnp.float64,
+    r00_support_rho_np = np.unique(
+        np.concatenate(
+            [
+                rho_center_np,
+                rho_face_np,
+            ],
+            axis=0,
+        )
     )
-    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
+    r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
+    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
