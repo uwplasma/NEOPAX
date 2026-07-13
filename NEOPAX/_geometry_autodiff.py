@@ -2862,7 +2862,9 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
         surface_indices, _ = surface_indices_from_static(static, list(s_values))
         return jnp.asarray(surface_indices, dtype=jnp.int32)
     except Exception:
-        s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
+        ns = int(jnp.asarray(static.s).shape[0])
+        s_full = np.linspace(0.0, 1.0, ns, dtype=float)
+        s_half = 0.5 * (s_full[:-1] + s_full[1:])
         surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
         return jnp.asarray(surface_indices, dtype=jnp.int32)
 
@@ -3013,7 +3015,7 @@ def _build_neopax_geometry_from_state(
     volume_p = jnp.abs(jnp.asarray(norms.volume)) * (4.0 * jnp.pi**2)
     vp = jnp.abs(jnp.asarray(norms.vp))
     s_full = jnp.asarray(context.static.s)
-    s_full_np = np.asarray(context.static.s, dtype=float)
+    s_full_np = np.linspace(0.0, 1.0, int(s_full.shape[0]), dtype=float)
     rho_half_np = np.concatenate(
         [
             np.zeros((1,), dtype=float),
