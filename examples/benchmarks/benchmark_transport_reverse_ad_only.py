@@ -1038,6 +1038,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
     profile_cfg: dict,
     geometry_parameter_name: str,
     accepted_step_limit_override: int | None = None,
+    reverse_segment_length: int | None = None,
     solver_override=None,
 ):
     del geometry_parameter_name
@@ -1090,13 +1091,14 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
-    rollout = _radau_adaptive_final_state_rollout(
+    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
         execution_context,
+        max_total_steps,
+        stop_after_accepted_steps,
+        reverse_segment_length,
         prepared_rollout.initial_carry,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
     )
-    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
     return _objective_vector(final_state, runtime)
 
 
@@ -1173,6 +1175,7 @@ def _run_realtime_geometry_reverse_mode(
         profile_cfg=profile_cfg,
         geometry_parameter_name=geometry_parameter,
         accepted_step_limit_override=args.accepted_step_limit,
+        reverse_segment_length=args.reverse_segment_length,
         solver_override=static_solver,
     )
     objective_fn = (
