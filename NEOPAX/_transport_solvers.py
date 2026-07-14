@@ -10997,6 +10997,113 @@ _radau_adaptive_final_y_realized_schedule_vjp.defvjp(
 )
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
+def _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    """Realized-schedule VJP that also exposes execution-context cotangents.
+
+    The profile-only reverse path keeps the execution context static. Realtime
+    geometry puts differentiable VMEC/NTX data inside that context, so this
+    sibling keeps the same frozen-schedule replay but lets cotangents flow back
+    into geometry-dependent flux/support fields.
+    """
+
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return rollout.final_carry.y
+
+
+def _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp_fwd(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    return rollout.final_carry.y, (
+        execution_context,
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+
+
+def _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp_bwd(
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
+    residuals,
+    final_y_bar,
+):
+    del max_total_steps, stop_after_accepted_steps, reverse_segment_length
+    (
+        execution_context,
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    ) = residuals
+
+    def _replay(context_value, carry_value):
+        replay = _radau_replay_realized_attempt_rollout(
+            context_value,
+            carry_value,
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        )
+        return replay.final_carry.y
+
+    _, pullback = jax.vjp(_replay, execution_context, carry0)
+    execution_context_bar, carry0_bar = pullback(final_y_bar)
+    return execution_context_bar, carry0_bar
+
+
+_radau_adaptive_final_y_realized_schedule_dynamic_context_vjp.defvjp(
+    _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp_fwd,
+    _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp_bwd,
+)
+
+
 def _radau_debug_realized_attempt_replay(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,

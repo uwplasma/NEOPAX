@@ -42,6 +42,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _make_solver_state_transform,
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
+    _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp_bwd,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
@@ -1091,7 +1092,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
-    final_y = _radau_adaptive_final_y_realized_schedule_vjp(
+    final_y = _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp(
         execution_context,
         max_total_steps,
         stop_after_accepted_steps,
