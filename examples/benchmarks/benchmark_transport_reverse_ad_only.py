@@ -42,10 +42,10 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _make_solver_state_transform,
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
-    _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp_bwd,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
+    _radau_replay_realized_attempt_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
@@ -1031,7 +1031,7 @@ def _baseline_rollout_for_diagnostics(
     )
 
 
-def _reverse_geometry_objective_vector_for_parameter_vector(
+def _reverse_geometry_rollout_parts_for_parameter_vector(
     parameter_values,
     *,
     config: dict[str, Any],
@@ -1043,6 +1043,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
     solver_override=None,
 ):
     del geometry_parameter_name
+    del reverse_segment_length
     profile_values = parameter_values[: len(PARAMETER_ORDER)]
     geometry_delta = parameter_values[len(PARAMETER_ORDER)]
     geom_cfg = config.get("geometry", {})
@@ -1092,15 +1093,143 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
         )
-    final_y = _radau_adaptive_final_y_realized_schedule_dynamic_context_vjp(
-        execution_context,
-        max_total_steps,
-        stop_after_accepted_steps,
-        reverse_segment_length,
-        prepared_rollout.initial_carry,
+    return runtime, prepared_rollout, execution_context, stop_after_accepted_steps, max_total_steps
+
+
+def _reverse_geometry_objective_vector_for_parameter_vector(
+    parameter_values,
+    *,
+    config: dict[str, Any],
+    geometry_context,
+    profile_cfg: dict,
+    geometry_parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+    reverse_segment_length: int | None = None,
+    solver_override=None,
+):
+    del reverse_segment_length
+    runtime, prepared_rollout, execution_context, stop_after_accepted_steps, max_total_steps = (
+        _reverse_geometry_rollout_parts_for_parameter_vector(
+            parameter_values,
+            config=config,
+            geometry_context=geometry_context,
+            profile_cfg=profile_cfg,
+            geometry_parameter_name=geometry_parameter_name,
+            accepted_step_limit_override=accepted_step_limit_override,
+            solver_override=solver_override,
+        )
     )
-    final_state = prepared_rollout.physics_context.unpack_flat(final_y)
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        prepared_rollout.initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return _objective_vector(final_state, runtime)
+
+
+def _make_reverse_geometry_objective_vector_with_schedule_vjp(
+    *,
+    config: dict[str, Any],
+    geometry_context,
+    profile_cfg: dict,
+    geometry_parameter_name: str,
+    accepted_step_limit_override: int | None = None,
+    solver_override=None,
+):
+    @jax.custom_vjp
+    def _objective(parameter_values):
+        return _reverse_geometry_objective_vector_for_parameter_vector(
+            parameter_values,
+            config=config,
+            geometry_context=geometry_context,
+            profile_cfg=profile_cfg,
+            geometry_parameter_name=geometry_parameter_name,
+            accepted_step_limit_override=accepted_step_limit_override,
+            solver_override=solver_override,
+        )
+
+    def _fwd(parameter_values):
+        runtime, prepared_rollout, execution_context, stop_after_accepted_steps, max_total_steps = (
+            _reverse_geometry_rollout_parts_for_parameter_vector(
+                parameter_values,
+                config=config,
+                geometry_context=geometry_context,
+                profile_cfg=profile_cfg,
+                geometry_parameter_name=geometry_parameter_name,
+                accepted_step_limit_override=accepted_step_limit_override,
+                solver_override=solver_override,
+            )
+        )
+        rollout = _radau_adaptive_schedule_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+        value = _objective_vector(final_state, runtime)
+        trace = rollout.trace
+        residuals = (
+            parameter_values,
+            jax.lax.stop_gradient(trace.active_mask),
+            jax.lax.stop_gradient(trace.accepted_mask),
+            jax.lax.stop_gradient(trace.attempted_dts),
+            jax.lax.stop_gradient(trace.next_dts),
+            jax.lax.stop_gradient(trace.next_recent_reject_count),
+            jax.lax.stop_gradient(trace.next_regrowth_cooldown),
+            jax.lax.stop_gradient(trace.next_easy_growth_streak),
+            jax.lax.stop_gradient(trace.next_lagged_response_valid),
+        )
+        return value, residuals
+
+    def _bwd(residuals, objective_bar):
+        (
+            parameter_values,
+            active_mask,
+            accepted_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ) = residuals
+
+        def _replay_objective(parameter_values_replay):
+            runtime, prepared_rollout, execution_context, _stop_after_accepted_steps, _max_total_steps = (
+                _reverse_geometry_rollout_parts_for_parameter_vector(
+                    parameter_values_replay,
+                    config=config,
+                    geometry_context=geometry_context,
+                    profile_cfg=profile_cfg,
+                    geometry_parameter_name=geometry_parameter_name,
+                    accepted_step_limit_override=accepted_step_limit_override,
+                    solver_override=solver_override,
+                )
+            )
+            replay = _radau_replay_realized_attempt_rollout(
+                execution_context,
+                prepared_rollout.initial_carry,
+                active_mask,
+                accepted_mask,
+                attempted_dts,
+                next_dts,
+                next_recent_reject_count,
+                next_regrowth_cooldown,
+                next_easy_growth_streak,
+                next_lagged_response_valid,
+            )
+            final_state = prepared_rollout.physics_context.unpack_flat(replay.final_carry.y)
+            return _objective_vector(final_state, runtime)
+
+        _, pullback = jax.vjp(_replay_objective, parameter_values)
+        (parameter_bar,) = pullback(objective_bar)
+        return (parameter_bar,)
+
+    _objective.defvjp(_fwd, _bwd)
+    return _objective
 
 
 def _run_realtime_geometry_reverse_mode(
@@ -1169,14 +1298,12 @@ def _run_realtime_geometry_reverse_mode(
     )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
 
-    objective_vector_fn = lambda p: _reverse_geometry_objective_vector_for_parameter_vector(  # noqa: E731
-        p,
+    objective_vector_fn = _make_reverse_geometry_objective_vector_with_schedule_vjp(
         config=config,
         geometry_context=geometry_context,
         profile_cfg=profile_cfg,
         geometry_parameter_name=geometry_parameter,
         accepted_step_limit_override=args.accepted_step_limit,
-        reverse_segment_length=args.reverse_segment_length,
         solver_override=static_solver,
     )
     objective_fn = (
