@@ -45,7 +45,6 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_final_y_realized_schedule_vjp,
     _radau_adaptive_final_y_realized_schedule_vjp_bwd,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
-    _radau_replay_realized_attempt_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
@@ -1187,45 +1186,49 @@ def _make_reverse_geometry_objective_vector_with_schedule_vjp(
     def _bwd(residuals, objective_bar):
         (
             parameter_values,
-            active_mask,
-            accepted_mask,
-            attempted_dts,
-            next_dts,
-            next_recent_reject_count,
-            next_regrowth_cooldown,
-            next_easy_growth_streak,
-            next_lagged_response_valid,
+            _active_mask,
+            _accepted_mask,
+            _attempted_dts,
+            _next_dts,
+            _next_recent_reject_count,
+            _next_regrowth_cooldown,
+            _next_easy_growth_streak,
+            _next_lagged_response_valid,
         ) = residuals
 
-        def _replay_objective(parameter_values_replay):
-            runtime, prepared_rollout, execution_context, _stop_after_accepted_steps, _max_total_steps = (
-                _reverse_geometry_rollout_parts_for_parameter_vector(
-                    parameter_values_replay,
-                    config=config,
-                    geometry_context=geometry_context,
-                    profile_cfg=profile_cfg,
-                    geometry_parameter_name=geometry_parameter_name,
-                    accepted_step_limit_override=accepted_step_limit_override,
-                    solver_override=solver_override,
-                )
+        def _primal_objective(parameter_values_replay):
+            return _reverse_geometry_objective_vector_for_parameter_vector(
+                parameter_values_replay,
+                config=config,
+                geometry_context=geometry_context,
+                profile_cfg=profile_cfg,
+                geometry_parameter_name=geometry_parameter_name,
+                accepted_step_limit_override=accepted_step_limit_override,
+                solver_override=solver_override,
             )
-            replay = _radau_replay_realized_attempt_rollout(
-                execution_context,
-                prepared_rollout.initial_carry,
-                active_mask,
-                accepted_mask,
-                attempted_dts,
-                next_dts,
-                next_recent_reject_count,
-                next_regrowth_cooldown,
-                next_easy_growth_streak,
-                next_lagged_response_valid,
-            )
-            final_state = prepared_rollout.physics_context.unpack_flat(replay.final_carry.y)
-            return _objective_vector(final_state, runtime)
 
-        _, pullback = jax.vjp(_replay_objective, parameter_values)
-        (parameter_bar,) = pullback(objective_bar)
+        # Realtime geometry makes the RHS/NTX support part of the differentiated
+        # payload. The profile reverse primitive keeps physics_context static, so
+        # do not route this opt-in branch through that replay VJP.  For now the
+        # realtime-geometry VJP contracts objective cotangents with JVP columns;
+        # the frozen/profile branch below remains the true reduced reverse path.
+        parameter_count = int(jnp.asarray(parameter_values).shape[0])
+        parameter_basis = jnp.eye(parameter_count, dtype=jnp.asarray(parameter_values).dtype)
+
+        def _jvp_column(parameter_tangent):
+            _, objective_tangent = jax.jvp(
+                _primal_objective,
+                (parameter_values,),
+                (parameter_tangent,),
+            )
+            return objective_tangent
+
+        objective_tangent_columns = jax.vmap(_jvp_column)(parameter_basis)
+        parameter_bar = jnp.tensordot(
+            jnp.asarray(objective_bar, dtype=objective_tangent_columns.dtype),
+            objective_tangent_columns,
+            axes=((-1,), (1,)),
+        )
         return (parameter_bar,)
 
     _objective.defvjp(_fwd, _bwd)
@@ -1419,6 +1422,7 @@ def _run_realtime_geometry_reverse_mode(
         "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_geometry_parameter": str(args.reverse_geometry_parameter),
+        "realtime_geometry_gradient_path": "jvp_cotangent_contract",
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
         "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
@@ -1438,6 +1442,7 @@ def _run_realtime_geometry_reverse_mode(
         f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
         f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
         f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
+        "realtime_geometry_gradient_path=jvp_cotangent_contract "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )

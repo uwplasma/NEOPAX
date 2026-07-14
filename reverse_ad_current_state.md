@@ -2108,3 +2108,41 @@ Expected interpretation:
   raw-attempt exact tangent propagation, not to the primal rollout.
 - Do not change reverse AD for this; reverse already matched FD much better for
   this 16-step profile case.
+
+## 2026-07-14: Realtime Geometry Reverse Coupling Boundary
+
+Current separation rule:
+
+- Frozen-geometry/profile reverse benchmarks must keep using the existing
+  reduced reverse accepted-step path.
+- Realtime VMEC geometry transport benchmarks must not pass traced geometry
+  through the profile path's static `physics_context` custom-VJP argument.
+
+Reason:
+
+- The profile reverse primitive treats the Radau `physics_context` as
+  nondifferentiable/static.
+- That is correct for frozen geometry, where NTX/geometry support is fixed.
+- It is not correct for realtime geometry, where VMEC-derived field tables and
+  NTX support depend on the differentiated VMEC boundary parameter.
+
+Implementation checkpoint:
+
+- `benchmark_transport_reverse_ad_only.py` now keeps
+  `--reverse-parameter-mode profiles` on the old profile reverse path.
+- `--reverse-parameter-mode profiles_plus_realtime_geometry` uses an isolated
+  realtime-geometry custom VJP whose backward contracts the objective cotangent
+  with JVP columns through the realtime geometry primal map.
+- The output JSON records
+  `realtime_geometry_gradient_path = "jvp_cotangent_contract"` for this opt-in
+  branch.
+
+Final optimized target:
+
+- Add a separate geometry-aware accepted-step/RHS transpose that has an explicit
+  differentiable geometry or NTX-support payload.
+- That final path should return both the transport carry cotangent and the
+  geometry/NTX-support cotangent, then pull the latter back through
+  `VMEC params -> VMEC state -> VMEC field tables -> NTX support`.
+- Do not retrofit this into the frozen/profile custom VJP; keep the profile
+  benchmark protected from realtime-geometry experiments.
