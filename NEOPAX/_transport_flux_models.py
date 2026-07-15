@@ -712,11 +712,14 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             None,
         )
         if callable(pullback_fn):
-            return pullback_fn(
-                state,
-                lagged_response_bar.neoclassical_response,
+            return _sanitize_float_delta_bar_tree(
                 support,
-                **kwargs,
+                pullback_fn(
+                    state,
+                    lagged_response_bar.neoclassical_response,
+                    support,
+                    **kwargs,
+                ),
             )
         support_delta0 = _float_delta_tree_like(support)
         _, support_delta_pullback = jax.vjp(
@@ -726,7 +729,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             support_delta0,
         )
         (support_bar,) = support_delta_pullback(lagged_response_bar.neoclassical_response)
-        return support_bar
+        return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         neo = (
@@ -864,12 +867,15 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             None,
         )
         if callable(pullback_fn):
-            return pullback_fn(
-                state,
-                lagged_response.neoclassical_response,
-                neo_flux_bar,
+            return _sanitize_float_delta_bar_tree(
                 support,
-                **kwargs,
+                pullback_fn(
+                    state,
+                    lagged_response.neoclassical_response,
+                    neo_flux_bar,
+                    support,
+                    **kwargs,
+                ),
             )
         support_delta0 = _float_delta_tree_like(support)
         _, support_delta_pullback = jax.vjp(
@@ -883,7 +889,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             support_delta0,
         )
         (support_bar,) = support_delta_pullback(neo_flux_bar)
-        return support_bar
+        return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         def _zero_state_bar():
@@ -1407,6 +1413,16 @@ def _add_float_delta_tree(primal_tree, delta_tree):
         return primal_leaf
 
     return jax.tree_util.tree_map(_add_leaf, primal_tree, delta_tree)
+
+
+def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
+    def _sanitize_leaf(primal_leaf, bar_leaf):
+        arr = jnp.asarray(primal_leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.asarray(bar_leaf, dtype=arr.dtype)
+        return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+    return jax.tree_util.tree_map(_sanitize_leaf, primal_tree, bar_tree)
 
 
 def build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_scan) -> NTXRuntimeScanChannels:
@@ -6101,7 +6117,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             support_delta0,
         )
         (support_bar,) = support_delta_pullback(lagged_response_bar)
-        return support_bar
+        return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
@@ -6485,7 +6501,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             support_delta0,
         )
         (support_bar,) = support_delta_pullback(flux_bar)
-        return support_bar
+        return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         del kwargs

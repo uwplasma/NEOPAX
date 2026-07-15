@@ -6003,6 +6003,16 @@ def _radau_zero_support_delta_tree_like(primal):
     return jax.tree_util.tree_map(_zero_leaf, primal)
 
 
+def _radau_sanitize_support_delta_bar_tree(primal, bar):
+    def _sanitize_leaf(primal_leaf, bar_leaf):
+        arr = jnp.asarray(primal_leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.asarray(bar_leaf, dtype=arr.dtype)
+        return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+    return jax.tree_util.tree_map(_sanitize_leaf, primal, bar)
+
+
 def _radau_sum_leading_axis_tree(tree):
     return jax.tree_util.tree_map(lambda value: jnp.sum(value, axis=0), tree)
 
@@ -6032,12 +6042,15 @@ def _radau_exact_stage_residual_support_pullback(
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
     staged_support_bars = jax.vmap(
-        lambda t_eval, y_eval, rhs_bar_eval: physics_context.flat_rhs_lagged_response_support_pullback(
-            t_eval,
-            y_eval,
-            lagged_response,
-            -rhs_bar_eval,
+        lambda t_eval, y_eval, rhs_bar_eval: _radau_sanitize_support_delta_bar_tree(
             support,
+            physics_context.flat_rhs_lagged_response_support_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                -rhs_bar_eval,
+                support,
+            ),
         ),
         in_axes=(0, 0, 0),
     )(stage_times, stage_states, residual_stages)
