@@ -1433,11 +1433,27 @@ def _support_with_channel_delta(support, center_delta, face_delta):
     )
 
 
+def _support_with_center_delta(support, center_channels_delta, center_prepared_delta):
+    return dataclasses.replace(
+        support,
+        center_channels=_add_float_delta_tree(support.center_channels, center_channels_delta),
+        center_prepared=_add_float_delta_tree(support.center_prepared, center_prepared_delta),
+    )
+
+
 def _support_bar_from_channel_bars(support, center_bar, face_bar):
     return dataclasses.replace(
         _float_delta_tree_like(support),
         center_channels=_sanitize_float_delta_bar_tree(support.center_channels, center_bar),
         face_channels=_sanitize_float_delta_bar_tree(support.face_channels, face_bar),
+    )
+
+
+def _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar):
+    return dataclasses.replace(
+        _float_delta_tree_like(support),
+        center_channels=_sanitize_float_delta_bar_tree(support.center_channels, center_channels_bar),
+        center_prepared=_sanitize_float_delta_bar_tree(support.center_prepared, center_prepared_bar),
     )
 
 
@@ -6125,15 +6141,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
-        support_delta0 = _float_delta_tree_like(support)
+        center_channels_delta0 = _float_delta_tree_like(support.center_channels)
+        center_prepared_delta0 = _float_delta_tree_like(support.center_prepared)
         _, support_delta_pullback = jax.vjp(
-            lambda support_delta: self.with_support_payload(
-                _add_float_delta_tree(support, support_delta)
+            lambda center_channels_delta, center_prepared_delta: self.with_support_payload(
+                _support_with_center_delta(
+                    support,
+                    center_channels_delta,
+                    center_prepared_delta,
+                )
             ).build_lagged_response(state),
-            support_delta0,
+            center_channels_delta0,
+            center_prepared_delta0,
         )
-        (support_bar,) = support_delta_pullback(lagged_response_bar)
-        return _sanitize_float_delta_bar_tree(support, support_bar)
+        center_channels_bar, center_prepared_bar = support_delta_pullback(lagged_response_bar)
+        return _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar)
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs

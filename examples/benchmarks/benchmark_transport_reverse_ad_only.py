@@ -1724,8 +1724,6 @@ def _run_realtime_geometry_support_segment_probe(
     objective_index = OBJECTIVE_LABELS.index(objective_name)
     profile_values = baseline_values[: len(PARAMETER_ORDER)]
     support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
-    if support_probe_cotangent_mode == "full":
-        support_probe_cotangent_mode = "zero_rebuild_pullback"
     reverse_setup = _prepare_reverse_static_setup(
         profile_values,
         config=config,
