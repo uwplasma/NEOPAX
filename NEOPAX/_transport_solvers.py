@@ -4455,7 +4455,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(
         return reduced_bar, None
 
     if not bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
-        return reduced_bar, _radau_zero_tangent_tree_like(support)
+        return reduced_bar, _radau_zero_support_delta_tree_like(support)
 
     primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
         kernel_context,
@@ -4477,7 +4477,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(
         physics_context.build_lagged_response,
     )
     if lagged_response is None:
-        return reduced_bar, _radau_zero_tangent_tree_like(support)
+        return reduced_bar, _radau_zero_support_delta_tree_like(support)
 
     trial_y_bar = next_reduced_bar.y
     if physics_context.project_flat is not None:
@@ -4913,13 +4913,13 @@ def _radau_segment_reduced_cotangent_bwd_with_support_call(
             )
 
         def _skip_bwd(_):
-            return slot_reduced_bar, _radau_zero_tangent_tree_like(support)
+            return slot_reduced_bar, _radau_zero_support_delta_tree_like(support)
 
         step_start_reduced_bar, step_support_bar = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
         support_bar = _radau_add_aligned_tangent_trees(support_bar, step_support_bar, support)
         return (step_start_reduced_bar, support_bar), None
 
-    zero_support_bar = _radau_zero_tangent_tree_like(support)
+    zero_support_bar = _radau_zero_support_delta_tree_like(support)
     (segment_start_reduced_bar, segment_support_bar), _ = jax.lax.scan(
         _slot_bwd,
         (segment_reduced_bar, zero_support_bar),
@@ -5993,8 +5993,14 @@ def _radau_add_aligned_tangent_trees(lhs, rhs, primal):
     return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
 
 
-def _radau_zero_tangent_tree_like(primal):
-    return jax.tree_util.tree_map(_radau_zero_tangent_like, primal)
+def _radau_zero_support_delta_tree_like(primal):
+    def _zero_leaf(leaf):
+        arr = jnp.asarray(leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+    return jax.tree_util.tree_map(_zero_leaf, primal)
 
 
 def _radau_sum_leading_axis_tree(tree):
@@ -6017,7 +6023,7 @@ def _radau_exact_stage_residual_support_pullback(
         or support is None
         or physics_context.flat_rhs_lagged_response_support_pullback is None
     ):
-        return _radau_zero_tangent_tree_like(support)
+        return _radau_zero_support_delta_tree_like(support)
 
     residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
         (kernel_context.num_stages, kernel_context.state_dim)
