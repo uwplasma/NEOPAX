@@ -50,9 +50,11 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
+    _radau_add_support_delta_trees,
     _radau_segment_reduced_cotangent_bwd_with_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_call,
     _radau_segment_reduced_cotangent_bwd_call,
+    _radau_zero_support_delta_tree_like,
 )
 
 
@@ -802,15 +804,6 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
     def _take_tree_axis0(tree, index: int):
         return jax.tree_util.tree_map(lambda value: value[index], tree)
 
-    def _add_trees(lhs, rhs, primal):
-        lhs = _radau_align_tangent_tree_to_primal(lhs, primal)
-        rhs = _radau_align_tangent_tree_to_primal(rhs, primal)
-        if lhs is None:
-            return rhs
-        if rhs is None:
-            return lhs
-        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
-
     def _carry_from_parameters(p):
         return _reverse_initial_carry_for_parameter_vector(
             p,
@@ -871,7 +864,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         ),
         lagged_reference_y=jnp.zeros_like(segmented_final_carry.lagged_reference_y),
     )
-    support_bar = _radau_align_tangent_tree_to_primal(None, support_payload)
+    support_bar = _radau_zero_support_delta_tree_like(support_payload)
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
@@ -887,7 +880,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
             segment_arrays,
             support_payload,
         )
-        support_bar = _add_trees(support_bar, segment_support_bar, support_payload)
+        support_bar = _radau_add_support_delta_trees(support_bar, segment_support_bar, support_payload)
 
     carry0_bar = dataclasses.replace(
         jax.tree_util.tree_map(_zero_tangent_like, carry0),
@@ -1730,6 +1723,9 @@ def _run_realtime_geometry_support_segment_probe(
     objective_name = "softmax_Er" if args.objective == "all" else str(args.objective)
     objective_index = OBJECTIVE_LABELS.index(objective_name)
     profile_values = baseline_values[: len(PARAMETER_ORDER)]
+    support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
+    if support_probe_cotangent_mode == "full":
+        support_probe_cotangent_mode = "zero_rebuild_pullback"
     reverse_setup = _prepare_reverse_static_setup(
         profile_values,
         config=config,
@@ -1741,7 +1737,7 @@ def _run_realtime_geometry_support_segment_probe(
         reverse_direct_stage_adjoint=True,
         reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
         reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
-        reverse_stage_cotangent_mode=args.reverse_stage_cotangent_mode,
+        reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
         reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
@@ -1783,6 +1779,8 @@ def _run_realtime_geometry_support_segment_probe(
         },
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
+        "reverse_stage_cotangent_mode_requested": str(args.reverse_stage_cotangent_mode),
+        "reverse_stage_cotangent_mode_effective": support_probe_cotangent_mode,
         "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
         "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
         "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
@@ -1797,6 +1795,7 @@ def _run_realtime_geometry_support_segment_probe(
         "parameter_mode=profiles_plus_realtime_geometry "
         "realtime_geometry_gradient_path=support_segment_probe "
         f"objective={objective_name} "
+        f"reverse_stage_cotangent_mode_effective={support_probe_cotangent_mode} "
         f"value={report['objective_value']:.16e} "
         f"support_bar_l2={support_bar_l2:.6e} "
         f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
