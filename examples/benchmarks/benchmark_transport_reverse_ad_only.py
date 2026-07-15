@@ -50,6 +50,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_carry_from_step_state,
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
+    _radau_segment_reduced_cotangent_bwd_with_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_call,
     _radau_segment_reduced_cotangent_bwd_call,
 )
@@ -761,6 +762,141 @@ def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
     carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
     gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
     return objective_values, gradient_matrix
+
+
+def _reverse_objective_support_payload_bar_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+    objective_index: int,
+    support_payload,
+):
+    """Return one objective value, profile gradients, and realtime support cotangent."""
+
+    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
+        raise ValueError("support payload reverse probe requires --reverse-segment-length.")
+    step_bwd_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower()
+    if step_bwd_mode not in {
+        "reduced_cotangent",
+        "reduced_cotangent_lean_replay",
+        "reduced_cotangent_recompute_replay",
+        "lean_replay",
+        "recompute_replay",
+        "reduced",
+        "state_only",
+        "final_state",
+    }:
+        raise ValueError("support payload reverse probe requires a reduced-cotangent reverse step bwd mode.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _add_trees(lhs, rhs, primal):
+        lhs = _radau_align_tangent_tree_to_primal(lhs, primal)
+        rhs = _radau_align_tangent_tree_to_primal(rhs, primal)
+        if lhs is None:
+            return rhs
+        if rhs is None:
+            return lhs
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+    def _carry_from_parameters(p):
+        return _reverse_initial_carry_for_parameter_vector(
+            p,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+    initial_carry, initial_carry_pullback = jax.vjp(_carry_from_parameters, parameter_values)
+    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)[objective_index]
+
+    objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
+    (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
+
+    (
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    ) = residuals
+    del (
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+        raise ValueError("support payload reverse probe requires segmented reverse residuals.")
+
+    reduced_bar = _RadauAcceptedStepReducedCotangent(
+        y=final_y_bar,
+        lagged_response_cache=_radau_align_tangent_tree_to_primal(
+            None,
+            segmented_final_carry.lagged_response_cache,
+        ),
+        lagged_reference_y=jnp.zeros_like(segmented_final_carry.lagged_reference_y),
+    )
+    support_bar = _radau_align_tangent_tree_to_primal(None, support_payload)
+    cotangent_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+    ).strip().lower()
+    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        reduced_bar, segment_support_bar = _radau_segment_reduced_cotangent_bwd_with_support_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bar,
+            segment_start_carry,
+            segment_arrays,
+            support_payload,
+        )
+        support_bar = _add_trees(support_bar, segment_support_bar, support_payload)
+
+    carry0_bar = dataclasses.replace(
+        jax.tree_util.tree_map(_zero_tangent_like, carry0),
+        y=reduced_bar.y,
+        lagged_response_cache=reduced_bar.lagged_response_cache,
+        lagged_reference_y=reduced_bar.lagged_reference_y,
+    )
+    (profile_parameter_bar,) = initial_carry_pullback(carry0_bar)
+    return objective_value, profile_parameter_bar, support_bar
 
 
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
@@ -1518,21 +1654,22 @@ def _run_realtime_geometry_support_pullback_probe(
         )
         support_bars[f"rhs_{component_name}"] = jax.block_until_ready(support_bar_value)
 
-    lagged_response_bar = jax.tree_util.tree_map(
-        lambda leaf: (
-            jnp.ones_like(leaf)
-            if hasattr(leaf, "shape") and jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-            else leaf
-        ),
-        lagged_response,
-    )
-    support_bars["build_lagged_response"] = jax.block_until_ready(
-        equation_system.pullback_build_lagged_response_support_payload(
-            baseline_profile_state,
-            lagged_response_bar,
-            support_payload,
+    if bool(args.support_pullback_probe_include_build):
+        lagged_response_bar = jax.tree_util.tree_map(
+            lambda leaf: (
+                jnp.ones_like(leaf)
+                if hasattr(leaf, "shape") and jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                else leaf
+            ),
+            lagged_response,
         )
-    )
+        support_bars["build_lagged_response"] = jax.block_until_ready(
+            equation_system.pullback_build_lagged_response_support_payload(
+                baseline_profile_state,
+                lagged_response_bar,
+                support_payload,
+            )
+        )
     support_summary = _payload_leaf_summary(support_payload)
     support_bar_summaries = {
         name: _payload_leaf_summary(support_bar)
@@ -1557,6 +1694,7 @@ def _run_realtime_geometry_support_pullback_probe(
         "support_payload_summary": support_summary,
         "support_bar_summary": support_bar_summaries,
         "support_bar_l2": support_bar_l2,
+        "support_pullback_probe_include_build": bool(args.support_pullback_probe_include_build),
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only "
@@ -1574,6 +1712,104 @@ def _run_realtime_geometry_support_pullback_probe(
             flush=True,
         )
     outpath = _report_path("realtime_geometry_support_pullback")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
+def _run_realtime_geometry_support_segment_probe(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    support_payload = _find_ntx_support_payload(baseline_runtime)
+    objective_name = "softmax_Er" if args.objective == "all" else str(args.objective)
+    objective_index = OBJECTIVE_LABELS.index(objective_name)
+    profile_values = baseline_values[: len(PARAMETER_ORDER)]
+    reverse_setup = _prepare_reverse_static_setup(
+        profile_values,
+        config=config,
+        runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        accepted_step_limit_override=args.accepted_step_limit,
+        reverse_segment_length=args.reverse_segment_length,
+        reverse_direct_stage_adjoint=True,
+        reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
+        reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
+        reverse_stage_cotangent_mode=args.reverse_stage_cotangent_mode,
+        reverse_step_bwd_mode=args.reverse_step_bwd_mode,
+        reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
+        reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
+        reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
+    )
+    print(
+        "[autodiff-gate] progress: probing realized-schedule reverse support payload cotangent "
+        f"for {objective_name}",
+        flush=True,
+    )
+    t_start = time.perf_counter()
+    objective_value, profile_bar, support_bar = _reverse_objective_support_payload_bar_for_parameter_vector(
+        profile_values,
+        runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        reverse_setup=reverse_setup,
+        objective_index=objective_index,
+        support_payload=support_payload,
+    )
+    objective_value, profile_bar, support_bar = jax.block_until_ready(
+        (objective_value, profile_bar, support_bar)
+    )
+    elapsed_s = time.perf_counter() - t_start
+    support_summary = _payload_leaf_summary(support_payload)
+    support_bar_summary = _payload_leaf_summary(support_bar)
+    support_bar_l2 = _tree_array_l2_norm(support_bar)
+    profile_bar_np = np.asarray(jax.device_get(profile_bar), dtype=float)
+    report = {
+        "mode": "transport_reverse_ad_only",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": objective_name,
+        "parameter_order": list(PARAMETER_ORDER),
+        "profile_baseline_values": np.asarray(jax.device_get(profile_values), dtype=float).tolist(),
+        "objective_value": float(np.asarray(jax.device_get(objective_value), dtype=float)),
+        "profile_gradient_reverse_ad": {
+            name: float(value) for name, value in zip(PARAMETER_ORDER, profile_bar_np.tolist())
+        },
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+        "realtime_geometry_gradient_path": "support_segment_probe",
+        "support_payload_summary": support_summary,
+        "support_bar_summary": support_bar_summary,
+        "support_bar_l2": support_bar_l2,
+        "elapsed_s": float(elapsed_s),
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only "
+        "parameter_mode=profiles_plus_realtime_geometry "
+        "realtime_geometry_gradient_path=support_segment_probe "
+        f"objective={objective_name} "
+        f"value={report['objective_value']:.16e} "
+        f"support_bar_l2={support_bar_l2:.6e} "
+        f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
+        f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']} "
+        f"elapsed_s={elapsed_s:.3f}",
+        flush=True,
+    )
+    print("[autodiff-gate] profile-gradient sidecar from same reverse pass:")
+    for parameter_name in PARAMETER_ORDER:
+        print(
+            f"  - {parameter_name}: ad={report['profile_gradient_reverse_ad'][parameter_name]:.6e}"
+        )
+    outpath = _report_path("realtime_geometry_support_segment")
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
@@ -1655,6 +1891,17 @@ def _run_realtime_geometry_reverse_mode(
         return
     if str(args.realtime_geometry_gradient_path) == "support_pullback_probe":
         _run_realtime_geometry_support_pullback_probe(
+            args=args,
+            config=config,
+            baseline_values=baseline_values,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
+    if str(args.realtime_geometry_gradient_path) == "support_segment_probe":
+        _run_realtime_geometry_support_segment_probe(
             args=args,
             config=config,
             baseline_values=baseline_values,
@@ -1902,7 +2149,7 @@ def main() -> None:
         "--realtime-geometry-gradient-path",
         type=str,
         default="reverse_payload",
-        choices=("reverse_payload", "payload_boundary_probe", "support_pullback_probe"),
+        choices=("reverse_payload", "payload_boundary_probe", "support_pullback_probe", "support_segment_probe"),
         help=(
             "Implementation used only with --reverse-parameter-mode "
             "profiles_plus_realtime_geometry. 'payload_boundary_probe' verifies "
@@ -1910,9 +2157,21 @@ def main() -> None:
             "claiming to compute the missing geometry reverse gradient. "
             "'support_pullback_probe' checks the local lagged-RHS support "
             "cotangent hook that the full reverse payload path needs. "
+            "'support_segment_probe' runs the realized-schedule reduced reverse "
+            "replay and accumulates cotangents wrt the explicit support payload. "
             "'reverse_payload' is the intended final path and currently fails "
             "explicitly until the Radau accepted-step transpose returns geometry "
             "payload cotangents."
+        ),
+    )
+    parser.add_argument(
+        "--support-pullback-probe-include-build",
+        action="store_true",
+        help=(
+            "Only for --realtime-geometry-gradient-path support_pullback_probe. "
+            "Also probe the generic support VJP through build_lagged_response. "
+            "This is intentionally off by default because that map materializes "
+            "a very large NTX graph and can OOM."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")

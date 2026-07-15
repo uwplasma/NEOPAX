@@ -2338,3 +2338,222 @@ Expected result:
 - `support_bar_all_finite=True`
 - JSON written to
   `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_realtime_geometry_support_pullback.json`.
+
+### 2026-07-15: Realtime Geometry Reverse Handoff
+
+Current status:
+
+- The payload boundary probe passed:
+  - `payload_array_leaves=134`
+  - `payload_total_array_bytes=20492928`
+  - `max_finite_objective_abs_delta=0.000000e+00`
+  - `max_finite_objective_rel_delta=0.000000e+00`
+- Interpretation: explicitly extracting and reinserting the realtime NTX support
+  payload is forward-equivalent for finite objectives. This validates the
+  static-object / differentiable-array-payload boundary.
+- The short two-step prefix still has nonfinite objectives for:
+  `Er2_volume_average`, `Er_volume_average`,
+  `electron_temperature_volume_average_keV`, `total_pressure_volume_average`,
+  and `alpha_power_volume_average_mw_m3`. These are identical on baseline and
+  swapped payload, so they are not caused by the payload boundary.
+
+What was added:
+
+- `NTXExactLijRuntimeSupport` is a JAX pytree with `grid` static.
+- `NTXExactLijRuntimeTransportModel.with_support_payload(...)` is the explicit
+  payload injection hook.
+- Benchmark-local payload replacement helpers in
+  `benchmark_transport_reverse_ad_only.py`.
+- Optional support-payload pullback plumbing through:
+  - `NTXExactLijRuntimeTransportModel`
+  - `CombinedTransportFluxModel`
+  - `ComposedEquationSystem`
+  - Radau flat-RHS factory / physics context
+- `--realtime-geometry-gradient-path payload_boundary_probe`
+- `--realtime-geometry-gradient-path support_pullback_probe`
+
+Important negative result:
+
+- A generic VJP through `build_lagged_response(...)` with respect to the full
+  NTX support payload OOMed:
+  - XLA estimated roughly `115 GiB` minimum rematerialized memory.
+  - The stack entered
+    `pullback_build_lagged_response_support_payload -> NTX build_lagged_response`.
+- Do **not** use the broad generic support VJP through lagged-response
+  construction as the final path.
+- The probe now skips that build path by default. It is only run with:
+  `--support-pullback-probe-include-build`.
+
+Correct next-step framing:
+
+- Do not rewrite Radau, NTX, or VMEC from scratch.
+- Do not replace the known-good frozen/profile reverse lane.
+- Do not try a forward-mode/JVP bridge through VMEC implicit solve.
+- Do not hide realtime geometry inside static `physics_context` and expect a
+  profile-only VJP to see it.
+
+What we need to connect:
+
+```text
+existing profile reverse AD machinery
+  -> transport/RHS/NTX cotangents
+  -> missing realtime NTX support payload cotangent
+  -> existing geometry AD machinery
+  -> VMEC harmonic gradients
+```
+
+The two working endpoints already exist:
+
+- Profile reverse AD already computes profile gradients for frozen/static
+  geometry.
+- Geometry AD already maps geometry-objective cotangents through
+  `vmec_jax solve_implicit -> VMEC/Boozer/NTX arrays -> RBC/ZBS`.
+
+The missing middle link is:
+
+```text
+transport objective cotangent -> cotangent wrt realtime NTX support payload
+```
+
+Recommended next implementation:
+
+1. Keep `--reverse-parameter-mode profiles` exactly on the current
+   frozen/profile reverse path.
+2. For `--reverse-parameter-mode profiles_plus_realtime_geometry`, create a
+   sibling realtime-only reduced reverse wrapper. It should reuse the existing
+   accepted-step / segmented replay reverse machinery but expose an additional
+   differentiable payload argument.
+3. The realtime wrapper should conceptually differentiate:
+
+```text
+(carry0, support_payload) -> final_y
+```
+
+   not just:
+
+```text
+carry0 -> final_y
+```
+
+4. Its backward should return:
+
+```text
+(carry0_bar, support_payload_bar)
+```
+
+5. Use the existing profile parameter mapping for `carry0_bar`.
+6. Pull `support_payload_bar` back through the existing realtime geometry AD
+   construction path to obtain VMEC harmonic gradients.
+7. Only after this works for `accepted_step_limit=2` and `RBC:1:0`, compare
+   against finite differences using the same accepted/replayed schedule
+   philosophy as the frozen profile benchmark.
+
+Most recent useful command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path payload_boundary_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Result:
+
+```text
+max_finite_objective_abs_delta=0.000000e+00
+max_finite_objective_rel_delta=0.000000e+00
+```
+
+Avoid rerunning the support build probe unless intentionally diagnosing OOM:
+
+```bash
+--support-pullback-probe-include-build
+```
+
+### 2026-07-15 continuation: support segment cotangent bridge
+
+We started the next bridge rather than rewriting the realtime reverse path.
+The frozen/profile-only reverse lane is still meant to use the existing
+`--reverse-parameter-mode profiles` code path.
+
+New implementation pieces:
+
+- `NEOPAX/_transport_solvers.py` now has a sibling reduced accepted-step bwd
+  helper that returns both the normal reduced carry cotangent and a cotangent
+  wrt the explicit realtime NTX support payload:
+
+```text
+_execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(...)
+_radau_segment_reduced_cotangent_bwd_with_support_call(...)
+```
+
+- `examples/benchmarks/benchmark_transport_reverse_ad_only.py` now has a
+  realtime-only probe mode:
+
+```text
+--realtime-geometry-gradient-path support_segment_probe
+```
+
+What this probe tests:
+
+```text
+objective cotangent
+  -> realized-schedule reduced Radau reverse replay
+  -> support_payload_bar
+```
+
+This is the missing transport half of the realtime geometry bridge. It does
+not yet pull `support_payload_bar` through VMEC/NTX support construction to
+`RBC/ZBS`; that remains the next step.
+
+First command to run next:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path support_segment_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected useful signal:
+
+```text
+realtime_geometry_gradient_path=support_segment_probe
+support_bar_l2=<finite, preferably nonzero>
+support_bar_all_finite=True
+```
+
+If this succeeds, next implementation is:
+
+1. Build a VJP for the existing traceable realtime support construction:
+
+```text
+geometry_delta -> support_payload
+```
+
+2. Feed `support_payload_bar` into that VJP to obtain the first VMEC harmonic
+   cotangent, initially for `RBC:1:0`.
+3. Then add profile gradients from the same reduced reverse pass and only then
+   compare to a frozen/replayed finite-difference geometry perturbation.
