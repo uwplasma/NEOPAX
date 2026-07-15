@@ -1428,7 +1428,7 @@ class ComposedEquationSystem:
                 working_state_bar = pullback_fn(working_state, flux_response_bar, **kwargs)
             else:
                 _, flux_pullback = jax.vjp(self.shared_flux_model.build_lagged_response, working_state)
-            (working_state_bar,) = flux_pullback(flux_response_bar)
+                (working_state_bar,) = flux_pullback(flux_response_bar)
         return self._prepare_working_state_pullback(state, working_state_bar)
 
     def pullback_build_lagged_response_support_payload(self, state, lagged_response_bar, support, **kwargs):
