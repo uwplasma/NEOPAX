@@ -2296,3 +2296,45 @@ Next implementation target:
 - Keep this implementation behind
   `--reverse-parameter-mode profiles_plus_realtime_geometry`; do not alter the
   frozen/profile-only reverse benchmark path.
+
+Support-pullback plumbing checkpoint:
+
+- Added local support-payload pullback hooks through:
+  - `NTXExactLijRuntimeTransportModel`
+  - `CombinedTransportFluxModel`
+  - `ComposedEquationSystem`
+  - Radau flat-RHS factory/context setup
+- These hooks are optional and unused by the frozen/profile-only reverse path.
+- Added benchmark mode
+  `--realtime-geometry-gradient-path support_pullback_probe`.
+- This probe does not compute transport-objective gradients yet. It checks the
+  local cotangent path needed by the full realtime reverse primitive:
+  `rhs_bar -> flux_bar -> NTX support_bar`.
+
+Support-pullback checkpoint command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path support_pullback_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected result:
+
+- `realtime_geometry_gradient_path=support_pullback_probe`
+- finite `support_bar_l2`
+- `support_bar_all_finite=True`
+- JSON written to
+  `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_realtime_geometry_support_pullback.json`.

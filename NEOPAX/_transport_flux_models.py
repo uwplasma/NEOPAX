@@ -705,6 +705,28 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             state_bar = jax.tree_util.tree_map(lambda a, b: a + b, state_bar, part)
         return state_bar
 
+    def pullback_build_lagged_response_support_payload(self, state, lagged_response_bar, support, **kwargs):
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload",
+            None,
+        )
+        if callable(pullback_fn):
+            return pullback_fn(
+                state,
+                lagged_response_bar.neoclassical_response,
+                support,
+                **kwargs,
+            )
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.neoclassical_model.with_support_payload(
+                support_value
+            ).build_lagged_response(state, **kwargs),
+            support,
+        )
+        (support_bar,) = support_pullback(lagged_response_bar.neoclassical_response)
+        return support_bar
+
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         neo = (
             self.neoclassical_model(state)
@@ -816,6 +838,50 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 classical_flux_bar,
             ),
         )
+
+    def pullback_evaluate_with_lagged_response_support_payload(
+        self,
+        state,
+        lagged_response,
+        flux_bar,
+        support,
+        **kwargs,
+    ):
+        gamma_total_bar = flux_bar.get("Gamma", 0)
+        q_total_bar = flux_bar.get("Q", 0)
+        upar_total_bar = flux_bar.get("Upar", 0)
+
+        zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
+        neo_flux_bar = {
+            "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
+            "Q": q_total_bar + flux_bar.get("Q_neo", 0),
+            "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+        }
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_evaluate_with_lagged_response_support_payload",
+            None,
+        )
+        if callable(pullback_fn):
+            return pullback_fn(
+                state,
+                lagged_response.neoclassical_response,
+                neo_flux_bar,
+                support,
+                **kwargs,
+            )
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.neoclassical_model.with_support_payload(
+                support_value
+            ).evaluate_with_lagged_response(
+                state,
+                lagged_response.neoclassical_response,
+                **kwargs,
+            ),
+            support,
+        )
+        (support_bar,) = support_pullback(neo_flux_bar)
+        return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         def _zero_state_bar():
@@ -5997,6 +6063,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         (state_bar,) = pullback(center_response_bar)
         return state_bar
 
+    def pullback_build_lagged_response_support_payload(
+        self,
+        state,
+        lagged_response_bar,
+        support,
+        **kwargs,
+    ):
+        del kwargs
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.with_support_payload(
+                support_value
+            ).build_lagged_response(state),
+            support,
+        )
+        (support_bar,) = support_pullback(lagged_response_bar)
+        return support_bar
+
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
         density = safe_density(state.density)
@@ -6361,6 +6444,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         (center_response_bar,) = pb(flux_bar)
         return NTXExactLijLaggedResponse(center_response=center_response_bar)
+
+    def pullback_evaluate_with_lagged_response_support_payload(
+        self,
+        state,
+        lagged_response,
+        flux_bar,
+        support,
+        **kwargs,
+    ):
+        del kwargs
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.with_support_payload(
+                support_value
+            ).evaluate_with_lagged_response(state, lagged_response),
+            support,
+        )
+        (support_bar,) = support_pullback(flux_bar)
+        return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         del kwargs

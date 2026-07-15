@@ -1422,8 +1422,25 @@ class ComposedEquationSystem:
                 working_state_bar = pullback_fn(working_state, flux_response_bar, **kwargs)
             else:
                 _, flux_pullback = jax.vjp(self.shared_flux_model.build_lagged_response, working_state)
-                (working_state_bar,) = flux_pullback(flux_response_bar)
+            (working_state_bar,) = flux_pullback(flux_response_bar)
         return self._prepare_working_state_pullback(state, working_state_bar)
+
+    def pullback_build_lagged_response_support_payload(self, state, lagged_response_bar, support, **kwargs):
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
+        if self.shared_flux_model is None or flux_response_bar is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, support)
+        pullback_fn = getattr(self.shared_flux_model, "pullback_build_lagged_response_support_payload", None)
+        if callable(pullback_fn):
+            return pullback_fn(working_state, flux_response_bar, support, **kwargs)
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.shared_flux_model.with_support_payload(
+                support_value
+            ).build_lagged_response(working_state, **kwargs),
+            support,
+        )
+        (support_bar,) = support_pullback(flux_response_bar)
+        return support_bar
 
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
@@ -1647,6 +1664,49 @@ class ComposedEquationSystem:
             )
             (flux_response_bar,) = flux_pullback(flux_bar)
         return TransportLaggedResponse(flux_response=flux_response_bar)
+
+    def pullback_evaluate_with_lagged_response_support_payload(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        support,
+    ):
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, support)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_support_payload",
+            None,
+        )
+        if callable(pullback_fn):
+            return pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                support,
+            )
+        _, support_pullback = jax.vjp(
+            lambda support_value: self.shared_flux_model.with_support_payload(
+                support_value
+            ).evaluate_with_lagged_response(
+                working_state,
+                lagged_response.flux_response,
+            ),
+            support,
+        )
+        (support_bar,) = support_pullback(flux_bar)
+        return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, t, state, runtime, lagged_response, rhs_bar):
         """Reverse-only split pullback for state dependence of the lagged RHS."""

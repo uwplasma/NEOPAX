@@ -178,6 +178,18 @@ def _payload_leaf_summary(payload) -> dict[str, Any]:
     }
 
 
+def _tree_array_l2_norm(payload) -> float:
+    leaves = jax.tree_util.tree_leaves(payload)
+    total = jnp.asarray(0.0, dtype=jnp.float64)
+    for leaf in leaves:
+        if not hasattr(leaf, "shape"):
+            continue
+        arr = jnp.asarray(leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            total = total + jnp.sum(arr.astype(jnp.float64) * arr.astype(jnp.float64))
+    return float(np.asarray(jax.device_get(jnp.sqrt(total))))
+
+
 def _report_path(objective_name: str) -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "reverse_ad"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1450,6 +1462,84 @@ def _run_realtime_geometry_payload_boundary_probe(
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
 
+def _run_realtime_geometry_support_pullback_probe(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    support_payload = _find_ntx_support_payload(baseline_runtime)
+    baseline_profile_state = _initial_state_for_parameter_vector(
+        baseline_values[: len(PARAMETER_ORDER)],
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=baseline_runtime,
+    )
+    components = prepare_transport_solver_components(
+        config,
+        baseline_runtime,
+        baseline_profile_state,
+    )
+    equation_system = components["equation_system"]
+    solver = components["solver"]
+    t0 = jnp.asarray(getattr(solver, "t0", 0.0), dtype=jnp.float64)
+    lagged_response = equation_system.build_lagged_response(baseline_profile_state)
+    rhs = equation_system.evaluate_with_lagged_response(
+        t0,
+        baseline_profile_state,
+        baseline_runtime.species,
+        lagged_response,
+    )
+    rhs_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.ones_like(leaf) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact) else leaf,
+        rhs,
+    )
+    support_bar = equation_system.pullback_evaluate_with_lagged_response_support_payload(
+        t0,
+        baseline_profile_state,
+        baseline_runtime.species,
+        lagged_response,
+        rhs_bar,
+        support_payload,
+    )
+    support_bar = jax.block_until_ready(support_bar)
+    support_summary = _payload_leaf_summary(support_payload)
+    support_bar_summary = _payload_leaf_summary(support_bar)
+    support_bar_l2 = _tree_array_l2_norm(support_bar)
+    report = {
+        "mode": "transport_reverse_ad_only",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": args.objective,
+        "objective_order": list(OBJECTIVE_LABELS),
+        "parameter_order": _reverse_geometry_parameter_order(str(args.reverse_geometry_parameter)),
+        "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+        "realtime_geometry_gradient_path": "support_pullback_probe",
+        "support_payload_summary": support_summary,
+        "support_bar_summary": support_bar_summary,
+        "support_bar_l2": support_bar_l2,
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only "
+        "parameter_mode=profiles_plus_realtime_geometry "
+        "realtime_geometry_gradient_path=support_pullback_probe "
+        f"support_bar_l2={support_bar_l2:.6e} "
+        f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
+        f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']}",
+        flush=True,
+    )
+    outpath = _report_path("realtime_geometry_support_pullback")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
 def _run_realtime_geometry_reverse_mode(
     *,
     args,
@@ -1516,6 +1606,17 @@ def _run_realtime_geometry_reverse_mode(
     )
     if str(args.realtime_geometry_gradient_path) == "payload_boundary_probe":
         _run_realtime_geometry_payload_boundary_probe(
+            args=args,
+            config=config,
+            baseline_values=baseline_values,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
+    if str(args.realtime_geometry_gradient_path) == "support_pullback_probe":
+        _run_realtime_geometry_support_pullback_probe(
             args=args,
             config=config,
             baseline_values=baseline_values,
@@ -1763,12 +1864,14 @@ def main() -> None:
         "--realtime-geometry-gradient-path",
         type=str,
         default="reverse_payload",
-        choices=("reverse_payload", "payload_boundary_probe"),
+        choices=("reverse_payload", "payload_boundary_probe", "support_pullback_probe"),
         help=(
             "Implementation used only with --reverse-parameter-mode "
             "profiles_plus_realtime_geometry. 'payload_boundary_probe' verifies "
             "the static-object/differentiable-NTX-support boundary without "
             "claiming to compute the missing geometry reverse gradient. "
+            "'support_pullback_probe' checks the local lagged-RHS support "
+            "cotangent hook that the full reverse payload path needs. "
             "'reverse_payload' is the intended final path and currently fails "
             "explicitly until the Radau accepted-step transpose returns geometry "
             "payload cotangents."
