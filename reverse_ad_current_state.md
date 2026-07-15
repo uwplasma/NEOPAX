@@ -2128,14 +2128,17 @@ Reason:
 
 Implementation checkpoint:
 
-- `benchmark_transport_reverse_ad_only.py` now keeps
+- `benchmark_transport_reverse_ad_only.py` keeps
   `--reverse-parameter-mode profiles` on the old profile reverse path.
-- `--reverse-parameter-mode profiles_plus_realtime_geometry` uses an isolated
-  realtime-geometry custom VJP whose backward contracts the objective cotangent
-  with JVP columns through the realtime geometry primal map.
-- The output JSON records
-  `realtime_geometry_gradient_path = "jvp_cotangent_contract"` for this opt-in
-  branch.
+- A temporary JVP-column bridge was tried for
+  `--reverse-parameter-mode profiles_plus_realtime_geometry`, but this is not a
+  valid path because `vmec_jax.core.implicit.solve_implicit(...)` is
+  `custom_vjp`-only and rejects forward-mode AD.
+- The realtime-geometry branch now fails explicitly with
+  `realtime_geometry_gradient_path = "pending_reverse_geometry_payload"` rather
+  than accidentally trying either:
+  - profile replay VJP with traced static `physics_context`, or
+  - forward-mode JVP through VMEC implicit solve.
 
 Final optimized target:
 
@@ -2146,3 +2149,131 @@ Final optimized target:
   `VMEC params -> VMEC state -> VMEC field tables -> NTX support`.
 - Do not retrofit this into the frozen/profile custom VJP; keep the profile
   benchmark protected from realtime-geometry experiments.
+
+### Next-session start point
+
+Do not restart by trying a JVP bridge.
+
+- The rejected command was the realtime transport reverse benchmark:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+- The JVP-column fallback failed with:
+  `TypeError: can't apply forward-mode autodiff (jvp) to a custom_vjp function`.
+- The failing custom-VJP function is
+  `vmec_jax.core.implicit.solve_implicit(...)`, which is reverse-mode only.
+- Therefore, the correct next implementation is reverse-mode only:
+  reuse the existing Radau/profile reverse math, but add a new realtime-geometry
+  payload channel through the RHS/accepted-step transpose.
+
+Concrete implementation target:
+
+1. Keep `--reverse-parameter-mode profiles` on the existing static
+   `physics_context` reduced reverse path.
+2. For `profiles_plus_realtime_geometry`, introduce a separate opt-in path whose
+   accepted-step/RHS transpose has an explicit differentiable geometry payload.
+   This must follow the same object-boundary philosophy as the transport reverse
+   path: build Python/static geometry objects outside the differentiated graph,
+   and differentiate only the JAX array payload held by those objects.
+3. The new backward should return both:
+   - `carry_bar`, for the existing profile/transport-state part;
+   - `geometry_payload_bar`, for VMEC/NTX support.
+4. The payload should be based on the same realtime geometry objects and helper
+   boundaries used by the geometry-objective benchmarks, not on rebuilding
+   support objects inside the transport derivative graph.
+5. Pull `geometry_payload_bar` back through the already-tested realtime geometry
+   array construction path:
+   `geometry_delta -> solve_implicit custom_vjp -> VMEC state -> VMEC field-table arrays -> NTX surface/support arrays`.
+6. Only after this passes the 2-accepted-step single-geometry-parameter test,
+   extend to multiple geometry harmonics and then optimize the multi-RHS/objective
+   handling.
+
+Payload design constraint:
+
+- Do not construct `Geometry`, `VmecSurface`, `NTXExactLijRuntimeSupport`, or
+  other Python/dataclass support containers dynamically inside the
+  differentiated transport objective.
+- Instead, prebuild the static scaffolding once from the realtime geometry setup
+  and pass/update a pytree of differentiable arrays through the RHS/flux
+  evaluation.
+- This is the same pattern as the profile transport reverse lane: the object
+  structure is static; only numerical arrays are differentiated.
+
+Implementation update:
+
+- `NTXExactLijRuntimeSupport` is now registered as a JAX pytree with `grid`
+  static and the scan/prepared arrays as differentiable data fields.
+- `NTXExactLijRuntimeTransportModel.with_support_payload(...)` is the explicit
+  model-level injection point for a realtime geometry NTX support payload.
+- `benchmark_transport_reverse_ad_only.py` now has an opt-in
+  `--realtime-geometry-gradient-path payload_boundary_probe` mode. This mode
+  does **not** compute geometry gradients; it checks the boundary we need for the
+  real implementation:
+  - find the preloaded realtime NTX support payload,
+  - swap that payload back into the already-built flux model,
+  - rerun the accepted-step prefix,
+  - report baseline-vs-swapped objective deltas and a support-pytree summary.
+- The default realtime geometry path remains
+  `--realtime-geometry-gradient-path reverse_payload` and still fails
+  explicitly until the Radau accepted-step transpose returns a geometry payload
+  cotangent.
+
+Checkpoint command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path payload_boundary_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Expected checkpoint output:
+
+- `realtime_geometry_gradient_path=payload_boundary_probe`
+- nonzero `payload_array_leaves`
+- `max_objective_abs_delta` and `max_objective_rel_delta` close to roundoff
+  when explicit payload injection is equivalent to the originally preloaded
+  realtime support.
+- JSON written to
+  `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_realtime_geometry_payload_boundary.json`.
+
+Next implementation target:
+
+- Add a realtime-only Radau reverse primitive whose differentiable input is
+  `(carry0, geometry_support_payload)` instead of just `carry0`.
+- Its forward pass should use the same realized accepted schedule machinery.
+- Its backward pass should return both:
+  - `carry0_bar`, following the existing reduced profile reverse path;
+  - `support_payload_bar`, accumulated from flux/RHS transposes.
+- After that, use a single VJP to pull `support_payload_bar` through
+  `vmec_jax solve_implicit -> VMEC field tables -> NTX prepared/support arrays`
+  back to VMEC boundary harmonics.
+- Keep this implementation behind
+  `--reverse-parameter-mode profiles_plus_realtime_geometry`; do not alter the
+  frozen/profile-only reverse benchmark path.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 import os
+import functools
 from typing import Any, Callable
 import abc
 import dataclasses
@@ -1353,6 +1354,11 @@ def build_ntx_runtime_surfaces(vmec_file, boozer_file, rho_values, *, surface_ba
     return tuple(loader(float(rho_value)) for rho_value in rho_arr)
 
 
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("center_channels", "face_channels", "center_prepared", "face_prepared"),
+    meta_fields=("grid",),
+)
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXExactLijRuntimeSupport:
     center_channels: NTXRuntimeScanChannels
@@ -1628,6 +1634,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if self.support is not None:
             return self
         return dataclasses.replace(self, support=self._static_support())
+
+    def with_support_payload(
+        self,
+        support: NTXExactLijRuntimeSupport,
+    ) -> "NTXExactLijRuntimeTransportModel":
+        """Return a copy with an explicit NTX support payload.
+
+        This is the realtime-geometry AD boundary: the model/scaffolding stays a
+        static Python object, while the support pytree carries differentiable
+        arrays produced by the VMEC/NTX geometry path.
+        """
+
+        return dataclasses.replace(self, support=support)
 
     def with_transport_resolution(self, *, n_theta=None, n_zeta=None, n_xi=None) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(

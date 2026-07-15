@@ -104,6 +104,80 @@ class _ReverseStaticSetup:
     reverse_segment_length: int | None
 
 
+def _replace_ntx_support_payload_in_model(model, support):
+    with_support_payload = getattr(model, "with_support_payload", None)
+    if callable(with_support_payload):
+        return with_support_payload(support), True
+    if not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        new_value, child_changed = _replace_ntx_support_payload_in_model(value, support)
+        if child_changed:
+            updates[field.name] = new_value
+            changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def _runtime_with_ntx_support_payload(runtime, support):
+    flux_model, changed = _replace_ntx_support_payload_in_model(runtime.models.flux, support)
+    if not changed:
+        raise ValueError("Could not find an NTX exact-runtime model that accepts an explicit support payload.")
+    return dataclasses.replace(
+        runtime,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def _find_ntx_support_payload_in_model(model):
+    support = getattr(model, "support", None)
+    if support is not None and hasattr(model, "with_support_payload"):
+        return support
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = _find_ntx_support_payload_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def _find_ntx_support_payload(runtime):
+    support = _find_ntx_support_payload_in_model(runtime.models.flux)
+    if support is None:
+        raise ValueError("No preloaded NTX exact-runtime support payload was found in the realtime runtime.")
+    return support
+
+
+def _payload_leaf_summary(payload) -> dict[str, Any]:
+    leaves = jax.tree_util.tree_leaves(payload)
+    array_leaves = [jnp.asarray(leaf) for leaf in leaves if hasattr(leaf, "shape")]
+    finite_leaves = [
+        bool(jnp.all(jnp.isfinite(leaf)))
+        for leaf in array_leaves
+        if jnp.issubdtype(leaf.dtype, jnp.inexact)
+    ]
+    total_bytes = int(
+        sum(int(leaf.size) * int(leaf.dtype.itemsize) for leaf in array_leaves)
+    )
+    return {
+        "n_leaves": int(len(leaves)),
+        "n_array_leaves": int(len(array_leaves)),
+        "total_array_bytes": total_bytes,
+        "all_floating_leaves_finite": bool(all(finite_leaves)) if finite_leaves else True,
+        "first_array_leaves": [
+            {
+                "shape": list(leaf.shape),
+                "dtype": str(leaf.dtype),
+            }
+            for leaf in array_leaves[:12]
+        ],
+    }
+
+
 def _report_path(objective_name: str) -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "reverse_ad"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1196,43 +1270,161 @@ def _make_reverse_geometry_objective_vector_with_schedule_vjp(
             _next_lagged_response_valid,
         ) = residuals
 
-        def _primal_objective(parameter_values_replay):
-            return _reverse_geometry_objective_vector_for_parameter_vector(
-                parameter_values_replay,
-                config=config,
-                geometry_context=geometry_context,
-                profile_cfg=profile_cfg,
-                geometry_parameter_name=geometry_parameter_name,
-                accepted_step_limit_override=accepted_step_limit_override,
-                solver_override=solver_override,
-            )
-
-        # Realtime geometry makes the RHS/NTX support part of the differentiated
-        # payload. The profile reverse primitive keeps physics_context static, so
-        # do not route this opt-in branch through that replay VJP.  For now the
-        # realtime-geometry VJP contracts objective cotangents with JVP columns;
-        # the frozen/profile branch below remains the true reduced reverse path.
-        parameter_count = int(jnp.asarray(parameter_values).shape[0])
-        parameter_basis = jnp.eye(parameter_count, dtype=jnp.asarray(parameter_values).dtype)
-
-        def _jvp_column(parameter_tangent):
-            _, objective_tangent = jax.jvp(
-                _primal_objective,
-                (parameter_values,),
-                (parameter_tangent,),
-            )
-            return objective_tangent
-
-        objective_tangent_columns = jax.vmap(_jvp_column)(parameter_basis)
-        parameter_bar = jnp.tensordot(
-            jnp.asarray(objective_bar, dtype=objective_tangent_columns.dtype),
-            objective_tangent_columns,
-            axes=((-1,), (1,)),
+        del (
+            parameter_values,
+            objective_bar,
         )
-        return (parameter_bar,)
+        raise NotImplementedError(
+            "Realtime geometry reverse AD must use a reverse-only geometry-payload "
+            "accepted-step transpose. The VMEC implicit lane is custom_vjp-only "
+            "and cannot be used through jax.jvp, while the profile replay VJP "
+            "keeps physics_context static and therefore cannot carry traced "
+            "geometry/NTX support. Keep --reverse-parameter-mode profiles for "
+            "frozen/profile reverse AD until the geometry-payload reverse path "
+            "is implemented."
+        )
 
     _objective.defvjp(_fwd, _bwd)
     return _objective
+
+
+def _run_realtime_geometry_payload_boundary_probe(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    support_payload = _find_ntx_support_payload(baseline_runtime)
+    payload_summary = _payload_leaf_summary(support_payload)
+    swapped_runtime = _runtime_with_ntx_support_payload(baseline_runtime, support_payload)
+    baseline_profile_state = _initial_state_for_parameter_vector(
+        baseline_values[: len(PARAMETER_ORDER)],
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=baseline_runtime,
+    )
+    swapped_profile_state = _initial_state_for_parameter_vector(
+        baseline_values[: len(PARAMETER_ORDER)],
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=swapped_runtime,
+    )
+    baseline_components = prepare_transport_solver_components(
+        config,
+        baseline_runtime,
+        baseline_profile_state,
+    )
+    swapped_components = prepare_transport_solver_components(
+        config,
+        swapped_runtime,
+        swapped_profile_state,
+        solver_override=baseline_components["solver"],
+    )
+
+    def _rollout_objectives(runtime, components):
+        solver = components["solver"]
+        prepared_rollout = _build_prepared_radau_accepted_rollout(
+            solver=solver,
+            state=components["solve_state"],
+            vector_field=components["solve_vector_field"],
+            species=runtime.species,
+        )
+        execution_context = _build_prepared_radau_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout,
+        )
+        stop_after_accepted_steps = (
+            int(args.accepted_step_limit)
+            if args.accepted_step_limit is not None
+            else getattr(solver, "stop_after_accepted_steps", None)
+        )
+        max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+        if stop_after_accepted_steps is not None:
+            max_total_steps = min(
+                max_total_steps,
+                max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+            )
+        rollout = _radau_adaptive_schedule_rollout(
+            execution_context,
+            prepared_rollout.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
+        return _objective_vector(final_state, runtime), rollout
+
+    print(
+        "[autodiff-gate] progress: probing realtime geometry support-payload boundary",
+        flush=True,
+    )
+    baseline_objectives, baseline_rollout = _rollout_objectives(baseline_runtime, baseline_components)
+    swapped_objectives, swapped_rollout = _rollout_objectives(swapped_runtime, swapped_components)
+    baseline_objectives = jax.block_until_ready(baseline_objectives)
+    swapped_objectives = jax.block_until_ready(swapped_objectives)
+    baseline_np = np.asarray(jax.device_get(baseline_objectives), dtype=float)
+    swapped_np = np.asarray(jax.device_get(swapped_objectives), dtype=float)
+    abs_delta = np.abs(swapped_np - baseline_np)
+    rel_delta = abs_delta / np.maximum(1.0e-300, np.maximum(np.abs(baseline_np), np.abs(swapped_np)))
+    report = {
+        "mode": "transport_reverse_ad_only",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": args.objective,
+        "objective_order": list(OBJECTIVE_LABELS),
+        "parameter_order": _reverse_geometry_parameter_order(str(args.reverse_geometry_parameter)),
+        "baseline_values": np.asarray(jax.device_get(baseline_values), dtype=float).tolist(),
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+        "realtime_geometry_gradient_path": "payload_boundary_probe",
+        "support_payload_summary": payload_summary,
+        "baseline_attempt_count": int(np.asarray(jax.device_get(jnp.sum(baseline_rollout.trace.active_mask.astype(jnp.int32))))),
+        "baseline_accepted_count": int(np.asarray(jax.device_get(jnp.sum(baseline_rollout.trace.accepted_mask.astype(jnp.int32))))),
+        "swapped_attempt_count": int(np.asarray(jax.device_get(jnp.sum(swapped_rollout.trace.active_mask.astype(jnp.int32))))),
+        "swapped_accepted_count": int(np.asarray(jax.device_get(jnp.sum(swapped_rollout.trace.accepted_mask.astype(jnp.int32))))),
+        "objective_values_baseline": {
+            name: float(value) for name, value in zip(OBJECTIVE_LABELS, baseline_np.tolist())
+        },
+        "objective_values_swapped_payload": {
+            name: float(value) for name, value in zip(OBJECTIVE_LABELS, swapped_np.tolist())
+        },
+        "objective_abs_delta": {
+            name: float(value) for name, value in zip(OBJECTIVE_LABELS, abs_delta.tolist())
+        },
+        "objective_rel_delta": {
+            name: float(value) for name, value in zip(OBJECTIVE_LABELS, rel_delta.tolist())
+        },
+        "max_objective_abs_delta": float(np.max(abs_delta)),
+        "max_objective_rel_delta": float(np.max(rel_delta)),
+        "gradient_reverse_ad": None,
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only "
+        "parameter_mode=profiles_plus_realtime_geometry "
+        "realtime_geometry_gradient_path=payload_boundary_probe "
+        f"payload_array_leaves={payload_summary['n_array_leaves']} "
+        f"payload_total_array_bytes={payload_summary['total_array_bytes']} "
+        f"max_objective_abs_delta={report['max_objective_abs_delta']:.6e} "
+        f"max_objective_rel_delta={report['max_objective_rel_delta']:.6e}",
+        flush=True,
+    )
+    print("[autodiff-gate] payload-boundary objective deltas:")
+    for objective_name in OBJECTIVE_LABELS:
+        print(
+            f"  - {objective_name}: "
+            f"baseline={report['objective_values_baseline'][objective_name]:.16e} "
+            f"swapped={report['objective_values_swapped_payload'][objective_name]:.16e} "
+            f"abs_delta={report['objective_abs_delta'][objective_name]:.6e} "
+            f"rel_delta={report['objective_rel_delta'][objective_name]:.6e}"
+        )
+    outpath = _report_path("realtime_geometry_payload_boundary")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
 
 
 def _run_realtime_geometry_reverse_mode(
@@ -1299,6 +1491,17 @@ def _run_realtime_geometry_reverse_mode(
         f"local_devices={[str(device) for device in jax.local_devices()]}",
         flush=True,
     )
+    if str(args.realtime_geometry_gradient_path) == "payload_boundary_probe":
+        _run_realtime_geometry_payload_boundary_probe(
+            args=args,
+            config=config,
+            baseline_values=baseline_values,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
 
     objective_vector_fn = _make_reverse_geometry_objective_vector_with_schedule_vjp(
@@ -1422,7 +1625,7 @@ def _run_realtime_geometry_reverse_mode(
         "ntx_exact_preload_support": neoclassical_cfg.get("preload_support", "config"),
         "radau_jacobian_reuse_mode": None if args.radau_jacobian_reuse_mode is None else str(args.radau_jacobian_reuse_mode),
         "reverse_geometry_parameter": str(args.reverse_geometry_parameter),
-        "realtime_geometry_gradient_path": "jvp_cotangent_contract",
+        "realtime_geometry_gradient_path": "pending_reverse_geometry_payload",
         "timing_mode": str(args.timing_mode),
         "reverse_total_s": float(reverse_total_s),
         "reverse_compile_plus_execute_s": None if reverse_compile_plus_execute_s is None else float(reverse_compile_plus_execute_s),
@@ -1442,7 +1645,7 @@ def _run_realtime_geometry_reverse_mode(
         f"ntx_exact_derivative_pullback_algebra={args.ntx_exact_derivative_pullback_algebra} "
         f"reverse_ntx_prepared_solve_boundary={args.reverse_ntx_prepared_solve_boundary} "
         f"ntx_exact_preload_support={neoclassical_cfg.get('preload_support', 'config')} "
-        "realtime_geometry_gradient_path=jvp_cotangent_contract "
+        "realtime_geometry_gradient_path=pending_reverse_geometry_payload "
         f"timing_mode={args.timing_mode} "
         f"reverse_total_s={reverse_total_s:.6e}"
     )
@@ -1531,6 +1734,21 @@ def main() -> None:
         help=(
             "Realtime VMEC geometry parameter used when --reverse-parameter-mode "
             "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0."
+        ),
+    )
+    parser.add_argument(
+        "--realtime-geometry-gradient-path",
+        type=str,
+        default="reverse_payload",
+        choices=("reverse_payload", "payload_boundary_probe"),
+        help=(
+            "Implementation used only with --reverse-parameter-mode "
+            "profiles_plus_realtime_geometry. 'payload_boundary_probe' verifies "
+            "the static-object/differentiable-NTX-support boundary without "
+            "claiming to compute the missing geometry reverse gradient. "
+            "'reverse_payload' is the intended final path and currently fails "
+            "explicitly until the Radau accepted-step transpose returns geometry "
+            "payload cotangents."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
