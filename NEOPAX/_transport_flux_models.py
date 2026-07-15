@@ -718,13 +718,14 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 support,
                 **kwargs,
             )
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.neoclassical_model.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.neoclassical_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).build_lagged_response(state, **kwargs),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(lagged_response_bar.neoclassical_response)
+        (support_bar,) = support_delta_pullback(lagged_response_bar.neoclassical_response)
         return support_bar
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
@@ -870,17 +871,18 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 support,
                 **kwargs,
             )
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.neoclassical_model.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.neoclassical_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).evaluate_with_lagged_response(
                 state,
                 lagged_response.neoclassical_response,
                 **kwargs,
             ),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(neo_flux_bar)
+        (support_bar,) = support_delta_pullback(neo_flux_bar)
         return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
@@ -1385,6 +1387,26 @@ class NTXRuntimeScanChannels:
             "fac_dkes_to_d31star": self.fac_dkes_to_d31star,
             "fac_dkes_to_d33star": self.fac_dkes_to_d33star,
         }
+
+
+def _float_delta_tree_like(tree):
+    def _zero_leaf(leaf):
+        arr = jnp.asarray(leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+    return jax.tree_util.tree_map(_zero_leaf, tree)
+
+
+def _add_float_delta_tree(primal_tree, delta_tree):
+    def _add_leaf(primal_leaf, delta_leaf):
+        arr = jnp.asarray(primal_leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return arr + jnp.asarray(delta_leaf, dtype=arr.dtype)
+        return primal_leaf
+
+    return jax.tree_util.tree_map(_add_leaf, primal_tree, delta_tree)
 
 
 def build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_scan) -> NTXRuntimeScanChannels:
@@ -6071,13 +6093,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).build_lagged_response(state),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(lagged_response_bar)
+        (support_bar,) = support_delta_pullback(lagged_response_bar)
         return support_bar
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
@@ -6454,13 +6477,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).evaluate_with_lagged_response(state, lagged_response),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(flux_bar)
+        (support_bar,) = support_delta_pullback(flux_bar)
         return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):

@@ -12,7 +12,12 @@ from ._source_models import (
     assemble_pressure_source_components,
     sum_source_components,
 )
-from ._transport_flux_models import build_face_transport_state, build_ntss_like_face_transport_state
+from ._transport_flux_models import (
+    _add_float_delta_tree,
+    _float_delta_tree_like,
+    build_face_transport_state,
+    build_ntss_like_face_transport_state,
+)
 from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
 from ._state import (
     DEFAULT_TRANSPORT_DENSITY_FLOOR,
@@ -1433,13 +1438,14 @@ class ComposedEquationSystem:
         pullback_fn = getattr(self.shared_flux_model, "pullback_build_lagged_response_support_payload", None)
         if callable(pullback_fn):
             return pullback_fn(working_state, flux_response_bar, support, **kwargs)
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.shared_flux_model.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.shared_flux_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).build_lagged_response(working_state, **kwargs),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(flux_response_bar)
+        (support_bar,) = support_delta_pullback(flux_response_bar)
         return support_bar
 
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
@@ -1696,16 +1702,17 @@ class ComposedEquationSystem:
                 flux_bar,
                 support,
             )
-        _, support_pullback = jax.vjp(
-            lambda support_value: self.shared_flux_model.with_support_payload(
-                support_value
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.shared_flux_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
             ).evaluate_with_lagged_response(
                 working_state,
                 lagged_response.flux_response,
             ),
-            support,
+            support_delta0,
         )
-        (support_bar,) = support_pullback(flux_bar)
+        (support_bar,) = support_delta_pullback(flux_bar)
         return support_bar
 
     def pullback_evaluate_with_lagged_response_state(self, t, state, runtime, lagged_response, rhs_bar):

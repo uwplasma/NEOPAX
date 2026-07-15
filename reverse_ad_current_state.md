@@ -2545,6 +2545,43 @@ support_bar_l2=<finite, preferably nonzero>
 support_bar_all_finite=True
 ```
 
+First failure seen on the GPU run:
+
+```text
+TypeError: object of type 'object' has no len()
+  NTX/src/ntx/_geometry_types.py, VmecSurface.__post_init__
+```
+
+Cause:
+
+- The generic support-payload VJP was differentiating the whole support pytree,
+  including integer/static NTX geometry leaves such as `m`, `n`, and related
+  metadata. During transpose tracing those can appear as object/float0-style
+  cotangents, but NTX dataclass validation expects normal array-like primals
+  and calls `len(self.m)`.
+
+Fix applied:
+
+- Support-payload pullbacks now use a float-delta boundary:
+
+```text
+support_delta -> with_support_payload(add_float_delta(primal_support, support_delta))
+```
+
+- Floating support leaves receive derivatives.
+- Non-floating/static leaves stay equal to the primal support values.
+- This preserves NTX dataclass construction while keeping the differentiable
+  geometry quantities active.
+
+Patched locations:
+
+```text
+NEOPAX/_transport_flux_models.py
+NEOPAX/_transport_equations.py
+```
+
+Rerun the same `support_segment_probe` command after this fix.
+
 If this succeeds, next implementation is:
 
 1. Build a VJP for the existing traceable realtime support construction:
