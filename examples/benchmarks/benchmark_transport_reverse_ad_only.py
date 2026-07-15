@@ -51,9 +51,9 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
     _radau_add_support_delta_trees,
-    _radau_segment_reduced_cotangent_bwd_with_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_call,
     _radau_segment_reduced_cotangent_bwd_call,
+    _radau_single_slot_support_cotangent_bwd_call,
     _radau_zero_support_delta_tree_like,
 )
 
@@ -780,6 +780,8 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
 
     if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
         raise ValueError("support payload reverse probe requires --reverse-segment-length.")
+    if int(reverse_setup.reverse_segment_length) != 1:
+        raise ValueError("support payload reverse probe currently requires --reverse-segment-length 1.")
     step_bwd_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
     ).strip().lower()
@@ -869,15 +871,29 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    next_reduced_bars_by_segment = [None] * segment_count
     for segment_index in range(segment_count - 1, -1, -1):
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-        reduced_bar, segment_support_bar = _radau_segment_reduced_cotangent_bwd_with_support_call(
+        next_reduced_bars_by_segment[segment_index] = reduced_bar
+        reduced_bar = _radau_segment_reduced_cotangent_bwd_call(
             reverse_setup.execution_context,
             cotangent_mode,
             reduced_bar,
             segment_start_carry,
             segment_arrays,
+        )
+
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        slot_arrays = _take_tree_axis0(segment_arrays, 0)
+        segment_support_bar = _radau_single_slot_support_cotangent_bwd_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            next_reduced_bars_by_segment[segment_index],
+            segment_start_carry,
+            slot_arrays,
             support_payload,
         )
         support_bar = _radau_add_support_delta_trees(support_bar, segment_support_bar, support_payload)
