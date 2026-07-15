@@ -1494,22 +1494,54 @@ def _run_realtime_geometry_support_pullback_probe(
         baseline_runtime.species,
         lagged_response,
     )
-    rhs_bar = jax.tree_util.tree_map(
-        lambda leaf: jnp.ones_like(leaf) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact) else leaf,
-        rhs,
-    )
-    support_bar = equation_system.pullback_evaluate_with_lagged_response_support_payload(
-        t0,
-        baseline_profile_state,
-        baseline_runtime.species,
+    zero_rhs_bar = jax.tree_util.tree_map(jnp.zeros_like, rhs)
+
+    def _rhs_bar_for(component_name: str):
+        return dataclasses.replace(
+            zero_rhs_bar,
+            **{
+                component_name: jnp.ones_like(
+                    getattr(zero_rhs_bar, component_name)
+                )
+            },
+        )
+
+    support_bars = {}
+    for component_name in ("density", "pressure", "Er"):
+        support_bar_value = equation_system.pullback_evaluate_with_lagged_response_support_payload(
+            t0,
+            baseline_profile_state,
+            baseline_runtime.species,
+            lagged_response,
+            _rhs_bar_for(component_name),
+            support_payload,
+        )
+        support_bars[f"rhs_{component_name}"] = jax.block_until_ready(support_bar_value)
+
+    lagged_response_bar = jax.tree_util.tree_map(
+        lambda leaf: (
+            jnp.ones_like(leaf)
+            if hasattr(leaf, "shape") and jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            else leaf
+        ),
         lagged_response,
-        rhs_bar,
-        support_payload,
     )
-    support_bar = jax.block_until_ready(support_bar)
+    support_bars["build_lagged_response"] = jax.block_until_ready(
+        equation_system.pullback_build_lagged_response_support_payload(
+            baseline_profile_state,
+            lagged_response_bar,
+            support_payload,
+        )
+    )
     support_summary = _payload_leaf_summary(support_payload)
-    support_bar_summary = _payload_leaf_summary(support_bar)
-    support_bar_l2 = _tree_array_l2_norm(support_bar)
+    support_bar_summaries = {
+        name: _payload_leaf_summary(support_bar)
+        for name, support_bar in support_bars.items()
+    }
+    support_bar_l2 = {
+        name: _tree_array_l2_norm(support_bar)
+        for name, support_bar in support_bars.items()
+    }
     report = {
         "mode": "transport_reverse_ad_only",
         "parameter_mode": str(args.reverse_parameter_mode),
@@ -1523,18 +1555,24 @@ def _run_realtime_geometry_support_pullback_probe(
         "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         "realtime_geometry_gradient_path": "support_pullback_probe",
         "support_payload_summary": support_summary,
-        "support_bar_summary": support_bar_summary,
+        "support_bar_summary": support_bar_summaries,
         "support_bar_l2": support_bar_l2,
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only "
         "parameter_mode=profiles_plus_realtime_geometry "
-        "realtime_geometry_gradient_path=support_pullback_probe "
-        f"support_bar_l2={support_bar_l2:.6e} "
-        f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
-        f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']}",
+        "realtime_geometry_gradient_path=support_pullback_probe ",
         flush=True,
     )
+    for name in support_bars:
+        summary = support_bar_summaries[name]
+        print(
+            f"[autodiff-gate] support_pullback {name}: "
+            f"l2={support_bar_l2[name]:.6e} "
+            f"array_leaves={summary['n_array_leaves']} "
+            f"all_finite={summary['all_floating_leaves_finite']}",
+            flush=True,
+        )
     outpath = _report_path("realtime_geometry_support_pullback")
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
