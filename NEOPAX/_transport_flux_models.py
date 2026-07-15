@@ -1425,6 +1425,22 @@ def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
     return jax.tree_util.tree_map(_sanitize_leaf, primal_tree, bar_tree)
 
 
+def _support_with_channel_delta(support, center_delta, face_delta):
+    return dataclasses.replace(
+        support,
+        center_channels=_add_float_delta_tree(support.center_channels, center_delta),
+        face_channels=_add_float_delta_tree(support.face_channels, face_delta),
+    )
+
+
+def _support_bar_from_channel_bars(support, center_bar, face_bar):
+    return dataclasses.replace(
+        _float_delta_tree_like(support),
+        center_channels=_sanitize_float_delta_bar_tree(support.center_channels, center_bar),
+        face_channels=_sanitize_float_delta_bar_tree(support.face_channels, face_bar),
+    )
+
+
 def build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_scan) -> NTXRuntimeScanChannels:
     rho = _as_float_array(rho_scan, name="rho_scan")
     channels = _load_ntx_vmec_boozer_channels(Path(vmec_file), Path(boozer_file), rho)
@@ -6493,15 +6509,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
-        support_delta0 = _float_delta_tree_like(support)
-        _, support_delta_pullback = jax.vjp(
-            lambda support_delta: self.with_support_payload(
-                _add_float_delta_tree(support, support_delta)
+        center_delta0 = _float_delta_tree_like(support.center_channels)
+        face_delta0 = _float_delta_tree_like(support.face_channels)
+        _, channel_delta_pullback = jax.vjp(
+            lambda center_delta, face_delta: self.with_support_payload(
+                _support_with_channel_delta(support, center_delta, face_delta)
             ).evaluate_with_lagged_response(state, lagged_response),
-            support_delta0,
+            center_delta0,
+            face_delta0,
         )
-        (support_bar,) = support_delta_pullback(flux_bar)
-        return _sanitize_float_delta_bar_tree(support, support_bar)
+        center_bar, face_bar = channel_delta_pullback(flux_bar)
+        return _support_bar_from_channel_bars(support, center_bar, face_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         del kwargs

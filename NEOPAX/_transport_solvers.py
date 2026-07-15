@@ -4547,7 +4547,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(
                 lagged_cache_bar,
                 support,
             )
-            support_bar = _radau_add_aligned_tangent_trees(
+            support_bar = _radau_add_support_delta_trees(
                 support_bar,
                 rebuild_support_bar,
                 support,
@@ -4916,7 +4916,7 @@ def _radau_segment_reduced_cotangent_bwd_with_support_call(
             return slot_reduced_bar, _radau_zero_support_delta_tree_like(support)
 
         step_start_reduced_bar, step_support_bar = jax.lax.cond(active, _do_step_bwd, _skip_bwd, operand=None)
-        support_bar = _radau_add_aligned_tangent_trees(support_bar, step_support_bar, support)
+        support_bar = _radau_add_support_delta_trees(support_bar, step_support_bar, support)
         return (step_start_reduced_bar, support_bar), None
 
     zero_support_bar = _radau_zero_support_delta_tree_like(support)
@@ -6013,6 +6013,18 @@ def _radau_sanitize_support_delta_bar_tree(primal, bar):
     return jax.tree_util.tree_map(_sanitize_leaf, primal, bar)
 
 
+def _radau_add_support_delta_trees(lhs, rhs, primal):
+    if primal is None:
+        return None
+    if lhs is None:
+        return _radau_sanitize_support_delta_bar_tree(primal, rhs)
+    if rhs is None:
+        return _radau_sanitize_support_delta_bar_tree(primal, lhs)
+    lhs_aligned = _radau_sanitize_support_delta_bar_tree(primal, lhs)
+    rhs_aligned = _radau_sanitize_support_delta_bar_tree(primal, rhs)
+    return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
+
+
 def _radau_sum_leading_axis_tree(tree):
     return jax.tree_util.tree_map(lambda value: jnp.sum(value, axis=0), tree)
 
@@ -6041,8 +6053,9 @@ def _radau_exact_stage_residual_support_pullback(
     stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
-    staged_support_bars = jax.vmap(
-        lambda t_eval, y_eval, rhs_bar_eval: _radau_sanitize_support_delta_bar_tree(
+    def _stage_support_pullback(accumulated_bar, stage_inputs):
+        t_eval, y_eval, rhs_bar_eval = stage_inputs
+        stage_support_bar = _radau_sanitize_support_delta_bar_tree(
             support,
             physics_context.flat_rhs_lagged_response_support_pullback(
                 t_eval,
@@ -6051,10 +6064,16 @@ def _radau_exact_stage_residual_support_pullback(
                 -rhs_bar_eval,
                 support,
             ),
-        ),
-        in_axes=(0, 0, 0),
-    )(stage_times, stage_states, residual_stages)
-    return _radau_sum_leading_axis_tree(staged_support_bars)
+        )
+        return _radau_add_support_delta_trees(accumulated_bar, stage_support_bar, support), None
+
+    support_bar0 = _radau_zero_support_delta_tree_like(support)
+    support_bar, _ = jax.lax.scan(
+        _stage_support_pullback,
+        support_bar0,
+        (stage_times, stage_states, residual_stages),
+    )
+    return support_bar
 
 
 def _radau_solve_exact_stage_residual_transpose_iterative(
