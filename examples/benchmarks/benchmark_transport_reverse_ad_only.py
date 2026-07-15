@@ -1369,6 +1369,15 @@ def _run_realtime_geometry_payload_boundary_probe(
     swapped_np = np.asarray(jax.device_get(swapped_objectives), dtype=float)
     abs_delta = np.abs(swapped_np - baseline_np)
     rel_delta = abs_delta / np.maximum(1.0e-300, np.maximum(np.abs(baseline_np), np.abs(swapped_np)))
+    finite_objectives = np.isfinite(baseline_np) & np.isfinite(swapped_np)
+    finite_delta = finite_objectives & np.isfinite(abs_delta) & np.isfinite(rel_delta)
+    nonfinite_objective_names = [
+        name
+        for name, finite in zip(OBJECTIVE_LABELS, finite_objectives.tolist())
+        if not bool(finite)
+    ]
+    max_abs_delta = float(np.max(abs_delta[finite_delta])) if np.any(finite_delta) else None
+    max_rel_delta = float(np.max(rel_delta[finite_delta])) if np.any(finite_delta) else None
     report = {
         "mode": "transport_reverse_ad_only",
         "parameter_mode": str(args.reverse_parameter_mode),
@@ -1399,28 +1408,42 @@ def _run_realtime_geometry_payload_boundary_probe(
         "objective_rel_delta": {
             name: float(value) for name, value in zip(OBJECTIVE_LABELS, rel_delta.tolist())
         },
-        "max_objective_abs_delta": float(np.max(abs_delta)),
-        "max_objective_rel_delta": float(np.max(rel_delta)),
+        "objective_finite": {
+            name: bool(value) for name, value in zip(OBJECTIVE_LABELS, finite_objectives.tolist())
+        },
+        "nonfinite_objectives": nonfinite_objective_names,
+        "max_finite_objective_abs_delta": max_abs_delta,
+        "max_finite_objective_rel_delta": max_rel_delta,
         "gradient_reverse_ad": None,
     }
+    max_abs_text = "nan" if max_abs_delta is None else f"{max_abs_delta:.6e}"
+    max_rel_text = "nan" if max_rel_delta is None else f"{max_rel_delta:.6e}"
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only "
         "parameter_mode=profiles_plus_realtime_geometry "
         "realtime_geometry_gradient_path=payload_boundary_probe "
         f"payload_array_leaves={payload_summary['n_array_leaves']} "
         f"payload_total_array_bytes={payload_summary['total_array_bytes']} "
-        f"max_objective_abs_delta={report['max_objective_abs_delta']:.6e} "
-        f"max_objective_rel_delta={report['max_objective_rel_delta']:.6e}",
+        f"max_finite_objective_abs_delta={max_abs_text} "
+        f"max_finite_objective_rel_delta={max_rel_text}",
         flush=True,
     )
+    if nonfinite_objective_names:
+        print(
+            "[autodiff-gate] payload-boundary nonfinite objectives: "
+            + ", ".join(nonfinite_objective_names),
+            flush=True,
+        )
     print("[autodiff-gate] payload-boundary objective deltas:")
     for objective_name in OBJECTIVE_LABELS:
+        finite_status = "finite" if report["objective_finite"][objective_name] else "nonfinite"
         print(
             f"  - {objective_name}: "
             f"baseline={report['objective_values_baseline'][objective_name]:.16e} "
             f"swapped={report['objective_values_swapped_payload'][objective_name]:.16e} "
             f"abs_delta={report['objective_abs_delta'][objective_name]:.6e} "
-            f"rel_delta={report['objective_rel_delta'][objective_name]:.6e}"
+            f"rel_delta={report['objective_rel_delta'][objective_name]:.6e} "
+            f"status={finite_status}"
         )
     outpath = _report_path("realtime_geometry_payload_boundary")
     outpath.write_text(json.dumps(report, indent=2))

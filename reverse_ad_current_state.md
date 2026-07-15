@@ -2263,6 +2263,25 @@ Expected checkpoint output:
 - JSON written to
   `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_realtime_geometry_payload_boundary.json`.
 
+Observed checkpoint result:
+
+- The payload boundary probe found `payload_array_leaves=134` and
+  `payload_total_array_bytes=20492928`.
+- For finite objectives, baseline and swapped-payload values matched exactly:
+  - `softmax_Er = 1.6049719305982389e+01`
+  - `smooth_root_proxy = 3.9999999999999997e-01`
+- The remaining objectives were `nan` for both baseline and swapped payload:
+  `Er2_volume_average`, `Er_volume_average`,
+  `electron_temperature_volume_average_keV`, `total_pressure_volume_average`,
+  and `alpha_power_volume_average_mw_m3`.
+- Interpretation: the support payload injection boundary is behaving for the
+  finite outputs. The `nan` max-delta was a probe-reporting issue caused by
+  finite and nonfinite objectives being reduced together, not evidence of a
+  payload mismatch.
+- The probe now reports finite-only maxima as
+  `max_finite_objective_abs_delta` and `max_finite_objective_rel_delta`, plus
+  an explicit `nonfinite_objectives` list.
+
 Next implementation target:
 
 - Add a realtime-only Radau reverse primitive whose differentiable input is
