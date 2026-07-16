@@ -2948,6 +2948,22 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
 
 
+def _vmec_r00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
+    """Return traceable VMEC R(m=0,n=0) on requested rho values."""
+
+    rho_arr = jnp.asarray(np.asarray(rho_values, dtype=float), dtype=jnp.float64)
+    m_arr = np.asarray(context.static.modes.m, dtype=np.int32).reshape(-1)
+    n_arr = np.asarray(context.static.modes.n, dtype=np.int32).reshape(-1)
+    matches = np.nonzero((m_arr == 0) & (n_arr == 0))[0]
+    if matches.size == 0:
+        raise ValueError("VMEC state is missing the R(m=0,n=0) mode.")
+    mode00 = int(matches[0])
+    s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+    rho_full = jnp.sqrt(jnp.maximum(s_full, 0.0))
+    r00_full = jnp.asarray(_vmec_state_field(state, "Rcos", "R_cos"), dtype=jnp.float64)[:, mode00]
+    return interpax.Interpolator1D(rho_full, r00_full, extrap=True)(rho_arr)
+
+
 def _build_neopax_geometry_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -3781,13 +3797,16 @@ def build_ntx_exact_lij_support_from_vmec_state(
         )
     )
     r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
-    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
+    surface_backend_key = str(surface_backend).strip().lower()
+    if surface_backend_key in {"vmec", "vmec_jax"}:
+        r00_support = _vmec_r00_from_state_at_rho(context, state, r00_support_rho_np)
+    else:
+        r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
     center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_np)
     face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_np)
-    surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
         center_surfaces = _traceable_vmec_surfaces_from_state(
             context,

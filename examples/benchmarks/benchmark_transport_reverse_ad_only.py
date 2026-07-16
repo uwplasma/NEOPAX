@@ -2415,6 +2415,7 @@ def _run_realtime_geometry_support_segment_probe(
             flush=True,
         )
         t_start = time.perf_counter()
+        t_phase = time.perf_counter()
         (
             objective_values,
             profile_gradient_matrix,
@@ -2431,6 +2432,11 @@ def _run_realtime_geometry_support_segment_probe(
         )
         objective_values, profile_gradient_matrix, support_bars = jax.block_until_ready(
             (objective_values, profile_gradient_matrix, support_bars)
+        )
+        print(
+            "[autodiff-gate] progress: transport reverse support/profile cotangents complete "
+            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            flush=True,
         )
 
         geom_cfg = config.get("geometry", {})
@@ -2458,33 +2464,54 @@ def _run_realtime_geometry_support_segment_probe(
                 jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
             )
 
+        t_phase = time.perf_counter()
+        print(
+            "[autodiff-gate] progress: building geometry support pullback "
+            f"for {geometry_parameter_name}",
+            flush=True,
+        )
         _support_baseline_for_pullback, geometry_support_pullback = jax.vjp(
             _support_from_geometry_deltas,
             baseline_geometry_deltas,
         )
+        _support_baseline_for_pullback = jax.block_until_ready(_support_baseline_for_pullback)
+        print(
+            "[autodiff-gate] progress: geometry support pullback ready "
+            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            flush=True,
+        )
 
-        def _support_bar_for_geometry_vjp(primal_tree, bar_tree):
-            def _leaf(primal_leaf, bar_leaf):
+        def _support_bars_for_geometry_vjp(primal_tree, bar_trees):
+            def _leaf(primal_leaf, *bar_leaves):
                 arr = jnp.asarray(primal_leaf)
                 if jnp.issubdtype(arr.dtype, jnp.inexact):
-                    return jnp.asarray(bar_leaf, dtype=arr.dtype)
-                return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+                    return jnp.stack([jnp.asarray(leaf, dtype=arr.dtype) for leaf in bar_leaves], axis=0)
+                return jnp.zeros(
+                    (len(bar_trees),) + arr.shape,
+                    dtype=jax.dtypes.float0,
+                )
 
-            return jax.tree_util.tree_map(_leaf, primal_tree, bar_tree)
+            return jax.tree_util.tree_map(_leaf, primal_tree, *bar_trees)
 
-        geometry_gradient_matrix = jnp.stack(
-            [
-                geometry_support_pullback(
-                    _support_bar_for_geometry_vjp(
-                        _support_baseline_for_pullback,
-                        support_bars[objective_i],
-                    )
-                )[0]
-                for objective_i in range(len(OBJECTIVE_LABELS))
-            ],
-            axis=0,
+        t_phase = time.perf_counter()
+        print(
+            "[autodiff-gate] progress: applying batched geometry support pullback "
+            f"for {len(OBJECTIVE_LABELS)} objectives",
+            flush=True,
         )
+        batched_support_bars = _support_bars_for_geometry_vjp(
+            _support_baseline_for_pullback,
+            support_bars,
+        )
+        geometry_gradient_matrix = jax.vmap(
+            lambda support_bar: geometry_support_pullback(support_bar)[0]
+        )(batched_support_bars)
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
+        print(
+            "[autodiff-gate] progress: batched geometry support pullback complete "
+            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            flush=True,
+        )
         elapsed_s = time.perf_counter() - t_start
 
         objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
