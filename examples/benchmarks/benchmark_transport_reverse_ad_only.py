@@ -890,7 +890,9 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         slot_arrays = _take_tree_axis0(segment_arrays, 0)
-        slot_lagged_response_valid = bool(np.asarray(jax.device_get(slot_arrays[-1])))
+        slot_lagged_response_valid = bool(
+            np.asarray(jax.device_get(segment_start_carry.lagged_response_valid))
+        )
         slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
         support_reuse_count += int(slot_lagged_response_valid)
         support_rebuild_count += int(not slot_lagged_response_valid)
