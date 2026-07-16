@@ -2594,3 +2594,107 @@ geometry_delta -> support_payload
    cotangent, initially for `RBC:1:0`.
 3. Then add profile gradients from the same reduced reverse pass and only then
    compare to a frozen/replayed finite-difference geometry perturbation.
+
+### 2026-07-16 continuation: realtime fixed-Er boundary probe
+
+Current intended semantics:
+
+- Frozen/profile reverse AD computes the baseline initial `Er` with the normal
+  ambipolar solve, then treats that `Er` as fixed for profile derivatives.
+- Realtime geometry reverse should first match this behavior: compute baseline
+  realtime geometry and baseline ambipolar `Er`, then copy that fixed `Er`
+  into the differentiated transport rollout.
+- Differentiating through the ambipolar initialization is a later implicit-root
+  layer, documented separately in `ambipolarity_ad_plan.md`.
+
+Important code changes in `examples/benchmarks/benchmark_transport_reverse_ad_only.py`:
+
+- Added scalar selected-objective evaluation so `--objective softmax_Er` does
+  not build the full objective vector and accidentally expose unrelated
+  nonfinite objectives.
+- Realtime baseline setup now uses normal `build_runtime_context_for_geometry_param`
+  ambipolar initialization for the probe baseline.
+- The experimental realtime rollout helper accepts `fixed_initial_er` and copies
+  `stop_gradient(baseline_state.Er)` into the profile/geometry transport initial
+  state. This preserves fixed-initial-`Er` semantics for geometry perturbations.
+- Added `--realtime-geometry-gradient-path initial_carry_boundary_probe`.
+  This does not compute `d objective / d geometry`; it returns diagnostics for
+  the compact cotangent wrt the initial transport state.
+
+Latest successful diagnostic command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path initial_carry_boundary_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective softmax_Er \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Latest output before the most recent patch:
+
+```text
+objective=softmax_Er
+value=2.4573910204527036e-01
+reduced_y_bar_all_finite=True
+reduced_lagged_cache_bar_all_finite=True
+state_bar_all_finite=False
+no_lagged_cache_state_bar_all_finite=False
+y_only_state_bar_all_finite=False
+lagged_reference_only_state_bar_all_finite=False
+lagged_cache_only_state_bar_all_finite=False
+```
+
+Interpretation:
+
+- The realized-schedule reduced Radau reverse replay is finite.
+- The NaNs are produced inside the benchmark-local initial-carry custom VJP.
+- Since `y_only`, `lagged_reference_only`, and `lagged_cache_only` all became
+  nonfinite, the likely poison is a zero-cotangent pullback inside the
+  initial-carry transpose, not the geometry/support bridge itself.
+
+Most recent patch to test next:
+
+- In `_reverse_initial_carry_from_state_with_static_setup(...)._build_initial_carry_bwd`,
+  explicit zero-cotangent guards were added around:
+
+```text
+rhs_bar -> flat_rhs_state_pullback
+rhs_bar -> flat_rhs_lagged_response_pullback
+lagged_bar -> pullback_build_lagged_response
+```
+
+Reason:
+
+- In the boundary probe, `prev_stages_bar` can be zero, so the initial RHS
+  contribution is mathematically zero.
+- Calling the RHS transpose with an all-zero cotangent can still produce
+  `0 * nan = nan` through inactive/unneeded paths.
+- The patch returns explicit zero cotangents for those zero-cotangent branches.
+
+Next run:
+
+Rerun the same `initial_carry_boundary_probe` command above.
+
+Expected useful signal:
+
+```text
+reduced_y_bar_all_finite=True
+reduced_lagged_cache_bar_all_finite=True
+y_only_state_bar_all_finite=True
+```
+
+If `y_only_state_bar_all_finite` remains false, inspect the direct state packing
+pullback from `_make_solver_state_transform` next. If `y_only` becomes finite
+but full `state_bar_all_finite` remains false, continue isolating the lagged
+reference/cache pullback branches.

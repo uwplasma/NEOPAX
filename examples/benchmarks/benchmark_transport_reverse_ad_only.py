@@ -464,6 +464,21 @@ def _reverse_initial_carry_from_state_with_static_setup(
         rhs_bar = jnp.sum(prev_stages_bar, axis=0)
         lagged_bar = carry_bar.lagged_response_cache
 
+        def _tree_max_abs(tree):
+            values = []
+            for leaf in jax.tree_util.tree_leaves(tree):
+                arr = jnp.asarray(leaf)
+                if arr.dtype == jax.dtypes.float0:
+                    continue
+                if jnp.issubdtype(arr.dtype, jnp.number):
+                    values.append(jnp.max(jnp.abs(arr)))
+            if not values:
+                return jnp.asarray(0.0, dtype=flat_state0.dtype)
+            return jnp.max(jnp.stack([jnp.asarray(value, dtype=flat_state0.dtype) for value in values]))
+
+        def _zero_flat_bar():
+            return jnp.zeros_like(flat_state0)
+
         def _rhs_state_pullback_fallback(lagged_response_value):
             def _rhs_from_flat(flat_value):
                 return _radau_eval_rhs(
@@ -478,18 +493,26 @@ def _reverse_initial_carry_from_state_with_static_setup(
             (rhs_flat_bar,) = rhs_pullback(rhs_bar)
             return rhs_flat_bar
 
-        if physics_context.flat_rhs_state_pullback is not None:
-            rhs_flat_bar = physics_context.flat_rhs_state_pullback(
-                initial_carry_static.t,
-                flat_state0,
-                initial_lagged_response,
-                rhs_bar,
-            )
-            if project_flat is not None:
-                _, project_pullback = jax.vjp(project_flat, flat_state0)
-                (rhs_flat_bar,) = project_pullback(rhs_flat_bar)
-        else:
-            rhs_flat_bar = _rhs_state_pullback_fallback(initial_lagged_response)
+        def _nonzero_rhs_state_pullback(_):
+            if physics_context.flat_rhs_state_pullback is not None:
+                rhs_flat_bar_value = physics_context.flat_rhs_state_pullback(
+                    initial_carry_static.t,
+                    flat_state0,
+                    initial_lagged_response,
+                    rhs_bar,
+                )
+                if project_flat is not None:
+                    _, project_pullback = jax.vjp(project_flat, flat_state0)
+                    (rhs_flat_bar_value,) = project_pullback(rhs_flat_bar_value)
+                return rhs_flat_bar_value
+            return _rhs_state_pullback_fallback(initial_lagged_response)
+
+        rhs_flat_bar = jax.lax.cond(
+            _tree_max_abs(rhs_bar) > 0.0,
+            _nonzero_rhs_state_pullback,
+            lambda _: _zero_flat_bar(),
+            operand=None,
+        )
         flat_bar = flat_bar + rhs_flat_bar
 
         if initial_lagged_response is not None:
@@ -502,26 +525,46 @@ def _reverse_initial_carry_from_state_with_static_setup(
                     physics_context.flat_rhs_with_lagged_response,
                 )
 
-            if physics_context.flat_rhs_lagged_response_pullback is not None:
-                rhs_lagged_bar = physics_context.flat_rhs_lagged_response_pullback(
-                    initial_carry_static.t,
-                    flat_state0,
-                    initial_lagged_response,
-                    rhs_bar,
-                )
-            else:
+            def _zero_lagged_bar():
+                return _radau_align_tangent_tree_to_primal(None, initial_lagged_response)
+
+            def _nonzero_rhs_lagged_pullback(_):
+                if physics_context.flat_rhs_lagged_response_pullback is not None:
+                    return physics_context.flat_rhs_lagged_response_pullback(
+                        initial_carry_static.t,
+                        flat_state0,
+                        initial_lagged_response,
+                        rhs_bar,
+                    )
                 _, rhs_pullback = jax.vjp(_rhs_from_flat_and_lagged, flat_state0, initial_lagged_response)
-                _rhs_flat_bar_unused, rhs_lagged_bar = rhs_pullback(rhs_bar)
+                _rhs_flat_bar_unused, rhs_lagged_bar_value = rhs_pullback(rhs_bar)
+                return rhs_lagged_bar_value
+
+            rhs_lagged_bar = jax.lax.cond(
+                _tree_max_abs(rhs_bar) > 0.0,
+                _nonzero_rhs_lagged_pullback,
+                lambda _: _zero_lagged_bar(),
+                operand=None,
+            )
             lagged_bar = _add_trees(lagged_bar, rhs_lagged_bar)
 
-            if lagged_pullback_fn is not None:
-                lagged_state_bar = lagged_pullback_fn(lagged_state0, lagged_bar)
-            else:
+            def _nonzero_lagged_state_pullback(_):
+                if lagged_pullback_fn is not None:
+                    return lagged_pullback_fn(lagged_state0, lagged_bar)
+
                 def _build_lagged_from_state(lagged_state_value):
                     return physics_context.build_lagged_response(lagged_state_value)
 
                 _, lagged_pullback = jax.vjp(_build_lagged_from_state, lagged_state0)
-                (lagged_state_bar,) = lagged_pullback(lagged_bar)
+                (lagged_state_bar_value,) = lagged_pullback(lagged_bar)
+                return lagged_state_bar_value
+
+            lagged_state_bar = jax.lax.cond(
+                _tree_max_abs(lagged_bar) > 0.0,
+                _nonzero_lagged_state_pullback,
+                lambda _: jax.tree_util.tree_map(jnp.zeros_like, lagged_state0),
+                operand=None,
+            )
 
             def _lagged_state_from_flat(flat_value):
                 return _build_state_from_flat(flat_value, unpack_flat, project_flat)
