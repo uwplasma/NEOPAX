@@ -907,9 +907,14 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         support_bar = _radau_add_support_delta_trees(support_bar, segment_support_bar, support_payload)
 
     initial_cache_pullback_used = False
+    initial_cache_pullback_skipped = False
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
-    if initial_lagged_response_valid and build_support_pullback is not None:
+    allow_initial_cache_support_pullback = cotangent_mode in {
+        "full_initial_cache_support_pullback",
+        "initial_cache_support_pullback",
+    }
+    if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
         initial_cache_support_bar = build_support_pullback(
             carry0.y,
             reduced_bar.lagged_response_cache,
@@ -921,6 +926,8 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
             support_payload,
         )
         initial_cache_pullback_used = True
+    elif initial_lagged_response_valid and build_support_pullback is not None:
+        initial_cache_pullback_skipped = True
 
     carry0_bar = dataclasses.replace(
         jax.tree_util.tree_map(_zero_tangent_like, carry0),
@@ -936,7 +943,128 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         support_reuse_count,
         support_rebuild_count,
         initial_cache_pullback_used,
+        initial_cache_pullback_skipped,
     )
+
+
+def _reverse_objective_initial_state_bar(
+    initial_state,
+    *,
+    runtime,
+    reverse_setup: _ReverseStaticSetup,
+    objective_index: int,
+):
+    """Return objective value and compact cotangent wrt the initial transport state."""
+
+    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
+        raise ValueError("initial-carry boundary probe requires --reverse-segment-length.")
+    step_bwd_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower()
+    if step_bwd_mode not in {
+        "reduced_cotangent",
+        "reduced_cotangent_lean_replay",
+        "reduced_cotangent_recompute_replay",
+        "lean_replay",
+        "recompute_replay",
+        "reduced",
+        "state_only",
+        "final_state",
+    }:
+        raise ValueError("initial-carry boundary probe requires a reduced-cotangent reverse step bwd mode.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _carry_from_state(state_value):
+        return _reverse_initial_carry_from_state_with_static_setup(
+            solver=reverse_setup.solver,
+            state=state_value,
+            solve_vector_field=reverse_setup.solve_vector_field,
+            species=runtime.species,
+            prepared_rollout_static=reverse_setup.prepared_rollout,
+        )
+
+    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
+    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)[objective_index]
+
+    objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
+    (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
+
+    (
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    ) = residuals
+    del (
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+        raise ValueError("initial-carry boundary probe requires segmented reverse residuals.")
+
+    reduced_bar = _RadauAcceptedStepReducedCotangent(
+        y=final_y_bar,
+        lagged_response_cache=_radau_align_tangent_tree_to_primal(
+            None,
+            segmented_final_carry.lagged_response_cache,
+        ),
+        lagged_reference_y=jnp.zeros_like(segmented_final_carry.lagged_reference_y),
+    )
+    cotangent_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+    ).strip().lower()
+    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        reduced_bar = _radau_segment_reduced_cotangent_bwd_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bar,
+            segment_start_carry,
+            segment_arrays,
+        )
+
+    carry0_bar = dataclasses.replace(
+        jax.tree_util.tree_map(_zero_tangent_like, carry0),
+        y=reduced_bar.y,
+        lagged_response_cache=reduced_bar.lagged_response_cache,
+        lagged_reference_y=reduced_bar.lagged_reference_y,
+    )
+    (initial_state_bar,) = initial_state_pullback(carry0_bar)
+    return objective_value, initial_state_bar
 
 
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
@@ -1801,6 +1929,7 @@ def _run_realtime_geometry_support_segment_probe(
         support_reuse_count,
         support_rebuild_count,
         initial_cache_pullback_used,
+        initial_cache_pullback_skipped,
     ) = _reverse_objective_support_payload_bar_for_parameter_vector(
         profile_values,
         runtime=baseline_runtime,
@@ -1843,6 +1972,7 @@ def _run_realtime_geometry_support_segment_probe(
         "support_reuse_count": int(support_reuse_count),
         "support_rebuild_count": int(support_rebuild_count),
         "support_initial_cache_pullback_used": bool(initial_cache_pullback_used),
+        "support_initial_cache_pullback_skipped": bool(initial_cache_pullback_skipped),
         "elapsed_s": float(elapsed_s),
     }
     print(
@@ -1856,6 +1986,7 @@ def _run_realtime_geometry_support_segment_probe(
         f"support_reuse_count={support_reuse_count} "
         f"support_rebuild_count={support_rebuild_count} "
         f"support_initial_cache_pullback_used={initial_cache_pullback_used} "
+        f"support_initial_cache_pullback_skipped={initial_cache_pullback_skipped} "
         f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
         f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
@@ -1867,6 +1998,100 @@ def _run_realtime_geometry_support_segment_probe(
             f"  - {parameter_name}: ad={report['profile_gradient_reverse_ad'][parameter_name]:.6e}"
         )
     outpath = _report_path("realtime_geometry_support_segment")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
+def _run_realtime_geometry_initial_carry_boundary_probe(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    objective_name = "softmax_Er" if args.objective == "all" else str(args.objective)
+    objective_index = OBJECTIVE_LABELS.index(objective_name)
+    profile_values = baseline_values[: len(PARAMETER_ORDER)]
+    baseline_profile_state = _initial_state_for_parameter_vector(
+        profile_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=baseline_runtime,
+    )
+    reverse_setup = _prepare_reverse_static_setup(
+        profile_values,
+        config=config,
+        runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        accepted_step_limit_override=args.accepted_step_limit,
+        reverse_segment_length=args.reverse_segment_length,
+        reverse_direct_stage_adjoint=True,
+        reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
+        reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
+        reverse_stage_cotangent_mode=args.reverse_stage_cotangent_mode,
+        reverse_step_bwd_mode=args.reverse_step_bwd_mode,
+        reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
+        reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
+        reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
+    )
+    print(
+        "[autodiff-gate] progress: probing compact initial-carry boundary cotangent "
+        f"for {objective_name}",
+        flush=True,
+    )
+    t_start = time.perf_counter()
+    objective_value, initial_state_bar = _reverse_objective_initial_state_bar(
+        baseline_profile_state,
+        runtime=baseline_runtime,
+        reverse_setup=reverse_setup,
+        objective_index=objective_index,
+    )
+    objective_value, initial_state_bar = jax.block_until_ready((objective_value, initial_state_bar))
+    elapsed_s = time.perf_counter() - t_start
+
+    state_bar_summary = _payload_leaf_summary(initial_state_bar)
+    field_l2 = {
+        "density": _tree_array_l2_norm(initial_state_bar.density),
+        "pressure": _tree_array_l2_norm(initial_state_bar.pressure),
+        "Er": _tree_array_l2_norm(initial_state_bar.Er),
+    }
+    report = {
+        "mode": "transport_reverse_ad_only",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": objective_name,
+        "objective_value": float(np.asarray(jax.device_get(objective_value), dtype=float)),
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
+        "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+        "realtime_geometry_gradient_path": "initial_carry_boundary_probe",
+        "initial_state_bar_summary": state_bar_summary,
+        "initial_state_bar_l2": _tree_array_l2_norm(initial_state_bar),
+        "initial_state_bar_field_l2": field_l2,
+        "elapsed_s": float(elapsed_s),
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only "
+        "parameter_mode=profiles_plus_realtime_geometry "
+        "realtime_geometry_gradient_path=initial_carry_boundary_probe "
+        f"objective={objective_name} "
+        f"value={report['objective_value']:.16e} "
+        f"initial_state_bar_l2={report['initial_state_bar_l2']:.6e} "
+        f"density_bar_l2={field_l2['density']:.6e} "
+        f"pressure_bar_l2={field_l2['pressure']:.6e} "
+        f"Er_bar_l2={field_l2['Er']:.6e} "
+        f"state_bar_all_finite={state_bar_summary['all_floating_leaves_finite']} "
+        f"elapsed_s={elapsed_s:.3f}",
+        flush=True,
+    )
+    outpath = _report_path("realtime_geometry_initial_carry_boundary")
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
@@ -1959,6 +2184,17 @@ def _run_realtime_geometry_reverse_mode(
         return
     if str(args.realtime_geometry_gradient_path) == "support_segment_probe":
         _run_realtime_geometry_support_segment_probe(
+            args=args,
+            config=config,
+            baseline_values=baseline_values,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
+    if str(args.realtime_geometry_gradient_path) == "initial_carry_boundary_probe":
+        _run_realtime_geometry_initial_carry_boundary_probe(
             args=args,
             config=config,
             baseline_values=baseline_values,
@@ -2206,7 +2442,13 @@ def main() -> None:
         "--realtime-geometry-gradient-path",
         type=str,
         default="reverse_payload",
-        choices=("reverse_payload", "payload_boundary_probe", "support_pullback_probe", "support_segment_probe"),
+        choices=(
+            "reverse_payload",
+            "payload_boundary_probe",
+            "support_pullback_probe",
+            "support_segment_probe",
+            "initial_carry_boundary_probe",
+        ),
         help=(
             "Implementation used only with --reverse-parameter-mode "
             "profiles_plus_realtime_geometry. 'payload_boundary_probe' verifies "
@@ -2216,6 +2458,9 @@ def main() -> None:
             "cotangent hook that the full reverse payload path needs. "
             "'support_segment_probe' runs the realized-schedule reduced reverse "
             "replay and accumulates cotangents wrt the explicit support payload. "
+            "'initial_carry_boundary_probe' returns the compact cotangent wrt "
+            "the initial transport state, matching the profile reverse boundary "
+            "before composing with VMEC/NTX geometry parameters. "
             "'reverse_payload' is the intended final path and currently fails "
             "explicitly until the Radau accepted-step transpose returns geometry "
             "payload cotangents."
