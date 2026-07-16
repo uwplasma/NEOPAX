@@ -884,13 +884,19 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
             segment_arrays,
         )
 
+    support_reuse_count = 0
+    support_rebuild_count = 0
     for segment_index in range(segment_count - 1, -1, -1):
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         slot_arrays = _take_tree_axis0(segment_arrays, 0)
+        slot_lagged_response_valid = bool(np.asarray(jax.device_get(slot_arrays[-1])))
+        slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
+        support_reuse_count += int(slot_lagged_response_valid)
+        support_rebuild_count += int(not slot_lagged_response_valid)
         segment_support_bar = _radau_single_slot_support_cotangent_bwd_call(
             reverse_setup.execution_context,
-            cotangent_mode,
+            slot_cotangent_mode,
             next_reduced_bars_by_segment[segment_index],
             segment_start_carry,
             slot_arrays,
@@ -905,7 +911,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         lagged_reference_y=reduced_bar.lagged_reference_y,
     )
     (profile_parameter_bar,) = initial_carry_pullback(carry0_bar)
-    return objective_value, profile_parameter_bar, support_bar
+    return objective_value, profile_parameter_bar, support_bar, support_reuse_count, support_rebuild_count
 
 
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
@@ -1763,7 +1769,13 @@ def _run_realtime_geometry_support_segment_probe(
         flush=True,
     )
     t_start = time.perf_counter()
-    objective_value, profile_bar, support_bar = _reverse_objective_support_payload_bar_for_parameter_vector(
+    (
+        objective_value,
+        profile_bar,
+        support_bar,
+        support_reuse_count,
+        support_rebuild_count,
+    ) = _reverse_objective_support_payload_bar_for_parameter_vector(
         profile_values,
         runtime=baseline_runtime,
         baseline_state=baseline_state,
@@ -1802,6 +1814,8 @@ def _run_realtime_geometry_support_segment_probe(
         "support_payload_summary": support_summary,
         "support_bar_summary": support_bar_summary,
         "support_bar_l2": support_bar_l2,
+        "support_reuse_count": int(support_reuse_count),
+        "support_rebuild_count": int(support_rebuild_count),
         "elapsed_s": float(elapsed_s),
     }
     print(
@@ -1812,6 +1826,8 @@ def _run_realtime_geometry_support_segment_probe(
         f"reverse_stage_cotangent_mode_effective={support_probe_cotangent_mode} "
         f"value={report['objective_value']:.16e} "
         f"support_bar_l2={support_bar_l2:.6e} "
+        f"support_reuse_count={support_reuse_count} "
+        f"support_rebuild_count={support_rebuild_count} "
         f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
         f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
