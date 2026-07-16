@@ -2243,6 +2243,8 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         f"state_bar_all_finite={state_bar_summary['all_floating_leaves_finite']} "
         f"reduced_y_bar_all_finite="
         f"{boundary_diagnostics['reduced_y_bar_summary']['all_floating_leaves_finite']} "
+        f"reduced_lagged_cache_bar_l2="
+        f"{boundary_diagnostics['reduced_lagged_response_cache_bar_l2']:.6e} "
         f"reduced_lagged_cache_bar_all_finite="
         f"{boundary_diagnostics['reduced_lagged_response_cache_bar_summary']['all_floating_leaves_finite']} "
         f"no_lagged_cache_state_bar_all_finite="
