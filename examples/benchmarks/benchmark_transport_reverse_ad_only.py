@@ -1082,16 +1082,26 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             zero_tree,
         )
 
-    def _carry_from_parameters(p):
-        return _reverse_initial_carry_for_parameter_vector(
+    def _state_from_parameters(p):
+        return _initial_state_for_parameter_vector(
             p,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
-            reverse_setup=reverse_setup,
         )
 
-    initial_carry, initial_carry_pullback = jax.vjp(_carry_from_parameters, parameter_values)
+    initial_state, profile_state_pullback = jax.vjp(_state_from_parameters, parameter_values)
+
+    def _carry_from_state(state_value):
+        return _reverse_initial_carry_from_state_with_static_setup(
+            solver=reverse_setup.solver,
+            state=state_value,
+            solve_vector_field=reverse_setup.solve_vector_field,
+            species=runtime.species,
+            prepared_rollout_static=reverse_setup.prepared_rollout,
+        )
+
+    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
     final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         reverse_setup.execution_context,
         reverse_setup.max_total_steps,
@@ -1201,16 +1211,22 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             for objective_i in range(objective_count)
         )
 
-    def _full_carry_bar_from_reduced(reduced_bar):
-        return dataclasses.replace(
+    initial_state_bars = []
+    for objective_i in range(objective_count):
+        carry0_bar = dataclasses.replace(
             jax.tree_util.tree_map(_zero_tangent_like, carry0),
-            y=reduced_bar.y,
-            lagged_response_cache=reduced_bar.lagged_response_cache,
-            lagged_reference_y=reduced_bar.lagged_reference_y,
+            y=_take_tree_axis0(reduced_bars.y, objective_i),
+            lagged_response_cache=_take_tree_axis0(reduced_bars.lagged_response_cache, objective_i),
+            lagged_reference_y=_take_tree_axis0(reduced_bars.lagged_reference_y, objective_i),
         )
-
-    carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
-    gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
+        initial_state_bars.append(initial_state_pullback(carry0_bar)[0])
+    gradient_matrix = jnp.stack(
+        [
+            profile_state_pullback(initial_state_bars[objective_i])[0]
+            for objective_i in range(objective_count)
+        ],
+        axis=0,
+    )
     return (
         objective_values,
         gradient_matrix,
