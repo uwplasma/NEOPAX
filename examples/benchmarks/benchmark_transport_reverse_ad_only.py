@@ -21,10 +21,16 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     _adaptive_rollout_diagnostics,
+    _alpha_power_volume_average,
     _baseline_profile_cfg,
+    _electron_temperature_volume_average,
     _objective_vector,
     _parameterized_profile_set,
     _prepare_benchmark_config,
+    _smooth_root_proxy,
+    _softmax_objective,
+    _total_pressure_volume_average,
+    _volume_average,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
@@ -60,6 +66,29 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 _REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+
+
+def _objective_scalar_by_index(final_state, runtime, objective_index: int):
+    """Evaluate one objective without constructing unrelated possibly-nonfinite objectives."""
+
+    objective_name = OBJECTIVE_LABELS[int(objective_index)]
+    er = jnp.asarray(final_state.Er)
+    if objective_name == "softmax_Er":
+        return _softmax_objective(er)
+    if objective_name == "smooth_root_proxy":
+        rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
+        return _smooth_root_proxy(er, rho)
+    if objective_name == "Er2_volume_average":
+        return _volume_average(er * er, runtime.geometry)
+    if objective_name == "Er_volume_average":
+        return _volume_average(er, runtime.geometry)
+    if objective_name == "electron_temperature_volume_average_keV":
+        return _electron_temperature_volume_average(final_state, runtime)
+    if objective_name == "total_pressure_volume_average":
+        return _total_pressure_volume_average(final_state, runtime)
+    if objective_name == "alpha_power_volume_average_mw_m3":
+        return _alpha_power_volume_average(final_state, runtime)
+    raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
 
 def _benchmark_device_context(config: dict[str, Any]):
@@ -539,7 +568,7 @@ def _reverse_objective_for_parameter_vector(
         initial_carry,
     )
     final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
-    return _objective_vector(final_state, runtime)[objective_index]
+    return _objective_scalar_by_index(final_state, runtime, objective_index)
 
 
 def _reverse_objective_vector_for_parameter_vector(
@@ -826,7 +855,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
 
     def _objective_from_final_y(final_y_value):
         final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-        return _objective_vector(final_state, runtime)[objective_index]
+        return _objective_scalar_by_index(final_state, runtime, objective_index)
 
     objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
     (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
@@ -1002,7 +1031,7 @@ def _reverse_objective_initial_state_bar(
 
     def _objective_from_final_y(final_y_value):
         final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-        return _objective_vector(final_state, runtime)[objective_index]
+        return _objective_scalar_by_index(final_state, runtime, objective_index)
 
     objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
     (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
@@ -1125,7 +1154,7 @@ def _reverse_final_y_objective_cotangent_for_parameter_vector(
 
     def _objective_from_final_y(final_y_value):
         final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-        return _objective_vector(final_state, runtime)[objective_index]
+        return _objective_scalar_by_index(final_state, runtime, objective_index)
 
     objective_value = _objective_from_final_y(final_y)
     final_y_bar = jax.grad(_objective_from_final_y)(final_y)
@@ -1187,7 +1216,7 @@ def _make_reverse_gradient_split_custom_vjp_fn(
 
     def _objective_from_final_y(final_y):
         final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
-        return _objective_vector(final_state, runtime)[objective_index]
+        return _objective_scalar_by_index(final_state, runtime, objective_index)
 
     def _rollout_bwd(residuals, final_y_bar):
         (carry0_bar,) = _radau_adaptive_final_y_realized_schedule_vjp_bwd(
@@ -1453,6 +1482,7 @@ def _reverse_geometry_rollout_parts_for_parameter_vector(
     geometry_context,
     profile_cfg: dict,
     geometry_parameter_name: str,
+    fixed_initial_er=None,
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
     solver_override=None,
@@ -1479,6 +1509,11 @@ def _reverse_geometry_rollout_parts_for_parameter_vector(
         profile_cfg=profile_cfg,
         runtime=runtime,
     )
+    if fixed_initial_er is not None:
+        state0 = dataclasses.replace(
+            state0,
+            Er=jnp.asarray(fixed_initial_er, dtype=state0.Er.dtype),
+        )
     prepared_components = prepare_transport_solver_components(
         config,
         runtime,
@@ -1518,6 +1553,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
     geometry_context,
     profile_cfg: dict,
     geometry_parameter_name: str,
+    fixed_initial_er=None,
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
     solver_override=None,
@@ -1530,6 +1566,7 @@ def _reverse_geometry_objective_vector_for_parameter_vector(
             geometry_context=geometry_context,
             profile_cfg=profile_cfg,
             geometry_parameter_name=geometry_parameter_name,
+            fixed_initial_er=fixed_initial_er,
             accepted_step_limit_override=accepted_step_limit_override,
             solver_override=solver_override,
         )
@@ -1550,6 +1587,7 @@ def _make_reverse_geometry_objective_vector_with_schedule_vjp(
     geometry_context,
     profile_cfg: dict,
     geometry_parameter_name: str,
+    fixed_initial_er=None,
     accepted_step_limit_override: int | None = None,
     solver_override=None,
 ):
@@ -1561,6 +1599,7 @@ def _make_reverse_geometry_objective_vector_with_schedule_vjp(
             geometry_context=geometry_context,
             profile_cfg=profile_cfg,
             geometry_parameter_name=geometry_parameter_name,
+            fixed_initial_er=fixed_initial_er,
             accepted_step_limit_override=accepted_step_limit_override,
             solver_override=solver_override,
         )
@@ -1573,6 +1612,7 @@ def _make_reverse_geometry_objective_vector_with_schedule_vjp(
                 geometry_context=geometry_context,
                 profile_cfg=profile_cfg,
                 geometry_parameter_name=geometry_parameter_name,
+                fixed_initial_er=fixed_initial_er,
                 accepted_step_limit_override=accepted_step_limit_override,
                 solver_override=solver_override,
             )
@@ -2178,7 +2218,6 @@ def _run_realtime_geometry_reverse_mode(
         max_iter=geom_cfg.get("vmec_max_iter"),
         step_size=geom_cfg.get("vmec_step_size"),
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-        initialize_er=False,
     )
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
@@ -2246,6 +2285,7 @@ def _run_realtime_geometry_reverse_mode(
         geometry_context=geometry_context,
         profile_cfg=profile_cfg,
         geometry_parameter_name=geometry_parameter,
+        fixed_initial_er=jax.lax.stop_gradient(baseline_state.Er),
         accepted_step_limit_override=args.accepted_step_limit,
         solver_override=static_solver,
     )
