@@ -1098,6 +1098,21 @@ def _reverse_objective_initial_state_bar(
         lagged_response_cache=_radau_align_tangent_tree_to_primal(None, carry0.lagged_response_cache),
     )
     (initial_state_bar_without_lagged_cache,) = initial_state_pullback(carry0_bar_without_lagged_cache)
+    carry0_zero_bar = jax.tree_util.tree_map(_zero_tangent_like, carry0)
+    carry0_y_only_bar = dataclasses.replace(carry0_zero_bar, y=reduced_bar.y)
+    carry0_lagged_reference_only_bar = dataclasses.replace(
+        carry0_zero_bar,
+        lagged_reference_y=reduced_bar.lagged_reference_y,
+    )
+    carry0_lagged_cache_only_bar = dataclasses.replace(
+        carry0_zero_bar,
+        lagged_response_cache=reduced_bar.lagged_response_cache,
+    )
+    (initial_state_bar_y_only,) = initial_state_pullback(carry0_y_only_bar)
+    (initial_state_bar_lagged_reference_only,) = initial_state_pullback(
+        carry0_lagged_reference_only_bar
+    )
+    (initial_state_bar_lagged_cache_only,) = initial_state_pullback(carry0_lagged_cache_only_bar)
     diagnostics = {
         "reduced_y_bar_l2": _tree_array_l2_norm(reduced_bar.y),
         "reduced_y_bar_summary": _payload_leaf_summary(reduced_bar.y),
@@ -1118,6 +1133,23 @@ def _reverse_objective_initial_state_bar(
             "pressure": _tree_array_l2_norm(initial_state_bar_without_lagged_cache.pressure),
             "Er": _tree_array_l2_norm(initial_state_bar_without_lagged_cache.Er),
         },
+        "initial_state_bar_y_only_l2": _tree_array_l2_norm(initial_state_bar_y_only),
+        "initial_state_bar_y_only_summary": _payload_leaf_summary(initial_state_bar_y_only),
+        "initial_state_bar_y_only_field_l2": {
+            "density": _tree_array_l2_norm(initial_state_bar_y_only.density),
+            "pressure": _tree_array_l2_norm(initial_state_bar_y_only.pressure),
+            "Er": _tree_array_l2_norm(initial_state_bar_y_only.Er),
+        },
+        "initial_state_bar_lagged_reference_only_l2": _tree_array_l2_norm(
+            initial_state_bar_lagged_reference_only
+        ),
+        "initial_state_bar_lagged_reference_only_summary": _payload_leaf_summary(
+            initial_state_bar_lagged_reference_only
+        ),
+        "initial_state_bar_lagged_cache_only_l2": _tree_array_l2_norm(initial_state_bar_lagged_cache_only),
+        "initial_state_bar_lagged_cache_only_summary": _payload_leaf_summary(
+            initial_state_bar_lagged_cache_only
+        ),
     }
     return objective_value, initial_state_bar, diagnostics
 
@@ -2163,6 +2195,12 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         f"{boundary_diagnostics['reduced_lagged_response_cache_bar_summary']['all_floating_leaves_finite']} "
         f"no_lagged_cache_state_bar_all_finite="
         f"{boundary_diagnostics['initial_state_bar_without_lagged_cache_summary']['all_floating_leaves_finite']} "
+        f"y_only_state_bar_all_finite="
+        f"{boundary_diagnostics['initial_state_bar_y_only_summary']['all_floating_leaves_finite']} "
+        f"lagged_reference_only_state_bar_all_finite="
+        f"{boundary_diagnostics['initial_state_bar_lagged_reference_only_summary']['all_floating_leaves_finite']} "
+        f"lagged_cache_only_state_bar_all_finite="
+        f"{boundary_diagnostics['initial_state_bar_lagged_cache_only_summary']['all_floating_leaves_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
         flush=True,
     )
