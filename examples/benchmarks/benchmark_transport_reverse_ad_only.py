@@ -1077,19 +1077,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             zero_tree,
         )
 
-    def _batched_zero_support_like(support, batch_size: int):
-        zero_tree = _radau_zero_support_delta_tree_like(support)
-        return jax.tree_util.tree_map(
-            lambda leaf: jnp.broadcast_to(
-                jnp.asarray(leaf)[None, ...],
-                (batch_size,) + jnp.asarray(leaf).shape,
-            ),
-            zero_tree,
-        )
-
-    def _add_batched_support_bars(lhs, rhs):
-        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
-
     def _carry_from_parameters(p):
         return _reverse_initial_carry_for_parameter_vector(
             p,
@@ -1155,7 +1142,10 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
         ),
     )
-    support_bars = _batched_zero_support_like(support_payload, objective_count)
+    support_bars = tuple(
+        _radau_zero_support_delta_tree_like(support_payload)
+        for _ in range(objective_count)
+    )
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
@@ -1172,17 +1162,21 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
         support_reuse_count += int(slot_lagged_response_valid)
         support_rebuild_count += int(not slot_lagged_response_valid)
-        segment_support_bars = jax.vmap(
-            lambda reduced_bar: _radau_single_slot_support_cotangent_bwd_call(
-                reverse_setup.execution_context,
-                slot_cotangent_mode,
-                reduced_bar,
-                segment_start_carry,
-                slot_arrays,
+        support_bars = tuple(
+            _radau_add_support_delta_trees(
+                support_bars[objective_i],
+                _radau_single_slot_support_cotangent_bwd_call(
+                    reverse_setup.execution_context,
+                    slot_cotangent_mode,
+                    _take_tree_axis0(reduced_bars, objective_i),
+                    segment_start_carry,
+                    slot_arrays,
+                    support_payload,
+                ),
                 support_payload,
             )
-        )(reduced_bars)
-        support_bars = _add_batched_support_bars(support_bars, segment_support_bars)
+            for objective_i in range(objective_count)
+        )
         reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
             reverse_setup.execution_context,
             cotangent_mode,
@@ -2410,15 +2404,12 @@ def _run_realtime_geometry_support_segment_probe(
         )
         elapsed_s = time.perf_counter() - t_start
 
-        def _take_axis0(tree, index: int):
-            return jax.tree_util.tree_map(lambda value: value[index], tree)
-
         objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
         profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
         for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
-            support_bar = _take_axis0(support_bars, objective_i)
+            support_bar = support_bars[objective_i]
             support_bar_summary_by_objective[objective_name] = _payload_leaf_summary(support_bar)
             support_bar_l2_by_objective[objective_name] = _tree_array_l2_norm(support_bar)
 
