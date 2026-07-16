@@ -906,6 +906,22 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         )
         support_bar = _radau_add_support_delta_trees(support_bar, segment_support_bar, support_payload)
 
+    initial_cache_pullback_used = False
+    initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
+    build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
+    if initial_lagged_response_valid and build_support_pullback is not None:
+        initial_cache_support_bar = build_support_pullback(
+            carry0.y,
+            reduced_bar.lagged_response_cache,
+            support_payload,
+        )
+        support_bar = _radau_add_support_delta_trees(
+            support_bar,
+            initial_cache_support_bar,
+            support_payload,
+        )
+        initial_cache_pullback_used = True
+
     carry0_bar = dataclasses.replace(
         jax.tree_util.tree_map(_zero_tangent_like, carry0),
         y=reduced_bar.y,
@@ -913,7 +929,14 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         lagged_reference_y=reduced_bar.lagged_reference_y,
     )
     (profile_parameter_bar,) = initial_carry_pullback(carry0_bar)
-    return objective_value, profile_parameter_bar, support_bar, support_reuse_count, support_rebuild_count
+    return (
+        objective_value,
+        profile_parameter_bar,
+        support_bar,
+        support_reuse_count,
+        support_rebuild_count,
+        initial_cache_pullback_used,
+    )
 
 
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
@@ -1777,6 +1800,7 @@ def _run_realtime_geometry_support_segment_probe(
         support_bar,
         support_reuse_count,
         support_rebuild_count,
+        initial_cache_pullback_used,
     ) = _reverse_objective_support_payload_bar_for_parameter_vector(
         profile_values,
         runtime=baseline_runtime,
@@ -1818,6 +1842,7 @@ def _run_realtime_geometry_support_segment_probe(
         "support_bar_l2": support_bar_l2,
         "support_reuse_count": int(support_reuse_count),
         "support_rebuild_count": int(support_rebuild_count),
+        "support_initial_cache_pullback_used": bool(initial_cache_pullback_used),
         "elapsed_s": float(elapsed_s),
     }
     print(
@@ -1830,6 +1855,7 @@ def _run_realtime_geometry_support_segment_probe(
         f"support_bar_l2={support_bar_l2:.6e} "
         f"support_reuse_count={support_reuse_count} "
         f"support_rebuild_count={support_rebuild_count} "
+        f"support_initial_cache_pullback_used={initial_cache_pullback_used} "
         f"support_bar_array_leaves={support_bar_summary['n_array_leaves']} "
         f"support_bar_all_finite={support_bar_summary['all_floating_leaves_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
