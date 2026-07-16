@@ -1082,26 +1082,16 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             zero_tree,
         )
 
-    def _state_from_parameters(p):
-        return _initial_state_for_parameter_vector(
+    def _carry_from_parameters(p):
+        return _reverse_initial_carry_for_parameter_vector(
             p,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
         )
 
-    initial_state, profile_state_pullback = jax.vjp(_state_from_parameters, parameter_values)
-
-    def _carry_from_state(state_value):
-        return _reverse_initial_carry_from_state_with_static_setup(
-            solver=reverse_setup.solver,
-            state=state_value,
-            solve_vector_field=reverse_setup.solve_vector_field,
-            species=runtime.species,
-            prepared_rollout_static=reverse_setup.prepared_rollout,
-        )
-
-    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
+    initial_carry, initial_carry_pullback = jax.vjp(_carry_from_parameters, parameter_values)
     final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         reverse_setup.execution_context,
         reverse_setup.max_total_steps,
@@ -1110,14 +1100,19 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         initial_carry,
     )
 
-    def _objective_vector_from_final_y(final_y_value):
-        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-        return _objective_vector(final_state, runtime)
-
-    objective_values, objective_pullback = jax.vjp(_objective_vector_from_final_y, final_y)
     objective_count = int(len(OBJECTIVE_LABELS))
-    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
-    final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
+    objective_values_rows = []
+    final_y_bar_rows = []
+    for objective_i in range(objective_count):
+        def _objective_from_final_y(final_y_value, objective_index=objective_i):
+            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+            return _objective_scalar_by_index(final_state, runtime, objective_index)
+
+        objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
+        objective_values_rows.append(objective_value)
+        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
+    objective_values = jnp.stack(objective_values_rows, axis=0)
+    final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
 
     (
         carry0,
@@ -1165,6 +1160,19 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    next_reduced_bars_by_segment = [None] * segment_count
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        next_reduced_bars_by_segment[segment_index] = reduced_bars
+        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+        )
+
     support_reuse_count = 0
     support_rebuild_count = 0
     for segment_index in range(segment_count - 1, -1, -1):
@@ -1183,7 +1191,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
                 _radau_single_slot_support_cotangent_bwd_call(
                     reverse_setup.execution_context,
                     slot_cotangent_mode,
-                    _take_tree_axis0(reduced_bars, objective_i),
+                    _take_tree_axis0(next_reduced_bars_by_segment[segment_index], objective_i),
                     segment_start_carry,
                     slot_arrays,
                     support_payload,
@@ -1192,38 +1200,17 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             )
             for objective_i in range(objective_count)
         )
-        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
-            reverse_setup.execution_context,
-            cotangent_mode,
-            reduced_bars,
-            segment_start_carry,
-            segment_arrays,
+
+    def _full_carry_bar_from_reduced(reduced_bar):
+        return dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry0),
+            y=reduced_bar.y,
+            lagged_response_cache=reduced_bar.lagged_response_cache,
+            lagged_reference_y=reduced_bar.lagged_reference_y,
         )
 
-    initial_state_bars = [
-        initial_state_pullback(
-            dataclasses.replace(
-                jax.tree_util.tree_map(_zero_tangent_like, carry0),
-                y=_take_tree_axis0(reduced_bars.y, objective_i),
-                lagged_response_cache=_take_tree_axis0(
-                    reduced_bars.lagged_response_cache,
-                    objective_i,
-                ),
-                lagged_reference_y=_take_tree_axis0(
-                    reduced_bars.lagged_reference_y,
-                    objective_i,
-                ),
-            )
-        )[0]
-        for objective_i in range(objective_count)
-    ]
-    gradient_matrix = jnp.stack(
-        [
-            profile_state_pullback(initial_state_bars[objective_i])[0]
-            for objective_i in range(objective_count)
-        ],
-        axis=0,
-    )
+    carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
+    gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
     return (
         objective_values,
         gradient_matrix,
@@ -2470,60 +2457,60 @@ def _run_realtime_geometry_support_segment_probe(
             f"for {geometry_parameter_name}",
             flush=True,
         )
-        _support_baseline_for_pullback, geometry_support_pullback = jax.vjp(
-            _support_from_geometry_deltas,
+        support_template = _support_from_geometry_deltas(baseline_geometry_deltas)
+        support_template = jax.block_until_ready(support_template)
+        support_template_leaves = jax.tree_util.tree_leaves(support_template)
+        support_float_leaf_indices = tuple(
+            leaf_i
+            for leaf_i, leaf in enumerate(support_template_leaves)
+            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        )
+
+        def _support_float_leaves_from_geometry_deltas(geometry_deltas):
+            support_tree = _support_from_geometry_deltas(geometry_deltas)
+            support_leaves = jax.tree_util.tree_leaves(support_tree)
+            return tuple(jnp.asarray(support_leaves[leaf_i]) for leaf_i in support_float_leaf_indices)
+
+        _support_float_baseline, geometry_support_float_pullback = jax.vjp(
+            _support_float_leaves_from_geometry_deltas,
             baseline_geometry_deltas,
         )
-        _support_baseline_for_pullback = jax.block_until_ready(_support_baseline_for_pullback)
+        _support_float_baseline = jax.block_until_ready(_support_float_baseline)
         print(
             "[autodiff-gate] progress: geometry support pullback ready "
+            f"floating_support_leaves={len(support_float_leaf_indices)} "
             f"elapsed_s={time.perf_counter() - t_phase:.3f}",
             flush=True,
         )
 
-        def _support_bars_for_geometry_vjp(primal_tree, bar_trees):
-            def _leaf(primal_leaf, *bar_leaves):
-                arr = jnp.asarray(primal_leaf)
-                if jnp.issubdtype(arr.dtype, jnp.inexact):
-                    return jnp.stack([jnp.asarray(leaf, dtype=arr.dtype) for leaf in bar_leaves], axis=0)
-                return jnp.zeros(
-                    (len(bar_trees),) + arr.shape,
-                    dtype=jnp.float64,
-                )
-
-            return jax.tree_util.tree_map(_leaf, primal_tree, *bar_trees)
-
         t_phase = time.perf_counter()
         print(
-            "[autodiff-gate] progress: applying metadata-aligned batched geometry support pullback "
+            "[autodiff-gate] progress: applying flat array-leaf batched geometry support pullback "
             f"for {len(OBJECTIVE_LABELS)} objectives",
             flush=True,
         )
-        try:
-            batched_support_bars = _support_bars_for_geometry_vjp(
-                _support_baseline_for_pullback,
-                support_bars,
+        support_bar_leaves_by_objective = tuple(
+            jax.tree_util.tree_leaves(support_bar) for support_bar in support_bars
+        )
+        batched_support_float_bars = tuple(
+            jnp.stack(
+                [
+                    jnp.asarray(
+                        support_bar_leaves_by_objective[objective_i][leaf_i],
+                        dtype=jnp.asarray(support_template_leaves[leaf_i]).dtype,
+                    )
+                    for objective_i in range(len(OBJECTIVE_LABELS))
+                ],
+                axis=0,
             )
-            geometry_gradient_matrix = jax.vmap(
-                lambda support_bar: geometry_support_pullback(support_bar)[0]
-            )(batched_support_bars)
-            geometry_pullback_mode = "metadata_aligned_batched"
-        except Exception as exc:
-            print(
-                "[autodiff-gate] metadata-aligned batched geometry support pullback failed; "
-                f"falling back to row-wise pullback ({type(exc).__name__}: {exc})",
-                flush=True,
-            )
-            geometry_gradient_rows = []
-            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
-                print(
-                    "[autodiff-gate] progress: geometry support pullback "
-                    f"{objective_i + 1}/{len(OBJECTIVE_LABELS)}: {objective_name}",
-                    flush=True,
-                )
-                geometry_gradient_rows.append(geometry_support_pullback(support_bars[objective_i])[0])
-            geometry_gradient_matrix = jnp.stack(geometry_gradient_rows, axis=0)
-            geometry_pullback_mode = "rowwise_fallback"
+            for leaf_i in support_float_leaf_indices
+        )
+        geometry_gradient_matrix = jax.vmap(
+            lambda *support_bar_float_leaves: geometry_support_float_pullback(
+                tuple(support_bar_float_leaves)
+            )[0]
+        )(*batched_support_float_bars)
+        geometry_pullback_mode = "flat_array_leaf_batched"
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
         print(
             "[autodiff-gate] progress: geometry support pullback complete "
