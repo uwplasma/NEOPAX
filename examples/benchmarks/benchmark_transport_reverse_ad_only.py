@@ -2488,28 +2488,46 @@ def _run_realtime_geometry_support_segment_probe(
                     return jnp.stack([jnp.asarray(leaf, dtype=arr.dtype) for leaf in bar_leaves], axis=0)
                 return jnp.zeros(
                     (len(bar_trees),) + arr.shape,
-                    dtype=jax.dtypes.float0,
+                    dtype=jnp.float64,
                 )
 
             return jax.tree_util.tree_map(_leaf, primal_tree, *bar_trees)
 
         t_phase = time.perf_counter()
         print(
-            "[autodiff-gate] progress: applying batched geometry support pullback "
+            "[autodiff-gate] progress: applying metadata-aligned batched geometry support pullback "
             f"for {len(OBJECTIVE_LABELS)} objectives",
             flush=True,
         )
-        batched_support_bars = _support_bars_for_geometry_vjp(
-            _support_baseline_for_pullback,
-            support_bars,
-        )
-        geometry_gradient_matrix = jax.vmap(
-            lambda support_bar: geometry_support_pullback(support_bar)[0]
-        )(batched_support_bars)
+        try:
+            batched_support_bars = _support_bars_for_geometry_vjp(
+                _support_baseline_for_pullback,
+                support_bars,
+            )
+            geometry_gradient_matrix = jax.vmap(
+                lambda support_bar: geometry_support_pullback(support_bar)[0]
+            )(batched_support_bars)
+            geometry_pullback_mode = "metadata_aligned_batched"
+        except Exception as exc:
+            print(
+                "[autodiff-gate] metadata-aligned batched geometry support pullback failed; "
+                f"falling back to row-wise pullback ({type(exc).__name__}: {exc})",
+                flush=True,
+            )
+            geometry_gradient_rows = []
+            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
+                print(
+                    "[autodiff-gate] progress: geometry support pullback "
+                    f"{objective_i + 1}/{len(OBJECTIVE_LABELS)}: {objective_name}",
+                    flush=True,
+                )
+                geometry_gradient_rows.append(geometry_support_pullback(support_bars[objective_i])[0])
+            geometry_gradient_matrix = jnp.stack(geometry_gradient_rows, axis=0)
+            geometry_pullback_mode = "rowwise_fallback"
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
         print(
-            "[autodiff-gate] progress: batched geometry support pullback complete "
-            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            "[autodiff-gate] progress: geometry support pullback complete "
+            f"mode={geometry_pullback_mode} elapsed_s={time.perf_counter() - t_phase:.3f}",
             flush=True,
         )
         elapsed_s = time.perf_counter() - t_start
@@ -2573,6 +2591,7 @@ def _run_realtime_geometry_support_segment_probe(
             ),
             "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             "realtime_geometry_gradient_path": "support_segment_probe",
+            "geometry_support_pullback_mode": geometry_pullback_mode,
             "support_payload_summary": support_summary,
             "support_bar_summary_by_objective": support_bar_summary_by_objective,
             "support_bar_l2_by_objective": support_bar_l2_by_objective,
