@@ -3860,6 +3860,44 @@ def build_ntx_exact_lij_support_from_vmec_state(
     )
 
 
+def build_ntx_exact_lij_support_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    lane: str = "ad",
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "booz",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    jacobian_penalty: float = 1.0e3,
+):
+    """Build differentiable NTX support from VMEC boundary-harmonic deltas."""
+
+    state = _solve_state_for_param_vector(
+        context,
+        param_deltas,
+        param_specs,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    geometry = _build_neopax_geometry_from_state(context, state, n_r=n_r)
+    return build_ntx_exact_lij_support_from_vmec_state(
+        context,
+        state,
+        geometry,
+        n_theta=int(n_theta),
+        n_zeta=int(n_zeta),
+        n_xi=int(n_xi),
+        surface_backend=str(surface_backend),
+    )
+
+
 def build_neopax_geometry_from_single_param(
     context: GeometryAutodiffContext,
     param_delta,

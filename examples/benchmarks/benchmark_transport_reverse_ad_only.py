@@ -34,6 +34,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
+    build_ntx_exact_lij_support_from_param_vector,
     build_runtime_context_for_geometry_param,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
@@ -317,6 +318,10 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
 
 def _reverse_geometry_parameter_order(geometry_parameter: str) -> tuple[str, ...]:
     return (*PARAMETER_ORDER, _format_reverse_geometry_parameter(geometry_parameter))
+
+
+def _geometry_param_specs_from_parameter_name(geometry_parameter: str) -> tuple[tuple[str, int, int], ...]:
+    return (_parse_reverse_geometry_parameter(geometry_parameter),)
 
 
 def _add_trees(lhs, rhs):
@@ -2402,10 +2407,64 @@ def _run_realtime_geometry_support_segment_probe(
         objective_values, profile_gradient_matrix, support_bars = jax.block_until_ready(
             (objective_values, profile_gradient_matrix, support_bars)
         )
+
+        geom_cfg = config.get("geometry", {})
+        geometry_parameter_name = str(args.reverse_geometry_parameter)
+        geometry_context = _geometry_context_from_config(config, geometry_parameter_name)
+        geometry_param_specs = _geometry_param_specs_from_parameter_name(geometry_parameter_name)
+        baseline_geometry_deltas = jnp.asarray(
+            [float(geom_cfg.get("vmec_param_delta", 0.0))],
+            dtype=jnp.float64,
+        )
+
+        def _support_from_geometry_deltas(geometry_deltas):
+            return build_ntx_exact_lij_support_from_param_vector(
+                geometry_context,
+                geometry_deltas,
+                geometry_param_specs,
+                lane="ad",
+                n_r=int(geom_cfg.get("n_radial", 51)),
+                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+                max_iter=geom_cfg.get("vmec_max_iter"),
+                step_size=geom_cfg.get("vmec_step_size"),
+                jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+            )
+
+        _support_baseline_for_pullback, geometry_support_pullback = jax.vjp(
+            _support_from_geometry_deltas,
+            baseline_geometry_deltas,
+        )
+
+        def _support_bar_for_geometry_vjp(primal_tree, bar_tree):
+            def _leaf(primal_leaf, bar_leaf):
+                arr = jnp.asarray(primal_leaf)
+                if jnp.issubdtype(arr.dtype, jnp.inexact):
+                    return jnp.asarray(bar_leaf, dtype=arr.dtype)
+                return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+            return jax.tree_util.tree_map(_leaf, primal_tree, bar_tree)
+
+        geometry_gradient_matrix = jnp.stack(
+            [
+                geometry_support_pullback(
+                    _support_bar_for_geometry_vjp(
+                        _support_baseline_for_pullback,
+                        support_bars[objective_i],
+                    )
+                )[0]
+                for objective_i in range(len(OBJECTIVE_LABELS))
+            ],
+            axis=0,
+        )
+        geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
         elapsed_s = time.perf_counter() - t_start
 
         objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
         profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
+        geometry_gradient_np = np.asarray(jax.device_get(geometry_gradient_matrix), dtype=float)
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
         for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
@@ -2434,6 +2493,19 @@ def _run_realtime_geometry_support_segment_probe(
                     )
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "geometry_gradient_reverse_ad": {
+                objective_name: {
+                    _format_reverse_geometry_parameter(geometry_parameter_name): float(
+                        geometry_gradient_np[objective_i, 0]
+                    )
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "geometry_baseline_values": {
+                _format_reverse_geometry_parameter(geometry_parameter_name): float(
+                    np.asarray(jax.device_get(baseline_geometry_deltas[0]), dtype=float)
+                )
             },
             "accepted_step_limit": None
             if args.accepted_step_limit is None
@@ -2476,6 +2548,11 @@ def _run_realtime_geometry_support_segment_probe(
             for parameter_name in PARAMETER_ORDER:
                 value = report["profile_gradient_reverse_ad"][objective_name][parameter_name]
                 print(f"      d{objective_name}/d{parameter_name}: ad={value:.6e}")
+        geometry_label = _format_reverse_geometry_parameter(geometry_parameter_name)
+        print("[autodiff-gate] reverse geometry gradients by objective:")
+        for objective_name in OBJECTIVE_LABELS:
+            value = report["geometry_gradient_reverse_ad"][objective_name][geometry_label]
+            print(f"  - d{objective_name}/d{geometry_label}: ad={value:.6e}")
         print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
         for objective_name in OBJECTIVE_LABELS:
             summary = support_bar_summary_by_objective[objective_name]
