@@ -1028,6 +1028,187 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
     )
 
 
+def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
+    parameter_values,
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict,
+    reverse_setup: _ReverseStaticSetup,
+    support_payload,
+):
+    """Return all objective values, profile gradients, and realtime support cotangents."""
+
+    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
+        raise ValueError("support payload reverse probe requires --reverse-segment-length.")
+    if int(reverse_setup.reverse_segment_length) != 1:
+        raise ValueError("support payload reverse probe currently requires --reverse-segment-length 1.")
+    step_bwd_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower()
+    if step_bwd_mode not in {
+        "reduced_cotangent",
+        "reduced_cotangent_lean_replay",
+        "reduced_cotangent_recompute_replay",
+        "lean_replay",
+        "recompute_replay",
+        "reduced",
+        "state_only",
+        "final_state",
+    }:
+        raise ValueError("support payload reverse probe requires a reduced-cotangent reverse step bwd mode.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
+        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
+        )
+
+    def _batched_zero_support_like(support, batch_size: int):
+        zero_tree = _radau_zero_support_delta_tree_like(support)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
+        )
+
+    def _add_batched_support_bars(lhs, rhs):
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+    def _carry_from_parameters(p):
+        return _reverse_initial_carry_for_parameter_vector(
+            p,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+        )
+
+    initial_carry, initial_carry_pullback = jax.vjp(_carry_from_parameters, parameter_values)
+    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_vector_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)
+
+    objective_values, objective_pullback = jax.vjp(_objective_vector_from_final_y, final_y)
+    objective_count = int(len(OBJECTIVE_LABELS))
+    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
+    final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
+
+    (
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    ) = residuals
+    del (
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+        raise ValueError("support payload reverse probe requires segmented reverse residuals.")
+
+    reduced_bars = _RadauAcceptedStepReducedCotangent(
+        y=final_y_bars,
+        lagged_response_cache=_batched_zero_tangent_tree_like(
+            segmented_final_carry.lagged_response_cache,
+            objective_count,
+        ),
+        lagged_reference_y=jnp.zeros(
+            (objective_count,) + jnp.shape(segmented_final_carry.lagged_reference_y),
+            dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
+        ),
+    )
+    support_bars = _batched_zero_support_like(support_payload, objective_count)
+    cotangent_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+    ).strip().lower()
+    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    support_reuse_count = 0
+    support_rebuild_count = 0
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        slot_arrays = _take_tree_axis0(segment_arrays, 0)
+        slot_lagged_response_valid = bool(
+            np.asarray(jax.device_get(segment_start_carry.lagged_response_valid))
+        )
+        slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
+        support_reuse_count += int(slot_lagged_response_valid)
+        support_rebuild_count += int(not slot_lagged_response_valid)
+        segment_support_bars = jax.vmap(
+            lambda reduced_bar: _radau_single_slot_support_cotangent_bwd_call(
+                reverse_setup.execution_context,
+                slot_cotangent_mode,
+                reduced_bar,
+                segment_start_carry,
+                slot_arrays,
+                support_payload,
+            )
+        )(reduced_bars)
+        support_bars = _add_batched_support_bars(support_bars, segment_support_bars)
+        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+        )
+
+    carry0_bars = jax.vmap(
+        lambda reduced_bar: dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry0),
+            y=reduced_bar.y,
+            lagged_response_cache=reduced_bar.lagged_response_cache,
+            lagged_reference_y=reduced_bar.lagged_reference_y,
+        )
+    )(reduced_bars)
+    gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
+    return (
+        objective_values,
+        gradient_matrix,
+        support_bars,
+        support_reuse_count,
+        support_rebuild_count,
+    )
+
+
 def _reverse_objective_initial_state_bar(
     initial_state,
     *,
@@ -1204,6 +1385,145 @@ def _reverse_objective_initial_state_bar(
         ),
     }
     return objective_value, initial_state_bar, diagnostics
+
+
+def _reverse_all_objectives_initial_state_boundary(
+    initial_state,
+    *,
+    runtime,
+    reverse_setup: _ReverseStaticSetup,
+):
+    """Return all objective values and compact initial-state cotangents."""
+
+    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
+        raise ValueError("initial-carry boundary probe requires --reverse-segment-length.")
+    step_bwd_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
+    ).strip().lower()
+    if step_bwd_mode not in {
+        "reduced_cotangent",
+        "reduced_cotangent_lean_replay",
+        "reduced_cotangent_recompute_replay",
+        "lean_replay",
+        "recompute_replay",
+        "reduced",
+        "state_only",
+        "final_state",
+    }:
+        raise ValueError("initial-carry boundary probe requires a reduced-cotangent reverse step bwd mode.")
+
+    def _zero_tangent_like(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.zeros_like(arr)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    def _take_tree_axis0(tree, index: int):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
+        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
+        )
+
+    def _carry_from_state(state_value):
+        return _reverse_initial_carry_from_state_with_static_setup(
+            solver=reverse_setup.solver,
+            state=state_value,
+            solve_vector_field=reverse_setup.solve_vector_field,
+            species=runtime.species,
+            prepared_rollout_static=reverse_setup.prepared_rollout,
+        )
+
+    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
+    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        reverse_setup.execution_context,
+        reverse_setup.max_total_steps,
+        reverse_setup.stop_after_accepted_steps,
+        reverse_setup.reverse_segment_length,
+        initial_carry,
+    )
+
+    def _objective_vector_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_vector(final_state, runtime)
+
+    objective_values, objective_pullback = jax.vjp(_objective_vector_from_final_y, final_y)
+    objective_count = int(len(OBJECTIVE_LABELS))
+    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
+    final_y_bars = jax.vmap(lambda basis: objective_pullback(basis)[0])(objective_basis)
+
+    (
+        carry0,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    ) = residuals
+    del (
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+    )
+    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
+        raise ValueError("initial-carry boundary probe requires segmented reverse residuals.")
+
+    reduced_bars = _RadauAcceptedStepReducedCotangent(
+        y=final_y_bars,
+        lagged_response_cache=_batched_zero_tangent_tree_like(
+            segmented_final_carry.lagged_response_cache,
+            objective_count,
+        ),
+        lagged_reference_y=jnp.zeros(
+            (objective_count,) + jnp.shape(segmented_final_carry.lagged_reference_y),
+            dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
+        ),
+    )
+    cotangent_mode = str(
+        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
+    ).strip().lower()
+    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+        )
+
+    def _full_carry_bar_from_reduced(reduced_bar):
+        return dataclasses.replace(
+            jax.tree_util.tree_map(_zero_tangent_like, carry0),
+            y=reduced_bar.y,
+            lagged_response_cache=reduced_bar.lagged_response_cache,
+            lagged_reference_y=reduced_bar.lagged_reference_y,
+        )
+
+    carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
+    initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(
+        carry0_bars
+    )
+    return objective_values, initial_state_bars, reduced_bars
 
 
 def _reverse_final_y_objective_cotangent_for_parameter_vector(
@@ -2045,8 +2365,6 @@ def _run_realtime_geometry_support_segment_probe(
     neoclassical_cfg: dict[str, Any],
 ):
     support_payload = _find_ntx_support_payload(baseline_runtime)
-    objective_name = "softmax_Er" if args.objective == "all" else str(args.objective)
-    objective_index = OBJECTIVE_LABELS.index(objective_name)
     profile_values = baseline_values[: len(PARAMETER_ORDER)]
     support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
     reverse_setup = _prepare_reverse_static_setup(
@@ -2066,6 +2384,123 @@ def _run_realtime_geometry_support_segment_probe(
         reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
         reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
     )
+    if args.objective == "all":
+        print(
+            "[autodiff-gate] progress: probing realized-schedule reverse support payload cotangents "
+            "for all objectives",
+            flush=True,
+        )
+        t_start = time.perf_counter()
+        (
+            objective_values,
+            profile_gradient_matrix,
+            support_bars,
+            support_reuse_count,
+            support_rebuild_count,
+        ) = _reverse_all_objectives_support_payload_bar_for_parameter_vector(
+            profile_values,
+            runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            reverse_setup=reverse_setup,
+            support_payload=support_payload,
+        )
+        objective_values, profile_gradient_matrix, support_bars = jax.block_until_ready(
+            (objective_values, profile_gradient_matrix, support_bars)
+        )
+        elapsed_s = time.perf_counter() - t_start
+
+        def _take_axis0(tree, index: int):
+            return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+        objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+        profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
+        support_bar_summary_by_objective = {}
+        support_bar_l2_by_objective = {}
+        for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
+            support_bar = _take_axis0(support_bars, objective_i)
+            support_bar_summary_by_objective[objective_name] = _payload_leaf_summary(support_bar)
+            support_bar_l2_by_objective[objective_name] = _tree_array_l2_norm(support_bar)
+
+        support_summary = _payload_leaf_summary(support_payload)
+        report = {
+            "mode": "transport_reverse_ad_only",
+            "parameter_mode": str(args.reverse_parameter_mode),
+            "config_path": str(Path(args.config)),
+            "objective_name": "all",
+            "objective_order": list(OBJECTIVE_LABELS),
+            "parameter_order": list(PARAMETER_ORDER),
+            "profile_baseline_values": np.asarray(jax.device_get(profile_values), dtype=float).tolist(),
+            "objective_values": {
+                name: float(value) for name, value in zip(OBJECTIVE_LABELS, objective_values_np.tolist())
+            },
+            "profile_gradient_reverse_ad": {
+                objective_name: {
+                    parameter_name: float(value)
+                    for parameter_name, value in zip(
+                        PARAMETER_ORDER,
+                        profile_gradient_np[objective_i].tolist(),
+                    )
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "accepted_step_limit": None
+            if args.accepted_step_limit is None
+            else int(args.accepted_step_limit),
+            "reverse_segment_length": None
+            if args.reverse_segment_length is None
+            else int(args.reverse_segment_length),
+            "reverse_stage_cotangent_mode_requested": str(args.reverse_stage_cotangent_mode),
+            "reverse_stage_cotangent_mode_effective": support_probe_cotangent_mode,
+            "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "ntx_exact_derivative_field_pullback_mode": str(
+                args.ntx_exact_derivative_field_pullback_mode
+            ),
+            "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+            "realtime_geometry_gradient_path": "support_segment_probe",
+            "support_payload_summary": support_summary,
+            "support_bar_summary_by_objective": support_bar_summary_by_objective,
+            "support_bar_l2_by_objective": support_bar_l2_by_objective,
+            "support_reuse_count": int(support_reuse_count),
+            "support_rebuild_count": int(support_rebuild_count),
+            "elapsed_s": float(elapsed_s),
+        }
+        print(
+            "[autodiff-gate] mode=transport_reverse_ad_only "
+            "parameter_mode=profiles_plus_realtime_geometry "
+            "realtime_geometry_gradient_path=support_segment_probe "
+            "objective=all "
+            f"reverse_stage_cotangent_mode_effective={support_probe_cotangent_mode} "
+            f"support_reuse_count={support_reuse_count} "
+            f"support_rebuild_count={support_rebuild_count} "
+            f"elapsed_s={elapsed_s:.3f}",
+            flush=True,
+        )
+        print("[autodiff-gate] objective values:")
+        for objective_name, value in report["objective_values"].items():
+            print(f"  - {objective_name}: value={value:.16e}")
+        print("[autodiff-gate] reverse profile gradients by objective:")
+        for objective_name in OBJECTIVE_LABELS:
+            print(f"  - {objective_name}:")
+            for parameter_name in PARAMETER_ORDER:
+                value = report["profile_gradient_reverse_ad"][objective_name][parameter_name]
+                print(f"      d{objective_name}/d{parameter_name}: ad={value:.6e}")
+        print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
+        for objective_name in OBJECTIVE_LABELS:
+            summary = support_bar_summary_by_objective[objective_name]
+            print(
+                f"  - {objective_name}: "
+                f"support_bar_l2={support_bar_l2_by_objective[objective_name]:.6e} "
+                f"support_bar_array_leaves={summary['n_array_leaves']} "
+                f"support_bar_all_finite={summary['all_floating_leaves_finite']}"
+            )
+        outpath = _report_path("realtime_geometry_support_segment")
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
+
+    objective_name = str(args.objective)
+    objective_index = OBJECTIVE_LABELS.index(objective_name)
     print(
         "[autodiff-gate] progress: probing realized-schedule reverse support payload cotangent "
         f"for {objective_name}",
@@ -2162,15 +2597,16 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
     profile_cfg: dict,
     neoclassical_cfg: dict[str, Any],
 ):
-    objective_name = "softmax_Er" if args.objective == "all" else str(args.objective)
-    objective_index = OBJECTIVE_LABELS.index(objective_name)
     profile_values = baseline_values[: len(PARAMETER_ORDER)]
-    baseline_profile_state = _initial_state_for_parameter_vector(
-        profile_values,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        runtime=baseline_runtime,
-    )
+    def _state_from_profiles(values):
+        return _initial_state_for_parameter_vector(
+            values,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            runtime=baseline_runtime,
+        )
+
+    baseline_profile_state, profile_state_pullback = jax.vjp(_state_from_profiles, profile_values)
     reverse_setup = _prepare_reverse_static_setup(
         profile_values,
         config=config,
@@ -2188,6 +2624,143 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
         reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
     )
+    if args.objective == "all":
+        print(
+            "[autodiff-gate] progress: probing compact initial-carry boundary cotangents "
+            "for all objectives",
+            flush=True,
+        )
+        t_start = time.perf_counter()
+        objective_values, initial_state_bars, reduced_bars = (
+            _reverse_all_objectives_initial_state_boundary(
+                baseline_profile_state,
+                runtime=baseline_runtime,
+                reverse_setup=reverse_setup,
+            )
+        )
+        profile_gradient_matrix = jax.vmap(
+            lambda state_bar: profile_state_pullback(state_bar)[0]
+        )(initial_state_bars)
+        objective_values, initial_state_bars, reduced_bars, profile_gradient_matrix = (
+            jax.block_until_ready(
+                (objective_values, initial_state_bars, reduced_bars, profile_gradient_matrix)
+            )
+        )
+        elapsed_s = time.perf_counter() - t_start
+
+        def _take_axis0(tree, index: int):
+            return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+        objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+        profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
+        boundary_diagnostics_by_objective = {}
+        for objective_i, objective_label in enumerate(OBJECTIVE_LABELS):
+            state_bar = _take_axis0(initial_state_bars, objective_i)
+            reduced_bar = _take_axis0(reduced_bars, objective_i)
+            state_bar_summary = _payload_leaf_summary(state_bar)
+            field_l2 = {
+                "density": _tree_array_l2_norm(state_bar.density),
+                "pressure": _tree_array_l2_norm(state_bar.pressure),
+                "Er": _tree_array_l2_norm(state_bar.Er),
+            }
+            boundary_diagnostics_by_objective[objective_label] = {
+                "initial_state_bar_l2": _tree_array_l2_norm(state_bar),
+                "initial_state_bar_field_l2": field_l2,
+                "initial_state_bar_summary": state_bar_summary,
+                "reduced_y_bar_l2": _tree_array_l2_norm(reduced_bar.y),
+                "reduced_y_bar_summary": _payload_leaf_summary(reduced_bar.y),
+                "reduced_lagged_response_cache_bar_l2": _tree_array_l2_norm(
+                    reduced_bar.lagged_response_cache
+                ),
+                "reduced_lagged_response_cache_bar_summary": _payload_leaf_summary(
+                    reduced_bar.lagged_response_cache
+                ),
+                "reduced_lagged_reference_y_bar_l2": _tree_array_l2_norm(
+                    reduced_bar.lagged_reference_y
+                ),
+                "reduced_lagged_reference_y_bar_summary": _payload_leaf_summary(
+                    reduced_bar.lagged_reference_y
+                ),
+            }
+
+        report = {
+            "mode": "transport_reverse_ad_only",
+            "parameter_mode": str(args.reverse_parameter_mode),
+            "config_path": str(Path(args.config)),
+            "objective_name": "all",
+            "objective_order": list(OBJECTIVE_LABELS),
+            "objective_values": {
+                name: float(value) for name, value in zip(OBJECTIVE_LABELS, objective_values_np.tolist())
+            },
+            "parameter_order": list(PARAMETER_ORDER),
+            "profile_gradient_reverse_ad": {
+                objective_name: {
+                    parameter_name: float(value)
+                    for parameter_name, value in zip(
+                        PARAMETER_ORDER,
+                        profile_gradient_np[objective_i].tolist(),
+                    )
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "accepted_step_limit": None
+            if args.accepted_step_limit is None
+            else int(args.accepted_step_limit),
+            "reverse_segment_length": None
+            if args.reverse_segment_length is None
+            else int(args.reverse_segment_length),
+            "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+            "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+            "ntx_exact_derivative_field_pullback_mode": str(
+                args.ntx_exact_derivative_field_pullback_mode
+            ),
+            "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+            "realtime_geometry_gradient_path": "initial_carry_boundary_probe",
+            "boundary_diagnostics_by_objective": boundary_diagnostics_by_objective,
+            "elapsed_s": float(elapsed_s),
+        }
+        print(
+            "[autodiff-gate] mode=transport_reverse_ad_only "
+            "parameter_mode=profiles_plus_realtime_geometry "
+            "realtime_geometry_gradient_path=initial_carry_boundary_probe "
+            "objective=all "
+            f"elapsed_s={elapsed_s:.3f}",
+            flush=True,
+        )
+        print("[autodiff-gate] objective values:")
+        for objective_name, value in report["objective_values"].items():
+            print(f"  - {objective_name}: value={value:.16e}")
+        print("[autodiff-gate] reverse profile gradients by objective:")
+        for objective_name in OBJECTIVE_LABELS:
+            print(f"  - {objective_name}:")
+            for parameter_name in PARAMETER_ORDER:
+                value = report["profile_gradient_reverse_ad"][objective_name][parameter_name]
+                print(f"      d{objective_name}/d{parameter_name}: ad={value:.6e}")
+        print("[autodiff-gate] initial-carry boundary diagnostics by objective:")
+        for objective_name in OBJECTIVE_LABELS:
+            diag = report["boundary_diagnostics_by_objective"][objective_name]
+            field_l2 = diag["initial_state_bar_field_l2"]
+            state_finite = diag["initial_state_bar_summary"]["all_floating_leaves_finite"]
+            lagged_finite = diag["reduced_lagged_response_cache_bar_summary"][
+                "all_floating_leaves_finite"
+            ]
+            print(
+                f"  - {objective_name}: "
+                f"initial_state_bar_l2={diag['initial_state_bar_l2']:.6e} "
+                f"density_bar_l2={field_l2['density']:.6e} "
+                f"pressure_bar_l2={field_l2['pressure']:.6e} "
+                f"Er_bar_l2={field_l2['Er']:.6e} "
+                f"lagged_cache_bar_l2={diag['reduced_lagged_response_cache_bar_l2']:.6e} "
+                f"state_bar_all_finite={state_finite} "
+                f"lagged_cache_bar_all_finite={lagged_finite}"
+            )
+        outpath = _report_path("realtime_geometry_initial_carry_boundary")
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
+
+    objective_name = str(args.objective)
+    objective_index = OBJECTIVE_LABELS.index(objective_name)
     print(
         "[autodiff-gate] progress: probing compact initial-carry boundary cotangent "
         f"for {objective_name}",
