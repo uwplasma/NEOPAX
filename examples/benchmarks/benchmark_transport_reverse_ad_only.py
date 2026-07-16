@@ -569,8 +569,17 @@ def _reverse_initial_carry_from_state_with_static_setup(
             def _lagged_state_from_flat(flat_value):
                 return _build_state_from_flat(flat_value, unpack_flat, project_flat)
 
-            _, lagged_state_flat_pullback = jax.vjp(_lagged_state_from_flat, flat_state0)
-            (lagged_flat_bar,) = lagged_state_flat_pullback(lagged_state_bar)
+            def _nonzero_lagged_state_flat_pullback(_):
+                _, lagged_state_flat_pullback = jax.vjp(_lagged_state_from_flat, flat_state0)
+                (lagged_flat_bar_value,) = lagged_state_flat_pullback(lagged_state_bar)
+                return lagged_flat_bar_value
+
+            lagged_flat_bar = jax.lax.cond(
+                _tree_max_abs(lagged_state_bar) > 0.0,
+                _nonzero_lagged_state_flat_pullback,
+                lambda _: _zero_flat_bar(),
+                operand=None,
+            )
             flat_bar = flat_bar + lagged_flat_bar
 
         _, state_pullback = jax.vjp(_flat_state_from_state, state_value)
