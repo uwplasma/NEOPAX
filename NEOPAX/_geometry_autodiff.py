@@ -3067,11 +3067,13 @@ def _build_neopax_geometry_from_state(
         axis=0,
     )
     rho_half = jnp.asarray(rho_half_np, dtype=s_full.dtype)
-    # Match the validated frozen-vs-realtime bridge: Boozer samples are taken
-    # on the transport interior half-grid, then extrapolated where needed.
-    # Including live edge Boozer rows can produce NaNs for some VMEC states and
-    # poisons transport scalars such as R0, a_b, and Vprime.
-    requested_sample_rho_np = np.asarray(rho_grid_half_np[1:-1], dtype=float)
+    # Match the file-backed VmecBoozer radial convention exactly: Boozer
+    # quantities are tabulated on VMEC half surfaces, while R00 is interpolated
+    # against the VMEC full-grid rho values used by the frozen boozermn path.
+    ns_vmec = int(s_full_np.shape[0])
+    surface_indices = jnp.arange(max(ns_vmec - 1, 0), dtype=jnp.int32)
+    sample_rho_half = rho_half[1:]
+    sample_rho_full = jnp.sqrt(jnp.maximum(jnp.asarray(s_full_np[1:], dtype=jnp.float64), 0.0))
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -3094,7 +3096,6 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho_np)
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
@@ -3116,8 +3117,8 @@ def _build_neopax_geometry_from_state(
     mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
 
     r00_samples = rmnc_b[:, mode00]
-    r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
-    r0_value = _vmec_state_field(state, "Rcos", "R_cos")[-1, 0]
+    r00_interp = interpax.Interpolator1D(sample_rho_full, r00_samples, extrap=True)
+    r0_value = r00_samples[-1]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
@@ -3139,12 +3140,17 @@ def _build_neopax_geometry_from_state(
     else:
         b10_raw_samples = bmnc_b[:, mode10]
 
-    b0_interp = interpax.Interpolator1D(sample_rho, b0_samples, extrap=True)
-    sqrtg00_interp = interpax.Interpolator1D(sample_rho, sqrtg00_samples, extrap=True)
-    b10_interp = interpax.Interpolator1D(sample_rho, b10_raw_samples, extrap=True)
-    iota_interp = interpax.Interpolator1D(sample_rho, iota_samples, extrap=True)
-    i_interp = interpax.Interpolator1D(sample_rho, i_value_samples, extrap=True)
-    g_interp = interpax.Interpolator1D(sample_rho, g_value_samples, extrap=True)
+    b0_interp = interpax.Interpolator1D(sample_rho_half, b0_samples, extrap=True)
+    sqrtg00_interp = interpax.Interpolator1D(sample_rho_half, sqrtg00_samples, extrap=True)
+    b10_interp = interpax.Interpolator1D(sample_rho_half, b10_raw_samples, extrap=True)
+    iotaf = jnp.asarray(getattr(context.flux, "iotaf", out["iota_b"]), dtype=jnp.float64)
+    iota_interp = interpax.Interpolator1D(
+        jnp.sqrt(jnp.maximum(jnp.asarray(s_full_np, dtype=jnp.float64), 0.0)),
+        iotaf,
+        extrap=True,
+    )
+    i_interp = interpax.Interpolator1D(sample_rho_half, i_value_samples, extrap=True)
+    g_interp = interpax.Interpolator1D(sample_rho_half, g_value_samples, extrap=True)
 
     b_00 = b0_interp(rho_grid)
     b0 = b_00
@@ -3152,8 +3158,6 @@ def _build_neopax_geometry_from_state(
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
-    # Match frozen VmecBoozer: epsilon_t uses the Boozer R00 profile, not the
-    # edge major radius used to define a_b.
     epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
     curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
     enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
