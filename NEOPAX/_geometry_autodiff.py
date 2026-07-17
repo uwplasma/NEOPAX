@@ -2972,19 +2972,17 @@ def _build_neopax_geometry_from_state(
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
-    rho_grid_np = np.linspace(0.0, 1.0, int(n_r), dtype=float)
-    rho_grid = jnp.asarray(rho_grid_np, dtype=jnp.float64)
+    rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
     if int(n_r) > 1:
-        rho_grid_half_np = np.concatenate(
+        rho_grid_half = jnp.concatenate(
             [
-                np.array([0.0], dtype=float),
-                0.5 * (rho_grid_np[:-1] + rho_grid_np[1:]),
-                np.array([1.0], dtype=float),
+                jnp.array([0.0], dtype=rho_grid.dtype),
+                0.5 * (rho_grid[:-1] + rho_grid[1:]),
+                jnp.array([1.0], dtype=rho_grid.dtype),
             ]
         )
     else:
-        rho_grid_half_np = np.array([0.0, 1.0], dtype=float)
-    rho_grid_half = jnp.asarray(rho_grid_half_np, dtype=jnp.float64)
+        rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
     try:
         from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
         from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
@@ -3058,22 +3056,26 @@ def _build_neopax_geometry_from_state(
     volume_p = jnp.abs(jnp.asarray(norms.volume)) * (4.0 * jnp.pi**2)
     vp = jnp.abs(jnp.asarray(norms.vp))
     s_full = jnp.asarray(context.static.s)
-    s_full_np = np.linspace(0.0, 1.0, int(s_full.shape[0]), dtype=float)
-    rho_half_np = np.concatenate(
-        [
-            np.zeros((1,), dtype=float),
-            np.sqrt(np.maximum(0.5 * (s_full_np[1:] + s_full_np[:-1]), 0.0)),
-        ],
+    rho_half = jnp.concatenate(
+        [jnp.zeros((1,), dtype=s_full.dtype), jnp.sqrt(jnp.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))],
         axis=0,
     )
-    rho_half = jnp.asarray(rho_half_np, dtype=s_full.dtype)
-    # Match the file-backed VmecBoozer radial convention exactly: Boozer
-    # quantities are tabulated on VMEC half surfaces, while R00 is interpolated
-    # against the VMEC full-grid rho values used by the frozen boozermn path.
-    ns_vmec = int(s_full_np.shape[0])
-    surface_indices = jnp.arange(max(ns_vmec - 1, 0), dtype=jnp.int32)
-    sample_rho_half = rho_half[1:]
-    sample_rho_full = jnp.sqrt(jnp.maximum(jnp.asarray(s_full_np[1:], dtype=jnp.float64), 0.0))
+    # Match the frozen VmecBoozer half-grid interpolation pattern without
+    # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
+    # half-mesh points at the axis and edge so extrapolated quantities such as
+    # B0(r_grid) use a frozen-like local slope.
+    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
+    requested_sample_rho = jnp.unique(
+        jnp.concatenate(
+            [
+                rho_grid_half[1:-1],
+                rho_half[1 : 1 + edge_count],
+                edge_rho,
+            ],
+            axis=0,
+        )
+    )
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -3096,6 +3098,7 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
@@ -3111,14 +3114,14 @@ def _build_neopax_geometry_from_state(
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
     gmnc_b = jnp.asarray(out["gmnc_b"])
     rmnc_b = jnp.asarray(out["rmnc_b"])
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (0,0) mode.")
-    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
+    mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
 
-    r00_samples = rmnc_b[:, mode00]
-    r00_interp = interpax.Interpolator1D(sample_rho_full, r00_samples, extrap=True)
-    r0_value = r00_samples[-1]
+    r0_value = rmnc_b[-1, mode00]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
@@ -3126,31 +3129,28 @@ def _build_neopax_geometry_from_state(
 
     dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
     volume_scale = (2.0 * jnp.pi) ** 2
-    vprime = (dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale).at[0].set(0.0)
-    vprime_half = (dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale).at[0].set(0.0)
+    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
+    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
     over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
 
     iota_samples = jnp.asarray(out["iota_b"])
     i_value_samples = jnp.asarray(out["buco_b"])
     g_value_samples = jnp.asarray(out["bvco_b"])
     b0_samples = bmnc_b[:, mode00]
+    r00_samples = rmnc_b[:, mode00]
     sqrtg00_samples = gmnc_b[:, mode00]
     if mode10 is None:
         b10_raw_samples = jnp.zeros_like(b0_samples)
     else:
         b10_raw_samples = bmnc_b[:, mode10]
 
-    b0_interp = interpax.Interpolator1D(sample_rho_half, b0_samples, extrap=True)
-    sqrtg00_interp = interpax.Interpolator1D(sample_rho_half, sqrtg00_samples, extrap=True)
-    b10_interp = interpax.Interpolator1D(sample_rho_half, b10_raw_samples, extrap=True)
-    iotaf = jnp.asarray(getattr(context.flux, "iotaf", out["iota_b"]), dtype=jnp.float64)
-    iota_interp = interpax.Interpolator1D(
-        jnp.sqrt(jnp.maximum(jnp.asarray(s_full_np, dtype=jnp.float64), 0.0)),
-        iotaf,
-        extrap=True,
-    )
-    i_interp = interpax.Interpolator1D(sample_rho_half, i_value_samples, extrap=True)
-    g_interp = interpax.Interpolator1D(sample_rho_half, g_value_samples, extrap=True)
+    b0_interp = interpax.Interpolator1D(sample_rho, b0_samples, extrap=True)
+    r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
+    sqrtg00_interp = interpax.Interpolator1D(sample_rho, sqrtg00_samples, extrap=True)
+    b10_interp = interpax.Interpolator1D(sample_rho, b10_raw_samples, extrap=True)
+    iota_interp = interpax.Interpolator1D(sample_rho, iota_samples, extrap=True)
+    i_interp = interpax.Interpolator1D(sample_rho, i_value_samples, extrap=True)
+    g_interp = interpax.Interpolator1D(sample_rho, g_value_samples, extrap=True)
 
     b_00 = b0_interp(rho_grid)
     b0 = b_00
@@ -3158,6 +3158,8 @@ def _build_neopax_geometry_from_state(
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
+    # Match frozen VmecBoozer: epsilon_t uses the Boozer R00 profile, not the
+    # edge major radius used to define a_b.
     epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
     curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
     enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
@@ -3384,99 +3386,18 @@ def _ntx_frozen_interp_mode_columns(interpolated_value, x_nodes, values, xq):
     )
 
 
-def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path, static):
+def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path, static=None):
     """Build an NTX VMEC surface using the same sampling convention as NTX's frozen loader."""
 
-    from ntx.geometry import VmecSurface
+    import ntx
 
-    s_value = float(s)
-    if not 0.0 <= s_value <= 1.0:
-        raise ValueError("s must be between 0 and 1")
-
-    ns = int(static.resolution.ns)
-    if ns < 2:
-        raise ValueError("VMEC input must contain at least two radial surfaces")
-
-    s_full_np = np.linspace(0.0, 1.0, ns, dtype=np.float64)
-    hs = 1.0 / (ns - 1)
-    s_half_np = s_full_np[:-1] + 0.5 * hs
-    s_full = jnp.asarray(s_full_np, dtype=jnp.float64)
-    s_half = jnp.asarray(s_half_np, dtype=jnp.float64)
-    s_query = jnp.asarray(s_value, dtype=jnp.float64)
-
-    xm_nyq_np = np.asarray(wout.xm_nyq, dtype=np.int32)
-    xn_nyq_np = np.asarray(wout.xn_nyq, dtype=np.int32)
-
-    def interp_half(values):
-        return interpax.interp1d(
-            s_query,
-            s_half,
-            jnp.asarray(values, dtype=jnp.float64)[1:, :],
-            method="cubic",
-            extrap=True,
-        )
-
-    def interp_full(values):
-        return interpax.interp1d(
-            s_query,
-            s_full,
-            jnp.asarray(values, dtype=jnp.float64),
-            method="cubic",
-            extrap=True,
-        )
-
-    bmnc = interp_half(wout.bmnc)
-    gmnc = interp_half(wout.gmnc)
-    bsupumnc = interp_half(wout.bsupumnc)
-    bsupvmnc = interp_half(wout.bsupvmnc)
-    bsubumnc = interp_half(wout.bsubumnc)
-    bsubvmnc = interp_half(wout.bsubvmnc)
-    iota = -interp_full(wout.iotaf)
-
-    # For the realtime AD path keep a fixed-size mode set. The current calls use
-    # min_bmn_to_load=0, so this matches the all-mode frozen loader without
-    # tracing through dynamic boolean indexing.
-    nfp = int(static.resolution.nfp)
-    mode_count = int(xm_nyq_np.size)
-    aminor_raw = getattr(wout, "Aminor_p", None)
-    if aminor_raw is None:
-        aminor_raw = getattr(wout, "aminor_p")
-    aminor_p = jnp.asarray(aminor_raw, dtype=jnp.float64).reshape(())
-    r_n = jnp.sqrt(s_query)
-    r_hat = aminor_p * r_n
-    phi = jnp.asarray(wout.phi, dtype=jnp.float64)
-    psi_a_hat = phi[-1] / (2.0 * jnp.pi)
-    dpsi_hat_dr_hat = 2.0 * psi_a_hat * r_n / aminor_p
-
-    return VmecSurface(
-        path=Path(source_path).expanduser(),
-        requested_psi_n=s_value,
-        psi_n=s_value,
-        nfp=nfp,
-        ns=ns,
-        mpol=int(static.resolution.mpol),
-        ntor=int(static.resolution.ntor),
-        total_mode_count=mode_count,
-        loaded_mode_count=mode_count,
-        iota=iota,
-        m=jnp.asarray(xm_nyq_np, dtype=jnp.int32),
-        n=jnp.asarray(np.rint(-xn_nyq_np / nfp).astype(np.int32), dtype=jnp.int32),
-        b_cos=jnp.asarray(bmnc, dtype=jnp.float64),
-        jacobian_cos=jnp.asarray(gmnc, dtype=jnp.float64),
-        b_sub_theta_cos=jnp.asarray(bsubumnc, dtype=jnp.float64),
-        b_sub_zeta_cos=jnp.asarray(bsubvmnc, dtype=jnp.float64),
-        b_sup_theta_cos=jnp.asarray(bsupumnc, dtype=jnp.float64),
-        b_sup_zeta_cos=jnp.asarray(bsupvmnc, dtype=jnp.float64),
-        b0=jnp.max(jnp.abs(bmnc)),
-        psi_a_hat=psi_a_hat,
-        phi_edge=phi[-1],
-        r_n=r_n,
-        r_hat=r_hat,
-        dpsi_hat_dr_hat=dpsi_hat_dr_hat,
-        dr_hat_dpsi_hat=1.0 / dpsi_hat_dr_hat,
-        aminor_p=aminor_p,
-        psi_p=None,
-        transport_psi_scale=dpsi_hat_dr_hat,
+    surface_fn = getattr(ntx, "surface_from_vmec_jax_vmec_wout", None)
+    if surface_fn is None:
+        from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout as surface_fn
+    return surface_fn(
+        wout,
+        s=float(s),
+        source_path=Path(source_path).expanduser(),
     )
 
 
@@ -3761,56 +3682,38 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
         return surfaces_fn(**kwargs)
 
-    n_center = int(geometry.rho_grid.shape[0])
-    n_face = int(geometry.rho_grid_half.shape[0])
-    rho_center_np = np.linspace(0.0, 1.0, n_center, dtype=float)
-    if n_face > 2:
-        rho_face_np = np.concatenate(
-            [
-                np.array([0.0], dtype=float),
-                0.5 * (rho_center_np[:-1] + rho_center_np[1:]),
-                np.array([1.0], dtype=float),
-            ],
-            axis=0,
+    vmec_wout_cache = None
+
+    def _vmec_surfaces_from_state(*, s_values):
+        nonlocal vmec_wout_cache
+        if vmec_wout_cache is None:
+            vmec_wout_cache = _wout_from_vmec_state(context, state)
+        return tuple(
+            _vmec_jax_wout_surface_with_frozen_sampling(
+                vmec_wout_cache,
+                s=float(s_value),
+                source_path=context.input_path,
+                static=context.static,
+            )
+            for s_value in s_values
         )
-    else:
-        rho_face_np = np.array([0.0, 1.0], dtype=float)
-    rho_center = jnp.asarray(rho_center_np, dtype=jnp.float64)
-    rho_face = jnp.asarray(rho_face_np, dtype=jnp.float64)
+
+    rho_center = jnp.asarray(geometry.r_grid, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
+    rho_face = jnp.asarray(geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(geometry.a_b, dtype=jnp.float64)
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
-    r00_support_rho_np = np.unique(
-        np.concatenate(
-            [
-                rho_center_np,
-                rho_face_np,
-            ],
-            axis=0,
-        )
-    )
-    r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
-    surface_backend_key = str(surface_backend).strip().lower()
-    if surface_backend_key in {"vmec", "vmec_jax"}:
-        r00_support = _vmec_r00_from_state_at_rho(context, state, r00_support_rho_np)
-    else:
-        r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
+    r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
+    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
-    center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_np)
-    face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_np)
+    center_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float))
+    face_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float))
+    surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
-        center_surfaces = _traceable_vmec_surfaces_from_state(
-            context,
-            state,
-            s_values=center_s_values,
-        )
-        face_surfaces = _traceable_vmec_surfaces_from_state(
-            context,
-            state,
-            s_values=face_s_values,
-        )
+        center_surfaces = _vmec_surfaces_from_state(s_values=center_s_values)
+        face_surfaces = _vmec_surfaces_from_state(s_values=face_s_values)
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
@@ -3820,7 +3723,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             s_values=center_s_values,
             mboz=int(context.mboz),
             nboz=int(context.nboz),
-            psi_p=ntx_psia,
+            psi_p=float(ntx_psia),
         )
         face_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
@@ -3830,7 +3733,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             s_values=face_s_values,
             mboz=int(context.mboz),
             nboz=int(context.nboz),
-            psi_p=ntx_psia,
+            psi_p=float(ntx_psia),
         )
     else:
         raise ValueError(
