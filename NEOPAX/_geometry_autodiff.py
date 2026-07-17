@@ -2893,18 +2893,20 @@ def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int 
 
 
 def _surface_indices_for_s_values(static, s_values: Sequence[float]):
-    ns = int(jnp.asarray(static.s).shape[0])
-    s_full = np.linspace(0.0, 1.0, ns, dtype=float)
-    s_half = 0.5 * (s_full[:-1] + s_full[1:])
-    surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
-    return np.asarray(surface_indices, dtype=np.int32)
+    vmec_jax = _import_vmec_jax()
+    try:
+        surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
+        surface_indices, _ = surface_indices_from_static(static, list(s_values))
+        return jnp.asarray(surface_indices, dtype=jnp.int32)
+    except Exception:
+        s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
+        surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in s_values]
+        return jnp.asarray(surface_indices, dtype=jnp.int32)
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
-    rho_np = np.asarray(rho_values, dtype=float)
-    s_values = tuple(float(rho_value**2) for rho_value in rho_np.reshape(-1))
-    surface_indices_np = np.unique(_surface_indices_for_s_values(static, s_values))
-    surface_indices = jnp.asarray(surface_indices_np, dtype=jnp.int32)
+    s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
+    surface_indices = jnp.unique(_surface_indices_for_s_values(static, s_values))
     s_full = jnp.asarray(static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     sample_rho = jnp.sqrt(jnp.maximum(s_half[surface_indices], 0.0))
@@ -2919,9 +2921,8 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     than full-grid VMEC Rcos[:, 0], otherwise NTX normalization factors see a
     different major-radius profile from the geometry object.
     """
-    rho_np = np.asarray(rho_values, dtype=float)
-    rho_arr = jnp.asarray(rho_np, dtype=jnp.float64)
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_np)
+    rho_arr = jnp.asarray(rho_values, dtype=jnp.float64)
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_arr)
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
     inputs = _booz_xform_inputs_from_state(
@@ -2941,7 +2942,9 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     )
     if "rmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
     rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
