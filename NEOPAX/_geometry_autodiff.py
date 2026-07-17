@@ -3134,8 +3134,8 @@ def _build_neopax_geometry_from_state(
 
     dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
     volume_scale = (2.0 * jnp.pi) ** 2
-    vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
-    vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
+    vprime = (dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale).at[0].set(0.0)
+    vprime_half = (dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale).at[0].set(0.0)
     over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
 
     iota_samples = jnp.asarray(out["iota_b"])
