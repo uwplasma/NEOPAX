@@ -3067,22 +3067,11 @@ def _build_neopax_geometry_from_state(
         axis=0,
     )
     rho_half = jnp.asarray(rho_half_np, dtype=s_full.dtype)
-    # Match the frozen VmecBoozer half-grid interpolation pattern without
-    # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
-    # half-mesh points at the axis and edge so extrapolated quantities such as
-    # B0(r_grid) use a frozen-like local slope.
-    edge_count = min(8, max(int(rho_half_np.shape[0]) - 1, 0))
-    edge_rho_np = rho_half_np[-edge_count:] if edge_count > 0 else rho_half_np[:0]
-    requested_sample_rho_np = np.unique(
-        np.concatenate(
-            [
-                rho_grid_half_np[1:-1],
-                rho_half_np[1 : 1 + edge_count],
-                edge_rho_np,
-            ],
-            axis=0,
-        )
-    )
+    # Match the validated frozen-vs-realtime bridge: Boozer samples are taken
+    # on the transport interior half-grid, then extrapolated where needed.
+    # Including live edge Boozer rows can produce NaNs for some VMEC states and
+    # poisons transport scalars such as R0, a_b, and Vprime.
+    requested_sample_rho_np = np.asarray(rho_grid_half_np[1:-1], dtype=float)
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -3126,7 +3115,9 @@ def _build_neopax_geometry_from_state(
         raise ValueError("Boozer output is missing the (0,0) mode.")
     mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
 
-    r0_value = rmnc_b[-1, mode00]
+    r00_samples = rmnc_b[:, mode00]
+    r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
+    r0_value = r00_interp(jnp.asarray(1.0, dtype=sample_rho.dtype))
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
@@ -3142,7 +3133,6 @@ def _build_neopax_geometry_from_state(
     i_value_samples = jnp.asarray(out["buco_b"])
     g_value_samples = jnp.asarray(out["bvco_b"])
     b0_samples = bmnc_b[:, mode00]
-    r00_samples = rmnc_b[:, mode00]
     sqrtg00_samples = gmnc_b[:, mode00]
     if mode10 is None:
         b10_raw_samples = jnp.zeros_like(b0_samples)
@@ -3150,7 +3140,6 @@ def _build_neopax_geometry_from_state(
         b10_raw_samples = bmnc_b[:, mode10]
 
     b0_interp = interpax.Interpolator1D(sample_rho, b0_samples, extrap=True)
-    r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
     sqrtg00_interp = interpax.Interpolator1D(sample_rho, sqrtg00_samples, extrap=True)
     b10_interp = interpax.Interpolator1D(sample_rho, b10_raw_samples, extrap=True)
     iota_interp = interpax.Interpolator1D(sample_rho, iota_samples, extrap=True)
