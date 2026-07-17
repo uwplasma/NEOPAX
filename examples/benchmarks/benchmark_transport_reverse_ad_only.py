@@ -35,7 +35,6 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     build_ntx_exact_lij_support_from_param_vector,
-    build_runtime_context_for_geometry_param,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
@@ -1968,9 +1967,9 @@ def _reverse_geometry_rollout_parts_for_parameter_vector(
     )
     raise NotImplementedError(
         "The old whole-runtime realtime geometry AD rollout path is disabled. "
-        "Use --realtime-geometry-gradient-path reverse_payload, which keeps the "
-        "forward realtime primal runtime and attaches geometry through the "
-        "explicit support-payload boundary."
+        "Use the explicit realtime-geometry diagnostics while the final "
+        "combined runtime.geometry + NTX-support reverse_payload path is being "
+        "implemented."
     )
 
 
@@ -2388,6 +2387,18 @@ def _run_realtime_geometry_support_segment_probe(
     profile_cfg: dict,
     neoclassical_cfg: dict[str, Any],
 ):
+    support_only_diagnostic = str(args.realtime_geometry_gradient_path) == "support_segment_probe"
+    if not support_only_diagnostic:
+        raise SystemExit(
+            "[autodiff-gate] realtime reverse_payload is not enabled yet: the current "
+            "support-segment implementation only differentiates the NTX exact support "
+            "payload. The transport RHS and objective reductions also depend directly "
+            "on runtime.geometry fields such as r_grid, r_grid_half, Vprime, "
+            "Vprime_half, B0, iota, and enlogation. Use "
+            "--realtime-geometry-gradient-path support_segment_probe only as a "
+            "diagnostic, or implement the combined geometry+support payload before "
+            "using reverse_payload as a benchmark."
+        )
     support_payload = _find_ntx_support_payload(baseline_runtime)
     profile_values = baseline_values[: len(PARAMETER_ORDER)]
     support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
@@ -2669,6 +2680,18 @@ def _run_realtime_geometry_support_segment_probe(
             ),
             "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             "realtime_geometry_gradient_path": "support_segment_probe",
+            "realtime_primal_runtime_builder": "build_runtime_context",
+            "realtime_geometry_derivative_boundary": "ntx_exact_lij_support_payload_only_diagnostic",
+            "realtime_geometry_derivative_complete": False,
+            "missing_realtime_geometry_payload_fields": [
+                "r_grid",
+                "r_grid_half",
+                "Vprime",
+                "Vprime_half",
+                "B0",
+                "iota",
+                "enlogation",
+            ],
             "geometry_support_pullback_mode": geometry_pullback_mode,
             "realtime_geometry_diagnostics": realtime_geometry_diagnostics,
             "support_payload_summary": support_summary,
@@ -2790,6 +2813,18 @@ def _run_realtime_geometry_support_segment_probe(
         "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
         "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         "realtime_geometry_gradient_path": "support_segment_probe",
+        "realtime_primal_runtime_builder": "build_runtime_context",
+        "realtime_geometry_derivative_boundary": "ntx_exact_lij_support_payload_only_diagnostic",
+        "realtime_geometry_derivative_complete": False,
+        "missing_realtime_geometry_payload_fields": [
+            "r_grid",
+            "r_grid_half",
+            "Vprime",
+            "Vprime_half",
+            "B0",
+            "iota",
+            "enlogation",
+        ],
         "support_payload_summary": support_summary,
         "support_bar_summary": support_bar_summary,
         "support_bar_l2": support_bar_l2,
@@ -3103,6 +3138,16 @@ def _run_realtime_geometry_reverse_mode(
             "[autodiff-gate] --reverse-all-objectives-mode vmap_pullback is "
             "currently implemented only for the profile-only static reverse setup."
         )
+    if str(args.realtime_geometry_gradient_path) == "reverse_payload":
+        raise SystemExit(
+            "[autodiff-gate] realtime reverse_payload is reserved for the final "
+            "combined runtime.geometry + NTX-support payload path and is not "
+            "enabled yet. This guard runs before building the realtime VMEC/Boozer/"
+            "NTX runtime so incomplete geometry derivatives are not printed and "
+            "expensive setup is not performed accidentally. Use "
+            "--realtime-geometry-gradient-path support_segment_probe only as an "
+            "explicit support-only diagnostic."
+        )
     geometry_parameter = str(args.reverse_geometry_parameter)
     parameter_order = _reverse_geometry_parameter_order(geometry_parameter)
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
@@ -3113,16 +3158,10 @@ def _run_realtime_geometry_reverse_mode(
         dtype=jnp.float64,
     )
     baseline_geometry_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
-    baseline_runtime, baseline_state = build_runtime_context_for_geometry_param(
-        config,
-        geometry_context,
-        baseline_geometry_delta,
-        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
-        n_r=int(geom_cfg.get("n_radial", 51)),
-        max_iter=geom_cfg.get("vmec_max_iter"),
-        step_size=geom_cfg.get("vmec_step_size"),
-        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-    )
+    # Use the same entrypoint as the realtime forward solver for the primal
+    # runtime.  Geometry-context helpers below are only for derivative-side
+    # support-payload pullbacks against VMEC harmonics.
+    baseline_runtime, baseline_state = build_runtime_context(config)
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
         baseline_state=baseline_state,
@@ -3160,7 +3199,7 @@ def _run_realtime_geometry_reverse_mode(
             neoclassical_cfg=neoclassical_cfg,
         )
         return
-    if str(args.realtime_geometry_gradient_path) in {"support_segment_probe", "reverse_payload"}:
+    if str(args.realtime_geometry_gradient_path) == "support_segment_probe":
         _run_realtime_geometry_support_segment_probe(
             args=args,
             config=config,
@@ -3184,8 +3223,10 @@ def _run_realtime_geometry_reverse_mode(
         return
     raise SystemExit(
         "[autodiff-gate] unsupported realtime geometry gradient path "
-        f"{args.realtime_geometry_gradient_path!r}. Use reverse_payload for "
-        "the forward-primal/profile-reverse/support-payload path."
+        f"{args.realtime_geometry_gradient_path!r}. Supported diagnostics are "
+        "payload_boundary_probe, support_pullback_probe, support_segment_probe, "
+        "and initial_carry_boundary_probe. reverse_payload is reserved for the "
+        "final combined runtime.geometry + NTX-support path."
     )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
 
@@ -3445,9 +3486,9 @@ def main() -> None:
             "'initial_carry_boundary_probe' returns the compact cotangent wrt "
             "the initial transport state, matching the profile reverse boundary "
             "before composing with VMEC/NTX geometry parameters. "
-            "'reverse_payload' currently aliases the support-segment implementation: "
-            "forward/realtime primal runtime, profile reverse replay, and explicit "
-            "support-payload cotangents for geometry."
+            "'reverse_payload' is reserved for the final combined "
+            "runtime.geometry + NTX-support payload path and currently refuses "
+            "to run rather than printing incomplete geometry derivatives."
         ),
     )
     parser.add_argument(
