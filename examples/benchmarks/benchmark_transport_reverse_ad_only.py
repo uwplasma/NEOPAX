@@ -224,6 +224,50 @@ def _tree_array_l2_norm(payload) -> float:
     return float(np.asarray(jax.device_get(jnp.sqrt(total))))
 
 
+def _array_finite_summary(value) -> dict[str, Any]:
+    arr = np.asarray(jax.device_get(jnp.asarray(value)))
+    finite = np.isfinite(arr)
+    finite_values = arr[finite]
+    first_nonfinite_index = None
+    if not bool(np.all(finite)):
+        first_nonfinite_index = [int(i) for i in np.argwhere(~finite)[0].tolist()]
+    return {
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "all_finite": bool(np.all(finite)),
+        "nan_count": int(np.isnan(arr).sum()),
+        "posinf_count": int(np.isposinf(arr).sum()),
+        "neginf_count": int(np.isneginf(arr).sum()),
+        "finite_min": None if finite_values.size == 0 else float(np.min(finite_values)),
+        "finite_max": None if finite_values.size == 0 else float(np.max(finite_values)),
+        "first_nonfinite_index": first_nonfinite_index,
+    }
+
+
+def _geometry_volume_diagnostics(geometry) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    for name in (
+        "a_b",
+        "rho_grid",
+        "rho_grid_half",
+        "r_grid",
+        "r_grid_half",
+        "Vprime",
+        "Vprime_half",
+        "overVprime",
+    ):
+        if hasattr(geometry, name):
+            diagnostics[name] = _array_finite_summary(getattr(geometry, name))
+    if hasattr(geometry, "Vprime") and hasattr(geometry, "r_grid"):
+        volume = jnp.trapezoid(
+            jnp.asarray(geometry.Vprime),
+            x=jnp.asarray(geometry.r_grid),
+        )
+        diagnostics["integrated_volume"] = _array_finite_summary(volume)
+        diagnostics["integrated_volume_value"] = float(np.asarray(jax.device_get(volume)))
+    return diagnostics
+
+
 def _report_path(objective_name: str) -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "reverse_ad"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -2404,6 +2448,24 @@ def _run_realtime_geometry_support_segment_probe(
         reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
     )
     if args.objective == "all":
+        early_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
+        print("[autodiff-gate] realtime geometry pre-reverse diagnostics:")
+        for field_name in ("a_b", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
+            if field_name not in early_geometry_diagnostics:
+                continue
+            summary = early_geometry_diagnostics[field_name]
+            value_suffix = ""
+            if field_name == "integrated_volume":
+                value_suffix = f" value={early_geometry_diagnostics['integrated_volume_value']:.16e}"
+            print(
+                f"  - {field_name}: all_finite={summary['all_finite']} "
+                f"nan_count={summary['nan_count']} "
+                f"finite_min={summary['finite_min']} "
+                f"finite_max={summary['finite_max']} "
+                f"first_nonfinite_index={summary['first_nonfinite_index']}"
+                f"{value_suffix}",
+                flush=True,
+            )
         print(
             "[autodiff-gate] progress: probing realized-schedule reverse support payload cotangents "
             "for all objectives",
@@ -2584,6 +2646,7 @@ def _run_realtime_geometry_support_segment_probe(
             objective_name: bool(np.all(np.isfinite(geometry_gradient_np[objective_i])))
             for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
         }
+        realtime_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
         for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
@@ -2646,6 +2709,7 @@ def _run_realtime_geometry_support_segment_probe(
             "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             "realtime_geometry_gradient_path": "support_segment_probe",
             "geometry_support_pullback_mode": geometry_pullback_mode,
+            "realtime_geometry_diagnostics": realtime_geometry_diagnostics,
             "support_payload_summary": support_summary,
             "support_bar_summary_by_objective": support_bar_summary_by_objective,
             "support_bar_l2_by_objective": support_bar_l2_by_objective,
@@ -2667,6 +2731,22 @@ def _run_realtime_geometry_support_segment_probe(
         print("[autodiff-gate] objective values:")
         for objective_name, value in report["objective_values"].items():
             print(f"  - {objective_name}: value={value:.16e}")
+        print("[autodiff-gate] realtime geometry diagnostics:")
+        for field_name in ("a_b", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
+            if field_name not in realtime_geometry_diagnostics:
+                continue
+            summary = realtime_geometry_diagnostics[field_name]
+            value_suffix = ""
+            if field_name == "integrated_volume":
+                value_suffix = f" value={realtime_geometry_diagnostics['integrated_volume_value']:.16e}"
+            print(
+                f"  - {field_name}: all_finite={summary['all_finite']} "
+                f"nan_count={summary['nan_count']} "
+                f"finite_min={summary['finite_min']} "
+                f"finite_max={summary['finite_max']} "
+                f"first_nonfinite_index={summary['first_nonfinite_index']}"
+                f"{value_suffix}"
+            )
         print("[autodiff-gate] reverse profile gradients by objective:")
         for objective_name in OBJECTIVE_LABELS:
             print(

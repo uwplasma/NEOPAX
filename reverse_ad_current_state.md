@@ -2698,3 +2698,139 @@ If `y_only_state_bar_all_finite` remains false, inspect the direct state packing
 pullback from `_make_solver_state_transform` next. If `y_only` becomes finite
 but full `state_bar_all_finite` remains false, continue isolating the lagged
 reference/cache pullback branches.
+
+### 2026-07-17 continuation: realtime geometry all-objective support bridge
+
+Current target:
+
+- Preserve the existing profile reverse machinery as the spine.
+- When geometry is frozen, profile-only reverse AD must remain unchanged.
+- When realtime geometry is selected, propagate the same transport-objective
+  cotangents to geometry harmonics through:
+
+```text
+transport objective -> reduced Radau reverse -> NTX/realtime support cotangent
+support cotangent -> compact reverse geometry support pullback -> VMEC harmonic gradient
+```
+
+The command under test is:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path support_segment_probe \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+What was fixed:
+
+- The previous GPU OOM at the initial-carry pullback is gone.
+- `_build_initial_carry_bwd` now uses the model-aware
+  `pullback_build_lagged_response(...)` directly when available, instead of
+  placing that compact pullback inside a `jax.lax.cond` that also traced the
+  huge generic fallback branch.
+- The geometry support bridge now has a reverse-mode compact boundary:
+  `flat_array_leaf_custom_vjp_batched_reverse`.
+- This compact bridge does not use geometry forward JVP sweeps and does not
+  zero or mask objective cotangents.
+
+Latest successful progression:
+
+```text
+transport reverse profile/support cotangents complete
+geometry support pullback ready floating_support_leaves=126
+geometry support pullback complete mode=flat_array_leaf_custom_vjp_batched_reverse
+```
+
+Latest remaining bad output:
+
+```text
+softmax_Er finite
+smooth_root_proxy finite
+Er2_volume_average nan
+Er_volume_average nan
+electron_temperature_volume_average_keV nan
+total_pressure_volume_average nan
+alpha_power_volume_average_mw_m3 nan
+
+profile gradients: nan for all objectives
+geometry gradients: nan for all objectives
+support_bar_l2: 0 for all objectives
+```
+
+Current interpretation:
+
+- The all-objective reverse path now runs to completion.
+- The remaining problem is not the earlier OOM.
+- The volume-average objectives are nonfinite because the realtime VMEC-built
+  NEOPAX geometry exposed a bad axis value in `geometry.Vprime`.
+- `softmax_Er` and `smooth_root_proxy` remain finite because they do not use
+  `Vprime`.
+- The frozen/realtime forward solver comparison can still match because the
+  particular forward comparison was dominated by transport state evolution and
+  did not necessarily expose the benchmark-only volume-average postprocessing
+  with `geometry.Vprime`.
+
+Patch applied after the latest run:
+
+```text
+NEOPAX/_geometry_autodiff.py
+```
+
+In `_build_neopax_geometry_from_state(...)`, realtime geometry now explicitly
+sets the magnetic-axis entries:
+
+```text
+Vprime[0] = 0
+Vprime_half[0] = 0
+```
+
+Reason:
+
+- The expression is mathematically zero at `rho = 0`.
+- Numerically, the extrapolated `dVdr(0)` can be nonfinite, and JAX evaluates
+  `0 * nan` as `nan`.
+- This poisoned the volume averages directly.
+
+Next run:
+
+- Rerun the same `support_segment_probe --objective all` command above.
+
+Expected first check:
+
+```text
+Er2_volume_average finite
+Er_volume_average finite
+electron_temperature_volume_average_keV finite
+total_pressure_volume_average finite
+alpha_power_volume_average_mw_m3 finite
+```
+
+If these become finite but profile gradients remain `nan`:
+
+1. Inspect the all-objective final-y cotangents for nonfinite rows before the
+   reduced reverse pass.
+2. Compare `--objective softmax_Er` single-objective profile gradients against
+   the known frozen/profile reverse command.
+3. If single-objective is finite but all-objective is not, isolate the batched
+   reduced reverse rows.
+
+If support bars remain exactly zero after finite objective primals:
+
+1. Inspect whether `_radau_exact_stage_residual_support_pullback(...)` is called
+   with nonzero residual bars.
+2. Check whether `flat_rhs_lagged_response_support_pullback` is connected for
+   the selected NTX exact VMEC backend.
+3. Verify the reduced reverse pass produces nonzero stage residual cotangents
+   for the objectives that should depend on NTX fluxes.
