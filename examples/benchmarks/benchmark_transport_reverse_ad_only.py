@@ -2479,9 +2479,54 @@ def _run_realtime_geometry_support_segment_probe(
             support_leaves = jax.tree_util.tree_leaves(support_tree)
             return tuple(jnp.asarray(support_leaves[leaf_i]) for leaf_i in support_float_leaf_indices)
 
-        _support_float_baseline, geometry_support_float_pullback = jax.vjp(
-            _support_float_leaves_from_geometry_deltas,
-            baseline_geometry_deltas,
+        @jax.custom_vjp
+        def _batched_support_float_leaves_from_geometry_delta_rows(geometry_delta_rows):
+            support_float_leaves = _support_float_leaves_from_geometry_deltas(geometry_delta_rows[0])
+            row_count = int(geometry_delta_rows.shape[0])
+            return tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (row_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in support_float_leaves
+            )
+
+        def _batched_support_float_leaves_fwd(geometry_delta_rows):
+            support_float_leaves = _support_float_leaves_from_geometry_deltas(geometry_delta_rows[0])
+            row_count = int(geometry_delta_rows.shape[0])
+            batched_support_float_leaves = tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (row_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in support_float_leaves
+            )
+            return batched_support_float_leaves, (geometry_delta_rows[0],)
+
+        def _batched_support_float_leaves_bwd(residual, batched_support_float_bars):
+            (geometry_deltas0,) = residual
+            _support_float_baseline_unused, support_float_pullback = jax.vjp(
+                _support_float_leaves_from_geometry_deltas,
+                geometry_deltas0,
+            )
+
+            def _row_pullback(*support_float_bar_leaves):
+                return support_float_pullback(tuple(support_float_bar_leaves))[0]
+
+            geometry_delta_bars = jax.vmap(_row_pullback)(*batched_support_float_bars)
+            return (geometry_delta_bars,)
+
+        _batched_support_float_leaves_from_geometry_delta_rows.defvjp(
+            _batched_support_float_leaves_fwd,
+            _batched_support_float_leaves_bwd,
+        )
+
+        baseline_geometry_delta_rows = jnp.broadcast_to(
+            baseline_geometry_deltas[None, :],
+            (len(OBJECTIVE_LABELS),) + baseline_geometry_deltas.shape,
+        )
+        _support_float_baseline = _batched_support_float_leaves_from_geometry_delta_rows(
+            baseline_geometry_delta_rows
         )
         _support_float_baseline = jax.block_until_ready(_support_float_baseline)
         print(
@@ -2513,12 +2558,12 @@ def _run_realtime_geometry_support_segment_probe(
             )
             for leaf_i in support_float_leaf_indices
         )
-        geometry_gradient_matrix = jax.vmap(
-            lambda *support_bar_float_leaves: geometry_support_float_pullback(
-                tuple(support_bar_float_leaves)
-            )[0]
-        )(*batched_support_float_bars)
-        geometry_pullback_mode = "flat_array_leaf_batched"
+        _batched_support_float_value, batched_geometry_support_pullback = jax.vjp(
+            _batched_support_float_leaves_from_geometry_delta_rows,
+            baseline_geometry_delta_rows,
+        )
+        (geometry_gradient_matrix,) = batched_geometry_support_pullback(batched_support_float_bars)
+        geometry_pullback_mode = "flat_array_leaf_custom_vjp_batched_reverse"
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
         print(
             "[autodiff-gate] progress: geometry support pullback complete "
