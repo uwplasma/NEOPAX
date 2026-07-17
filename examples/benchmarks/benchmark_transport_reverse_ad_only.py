@@ -554,23 +554,23 @@ def _reverse_initial_carry_from_state_with_static_setup(
             )
             lagged_bar = _add_trees(lagged_bar, rhs_lagged_bar)
 
-            def _nonzero_lagged_state_pullback(_):
-                if lagged_pullback_fn is not None:
-                    return lagged_pullback_fn(lagged_state0, lagged_bar)
+            if lagged_pullback_fn is not None:
+                lagged_state_bar = lagged_pullback_fn(lagged_state0, lagged_bar)
+            else:
+                def _nonzero_lagged_state_pullback(_):
+                    def _build_lagged_from_state(lagged_state_value):
+                        return physics_context.build_lagged_response(lagged_state_value)
 
-                def _build_lagged_from_state(lagged_state_value):
-                    return physics_context.build_lagged_response(lagged_state_value)
+                    _, lagged_pullback = jax.vjp(_build_lagged_from_state, lagged_state0)
+                    (lagged_state_bar_value,) = lagged_pullback(lagged_bar)
+                    return lagged_state_bar_value
 
-                _, lagged_pullback = jax.vjp(_build_lagged_from_state, lagged_state0)
-                (lagged_state_bar_value,) = lagged_pullback(lagged_bar)
-                return lagged_state_bar_value
-
-            lagged_state_bar = jax.lax.cond(
-                _tree_max_abs(lagged_bar) > 0.0,
-                _nonzero_lagged_state_pullback,
-                lambda _: jax.tree_util.tree_map(jnp.zeros_like, lagged_state0),
-                operand=None,
-            )
+                lagged_state_bar = jax.lax.cond(
+                    _tree_max_abs(lagged_bar) > 0.0,
+                    _nonzero_lagged_state_pullback,
+                    lambda _: jax.tree_util.tree_map(jnp.zeros_like, lagged_state0),
+                    operand=None,
+                )
 
             def _lagged_state_from_flat(flat_value):
                 return _build_state_from_flat(flat_value, unpack_flat, project_flat)
