@@ -3117,7 +3117,7 @@ def _build_neopax_geometry_from_state(
 
     r00_samples = rmnc_b[:, mode00]
     r00_interp = interpax.Interpolator1D(sample_rho, r00_samples, extrap=True)
-    r0_value = r00_interp(jnp.asarray(1.0, dtype=sample_rho.dtype))
+    r0_value = _vmec_state_field(state, "Rcos", "R_cos")[-1, 0]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
