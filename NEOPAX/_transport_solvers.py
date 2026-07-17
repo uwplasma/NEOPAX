@@ -5130,6 +5130,97 @@ def _radau_single_slot_support_cotangent_bwd_call(
 
 
 @partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_single_slot_support_cotangent_bwd_flat_batched_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    step_start_carry: _RadauAcceptedStepCarry,
+    slot_arrays,
+    support,
+) -> tuple[Any, ...]:
+    """Batched support cotangents as flat leaves with static support metadata.
+
+    Returning leaves avoids vmapping over NTX geometry dataclasses directly;
+    their metadata is static and only the cotangent arrays need a leading
+    objective axis.
+    """
+
+    mode = str(cotangent_mode).strip().lower()
+    zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+    force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
+    force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+
+    (
+        active,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ) = slot_arrays
+    del (
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    )
+
+    def _single_support_bar(next_reduced_bar):
+        def _do_step_bwd(_):
+            carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+            residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_support_cotangent_bwd(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "reuse",
+                    residual_carry,
+                    next_reduced_bar,
+                    support,
+                )
+
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_support_cotangent_bwd(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "rebuild",
+                    residual_carry,
+                    next_reduced_bar,
+                    support,
+                )
+
+            if force_reuse_bwd:
+                return _reuse_branch(None)
+            if force_rebuild_bwd:
+                return _rebuild_branch(None)
+            return jax.lax.cond(
+                residual_carry.lagged_response_valid,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
+            )
+
+        def _skip_bwd(_):
+            return _radau_zero_support_delta_tree_like(support)
+
+        support_bar = jax.lax.cond(
+            jnp.logical_and(active, jnp.logical_not(zero_step_bwd)),
+            _do_step_bwd,
+            _skip_bwd,
+            operand=None,
+        )
+        support_bar = _radau_sanitize_support_delta_bar_tree(support, support_bar)
+        return tuple(jax.tree_util.tree_leaves(support_bar))
+
+    return jax.vmap(_single_support_bar)(next_reduced_bars)
+
+
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
 def _radau_segment_reduced_cotangent_bwd_batched_call(
     execution_context: _RadauSolveExecutionContext,
     cotangent_mode: str,

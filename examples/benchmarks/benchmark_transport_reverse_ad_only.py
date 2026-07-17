@@ -61,6 +61,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_segment_reduced_cotangent_bwd_batched_call,
     _radau_segment_reduced_cotangent_bwd_call,
     _radau_single_slot_support_cotangent_bwd_call,
+    _radau_single_slot_support_cotangent_bwd_flat_batched_call,
     _radau_zero_support_delta_tree_like,
 )
 
@@ -1115,30 +1116,9 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
         objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
         objective_values_rows.append(objective_value)
-        final_y_bar = objective_pullback(jnp.ones_like(objective_value))[0]
-        objective_finite = jnp.isfinite(objective_value)
-        final_y_bar = jnp.where(objective_finite, final_y_bar, jnp.zeros_like(final_y_bar))
-        final_y_bar = jnp.where(jnp.isfinite(final_y_bar), final_y_bar, jnp.zeros_like(final_y_bar))
-        final_y_bar_rows.append(final_y_bar)
+        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
     objective_values = jnp.stack(objective_values_rows, axis=0)
     final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
-    objective_finite_mask = jnp.isfinite(objective_values)
-
-    def _mask_objective_rows(tree):
-        def _mask_leaf(leaf):
-            arr = jnp.asarray(leaf)
-            if (
-                arr.ndim >= 1
-                and int(arr.shape[0]) == objective_count
-                and jnp.issubdtype(arr.dtype, jnp.inexact)
-            ):
-                mask = objective_finite_mask.reshape(
-                    (objective_count,) + (1,) * (arr.ndim - 1)
-                )
-                return jnp.where(mask, arr, jnp.zeros_like(arr))
-            return leaf
-
-        return jax.tree_util.tree_map(_mask_leaf, tree)
 
     (
         carry0,
@@ -1178,10 +1158,14 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
         ),
     )
-    reduced_bars = _mask_objective_rows(reduced_bars)
-    support_bars = tuple(
-        _radau_zero_support_delta_tree_like(support_payload)
-        for _ in range(objective_count)
+    zero_support_bar = _radau_zero_support_delta_tree_like(support_payload)
+    zero_support_leaves, support_treedef = jax.tree_util.tree_flatten(zero_support_bar)
+    support_bar_leaves = tuple(
+        jnp.broadcast_to(
+            jnp.asarray(leaf)[None, ...],
+            (objective_count,) + jnp.asarray(leaf).shape,
+        )
+        for leaf in zero_support_leaves
     )
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
@@ -1199,20 +1183,17 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
         support_reuse_count += int(slot_lagged_response_valid)
         support_rebuild_count += int(not slot_lagged_response_valid)
-        support_bars = tuple(
-            _radau_add_support_delta_trees(
-                support_bars[objective_i],
-                _radau_single_slot_support_cotangent_bwd_call(
-                    reverse_setup.execution_context,
-                    slot_cotangent_mode,
-                    _take_tree_axis0(reduced_bars, objective_i),
-                    segment_start_carry,
-                    slot_arrays,
-                    support_payload,
-                ),
-                support_payload,
-            )
-            for objective_i in range(objective_count)
+        step_support_bar_leaves = _radau_single_slot_support_cotangent_bwd_flat_batched_call(
+            reverse_setup.execution_context,
+            slot_cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            slot_arrays,
+            support_payload,
+        )
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
         )
         reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
             reverse_setup.execution_context,
@@ -1221,7 +1202,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             segment_start_carry,
             segment_arrays,
         )
-        reduced_bars = _mask_objective_rows(reduced_bars)
 
     def _full_carry_bar_from_reduced(reduced_bar):
         return dataclasses.replace(
@@ -1233,12 +1213,12 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
     carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
     gradient_matrix = jax.vmap(lambda carry0_bar: initial_carry_pullback(carry0_bar)[0])(carry0_bars)
-    gradient_matrix = jnp.where(
-        objective_finite_mask[:, None],
-        gradient_matrix,
-        jnp.full_like(gradient_matrix, jnp.nan),
+    support_bars = tuple(
+        support_treedef.unflatten(
+            [jnp.asarray(leaf)[objective_i] for leaf in support_bar_leaves]
+        )
+        for objective_i in range(objective_count)
     )
-
     return (
         objective_values,
         gradient_matrix,
