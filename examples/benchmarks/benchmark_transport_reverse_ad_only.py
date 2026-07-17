@@ -248,6 +248,7 @@ def _geometry_volume_diagnostics(geometry) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for name in (
         "a_b",
+        "R0",
         "rho_grid",
         "rho_grid_half",
         "r_grid",
@@ -1954,63 +1955,23 @@ def _reverse_geometry_rollout_parts_for_parameter_vector(
     reverse_segment_length: int | None = None,
     solver_override=None,
 ):
-    del geometry_parameter_name
-    del reverse_segment_length
-    profile_values = parameter_values[: len(PARAMETER_ORDER)]
-    geometry_delta = parameter_values[len(PARAMETER_ORDER)]
-    geom_cfg = config.get("geometry", {})
-    runtime, geometry_baseline_state = build_runtime_context_for_geometry_param(
+    del (
+        parameter_values,
         config,
         geometry_context,
-        geometry_delta,
-        lane="ad",
-        n_r=int(geom_cfg.get("n_radial", 51)),
-        max_iter=geom_cfg.get("vmec_max_iter"),
-        step_size=geom_cfg.get("vmec_step_size"),
-        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-        initialize_er=False,
+        profile_cfg,
+        geometry_parameter_name,
+        fixed_initial_er,
+        accepted_step_limit_override,
+        reverse_segment_length,
+        solver_override,
     )
-    state0 = _initial_state_for_parameter_vector(
-        profile_values,
-        baseline_state=geometry_baseline_state,
-        profile_cfg=profile_cfg,
-        runtime=runtime,
+    raise NotImplementedError(
+        "The old whole-runtime realtime geometry AD rollout path is disabled. "
+        "Use --realtime-geometry-gradient-path reverse_payload, which keeps the "
+        "forward realtime primal runtime and attaches geometry through the "
+        "explicit support-payload boundary."
     )
-    if fixed_initial_er is not None:
-        state0 = dataclasses.replace(
-            state0,
-            Er=jnp.asarray(fixed_initial_er, dtype=state0.Er.dtype),
-        )
-    prepared_components = prepare_transport_solver_components(
-        config,
-        runtime,
-        state0,
-        solver_override=solver_override,
-    )
-    solver = prepared_components["solver"]
-    solve_vector_field = prepared_components["solve_vector_field"]
-    prepared_rollout = _build_prepared_radau_accepted_rollout(
-        solver=solver,
-        state=state0,
-        vector_field=solve_vector_field,
-        species=runtime.species,
-    )
-    execution_context = _build_prepared_radau_execution_context(
-        solver=solver,
-        prepared_rollout=prepared_rollout,
-    )
-    stop_after_accepted_steps = (
-        int(accepted_step_limit_override)
-        if accepted_step_limit_override is not None
-        else getattr(solver, "stop_after_accepted_steps", None)
-    )
-    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-    if stop_after_accepted_steps is not None:
-        max_total_steps = min(
-            max_total_steps,
-            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
-        )
-    return runtime, prepared_rollout, execution_context, stop_after_accepted_steps, max_total_steps
 
 
 def _reverse_geometry_objective_vector_for_parameter_vector(
@@ -2450,7 +2411,7 @@ def _run_realtime_geometry_support_segment_probe(
     if args.objective == "all":
         early_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         print("[autodiff-gate] realtime geometry pre-reverse diagnostics:")
-        for field_name in ("a_b", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
+        for field_name in ("a_b", "R0", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
             if field_name not in early_geometry_diagnostics:
                 continue
             summary = early_geometry_diagnostics[field_name]
@@ -2732,7 +2693,7 @@ def _run_realtime_geometry_support_segment_probe(
         for objective_name, value in report["objective_values"].items():
             print(f"  - {objective_name}: value={value:.16e}")
         print("[autodiff-gate] realtime geometry diagnostics:")
-        for field_name in ("a_b", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
+        for field_name in ("a_b", "R0", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
             if field_name not in realtime_geometry_diagnostics:
                 continue
             summary = realtime_geometry_diagnostics[field_name]
@@ -3156,7 +3117,7 @@ def _run_realtime_geometry_reverse_mode(
         config,
         geometry_context,
         baseline_geometry_delta,
-        lane="ad",
+        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
         n_r=int(geom_cfg.get("n_radial", 51)),
         max_iter=geom_cfg.get("vmec_max_iter"),
         step_size=geom_cfg.get("vmec_step_size"),
@@ -3199,7 +3160,7 @@ def _run_realtime_geometry_reverse_mode(
             neoclassical_cfg=neoclassical_cfg,
         )
         return
-    if str(args.realtime_geometry_gradient_path) == "support_segment_probe":
+    if str(args.realtime_geometry_gradient_path) in {"support_segment_probe", "reverse_payload"}:
         _run_realtime_geometry_support_segment_probe(
             args=args,
             config=config,
@@ -3221,6 +3182,11 @@ def _run_realtime_geometry_reverse_mode(
             neoclassical_cfg=neoclassical_cfg,
         )
         return
+    raise SystemExit(
+        "[autodiff-gate] unsupported realtime geometry gradient path "
+        f"{args.realtime_geometry_gradient_path!r}. Use reverse_payload for "
+        "the forward-primal/profile-reverse/support-payload path."
+    )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
 
     objective_vector_fn = _make_reverse_geometry_objective_vector_with_schedule_vjp(
@@ -3479,9 +3445,9 @@ def main() -> None:
             "'initial_carry_boundary_probe' returns the compact cotangent wrt "
             "the initial transport state, matching the profile reverse boundary "
             "before composing with VMEC/NTX geometry parameters. "
-            "'reverse_payload' is the intended final path and currently fails "
-            "explicitly until the Radau accepted-step transpose returns geometry "
-            "payload cotangents."
+            "'reverse_payload' currently aliases the support-segment implementation: "
+            "forward/realtime primal runtime, profile reverse replay, and explicit "
+            "support-payload cotangents for geometry."
         ),
     )
     parser.add_argument(
