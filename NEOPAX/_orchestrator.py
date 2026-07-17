@@ -248,10 +248,7 @@ def _build_state(config: dict, geometry, species: Species):
         return None
     profile_cfg = dict(config.get("profiles", {}))
     if profile_cfg.get("charge_qp") is None:
-        species_cfg = config.get("species", {})
-        profile_cfg["charge_qp"] = tuple(
-            float(v) for v in species_cfg.get("charge_qp", [-1.0, 1.0, 1.0])
-        )
+        profile_cfg["charge_qp"] = tuple(float(v) for v in jnp.asarray(species.charge_qp))
     profile_set = build_profiles(profile_cfg, geometry, species.number_species)
     density_state = profile_set.density / 1.0e20
     temperature_state = profile_set.temperature / 1.0e3
@@ -727,8 +724,6 @@ def prepare_transport_solver_components(
     config: dict,
     runtime: RuntimeContext,
     state: TransportState,
-    *,
-    solver_override: Any = None,
 ) -> dict[str, Any]:
     """Build the reusable transport solve components without executing solve.
 
@@ -830,12 +825,8 @@ def prepare_transport_solver_components(
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
-        config=config,
-        source_models=runtime.models.source,
-        solver_cfg=solver_cfg,
-        boundary_models=bc,
     )
-    solver = build_time_solver(solver_cfg, solver_override=solver_override)
+    solver = build_time_solver(solver_cfg)
     return {
         "bc": bc,
         "equations_to_evolve": equations_to_evolve,

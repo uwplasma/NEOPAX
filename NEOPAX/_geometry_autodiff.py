@@ -119,54 +119,12 @@ def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inp
     if context.booz_constants is not None and context.booz_grids is not None:
         return context.booz_constants, context.booz_grids
     booz_api = _import_booz_xform_jax_api()
-    nfp_static = int(context.static.resolution.nfp)
-    mboz_static = int(context.mboz)
-    nboz_static = int(context.nboz)
-    asym_static = bool(context.cfg.lasym)
-    mpol_static = int(context.static.resolution.mpol)
-    ntor_static = int(context.static.resolution.ntor)
-    ntheta1 = int(getattr(context.static.resolution, "ntheta1", context.static.resolution.ntheta))
-    nzeta = int(getattr(context.static.resolution, "nzeta", 0))
-    mmax_non = max(mpol_static - 1, 0)
-    nmax_non = max(ntor_static, 0)
-    mmax_nyq = max(ntheta1 // 2, mmax_non)
-    nmax_nyq = max(nzeta // 2, nmax_non)
-
-    ntheta_full = 2 * (2 * mboz_static + 1)
-    nzeta_full = 2 * (2 * nboz_static + 1) if nboz_static > 0 else 1
-    nu2_b = ntheta_full // 2 + 1
-    nu3_b = ntheta_full if asym_static else nu2_b
-    theta_vals = np.arange(nu3_b, dtype=np.float64) * (2.0 * np.pi / ntheta_full)
-    zeta_vals = np.arange(nzeta_full, dtype=np.float64) * (2.0 * np.pi / (nfp_static * nzeta_full))
-
-    xm_b: list[int] = []
-    xn_b: list[int] = []
-    for m_value in range(mboz_static):
-        n_min = 0 if m_value == 0 else -nboz_static
-        for n_value in range(n_min, nboz_static + 1):
-            xm_b.append(m_value)
-            xn_b.append(n_value * nfp_static)
-
-    constants = booz_api.BoozXformConstants(
-        nfp=nfp_static,
-        mboz=mboz_static,
-        nboz=nboz_static,
-        asym=asym_static,
-        ntheta=ntheta_full,
-        nzeta=nzeta_full,
-        nu2_b=nu2_b,
-        mmax_non=mmax_non,
-        nmax_non=nmax_non,
-        mmax_nyq=mmax_nyq,
-        nmax_nyq=nmax_nyq,
+    return booz_api.prepare_booz_xform_constants_from_inputs(
+        inputs=inputs,
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        asym=bool(context.cfg.lasym),
     )
-    grids = booz_api.BoozXformGrids(
-        theta_grid=np.repeat(theta_vals, nzeta_full),
-        zeta_grid=np.tile(zeta_vals, nu3_b),
-        xm_b=np.asarray(xm_b, dtype=np.int32),
-        xn_b=np.asarray(xn_b, dtype=np.int32),
-    )
-    return constants, grids
 
 
 def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
@@ -2933,55 +2891,21 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
         flux=context.flux,
     )
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    def _run_boozer(surface_indices_in):
-        out_local = booz_api.booz_xform_from_inputs(
-            inputs=inputs,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=surface_indices_in,
-            jit=True,
-        )
-        if "rmnc_b" not in out_local:
-            raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-        ixm_b = jnp.asarray(out_local["ixm_b"], dtype=jnp.int32)
-        ixn_b = jnp.asarray(out_local["ixn_b"], dtype=jnp.int32)
-        mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
-        if mode00 is None:
-            raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
-        return jnp.asarray(out_local["rmnc_b"], dtype=jnp.float64)[:, mode00]
-
-    rmnc00_samples = _run_boozer(surface_indices)
-
-    if int(sample_rho.shape[0]) < 2 or int(rmnc00_samples.shape[0]) < 2:
-        s_full_np = np.asarray(context.static.s, dtype=float)
-        s_half_np = 0.5 * (s_full_np[:-1] + s_full_np[1:])
-        rho_np = np.asarray(rho_arr, dtype=float).reshape(-1)
-        finite_rho = rho_np[np.isfinite(rho_np)]
-        if finite_rho.size >= 2:
-            fallback_indices_np = np.unique(
-                [int(np.argmin(np.abs(s_half_np - float(rho_value**2)))) for rho_value in finite_rho]
-            ).astype(np.int32)
-        else:
-            fallback_count = min(int(s_half_np.size), 32)
-            fallback_indices_np = np.unique(
-                np.rint(np.linspace(0, int(s_half_np.size) - 1, fallback_count)).astype(np.int32)
-            )
-        if fallback_indices_np.size < 2:
-            raise ValueError(
-                "Boozer R00 support has fewer than two radial samples while building realtime NTX support. "
-                f"surface_indices={np.asarray(surface_indices).tolist()} "
-                f"fallback_indices={fallback_indices_np.tolist()} "
-                f"rho_values_shape={tuple(rho_arr.shape)}"
-            )
-        surface_indices = jnp.asarray(fallback_indices_np, dtype=jnp.int32)
-        sample_rho = jnp.sqrt(jnp.maximum(jnp.asarray(s_half_np[fallback_indices_np], dtype=jnp.float64), 0.0))
-        rmnc00_samples = _run_boozer(surface_indices)
-        if int(rmnc00_samples.shape[0]) < 2:
-            raise ValueError(
-                "Boozer R00 fallback support has fewer than two radial samples after booz_xform. "
-                f"surface_indices={fallback_indices_np.tolist()} "
-                f"rmnc00_shape={tuple(rmnc00_samples.shape)}"
-            )
+    out = booz_api.booz_xform_from_inputs(
+        inputs=inputs,
+        constants=booz_constants,
+        grids=booz_grids,
+        surface_indices=surface_indices,
+        jit=True,
+    )
+    if "rmnc_b" not in out:
+        raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    if mode00 is None:
+        raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
+    rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
     return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
 
 
@@ -3274,7 +3198,7 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
         return _surface_zero_mode_value(surface, "b_sub_zeta_cos")
 
     rho_arr = jnp.asarray(rho, dtype=jnp.float64)
-    psia_value = jnp.asarray(psia, dtype=jnp.float64)
+    psia_value = float(jnp.asarray(psia))
     r00_arr = jnp.asarray(r00, dtype=jnp.float64)
     b00 = jnp.asarray([_surface_b00(surface) for surface in surfaces])
     boozer_i = jnp.asarray([_surface_boozer_i(surface) for surface in surfaces])
@@ -3296,7 +3220,7 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
-        a_b=jnp.asarray(a_b, dtype=jnp.float64),
+        a_b=float(a_b),
         psia=psia_value,
         b00=b00,
         r00=r00_arr,
@@ -3329,7 +3253,7 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
         return interpax.Interpolator1D(rho_grid, values, extrap=True)(rho_arr)
 
     a_b = jnp.asarray(geometry.a_b, dtype=jnp.float64)
-    psia_value = jnp.asarray(psia, dtype=jnp.float64)
+    psia_value = float(jnp.asarray(psia))
     r00_arr = jnp.asarray(r00, dtype=jnp.float64)
     b00 = _interp_geometry_field("B0")
     boozer_i = _interp_geometry_field("I_value")
@@ -3352,7 +3276,7 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
     fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
-        a_b=a_b,
+        a_b=float(a_b),
         psia=psia_value,
         b00=b00,
         r00=r00_arr,
@@ -3423,7 +3347,7 @@ def _ntx_frozen_interp_mode_columns(interpolated_value, x_nodes, values, xq):
     )
 
 
-def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path, static=None):
+def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     """Build an NTX VMEC surface using the same sampling convention as NTX's frozen loader."""
 
     import ntx
@@ -3730,7 +3654,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 vmec_wout_cache,
                 s=float(s_value),
                 source_path=context.input_path,
-                static=context.static,
             )
             for s_value in s_values
         )
