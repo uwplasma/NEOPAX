@@ -2933,21 +2933,55 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
         flux=context.flux,
     )
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    out = booz_api.booz_xform_from_inputs(
-        inputs=inputs,
-        constants=booz_constants,
-        grids=booz_grids,
-        surface_indices=surface_indices,
-        jit=True,
-    )
-    if "rmnc_b" not in out:
-        raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
-    if mode00 is None:
-        raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
-    rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
+    def _run_boozer(surface_indices_in):
+        out_local = booz_api.booz_xform_from_inputs(
+            inputs=inputs,
+            constants=booz_constants,
+            grids=booz_grids,
+            surface_indices=surface_indices_in,
+            jit=True,
+        )
+        if "rmnc_b" not in out_local:
+            raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
+        ixm_b = jnp.asarray(out_local["ixm_b"], dtype=jnp.int32)
+        ixn_b = jnp.asarray(out_local["ixn_b"], dtype=jnp.int32)
+        mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+        if mode00 is None:
+            raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
+        return jnp.asarray(out_local["rmnc_b"], dtype=jnp.float64)[:, mode00]
+
+    rmnc00_samples = _run_boozer(surface_indices)
+
+    if int(sample_rho.shape[0]) < 2 or int(rmnc00_samples.shape[0]) < 2:
+        s_full_np = np.asarray(context.static.s, dtype=float)
+        s_half_np = 0.5 * (s_full_np[:-1] + s_full_np[1:])
+        rho_np = np.asarray(rho_arr, dtype=float).reshape(-1)
+        finite_rho = rho_np[np.isfinite(rho_np)]
+        if finite_rho.size >= 2:
+            fallback_indices_np = np.unique(
+                [int(np.argmin(np.abs(s_half_np - float(rho_value**2)))) for rho_value in finite_rho]
+            ).astype(np.int32)
+        else:
+            fallback_count = min(int(s_half_np.size), 32)
+            fallback_indices_np = np.unique(
+                np.rint(np.linspace(0, int(s_half_np.size) - 1, fallback_count)).astype(np.int32)
+            )
+        if fallback_indices_np.size < 2:
+            raise ValueError(
+                "Boozer R00 support has fewer than two radial samples while building realtime NTX support. "
+                f"surface_indices={np.asarray(surface_indices).tolist()} "
+                f"fallback_indices={fallback_indices_np.tolist()} "
+                f"rho_values_shape={tuple(rho_arr.shape)}"
+            )
+        surface_indices = jnp.asarray(fallback_indices_np, dtype=jnp.int32)
+        sample_rho = jnp.sqrt(jnp.maximum(jnp.asarray(s_half_np[fallback_indices_np], dtype=jnp.float64), 0.0))
+        rmnc00_samples = _run_boozer(surface_indices)
+        if int(rmnc00_samples.shape[0]) < 2:
+            raise ValueError(
+                "Boozer R00 fallback support has fewer than two radial samples after booz_xform. "
+                f"surface_indices={fallback_indices_np.tolist()} "
+                f"rmnc00_shape={tuple(rmnc00_samples.shape)}"
+            )
     return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
 
 
