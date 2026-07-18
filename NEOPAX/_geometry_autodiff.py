@@ -3659,10 +3659,19 @@ def build_ntx_exact_lij_support_from_vmec_state(
     r00_face = r00_interp(rho_face)
     center_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float))
     face_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float))
+
+    def _positive_transport_s_values(rho_values):
+        rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
+        positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
+        if positive.size == 0:
+            return tuple(float(rho_value**2) for rho_value in rho_np)
+        first_transport_rho = float(np.min(positive))
+        return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
+
     surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
-        center_surfaces = _vmec_surfaces_from_state(s_values=center_s_values)
-        face_surfaces = _vmec_surfaces_from_state(s_values=face_s_values)
+        center_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_center))
+        face_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_face))
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
