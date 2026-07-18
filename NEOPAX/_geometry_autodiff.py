@@ -2687,19 +2687,18 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     qi_index = names.index("boozer_qi_objective")
 
-    def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
+    def qi_scalar_from_state(state_inner):
+        values = _vmec_booz_qi_scalar_objective_from_state(context, state_inner)
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
-    qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
+    qi_value, qi_state_pullback = jax.vjp(qi_scalar_from_state, state)
     values_by_name["boozer_qi_objective"] = qi_value
-    qi_unit_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    qi_boozer_bar = _tree_scale_unit_cotangent(qi_unit_boozer_bar, cotangents[:, qi_index])
+    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_state_bar = _tree_scale_unit_cotangent(qi_unit_state_bar, cotangents[:, qi_index])
 
-    booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
-    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
+    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
 
-    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
+    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar, qi_state_bar)
     if use_current_multi_rhs:
         param_grads = implicit.implicit_state_pullback_multi_rhs(
             implicit_params,
@@ -3844,6 +3843,29 @@ def build_runtime_context_for_geometry_param(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ):
+    state_vmec = _solve_state_for_single_param(
+        context,
+        param_delta,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        jacobian_penalty=jacobian_penalty,
+    )
+    return build_runtime_context_for_vmec_state(
+        config,
+        context,
+        state_vmec,
+        n_r=n_r,
+    )
+
+
+def build_runtime_context_for_vmec_state(
+    config: dict[str, Any],
+    context: GeometryAutodiffContext,
+    state_vmec,
+    *,
+    n_r: int,
+):
     from NEOPAX._orchestrator import (
         Models,
         RuntimeContext,
@@ -3858,14 +3880,6 @@ def build_runtime_context_for_geometry_param(
     )
     from NEOPAX._source_models import build_source_models_from_config
 
-    state_vmec = _solve_state_for_single_param(
-        context,
-        param_delta,
-        lane=lane,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
     geometry = _build_neopax_geometry_from_state(context, state_vmec, n_r=n_r)
     species = _build_species(config)
     energy_grid = _build_energy_grid(config)

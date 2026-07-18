@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -11,8 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+WORKSPACE_ROOT = ROOT.parent
+for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
@@ -31,7 +34,12 @@ from benchmark_transport_reverse_ad_only import (  # noqa: E402
     _geometry_param_specs_from_parameter_name,
     _initial_state_for_parameter_vector,
 )
-from NEOPAX._geometry_autodiff import build_runtime_context_for_geometry_param  # noqa: E402
+from NEOPAX._geometry_autodiff import (  # noqa: E402
+    _implicit_params_with_boundary_deltas,
+    boundary_param_entries,
+    build_runtime_context_for_geometry_param,
+    build_runtime_context_for_vmec_state,
+)
 from NEOPAX._orchestrator import build_runtime_context, prepare_transport_solver_components  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
@@ -39,6 +47,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_schedule_rollout,
     _radau_run_prepared_on_realized_trace,
 )
+from vmec_jax.core import implicit as im  # noqa: E402
 
 
 def _report_path(parameter_name: str) -> Path:
@@ -161,6 +170,122 @@ def _runtime_for_geometry_delta(config: dict[str, Any], geometry_parameter: str,
     )
 
 
+def _param_unit_tangent_like(params, entry: dict[str, Any]):
+    leaves = {
+        field.name: jnp.zeros_like(getattr(params, field.name))
+        for field in dataclasses.fields(params)
+    }
+    field_name = str(entry["input_field"])
+    leaves[field_name] = leaves[field_name].at[
+        int(entry["n_offset"]),
+        int(entry["m_index"]),
+    ].set(1.0)
+    return dataclasses.replace(params, **leaves)
+
+
+def _manual_implicit_forward_state_tangent(*, params, param_tangent, cfg, x_star, dof_mask):
+    frozen = jax.lax.stop_gradient(x_star)
+    edge_mask = im._edge_mask(cfg)
+    P = im._dof_projector(cfg, dof_mask)
+    F = im.residual_fn(cfg, frozen, dof_mask)
+    z_star = P(x_star)
+
+    rhs = jax.tree.map(
+        jnp.negative,
+        jax.jvp(lambda prm: F(z_star, prm), (params,), (param_tangent,))[1],
+    )
+    dz, _ = im._adjoint_solve(
+        lambda v: jax.jvp(lambda z: F(z, params), (z_star,), (v,))[1],
+        rhs,
+        cfg,
+    )
+
+    def assemble_from_z_params(z, prm):
+        return im._assemble(
+            z,
+            im.runtime_from_params(prm, cfg),
+            frozen,
+            P,
+            edge_mask,
+        )
+
+    return jax.jvp(
+        assemble_from_z_params,
+        (z_star, params),
+        (dz, param_tangent),
+    )[1]
+
+
+def _frozen_linearized_vmec_geometry_bundle(
+    config: dict[str, Any],
+    geometry_parameter: str,
+    *,
+    baseline_delta: float,
+):
+    geom_cfg = config.get("geometry", {})
+    geometry_context = _geometry_context_from_config(config, geometry_parameter)
+    specs = _geometry_param_specs_from_parameter_name(geometry_parameter)
+    if len(specs) != 1:
+        raise ValueError("This FD benchmark currently expects one geometry parameter.")
+    (entry,) = boundary_param_entries(geometry_context, specs)
+    params0 = im.params_from_input(geometry_context.indata)
+    params = _implicit_params_with_boundary_deltas(
+        geometry_context,
+        im,
+        jnp.asarray([baseline_delta], dtype=jnp.float64),
+        (entry,),
+    )
+    cfg_kwargs = {
+        "mode": "cli",
+        "multigrid": True,
+    }
+    if geom_cfg.get("vmec_max_iter") is not None:
+        cfg_kwargs["max_iterations"] = int(geom_cfg["vmec_max_iter"])
+    cfg = im.make_config(geometry_context.indata, **cfg_kwargs)
+
+    print("[autodiff-gate] progress: baseline implicit VMEC solve for frozen-linearized geometry FD", flush=True)
+    state_star, dof_mask = im.solve_implicit_with_aux(params, cfg)
+    param_tangent = _param_unit_tangent_like(params0, entry)
+    state_tangent = _manual_implicit_forward_state_tangent(
+        params=params,
+        param_tangent=param_tangent,
+        cfg=cfg,
+        x_star=state_star,
+        dof_mask=dof_mask,
+    )
+    coefficient_value = float(entry["baseline_coefficient"]) + float(baseline_delta)
+    return {
+        "context": geometry_context,
+        "state_star": state_star,
+        "state_tangent": state_tangent,
+        "coefficient_value": coefficient_value,
+        "n_r": int(geom_cfg.get("n_radial", 51)),
+    }
+
+
+def _runtime_for_frozen_linearized_geometry_step(
+    config: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    step_scale: float,
+    fixed_initial_er=None,
+):
+    state = jax.tree.map(
+        lambda value, tangent: value + jnp.asarray(step_scale, dtype=jnp.float64) * tangent,
+        bundle["state_star"],
+        bundle["state_tangent"],
+    )
+    runtime, state = build_runtime_context_for_vmec_state(
+        config,
+        bundle["context"],
+        state,
+        n_r=int(bundle["n_r"]),
+    )
+    if fixed_initial_er is not None:
+        state = dataclasses.replace(state, Er=jnp.asarray(fixed_initial_er, dtype=state.Er.dtype))
+    return runtime, state
+
+
 def _geometry_fd_objectives(
     *,
     config: dict[str, Any],
@@ -170,8 +295,22 @@ def _geometry_fd_objectives(
     profile_cfg: dict[str, Any],
     frozen_trace,
     replay_mode: str,
+    geometry_fd_lane: str,
+    frozen_linearized_bundle: dict[str, Any] | None = None,
+    fixed_initial_er=None,
 ):
-    runtime, baseline_state = _runtime_for_geometry_delta(config, geometry_parameter, geometry_delta)
+    if str(geometry_fd_lane).strip().lower() == "frozen_linearized":
+        if frozen_linearized_bundle is None:
+            raise ValueError("frozen_linearized geometry FD requires a baseline VMEC tangent bundle.")
+        baseline_delta = float(config.get("geometry", {}).get("vmec_param_delta", 0.0))
+        runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
+            config,
+            frozen_linearized_bundle,
+            step_scale=float(geometry_delta) - baseline_delta,
+            fixed_initial_er=fixed_initial_er,
+        )
+    else:
+        runtime, baseline_state = _runtime_for_geometry_delta(config, geometry_parameter, geometry_delta)
     return _objectives_on_realtime_geometry_frozen_trace(
         config=config,
         runtime=runtime,
@@ -205,6 +344,16 @@ def main() -> None:
     parser.add_argument("--accepted-step-limit", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
+        "--geometry-fd-lane",
+        choices=("frozen_linearized", "nonlinear_resolve"),
+        default="frozen_linearized",
+        help=(
+            "Geometry-parameter FD oracle. 'frozen_linearized' freezes the baseline VMEC "
+            "implicit solve and perturbs state_star +/- h*dstate/dp; 'nonlinear_resolve' "
+            "keeps the older full VMEC re-solve endpoint diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--replay-mode",
         choices=("attempt", "accepted"),
         default="attempt",
@@ -220,7 +369,24 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     profile_cfg = _baseline_profile_cfg(config)
-    baseline_runtime, baseline_state = build_runtime_context(config)
+    parameter_name = str(args.parameter)
+    geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
+    parameter_is_profile = parameter_name in PARAMETER_ORDER
+    frozen_linearized_bundle = None
+    if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
+        baseline_runtime, baseline_state = build_runtime_context(config)
+    else:
+        baseline_delta = float(config.get("geometry", {}).get("vmec_param_delta", 0.0))
+        frozen_linearized_bundle = _frozen_linearized_vmec_geometry_bundle(
+            config,
+            parameter_name,
+            baseline_delta=baseline_delta,
+        )
+        baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
+            config,
+            frozen_linearized_bundle,
+            step_scale=0.0,
+        )
     profile_values = jnp.asarray([float(profile_cfg[name]) for name in PARAMETER_ORDER], dtype=jnp.float64)
     baseline_profile_state = _profile_state_from_values(
         profile_values,
@@ -242,9 +408,13 @@ def main() -> None:
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
     baseline_objectives = jax.block_until_ready(baseline_objectives)
+    fixed_initial_er = (
+        jax.lax.stop_gradient(baseline_state.Er)
+        if (not parameter_is_profile and geometry_fd_lane == "frozen_linearized")
+        else None
+    )
 
-    parameter_name = str(args.parameter)
-    if parameter_name in PARAMETER_ORDER:
+    if parameter_is_profile:
         parameter_kind = "profile"
         param_index = PARAMETER_ORDER.index(parameter_name)
         baseline_value = float(profile_cfg[parameter_name])
@@ -278,7 +448,16 @@ def main() -> None:
         parameter_kind = "realtime_geometry"
         geom_cfg = config.get("geometry", {})
         baseline_value = float(geom_cfg.get("vmec_param_delta", 0.0))
-        h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+        if geometry_fd_lane == "frozen_linearized":
+            if frozen_linearized_bundle is None:
+                raise ValueError("Missing frozen-linearized geometry bundle.")
+            step_scale_value = float(frozen_linearized_bundle["coefficient_value"])
+        else:
+            geometry_context = _geometry_context_from_config(config, parameter_name)
+            specs = _geometry_param_specs_from_parameter_name(parameter_name)
+            (entry,) = boundary_param_entries(geometry_context, specs)
+            step_scale_value = float(entry["baseline_coefficient"]) + baseline_value
+        h = _fd_step(step_scale_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
         print("[autodiff-gate] progress: running realtime geometry fd_minus replay", flush=True)
         minus_objectives, minus_replay = _geometry_fd_objectives(
             config=config,
@@ -288,6 +467,9 @@ def main() -> None:
             profile_cfg=profile_cfg,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            geometry_fd_lane=geometry_fd_lane,
+            frozen_linearized_bundle=frozen_linearized_bundle,
+            fixed_initial_er=fixed_initial_er,
         )
         print("[autodiff-gate] progress: running realtime geometry fd_plus replay", flush=True)
         plus_objectives, plus_replay = _geometry_fd_objectives(
@@ -298,6 +480,9 @@ def main() -> None:
             profile_cfg=profile_cfg,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            geometry_fd_lane=geometry_fd_lane,
+            frozen_linearized_bundle=frozen_linearized_bundle,
+            fixed_initial_er=fixed_initial_er,
         )
 
     minus_objectives, plus_objectives = jax.block_until_ready((minus_objectives, plus_objectives))
@@ -314,6 +499,7 @@ def main() -> None:
         "baseline_value": float(baseline_value),
         "fd_step": float(h),
         "replay_mode": str(args.replay_mode),
+        "geometry_fd_lane": str(geometry_fd_lane),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "radau_jacobian_reuse_mode": None
         if args.radau_jacobian_reuse_mode is None
@@ -340,7 +526,7 @@ def main() -> None:
         "[autodiff-gate] mode=transport_realtime_geometry_forward_fd "
         f"parameter={parameter_name} parameter_kind={parameter_kind} "
         f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
-        f"replay_mode={args.replay_mode}"
+        f"replay_mode={args.replay_mode} geometry_fd_lane={geometry_fd_lane}"
     )
     print("[autodiff-gate] objective values:")
     for label, value in zip(OBJECTIVE_LABELS, baseline_np.tolist()):
