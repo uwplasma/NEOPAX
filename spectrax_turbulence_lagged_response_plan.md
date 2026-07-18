@@ -2,31 +2,70 @@
 
 ## Goal
 
-Add SPECTRAX-GK turbulent flux modes to NEOPAX that use the existing lagged-response transport solver machinery, analogous in solver interface to the NTX exact-runtime neoclassical lagged response, but without changing or contaminating the working NTX lagged path.
+Add a turbulence lagged-response mode to NEOPAX that can consume SPECTRAX-GK
+flux information through the existing transport-solver lagged-response
+machinery.
 
-The target use case is:
+The first target is not a live SPECTRAX runtime call. The first target is a
+file-backed finite-difference mode in which the transport file contains:
 
-- NTX remains the neoclassical flux model.
-- SPECTRAX-GK becomes an optional turbulence flux model.
-- The transport solver can rebuild or reuse a turbulent lagged response using the same solver-level cache and drift machinery already available for lagged responses.
-- Future realtime-geometry optimization can differentiate transport objectives with respect to profiles and geometry parameters, but the first SPECTRAX turbulence plan should focus on profile-state turbulent response correctness.
+- a reference turbulent flux `Q_ref`,
+- perturbed turbulent flux evaluations `Q_perturb`,
+- perturbation metadata sufficient to reconstruct a local Jacobian.
 
-This file is a plan only. Implementation should happen later and should be validated in small steps.
+After that works, add a live AD-backed mode that builds the same lagged-response
+object from a single differentiable SPECTRAX-GK evaluation path.
 
-## Non-contamination requirement
+The lagged response should represent a local affine model:
 
-Do not modify the working NTX lagged-response semantics while implementing this plan.
+```text
+Q(x) ~= Q_ref + J_ref (x - x_ref)
+```
+
+where:
+
+- `x_ref` is the reference transport state used to build the response,
+- `Q_ref` is the reference turbulent flux vector,
+- `J_ref` is the local flux Jacobian with respect to the chosen transport-state
+  basis.
+
+This is a response-model question, not an integrator question. The solver may
+be theta-based or Radau-based; the lagged turbulence response should be usable
+through the same solver-level `build_lagged_response(...)` and
+`evaluate_with_lagged_response(...)` contract.
+
+## Scope
+
+In scope:
+
+- a new turbulence lagged-response object,
+- a finite-difference build path,
+- an AD build path,
+- a transport-file extension for FD payloads,
+- solver-side reuse and rebuild using the existing lagged-response controls,
+- validation diagnostics comparing lagged predictions to fresh turbulence
+  evaluations.
+
+Out of scope for the first rollout:
+
+- geometry-parameter perturbations,
+- long-window production nonlinear transport claims,
+- replacing the existing NTX lagged-response semantics,
+- requiring live SPECTRAX-GK AD before the file-backed FD path works.
+
+## Non-contamination requirements
+
+Do not disturb the current NTX lagged-response path while implementing this.
 
 Concretely:
 
-- Do not change `NTXExactLijRuntimeTransportModel` behavior to support SPECTRAX.
+- Do not change the semantics of the working NTX lagged-response modes.
 - Do not change existing NTX benchmark defaults.
-- Do not change solver-level `lagged_response` behavior unless the change is model-agnostic and separately validated on the existing NTX benchmarks.
-- Implement SPECTRAX turbulence as a separate `TransportFluxModelBase` subclass or as an extension of the existing SPECTRAX turbulence model class.
-- Keep SPECTRAX-specific response pytrees separate from `NTXExactLijLaggedResponse`.
-- Add tests/benchmarks that can run SPECTRAX turbulence alone before combining it with NTX.
+- Do not reuse NTX-specific lagged-response dataclasses for turbulence payloads.
+- Only share model-agnostic solver plumbing where the behavior is identical and
+  separately validated.
 
-The intended shared contract is only the existing public model interface:
+The intended shared interface is:
 
 ```python
 build_lagged_response(state, **kwargs)
@@ -35,94 +74,232 @@ pullback_build_lagged_response(...)
 pullback_evaluate_with_lagged_response(...)
 ```
 
-## Current starting point
+## Core design
 
-NEOPAX already has a scaffolded SPECTRAX turbulence model:
+### State basis
 
-```text
-SpectraXQuasilinearRuntimeTransportModel
-```
+The lagged turbulence response should be built with respect to an explicit
+transport-state basis. The first version should keep this basis small and
+transparent.
 
-registered under:
+Recommended initial basis:
 
-```text
-spectrax_quasilinear_runtime
-spectrax_quasilinear_runtime_lagged
-```
+- ion density-gradient channels,
+- ion/electron temperature-gradient channels,
+- optionally profile-value channels only if the turbulence closure depends
+  directly on values and not only normalized gradients.
 
-The current implementation uses a smooth in-repo proxy evaluator, not the full SPECTRAX-GK runtime. Its lagged response already has the right shape:
+Do not include geometry channels in the first version.
 
-```text
-reference_state
-reference_flux
-linearized flux update
-```
+### Response object
 
-The new work should replace or extend this proxy lane with real SPECTRAX-GK nonlinear and quasilinear evaluators while preserving the same transport-facing interface.
-
-## Mode A: nonlinear SPECTRAX-GK lagged response
-
-### Intent
-
-Use SPECTRAX-GK nonlinear turbulent fluxes directly as the expensive turbulence response, then linearize those fluxes around the reference transport state.
-
-This is the closest analog to how T3D/GX uses nonlinear or expensive gyrokinetic flux evaluations:
-
-1. Evaluate the base turbulent flux at the current transport state.
-2. Perturb profile inputs.
-3. Re-evaluate turbulent fluxes.
-4. Build a local finite-difference response.
-5. Reuse that response inside the transport nonlinear/Radau solve until the solver decides to rebuild it.
-
-### First implementation derivative mode
-
-Use finite differences first.
-
-Do not require SPECTRAX nonlinear AD for the first nonlinear turbulent response.
-
-Reason:
-
-- Nonlinear turbulent windows are expensive and may include diagnostic/postprocessing choices.
-- Saturated nonlinear fluxes are less smooth than reduced linear/quasilinear features.
-- A T3D-like finite-difference response is easier to validate against existing transport intuition.
-- FD lets us isolate the coupling and lagged-response semantics before debugging nonlinear AD.
-
-### Response contents
-
-The nonlinear lagged response should store:
+The turbulence lagged-response object should store:
 
 ```text
-reference_state
-reference_fluxes
-profile_response_basis
-finite_difference_steps
-dGamma/dprofile_basis
-dQ/dprofile_basis
-dUpar/dprofile_basis, optional or zero initially
+reference_state x_ref
+reference_flux Q_ref
+state_basis metadata
+perturbation_steps
+either:
+  perturbed_flux_payloads
+or:
+  local_jacobian J_ref
 diagnostics
 ```
 
-The first profile basis should be local and small:
-
-- density-gradient perturbations,
-- temperature-gradient perturbations,
-- optionally profile-value perturbations if the SPECTRAX nonlinear input depends directly on profile values rather than only gradients,
-- no geometry perturbations in the first version.
-
-### Evaluation
-
-For a current state near the reference state:
+For FD mode, `J_ref` can be reconstructed from:
 
 ```text
-delta = current_state - reference_state
-flux(current_state) ~= reference_flux + response_matrix @ delta_features
+J_ref[:, i] ~= (Q_perturb_i - Q_ref) / delta_i
 ```
 
-The `evaluate_with_lagged_response` implementation should be pure JAX algebra after the response is built. It should not call SPECTRAX-GK again.
+For AD mode, `J_ref` may be stored explicitly or represented implicitly through
+JVP/VJP-compatible evaluator state.
 
-### Rebuild and reuse criterion
+### Solver-side evaluation
 
-Use the existing NEOPAX solver-level lagged-response controls:
+Once the response is built, evaluation inside the transport solver should be
+pure algebra:
+
+```text
+delta_x = x - x_ref
+Q_lagged = Q_ref + J_ref @ delta_x
+```
+
+The first implementation should materialize `J_ref` explicitly for simplicity.
+Later compact tangent-only representations are allowed if they preserve the same
+transport-facing behavior.
+
+## Mode 1: FD from transport file
+
+### Purpose
+
+This is the first rollout target.
+
+The transport file will not just store baseline turbulent fluxes. It will also
+store the perturbed turbulent flux payloads needed to reconstruct a local
+finite-difference turbulence response.
+
+This mode gives:
+
+- a stable schema first,
+- decoupling of response consumption from response generation,
+- a validation target before live SPECTRAX-GK integration,
+- a Trinity-like local finite-difference lagged response without requiring AD.
+
+### Required transport-file contents
+
+Extend the transport file schema with a versioned turbulence-response section
+containing at least:
+
+```text
+response_kind = "spectrax_turbulence_fd"
+reference_state_basis_name
+reference_state_vector
+reference_flux_vector
+perturbation_labels
+perturbation_steps
+perturbed_flux_vectors
+optional_precomputed_jacobian
+metadata
+```
+
+Recommended metadata:
+
+- state-basis ordering,
+- units/normalization conventions,
+- surface/radius indexing,
+- species indexing,
+- turbulence observable definition,
+- generation timestamp or provenance tag,
+- schema version.
+
+### FD build semantics
+
+At one rebuild point with `N` active state directions:
+
+- one baseline flux evaluation produces `Q_ref`,
+- `N` one-sided perturbed evaluations produce `Q_perturb_i`,
+- optionally use centered differences later, but one-sided FD is enough to
+  start.
+
+So the first FD mode requires:
+
+```text
+1 + N
+```
+
+turbulent flux evaluations per response build.
+
+### NEOPAX runtime behavior
+
+At runtime:
+
+1. Load `Q_ref`, perturbation metadata, and `Q_perturb_i` from the transport
+   file.
+2. Build `J_ref` in memory.
+3. Construct a turbulence lagged-response object.
+4. Use the existing solver lagged-response machinery to reuse or rebuild that
+   object according to drift settings.
+
+The first implementation can assume the file already exists and is correct.
+Generating the file can remain an external preprocessing step.
+
+### Validation for file-backed FD mode
+
+At minimum, validate:
+
+- file round-trip for all new fields,
+- Jacobian reconstruction from stored perturbations,
+- lagged prediction against direct baseline at `x_ref`,
+- lagged prediction against one or two nearby fresh turbulence evaluations.
+
+## Mode 2: live FD builder
+
+### Purpose
+
+After the file-backed FD mode works, allow NEOPAX to build the same FD response
+live by calling a turbulence evaluator repeatedly.
+
+This mode uses the same response object and the same solver-side evaluation
+path. Only the response-construction source changes.
+
+### Build semantics
+
+Given a live turbulence flux function `Q(x)`:
+
+1. evaluate `Q_ref = Q(x_ref)`,
+2. for each active state direction `i`, evaluate
+   `Q_perturb_i = Q(x_ref + delta_i e_i)`,
+3. form `J_ref`.
+
+The resulting response object should be identical in meaning to the one loaded
+from file.
+
+### Benefit
+
+This mode proves that the lagged-response API is not tied to file I/O and will
+make later AD integration cleaner.
+
+## Mode 3: live AD builder
+
+### Purpose
+
+Allow a differentiable SPECTRAX-GK flux lane to build the same turbulence
+lagged-response object from a single live evaluation path plus tangent
+information.
+
+### AD semantics
+
+If the turbulence flux function is differentiable enough:
+
+```text
+Q_ref = Q(x_ref)
+J_ref = dQ/dx evaluated at x_ref
+```
+
+The first AD implementation may materialize `J_ref` explicitly even if that is
+not the final desired representation.
+
+Later compact representations may use JVP/VJP logic instead, but the transport
+interface should remain the same.
+
+### Important caution
+
+AD mode should not be the first milestone unless the selected SPECTRAX-GK
+observable is already known to be stable and differentiable.
+
+If the target flux depends on:
+
+- noisy nonlinear windows,
+- non-smooth postprocessing,
+- Python reporting code,
+- branchy eigenvector selection,
+
+then the first AD target should be a reduced or quasilinear turbulence
+observable whose tangent path is already validated.
+
+### Benefit
+
+AD mode can reduce response-build cost from:
+
+```text
+1 + N evaluations
+```
+
+to:
+
+```text
+1 evaluation path plus tangent extraction
+```
+
+when the observable and implementation are suitable.
+
+## Reuse and rebuild policy
+
+Use the existing solver-level lagged-response controls first.
+
+Recommended first settings:
 
 ```toml
 radau_rhs_mode = "lagged_response"
@@ -131,310 +308,84 @@ lagged_response_reuse_rtol = ...
 lagged_response_reuse_atol = ...
 ```
 
-The model should not implement its own competing accepted-step/rejected-step policy unless later evidence shows the global state drift metric is insufficient for turbulence.
+The turbulence model should not invent its own competing accepted-step or
+rejected-step policy unless later evidence shows that the generic global drift
+criterion is insufficient.
 
-### Practical nonlinear questions to settle before implementation
+Possible later addition:
 
-1. What exact nonlinear SPECTRAX output is the turbulent flux?
-2. What time window or diagnostic average defines the response?
-3. Is the nonlinear flux deterministic enough for finite-difference columns?
-4. Which quantities should perturb: profile values, gradients, normalized gradients, collisionality, beta, or geometry inputs?
-5. How expensive is one full response build per radial surface?
-6. Should nonlinear SPECTRAX be run at all radii in one response build, or only at selected anchor radii with interpolation?
+- a prediction-mismatch rebuild trigger comparing lagged `Q` to a fresh
+  turbulence evaluation at occasional validation points.
 
-## Mode B: quasilinear SPECTRAX-GK lagged response
+## Recommended rollout order
 
-### Intent
+### Phase 1: schema and file-backed FD
 
-Use SPECTRAX-GK quasilinear turbulent fluxes as a differentiable turbulence closure.
+1. Define the turbulence lagged-response dataclass.
+2. Extend the transport file schema for baseline and perturbed flux payloads.
+3. Add a file loader that reconstructs `J_ref`.
+4. Add a turbulence lagged-response evaluation path in NEOPAX.
+5. Add unit tests and small synthetic integration tests.
 
-Unlike the nonlinear mode, the quasilinear mode should use AD, not finite differences.
+### Phase 2: live FD builder
 
-### Derivative mode
+1. Define a live turbulence flux callback API.
+2. Build `Q_ref` and `Q_perturb_i` from live calls.
+3. Reuse the exact same response object and evaluator from Phase 1.
+4. Compare live-built FD responses against file-backed FD responses.
 
-Quasilinear mode is AD-only.
+### Phase 3: live AD builder
 
-Do not add a finite-difference quasilinear response mode unless later evidence shows an AD path is impossible for a required quasilinear output.
+1. Define a differentiable turbulence flux API.
+2. Add AD-based Jacobian extraction.
+3. Build the same response object from AD.
+4. Compare AD Jacobian columns against FD Jacobian columns.
+5. Gate rollout on AD-vs-FD agreement.
 
-Reason:
+## Validation matrix
 
-- The quasilinear lane is intended to be a differentiable reduced model.
-- NEOPAX already has a JVP-style lagged response scaffold for SPECTRAX-like turbulence.
-- The quasilinear closure is expected to be smoother and cheaper than nonlinear turbulent windows.
-- AD avoids storing explicit dense Jacobians and keeps the model closer to the current compact lagged-response strategy.
+### FD file mode
 
-### AD response form
+- schema round-trip,
+- Jacobian reconstruction sanity,
+- exact recovery at `x_ref`,
+- nearby-state lagged-prediction checks.
 
-The preferred quasilinear response is compact JVP/VJP style:
+### Live FD mode
 
-```text
-reference_state
-reference_flux
-linearized evaluator around reference_state
-```
+- equality with file-backed FD on the same generated payload,
+- rebuild and reuse behavior across a small transport solve.
 
-For forward/evaluate:
+### AD mode
 
-```python
-_, tangent_flux = jax.jvp(
-    spectrax_quasilinear_flux_fn,
-    (reference_state,),
-    (current_state - reference_state,),
-)
-flux = reference_flux + tangent_flux
-```
+- columnwise AD-vs-FD Jacobian comparison,
+- lagged-prediction agreement with FD mode,
+- reverse-mode smoke test if transport objectives consume the turbulence lagged
+  response in differentiated solves.
 
-For reverse-mode transport:
+## Open questions
 
-- Prefer model-provided compact pullbacks.
-- Avoid materializing full dense flux Jacobians when possible.
-- If the quasilinear response is a vector of species/radius fluxes, propagate cotangents through the same reduced feature/JAX path.
+1. What exact SPECTRAX-GK turbulent observable should define `Q` first?
+2. What is the first active-state basis: gradients only, or gradients plus
+   profile values?
+3. Is the first target quasilinear, reduced nonlinear, or true nonlinear
+   window-averaged flux?
+4. Should the transport file store only `Q_perturb` or also a precomputed
+   `J_ref` for convenience?
+5. How large can the active state basis be before explicit FD becomes too
+   expensive?
+6. Should the first response be per-radius local, or a coupled multi-radius
+   vector response?
+7. What minimum diagnostic payload is needed to audit stale or mismatched
+   response files?
 
-### Quasilinear output choices
+## Immediate next step
 
-The first quasilinear implementation should define one of these explicitly:
+Implement Phase 1 only:
 
-1. Linear growth-rate based proxy.
-2. Mixing-length heat-flux proxy.
-3. Shape-aware quasilinear heat-flux proxy.
-4. Existing SPECTRAX quasilinear transport weights plus smooth saturation rule.
+- transport-file schema extension for turbulence FD payloads,
+- NEOPAX loader for `Q_ref` plus `Q_perturb`,
+- in-memory Jacobian reconstruction,
+- lagged turbulence evaluation through the existing solver machinery.
 
-For AD-only mode, the chosen output must avoid non-JAX reporting paths such as Python `float(...)` conversion or JSON dataclass construction inside the differentiated function.
-
-Use lower-level JAX arrays/features as the differentiable interface, then build reporting diagnostics outside the AD path.
-
-### Important quasilinear caution
-
-Current SPECTRAX-GK examples note that some quasilinear optimization lanes use finite-difference outer Jacobians because they depend on a nonsymmetric eigenvector selection.
-
-That does not block the plan, but it means the first AD-only quasilinear mode should choose an output whose AD path is already validated, or should first add an AD validation benchmark.
-
-Recommended first target:
-
-- a reduced smooth feature or growth-rate based objective with confirmed AD-vs-FD behavior,
-- then move to heat-flux weights or mixing-length saturated flux after branch/eigenvector continuity is validated.
-
-## Shared NEOPAX integration design
-
-### Model keys
-
-Suggested model keys:
-
-```text
-spectrax_nonlinear_runtime_lagged_fd
-spectrax_quasilinear_runtime_lagged_ad
-```
-
-or, if we keep one family name:
-
-```toml
-[turbulence]
-flux_model = "spectrax_runtime_lagged"
-
-[turbulence.spectrax]
-mode = "nonlinear_fd"       # nonlinear finite-difference response
-# or
-mode = "quasilinear_ad"     # quasilinear AD response
-```
-
-The exact names can be chosen later, but nonlinear FD and quasilinear AD should remain explicit in the TOML and benchmark output.
-
-### Response dataclasses
-
-Add separate response pytrees, for example:
-
-```python
-SpectraXNonlinearFDLaggedResponse
-SpectraXQuasilinearADLaggedResponse
-```
-
-Do not reuse NTX response classes.
-
-### Combined flux behavior
-
-The existing `CombinedTransportFluxModel` can already combine:
-
-```text
-neoclassical_response
-turbulent_response
-classical_response
-```
-
-So the SPECTRAX response should slot into `turbulent_response`.
-
-This means the solver-level lagged-response cache can remain model-agnostic.
-
-### Face fluxes and channels
-
-The SPECTRAX turbulent model must return the same flux dictionary shape as other NEOPAX flux models:
-
-```python
-{
-    "Gamma": ...,
-    "Q": ...,
-    "Upar": ...,
-}
-```
-
-First version:
-
-- support `Q_turb`,
-- support optional `Gamma_turb`,
-- set `Upar_turb = 0` unless a validated turbulent parallel momentum channel exists.
-
-### Geometry
-
-First implementation should keep geometry fixed during the response build/evaluation.
-
-Later extension:
-
-- include realtime geometry in the SPECTRAX input,
-- expose geometry-response pullbacks,
-- compare against geometry-objective AD benchmarks and forward finite differences.
-
-Do not start by differentiating nonlinear SPECTRAX fluxes with respect to geometry unless the profile-only response is already correct.
-
-## Benchmark plan
-
-### Phase 1: isolated model-call benchmarks
-
-Create small tests that do not involve Radau:
-
-1. Evaluate nonlinear SPECTRAX flux for one profile state.
-2. Build nonlinear FD lagged response.
-3. Evaluate nonlinear FD lagged response at perturbed states.
-4. Compare against direct nonlinear SPECTRAX flux at the perturbed states.
-
-For quasilinear:
-
-1. Evaluate quasilinear SPECTRAX flux for one profile state.
-2. Build quasilinear AD lagged response.
-3. Compare JVP-linearized response against direct quasilinear flux for small perturbations.
-4. Compare reverse pullbacks against finite differences only as a validation test, not as the production derivative mode.
-
-### Phase 2: transport one-step benchmarks
-
-Use a one-accepted-step or short accepted-step-limit transport run:
-
-```toml
-radau_rhs_mode = "lagged_response"
-lagged_response_reuse_mode = "retry_only"
-stop_after_accepted_steps = 1
-```
-
-Then repeat with:
-
-```toml
-lagged_response_reuse_mode = "global_state_drift"
-```
-
-Record:
-
-- number of turbulent response rebuilds,
-- number of turbulent response reuses,
-- objective values,
-- flux finiteness,
-- solver accepted/rejected attempts.
-
-### Phase 3: reverse/AD benchmarks
-
-For quasilinear AD:
-
-- run profile-gradient reverse checks,
-- compare against finite differences,
-- verify no dense Jacobian materialization,
-- verify NTX-only reverse benchmarks still match previous values.
-
-For nonlinear FD:
-
-- the lagged response itself may be FD-built,
-- transport reverse through the cheap linearized response should be possible,
-- gradients should be interpreted as gradients of the lagged FD surrogate, not full nonlinear SPECTRAX AD.
-
-### Phase 4: combined NTX plus SPECTRAX turbulence
-
-Only after isolated turbulence benchmarks pass:
-
-- combine `ntx_exact_lij_runtime` neoclassical with SPECTRAX turbulent lagged response,
-- verify the combined response rebuild/reuse counts,
-- verify that NTX response values are unchanged relative to NTX-only benchmarks when SPECTRAX is disabled,
-- verify that SPECTRAX response values are unchanged relative to SPECTRAX-only benchmarks when NTX is disabled.
-
-## Validation criteria
-
-### Nonlinear FD mode
-
-Accept when:
-
-- direct nonlinear SPECTRAX fluxes are finite,
-- FD response columns are finite,
-- lagged linearized flux matches direct perturbed flux to expected first-order accuracy for small perturbations,
-- transport run accepts at least one step,
-- rebuild/reuse counts are reported,
-- disabling SPECTRAX returns existing NTX behavior.
-
-### Quasilinear AD mode
-
-Accept when:
-
-- quasilinear flux is finite,
-- JVP-linearized lagged response matches direct quasilinear perturbation at small amplitude,
-- reverse pullback agrees with finite-difference validation,
-- no Python `float(...)` or report dataclass conversion appears inside the differentiated path,
-- memory is consistent with compact JVP/VJP expectations,
-- disabling SPECTRAX returns existing NTX behavior.
-
-## Risks
-
-### Nonlinear mode risks
-
-- Full nonlinear SPECTRAX windows may be too expensive to rebuild frequently.
-- Flux averages may be noisy, making FD columns unstable.
-- Long-window diagnostics may not be suitable inside a Radau inner-loop response.
-- Anchor/interpolation may be needed sooner than expected.
-
-### Quasilinear mode risks
-
-- Eigenvector or branch selection can make AD fragile.
-- Some public SPECTRAX diagnostics are report-oriented and convert to Python floats.
-- Differentiable lower-level feature extraction may need to be exposed before NEOPAX can use it safely.
-
-### Shared risks
-
-- A turbulent response has different natural variables than NTX.
-- Copying NTX derivative internals directly would be the wrong abstraction.
-- Solver-level lagged-response logic should stay generic; model-specific response math belongs inside the SPECTRAX turbulent model.
-
-## First implementation checklist for later
-
-1. Add a tiny direct SPECTRAX nonlinear flux evaluator wrapper that returns JAX/NumPy arrays in NEOPAX flux dictionary format.
-2. Add `SpectraXNonlinearFDLaggedResponse`.
-3. Add nonlinear FD `build_lagged_response` and cheap algebraic `evaluate_with_lagged_response`.
-4. Add a small no-Radau benchmark comparing direct nonlinear flux perturbations against the FD lagged response.
-5. Add a quasilinear AD evaluator that avoids report-time Python conversions.
-6. Add `SpectraXQuasilinearADLaggedResponse` or reuse the existing compact JVP response only if the type/name makes the AD-only contract explicit.
-7. Add quasilinear AD-vs-FD validation benchmark.
-8. Add one-step transport benchmarks.
-9. Add combined NTX plus SPECTRAX turbulence benchmarks.
-10. Re-run existing NTX lagged benchmarks to confirm no regression.
-
-## Summary
-
-The plan is to add SPECTRAX-GK as a turbulence lagged-response family, not to alter NTX.
-
-Use:
-
-- nonlinear SPECTRAX-GK with finite-difference lagged response first,
-- quasilinear SPECTRAX-GK with AD-only lagged response,
-- existing NEOPAX solver-level lagged-response rebuild/reuse machinery,
-- isolated benchmarks before combined NTX plus turbulence runs.
-
-The intended end state is a NEOPAX transport configuration where:
-
-```text
-neoclassical fluxes: NTX exact-runtime lagged response
-turbulent fluxes: SPECTRAX-GK lagged response
-solver reuse: existing Radau lagged-response cache and drift criteria
-```
-
-without changing the validated NTX path.
+Do not block Phase 1 on live SPECTRAX-GK AD support.
