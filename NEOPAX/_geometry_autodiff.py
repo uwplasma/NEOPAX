@@ -377,56 +377,6 @@ def _param_vector_gradient_from_implicit_param_grads(
     return jnp.stack(columns, axis=1)
 
 
-def _implicit_state_pullback_multi_rhs_with_assemble_rhs(
-    implicit,
-    params,
-    cfg,
-    x_star,
-    dof_mask,
-    state_bar_batch,
-):
-    """Batched implicit state pullback using the assembled-state transpose RHS."""
-
-    frozen = jax.lax.stop_gradient(x_star)
-    edge_mask = implicit._edge_mask(cfg)
-    projector = implicit._dof_projector(cfg, dof_mask)
-    residual = implicit.residual_fn(cfg, frozen, dof_mask)
-    z_star = projector(x_star)
-
-    _, assemble_vjp_z = jax.vjp(
-        lambda z: implicit._assemble(
-            z,
-            implicit.runtime_from_params(params, cfg),
-            frozen,
-            projector,
-            edge_mask,
-        ),
-        z_star,
-    )
-    _, residual_vjp_z = jax.vjp(lambda z: residual(z, params), z_star)
-    _, residual_vjp_p = jax.vjp(lambda prm: residual(z_star, prm), params)
-    _, assemble_vjp_p = jax.vjp(
-        lambda prm: implicit._assemble(
-            z_star,
-            implicit.runtime_from_params(prm, cfg),
-            frozen,
-            projector,
-            edge_mask,
-        ),
-        params,
-    )
-
-    rhs_batch = jax.vmap(lambda state_bar: assemble_vjp_z(state_bar)[0])(state_bar_batch)
-    lambda_batch = jax.vmap(
-        lambda rhs: implicit._adjoint_solve(lambda vec: residual_vjp_z(vec)[0], rhs, cfg)[0]
-    )(rhs_batch)
-    implicit_param_bar = jax.vmap(
-        lambda lam: residual_vjp_p(jax.tree.map(jnp.negative, lam))[0]
-    )(lambda_batch)
-    assemble_param_bar = jax.vmap(lambda state_bar: assemble_vjp_p(state_bar)[0])(state_bar_batch)
-    return jax.tree.map(lambda left, right: left + right, implicit_param_bar, assemble_param_bar)
-
-
 def _boundary_with_boundary_deltas(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -2600,42 +2550,25 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()
     param_entries = boundary_param_entries(context, param_specs)
-    use_local_assemble_rhs_pullback = (
-        _using_current_vmec_jax_context(context)
-        and str(lane).strip().lower() == "ad"
-        and final_mode == "vmap"
-    )
     use_current_multi_rhs = (
         _using_current_vmec_jax_context(context)
         and str(lane).strip().lower() == "ad"
         and final_mode == "vmec_jax_multi_rhs"
     )
     implicit = implicit_params = implicit_cfg = dof_mask = state_pullback = None
-    if use_local_assemble_rhs_pullback or use_current_multi_rhs:
+    if use_current_multi_rhs:
         implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
             context,
             param_deltas,
             param_entries,
             max_iter=max_iter,
         )
-        required_attrs = (
-            "solve_implicit_with_aux",
-            "_edge_mask",
-            "_dof_projector",
-            "_assemble",
-            "runtime_from_params",
-            "residual_fn",
-            "_adjoint_solve",
-        )
-        if use_local_assemble_rhs_pullback and all(hasattr(implicit, name) for name in required_attrs):
-            state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
-        elif use_current_multi_rhs and hasattr(implicit, "solve_implicit_with_aux") and hasattr(implicit, "implicit_state_pullback_multi_rhs"):
+        if hasattr(implicit, "solve_implicit_with_aux") and hasattr(implicit, "implicit_state_pullback_multi_rhs"):
             state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
         else:
-            use_local_assemble_rhs_pullback = False
             use_current_multi_rhs = False
 
-    if not (use_local_assemble_rhs_pullback or use_current_multi_rhs):
+    if not use_current_multi_rhs:
         def solve_state(theta):
             return _solve_state_for_param_vector(
                 context,
@@ -2768,17 +2701,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
-    if use_local_assemble_rhs_pullback:
-        param_grads = _implicit_state_pullback_multi_rhs_with_assemble_rhs(
-            implicit,
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
-            state_bar,
-        )
-        gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_grads, param_entries)
-    elif use_current_multi_rhs:
+    if use_current_multi_rhs:
         param_grads = implicit.implicit_state_pullback_multi_rhs(
             implicit_params,
             implicit_cfg,
