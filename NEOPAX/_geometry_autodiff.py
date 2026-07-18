@@ -902,10 +902,9 @@ def _solve_state_for_param_vector(
 
 
 def _find_mode_index(ixm_b: jnp.ndarray, ixn_b: jnp.ndarray, *, m: int, n: int) -> int | None:
-    ixm_np = np.asarray(ixm_b, dtype=np.int32).reshape(-1)
-    ixn_np = np.asarray(ixn_b, dtype=np.int32).reshape(-1)
-    matches = np.nonzero((ixm_np == int(m)) & (ixn_np == int(n)))[0]
-    return None if matches.size == 0 else int(matches[0])
+    matches = jnp.where((ixm_b == int(m)) & (ixn_b == int(n)), size=1, fill_value=-1)[0]
+    match = int(matches[0])
+    return None if match < 0 else match
 
 
 def _vmec_state_field(state, legacy_name: str, current_name: str):
@@ -1263,14 +1262,13 @@ def _vmec_booz_scalar_observables_from_boozer(
     out,
 ) -> dict[str, jnp.ndarray]:
     bmnc_b = jnp.asarray(out["bmnc_b"])
-    mode00 = out.get("_mode00")
-    if mode00 is None:
-        mode00 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=0, n=0)
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+
+    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
-    mode10 = out.get("_mode10")
-    if mode10 is None:
-        mode10 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=1, n=0)
+    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
     magnetic_well = _vmec_magnetic_well_from_state(context, state)
@@ -1318,14 +1316,13 @@ def _vmec_booz_light_scalar_observables_from_boozer(
     """
 
     bmnc_b = jnp.asarray(out["bmnc_b"])
-    mode00 = out.get("_mode00")
-    if mode00 is None:
-        mode00 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=0, n=0)
+    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+
+    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
-    mode10 = out.get("_mode10")
-    if mode10 is None:
-        mode10 = _find_mode_index(out["ixm_b"], out["ixn_b"], m=1, n=0)
+    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     b00 = bmnc_b[:, mode00]
     reduced = {
@@ -1614,26 +1611,18 @@ def _vmec_surface_line_data_from_state(
     s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     phips_half = jnp.asarray(context.flux.phips, dtype=jnp.float64)[1:]
-    target_indices_np = np.asarray(context.surface_indices, dtype=np.int32).reshape(-1)
-    half_count = int(s_half.shape[0])
-    neighbor_minus_np = np.clip(target_indices_np - 1, 0, half_count - 1)
-    neighbor_plus_np = np.clip(target_indices_np + 1, 0, half_count - 1)
-    extended_indices_np = np.unique(np.concatenate([neighbor_minus_np, target_indices_np, neighbor_plus_np], axis=0))
-    surface_map = {int(idx): pos for pos, idx in enumerate(extended_indices_np)}
-    target_positions_np = np.asarray([surface_map[int(idx)] for idx in target_indices_np], dtype=np.int32)
-    minus_positions_np = np.asarray([surface_map[int(idx)] for idx in neighbor_minus_np], dtype=np.int32)
-    plus_positions_np = np.asarray([surface_map[int(idx)] for idx in neighbor_plus_np], dtype=np.int32)
-    target_indices = jnp.asarray(target_indices_np, dtype=jnp.int32)
-    neighbor_minus = jnp.asarray(neighbor_minus_np, dtype=jnp.int32)
-    neighbor_plus = jnp.asarray(neighbor_plus_np, dtype=jnp.int32)
-    extended_indices = jnp.asarray(extended_indices_np, dtype=jnp.int32)
+    target_indices = jnp.asarray(context.surface_indices, dtype=jnp.int32)
+    neighbor_minus = jnp.clip(target_indices - 1, 0, int(s_half.shape[0]) - 1)
+    neighbor_plus = jnp.clip(target_indices + 1, 0, int(s_half.shape[0]) - 1)
+    extended_indices = jnp.unique(jnp.concatenate([neighbor_minus, target_indices, neighbor_plus], axis=0))
     extended_s = s_half[extended_indices]
     bmag_half = _interp_radial_grid(bmag_grid_full, s_full, extended_s)
     dl_half = _interp_radial_grid(dl_grid_full, s_full, extended_s)
     iota_surface = jnp.asarray(iotas_half, dtype=jnp.float64)[extended_indices]
-    target_positions = jnp.asarray(target_positions_np, dtype=jnp.int32)
-    minus_positions = jnp.asarray(minus_positions_np, dtype=jnp.int32)
-    plus_positions = jnp.asarray(plus_positions_np, dtype=jnp.int32)
+    surface_map = {int(idx): pos for pos, idx in enumerate(np.asarray(extended_indices, dtype=int))}
+    target_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(target_indices)], dtype=jnp.int32)
+    minus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_minus)], dtype=jnp.int32)
+    plus_positions = jnp.asarray([surface_map[int(idx)] for idx in np.asarray(neighbor_plus)], dtype=jnp.int32)
     db_ds = (bmag_half[plus_positions] - bmag_half[minus_positions]) / jnp.maximum(
         (s_half[neighbor_plus] - s_half[neighbor_minus])[:, None, None],
         1.0e-12,
@@ -2844,10 +2833,10 @@ def _safe_reciprocal(values):
 
 
 def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int | None:
-    ixm_np = np.asarray(ixm_b, dtype=np.int32).reshape(-1)
-    ixn_np = np.asarray(ixn_b, dtype=np.int32).reshape(-1)
-    matches = np.nonzero((ixm_np == int(m_value)) & (ixn_np == int(n_value)))[0]
-    return None if matches.size == 0 else int(matches[0])
+    matches = (jnp.asarray(ixm_b) == int(m_value)) & (jnp.asarray(ixn_b) == int(n_value))
+    if not bool(jnp.any(matches)):
+        return None
+    return int(jnp.argmax(matches))
 
 
 def _surface_indices_for_s_values(static, s_values: Sequence[float]):
@@ -3843,7 +3832,6 @@ def build_runtime_context_for_geometry_param(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
-    initialize_er: bool = True,
 ):
     from NEOPAX._orchestrator import (
         Models,
@@ -3906,7 +3894,7 @@ def build_runtime_context_for_geometry_param(
         models=models,
     )
     mode = str(config_eff.get("general", {}).get("mode", config_eff.get("mode", "transport"))).strip().lower()
-    if initialize_er and mode != "ambipolarity":
+    if mode != "ambipolarity":
         state = _maybe_initialize_er_from_ambipolarity(config_eff, runtime, state)
     state = _apply_configured_er_dirichlet_boundaries(config_eff, state)
     return runtime, state
