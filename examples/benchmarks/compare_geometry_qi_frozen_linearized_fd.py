@@ -18,12 +18,7 @@ for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
         sys.path.insert(0, str(path))
 
 from NEOPAX._geometry_autodiff import (  # noqa: E402
-    _booz_constants_and_grids_for_inputs,
-    _booz_xform_inputs_from_state,
-    _find_boozer_mode_index,
     _geometry_full_ad_objectives_from_state,
-    _import_booz_xform_jax_api,
-    _vmec_booz_qi_scalar_objective_from_boozer,
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
 )
@@ -144,60 +139,6 @@ def _manual_implicit_pullback(
     )
     assemble_param_bar = assemble_vjp_p(state_bar)[0]
     return jax.tree.map(lambda a, b: a + b, implicit_param_bar, assemble_param_bar)
-
-
-def _compact_qi_state_bar(context, state):
-    booz_api = _import_booz_xform_jax_api()
-    booz_inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
-    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
-    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
-    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
-
-    def booz_float_output_from_state(state_inner):
-        inputs_inner = _booz_xform_inputs_from_state(
-            state=state_inner,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
-            flux=context.flux,
-        )
-        out = booz_api.booz_xform_from_inputs(
-            inputs=inputs_inner,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=context.surface_indices,
-            jit=True,
-        )
-        return {
-            key: jnp.asarray(out[key], dtype=jnp.float64)
-            for key in ("iota_b", "buco_b", "bvco_b", "bmnc_b")
-        }
-
-    def booz_with_modes(booz_float):
-        out = dict(booz_float)
-        out["ixm_b"] = ixm_b
-        out["ixn_b"] = ixn_b
-        out["_mode00"] = mode00
-        out["_mode10"] = mode10
-        return out
-
-    booz, booz_state_pullback = jax.vjp(booz_float_output_from_state, state)
-
-    def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
-        return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
-
-    _qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
-    qi_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    return booz_state_pullback(qi_boozer_bar)[0]
 
 
 def _manual_implicit_forward_state_tangent(
@@ -394,8 +335,6 @@ def main() -> None:
         _objective_value, objective_vjp = jax.vjp(lambda state: _objective(context, args.objective, state), x_star)
         state_bar = objective_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]
         state_dot_tangent = _tree_dot(state_bar, state_tangent)
-        compact_state_bar = _compact_qi_state_bar(context, x_star)
-        compact_state_dot_tangent = _tree_dot(compact_state_bar, state_tangent)
         param_bar = _manual_implicit_pullback(
             params=params0,
             cfg=cfg,
@@ -418,16 +357,13 @@ def main() -> None:
             dtype=jnp.float64,
         )[0, row, col]
         state_dot_f = float(jax.device_get(state_dot_tangent))
-        compact_state_dot_f = float(jax.device_get(compact_state_dot_tangent))
         reverse_grad_f = float(jax.device_get(reverse_grad))
         builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
         print(
             f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
-            f"compact_reverse_state_dot_tangent={compact_state_dot_f:.16e} "
             f"reverse_param_grad={reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
-            f"rel_err_compact_state_dot_vs_jvp={_relative_error(compact_state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
             flush=True,
