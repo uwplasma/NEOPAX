@@ -2553,7 +2553,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     use_current_multi_rhs = (
         _using_current_vmec_jax_context(context)
         and str(lane).strip().lower() == "ad"
-        and final_mode == "vmap"
+        and final_mode == "vmec_jax_multi_rhs"
     )
     implicit = implicit_params = implicit_cfg = dof_mask = state_pullback = None
     if use_current_multi_rhs:
@@ -2714,7 +2714,9 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     elif final_mode == "vmap":
         gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
     else:
-        raise ValueError("final_vmec_pullback_mode must be 'vmap', 'lax_map', or 'sequential'.")
+        raise ValueError(
+            "final_vmec_pullback_mode must be 'vmap', 'lax_map', 'sequential', or 'vmec_jax_multi_rhs'."
+        )
     return values_by_name, gradient_matrix
 
 
