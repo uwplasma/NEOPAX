@@ -27,6 +27,22 @@ from vmec_jax.core import implicit as im  # noqa: E402
 
 DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires_true"
 
+OBJECTIVE_ALIASES = {
+    "aspect_ratio": "vmec_aspect_ratio",
+    "volume": "vmec_volume_total",
+    "mean_iota": "vmec_iota_mean",
+    "magnetic_well": "vmec_magnetic_well",
+    "mirror_ratio": "vmec_mirror_ratio",
+    "beta_volume": "vmec_beta_volume",
+    "iota_b_mean": "boozer_iota_b_mean",
+    "b00_mean": "boozer_b00_mean",
+    "buco_b_mean": "boozer_buco_b_mean",
+    "bvco_b_mean": "boozer_bvco_b_mean",
+    "aspect_proxy": "boozer_aspect_proxy",
+    "b10_over_b00_mean": "boozer_b10_over_b00_mean",
+    "qi_objective": "boozer_qi_objective",
+}
+
 
 def _parse_param_spec(text: str) -> tuple[str, int, int]:
     parts = [part.strip() for part in str(text).split(":")]
@@ -188,6 +204,10 @@ def _objective(context, objective_name: str, state):
     return jnp.asarray(values[objective_name], dtype=jnp.float64).reshape(())
 
 
+def _normalize_objective_name(name: str) -> str:
+    return OBJECTIVE_ALIASES.get(str(name), str(name))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -213,6 +233,7 @@ def main() -> None:
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
     parser.add_argument("--skip-reverse-check", action="store_true")
     args = parser.parse_args()
+    args.objective = _normalize_objective_name(args.objective)
 
     family, m, n = _parse_param_spec(args.parameter)
     surfaces = tuple(float(item.strip()) for item in str(args.surface_s).split(",") if item.strip())

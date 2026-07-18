@@ -2618,26 +2618,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
         return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
 
-    def qi_booz_output_from_state(state_inner):
-        inputs_inner = _booz_xform_inputs_from_state(
-            state=state_inner,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
-            flux=context.flux,
-        )
-        out = booz_api.booz_xform_from_inputs(
-            inputs=inputs_inner,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=context.surface_indices,
-            jit=True,
-        )
-        return {
-            "iota_b": jnp.asarray(out["iota_b"], dtype=jnp.float64),
-            "bmnc_b": jnp.asarray(out["bmnc_b"], dtype=jnp.float64),
-        }
-
     def booz_with_modes(booz_float):
         out = dict(booz_float)
         out["ixm_b"] = ixm_b
@@ -2706,21 +2686,21 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
 
     qi_index = names.index("boozer_qi_objective")
-    qi_booz, qi_booz_state_pullback = jax.vjp(qi_booz_output_from_state, state)
 
     def qi_scalar(booz_inner):
         values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
-    qi_value, qi_pullback = jax.vjp(qi_scalar, qi_booz)
+    qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
     values_by_name["boozer_qi_objective"] = qi_value
     qi_unit_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
     qi_boozer_bar = _tree_scale_unit_cotangent(qi_unit_boozer_bar, cotangents[:, qi_index])
 
-    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
-    qi_state_bar = jax.vmap(lambda booz_cotangent: qi_booz_state_pullback(booz_cotangent)[0])(qi_boozer_bar)
+    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(
+        _tree_add_all(boozer_bar, qi_boozer_bar)
+    )
 
-    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar, qi_state_bar)
+    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if use_current_multi_rhs:
         param_grads = implicit.implicit_state_pullback_multi_rhs(
             implicit_params,
