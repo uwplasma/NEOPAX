@@ -81,6 +81,66 @@ def _relative_error(value: float, reference: float | None) -> float:
     return abs(value - reference) / max(abs(reference), 1.0e-300)
 
 
+def _tree_dot(left, right):
+    leaves = jax.tree.leaves(
+        jax.tree.map(
+            lambda a, b: jnp.sum(jnp.asarray(a, dtype=jnp.float64) * jnp.asarray(b, dtype=jnp.float64)),
+            left,
+            right,
+        )
+    )
+    if not leaves:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    return sum(leaves, jnp.asarray(0.0, dtype=jnp.float64))
+
+
+def _manual_implicit_pullback(
+    *,
+    params,
+    cfg,
+    x_star,
+    dof_mask,
+    state_bar,
+    formulation: str,
+):
+    frozen = jax.lax.stop_gradient(x_star)
+    edge_mask = im._edge_mask(cfg)
+    P = im._dof_projector(cfg, dof_mask)
+    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
+    z_star = P(x_star)
+
+    _, assemble_vjp_z = jax.vjp(
+        lambda z: im._assemble(
+            z,
+            im.runtime_from_params(params, cfg),
+            frozen,
+            P,
+            edge_mask,
+        ),
+        z_star,
+    )
+    rhs = assemble_vjp_z(state_bar)[0]
+
+    _, vjp_z = jax.vjp(lambda z: F(z, params), z_star)
+    lam, _ = im._adjoint_solve(lambda v: vjp_z(v)[0], rhs, cfg)
+
+    _, vjp_p = jax.vjp(lambda prm: F(z_star, prm), params)
+    implicit_param_bar = vjp_p(jax.tree.map(jnp.negative, lam))[0]
+
+    _, assemble_vjp_p = jax.vjp(
+        lambda prm: im._assemble(
+            z_star,
+            im.runtime_from_params(prm, cfg),
+            frozen,
+            P,
+            edge_mask,
+        ),
+        params,
+    )
+    assemble_param_bar = assemble_vjp_p(state_bar)[0]
+    return jax.tree.map(lambda a, b: a + b, implicit_param_bar, assemble_param_bar)
+
+
 def _manual_implicit_forward_state_tangent(
     *,
     params,
@@ -151,6 +211,7 @@ def main() -> None:
     parser.add_argument("--adjoint-tol", type=float, default=1e-11)
     parser.add_argument("--adjoint-restart", type=int, default=30)
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
+    parser.add_argument("--skip-reverse-check", action="store_true")
     args = parser.parse_args()
 
     family, m, n = _parse_param_spec(args.parameter)
@@ -269,6 +330,44 @@ def main() -> None:
         f"total_elapsed_s={time.perf_counter() - t0:.3f}",
         flush=True,
     )
+    if not args.skip_reverse_check:
+        print("[geometry-qi-linearized-fd] progress: same-baseline reverse pullback check", flush=True)
+        _objective_value, objective_vjp = jax.vjp(lambda state: _objective(context, args.objective, state), x_star)
+        state_bar = objective_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]
+        state_dot_tangent = _tree_dot(state_bar, state_tangent)
+        param_bar = _manual_implicit_pullback(
+            params=params0,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            state_bar=state_bar,
+            formulation=args.formulation,
+        )
+        field_name = _param_field(family)
+        reverse_grad = jnp.asarray(getattr(param_bar, field_name), dtype=jnp.float64)[row, col]
+        builtin_param_bar = im.implicit_state_pullback_multi_rhs(
+            params0,
+            cfg,
+            x_star,
+            dof_mask,
+            jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), state_bar),
+        )
+        builtin_reverse_grad = jnp.asarray(
+            getattr(builtin_param_bar, field_name),
+            dtype=jnp.float64,
+        )[0, row, col]
+        state_dot_f = float(jax.device_get(state_dot_tangent))
+        reverse_grad_f = float(jax.device_get(reverse_grad))
+        builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
+        print(
+            f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
+            f"reverse_param_grad={reverse_grad_f:.16e} "
+            f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
+            f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
+            f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
+            f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
