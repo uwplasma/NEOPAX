@@ -1482,12 +1482,6 @@ def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
     vmec_file = str(vmec_file)
     boozer_file = str(boozer_file)
     vmec_file_loaders = []
-    try:
-        from ntx.vmec import load_vmec_surface
-
-        vmec_file_loaders.append(lambda path, *, s: load_vmec_surface(path, psi_n=s))
-    except Exception:
-        pass
     for loader_name in ("surface_from_vmex_vmec_wout_file", "surface_from_vmec_jax_vmec_wout_file"):
         loader = getattr(ntx, loader_name, None)
         if loader is not None:
@@ -1495,8 +1489,8 @@ def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
     if not vmec_file_loaders:
         raise AttributeError(
             "NTX does not expose a VMEC surface loader. Expected either "
-            "'ntx.vmec.load_vmec_surface', 'surface_from_vmex_vmec_wout_file', "
-            "or 'surface_from_vmec_jax_vmec_wout_file'."
+            "'surface_from_vmex_vmec_wout_file' or "
+            "'surface_from_vmec_jax_vmec_wout_file'."
         )
 
     def load_vmec(rho_value: float):
