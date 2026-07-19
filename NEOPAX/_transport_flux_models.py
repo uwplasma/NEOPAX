@@ -7397,8 +7397,7 @@ def build_fluxes_r_file_transport_model(
     print(
         "[NEOPAX] fluxes_r_file loaded: "
         f"path={path} profile_location={str(location).strip().lower()} "
-        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} "
-        f"lagged_response_mode={lagged_response_mode} {r_summary}"
+        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
     )
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Q', q_data)}")
@@ -7430,9 +7429,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
 
     def with_q_scale(self, q_scale: float) -> "FluxesRFileTransportModel":
         return dataclasses.replace(self, q_scale=float(q_scale))
-
-    def with_lagged_response_mode(self, lagged_response_mode: str) -> "FluxesRFileTransportModel":
-        return dataclasses.replace(self, lagged_response_mode=str(lagged_response_mode).strip().lower())
 
     def _interp_species_profile(self, data, target_r):
         if data is None:

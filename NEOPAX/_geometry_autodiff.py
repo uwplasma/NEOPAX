@@ -519,7 +519,7 @@ def _wout_from_vmec_state(
             converged=True,
             flux_override=context.flux,
         )
-    except ModuleNotFoundError:
+    except (AttributeError, ModuleNotFoundError):
         wout_module = _import_vmec_module("core.wout")
         wout_from_state = wout_module.wout_from_state
 
