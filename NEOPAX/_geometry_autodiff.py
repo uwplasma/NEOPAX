@@ -2556,62 +2556,6 @@ def _tree_add_all(*trees):
     return out
 
 
-def _geometry_full_ad_qi_direct_pullback_from_param_vector(
-    context: GeometryAutodiffContext,
-    param_deltas,
-    param_specs: Sequence[tuple[str, int, int]],
-    *,
-    lane: str = "ad",
-    max_iter: int | None = None,
-    step_size: float | None = None,
-    jacobian_penalty: float = 1.0e3,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return QI value and dQI/dparams using the direct QI state cotangent."""
-
-    param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
-    param_entries = boundary_param_entries(context, param_specs)
-    if _using_current_vmec_jax_context(context) and str(lane).strip().lower() == "ad":
-        implicit, params, cfg = _current_implicit_params_cfg_for_param_vector(
-            context,
-            param_deltas,
-            param_entries,
-            max_iter=max_iter,
-        )
-        if hasattr(implicit, "solve_implicit_with_aux") and hasattr(implicit, "implicit_state_pullback_multi_rhs"):
-            state, dof_mask = implicit.solve_implicit_with_aux(params, cfg)
-
-            def qi_scalar_from_state(state_inner):
-                values = _vmec_booz_qi_scalar_objective_from_state(context, state_inner)
-                return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
-
-            qi_value, qi_state_pullback = jax.vjp(qi_scalar_from_state, state)
-            qi_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-            qi_param_grads = implicit.implicit_state_pullback_multi_rhs(
-                params,
-                cfg,
-                state,
-                dof_mask,
-                jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), qi_state_bar),
-            )
-            qi_gradient = _param_vector_gradient_from_implicit_param_grads(qi_param_grads, param_entries)[0]
-            return qi_value, qi_gradient
-
-    def qi_from_param_vector(theta):
-        state = _solve_state_for_param_vector(
-            context,
-            theta,
-            param_specs,
-            lane=lane,
-            max_iter=max_iter,
-            step_size=step_size,
-            jacobian_penalty=jacobian_penalty,
-        )
-        values = _geometry_full_ad_objectives_from_state(context, state)
-        return jnp.asarray(values["boozer_qi_objective"], dtype=jnp.float64).reshape(())
-
-    return jax.value_and_grad(qi_from_param_vector)(param_deltas)
-
-
 def geometry_full_ad_objective_table_pullback_from_param_vector(
     context: GeometryAutodiffContext,
     param_deltas,
@@ -2653,17 +2597,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             f"Expected objective cotangents with {len(names)} columns for geometry_full_ad_objectives; "
             f"got {int(cotangents.shape[1])}."
         )
-
-    qi_index = names.index("boozer_qi_objective")
-    qi_value, qi_gradient = _geometry_full_ad_qi_direct_pullback_from_param_vector(
-        context,
-        param_deltas,
-        param_specs,
-        lane=lane,
-        max_iter=max_iter,
-        step_size=step_size,
-        jacobian_penalty=jacobian_penalty,
-    )
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()
     param_entries = boundary_param_entries(context, param_specs)
@@ -2821,8 +2754,19 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         cotangents[:, aspect_proxy_index],
     )
 
+    qi_index = names.index("boozer_qi_objective")
+
+    def qi_scalar(booz_inner):
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
+        return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
+
+    qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
     values_by_name["boozer_qi_objective"] = qi_value
-    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
+    qi_unit_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_boozer_bar = _tree_scale_unit_cotangent(qi_unit_boozer_bar, cotangents[:, qi_index])
+
+    booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
+    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if use_local_assemble_rhs_pullback:
@@ -2852,7 +2796,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         raise ValueError(
             "final_vmec_pullback_mode must be 'vmap', 'lax_map', 'sequential', or 'vmec_jax_multi_rhs'."
         )
-    gradient_matrix = gradient_matrix + cotangents[:, qi_index, None] * qi_gradient[None, :]
     return values_by_name, gradient_matrix
 
 
