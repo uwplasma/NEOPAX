@@ -48,30 +48,64 @@ def _vmec_backend_package_name() -> str:
 
 
 def _import_vmec_module(module_name: str):
+    return _import_vmec_module_any((module_name,))
+
+
+_CURRENT_VMEX_MODULE_ALIASES = {
+    "boozer_tables": ("core.boozer_tables",),
+    "fields": ("core.fields",),
+    "fourier": ("core.fourier",),
+    "geometry": ("core.geometry",),
+    "implicit": ("core.implicit",),
+    "multigrid": ("core.multigrid",),
+    "optimize": ("core.optimize",),
+    "setup": ("core.setup",),
+    "solver": ("core.solver",),
+    "statephysics": ("core.statephysics",),
+    "wout": ("core.wout",),
+}
+
+
+def _import_vmec_module_any(module_names: Sequence[str]):
     _ensure_local_stack_on_path()
     backend_name = _vmec_backend_package_name()
-    try:
-        return importlib.import_module(f"{backend_name}.{module_name}")
-    except ModuleNotFoundError:
-        fallback = "vmec_jax" if backend_name == "vmex" else "vmex"
-        return importlib.import_module(f"{fallback}.{module_name}")
+    fallback_name = "vmec_jax" if backend_name == "vmex" else "vmex"
+    errors = []
+    backend_module_names: tuple[str, ...] = tuple(module_names)
+    if backend_name == "vmex":
+        expanded: list[str] = []
+        for module_name in module_names:
+            expanded.extend(_CURRENT_VMEX_MODULE_ALIASES.get(module_name, (module_name,)))
+        backend_module_names = tuple(dict.fromkeys(expanded))
+
+    for module_name in backend_module_names:
+        candidate_name = f"{backend_name}.{module_name}"
+        try:
+            return importlib.import_module(candidate_name)
+        except ModuleNotFoundError as exc:
+            if exc.name != candidate_name:
+                raise
+            errors.append(f"{candidate_name}: {exc}")
+
+    for module_name in module_names:
+        candidate_name = f"{fallback_name}.{module_name}"
+        try:
+            return importlib.import_module(candidate_name)
+        except ModuleNotFoundError as exc:
+            if exc.name != candidate_name:
+                raise
+            errors.append(f"{candidate_name}: {exc}")
+    raise ModuleNotFoundError(
+        "Could not import VMEC backend module from any candidate: " + "; ".join(errors)
+    )
 
 
 def _import_vmec_jax_implicit():
-    try:
-        return _import_vmec_module("implicit")
-    except ModuleNotFoundError:
-        return _import_vmec_module("core.implicit")
+    return _import_vmec_module("implicit")
 
 
 def _import_vmec_jax_optimization():
-    try:
-        return _import_vmec_module("optimization")
-    except ModuleNotFoundError:
-        try:
-            return _import_vmec_module("optimize")
-        except ModuleNotFoundError:
-            return _import_vmec_module("core.optimize")
+    return _import_vmec_module_any(("optimization", "optimize"))
 
 
 def _import_booz_xform_jax_api():
