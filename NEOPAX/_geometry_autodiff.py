@@ -2786,16 +2786,19 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         cotangents[:, aspect_proxy_index],
     )
 
-    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
-
     qi_index = names.index("boozer_qi_objective")
 
-    def qi_scalar_from_state(state_inner):
-        values = _vmec_booz_qi_scalar_objective_from_state(context, state_inner)
+    def qi_scalar_from_boozer(booz_inner):
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
-    qi_value, qi_state_pullback = jax.vjp(jax.checkpoint(qi_scalar_from_state), state)
+    qi_value, qi_boozer_pullback = jax.vjp(qi_scalar_from_boozer, booz)
     values_by_name["boozer_qi_objective"] = qi_value
+    qi_unit_boozer_bar = qi_boozer_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_boozer_bar = _tree_scale_unit_cotangent(qi_unit_boozer_bar, cotangents[:, qi_index])
+    boozer_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
+
+    boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if use_local_assemble_rhs_pullback:
@@ -2825,27 +2828,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         raise ValueError(
             "final_vmec_pullback_mode must be 'vmap', 'lax_map', 'sequential', or 'vmec_jax_multi_rhs'."
         )
-    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    qi_state_bar = jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), qi_unit_state_bar)
-    if (
-        _using_current_vmec_jax_context(context)
-        and str(lane).strip().lower() == "ad"
-        and implicit is not None
-        and hasattr(implicit, "implicit_state_pullback_multi_rhs")
-    ):
-        qi_param_grads = implicit.implicit_state_pullback_multi_rhs(
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
-            qi_state_bar,
-        )
-        qi_gradient = _param_vector_gradient_from_implicit_param_grads(qi_param_grads, param_entries)[0]
-    else:
-        if state_pullback is None:
-            raise ValueError("QI table pullback fallback requires the generic state pullback.")
-        qi_gradient = state_pullback(qi_unit_state_bar)[0]
-    gradient_matrix = gradient_matrix + cotangents[:, qi_index, None] * qi_gradient[None, :]
     return values_by_name, gradient_matrix
 
 
