@@ -2567,7 +2567,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
-    final_vmec_pullback_mode: str = "vmap",
+    final_vmec_pullback_mode: str = "vmec_jax_multi_rhs",
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return geometry objective values and W @ d(objectives)/d(params).
 

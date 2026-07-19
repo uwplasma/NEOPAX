@@ -511,7 +511,7 @@ def main() -> None:
     parser.add_argument(
         "--final-vmec-pullback-mode",
         type=str,
-        default="vmap",
+        default="vmec_jax_multi_rhs",
         choices=("vmap", "lax_map", "sequential", "vmec_jax_multi_rhs"),
         help=(
             "Diagnostic only for geometry_full_ad_objectives objective_table. "
