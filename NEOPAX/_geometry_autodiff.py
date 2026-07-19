@@ -266,7 +266,6 @@ def _build_current_vmec_jax_context(vmec_jax, vmec_input: Path):
     boundary_from_input = setup_module.boundary_from_input
     prepare_runtime = solver_module.prepare_runtime
     resolution_from_input = solver_module.resolution_from_input
-
     ns_array = np.atleast_1d(np.asarray(inp.ns_array, dtype=np.int64)).ravel()
     ns_array = ns_array[ns_array > 0]
     final_ns = int(ns_array[-1]) if ns_array.size else None
@@ -2709,23 +2708,51 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             )
 
         state, state_pullback = jax.vjp(solve_state, param_deltas)
+    booz_api = _import_booz_xform_jax_api()
+    booz_inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
+    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
+    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
+    booz_float_keys = (
+        "iota_b",
+        "buco_b",
+        "bvco_b",
+        "bmnc_b",
+    )
+
     def booz_output_from_state(state_inner):
-        out = dict(_boozer_output_from_state(context, state_inner))
-        return {
-            key: jnp.asarray(value, dtype=jnp.float64)
-            for key, value in out.items()
-            if key not in {"ixm_b", "ixn_b", "_mode00", "_mode10", "nfp_b", "ns_b", "jlist"}
-        }
+        inputs_inner = _booz_xform_inputs_from_state(
+            state=state_inner,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        out = booz_api.booz_xform_from_inputs(
+            inputs=inputs_inner,
+            constants=booz_constants,
+            grids=booz_grids,
+            surface_indices=context.surface_indices,
+            jit=True,
+        )
+        return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
 
     def booz_with_modes(booz_float):
         out = dict(booz_float)
-        out["ixm_b"] = jnp.asarray(booz_full["ixm_b"], dtype=jnp.int32)
-        out["ixn_b"] = jnp.asarray(booz_full["ixn_b"], dtype=jnp.int32)
-        out["_mode00"] = booz_full.get("_mode00")
-        out["_mode10"] = booz_full.get("_mode10")
+        out["ixm_b"] = ixm_b
+        out["ixn_b"] = ixn_b
+        out["_mode00"] = mode00
+        out["_mode10"] = mode10
         return out
 
-    booz_full = _boozer_output_from_state(context, state)
     booz, booz_state_pullback = jax.vjp(booz_output_from_state, state)
     values_by_name: dict[str, jnp.ndarray] = {}
 
@@ -2770,7 +2797,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
     boozer_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
 
-    mode00 = booz_full.get("_mode00")
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
     aspect_proxy_index = names.index("boozer_aspect_proxy")
@@ -2789,17 +2815,30 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     qi_index = names.index("boozer_qi_objective")
 
     def qi_scalar_from_state(state_inner):
-        values = _vmec_booz_qi_scalar_objective_from_state(context, state_inner)
+        inputs_inner = _booz_xform_inputs_from_state(
+            state=state_inner,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        out = booz_api.booz_xform_from_inputs(
+            inputs=inputs_inner,
+            constants=booz_constants,
+            grids=booz_grids,
+            surface_indices=context.surface_indices,
+            jit=True,
+        )
+        out = {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
+        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(out))
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
     qi_value, qi_state_pullback = jax.vjp(qi_scalar_from_state, state)
     values_by_name["boozer_qi_objective"] = qi_value
-    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    qi_state_bar = _tree_scale_unit_cotangent(qi_unit_state_bar, cotangents[:, qi_index])
 
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(boozer_bar)
 
-    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar, qi_state_bar)
+    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if use_local_assemble_rhs_pullback:
         param_grads = _implicit_state_pullback_multi_rhs_with_assemble_rhs(
             implicit,
@@ -2827,6 +2866,27 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         raise ValueError(
             "final_vmec_pullback_mode must be 'vmap', 'lax_map', 'sequential', or 'vmec_jax_multi_rhs'."
         )
+    qi_unit_state_bar = qi_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+    qi_state_bar = jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), qi_unit_state_bar)
+    if (
+        _using_current_vmec_jax_context(context)
+        and str(lane).strip().lower() == "ad"
+        and implicit is not None
+        and hasattr(implicit, "implicit_state_pullback_multi_rhs")
+    ):
+        qi_param_grads = implicit.implicit_state_pullback_multi_rhs(
+            implicit_params,
+            implicit_cfg,
+            state,
+            dof_mask,
+            qi_state_bar,
+        )
+        qi_gradient = _param_vector_gradient_from_implicit_param_grads(qi_param_grads, param_entries)[0]
+    else:
+        if state_pullback is None:
+            raise ValueError("QI table pullback fallback requires the generic state pullback.")
+        qi_gradient = state_pullback(qi_unit_state_bar)[0]
+    gradient_matrix = gradient_matrix + cotangents[:, qi_index, None] * qi_gradient[None, :]
     return values_by_name, gradient_matrix
 
 
