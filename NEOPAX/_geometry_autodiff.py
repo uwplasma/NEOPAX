@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -20,10 +21,12 @@ def _repo_root() -> Path:
 def _ensure_local_stack_on_path() -> None:
     repo = _repo_root()
     candidates = (
+        repo / "VMEX",
+        repo / "vmex",
         repo / "vmec_jax",
         repo / "booz_xform_jax" / "src",
     )
-    for candidate in candidates:
+    for candidate in reversed(candidates):
         candidate_str = str(candidate)
         if candidate.exists() and candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
@@ -31,32 +34,44 @@ def _ensure_local_stack_on_path() -> None:
 
 def _import_vmec_jax():
     _ensure_local_stack_on_path()
-    import vmec_jax
+    try:
+        import vmex as vmec_backend
+    except ModuleNotFoundError:
+        import vmec_jax as vmec_backend
 
-    return vmec_jax
+    return vmec_backend
+
+
+def _vmec_backend_package_name() -> str:
+    module = _import_vmec_jax()
+    return str(getattr(module, "__name__", "vmex"))
+
+
+def _import_vmec_module(module_name: str):
+    _ensure_local_stack_on_path()
+    backend_name = _vmec_backend_package_name()
+    try:
+        return importlib.import_module(f"{backend_name}.{module_name}")
+    except ModuleNotFoundError:
+        fallback = "vmec_jax" if backend_name == "vmex" else "vmex"
+        return importlib.import_module(f"{fallback}.{module_name}")
 
 
 def _import_vmec_jax_implicit():
-    _ensure_local_stack_on_path()
     try:
-        import vmec_jax.implicit as implicit
+        return _import_vmec_module("implicit")
     except ModuleNotFoundError:
-        import vmec_jax.core.implicit as implicit
-
-    return implicit
+        return _import_vmec_module("core.implicit")
 
 
 def _import_vmec_jax_optimization():
-    _ensure_local_stack_on_path()
     try:
-        import vmec_jax.optimization as optimization
+        return _import_vmec_module("optimization")
     except ModuleNotFoundError:
         try:
-            import vmec_jax.optimize as optimization
+            return _import_vmec_module("optimize")
         except ModuleNotFoundError:
-            import vmec_jax.core.optimize as optimization
-
-    return optimization
+            return _import_vmec_module("core.optimize")
 
 
 def _import_booz_xform_jax_api():
@@ -89,7 +104,8 @@ def _booz_xform_inputs_from_state(
             flux=flux,
         )
     except (AttributeError, ModuleNotFoundError):
-        from vmec_jax.core.boozer_tables import boozer_input_tables
+        boozer_tables = _import_vmec_module("core.boozer_tables")
+        boozer_input_tables = boozer_tables.boozer_input_tables
 
         rt = static.runtime
         ns = int(jnp.asarray(rt.setup.s_full).shape[0])
@@ -132,11 +148,11 @@ def _resolve_vmec_attr(module, name: str, *, submodule: str | None = None):
     if value is not None:
         return value
     if submodule is None:
-        raise AttributeError(f"vmec_jax does not provide '{name}'.")
-    imported = __import__(f"vmec_jax.{submodule}", fromlist=[name])
+        raise AttributeError(f"{getattr(module, '__name__', 'vmec backend')} does not provide '{name}'.")
+    imported = _import_vmec_module(submodule)
     value = getattr(imported, name, None)
     if value is None:
-        raise AttributeError(f"vmec_jax.{submodule} does not provide '{name}'.")
+        raise AttributeError(f"{imported.__name__} does not provide '{name}'.")
     return value
 
 
@@ -146,9 +162,9 @@ def _resolve_vmec_attr_any(module, name: str, *, submodules: Sequence[str]):
         try:
             return _resolve_vmec_attr(module, name, submodule=submodule)
         except (AttributeError, ModuleNotFoundError) as exc:
-            errors.append(f"vmec_jax.{submodule}: {exc}")
+            errors.append(f"{submodule}: {exc}")
     raise AttributeError(
-        f"vmec_jax does not provide '{name}' in any of: {', '.join(submodules)}. "
+        f"VMEC backend does not provide '{name}' in any of: {', '.join(submodules)}. "
         f"Errors: {'; '.join(errors)}"
     )
 
@@ -211,8 +227,11 @@ def _vmec_input_get_float(indata: Any, name: str, default: float | None) -> floa
 def _build_current_vmec_jax_context(vmec_jax, vmec_input: Path):
     VmecInput = _resolve_vmec_attr(vmec_jax, "VmecInput")
     inp = VmecInput.from_file(vmec_input)
-    from vmec_jax.core.setup import boundary_from_input
-    from vmec_jax.core.solver import prepare_runtime, resolution_from_input
+    setup_module = _import_vmec_module("core.setup")
+    solver_module = _import_vmec_module("core.solver")
+    boundary_from_input = setup_module.boundary_from_input
+    prepare_runtime = solver_module.prepare_runtime
+    resolution_from_input = solver_module.resolution_from_input
 
     ns_array = np.atleast_1d(np.asarray(inp.ns_array, dtype=np.int64)).ravel()
     ns_array = ns_array[ns_array > 0]
@@ -452,7 +471,8 @@ def _wout_from_vmec_state(
     fsql: float = 0.0,
 ):
     try:
-        from vmec_jax.wout import wout_minimal_from_fixed_boundary
+        wout_module = _import_vmec_module("wout")
+        wout_minimal_from_fixed_boundary = wout_module.wout_minimal_from_fixed_boundary
 
         return wout_minimal_from_fixed_boundary(
             path=context.input_path,
@@ -467,7 +487,8 @@ def _wout_from_vmec_state(
             flux_override=context.flux,
         )
     except ModuleNotFoundError:
-        from vmec_jax.core.wout import wout_from_state
+        wout_module = _import_vmec_module("core.wout")
+        wout_from_state = wout_module.wout_from_state
 
         return wout_from_state(
             inp=context.indata,
@@ -494,7 +515,9 @@ def _build_vmec_fixed_context(vmec_jax, *, static, indata, boundary):
         flux_profiles_from_indata = _resolve_vmec_attr(vmec_jax, "flux_profiles_from_indata", submodule="energy")
         flux = flux_profiles_from_indata(indata, jnp.asarray(static.s), signgs=signgs)
     except (AttributeError, ModuleNotFoundError):
-        from vmec_jax.core.setup import flux_profiles, radial_grids
+        setup_module = _import_vmec_module("core.setup")
+        flux_profiles = setup_module.flux_profiles
+        radial_grids = setup_module.radial_grids
 
         grids = radial_grids(int(jnp.asarray(static.s).shape[0]), dtype=jnp.asarray(static.s).dtype)
         flux = SimpleNamespace(
@@ -662,17 +685,17 @@ def build_geometry_autodiff_context(
     nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
 ) -> GeometryAutodiffContext:
-    vmec_jax = _import_vmec_jax()
+    vmec_backend = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
 
     vmec_input = Path(input_path).expanduser().resolve()
-    if all(hasattr(vmec_jax, name) for name in ("load_input", "build_static", "boundary_from_indata")):
-        cfg, indata = vmec_jax.load_input(str(vmec_input))
-        static = vmec_jax.build_static(cfg)
-        boundary = vmec_jax.boundary_from_indata(indata, static.modes)
+    if all(hasattr(vmec_backend, name) for name in ("load_input", "build_static", "boundary_from_indata")):
+        cfg, indata = vmec_backend.load_input(str(vmec_input))
+        static = vmec_backend.build_static(cfg)
+        boundary = vmec_backend.boundary_from_indata(indata, static.modes)
         fixed_context = None
     else:
-        cfg, indata, static, boundary, fixed_context = _build_current_vmec_jax_context(vmec_jax, vmec_input)
+        cfg, indata, static, boundary, fixed_context = _build_current_vmec_jax_context(vmec_backend, vmec_input)
 
     kind = _boundary_kind_for_family(param_family)
     m_arr = jnp.asarray(static.modes.m)
@@ -691,7 +714,7 @@ def build_geometry_autodiff_context(
 
     if fixed_context is None:
         try:
-            prepare_fixed_boundary_context = _resolve_vmec_attr(vmec_jax, "prepare_fixed_boundary_context")
+            prepare_fixed_boundary_context = _resolve_vmec_attr(vmec_backend, "prepare_fixed_boundary_context")
             fixed_context_obj = prepare_fixed_boundary_context(
                 static=static,
                 indata=indata,
@@ -705,9 +728,9 @@ def build_geometry_autodiff_context(
                 "booz_inputs": fixed_context_obj.booz_inputs,
             }
         except Exception:
-            fixed_context = _build_vmec_fixed_context(vmec_jax, static=static, indata=indata, boundary=boundary)
+            fixed_context = _build_vmec_fixed_context(vmec_backend, static=static, indata=indata, boundary=boundary)
     try:
-        surface_indices_from_static = _resolve_vmec_attr(vmec_jax, "surface_indices_from_static")
+        surface_indices_from_static = _resolve_vmec_attr(vmec_backend, "surface_indices_from_static")
         surface_indices, _ = surface_indices_from_static(static, list(surface_s))
     except Exception:
         s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
@@ -773,7 +796,8 @@ def _solve_state_for_single_param(
             raise ValueError("lane must be 'forward' or 'ad'.")
         if lane_key == "forward":
             input_eff = _input_with_boundary_delta(context, param_delta)
-            from vmec_jax.core.multigrid import solve_multigrid
+            multigrid = _import_vmec_module("core.multigrid")
+            solve_multigrid = multigrid.solve_multigrid
 
             solve_kwargs = {"mode": "cli", "verbose": False}
             if max_iter is not None:
@@ -877,7 +901,8 @@ def _solve_state_for_param_vector(
             raise ValueError("lane must be 'forward' or 'ad'.")
         if lane_key == "forward":
             input_eff = _input_with_boundary_deltas(context, param_deltas, param_entries)
-            from vmec_jax.core.multigrid import solve_multigrid
+            multigrid = _import_vmec_module("core.multigrid")
+            solve_multigrid = multigrid.solve_multigrid
 
             solve_kwargs = {"mode": "cli", "verbose": False}
             if max_iter is not None:
@@ -3006,12 +3031,16 @@ def _build_neopax_geometry_from_state(
     else:
         rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
     try:
-        from vmec_jax.vmec_forces import vmec_forces_rz_from_wout
-        from vmec_jax.vmec_residue import vmec_force_norms_from_bcovar_dynamic
+        forces_module = _import_vmec_module("vmec_forces")
+        residue_module = _import_vmec_module("vmec_residue")
+        vmec_forces_rz_from_wout = forces_module.vmec_forces_rz_from_wout
+        vmec_force_norms_from_bcovar_dynamic = residue_module.vmec_force_norms_from_bcovar_dynamic
     except ModuleNotFoundError:
         try:
-            from vmec_jax.kernels.forces import vmec_forces_rz_from_wout
-            from vmec_jax.kernels.residue import vmec_force_norms_from_bcovar_dynamic
+            forces_module = _import_vmec_module("kernels.forces")
+            residue_module = _import_vmec_module("kernels.residue")
+            vmec_forces_rz_from_wout = forces_module.vmec_forces_rz_from_wout
+            vmec_force_norms_from_bcovar_dynamic = residue_module.vmec_force_norms_from_bcovar_dynamic
         except ModuleNotFoundError:
             vmec_forces_rz_from_wout = None
             vmec_force_norms_from_bcovar_dynamic = None
@@ -3043,9 +3072,14 @@ def _build_neopax_geometry_from_state(
             signgs=int(context.signgs),
         )
     else:
-        from vmec_jax.core.fields import energies_and_force_norms, magnetic_fields, metric_elements
-        from vmec_jax.core.geometry import half_mesh_jacobian
-        from vmec_jax.core.solver import _geometry
+        fields_module = _import_vmec_module("core.fields")
+        geometry_module = _import_vmec_module("core.geometry")
+        solver_module = _import_vmec_module("core.solver")
+        energies_and_force_norms = fields_module.energies_and_force_norms
+        magnetic_fields = fields_module.magnetic_fields
+        metric_elements = fields_module.metric_elements
+        half_mesh_jacobian = geometry_module.half_mesh_jacobian
+        _geometry = solver_module._geometry
 
         rt = context.static.runtime
         setup = rt.setup
@@ -3426,10 +3460,15 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
 def _traceable_vmec_field_tables_from_state(context: GeometryAutodiffContext, state):
     """Build the NTX-needed VMEC Nyquist tables without materializing WOUT."""
 
-    from vmec_jax.core.fields import magnetic_fields, metric_elements
-    from vmec_jax.core.geometry import half_mesh_jacobian
-    from vmec_jax.core.solver import _geometry
-    from vmec_jax.core.fourier import mode_table
+    fields_module = _import_vmec_module("core.fields")
+    geometry_module = _import_vmec_module("core.geometry")
+    solver_module = _import_vmec_module("core.solver")
+    fourier_module = _import_vmec_module("core.fourier")
+    magnetic_fields = fields_module.magnetic_fields
+    metric_elements = fields_module.metric_elements
+    half_mesh_jacobian = geometry_module.half_mesh_jacobian
+    _geometry = solver_module._geometry
+    mode_table = fourier_module.mode_table
 
     if bool(context.cfg.lasym):
         raise NotImplementedError("traceable realtime VMEC NTX surfaces currently support stellarator symmetry only")

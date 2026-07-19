@@ -13,16 +13,18 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = ROOT.parent
-for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
+for path in reversed((ROOT, WORKSPACE_ROOT / "VMEX", WORKSPACE_ROOT / "vmex", WORKSPACE_ROOT / "vmec_jax")):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _geometry_full_ad_objectives_from_state,
+    _import_vmec_jax_implicit,
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
 )
-from vmec_jax.core import implicit as im  # noqa: E402
+
+im = _import_vmec_jax_implicit()
 
 
 DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires_true"

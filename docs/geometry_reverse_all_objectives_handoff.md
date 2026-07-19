@@ -31,6 +31,7 @@ Current code state:
 - This recovers the older compact RHS row-replacement structure found in commit `97a490d`, with one change: `jax.checkpoint(qi_scalar_from_state)` is used because the uncheckpointed QI VJP OOMed at `booz_xform_from_inputs` while allocating 83.41 MiB.
 
 Important recent observations:
+- Latest failure before rerun was a VMEX/JAX pytree registration compatibility issue, not a reverse-rule issue: updated VMEX failed while registering `ImplicitSolution` with `drop=("runtime",)`. The fix is in VMEX `vmex/core/transforms.py`: when `drop` fields are requested, use an explicit `register_pytree_node` so dropped fields such as `runtime` are excluded from the pytree and restored from defaults on unflatten.
 - Reduced Boozer QI cotangent path gave too-small QI row values such as `1.625793e-03` and `4.143428e-03`.
 - Full Boozer objective-block cotangent path moved too high, e.g. `9.683326e-03` to `1.350655e-02`.
 - Restoring the exact older uncheckpointed QI state-VJP row replacement OOMed at:
