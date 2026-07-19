@@ -3522,9 +3522,14 @@ def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
 
     import ntx
 
-    surface_fn = getattr(ntx, "surface_from_vmec_jax_vmec_wout", None)
+    surface_fn = getattr(ntx, "surface_from_vmex_vmec_wout", None)
     if surface_fn is None:
-        from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout as surface_fn
+        surface_fn = getattr(ntx, "surface_from_vmec_jax_vmec_wout", None)
+    if surface_fn is None:
+        try:
+            from ntx.vmex_vmec import surface_from_vmex_vmec_wout as surface_fn
+        except Exception:
+            from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout as surface_fn
     return surface_fn(
         wout,
         s=float(s),

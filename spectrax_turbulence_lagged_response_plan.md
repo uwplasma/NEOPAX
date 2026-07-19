@@ -6,15 +6,27 @@ Add a turbulence lagged-response mode to NEOPAX that can consume SPECTRAX-GK
 flux information through the existing transport-solver lagged-response
 machinery.
 
+This should enter NEOPAX as SPECTRAX turbulence support analogous in role to how
+`ntx` provides neoclassical fluxes, but without changing the behavior of
+existing turbulence or neoclassical models.
+
+For the file-backed path, do not create a second file-reader model just for the
+lagged response. Reuse the existing turbulence file-reader model and add an
+opt-in lagged-response submode inside it. The non-lagged file-reader behavior
+must remain exactly as it is today unless that submode is explicitly selected.
+
 The first target is not a live SPECTRAX runtime call. The first target is a
-file-backed finite-difference mode in which the transport file contains:
+file-backed finite-difference submode of that new turbulence model in which the
+transport file contains:
 
 - a reference turbulent flux `Q_ref`,
 - perturbed turbulent flux evaluations `Q_perturb`,
 - perturbation metadata sufficient to reconstruct a local Jacobian.
 
-After that works, add a live AD-backed mode that builds the same lagged-response
-object from a single differentiable SPECTRAX-GK evaluation path.
+After that works, add a separate live SPECTRAX-GK turbulence model path that
+builds the same lagged-response object from live evaluations. That live model
+may later support AD-backed construction from a single differentiable
+SPECTRAX-GK evaluation path.
 
 The lagged response should represent a local affine model:
 
@@ -38,9 +50,12 @@ through the same solver-level `build_lagged_response(...)` and
 
 In scope:
 
+- a new turbulence flux model dedicated to SPECTRAX-GK lagged responses,
 - a new turbulence lagged-response object,
-- a finite-difference build path,
-- an AD build path,
+- a file-backed finite-difference submode of that turbulence model,
+- a future live SPECTRAX-GK build path,
+- an AD build path for the live SPECTRAX-GK model only after the file-backed
+  path is stable,
 - a transport-file extension for FD payloads,
 - solver-side reuse and rebuild using the existing lagged-response controls,
 - validation diagnostics comparing lagged predictions to fresh turbulence
@@ -61,6 +76,10 @@ Concretely:
 
 - Do not change the semantics of the working NTX lagged-response modes.
 - Do not change existing NTX benchmark defaults.
+- Do not change existing turbulence-model defaults or benchmark lanes.
+- Do not change the existing non-lagged file-reader turbulence behavior.
+- Do not activate any of this machinery unless the SPECTRAX lagged-response
+  option is explicitly selected.
 - Do not reuse NTX-specific lagged-response dataclasses for turbulence payloads.
 - Only share model-agnostic solver plumbing where the behavior is identical and
   separately validated.
@@ -130,7 +149,7 @@ The first implementation should materialize `J_ref` explicitly for simplicity.
 Later compact tangent-only representations are allowed if they preserve the same
 transport-facing behavior.
 
-## Mode 1: FD from transport file
+## Mode 1: file-backed FD submode of the existing turbulence file-reader model
 
 ### Purpose
 
@@ -140,7 +159,7 @@ The transport file will not just store baseline turbulent fluxes. It will also
 store the perturbed turbulent flux payloads needed to reconstruct a local
 finite-difference turbulence response.
 
-This mode gives:
+This submode gives:
 
 - a stable schema first,
 - decoupling of response consumption from response generation,
@@ -198,9 +217,13 @@ At runtime:
 1. Load `Q_ref`, perturbation metadata, and `Q_perturb_i` from the transport
    file.
 2. Build `J_ref` in memory.
-3. Construct a turbulence lagged-response object.
+3. Construct a turbulence lagged-response object inside the selected file-reader
+   turbulence model submode.
 4. Use the existing solver lagged-response machinery to reuse or rebuild that
    object according to drift settings.
+
+If the lagged-response submode is not selected, the existing file-reader model
+must keep using only the baseline file fluxes exactly as it does today.
 
 The first implementation can assume the file already exists and is correct.
 Generating the file can remain an external preprocessing step.
@@ -214,12 +237,13 @@ At minimum, validate:
 - lagged prediction against direct baseline at `x_ref`,
 - lagged prediction against one or two nearby fresh turbulence evaluations.
 
-## Mode 2: live FD builder
+## Mode 2: live SPECTRAX-GK FD builder
 
 ### Purpose
 
-After the file-backed FD mode works, allow NEOPAX to build the same FD response
-live by calling a turbulence evaluator repeatedly.
+After the file-backed FD submode works, allow a separate live SPECTRAX-GK
+turbulence model in NEOPAX to build the same FD response live by calling a
+turbulence evaluator repeatedly.
 
 This mode uses the same response object and the same solver-side evaluation
 path. Only the response-construction source changes.
@@ -241,7 +265,7 @@ from file.
 This mode proves that the lagged-response API is not tied to file I/O and will
 make later AD integration cleaner.
 
-## Mode 3: live AD builder
+## Mode 3: live SPECTRAX-GK AD builder
 
 ### Purpose
 
@@ -308,9 +332,9 @@ lagged_response_reuse_rtol = ...
 lagged_response_reuse_atol = ...
 ```
 
-The turbulence model should not invent its own competing accepted-step or
-rejected-step policy unless later evidence shows that the generic global drift
-criterion is insufficient.
+The selected SPECTRAX turbulence model should not invent its own competing
+accepted-step or rejected-step policy unless later evidence shows that the
+generic global drift criterion is insufficient.
 
 Possible later addition:
 
@@ -319,22 +343,24 @@ Possible later addition:
 
 ## Recommended rollout order
 
-### Phase 1: schema and file-backed FD
+### Phase 1: schema and file-backed FD submode
 
 1. Define the turbulence lagged-response dataclass.
 2. Extend the transport file schema for baseline and perturbed flux payloads.
 3. Add a file loader that reconstructs `J_ref`.
-4. Add a turbulence lagged-response evaluation path in NEOPAX.
+4. Extend the existing turbulence file-reader model with an opt-in FD
+   lagged-response submode while preserving the current non-lagged behavior.
 5. Add unit tests and small synthetic integration tests.
 
-### Phase 2: live FD builder
+### Phase 2: live SPECTRAX-GK FD builder
 
 1. Define a live turbulence flux callback API.
 2. Build `Q_ref` and `Q_perturb_i` from live calls.
-3. Reuse the exact same response object and evaluator from Phase 1.
-4. Compare live-built FD responses against file-backed FD responses.
+3. Implement that as a separate live SPECTRAX-GK turbulence model path.
+4. Reuse the exact same response object and evaluator from Phase 1.
+5. Compare live-built FD responses against file-backed FD responses.
 
-### Phase 3: live AD builder
+### Phase 3: live SPECTRAX-GK AD builder
 
 1. Define a differentiable turbulence flux API.
 2. Add AD-based Jacobian extraction.

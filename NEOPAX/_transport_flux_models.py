@@ -1468,17 +1468,25 @@ def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
     backend = str(surface_backend).strip().lower()
     vmec_file = str(vmec_file)
     boozer_file = str(boozer_file)
+    surface_from_vmec_wout_file = getattr(ntx, "surface_from_vmex_vmec_wout_file", None)
+    if surface_from_vmec_wout_file is None:
+        surface_from_vmec_wout_file = getattr(ntx, "surface_from_vmec_jax_vmec_wout_file", None)
+    if surface_from_vmec_wout_file is None:
+        raise AttributeError(
+            "NTX does not expose a VMEC surface loader. Expected either "
+            "'surface_from_vmex_vmec_wout_file' or 'surface_from_vmec_jax_vmec_wout_file'."
+        )
 
     def load(rho_value: float):
         if backend == "vmec":
-            return ntx.surface_from_vmec_jax_vmec_wout_file(vmec_file, s=float(rho_value**2))
+            return surface_from_vmec_wout_file(vmec_file, s=float(rho_value**2))
         if backend == "boozmn":
             return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
         if backend == "auto":
             try:
                 return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
             except Exception:
-                return ntx.surface_from_vmec_jax_vmec_wout_file(vmec_file, s=float(rho_value**2))
+                return surface_from_vmec_wout_file(vmec_file, s=float(rho_value**2))
         raise ValueError("surface_backend must be one of: auto, boozmn, vmec")
 
     return ntx, load
