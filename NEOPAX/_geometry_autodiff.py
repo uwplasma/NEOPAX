@@ -2735,7 +2735,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         values = _vmec_booz_qi_scalar_objective_from_state(context, state_inner)
         return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
 
-    qi_value, qi_state_pullback = jax.vjp(qi_scalar_from_state, state)
+    qi_value, qi_state_pullback = jax.vjp(jax.checkpoint(qi_scalar_from_state), state)
     values_by_name["boozer_qi_objective"] = qi_value
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
