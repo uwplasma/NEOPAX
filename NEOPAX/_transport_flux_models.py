@@ -299,6 +299,19 @@ class NTXExactLijLaggedResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class SpectraXTurbulenceFDLaggedResponse:
+    reference_state: Any
+    reference_flux: dict
+    perturb_kind: Any = None
+    perturb_species: Any = None
+    perturb_delta: Any = None
+    perturb_present: Any = None
+    gamma_perturb: Any = None
+    q_perturb: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class FaceTransportState:
     density: jax.Array
     pressure: jax.Array
@@ -1468,25 +1481,44 @@ def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
     backend = str(surface_backend).strip().lower()
     vmec_file = str(vmec_file)
     boozer_file = str(boozer_file)
-    surface_from_vmec_wout_file = getattr(ntx, "surface_from_vmex_vmec_wout_file", None)
-    if surface_from_vmec_wout_file is None:
-        surface_from_vmec_wout_file = getattr(ntx, "surface_from_vmec_jax_vmec_wout_file", None)
-    if surface_from_vmec_wout_file is None:
+    vmec_file_loaders = []
+    try:
+        from ntx.vmec import load_vmec_surface
+
+        vmec_file_loaders.append(lambda path, *, s: load_vmec_surface(path, psi_n=s))
+    except Exception:
+        pass
+    for loader_name in ("surface_from_vmex_vmec_wout_file", "surface_from_vmec_jax_vmec_wout_file"):
+        loader = getattr(ntx, loader_name, None)
+        if loader is not None:
+            vmec_file_loaders.append(loader)
+    if not vmec_file_loaders:
         raise AttributeError(
             "NTX does not expose a VMEC surface loader. Expected either "
-            "'surface_from_vmex_vmec_wout_file' or 'surface_from_vmec_jax_vmec_wout_file'."
+            "'ntx.vmec.load_vmec_surface', 'surface_from_vmex_vmec_wout_file', "
+            "or 'surface_from_vmec_jax_vmec_wout_file'."
         )
+
+    def load_vmec(rho_value: float):
+        s_value = float(rho_value**2)
+        errors = []
+        for loader in vmec_file_loaders:
+            try:
+                return loader(vmec_file, s=s_value)
+            except Exception as exc:
+                errors.append(exc)
+        raise errors[-1]
 
     def load(rho_value: float):
         if backend == "vmec":
-            return surface_from_vmec_wout_file(vmec_file, s=float(rho_value**2))
+            return load_vmec(rho_value)
         if backend == "boozmn":
             return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
         if backend == "auto":
             try:
                 return ntx.load_boozmn_surface(boozer_file, rho=float(rho_value)).surface
             except Exception:
-                return surface_from_vmec_wout_file(vmec_file, s=float(rho_value**2))
+                return load_vmec(rho_value)
         raise ValueError("surface_backend must be one of: auto, boozmn, vmec")
 
     return ntx, load
@@ -7336,6 +7368,12 @@ def build_fluxes_r_file_transport_model(
             ),
         )
     )
+    lagged_response_mode = str(
+        kwargs.pop(
+            "lagged_response_mode",
+            kwargs.pop("response_mode", "none"),
+        )
+    ).strip().lower()
     path = (
         fluxes_file
         or file
@@ -7365,7 +7403,8 @@ def build_fluxes_r_file_transport_model(
     print(
         "[NEOPAX] fluxes_r_file loaded: "
         f"path={path} profile_location={str(location).strip().lower()} "
-        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
+        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} "
+        f"lagged_response_mode={lagged_response_mode} {r_summary}"
     )
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Q', q_data)}")
@@ -7379,6 +7418,7 @@ def build_fluxes_r_file_transport_model(
         upar_data=upar_data,
         profile_location=str(location).strip().lower(),
         q_scale=q_scale,
+        lagged_response_mode=lagged_response_mode,
     )
 
 
@@ -7392,9 +7432,13 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     upar_data: Any = None
     profile_location: str = "cell_centered"
     q_scale: float = 1.0
+    lagged_response_mode: str = "none"
 
     def with_q_scale(self, q_scale: float) -> "FluxesRFileTransportModel":
         return dataclasses.replace(self, q_scale=float(q_scale))
+
+    def with_lagged_response_mode(self, lagged_response_mode: str) -> "FluxesRFileTransportModel":
+        return dataclasses.replace(self, lagged_response_mode=str(lagged_response_mode).strip().lower())
 
     def _interp_species_profile(self, data, target_r):
         if data is None:
