@@ -18,12 +18,7 @@ for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
         sys.path.insert(0, str(path))
 
 from NEOPAX._geometry_autodiff import (  # noqa: E402
-    _booz_constants_and_grids_for_inputs,
-    _booz_xform_inputs_from_state,
-    _find_boozer_mode_index,
     _geometry_full_ad_objectives_from_state,
-    _import_booz_xform_jax_api,
-    _vmec_booz_qi_scalar_objective_from_boozer,
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
 )
@@ -209,62 +204,6 @@ def _objective(context, objective_name: str, state):
     return jnp.asarray(values[objective_name], dtype=jnp.float64).reshape(())
 
 
-def _reduced_table_qi_state_bar(context, state):
-    booz_api = _import_booz_xform_jax_api()
-    inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
-    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
-    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
-
-    def booz_float_output_from_state(state_inner):
-        inputs_inner = _booz_xform_inputs_from_state(
-            state=state_inner,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
-            flux=context.flux,
-        )
-        out = booz_api.booz_xform_from_inputs(
-            inputs=inputs_inner,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=context.surface_indices,
-            jit=True,
-        )
-        return {
-            "iota_b": jnp.asarray(out["iota_b"], dtype=jnp.float64),
-            "buco_b": jnp.asarray(out["buco_b"], dtype=jnp.float64),
-            "bvco_b": jnp.asarray(out["bvco_b"], dtype=jnp.float64),
-            "bmnc_b": jnp.asarray(out["bmnc_b"], dtype=jnp.float64),
-        }
-
-    def booz_with_modes(booz_float):
-        out = dict(booz_float)
-        out["ixm_b"] = ixm_b
-        out["ixn_b"] = ixn_b
-        out["_mode00"] = mode00
-        out["_mode10"] = mode10
-        return out
-
-    booz, booz_state_pullback = jax.vjp(booz_float_output_from_state, state)
-
-    def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
-        return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
-
-    _qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
-    qi_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    return booz_state_pullback(qi_boozer_bar)[0]
-
-
 def _normalize_objective_name(name: str) -> str:
     return OBJECTIVE_ALIASES.get(str(name), str(name))
 
@@ -293,7 +232,6 @@ def main() -> None:
     parser.add_argument("--adjoint-restart", type=int, default=30)
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
     parser.add_argument("--skip-reverse-check", action="store_true")
-    parser.add_argument("--run-reduced-table-qi-check", action="store_true")
     args = parser.parse_args()
     args.objective = _normalize_objective_name(args.objective)
 
@@ -451,34 +389,6 @@ def main() -> None:
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
             flush=True,
         )
-    if args.run_reduced_table_qi_check:
-        if args.objective != "boozer_qi_objective":
-            raise ValueError("--run-reduced-table-qi-check is only valid for boozer_qi_objective.")
-        print("[geometry-qi-linearized-fd] progress: reduced table QI state-cotangent check", flush=True)
-        reduced_state_bar = _reduced_table_qi_state_bar(context, x_star)
-        reduced_dot = _tree_dot(reduced_state_bar, state_tangent)
-        reduced_param_bar = im.implicit_state_pullback_multi_rhs(
-            params0,
-            cfg,
-            x_star,
-            dof_mask,
-            jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), reduced_state_bar),
-        )
-        field_name = _param_field(family)
-        reduced_builtin_grad = jnp.asarray(
-            getattr(reduced_param_bar, field_name),
-            dtype=jnp.float64,
-        )[0, row, col]
-        reduced_dot_f = float(jax.device_get(reduced_dot))
-        reduced_builtin_grad_f = float(jax.device_get(reduced_builtin_grad))
-        print(
-            f"[geometry-qi-linearized-fd] reduced_table_state_dot_tangent={reduced_dot_f:.16e} "
-            f"reduced_table_implicit_reverse_param_grad={reduced_builtin_grad_f:.16e} "
-            f"rel_err_reduced_dot_vs_jvp={_relative_error(reduced_dot_f, jvp_f):.6e} "
-            f"rel_err_reduced_implicit_reverse_vs_jvp={_relative_error(reduced_builtin_grad_f, jvp_f):.6e}",
-            flush=True,
-        )
-
 
 if __name__ == "__main__":
     main()
