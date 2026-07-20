@@ -141,6 +141,18 @@ def _tree_sub(left, right):
     )
 
 
+def _adjoint_solve_jax_scipy(A, b, cfg):
+    return jax.scipy.sparse.linalg.gmres(
+        A,
+        b,
+        tol=cfg.adjoint_tol,
+        atol=0.0,
+        restart=cfg.adjoint_restart,
+        maxiter=cfg.adjoint_maxiter,
+        solve_method="incremental",
+    )
+
+
 def _manual_implicit_pullback(
     *,
     params,
@@ -149,6 +161,7 @@ def _manual_implicit_pullback(
     dof_mask,
     state_bar,
     formulation: str,
+    adjoint_solve=None,
 ):
     frozen = jax.lax.stop_gradient(x_star)
     edge_mask = im._edge_mask(cfg)
@@ -169,7 +182,8 @@ def _manual_implicit_pullback(
     rhs = assemble_vjp_z(state_bar)[0]
 
     _, vjp_z = jax.vjp(lambda z: F(z, params), z_star)
-    lam, _ = im._adjoint_solve(lambda v: vjp_z(v)[0], rhs, cfg)
+    solve = im._adjoint_solve if adjoint_solve is None else adjoint_solve
+    lam, _ = solve(lambda v: vjp_z(v)[0], rhs, cfg)
 
     _, vjp_p = jax.vjp(lambda prm: F(z_star, prm), params)
     implicit_param_bar = vjp_p(jax.tree.map(jnp.negative, lam))[0]
@@ -423,8 +437,18 @@ def main() -> None:
             state_bar=state_bar,
             formulation=args.formulation,
         )
+        scipy_param_bar = _manual_implicit_pullback(
+            params=params0,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            state_bar=state_bar,
+            formulation=args.formulation,
+            adjoint_solve=_adjoint_solve_jax_scipy,
+        )
         field_name = _param_field(family)
         reverse_grad = jnp.asarray(getattr(param_bar, field_name), dtype=jnp.float64)[row, col]
+        scipy_reverse_grad = jnp.asarray(getattr(scipy_param_bar, field_name), dtype=jnp.float64)[row, col]
         builtin_param_bar = im.implicit_state_pullback_multi_rhs(
             params0,
             cfg,
@@ -438,6 +462,7 @@ def main() -> None:
         )[0, row, col]
         state_dot_f = float(jax.device_get(state_dot_tangent))
         reverse_grad_f = float(jax.device_get(reverse_grad))
+        scipy_reverse_grad_f = float(jax.device_get(scipy_reverse_grad))
         builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
         print(
             f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
@@ -452,9 +477,11 @@ def main() -> None:
         print(
             f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
             f"reverse_param_grad={reverse_grad_f:.16e} "
+            f"jax_scipy_reverse_param_grad={scipy_reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
+            f"rel_err_jax_scipy_reverse_vs_jvp={_relative_error(scipy_reverse_grad_f, jvp_f):.6e} "
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
             flush=True,
         )
