@@ -5,6 +5,7 @@ import dataclasses
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +20,7 @@ for path in reversed((ROOT, WORKSPACE_ROOT / "VMEX", WORKSPACE_ROOT / "vmex", WO
 
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _geometry_full_ad_objectives_from_state,
+    _implicit_params_from_input,
     _import_vmec_jax_implicit,
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
@@ -67,12 +69,22 @@ def _param_field(family: str) -> str:
 def _param_index(inp, family: str, m: int, n: int) -> tuple[int, int]:
     row = int(n) + int(inp.ntor)
     col = int(m)
-    arr = getattr(im.params_from_input(inp), _param_field(family))
+    arr = getattr(_implicit_params_from_input_for_script(inp), _param_field(family))
     if row < 0 or row >= arr.shape[0] or col < 0 or col >= arr.shape[1]:
         raise ValueError(
             f"{family}:{m}:{n} maps to index {(row, col)}, outside shape {arr.shape}."
         )
     return row, col
+
+
+def _implicit_params_from_input_for_script(inp, solver_device: str | None = "default"):
+    # Tiny local context shim so this diagnostic uses the same placement helper
+    # as the NEOPAX geometry objective-table benchmark.
+    return _implicit_params_from_input(
+        SimpleNamespace(indata=inp),
+        im,
+        solver_device=solver_device,
+    )
 
 
 def _param_unit_tangent_like(params, family: str, row: int, col: int):
@@ -233,6 +245,16 @@ def main() -> None:
     parser.add_argument("--adjoint-tol", type=float, default=1e-11)
     parser.add_argument("--adjoint-restart", type=int, default=30)
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
+    parser.add_argument(
+        "--implicit-solver-device",
+        type=str,
+        default="default",
+        choices=("default", "auto", "cpu", "gpu"),
+        help=(
+            "Device placement for VMEX implicit AD parameters. 'default' preserves "
+            "old vmec_jax behavior by leaving placement to JAX; 'auto' uses VMEX policy."
+        ),
+    )
     parser.add_argument("--skip-reverse-check", action="store_true")
     args = parser.parse_args()
     args.objective = _normalize_objective_name(args.objective)
@@ -258,7 +280,7 @@ def main() -> None:
         adjoint_restart=args.adjoint_restart,
         adjoint_maxiter=args.adjoint_maxiter,
     )
-    params0 = im.params_from_input(inp)
+    params0 = _implicit_params_from_input_for_script(inp, solver_device=args.implicit_solver_device)
     row, col = _param_index(inp, family, m, n)
     base_value = _param_value(params0, family, row, col)
     h = _fd_step(base_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
@@ -268,7 +290,7 @@ def main() -> None:
         f"input={Path(args.vmec_input).resolve()} objective={args.objective} "
         f"parameter={family}:{m}:{n} ns={cfg.resolution.ns} ftol={cfg.ftol:.6e} "
         f"mboz={args.mboz} nboz={args.nboz} surfaces={','.join(f'{s:.3f}' for s in surfaces)} "
-        f"formulation={args.formulation}",
+        f"formulation={args.formulation} implicit_solver_device={args.implicit_solver_device}",
         flush=True,
     )
     print(
