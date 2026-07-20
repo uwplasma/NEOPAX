@@ -29,8 +29,8 @@ n_x = 4
 
 [species]
 n_species = 2
-names = ["e", "T"]
-mass_mp = [0.000544617, 3.0]
+names = ["e", "H"]
+mass_mp = [0.000544617, 1.0]
 charge_qp = [-1.0, 1.0]
 
 [profiles]
@@ -58,7 +58,7 @@ type = "dirichlet"
 
 [boundary.density.right.value]
 e = 0.29
-T = 0.29
+H = 0.29
 
 [boundary.temperature.left]
 type = "neumann"
@@ -71,7 +71,7 @@ type = "dirichlet"
 
 [boundary.temperature.right.value]
 e = 0.8
-T = 0.8
+H = 0.8
 
 [boundary.Er.left]
 type = "dirichlet"
