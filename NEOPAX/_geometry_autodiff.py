@@ -275,7 +275,7 @@ def _neopax_vmex_booz_xform_inputs_from_state(*, state, static) -> SimpleNamespa
     )
 
 
-def _neopax_vmex_boozer_table_inputs_from_state(*, state, static) -> SimpleNamespace:
+def _neopax_vmex_boozer_table_inputs_from_state(*, state, static, surface_indices=None) -> SimpleNamespace:
     """Batched current-VMEX version of ``vmex.core.boozer_tables.boozer_input_tables``."""
     rt = static.runtime
     setup = rt.setup
@@ -290,7 +290,18 @@ def _neopax_vmex_boozer_table_inputs_from_state(*, state, static) -> SimpleNames
     nfp = int(rt.resolution.nfp)
     s = jnp.asarray(setup.s_full)
     ns = int(s.shape[0])
-    rows_np = np.arange(1, ns, dtype=np.int32)
+    if surface_indices is None:
+        rows_np = np.arange(1, ns, dtype=np.int32)
+    else:
+        surface_indices_np = np.asarray(surface_indices, dtype=np.int32).reshape(-1)
+        if surface_indices_np.size == 0:
+            raise ValueError("Boozer table input surface_indices must be non-empty.")
+        if np.any(surface_indices_np < 0) or np.any(surface_indices_np >= ns - 1):
+            raise ValueError(
+                f"Boozer table input surface_indices must be in [0, {ns - 2}], "
+                f"got {surface_indices_np.tolist()}."
+            )
+        rows_np = surface_indices_np + 1
     rows = jnp.asarray(rows_np, dtype=jnp.int32)
     sqrt_s = jnp.sqrt(s)
     s_half = 0.5 * (s[rows] + s[rows - 1])
@@ -2959,13 +2970,23 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     state, state_pullback = jax.vjp(solve_state, param_deltas)
     booz_api = _import_booz_xform_jax_api()
-    booz_inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
+    use_selected_boozer_inputs = _using_current_vmec_jax_context(context) and isinstance(context.static, _VmecStaticCompat)
+    if use_selected_boozer_inputs:
+        booz_inputs = _neopax_vmex_boozer_table_inputs_from_state(
+            state=state,
+            static=context.static,
+            surface_indices=context.surface_indices,
+        )
+        booz_surface_indices = None
+    else:
+        booz_inputs = _booz_xform_inputs_from_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        booz_surface_indices = context.surface_indices
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
     ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
     ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
@@ -2979,18 +3000,25 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
 
     def booz_output_from_state(state_inner):
-        inputs_inner = _booz_xform_inputs_from_state(
-            state=state_inner,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
-            flux=context.flux,
-        )
+        if use_selected_boozer_inputs:
+            inputs_inner = _neopax_vmex_boozer_table_inputs_from_state(
+                state=state_inner,
+                static=context.static,
+                surface_indices=context.surface_indices,
+            )
+        else:
+            inputs_inner = _booz_xform_inputs_from_state(
+                state=state_inner,
+                static=context.static,
+                indata=context.indata,
+                signgs=context.signgs,
+                flux=context.flux,
+            )
         out = booz_api.booz_xform_from_inputs(
             inputs=inputs_inner,
             constants=booz_constants,
             grids=booz_grids,
-            surface_indices=context.surface_indices,
+            surface_indices=booz_surface_indices,
             jit=True,
         )
         return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}

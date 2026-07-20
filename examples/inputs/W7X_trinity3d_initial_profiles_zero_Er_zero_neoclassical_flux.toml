@@ -1,7 +1,8 @@
 # Benchmark-style NEOPAX input using the W7-X geometry files added in
 # examples/inputs, with initial profiles matched to the Trinity3D W7-X example.
-# This file is configured for direct flux evaluation with Er initialized to zero
-# and all transport flux models disabled, so the neoclassical flux is exactly zero.
+# This file is configured for direct flux evaluation with Er initialized to zero,
+# no neoclassical/classical fluxes, and turbulence read from a Stage-4 SPECTRAX-GK
+# flux file.
 
 [general]
 mode = "fluxes"
@@ -17,7 +18,8 @@ flux_model = "none"
 entropy_model = "none"
 
 [turbulence]
-flux_model = "none"
+flux_model = "fluxes_r_file"
+turbulence_file = "./examples/outputs/w7x_trinity3d_stage4_t_ion/neopax_fluxes.h5"
 
 [classical]
 flux_model = "none"
@@ -27,8 +29,8 @@ n_x = 4
 
 [species]
 n_species = 2
-names = ["e", "H"]
-mass_mp = [0.000544617, 1.0]
+names = ["e", "T"]
+mass_mp = [0.000544617, 3.0]
 charge_qp = [-1.0, 1.0]
 
 [profiles]
@@ -56,7 +58,7 @@ type = "dirichlet"
 
 [boundary.density.right.value]
 e = 0.29
-H = 0.29
+T = 0.29
 
 [boundary.temperature.left]
 type = "neumann"
@@ -69,7 +71,7 @@ type = "dirichlet"
 
 [boundary.temperature.right.value]
 e = 0.8
-H = 0.8
+T = 0.8
 
 [boundary.Er.left]
 type = "dirichlet"
