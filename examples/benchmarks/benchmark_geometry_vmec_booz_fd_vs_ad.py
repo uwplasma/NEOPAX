@@ -512,12 +512,11 @@ def main() -> None:
         "--final-vmec-pullback-mode",
         type=str,
         default="vmap",
-        choices=("vmap", "lax_map", "sequential", "vmec_jax_multi_rhs"),
+        choices=("vmap", "lax_map", "sequential"),
         help=(
             "Diagnostic only for geometry_full_ad_objectives objective_table. "
-            "'vmap' keeps the original vectorized custom-VJP final VMEC pullback; "
-            "'vmec_jax_multi_rhs' uses the newer vmec_jax multi-RHS helper; 'lax_map' "
-            "applies the current single-RHS vmec_jax implicit VJP one row at a time."
+            "'vmap' keeps the vectorized final VMEC pullback; 'lax_map' applies "
+            "the current single-RHS vmec_jax implicit VJP one row at a time."
         ),
     )
     parser.add_argument(

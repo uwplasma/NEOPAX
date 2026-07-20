@@ -2658,44 +2658,25 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()
     param_entries = boundary_param_entries(context, param_specs)
-    use_local_assemble_rhs_pullback = (
+    use_current_multi_rhs = (
         _using_current_vmec_jax_context(context)
         and str(lane).strip().lower() == "ad"
         and final_mode == "vmap"
     )
-    use_current_multi_rhs = (
-        _using_current_vmec_jax_context(context)
-        and str(lane).strip().lower() == "ad"
-        and final_mode == "vmec_jax_multi_rhs"
-    )
     implicit = implicit_params = implicit_cfg = dof_mask = state_pullback = None
-    if use_local_assemble_rhs_pullback or use_current_multi_rhs:
+    if use_current_multi_rhs:
         implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
             context,
             param_deltas,
             param_entries,
             max_iter=max_iter,
         )
-        required_attrs = (
-            "solve_implicit_with_aux",
-            "_edge_mask",
-            "_dof_projector",
-            "_assemble",
-            "runtime_from_params",
-            "residual_fn",
-            "_adjoint_solve",
-        )
-        if use_local_assemble_rhs_pullback and all(hasattr(implicit, name) for name in required_attrs):
-            state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
-        elif use_current_multi_rhs and hasattr(implicit, "solve_implicit_with_aux") and hasattr(
-            implicit, "implicit_state_pullback_multi_rhs"
-        ):
+        if hasattr(implicit, "solve_implicit_with_aux") and hasattr(implicit, "implicit_state_pullback_multi_rhs"):
             state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
         else:
-            use_local_assemble_rhs_pullback = False
             use_current_multi_rhs = False
 
-    if not (use_local_assemble_rhs_pullback or use_current_multi_rhs):
+    if not use_current_multi_rhs:
         def solve_state(theta):
             return _solve_state_for_param_vector(
                 context,
@@ -2830,17 +2811,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
-    if use_local_assemble_rhs_pullback:
-        param_grads = _implicit_state_pullback_multi_rhs_with_assemble_rhs(
-            implicit,
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
-            state_bar,
-        )
-        gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_grads, param_entries)
-    elif use_current_multi_rhs:
+    if use_current_multi_rhs:
         param_grads = implicit.implicit_state_pullback_multi_rhs(
             implicit_params,
             implicit_cfg,
@@ -2854,9 +2825,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     elif final_mode == "vmap":
         gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
     else:
-        raise ValueError(
-            "final_vmec_pullback_mode must be 'vmap', 'lax_map', 'sequential', or 'vmec_jax_multi_rhs'."
-        )
+        raise ValueError("final_vmec_pullback_mode must be 'vmap', 'lax_map', or 'sequential'.")
     return values_by_name, gradient_matrix
 
 
