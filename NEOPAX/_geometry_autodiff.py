@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -2955,6 +2956,22 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             f"got {int(cotangents.shape[1])}."
         )
 
+    phase_start = time.perf_counter()
+
+    def _ready(tree):
+        def _leaf_ready(value):
+            return value.block_until_ready() if hasattr(value, "block_until_ready") else value
+
+        return jax.tree.map(_leaf_ready, tree)
+
+    def _progress(label: str, tree=None):
+        nonlocal phase_start
+        if tree is not None:
+            _ready(tree)
+        now = time.perf_counter()
+        print(f"[geometry-fd-ad] progress: objective_table {label} elapsed_s={now - phase_start:.3f}", flush=True)
+        phase_start = now
+
     final_mode = str(final_vmec_pullback_mode).strip().lower()
 
     def solve_state(theta):
@@ -2969,6 +2986,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     state, state_pullback = jax.vjp(solve_state, param_deltas)
+    _progress("vmec implicit state/vjp ready", state)
     booz_api = _import_booz_xform_jax_api()
     use_selected_boozer_inputs = _using_current_vmec_jax_context(context) and isinstance(context.static, _VmecStaticCompat)
     if use_selected_boozer_inputs:
@@ -2988,6 +3006,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
         booz_surface_indices = context.surface_indices
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
+    _progress("booz input tables ready", booz_inputs)
     ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
     ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
     mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
@@ -3032,6 +3051,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         return out
 
     booz, booz_state_pullback = jax.vjp(booz_output_from_state, state)
+    _progress("booz_xform vjp ready", booz)
     values_by_name: dict[str, jnp.ndarray] = {}
 
     vmec_names = (
@@ -3054,6 +3074,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         jnp.eye(len(vmec_names), dtype=jnp.float64)
     )
     vmec_state_bar = _tree_weighted_basis_sum(vmec_basis, cotangents[:, vmec_indices])
+    _progress("vmec objective cotangents ready", vmec_state_bar)
 
     boozer_light_names = (
         "iota_b_mean",
@@ -3074,6 +3095,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         jnp.eye(len(boozer_light_names), dtype=jnp.float64)
     )
     boozer_bar = _tree_weighted_basis_sum(boozer_basis, cotangents[:, boozer_light_indices])
+    _progress("boozer light cotangents ready", boozer_bar)
 
     if mode00 is None:
         raise ValueError("Boozer output is missing the (m, n) = (0, 0) mode.")
@@ -3089,6 +3111,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         aspect_proxy_unit_state_bar,
         cotangents[:, aspect_proxy_index],
     )
+    _progress("aspect proxy cotangents ready", aspect_proxy_state_bar)
 
     qi_index = names.index("boozer_qi_objective")
 
@@ -3103,9 +3126,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         qi_unit_boozer_bar,
         cotangents[:, qi_index],
     )
+    _progress("qi cotangents ready", qi_boozer_bar)
 
     booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
+    _progress("booz cotangents pulled to state", boozer_state_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
     if final_mode in {"lax_map", "sequential"}:
@@ -3114,6 +3139,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
     else:
         raise ValueError("final_vmec_pullback_mode must be 'vmap', 'lax_map', or 'sequential'.")
+    _progress("final vmec parameter pullback ready", gradient_matrix)
     return values_by_name, gradient_matrix
 
 
