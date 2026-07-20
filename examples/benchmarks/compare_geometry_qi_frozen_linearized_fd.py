@@ -190,6 +190,16 @@ def _adjoint_solve_jax_scipy(A, b, cfg):
     )
 
 
+def _adjoint_solve_bicgstab(A, b, cfg):
+    return jax.scipy.sparse.linalg.bicgstab(
+        A,
+        b,
+        tol=cfg.adjoint_tol,
+        atol=0.0,
+        maxiter=cfg.adjoint_restart * cfg.adjoint_maxiter,
+    )
+
+
 def _manual_implicit_pullback(
     *,
     params,
@@ -486,9 +496,19 @@ def main() -> None:
             formulation=args.formulation,
             adjoint_solve=_adjoint_solve_jax_scipy,
         )
+        bicgstab_param_bar = _manual_implicit_pullback(
+            params=params0,
+            cfg=cfg,
+            x_star=x_star,
+            dof_mask=dof_mask,
+            state_bar=state_bar,
+            formulation=args.formulation,
+            adjoint_solve=_adjoint_solve_bicgstab,
+        )
         field_name = _param_field(family)
         reverse_grad = jnp.asarray(getattr(param_bar, field_name), dtype=jnp.float64)[row, col]
         scipy_reverse_grad = jnp.asarray(getattr(scipy_param_bar, field_name), dtype=jnp.float64)[row, col]
+        bicgstab_reverse_grad = jnp.asarray(getattr(bicgstab_param_bar, field_name), dtype=jnp.float64)[row, col]
         builtin_param_bar = im.implicit_state_pullback_multi_rhs(
             params0,
             cfg,
@@ -500,30 +520,11 @@ def main() -> None:
             getattr(builtin_param_bar, field_name),
             dtype=jnp.float64,
         )[0, row, col]
-        structured_reverse_grad_f = None
-        if hasattr(im, "implicit_state_pullback_multi_rhs_raw_transpose"):
-            structured_param_bar = im.implicit_state_pullback_multi_rhs_raw_transpose(
-                params0,
-                cfg,
-                x_star,
-                dof_mask,
-                jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), state_bar),
-            )
-            structured_reverse_grad = jnp.asarray(
-                getattr(structured_param_bar, field_name),
-                dtype=jnp.float64,
-            )[0, row, col]
-            structured_reverse_grad_f = float(jax.device_get(structured_reverse_grad))
         state_dot_f = float(jax.device_get(state_dot_tangent))
         reverse_grad_f = float(jax.device_get(reverse_grad))
         scipy_reverse_grad_f = float(jax.device_get(scipy_reverse_grad))
+        bicgstab_reverse_grad_f = float(jax.device_get(bicgstab_reverse_grad))
         builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
-        structured_text = ""
-        if structured_reverse_grad_f is not None:
-            structured_text = (
-                f" raw_transpose_reverse_param_grad={structured_reverse_grad_f:.16e}"
-                f" rel_err_raw_transpose_reverse_vs_jvp={_relative_error(structured_reverse_grad_f, jvp_f):.6e} "
-            )
         print(
             f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
             f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
@@ -540,11 +541,12 @@ def main() -> None:
             f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
             f"reverse_param_grad={reverse_grad_f:.16e} "
             f"jax_scipy_reverse_param_grad={scipy_reverse_grad_f:.16e} "
+            f"bicgstab_reverse_param_grad={bicgstab_reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
-            f"{structured_text}"
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_jax_scipy_reverse_vs_jvp={_relative_error(scipy_reverse_grad_f, jvp_f):.6e} "
+            f"rel_err_bicgstab_reverse_vs_jvp={_relative_error(bicgstab_reverse_grad_f, jvp_f):.6e} "
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
             flush=True,
         )
