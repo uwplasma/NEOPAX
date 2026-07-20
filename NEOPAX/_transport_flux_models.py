@@ -7580,6 +7580,15 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             return None
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
+    def _require_matching_fd_grid(self):
+        file_r = jnp.asarray(self.r_data, dtype=jnp.float64)
+        target_r = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)
+        if file_r.shape != target_r.shape or not bool(jnp.allclose(file_r, target_r, rtol=0.0, atol=1.0e-12)):
+            raise ValueError(
+                "fluxes_r_file lagged_response_mode='fd' currently requires the file radial grid "
+                "to match NEOPAX geometry.r_grid exactly."
+            )
+
     def _spectrax_fd_basis(self, state):
         density = safe_density(state.density)
         temperature = safe_temperature(state.temperature, 1.0e-12)
@@ -7655,20 +7664,17 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
             )
+        self._require_matching_fd_grid()
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),
             reference_basis=self._spectrax_fd_basis(state),
             perturb_kind_codes=self.perturb_kind_codes,
             perturb_species_indices=self.perturb_species_indices,
-            perturb_delta=self._interp_perturb_scalar_profile(self.perturb_delta_data, self.geometry.r_grid),
-            perturb_present=self._interp_perturb_scalar_profile(
-                self.perturb_present_data.astype(float),
-                self.geometry.r_grid,
-            )
-            > 0.5,
-            gamma_perturb=self._interp_perturb_species_profile(self.gamma_perturb_data, self.geometry.r_grid),
-            q_perturb=self.q_scale * self._interp_perturb_species_profile(self.q_perturb_data, self.geometry.r_grid),
+            perturb_delta=jnp.asarray(self.perturb_delta_data, dtype=float),
+            perturb_present=jnp.asarray(self.perturb_present_data, dtype=bool),
+            gamma_perturb=jnp.asarray(self.gamma_perturb_data, dtype=float),
+            q_perturb=self.q_scale * jnp.asarray(self.q_perturb_data, dtype=float),
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
