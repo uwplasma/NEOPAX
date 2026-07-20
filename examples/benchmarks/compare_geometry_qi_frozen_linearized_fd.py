@@ -141,6 +141,43 @@ def _tree_sub(left, right):
     )
 
 
+def _solver_info_text(info) -> str:
+    fields = []
+    for name in (
+        "converged",
+        "iterations",
+        "num_iters",
+        "niter",
+        "restarts",
+        "num_restarts",
+        "residual_norm",
+        "relative_residual",
+        "res_norm",
+        "error",
+    ):
+        if not hasattr(info, name):
+            continue
+        value = getattr(info, name)
+        try:
+            arr = jax.device_get(value)
+            arr_np = np.asarray(arr)
+            if arr_np.shape == ():
+                if arr_np.dtype == np.bool_:
+                    value_text = str(bool(arr_np))
+                elif np.issubdtype(arr_np.dtype, np.integer):
+                    value_text = str(int(arr_np))
+                else:
+                    value_text = f"{float(arr_np):.6e}"
+            else:
+                value_text = f"shape={arr_np.shape}"
+        except Exception:
+            value_text = repr(value)
+        fields.append(f"{name}={value_text}")
+    if not fields:
+        fields.append(f"type={type(info).__name__}")
+    return " ".join(fields)
+
+
 def _adjoint_solve_jax_scipy(A, b, cfg):
     return jax.scipy.sparse.linalg.gmres(
         A,
@@ -429,6 +466,9 @@ def main() -> None:
         assembled_lam, assembled_lam_info = im._adjoint_solve(lambda v: vjp_z(v)[0], assembled_rhs, cfg)
         builtin_res_l2 = _tree_l2(_tree_sub(vjp_z(builtin_lam)[0], projected_rhs))
         assembled_res_l2 = _tree_l2(_tree_sub(vjp_z(assembled_lam)[0], assembled_rhs))
+        rhs_l2_safe = jnp.maximum(rhs_l2, jnp.asarray(1.0e-300, dtype=jnp.float64))
+        builtin_rel_res = builtin_res_l2 / rhs_l2_safe
+        assembled_rel_res = assembled_res_l2 / rhs_l2_safe
         param_bar = _manual_implicit_pullback(
             params=params0,
             cfg=cfg,
@@ -469,9 +509,11 @@ def main() -> None:
             f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
             f"rhs_l2={float(jax.device_get(rhs_l2)):.6e} "
             f"builtin_adjoint_res_l2={float(jax.device_get(builtin_res_l2)):.6e} "
+            f"builtin_adjoint_rel_res={float(jax.device_get(builtin_rel_res)):.6e} "
             f"assembled_adjoint_res_l2={float(jax.device_get(assembled_res_l2)):.6e} "
-            f"builtin_converged={getattr(builtin_lam_info, 'converged', None)} "
-            f"assembled_converged={getattr(assembled_lam_info, 'converged', None)}",
+            f"assembled_adjoint_rel_res={float(jax.device_get(assembled_rel_res)):.6e} "
+            f"builtin_solver_info=({_solver_info_text(builtin_lam_info)}) "
+            f"assembled_solver_info=({_solver_info_text(assembled_lam_info)})",
             flush=True,
         )
         print(
