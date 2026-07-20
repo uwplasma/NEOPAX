@@ -266,6 +266,11 @@ def main() -> None:
         ),
     )
     parser.add_argument("--vmex-traceable-qi-oversample", type=int, default=2)
+    parser.add_argument(
+        "--vmex-traceable-qi-jvp-only",
+        action="store_true",
+        help="For the VMEX traceable QI diagnostic, skip the reverse VJP and print only value/JVP.",
+    )
     args = parser.parse_args()
     args.objective = _normalize_objective_name(args.objective)
 
@@ -436,11 +441,20 @@ def main() -> None:
             )
 
         vmex_value, vmex_jvp = jax.jvp(vmex_qi, (x_star,), (state_tangent,))
+        vmex_value_f = float(jax.device_get(vmex_value))
+        vmex_jvp_f = float(jax.device_get(vmex_jvp))
+        if args.vmex_traceable_qi_jvp_only:
+            print(
+                f"[geometry-qi-linearized-fd] vmex_traceable_qi "
+                f"value={vmex_value_f:.16e} "
+                f"forward_jvp={vmex_jvp_f:.16e} "
+                f"rel_err_vs_neopax_jvp={_relative_error(vmex_jvp_f, jvp_f):.6e}",
+                flush=True,
+            )
+            return
         _vmex_value_for_vjp, vmex_vjp = jax.vjp(vmex_qi, x_star)
         vmex_state_bar = vmex_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]
         vmex_state_dot = _tree_dot(vmex_state_bar, state_tangent)
-        vmex_value_f = float(jax.device_get(vmex_value))
-        vmex_jvp_f = float(jax.device_get(vmex_jvp))
         vmex_state_dot_f = float(jax.device_get(vmex_state_dot))
         print(
             f"[geometry-qi-linearized-fd] vmex_traceable_qi "
