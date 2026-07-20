@@ -42,7 +42,9 @@ class AnalyticalProfileModel(ProfileModel):
     c_density: tuple[float, ...] | None = None
     c_temperature: tuple[float, ...] | None = None
     density_shape_power: float = 2.0
+    density_shape_alpha: float = 1.0
     temperature_shape_power: float = 2.0
+    temperature_shape_alpha: float = 1.0
     n_scale: float | tuple[float, ...] = 1.0
     T_scale: float | tuple[float, ...] = 1.0
     er0_scale: float = 100.0
@@ -53,9 +55,10 @@ class AnalyticalProfileModel(ProfileModel):
         if n_species < 1:
             raise ValueError("StandardAnalyticalProfileModel requires at least one species.")
 
-        x = field.r_grid / field.a_b
-        density_shape = 1.0 - x ** self.density_shape_power
-        temperature_shape = 1.0 - x ** self.temperature_shape_power
+        r_max = jnp.maximum(field.r_grid[-1], jnp.asarray(1.0e-30, dtype=field.r_grid.dtype))
+        x = field.r_grid / r_max
+        density_shape = (1.0 - x ** self.density_shape_power) ** self.density_shape_alpha
+        temperature_shape = (1.0 - x ** self.temperature_shape_power) ** self.temperature_shape_alpha
 
         # User-facing TOML convention:
         #   density inputs in units of 1e20 m^-3
@@ -104,7 +107,7 @@ class AnalyticalProfileModel(ProfileModel):
         n_scale = _expand_species_values(self.n_scale, default=1.0, include_electron=False)
         T_scale = _expand_species_values(self.T_scale, default=1.0, include_electron=True)
 
-        Er = self.er0_scale * field.rho_grid * (self.er0_peak_rho - field.rho_grid)
+        Er = self.er0_scale * x * (self.er0_peak_rho - x)
 
         temperature = jnp.zeros((n_species, field.r_grid.shape[0]))
         density = jnp.zeros((n_species, field.r_grid.shape[0]))
@@ -194,7 +197,9 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
             if profile_cfg.get("c_temperature") is None
             else tuple(float(v) for v in profile_cfg.get("c_temperature")),
             density_shape_power=float(profile_cfg.get("density_shape_power", 2.0)),
+            density_shape_alpha=float(profile_cfg.get("density_shape_alpha", 1.0)),
             temperature_shape_power=float(profile_cfg.get("temperature_shape_power", 2.0)),
+            temperature_shape_alpha=float(profile_cfg.get("temperature_shape_alpha", 1.0)),
             n_scale=(
                 float(profile_cfg.get("n_scale", 1.0))
                 if isinstance(profile_cfg.get("n_scale", 1.0), (int, float))

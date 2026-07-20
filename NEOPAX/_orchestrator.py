@@ -224,11 +224,12 @@ def _build_geometry(config: dict):
     if backend in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}:
         return None
     n_radial = int(geom_cfg.get("n_radial", 51))
+    rho_edge = float(geom_cfg.get("rho_edge", 1.0))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
     if vmec_file is None or boozer_file is None:
         return None
-    return get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
+    return get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file, rho_edge=rho_edge)
 
 
 def _build_database(config: dict, geometry):

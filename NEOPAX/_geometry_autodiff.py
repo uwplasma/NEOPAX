@@ -52,13 +52,11 @@ def _import_vmec_module(module_name: str):
 
 
 _CURRENT_VMEX_MODULE_ALIASES = {
-    "boozer_tables": ("core.boozer_tables",),
     "fields": ("core.fields",),
     "fourier": ("core.fourier",),
     "geometry": ("core.geometry",),
     "implicit": ("core.implicit",),
     "multigrid": ("core.multigrid",),
-    "omnigenity": ("core.omnigenity",),
     "optimize": ("core.optimize",),
     "setup": ("core.setup",),
     "solver": ("core.solver",),
@@ -116,6 +114,167 @@ def _import_booz_xform_jax_api():
     return jax_api
 
 
+def _neopax_full_to_half_mesh(full: Any, m_modes: Any, s_full: Any) -> jnp.ndarray:
+    """VMEC full-mesh spectral rows -> Boozer half-mesh rows, all in JAX."""
+    full = jnp.asarray(full)
+    m_modes = jnp.asarray(m_modes)
+    s_full = jnp.asarray(s_full)
+    ns_full = int(full.shape[0])
+    if ns_full < 2:
+        return full
+
+    sqrt_s_full = jnp.sqrt(jnp.maximum(s_full, 0.0)).at[0].set(1.0)
+    s_half = 0.5 * (s_full[:-1] + s_full[1:])
+    sqrt_s_half = jnp.sqrt(jnp.maximum(s_half, 0.0))
+
+    even_val = 0.5 * (full[:-1, :] + full[1:, :])
+    odd_val = (
+        0.5
+        * ((full[:-1, :] / sqrt_s_full[:-1, None]) + (full[1:, :] / sqrt_s_full[1:, None]))
+        * sqrt_s_half[:, None]
+    )
+    half = jnp.where(((m_modes % 2) == 0)[None, :], even_val, odd_val)
+
+    if ns_full >= 3:
+        axis_mask = m_modes == 1
+        axis_val = (
+            1.5 * full[1, :] / sqrt_s_full[1]
+            - 0.5 * full[2, :] / sqrt_s_full[2]
+        ) * sqrt_s_half[0]
+        half = half.at[0, :].set(jnp.where(axis_mask, axis_val, half[0, :]))
+    return half
+
+
+def _neopax_lambda_wout_from_full_mesh(
+    *,
+    lam_full: Any,
+    m_modes: Any,
+    phipf_internal: Any,
+    lamscale: Any,
+    s_full: Any,
+) -> jnp.ndarray:
+    """Traceable VMEX-state version of VMEC wrout lambda half-mesh scaling."""
+    lam_full = jnp.asarray(lam_full)
+    m_modes = jnp.asarray(m_modes)
+    phipf_internal = jnp.asarray(phipf_internal)
+    s_full = jnp.asarray(s_full)
+    ns = int(lam_full.shape[0])
+    if ns < 2:
+        return jnp.zeros_like(lam_full)
+
+    phipf_safe = jnp.where(phipf_internal == 0.0, 1.0, phipf_internal)
+    lam_ext = lam_full * (jnp.asarray(lamscale) / phipf_safe[:, None])
+
+    idx = jnp.arange(ns + 1, dtype=lam_ext.dtype)
+    hs = s_full[1] - s_full[0]
+    sqrts = jnp.sqrt(jnp.maximum(hs * (idx - 1.0), 0.0)).at[ns].set(1.0)
+    shalf = jnp.sqrt(jnp.maximum(hs * jnp.abs(idx - 1.5), 0.0))
+    js = jnp.arange(2, ns + 1)
+    sm = jnp.zeros_like(sqrts).at[js].set(jnp.where(sqrts[js] != 0.0, shalf[js] / sqrts[js], 0.0))
+    sp_val = jnp.where(
+        js < ns,
+        jnp.where(sqrts[js] != 0.0, shalf[js + 1] / sqrts[js], 0.0),
+        jnp.where(sqrts[js] != 0.0, 1.0 / sqrts[js], 0.0),
+    )
+    sp = jnp.zeros_like(sqrts).at[js].set(sp_val)
+    sp = sp.at[1].set(jnp.where(ns >= 2, sm[2], 0.0))
+
+    mask_m_le1 = m_modes <= 1
+    lam_half = lam_ext.at[0, :].set(jnp.where(mask_m_le1, lam_ext[1, :], lam_ext[0, :]))
+    even_mask = (m_modes % 2) == 0
+
+    def body(i, arr):
+        row = ns - 1 - i
+        even_val = 0.5 * (arr[row, :] + arr[row - 1, :])
+        odd_val = 0.5 * (sm[row + 1] * arr[row, :] + sp[row] * arr[row - 1, :])
+        return arr.at[row, :].set(jnp.where(even_mask, even_val, odd_val))
+
+    lam_half = jax.lax.fori_loop(0, ns - 1, body, lam_half)
+    return lam_half.at[0, :].set(jnp.zeros_like(lam_half[0, :]))
+
+
+def _neopax_vmex_booz_xform_inputs_from_state(*, state, static) -> SimpleNamespace:
+    """Build booz_xform_jax inputs from current VMEX state/runtime without host table loops."""
+    rt = static.runtime
+    setup = rt.setup
+    lasym = bool(getattr(setup, "lasym", rt.resolution.lasym))
+    if lasym:
+        raise NotImplementedError("NEOPAX current-VMEX Boozer AD input builder currently supports lasym=False only.")
+
+    solver_module = _import_vmec_module("core.solver")
+    geometry_module = _import_vmec_module("core.geometry")
+    fields_module = _import_vmec_module("core.fields")
+    statephysics_module = _import_vmec_module("core.statephysics")
+    transforms_module = _import_vmec_module("core.transforms")
+
+    s_full = jnp.asarray(setup.s_full)
+    (R_cos, R_sin, Z_cos, Z_sin), geometry = solver_module._geometry(state, rt)
+    jacobian = geometry_module.half_mesh_jacobian(geometry, s=s_full)
+    metrics = fields_module.metric_elements(geometry, s=s_full)
+    fields = fields_module.magnetic_fields(
+        geometry=geometry,
+        jacobian=jacobian,
+        metrics=metrics,
+        trig=rt.trig,
+        s=s_full,
+        phips=setup.phips,
+        phipf=setup.phipf,
+        chips=setup.chips,
+        signgs=setup.signgs,
+        gamma=rt.gamma,
+        mass=setup.mass,
+        ncurr=setup.ncurr,
+        enclosed_current=setup.icurv,
+    )
+
+    mode_scale = jnp.asarray(1.0 / transforms_module.physical_to_internal_scale(rt.modes, rt.trig))
+    m_modes = jnp.asarray(rt.modes.m, dtype=jnp.int32)
+    nfp = int(rt.resolution.nfp)
+
+    rmnc = _neopax_full_to_half_mesh(jnp.asarray(R_cos) * mode_scale[None, :], m_modes, s_full)
+    zmns = _neopax_full_to_half_mesh(jnp.asarray(Z_sin) * mode_scale[None, :], m_modes, s_full)
+    lmns_full = _neopax_lambda_wout_from_full_mesh(
+        lam_full=jnp.asarray(state.L_sin) * mode_scale[None, :],
+        m_modes=m_modes,
+        phipf_internal=setup.phipf,
+        lamscale=fields.lamscale,
+        s_full=s_full,
+    )
+
+    modes_nyq, consts = statephysics_module._nyquist_analysis_constants(rt.resolution)
+    pressure = jnp.asarray(fields.pressure)
+    bmag = jnp.sqrt(jnp.maximum(
+        2.0 * (jnp.asarray(fields.total_pressure) - pressure[:, None, None]),
+        jnp.asarray(jnp.finfo(pressure.dtype).tiny, dtype=pressure.dtype),
+    ))
+
+    bmnc = statephysics_module._wrout_cos_coeffs_state(bmag, consts)
+    bsubumnc = statephysics_module._wrout_cos_coeffs_state(jnp.asarray(fields.bsubu), consts)
+    bsubvmnc = statephysics_module._wrout_cos_coeffs_state(jnp.asarray(fields.bsubv), consts)
+
+    iota = jnp.where(
+        jnp.asarray(int(setup.ncurr) == 1),
+        jnp.where(jnp.asarray(setup.phips) != 0.0, jnp.asarray(fields.chips) / jnp.asarray(setup.phips), 0.0),
+        jnp.asarray(setup.iotas),
+    )
+    iota = iota.at[0].set(jnp.asarray(0.0, dtype=iota.dtype))
+
+    return SimpleNamespace(
+        nfp=nfp,
+        xm=jnp.asarray(rt.modes.m, dtype=jnp.int32),
+        xn=jnp.asarray(np.asarray(rt.modes.n, dtype=np.int32) * nfp, dtype=jnp.int32),
+        xm_nyq=jnp.asarray(modes_nyq.m, dtype=jnp.int32),
+        xn_nyq=jnp.asarray(np.asarray(modes_nyq.n, dtype=np.int32) * nfp, dtype=jnp.int32),
+        rmnc=rmnc,
+        zmns=zmns,
+        lmns=lmns_full[1:, :],
+        bmnc=bmnc[1:, :],
+        bsubumnc=bsubumnc[1:, :],
+        bsubvmnc=bsubvmnc[1:, :],
+        iota=iota[1:],
+    )
+
+
 def _booz_xform_inputs_from_state(
     *,
     state,
@@ -139,31 +298,10 @@ def _booz_xform_inputs_from_state(
             flux=flux,
         )
     except (AttributeError, ModuleNotFoundError):
-        boozer_tables = _import_vmec_module("core.boozer_tables")
-        boozer_input_tables = boozer_tables.boozer_input_tables
+        if isinstance(static, _VmecStaticCompat):
+            return _neopax_vmex_booz_xform_inputs_from_state(state=state, static=static)
 
-        rt = static.runtime
-        ns = int(jnp.asarray(rt.setup.s_full).shape[0])
-        tables = [boozer_input_tables(state, rt, j) for j in range(1, ns)]
-
-        def stack(name: str):
-            return jnp.stack([jnp.asarray(table[name]) for table in tables], axis=0)
-
-        first = tables[0]
-        return SimpleNamespace(
-            nfp=jnp.asarray(int(rt.resolution.nfp), dtype=jnp.int32),
-            xm=jnp.asarray(first["xm"], dtype=jnp.int32),
-            xn=jnp.asarray(first["xn"], dtype=jnp.int32),
-            xm_nyq=jnp.asarray(first["xm"], dtype=jnp.int32),
-            xn_nyq=jnp.asarray(first["xn"], dtype=jnp.int32),
-            rmnc=stack("rmnc"),
-            zmns=stack("zmns"),
-            lmns=stack("lmns"),
-            bmnc=stack("bmnc"),
-            bsubumnc=stack("bsubumnc"),
-            bsubvmnc=stack("bsubvmnc"),
-            iota=stack("iota"),
-        )
+        raise
 
 
 def _booz_constants_and_grids_for_inputs(context: "GeometryAutodiffContext", inputs):
@@ -1484,7 +1622,7 @@ def _vmec_booz_qi_scalar_objective_from_state(
     nalpha: int = 31,
     n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
-    booz = _traceable_boozer_spectrum_from_state(context, state)
+    booz = _boozer_output_from_state(context, state)
     return _vmec_booz_qi_scalar_objective_from_boozer(
         context,
         booz,
@@ -1503,12 +1641,10 @@ def _vmec_booz_qi_scalar_objective_from_boozer(
     n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
     optimization = _import_vmec_jax_optimization()
-    xm_b = booz["ixm_b"] if "ixm_b" in booz else booz["xm_b"]
-    xn_b = booz["ixn_b"] if "ixn_b" in booz else booz["xn_b"]
     qi = optimization.quasi_isodynamic_residual(
         bmnc_b=booz["bmnc_b"],
-        xm_b=xm_b,
-        xn_b=xn_b,
+        xm_b=booz["ixm_b"],
+        xn_b=booz["ixn_b"],
         iota_b=booz["iota_b"],
         nfp=int(context.cfg.nfp),
         nphi=int(nphi),
@@ -1520,79 +1656,6 @@ def _vmec_booz_qi_scalar_objective_from_boozer(
     }
 
 
-def _traceable_boozer_spectrum_from_state(
-    context: GeometryAutodiffContext,
-    state,
-):
-    """Current-VMEX traceable Boozer spectrum used by compact QI AD paths."""
-
-    omnigenity = _import_vmec_module("omnigenity")
-    booz = omnigenity.boozer_bmnc_state(
-        state,
-        context.static.runtime,
-        surfaces=context.surface_s,
-        mboz=int(context.mboz),
-        nboz=int(context.nboz),
-        oversample=2,
-    )
-    out = dict(booz)
-    if "buco_b" not in out or "bvco_b" not in out:
-        buco_b, bvco_b = _traceable_boozer_current_profiles_from_state(context, state)
-        out.setdefault("buco_b", buco_b)
-        out.setdefault("bvco_b", bvco_b)
-    out["ixm_b"] = jnp.asarray(out.get("ixm_b", out["xm_b"]), dtype=jnp.int32)
-    out["ixn_b"] = jnp.asarray(out.get("ixn_b", out["xn_b"]), dtype=jnp.int32)
-    out["xm_b"] = out["ixm_b"]
-    out["xn_b"] = out["ixn_b"]
-    return out
-
-
-def _traceable_boozer_current_profiles_from_state(
-    context: GeometryAutodiffContext,
-    state,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return Boozer I/G profiles on the same half-mesh rows as VMEX QI."""
-
-    fields_module = _import_vmec_module("fields")
-    geometry_module = _import_vmec_module("geometry")
-    solver_module = _import_vmec_module("solver")
-    rt = context.static.runtime
-    setup = rt.setup
-    s_full = jnp.asarray(setup.s_full)
-    ns = int(s_full.shape[0])
-    s_half_np = (np.arange(ns - 1) + 0.5) / (ns - 1)
-    surface_s = np.atleast_1d(np.asarray(context.surface_s, dtype=float))
-    rows = np.argmin(np.abs(s_half_np[:, None] - surface_s[None, :]), axis=0) + 1
-
-    _, geometry = solver_module._geometry(state, rt)
-    jacobian = geometry_module.half_mesh_jacobian(geometry, s=s_full)
-    metrics = fields_module.metric_elements(geometry, s=s_full)
-    fields = fields_module.magnetic_fields(
-        geometry=geometry,
-        jacobian=jacobian,
-        metrics=metrics,
-        trig=rt.trig,
-        s=s_full,
-        phips=setup.phips,
-        phipf=setup.phipf,
-        chips=setup.chips,
-        signgs=setup.signgs,
-        gamma=rt.gamma,
-        mass=setup.mass,
-        ncurr=setup.ncurr,
-        enclosed_current=setup.icurv,
-    )
-    currents = fields_module.surface_currents(
-        bsubu=fields.bsubu,
-        bsubv=fields.bsubv,
-        trig=rt.trig,
-        s=s_full,
-        signgs=setup.signgs,
-    )
-    row_indices = jnp.asarray(rows, dtype=jnp.int32)
-    return jnp.asarray(currents.buco)[row_indices], jnp.asarray(currents.bvco)[row_indices]
-
-
 def _geometry_full_ad_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1600,7 +1663,7 @@ def _geometry_full_ad_objectives_from_state(
     """One AD gate vector for VMEC scalars, Boozer scalars, and Boozer QI."""
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
-    booz = _traceable_boozer_spectrum_from_state(context, state)
+    booz = _boozer_output_from_state(context, state)
     boozer_scalars = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz)
     qi = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
 
@@ -2765,6 +2828,19 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             )
 
         state, state_pullback = jax.vjp(solve_state, param_deltas)
+    booz_api = _import_booz_xform_jax_api()
+    booz_inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
+    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
+    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
     booz_float_keys = (
         "iota_b",
         "buco_b",
@@ -2773,15 +2849,21 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
 
     def booz_output_from_state(state_inner):
-        out = _traceable_boozer_spectrum_from_state(context, state_inner)
+        inputs_inner = _booz_xform_inputs_from_state(
+            state=state_inner,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        out = booz_api.booz_xform_from_inputs(
+            inputs=inputs_inner,
+            constants=booz_constants,
+            grids=booz_grids,
+            surface_indices=context.surface_indices,
+            jit=True,
+        )
         return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
-
-    booz_probe = _traceable_boozer_spectrum_from_state(context, state)
-    booz = {key: jnp.asarray(booz_probe[key], dtype=jnp.float64) for key in booz_float_keys}
-    ixm_b = jnp.asarray(booz_probe["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(booz_probe["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
-    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     def booz_with_modes(booz_float):
         out = dict(booz_float)
@@ -2791,7 +2873,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         out["_mode10"] = mode10
         return out
 
-    _, booz_state_pullback = jax.vjp(booz_output_from_state, state)
+    booz, booz_state_pullback = jax.vjp(booz_output_from_state, state)
     values_by_name: dict[str, jnp.ndarray] = {}
 
     vmec_names = (

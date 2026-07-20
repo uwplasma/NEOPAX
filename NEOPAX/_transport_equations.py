@@ -1180,11 +1180,12 @@ def build_equation_system_from_config(config, species):
 
     geom_cfg = config.get("geometry", {})
     n_radial = int(geom_cfg.get("n_radial", 51))
+    rho_edge = float(geom_cfg.get("rho_edge", 1.0))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
     field = None
     if vmec_file is not None and boozer_file is not None:
-        field = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
+        field = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file, rho_edge=rho_edge)
 
     energy_grid_cfg = config.get("energy_grid", {})
     n_x = int(energy_grid_cfg.get("n_x", 4))

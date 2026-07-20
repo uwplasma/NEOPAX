@@ -105,15 +105,16 @@ class VmecBoozer(GeometryModelBase):
 
         self.n_r = n_r
         self.full_grid_indices=jnp.arange(self.n_r) 
+        rho_edge = float(kwargs.get("rho_edge", 1.0))
 
 
         self.R0 = rmnc_b[-1,0]
         self.a_b = np.sqrt(volume_p/(2*jnp.pi**2*self.R0))
-        self.rho_grid = jnp.linspace(0., 1., self.n_r)
+        self.rho_grid = jnp.linspace(0., rho_edge, self.n_r)
         self.rho_grid_half = jnp.concatenate([
             jnp.array([0.]),
             0.5 * (self.rho_grid[:-1] + self.rho_grid[1:]),
-            jnp.array([1.])
+            jnp.array([rho_edge])
         ])
         self.r_grid = self.rho_grid * self.a_b
         self.r_grid_half = self.rho_grid_half * self.a_b
