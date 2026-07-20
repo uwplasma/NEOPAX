@@ -1536,11 +1536,61 @@ def _traceable_boozer_spectrum_from_state(
         oversample=2,
     )
     out = dict(booz)
+    if "buco_b" not in out or "bvco_b" not in out:
+        buco_b, bvco_b = _traceable_boozer_current_profiles_from_state(context, state)
+        out.setdefault("buco_b", buco_b)
+        out.setdefault("bvco_b", bvco_b)
     out["ixm_b"] = jnp.asarray(out.get("ixm_b", out["xm_b"]), dtype=jnp.int32)
     out["ixn_b"] = jnp.asarray(out.get("ixn_b", out["xn_b"]), dtype=jnp.int32)
     out["xm_b"] = out["ixm_b"]
     out["xn_b"] = out["ixn_b"]
     return out
+
+
+def _traceable_boozer_current_profiles_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return Boozer I/G profiles on the same half-mesh rows as VMEX QI."""
+
+    fields_module = _import_vmec_module("fields")
+    geometry_module = _import_vmec_module("geometry")
+    solver_module = _import_vmec_module("solver")
+    rt = context.static.runtime
+    setup = rt.setup
+    s_full = jnp.asarray(setup.s_full)
+    ns = int(s_full.shape[0])
+    s_half_np = (np.arange(ns - 1) + 0.5) / (ns - 1)
+    surface_s = np.atleast_1d(np.asarray(context.surface_s, dtype=float))
+    rows = np.argmin(np.abs(s_half_np[:, None] - surface_s[None, :]), axis=0) + 1
+
+    _, geometry = solver_module._geometry(state, rt)
+    jacobian = geometry_module.half_mesh_jacobian(geometry, s=s_full)
+    metrics = fields_module.metric_elements(geometry, s=s_full)
+    fields = fields_module.magnetic_fields(
+        geometry=geometry,
+        jacobian=jacobian,
+        metrics=metrics,
+        trig=rt.trig,
+        s=s_full,
+        phips=setup.phips,
+        phipf=setup.phipf,
+        chips=setup.chips,
+        signgs=setup.signgs,
+        gamma=rt.gamma,
+        mass=setup.mass,
+        ncurr=setup.ncurr,
+        enclosed_current=setup.icurv,
+    )
+    currents = fields_module.surface_currents(
+        bsubu=fields.bsubu,
+        bsubv=fields.bsubv,
+        trig=rt.trig,
+        s=s_full,
+        signgs=setup.signgs,
+    )
+    row_indices = jnp.asarray(rows, dtype=jnp.int32)
+    return jnp.asarray(currents.buco)[row_indices], jnp.asarray(currents.bvco)[row_indices]
 
 
 def _geometry_full_ad_objectives_from_state(
