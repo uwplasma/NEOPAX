@@ -20,6 +20,8 @@ for path in reversed((ROOT, WORKSPACE_ROOT / "VMEX", WORKSPACE_ROOT / "vmex", WO
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _geometry_full_ad_objectives_from_state,
     _import_vmec_jax_implicit,
+    _import_vmec_jax_optimization,
+    _import_vmec_module,
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
 )
@@ -206,6 +208,27 @@ def _objective(context, objective_name: str, state):
     return jnp.asarray(values[objective_name], dtype=jnp.float64).reshape(())
 
 
+def _vmex_traceable_qi_objective(context, state, *, oversample: int):
+    omnigenity = _import_vmec_module("omnigenity")
+    optimization = _import_vmec_jax_optimization()
+    booz = omnigenity.boozer_bmnc_state(
+        state,
+        context.static.runtime,
+        surfaces=jnp.asarray(context.surface_s, dtype=jnp.float64),
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        oversample=int(oversample),
+    )
+    qi = optimization.quasi_isodynamic_residual(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["xm_b"],
+        xn_b=booz["xn_b"],
+        iota_b=booz["iota_b"],
+        nfp=int(context.cfg.nfp),
+    )
+    return jnp.asarray(qi["total"], dtype=jnp.float64).reshape(())
+
+
 def _normalize_objective_name(name: str) -> str:
     return OBJECTIVE_ALIASES.get(str(name), str(name))
 
@@ -234,6 +257,15 @@ def main() -> None:
     parser.add_argument("--adjoint-restart", type=int, default=30)
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
     parser.add_argument("--skip-reverse-check", action="store_true")
+    parser.add_argument(
+        "--compare-vmex-traceable-qi",
+        action="store_true",
+        help=(
+            "Also evaluate QI through vmex.core.omnigenity.boozer_bmnc_state "
+            "on the same baseline state/tangent."
+        ),
+    )
+    parser.add_argument("--vmex-traceable-qi-oversample", type=int, default=2)
     args = parser.parse_args()
     args.objective = _normalize_objective_name(args.objective)
 
@@ -389,6 +421,34 @@ def main() -> None:
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
+            flush=True,
+        )
+    if args.compare_vmex_traceable_qi:
+        if args.objective != "boozer_qi_objective":
+            raise ValueError("--compare-vmex-traceable-qi is only defined for boozer_qi_objective.")
+        print("[geometry-qi-linearized-fd] progress: VMEX traceable QI path check", flush=True)
+
+        def vmex_qi(state):
+            return _vmex_traceable_qi_objective(
+                context,
+                state,
+                oversample=args.vmex_traceable_qi_oversample,
+            )
+
+        vmex_value, vmex_jvp = jax.jvp(vmex_qi, (x_star,), (state_tangent,))
+        _vmex_value_for_vjp, vmex_vjp = jax.vjp(vmex_qi, x_star)
+        vmex_state_bar = vmex_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]
+        vmex_state_dot = _tree_dot(vmex_state_bar, state_tangent)
+        vmex_value_f = float(jax.device_get(vmex_value))
+        vmex_jvp_f = float(jax.device_get(vmex_jvp))
+        vmex_state_dot_f = float(jax.device_get(vmex_state_dot))
+        print(
+            f"[geometry-qi-linearized-fd] vmex_traceable_qi "
+            f"value={vmex_value_f:.16e} "
+            f"forward_jvp={vmex_jvp_f:.16e} "
+            f"reverse_state_dot_tangent={vmex_state_dot_f:.16e} "
+            f"rel_err_state_dot_vs_jvp={_relative_error(vmex_state_dot_f, vmex_jvp_f):.6e} "
+            f"rel_err_vs_neopax_jvp={_relative_error(vmex_jvp_f, jvp_f):.6e}",
             flush=True,
         )
 

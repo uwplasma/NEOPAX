@@ -302,8 +302,9 @@ class NTXExactLijLaggedResponse:
 class SpectraXTurbulenceFDLaggedResponse:
     reference_state: Any
     reference_flux: dict
-    perturb_kind: Any = None
-    perturb_species: Any = None
+    reference_basis: Any = None
+    perturb_kind_codes: Any = None
+    perturb_species_indices: Any = None
     perturb_delta: Any = None
     perturb_present: Any = None
     gamma_perturb: Any = None
@@ -7271,6 +7272,42 @@ def _normalize_flux_dataset(arr, n_species):
     raise ValueError(f"Flux dataset shape {out.shape} is not compatible with n_species={n_species}.")
 
 
+def _normalize_perturb_species_flux_dataset(arr, n_species):
+    out = jnp.asarray(arr, dtype=float)
+    if out.ndim != 3:
+        raise ValueError(f"Perturbation flux dataset must be 3D, got shape {out.shape}.")
+    if out.shape[1] == n_species:
+        return out
+    if out.shape[2] == n_species:
+        return jnp.swapaxes(out, 1, 2)
+    raise ValueError(f"Perturbation flux dataset shape {out.shape} is not compatible with n_species={n_species}.")
+
+
+def _spectrax_perturb_kind_codes(labels):
+    mapping = {
+        "density_gradient": 0,
+        "temperature_gradient": 1,
+    }
+    codes = []
+    for raw in labels:
+        key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw).strip().lower()
+        if key not in mapping:
+            raise ValueError(f"Unsupported SPECTRAX perturb_kind {raw!r}.")
+        codes.append(mapping[key])
+    return jnp.asarray(codes, dtype=jnp.int32)
+
+
+def _spectrax_perturb_species_indices(labels, species_names):
+    lookup = {str(name).strip().lower(): idx for idx, name in enumerate(species_names)}
+    indices = []
+    for raw in labels:
+        key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw).strip().lower()
+        if key not in lookup:
+            raise ValueError(f"Unknown SPECTRAX perturb_species {raw!r} for NEOPAX species {species_names!r}.")
+        indices.append(lookup[key])
+    return jnp.asarray(indices, dtype=jnp.int32)
+
+
 def read_flux_profile_file(path, n_species):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
@@ -7296,6 +7333,38 @@ def read_flux_profile_file(path, n_species):
     q_arr = None if q is None else _normalize_flux_dataset(q, n_species)
     upar_arr = None if upar is None else _normalize_flux_dataset(upar, n_species)
     return r_arr, gamma_arr, q_arr, upar_arr
+
+
+def read_flux_profile_fd_response_file(path, n_species, species_names):
+    with h5py.File(path, "r") as f:
+        keys = set(f.keys())
+        required = {
+            "Gamma_perturb",
+            "Q_perturb",
+            "perturb_delta",
+            "perturb_present",
+            "perturb_kind",
+            "perturb_species",
+        }
+        if not required.issubset(keys):
+            missing = ", ".join(sorted(required - keys))
+            raise ValueError(
+                f"Flux file '{path}' is missing SPECTRAX FD lagged-response datasets: {missing}."
+            )
+        gamma_perturb = _normalize_perturb_species_flux_dataset(f["Gamma_perturb"][...], n_species)
+        q_perturb = _normalize_perturb_species_flux_dataset(f["Q_perturb"][...], n_species)
+        perturb_delta = jnp.asarray(f["perturb_delta"][...], dtype=float)
+        perturb_present = jnp.asarray(f["perturb_present"][...], dtype=bool)
+        perturb_kind_codes = _spectrax_perturb_kind_codes(f["perturb_kind"][...])
+        perturb_species_indices = _spectrax_perturb_species_indices(f["perturb_species"][...], species_names)
+    return (
+        gamma_perturb,
+        q_perturb,
+        perturb_delta,
+        perturb_present,
+        perturb_kind_codes,
+        perturb_species_indices,
+    )
 
 
 def _flux_profile_debug_summary(name, arr):
@@ -7383,6 +7452,21 @@ def build_fluxes_r_file_transport_model(
     )
     location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    gamma_perturb_data = None
+    q_perturb_data = None
+    perturb_delta_data = None
+    perturb_present_data = None
+    perturb_kind_codes = None
+    perturb_species_indices = None
+    if lagged_response_mode == "fd":
+        (
+            gamma_perturb_data,
+            q_perturb_data,
+            perturb_delta_data,
+            perturb_present_data,
+            perturb_kind_codes,
+            perturb_species_indices,
+        ) = read_flux_profile_fd_response_file(path, species.number_species, species.names)
     r_finite = jnp.isfinite(r_data)
     r_nfinite = int(jnp.sum(r_finite))
     if r_nfinite > 0:
@@ -7412,6 +7496,12 @@ def build_fluxes_r_file_transport_model(
         profile_location=str(location).strip().lower(),
         q_scale=q_scale,
         lagged_response_mode=lagged_response_mode,
+        gamma_perturb_data=gamma_perturb_data,
+        q_perturb_data=q_perturb_data,
+        perturb_delta_data=perturb_delta_data,
+        perturb_present_data=perturb_present_data,
+        perturb_kind_codes=perturb_kind_codes,
+        perturb_species_indices=perturb_species_indices,
     )
 
 
@@ -7426,6 +7516,12 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     profile_location: str = "cell_centered"
     q_scale: float = 1.0
     lagged_response_mode: str = "none"
+    gamma_perturb_data: Any = None
+    q_perturb_data: Any = None
+    perturb_delta_data: Any = None
+    perturb_present_data: Any = None
+    perturb_kind_codes: Any = None
+    perturb_species_indices: Any = None
 
     def with_q_scale(self, q_scale: float) -> "FluxesRFileTransportModel":
         return dataclasses.replace(self, q_scale=float(q_scale))
@@ -7472,6 +7568,54 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         cell_values = self._interp_species_profile(data, self.geometry.r_grid)
         return jax.vmap(faces_from_cell_centered)(cell_values)
 
+    def _interp_perturb_species_profile(self, data, target_r):
+        if data is None:
+            return None
+        return jax.vmap(
+            lambda perts: jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(perts)
+        )(data)
+
+    def _interp_perturb_scalar_profile(self, data, target_r):
+        if data is None:
+            return None
+        return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
+
+    def _spectrax_fd_basis(self, state):
+        density = safe_density(state.density)
+        temperature = safe_temperature(state.temperature, 1.0e-12)
+        a_minor = jnp.asarray(getattr(self.geometry, "a_b", 1.0), dtype=density.dtype)
+        dndr_all = jax.vmap(
+            lambda density_a: get_gradient_density(
+                density_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=density_a[-1],
+            )
+        )(density)
+        dTdr_all = jax.vmap(
+            lambda temperature_a: get_gradient_temperature(
+                temperature_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=temperature_a[-1],
+            )
+        )(temperature)
+        # Stage 4 currently writes SPECTRAX perturbations in the default
+        # gradient_coordinate='rho' convention, so convert NEOPAX's physical-r
+        # gradients back to d/d rho using rho = r / a_minor.
+        density_basis = -a_minor * dndr_all / density
+        temperature_basis = -a_minor * dTdr_all / temperature
+        return jax.vmap(
+            lambda kind_code, species_index: jax.lax.cond(
+                kind_code == 0,
+                lambda _: density_basis[species_index],
+                lambda _: temperature_basis[species_index],
+                operand=None,
+            )
+        )(self.perturb_kind_codes, self.perturb_species_indices)
+
     def __call__(self, state) -> dict:
         del state
         gamma = self._data_on_cell_grid(self.gamma_data)
@@ -7495,6 +7639,85 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         q = self.q_scale * self._data_on_face_grid(self.q_data)
         upar = self._data_on_face_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
+
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        if str(self.lagged_response_mode).strip().lower() != "fd":
+            return JVPTransportFluxResponse(reference_state=state, reference_flux=self(state))
+        if (
+            self.gamma_perturb_data is None
+            or self.q_perturb_data is None
+            or self.perturb_delta_data is None
+            or self.perturb_present_data is None
+            or self.perturb_kind_codes is None
+            or self.perturb_species_indices is None
+        ):
+            raise ValueError(
+                "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
+            )
+        return SpectraXTurbulenceFDLaggedResponse(
+            reference_state=state,
+            reference_flux=self(state),
+            reference_basis=self._spectrax_fd_basis(state),
+            perturb_kind_codes=self.perturb_kind_codes,
+            perturb_species_indices=self.perturb_species_indices,
+            perturb_delta=self._interp_perturb_scalar_profile(self.perturb_delta_data, self.geometry.r_grid),
+            perturb_present=self._interp_perturb_scalar_profile(
+                self.perturb_present_data.astype(float),
+                self.geometry.r_grid,
+            )
+            > 0.5,
+            gamma_perturb=self._interp_perturb_species_profile(self.gamma_perturb_data, self.geometry.r_grid),
+            q_perturb=self.q_scale * self._interp_perturb_species_profile(self.q_perturb_data, self.geometry.r_grid),
+        )
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del kwargs
+        if (
+            str(self.lagged_response_mode).strip().lower() != "fd"
+            or not isinstance(lagged_response, SpectraXTurbulenceFDLaggedResponse)
+        ):
+            delta_state = jax.tree_util.tree_map(
+                lambda current, reference: current - reference,
+                state,
+                lagged_response.reference_state,
+            )
+            tangent_flux = jax.jvp(
+                self.__call__,
+                (lagged_response.reference_state,),
+                (delta_state,),
+            )[1]
+            return jax.tree_util.tree_map(
+                lambda reference, tangent: reference + tangent,
+                lagged_response.reference_flux,
+                tangent_flux,
+            )
+
+        current_basis = self._spectrax_fd_basis(state)
+        delta_basis = current_basis - lagged_response.reference_basis
+        perturb_present = lagged_response.perturb_present[:, None, :]
+        safe_delta = jnp.where(
+            perturb_present[:, 0, :],
+            lagged_response.perturb_delta,
+            1.0,
+        )
+        dgamma = jnp.where(
+            perturb_present,
+            (lagged_response.gamma_perturb - lagged_response.reference_flux["Gamma"][None, :, :]) / safe_delta[:, None, :],
+            0.0,
+        )
+        dq = jnp.where(
+            perturb_present,
+            (lagged_response.q_perturb - lagged_response.reference_flux["Q"][None, :, :]) / safe_delta[:, None, :],
+            0.0,
+        )
+        gamma = lagged_response.reference_flux["Gamma"] + jnp.sum(dgamma * delta_basis[:, None, :], axis=0)
+        q = lagged_response.reference_flux["Q"] + jnp.sum(dq * delta_basis[:, None, :], axis=0)
+        return {
+            "Gamma": gamma,
+            "Q": q,
+            "Upar": lagged_response.reference_flux["Upar"],
+        }
 
 
 
