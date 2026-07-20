@@ -58,6 +58,7 @@ _CURRENT_VMEX_MODULE_ALIASES = {
     "geometry": ("core.geometry",),
     "implicit": ("core.implicit",),
     "multigrid": ("core.multigrid",),
+    "omnigenity": ("core.omnigenity",),
     "optimize": ("core.optimize",),
     "setup": ("core.setup",),
     "solver": ("core.solver",),
@@ -1483,7 +1484,7 @@ def _vmec_booz_qi_scalar_objective_from_state(
     nalpha: int = 31,
     n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
-    booz = _boozer_output_from_state(context, state)
+    booz = _traceable_boozer_spectrum_from_state(context, state)
     return _vmec_booz_qi_scalar_objective_from_boozer(
         context,
         booz,
@@ -1502,10 +1503,12 @@ def _vmec_booz_qi_scalar_objective_from_boozer(
     n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
     optimization = _import_vmec_jax_optimization()
+    xm_b = booz["ixm_b"] if "ixm_b" in booz else booz["xm_b"]
+    xn_b = booz["ixn_b"] if "ixn_b" in booz else booz["xn_b"]
     qi = optimization.quasi_isodynamic_residual(
         bmnc_b=booz["bmnc_b"],
-        xm_b=booz["ixm_b"],
-        xn_b=booz["ixn_b"],
+        xm_b=xm_b,
+        xn_b=xn_b,
         iota_b=booz["iota_b"],
         nfp=int(context.cfg.nfp),
         nphi=int(nphi),
@@ -1517,6 +1520,29 @@ def _vmec_booz_qi_scalar_objective_from_boozer(
     }
 
 
+def _traceable_boozer_spectrum_from_state(
+    context: GeometryAutodiffContext,
+    state,
+):
+    """Current-VMEX traceable Boozer spectrum used by compact QI AD paths."""
+
+    omnigenity = _import_vmec_module("omnigenity")
+    booz = omnigenity.boozer_bmnc_state(
+        state,
+        context.static.runtime,
+        surfaces=context.surface_s,
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        oversample=2,
+    )
+    out = dict(booz)
+    out["ixm_b"] = jnp.asarray(out.get("ixm_b", out["xm_b"]), dtype=jnp.int32)
+    out["ixn_b"] = jnp.asarray(out.get("ixn_b", out["xn_b"]), dtype=jnp.int32)
+    out["xm_b"] = out["ixm_b"]
+    out["xn_b"] = out["ixn_b"]
+    return out
+
+
 def _geometry_full_ad_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
@@ -1524,7 +1550,7 @@ def _geometry_full_ad_objectives_from_state(
     """One AD gate vector for VMEC scalars, Boozer scalars, and Boozer QI."""
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
-    booz = _boozer_output_from_state(context, state)
+    booz = _traceable_boozer_spectrum_from_state(context, state)
     boozer_scalars = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz)
     qi = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
 
@@ -2689,19 +2715,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             )
 
         state, state_pullback = jax.vjp(solve_state, param_deltas)
-    booz_api = _import_booz_xform_jax_api()
-    booz_inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, booz_inputs)
-    ixm_b = jnp.asarray(booz_grids.xm_b, dtype=jnp.int32)
-    ixn_b = jnp.asarray(booz_grids.xn_b, dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
-    mode10 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=1, n_value=0)
     booz_float_keys = (
         "iota_b",
         "buco_b",
@@ -2710,21 +2723,15 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
 
     def booz_output_from_state(state_inner):
-        inputs_inner = _booz_xform_inputs_from_state(
-            state=state_inner,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
-            flux=context.flux,
-        )
-        out = booz_api.booz_xform_from_inputs(
-            inputs=inputs_inner,
-            constants=booz_constants,
-            grids=booz_grids,
-            surface_indices=context.surface_indices,
-            jit=True,
-        )
+        out = _traceable_boozer_spectrum_from_state(context, state_inner)
         return {key: jnp.asarray(out[key], dtype=jnp.float64) for key in booz_float_keys}
+
+    booz_probe = _traceable_boozer_spectrum_from_state(context, state)
+    booz = {key: jnp.asarray(booz_probe[key], dtype=jnp.float64) for key in booz_float_keys}
+    ixm_b = jnp.asarray(booz_probe["ixm_b"], dtype=jnp.int32)
+    ixn_b = jnp.asarray(booz_probe["ixn_b"], dtype=jnp.int32)
+    mode00 = _find_mode_index(ixm_b, ixn_b, m=0, n=0)
+    mode10 = _find_mode_index(ixm_b, ixn_b, m=1, n=0)
 
     def booz_with_modes(booz_float):
         out = dict(booz_float)
@@ -2734,7 +2741,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         out["_mode10"] = mode10
         return out
 
-    booz, booz_state_pullback = jax.vjp(booz_output_from_state, state)
+    _, booz_state_pullback = jax.vjp(booz_output_from_state, state)
     values_by_name: dict[str, jnp.ndarray] = {}
 
     vmec_names = (
