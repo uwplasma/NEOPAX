@@ -2796,38 +2796,19 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()
-    param_entries = boundary_param_entries(context, param_specs)
-    use_current_multi_rhs = (
-        _using_current_vmec_jax_context(context)
-        and str(lane).strip().lower() == "ad"
-        and final_mode == "vmap"
-    )
-    implicit = implicit_params = implicit_cfg = dof_mask = state_pullback = None
-    if use_current_multi_rhs:
-        implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
+
+    def solve_state(theta):
+        return _solve_state_for_param_vector(
             context,
-            param_deltas,
-            param_entries,
+            theta,
+            param_specs,
+            lane=lane,
             max_iter=max_iter,
+            step_size=step_size,
+            jacobian_penalty=jacobian_penalty,
         )
-        if hasattr(implicit, "solve_implicit_with_aux") and hasattr(implicit, "implicit_state_pullback_multi_rhs"):
-            state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
-        else:
-            use_current_multi_rhs = False
 
-    if not use_current_multi_rhs:
-        def solve_state(theta):
-            return _solve_state_for_param_vector(
-                context,
-                theta,
-                param_specs,
-                lane=lane,
-                max_iter=max_iter,
-                step_size=step_size,
-                jacobian_penalty=jacobian_penalty,
-            )
-
-        state, state_pullback = jax.vjp(solve_state, param_deltas)
+    state, state_pullback = jax.vjp(solve_state, param_deltas)
     booz_api = _import_booz_xform_jax_api()
     booz_inputs = _booz_xform_inputs_from_state(
         state=state,
@@ -2950,16 +2931,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
-    if use_current_multi_rhs:
-        param_grads = implicit.implicit_state_pullback_multi_rhs(
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
-            state_bar,
-        )
-        gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_grads, param_entries)
-    elif final_mode in {"lax_map", "sequential"}:
+    if final_mode in {"lax_map", "sequential"}:
         gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
     elif final_mode == "vmap":
         gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)

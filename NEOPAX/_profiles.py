@@ -35,16 +35,16 @@ class ProfileModel(abc.ABC):
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class AnalyticalProfileModel(ProfileModel):
-    n0: float
-    n_edge: float
-    T0: float
-    T_edge: float
+    n0: float | tuple[float, ...]
+    n_edge: float | tuple[float, ...]
+    T0: float | tuple[float, ...]
+    T_edge: float | tuple[float, ...]
     c_density: tuple[float, ...] | None = None
     c_temperature: tuple[float, ...] | None = None
-    density_shape_power: float = 2.0
-    density_shape_alpha: float = 1.0
-    temperature_shape_power: float = 2.0
-    temperature_shape_alpha: float = 1.0
+    density_shape_power: float | tuple[float, ...] = 2.0
+    density_shape_alpha: float | tuple[float, ...] = 1.0
+    temperature_shape_power: float | tuple[float, ...] = 2.0
+    temperature_shape_alpha: float | tuple[float, ...] = 1.0
     n_scale: float | tuple[float, ...] = 1.0
     T_scale: float | tuple[float, ...] = 1.0
     er0_scale: float = 100.0
@@ -57,8 +57,6 @@ class AnalyticalProfileModel(ProfileModel):
 
         r_max = jnp.maximum(field.r_grid[-1], jnp.asarray(1.0e-30, dtype=field.r_grid.dtype))
         x = field.r_grid / r_max
-        density_shape = (1.0 - x ** self.density_shape_power) ** self.density_shape_alpha
-        temperature_shape = (1.0 - x ** self.temperature_shape_power) ** self.temperature_shape_alpha
 
         # User-facing TOML convention:
         #   density inputs in units of 1e20 m^-3
@@ -69,13 +67,10 @@ class AnalyticalProfileModel(ProfileModel):
         base_density = density_scale_physical * ((self.n0-self.n_edge) * density_shape + self.n_edge)
         base_temperature = temperature_scale_physical * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
 
-        charge_qp = None
         electron_index = -1
         if self.charge_qp is not None:
             charge_qp_values = tuple(float(value) for value in self.charge_qp)
-            charge_qp = jnp.asarray(charge_qp_values, dtype=float)
-            if charge_qp.shape[0] >= n_species:
-                charge_qp = charge_qp[:n_species]
+            if len(charge_qp_values) >= n_species:
                 eidx = min(range(n_species), key=lambda idx: charge_qp_values[idx])
                 if charge_qp_values[eidx] < 0.0:
                     electron_index = eidx
@@ -102,6 +97,14 @@ class AnalyticalProfileModel(ProfileModel):
                 f"Got length {len(vals)} for n_species={n_species}."
             )
 
+        n0 = _expand_species_values(self.n0, default=0.0, include_electron=True)
+        n_edge = _expand_species_values(self.n_edge, default=0.0, include_electron=True)
+        T0 = _expand_species_values(self.T0, default=0.0, include_electron=True)
+        T_edge = _expand_species_values(self.T_edge, default=0.0, include_electron=True)
+        density_shape_power = _expand_species_values(self.density_shape_power, default=2.0, include_electron=True)
+        density_shape_alpha = _expand_species_values(self.density_shape_alpha, default=1.0, include_electron=True)
+        temperature_shape_power = _expand_species_values(self.temperature_shape_power, default=2.0, include_electron=True)
+        temperature_shape_alpha = _expand_species_values(self.temperature_shape_alpha, default=1.0, include_electron=True)
         c_density = _expand_species_values(self.c_density, default=1.0, include_electron=False)
         c_temperature = _expand_species_values(self.c_temperature, default=1.0, include_electron=True)
         n_scale = _expand_species_values(self.n_scale, default=1.0, include_electron=False)
@@ -113,8 +116,12 @@ class AnalyticalProfileModel(ProfileModel):
         density = jnp.zeros((n_species, field.r_grid.shape[0]))
 
         for i in range(n_species):
-            temperature = temperature.at[i, :].set(c_temperature[i] * T_scale[i] * base_temperature)
-            density = density.at[i, :].set(c_density[i] * n_scale[i] * base_density)
+            density_shape_i = (1.0 - x ** density_shape_power[i]) ** density_shape_alpha[i]
+            temperature_shape_i = (1.0 - x ** temperature_shape_power[i]) ** temperature_shape_alpha[i]
+            base_density_i = density_scale_physical * ((n0[i] - n_edge[i]) * density_shape_i + n_edge[i])
+            base_temperature_i = temperature_scale_physical * ((T0[i] - T_edge[i]) * temperature_shape_i + T_edge[i])
+            temperature = temperature.at[i, :].set(c_temperature[i] * T_scale[i] * base_temperature_i)
+            density = density.at[i, :].set(c_density[i] * n_scale[i] * base_density_i)
 
         T_edge = temperature[:, -1]
         n_edge = density[:, -1]
