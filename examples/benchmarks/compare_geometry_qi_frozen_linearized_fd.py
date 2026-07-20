@@ -124,6 +124,23 @@ def _tree_dot(left, right):
     return sum(leaves, jnp.asarray(0.0, dtype=jnp.float64))
 
 
+def _tree_l2(tree):
+    leaves = jax.tree.leaves(
+        jax.tree.map(lambda a: jnp.sum(jnp.asarray(a, dtype=jnp.float64) ** 2), tree)
+    )
+    if not leaves:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    return jnp.sqrt(sum(leaves, jnp.asarray(0.0, dtype=jnp.float64)))
+
+
+def _tree_sub(left, right):
+    return jax.tree.map(
+        lambda a, b: jnp.asarray(a, dtype=jnp.float64) - jnp.asarray(b, dtype=jnp.float64),
+        left,
+        right,
+    )
+
+
 def _manual_implicit_pullback(
     *,
     params,
@@ -380,6 +397,24 @@ def main() -> None:
         _objective_value, objective_vjp = jax.vjp(lambda state: _objective(context, args.objective, state), x_star)
         state_bar = objective_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]
         state_dot_tangent = _tree_dot(state_bar, state_tangent)
+        frozen = jax.lax.stop_gradient(x_star)
+        edge_mask = im._edge_mask(cfg)
+        P = im._dof_projector(cfg, dof_mask)
+        F = im.residual_fn(cfg, frozen, dof_mask, formulation=args.formulation)
+        z_star = P(x_star)
+        _, assemble_vjp_z = jax.vjp(
+            lambda z: im._assemble(z, im.runtime_from_params(params0, cfg), frozen, P, edge_mask),
+            z_star,
+        )
+        assembled_rhs = assemble_vjp_z(state_bar)[0]
+        projected_rhs = P(state_bar)
+        rhs_diff_l2 = _tree_l2(_tree_sub(assembled_rhs, projected_rhs))
+        rhs_l2 = _tree_l2(projected_rhs)
+        _, vjp_z = jax.vjp(lambda z: F(z, params0), z_star)
+        builtin_lam, builtin_lam_info = im._adjoint_solve(lambda v: vjp_z(v)[0], projected_rhs, cfg)
+        assembled_lam, assembled_lam_info = im._adjoint_solve(lambda v: vjp_z(v)[0], assembled_rhs, cfg)
+        builtin_res_l2 = _tree_l2(_tree_sub(vjp_z(builtin_lam)[0], projected_rhs))
+        assembled_res_l2 = _tree_l2(_tree_sub(vjp_z(assembled_lam)[0], assembled_rhs))
         param_bar = _manual_implicit_pullback(
             params=params0,
             cfg=cfg,
@@ -404,6 +439,16 @@ def main() -> None:
         state_dot_f = float(jax.device_get(state_dot_tangent))
         reverse_grad_f = float(jax.device_get(reverse_grad))
         builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
+        print(
+            f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
+            f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
+            f"rhs_l2={float(jax.device_get(rhs_l2)):.6e} "
+            f"builtin_adjoint_res_l2={float(jax.device_get(builtin_res_l2)):.6e} "
+            f"assembled_adjoint_res_l2={float(jax.device_get(assembled_res_l2)):.6e} "
+            f"builtin_converged={getattr(builtin_lam_info, 'converged', None)} "
+            f"assembled_converged={getattr(assembled_lam_info, 'converged', None)}",
+            flush=True,
+        )
         print(
             f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
             f"reverse_param_grad={reverse_grad_f:.16e} "

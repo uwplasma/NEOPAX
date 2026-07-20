@@ -64,8 +64,6 @@ class AnalyticalProfileModel(ProfileModel):
         # Internally ProfileSet stores physical density [m^-3] and temperature [eV].
         density_scale_physical = 1.0e20
         temperature_scale_physical = 1.0e3
-        base_density = density_scale_physical * ((self.n0-self.n_edge) * density_shape + self.n_edge)
-        base_temperature = temperature_scale_physical * ((self.T0-self.T_edge) * temperature_shape + self.T_edge)
 
         electron_index = -1
         if self.charge_qp is not None:
@@ -181,10 +179,15 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
     model = str(profile_cfg.get("model", profile_cfg.get("profiles_model", "standard_analytical"))).lower()
 
     if model in ("standard_analytical", "standard analytical", "analytical"):
-        n0 = float(profile_cfg.get("n0", profile_cfg.get("ni0", profile_cfg.get("ne0", 4.21e20))))
-        n_edge = float(profile_cfg.get("n_edge", profile_cfg.get("nib", profile_cfg.get("neb", 0.6e20))))
-        T0 = float(profile_cfg.get("T0", profile_cfg.get("ti0", profile_cfg.get("te0", 17.8e3))))
-        T_edge = float(profile_cfg.get("T_edge", profile_cfg.get("tib", profile_cfg.get("teb", 0.7e3))))
+        def _coerce_scalar_or_tuple(raw):
+            if isinstance(raw, (int, float)):
+                return float(raw)
+            return tuple(float(v) for v in raw)
+
+        n0 = _coerce_scalar_or_tuple(profile_cfg.get("n0", profile_cfg.get("ni0", profile_cfg.get("ne0", 4.21e20))))
+        n_edge = _coerce_scalar_or_tuple(profile_cfg.get("n_edge", profile_cfg.get("nib", profile_cfg.get("neb", 0.6e20))))
+        T0 = _coerce_scalar_or_tuple(profile_cfg.get("T0", profile_cfg.get("ti0", profile_cfg.get("te0", 17.8e3))))
+        T_edge = _coerce_scalar_or_tuple(profile_cfg.get("T_edge", profile_cfg.get("tib", profile_cfg.get("teb", 0.7e3))))
 
         c_density = profile_cfg.get("c_density")
         if c_density is None:
@@ -203,10 +206,10 @@ def build_profiles(profile_cfg: dict[str, Any], field, n_species: int) -> Profil
             c_temperature=None
             if profile_cfg.get("c_temperature") is None
             else tuple(float(v) for v in profile_cfg.get("c_temperature")),
-            density_shape_power=float(profile_cfg.get("density_shape_power", 2.0)),
-            density_shape_alpha=float(profile_cfg.get("density_shape_alpha", 1.0)),
-            temperature_shape_power=float(profile_cfg.get("temperature_shape_power", 2.0)),
-            temperature_shape_alpha=float(profile_cfg.get("temperature_shape_alpha", 1.0)),
+            density_shape_power=_coerce_scalar_or_tuple(profile_cfg.get("density_shape_power", 2.0)),
+            density_shape_alpha=_coerce_scalar_or_tuple(profile_cfg.get("density_shape_alpha", 1.0)),
+            temperature_shape_power=_coerce_scalar_or_tuple(profile_cfg.get("temperature_shape_power", 2.0)),
+            temperature_shape_alpha=_coerce_scalar_or_tuple(profile_cfg.get("temperature_shape_alpha", 1.0)),
             n_scale=(
                 float(profile_cfg.get("n_scale", 1.0))
                 if isinstance(profile_cfg.get("n_scale", 1.0), (int, float))
