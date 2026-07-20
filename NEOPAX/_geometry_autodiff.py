@@ -618,8 +618,38 @@ def _input_with_boundary_delta(context: "GeometryAutodiffContext", param_delta):
     return dataclasses.replace(context.indata, **{field_name: updated})
 
 
-def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", implicit, param_delta):
-    params = implicit.params_from_input(context.indata)
+def _implicit_params_from_input(context: "GeometryAutodiffContext", implicit, solver_device: str | None = None):
+    device_key = "auto" if solver_device is None else str(solver_device).strip().lower()
+    if device_key in {"", "auto", "vmex"}:
+        return implicit.params_from_input(context.indata)
+
+    def _arr(value):
+        raw = np.asarray(value, dtype=np.float64)
+        if device_key in {"default", "jax"}:
+            return jnp.asarray(raw)
+        if device_key in {"cpu", "gpu", "cuda", "rocm", "tpu"}:
+            platform = "gpu" if device_key in {"gpu", "cuda", "rocm"} else device_key
+            return jax.device_put(raw, jax.devices(platform)[0])
+        raise ValueError(
+            "implicit solver device must be one of 'default', 'auto', 'cpu', or 'gpu'."
+        )
+
+    return implicit.ImplicitParams(
+        rbc=_arr(context.indata.rbc),
+        rbs=_arr(context.indata.rbs),
+        zbc=_arr(context.indata.zbc),
+        zbs=_arr(context.indata.zbs),
+        phiedge=_arr(context.indata.phiedge),
+        pres_scale=_arr(context.indata.pres_scale),
+        curtor=_arr(context.indata.curtor),
+        am=_arr(context.indata.am),
+        ai=_arr(context.indata.ai),
+        ac=_arr(context.indata.ac),
+    )
+
+
+def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", implicit, param_delta, *, solver_device: str | None = None):
+    params = _implicit_params_from_input(context, implicit, solver_device=solver_device)
     field_name = _input_boundary_array_name_for_kind(context.boundary_kind)
     base = jnp.asarray(getattr(params, field_name), dtype=jnp.float64)
     n_offset = int(context.static.resolution.ntor) + int(context.param_n)
@@ -686,8 +716,10 @@ def _implicit_params_with_boundary_deltas(
     implicit,
     param_deltas,
     param_entries: Sequence[dict[str, Any]],
+    *,
+    solver_device: str | None = None,
 ):
-    params = implicit.params_from_input(context.indata)
+    params = _implicit_params_from_input(context, implicit, solver_device=solver_device)
     updates: dict[str, Any] = {}
     deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
     for i, entry in enumerate(param_entries):
@@ -705,9 +737,16 @@ def _current_implicit_params_cfg_for_param_vector(
     param_entries: Sequence[dict[str, Any]],
     *,
     max_iter: int | None = None,
+    solver_device: str | None = None,
 ):
     implicit = _import_vmec_jax_implicit()
-    params = _implicit_params_with_boundary_deltas(context, implicit, param_deltas, param_entries)
+    params = _implicit_params_with_boundary_deltas(
+        context,
+        implicit,
+        param_deltas,
+        param_entries,
+        solver_device=solver_device,
+    )
     config_kwargs = {
         "ns": int(context.static.resolution.ns),
         "mode": "cli",
@@ -1121,6 +1160,7 @@ def _solve_state_for_single_param(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    solver_device: str | None = None,
 ) -> Any:
     vmec_jax = _import_vmec_jax()
     if _using_current_vmec_jax_context(context):
@@ -1146,7 +1186,12 @@ def _solve_state_for_single_param(
 
         del jacobian_penalty
         implicit = _import_vmec_jax_implicit()
-        params = _implicit_params_with_boundary_delta(context, implicit, param_delta)
+        params = _implicit_params_with_boundary_delta(
+            context,
+            implicit,
+            param_delta,
+            solver_device=solver_device,
+        )
         config_kwargs = {
             "ns": int(context.static.resolution.ns),
             "mode": "cli",
@@ -1225,6 +1270,7 @@ def _solve_state_for_param_vector(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    solver_device: str | None = None,
 ) -> Any:
     param_entries = boundary_param_entries(context, param_specs)
     vmec_jax = _import_vmec_jax()
@@ -1248,7 +1294,13 @@ def _solve_state_for_param_vector(
 
         del jacobian_penalty
         implicit = _import_vmec_jax_implicit()
-        params = _implicit_params_with_boundary_deltas(context, implicit, param_deltas, param_entries)
+        params = _implicit_params_with_boundary_deltas(
+            context,
+            implicit,
+            param_deltas,
+            param_entries,
+            solver_device=solver_device,
+        )
         config_kwargs = {
             "ns": int(context.static.resolution.ns),
             "mode": "cli",
@@ -2926,6 +2978,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
     final_vmec_pullback_mode: str = "vmap",
+    solver_device: str | None = None,
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return geometry objective values and W @ d(objectives)/d(params).
 
@@ -2983,6 +3036,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             max_iter=max_iter,
             step_size=step_size,
             jacobian_penalty=jacobian_penalty,
+            solver_device=solver_device,
         )
 
     state, state_pullback = jax.vjp(solve_state, param_deltas)
@@ -3155,6 +3209,7 @@ def geometry_observable_multi_rhs_pullback_from_param_vector(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    solver_device: str | None = None,
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return objective values and a multi-RHS reverse table for geometry params."""
     param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
@@ -3177,6 +3232,7 @@ def geometry_observable_multi_rhs_pullback_from_param_vector(
             max_iter=max_iter,
             step_size=step_size,
             jacobian_penalty=jacobian_penalty,
+            solver_device=solver_device,
         )
         items = _observable_items_from_state(context, state, observable_kind=observable_kind)
         observables = {name: jnp.asarray(value, dtype=jnp.float64).reshape(()) for name, value in items}

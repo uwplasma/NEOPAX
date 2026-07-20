@@ -335,6 +335,7 @@ def _custom_vjp_reverse_table(
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
             final_vmec_pullback_mode=args.final_vmec_pullback_mode,
+            solver_device=args.implicit_solver_device,
         )
     return geometry_observable_multi_rhs_pullback_from_param_vector(
         context,
@@ -346,6 +347,7 @@ def _custom_vjp_reverse_table(
         lane="ad",
         max_iter=resolved_max_iter,
         step_size=resolved_step_size,
+        solver_device=args.implicit_solver_device,
     )
 
 
@@ -528,6 +530,17 @@ def main() -> None:
         help="Device used by the exact accepted-point forward/reverse callbacks. Default: cpu.",
     )
     parser.add_argument(
+        "--implicit-solver-device",
+        type=str,
+        default="default",
+        choices=("default", "auto", "cpu", "gpu"),
+        help=(
+            "Device placement for VMEX implicit AD parameters in the objective-table benchmark. "
+            "'default' preserves old vmec_jax behavior by leaving placement to JAX; "
+            "'auto' uses VMEX's current default policy."
+        ),
+    )
+    parser.add_argument(
         "--with-five-point",
         action="store_true",
         help="Also compute a five-point stencil FD estimate.",
@@ -589,7 +602,8 @@ def _run_multi_parameter_implicit(args, *, param_specs: tuple[tuple[str, int, in
         f"step_size={resolved_step_size:.6e} mboz={args.mboz} nboz={args.nboz} "
         f"surfaces={','.join(f'{value:.3f}' for value in context.surface_s)} "
         f"reverse_derivative_mode={args.reverse_derivative_mode} "
-        f"reverse_objective_block_size={args.reverse_objective_block_size}",
+        f"reverse_objective_block_size={args.reverse_objective_block_size} "
+        f"implicit_solver_device={args.implicit_solver_device}",
         flush=True,
     )
 
