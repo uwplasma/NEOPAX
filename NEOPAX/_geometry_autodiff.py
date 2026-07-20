@@ -275,6 +275,152 @@ def _neopax_vmex_booz_xform_inputs_from_state(*, state, static) -> SimpleNamespa
     )
 
 
+def _neopax_vmex_boozer_table_inputs_from_state(*, state, static) -> SimpleNamespace:
+    """Batched current-VMEX version of ``vmex.core.boozer_tables.boozer_input_tables``."""
+    rt = static.runtime
+    setup = rt.setup
+    lasym = bool(getattr(setup, "lasym", rt.resolution.lasym))
+    if lasym:
+        raise NotImplementedError("NEOPAX current-VMEX Boozer table AD input builder supports lasym=False only.")
+
+    solver_module = _import_vmec_module("core.solver")
+    geometry_module = _import_vmec_module("core.geometry")
+    fields_module = _import_vmec_module("core.fields")
+
+    nfp = int(rt.resolution.nfp)
+    s = jnp.asarray(setup.s_full)
+    ns = int(s.shape[0])
+    rows_np = np.arange(1, ns, dtype=np.int32)
+    rows = jnp.asarray(rows_np, dtype=jnp.int32)
+    sqrt_s = jnp.sqrt(s)
+    s_half = 0.5 * (s[rows] + s[rows - 1])
+
+    _, geometry = solver_module._geometry(state, rt)
+    jacobian = geometry_module.half_mesh_jacobian(geometry, s=s)
+    metrics = fields_module.metric_elements(geometry, s=s)
+    fields = fields_module.magnetic_fields(
+        geometry=geometry,
+        jacobian=jacobian,
+        metrics=metrics,
+        trig=rt.trig,
+        s=s,
+        phips=setup.phips,
+        phipf=setup.phipf,
+        chips=setup.chips,
+        signgs=setup.signgs,
+        gamma=rt.gamma,
+        mass=setup.mass,
+        ncurr=setup.ncurr,
+        enclosed_current=setup.icurv,
+    )
+
+    ntheta2 = int(np.shape(fields.total_pressure)[1])
+    nzeta = int(np.shape(fields.total_pressure)[2])
+    ntheta1 = max(2 * (ntheta2 - 1), 1)
+    i_full = np.arange(ntheta1)
+    kk = np.arange(nzeta)
+    i_src = np.where(i_full < ntheta2, i_full, ntheta1 - i_full)
+    k_src = np.where(i_full[:, None] < ntheta2, kk[None, :], (nzeta - kk[None, :]) % nzeta)
+    i_src2 = np.broadcast_to(i_src[:, None], (ntheta1, nzeta))
+    sign_odd = jnp.asarray(np.where(i_full < ntheta2, 1.0, -1.0)[:, None])
+
+    def mirror(values, parity):
+        out = jnp.asarray(values)[:, i_src2, k_src]
+        return out if parity == "even" else out * sign_odd[None, :, :]
+
+    theta = 2.0 * np.pi * np.arange(ntheta1) / ntheta1
+    zeta = 2.0 * np.pi * np.arange(nzeta) / (nfp * nzeta)
+    m_max = ntheta1 // 2 - 1
+    n_max = max(nzeta // 2 - 1, 0)
+    ml: list[int] = []
+    nl: list[int] = []
+    for m_value in range(0, m_max + 1):
+        for n_value in range(-n_max, n_max + 1):
+            if m_value == 0 and n_value < 0:
+                continue
+            ml.append(m_value)
+            nl.append(n_value * nfp)
+    xm = np.asarray(ml, dtype=np.int32)
+    xn = np.asarray(nl, dtype=np.int32)
+    angle = theta[:, None, None] * xm[None, None, :] - zeta[None, :, None] * xn[None, None, :]
+    cos_t = jnp.asarray(np.cos(angle))
+    sin_t = jnp.asarray(np.sin(angle))
+    weights = 2.0 / (ntheta1 * nzeta) * np.ones(xm.shape, dtype=np.float64)
+    weights[(xm == 0) & (xn == 0)] = 1.0 / (ntheta1 * nzeta)
+    weights_j = jnp.asarray(weights)
+
+    def project(values, parity):
+        basis = cos_t if parity == "even" else sin_t
+        return weights_j[None, :] * jnp.einsum("rtz,tzm->rm", values, basis)
+
+    pressure = jnp.asarray(fields.pressure)
+    bsq2 = 2.0 * (jnp.asarray(fields.total_pressure)[rows] - pressure[rows, None, None])
+    tiny = jnp.asarray(jnp.finfo(pressure.dtype).tiny, dtype=pressure.dtype)
+    bmnc = project(mirror(jnp.sqrt(jnp.maximum(bsq2, tiny)), "even"), "even")
+    bsubumnc = project(mirror(jnp.asarray(fields.bsubu)[rows], "even"), "even")
+    bsubvmnc = project(mirror(jnp.asarray(fields.bsubv)[rows], "even"), "even")
+
+    def phys_rows(even, odd, row_indices):
+        return jnp.asarray(even)[row_indices] + sqrt_s[row_indices, None, None] * jnp.asarray(odd)[row_indices]
+
+    def spectral_half(even, odd, parity):
+        lo = project(mirror(phys_rows(even, odd, rows - 1), parity), parity)
+        hi = project(mirror(phys_rows(even, odd, rows), parity), parity)
+        m_even = jnp.asarray((xm % 2) == 0)
+        interp_even = 0.5 * (lo + hi)
+        interp_odd = (
+            0.5
+            * (lo / jnp.maximum(sqrt_s[rows - 1, None], 1.0e-30) + hi / sqrt_s[rows, None])
+            * jnp.sqrt(s_half)[:, None]
+        )
+        return jnp.where(m_even[None, :], interp_even, interp_odd)
+
+    rmnc = spectral_half(geometry.R_even, geometry.R_odd, "even")
+    zmns = spectral_half(geometry.Z_even, geometry.Z_odd, "odd")
+
+    lamscale = jnp.asarray(fields.lamscale)
+
+    def half_native(even, odd):
+        lo = phys_rows(even, odd, rows - 1)
+        hi = phys_rows(even, odd, rows)
+        return 0.5 * (lo + hi) * lamscale
+
+    lth = project(mirror(half_native(geometry.dlambda_dtheta_even, geometry.dlambda_dtheta_odd), "even"), "even")
+    lze = project(mirror(half_native(geometry.dlambda_dzeta_even, geometry.dlambda_dzeta_odd), "even"), "even")
+    m_safe = jnp.asarray(np.where(xm != 0, xm, 1), dtype=jnp.float64)
+    n_safe = jnp.asarray(np.where(xn != 0, xn, 1), dtype=jnp.float64)
+    phips_rows = jnp.asarray(setup.phips)[rows]
+    lmns = (
+        jnp.where(
+            jnp.asarray(xm != 0)[None, :],
+            lth / m_safe[None, :],
+            jnp.where(jnp.asarray(xn != 0)[None, :], -lze / n_safe[None, :], 0.0),
+        )
+        / phips_rows[:, None]
+    )
+
+    iota = jnp.where(
+        jnp.asarray(int(setup.ncurr) == 1),
+        jnp.asarray(fields.chips)[rows] / jnp.asarray(setup.phips)[rows],
+        jnp.asarray(setup.iotas)[rows],
+    )
+
+    return SimpleNamespace(
+        nfp=jnp.asarray(nfp, dtype=jnp.int32),
+        xm=jnp.asarray(xm, dtype=jnp.int32),
+        xn=jnp.asarray(xn, dtype=jnp.int32),
+        xm_nyq=jnp.asarray(xm, dtype=jnp.int32),
+        xn_nyq=jnp.asarray(xn, dtype=jnp.int32),
+        rmnc=rmnc,
+        zmns=zmns,
+        lmns=lmns,
+        bmnc=bmnc,
+        bsubumnc=bsubumnc,
+        bsubvmnc=bsubvmnc,
+        iota=iota,
+    )
+
+
 def _booz_xform_inputs_from_state(
     *,
     state,
@@ -299,7 +445,10 @@ def _booz_xform_inputs_from_state(
         )
     except (AttributeError, ModuleNotFoundError):
         if isinstance(static, _VmecStaticCompat):
-            return _neopax_vmex_booz_xform_inputs_from_state(state=state, static=static)
+            try:
+                return _neopax_vmex_boozer_table_inputs_from_state(state=state, static=static)
+            except (AttributeError, ModuleNotFoundError):
+                return _neopax_vmex_booz_xform_inputs_from_state(state=state, static=static)
 
         raise
 
