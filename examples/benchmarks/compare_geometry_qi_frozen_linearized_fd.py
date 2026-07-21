@@ -534,6 +534,21 @@ def main() -> None:
             dtype=jnp.float64,
         )[0, row, col]
         block_reverse_grad_f = None
+        raw_block_reverse_grad_f = None
+        if hasattr(im, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+            raw_block_param_bar = im.implicit_state_pullback_multi_rhs_raw_block_transpose(
+                params0,
+                cfg,
+                x_star,
+                dof_mask,
+                jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), state_bar),
+                probe_chunk_size=max(1, int(args.block_transpose_probe_chunk_size)),
+            )
+            raw_block_reverse_grad = jnp.asarray(
+                getattr(raw_block_param_bar, field_name),
+                dtype=jnp.float64,
+            )[0, row, col]
+            raw_block_reverse_grad_f = float(jax.device_get(raw_block_reverse_grad))
         if hasattr(im, "implicit_state_pullback_multi_rhs_block_transpose_init"):
             block_param_bar = im.implicit_state_pullback_multi_rhs_block_transpose_init(
                 params0,
@@ -564,6 +579,13 @@ def main() -> None:
                 f" rel_err_block_transpose_init_reverse_vs_jvp="
                 f"{_relative_error(block_reverse_grad_f, jvp_f):.6e}"
             )
+        raw_block_text = ""
+        if raw_block_reverse_grad_f is not None:
+            raw_block_text = (
+                f" raw_block_transpose_reverse_param_grad={raw_block_reverse_grad_f:.16e}"
+                f" rel_err_raw_block_transpose_reverse_vs_jvp="
+                f"{_relative_error(raw_block_reverse_grad_f, jvp_f):.6e}"
+            )
         print(
             f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
             f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
@@ -581,7 +603,7 @@ def main() -> None:
             f"reverse_param_grad={reverse_grad_f:.16e} "
             f"jax_scipy_reverse_param_grad={scipy_reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
-            f"{block_text} "
+            f"{raw_block_text}{block_text} "
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_jax_scipy_reverse_vs_jvp={_relative_error(scipy_reverse_grad_f, jvp_f):.6e} "
