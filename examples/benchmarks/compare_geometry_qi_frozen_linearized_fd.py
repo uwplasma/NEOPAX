@@ -375,6 +375,12 @@ def main() -> None:
     )
     forward_cfg = dataclasses.replace(cfg, adjoint_maxiter=int(args.forward_linear_maxiter))
     params0 = _implicit_params_from_input_for_script(inp, solver_device=args.implicit_solver_device)
+    # VMEX runtime_from_params expects the p-independent template runtime to be
+    # a host-built closure constant.  Prewarm both configs so JIT tracing never
+    # enters setup.run_setup's discrete host logic.
+    if hasattr(im, "_template_runtime"):
+        im._template_runtime(cfg)
+        im._template_runtime(forward_cfg)
     row, col = _param_index(inp, family, m, n)
     base_value = _param_value(params0, family, row, col)
     h = _fd_step(base_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
