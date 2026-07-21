@@ -2977,7 +2977,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
-    final_vmec_pullback_mode: str = "vmap",
+    final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = None,
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return geometry objective values and W @ d(objectives)/d(params).
@@ -3026,6 +3026,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         phase_start = now
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()
+    param_entries = boundary_param_entries(context, param_specs)
 
     def solve_state(theta):
         return _solve_state_for_param_vector(
@@ -3039,8 +3040,21 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             solver_device=solver_device,
         )
 
-    state, state_pullback = jax.vjp(solve_state, param_deltas)
-    _progress("vmec implicit state/vjp ready", state)
+    if final_mode == "raw_block_transpose":
+        if str(lane).strip().lower() != "ad" or not _using_current_vmec_jax_context(context):
+            raise ValueError("raw_block_transpose final VMEC pullback requires the current VMEX implicit AD lane.")
+        implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
+            context,
+            param_deltas,
+            param_entries,
+            max_iter=max_iter,
+            solver_device=solver_device,
+        )
+        state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+        _progress("vmec implicit state/raw-block aux ready", state)
+    else:
+        state, state_pullback = jax.vjp(solve_state, param_deltas)
+        _progress("vmec implicit state/vjp ready", state)
     booz_api = _import_booz_xform_jax_api()
     use_selected_boozer_inputs = _using_current_vmec_jax_context(context) and isinstance(context.static, _VmecStaticCompat)
     if use_selected_boozer_inputs:
@@ -3187,12 +3201,28 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
-    if final_mode in {"lax_map", "sequential"}:
+    if final_mode == "raw_block_transpose":
+        if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+            raise AttributeError(
+                "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
+            )
+        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+            implicit_params,
+            implicit_cfg,
+            state,
+            dof_mask,
+            state_bar,
+            probe_chunk_size=1,
+        )
+        gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
+    elif final_mode in {"lax_map", "sequential"}:
         gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
     elif final_mode == "vmap":
         gradient_matrix = jax.vmap(lambda state_cotangent: state_pullback(state_cotangent)[0])(state_bar)
     else:
-        raise ValueError("final_vmec_pullback_mode must be 'vmap', 'lax_map', or 'sequential'.")
+        raise ValueError(
+            "final_vmec_pullback_mode must be 'raw_block_transpose', 'vmap', 'lax_map', or 'sequential'."
+        )
     _progress("final vmec parameter pullback ready", gradient_matrix)
     return values_by_name, gradient_matrix
 
