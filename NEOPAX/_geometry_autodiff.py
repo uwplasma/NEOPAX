@@ -3707,7 +3707,7 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
         return _surface_zero_mode_value(surface, "b_sub_zeta_cos")
 
     rho_arr = jnp.asarray(rho, dtype=jnp.float64)
-    psia_value = float(jnp.asarray(psia))
+    psia_value = jnp.asarray(psia, dtype=jnp.float64)
     r00_arr = jnp.asarray(r00, dtype=jnp.float64)
     b00 = jnp.asarray([_surface_b00(surface) for surface in surfaces])
     boozer_i = jnp.asarray([_surface_boozer_i(surface) for surface in surfaces])
@@ -3729,7 +3729,7 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
-        a_b=float(a_b),
+        a_b=a_b,
         psia=psia_value,
         b00=b00,
         r00=r00_arr,
@@ -4182,13 +4182,35 @@ def build_ntx_exact_lij_support_from_vmec_state(
     # NEOPAX geometry stores the full toroidal flux, while the NTX exact-Lij
     # runtime support matches the file-backed NTX convention with psi_p / 2*pi.
     ntx_psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
+    static_phipf = jnp.asarray(context.flux.phipf, dtype=jnp.float64)
+    static_s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+    static_phi = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=static_phipf.dtype),
+            jnp.cumsum(static_phipf[1:] * (static_s_full[1:] - static_s_full[:-1])),
+        ],
+        axis=0,
+    )
+    static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
     r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
     r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
-    center_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_center, dtype=float))
-    face_s_values = tuple(float(rho_value**2) for rho_value in np.asarray(rho_face, dtype=float))
+    rho_center_sample = np.linspace(0.0, 1.0, int(rho_center.shape[0]), dtype=float)
+    if int(rho_face.shape[0]) > 1:
+        rho_face_sample = np.concatenate(
+            [
+                np.asarray([0.0], dtype=float),
+                0.5 * (rho_center_sample[:-1] + rho_center_sample[1:]),
+                np.asarray([1.0], dtype=float),
+            ],
+            axis=0,
+        )
+    else:
+        rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
+    center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_sample)
+    face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_sample)
 
     def _positive_transport_s_values(rho_values):
         rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
@@ -4200,8 +4222,8 @@ def build_ntx_exact_lij_support_from_vmec_state(
 
     surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
-        center_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_center))
-        face_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_face))
+        center_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_center_sample))
+        face_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_face_sample))
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
@@ -4211,7 +4233,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             s_values=center_s_values,
             mboz=int(context.mboz),
             nboz=int(context.nboz),
-            psi_p=float(ntx_psia),
+            psi_p=static_ntx_psia,
         )
         face_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
@@ -4221,7 +4243,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             s_values=face_s_values,
             mboz=int(context.mboz),
             nboz=int(context.nboz),
-            psi_p=float(ntx_psia),
+            psi_p=static_ntx_psia,
         )
     else:
         raise ValueError(
