@@ -78,21 +78,24 @@ class AnalyticalProfileModel(ProfileModel):
                 return jnp.asarray([default] * n_species, dtype=float)
             if isinstance(raw, (int, float)):
                 return jnp.asarray([float(raw)] * n_species, dtype=float)
-            vals = [float(v) for v in raw]
-            if len(vals) == n_species:
-                return jnp.asarray(vals, dtype=float)
-            if (not include_electron) and electron_index >= 0 and len(vals) == (n_species - 1):
-                out = [1.0] * n_species
+            arr = jnp.asarray(raw, dtype=float)
+            if arr.ndim == 0:
+                return jnp.broadcast_to(arr, (n_species,))
+            vals_len = int(arr.shape[0])
+            if vals_len == n_species:
+                return arr
+            if (not include_electron) and electron_index >= 0 and vals_len == (n_species - 1):
+                out = jnp.ones((n_species,), dtype=arr.dtype)
                 k = 0
                 for i in range(n_species):
                     if i == electron_index:
                         continue
-                    out[i] = vals[k]
+                    out = out.at[i].set(arr[k])
                     k += 1
-                return jnp.asarray(out, dtype=float)
+                return out
             raise ValueError(
                 "Species-resolved array length must be n_species, or n_species-1 when electron is omitted. "
-                f"Got length {len(vals)} for n_species={n_species}."
+                f"Got length {vals_len} for n_species={n_species}."
             )
 
         n0 = _expand_species_values(self.n0, default=0.0, include_electron=True)
