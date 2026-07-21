@@ -3713,20 +3713,25 @@ def _build_ntx_runtime_channels_from_surfaces(surfaces, *, rho, a_b, psia, r00):
     boozer_i = jnp.asarray([_surface_boozer_i(surface) for surface in surfaces])
     boozer_g = jnp.asarray([_surface_boozer_g(surface) for surface in surfaces])
     iota = jnp.asarray([jnp.asarray(surface.iota, dtype=jnp.float64) for surface in surfaces])
-    drds = jnp.where(rho_arr > 0.0, jnp.asarray(a_b, dtype=jnp.float64) / (2.0 * rho_arr), 0.0)
-    dpsi_drtilde = rho_arr * jnp.asarray(a_b, dtype=jnp.float64) * b00
+    a_b_value = jnp.asarray(a_b, dtype=jnp.float64)
+    rho_positive = rho_arr > 0.0
+    rho_safe = jnp.where(rho_positive, rho_arr, 1.0)
+    drds = jnp.where(rho_positive, a_b_value / (2.0 * rho_safe), 0.0)
+    dpsi_drtilde = rho_arr * a_b_value * b00
     dr_tildedr = 2.0 * psia_value / (jnp.asarray(a_b, dtype=jnp.float64) ** 2 * b00)
     dr_tildeds = dr_tildedr * drds
     denom = boozer_g + iota * boozer_i
     fac_reference_to_sfincs_11 = 8.0 * denom * b00 * psia_value**2 / (jnp.sqrt(jnp.pi) * boozer_g**2)
     fac_reference_to_sfincs_31 = 4.0 * b00 * psia_value / (jnp.sqrt(jnp.pi) * boozer_g)
     fac_reference_to_sfincs_33 = -2.0 * b00 / (denom * jnp.sqrt(jnp.pi))
-    fac_sfincs_to_dkes_11 = 1.0 / (8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * jnp.sqrt(jnp.pi)))
-    fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsi_drtilde / (boozer_g * jnp.sqrt(jnp.pi)))
-    fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00 / (denom * jnp.sqrt(jnp.pi)))
-    epsilon_t = rho_arr * jnp.asarray(a_b, dtype=jnp.float64) / r00_arr
+    fac_sfincs_to_dkes_11 = _safe_reciprocal(
+        8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * jnp.sqrt(jnp.pi))
+    )
+    fac_sfincs_to_dkes_31 = _safe_reciprocal(4.0 * dpsi_drtilde / (boozer_g * jnp.sqrt(jnp.pi)))
+    fac_sfincs_to_dkes_33 = _safe_reciprocal(-2.0 * b00 / (denom * jnp.sqrt(jnp.pi)))
+    epsilon_t = _safe_divide(rho_arr * a_b_value, r00_arr)
     fac_dkes_to_d11star = -(8.0 / jnp.pi) * iota * r00_arr
-    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
+    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(jnp.maximum(epsilon_t, 0.0)) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
         a_b=a_b,
@@ -3768,7 +3773,9 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
     boozer_i = _interp_geometry_field("I_value")
     boozer_g = _interp_geometry_field("G_value")
     iota = _interp_geometry_field("iota")
-    drds = jnp.where(rho_arr > 0.0, a_b / (2.0 * rho_arr), 0.0)
+    rho_positive = rho_arr > 0.0
+    rho_safe = jnp.where(rho_positive, rho_arr, 1.0)
+    drds = jnp.where(rho_positive, a_b / (2.0 * rho_safe), 0.0)
     dpsi_drtilde = rho_arr * a_b * b00
     dr_tildedr = 2.0 * psia_value / (a_b**2 * b00)
     dr_tildeds = dr_tildedr * drds
@@ -3777,12 +3784,14 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
     fac_reference_to_sfincs_11 = 8.0 * denom * b00 * psia_value**2 / (sqrt_pi * boozer_g**2)
     fac_reference_to_sfincs_31 = 4.0 * b00 * psia_value / (sqrt_pi * boozer_g)
     fac_reference_to_sfincs_33 = -2.0 * b00 / (denom * sqrt_pi)
-    fac_sfincs_to_dkes_11 = 1.0 / (8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * sqrt_pi))
-    fac_sfincs_to_dkes_31 = 1.0 / (4.0 * dpsi_drtilde / (boozer_g * sqrt_pi))
-    fac_sfincs_to_dkes_33 = 1.0 / (-2.0 * b00 / (denom * sqrt_pi))
-    epsilon_t = rho_arr * a_b / r00_arr
+    fac_sfincs_to_dkes_11 = _safe_reciprocal(
+        8.0 * denom * dpsi_drtilde**2 / (boozer_g**2 * b00 * sqrt_pi)
+    )
+    fac_sfincs_to_dkes_31 = _safe_reciprocal(4.0 * dpsi_drtilde / (boozer_g * sqrt_pi))
+    fac_sfincs_to_dkes_33 = _safe_reciprocal(-2.0 * b00 / (denom * sqrt_pi))
+    epsilon_t = _safe_divide(rho_arr * a_b, r00_arr)
     fac_dkes_to_d11star = -(8.0 / jnp.pi) * iota * r00_arr
-    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
+    fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(jnp.maximum(epsilon_t, 0.0)) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
         a_b=a_b,
@@ -4407,6 +4416,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     surface_backend: str = "booz",
     max_iter: int | None = None,
     solver_device: str | None = None,
+    progress_label: str | None = None,
 ) -> jnp.ndarray:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -4436,64 +4446,128 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
     state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
 
-    def payload_from_state(state_inner):
-        if combined_payload:
-            return build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                context,
-                state_inner,
-                n_r=n_r,
-                n_theta=n_theta,
-                n_zeta=n_zeta,
-                n_xi=n_xi,
-                surface_backend=surface_backend,
-            )
-        geometry = _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)
+    def geometry_from_state(state_inner):
+        return _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)
+
+    def ntx_support_from_state(state_inner):
+        geometry_inner = geometry_from_state(state_inner)
         return build_ntx_exact_lij_support_from_vmec_state(
             context,
             state_inner,
-            geometry,
+            geometry_inner,
             n_theta=int(n_theta),
             n_zeta=int(n_zeta),
             n_xi=int(n_xi),
             surface_backend=str(surface_backend),
         )
 
-    payload_template = payload_from_state(state)
-    payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
-    float_leaf_indices = tuple(
-        leaf_i
-        for leaf_i, leaf in enumerate(payload_template_leaves)
-        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-    )
-    if not float_leaf_indices:
-        raise ValueError("payload pullback found no floating leaves to differentiate.")
+    zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
 
-    def payload_float_leaves_from_state(state_inner):
-        leaves = jax.tree_util.tree_leaves(payload_from_state(state_inner))
-        return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in float_leaf_indices)
-
-    _payload_float_baseline, payload_float_pullback = jax.vjp(payload_float_leaves_from_state, state)
-    payload_bar_leaves_by_objective = tuple(jax.tree_util.tree_leaves(payload_bar) for payload_bar in payload_bars)
-    batched_payload_float_bars = tuple(
-        jnp.stack(
-            [
-                jnp.asarray(
-                    payload_bar_leaves_by_objective[objective_i][leaf_i],
-                    dtype=jnp.asarray(payload_template_leaves[leaf_i]).dtype,
-                )
-                for objective_i in range(len(payload_bars))
-            ],
-            axis=0,
+    def _zero_state_bar_batch():
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(leaf[None, ...], (len(payload_bars),) + leaf.shape),
+            zero_like_state,
         )
-        for leaf_i in float_leaf_indices
-    )
-    def _single_state_bar_from_payload_bars(payload_bar_leaves):
-        return payload_float_pullback(tuple(payload_bar_leaves))[0]
 
-    state_bar_batch = jax.lax.map(
-        _single_state_bar_from_payload_bars,
-        batched_payload_float_bars,
-    )
+    def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
+        payload_template = payload_fn(state)
+        payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
+        float_leaf_indices = tuple(
+            leaf_i
+            for leaf_i, leaf in enumerate(payload_template_leaves)
+            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        )
+        payload_bar_leaves_by_objective = tuple(
+            jax.tree_util.tree_leaves(payload_bar) for payload_bar in branch_bars
+        )
+        active_float_leaf_indices = []
+        for leaf_i in float_leaf_indices:
+            leaf_has_bar = False
+            for objective_i in range(len(branch_bars)):
+                bar_leaf = payload_bar_leaves_by_objective[objective_i][leaf_i]
+                bar_arr = jnp.asarray(bar_leaf)
+                is_active = np.any(
+                    np.asarray(
+                        jax.device_get(
+                            jnp.logical_and(jnp.isfinite(bar_arr), jnp.abs(bar_arr) > 0.0)
+                        )
+                    )
+                )
+                has_nonfinite = np.any(np.asarray(jax.device_get(~jnp.isfinite(bar_arr))))
+                if bool(has_nonfinite):
+                    raise FloatingPointError(
+                        f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
+                        "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
+                    )
+                if bool(is_active):
+                    leaf_has_bar = True
+                    break
+            if leaf_has_bar:
+                active_float_leaf_indices.append(leaf_i)
+        active_float_leaf_indices = tuple(active_float_leaf_indices)
+        if progress_label is not None:
+            print(
+                f"{progress_label} {branch_name}_active_float_leaves={len(active_float_leaf_indices)}",
+                flush=True,
+            )
+        if not active_float_leaf_indices:
+            return _zero_state_bar_batch()
+
+        def payload_float_leaves_from_state(state_inner):
+            leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
+            return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in active_float_leaf_indices)
+
+        _payload_float_baseline, payload_float_pullback = jax.vjp(
+            payload_float_leaves_from_state,
+            state,
+        )
+        del _payload_float_baseline
+        batched_payload_float_bars = tuple(
+            jnp.stack(
+                [
+                    jnp.asarray(
+                        payload_bar_leaves_by_objective[objective_i][leaf_i],
+                        dtype=jnp.asarray(payload_template_leaves[leaf_i]).dtype,
+                    )
+                    for objective_i in range(len(branch_bars))
+                ],
+                axis=0,
+            )
+            for leaf_i in active_float_leaf_indices
+        )
+
+        def _single_state_bar_from_payload_bars(payload_bar_leaves):
+            return payload_float_pullback(tuple(payload_bar_leaves))[0]
+
+        return jax.lax.map(
+            _single_state_bar_from_payload_bars,
+            batched_payload_float_bars,
+        )
+
+    if combined_payload:
+        geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
+        support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+        geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
+            "geometry",
+            geometry_from_state,
+            geometry_bars,
+        )
+        support_state_bar_batch = _state_bar_batch_from_payload_branch(
+            "ntx_support",
+            ntx_support_from_state,
+            support_bars,
+        )
+        state_bar_batch = jax.tree_util.tree_map(
+            lambda geometry_bar, support_bar: geometry_bar + support_bar,
+            geometry_state_bar_batch,
+            support_state_bar_batch,
+        )
+    else:
+        state_bar_batch = _state_bar_batch_from_payload_branch(
+            "ntx_support",
+            ntx_support_from_state,
+            tuple(payload_bars),
+        )
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,

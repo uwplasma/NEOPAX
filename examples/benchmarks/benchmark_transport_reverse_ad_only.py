@@ -218,6 +218,86 @@ def _payload_leaf_summary(payload) -> dict[str, Any]:
     }
 
 
+def _tree_path_label(path) -> str:
+    parts: list[str] = []
+    for entry in path:
+        key = getattr(entry, "key", None)
+        name = getattr(entry, "name", None)
+        idx = getattr(entry, "idx", None)
+        if key is not None:
+            parts.append(str(key))
+        elif name is not None:
+            parts.append(str(name))
+        elif idx is not None:
+            parts.append(str(idx))
+        else:
+            parts.append(str(entry))
+    return ".".join(parts) if parts else "<root>"
+
+
+def _payload_nonfinite_leaf_summaries(payload, *, limit: int = 8) -> list[dict[str, Any]]:
+    entries = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(payload)[0]:
+        if not hasattr(leaf, "shape"):
+            continue
+        arr_jax = jnp.asarray(leaf)
+        if not jnp.issubdtype(arr_jax.dtype, jnp.inexact):
+            continue
+        arr = np.asarray(jax.device_get(arr_jax))
+        finite = np.isfinite(arr)
+        if bool(np.all(finite)):
+            continue
+        finite_values = arr[finite]
+        first_index = [int(i) for i in np.argwhere(~finite)[0].tolist()]
+        entries.append(
+            {
+                "path": _tree_path_label(path),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "nan_count": int(np.isnan(arr).sum()),
+                "posinf_count": int(np.isposinf(arr).sum()),
+                "neginf_count": int(np.isneginf(arr).sum()),
+                "finite_min": None if finite_values.size == 0 else float(np.min(finite_values)),
+                "finite_max": None if finite_values.size == 0 else float(np.max(finite_values)),
+                "first_nonfinite_index": first_index,
+            }
+        )
+        if len(entries) >= int(limit):
+            break
+    return entries
+
+
+def _payload_branch_diagnostics(payload) -> dict[str, Any]:
+    def _branch(tree) -> dict[str, Any]:
+        return {
+            "l2": _tree_array_l2_norm(tree),
+            "summary": _payload_leaf_summary(tree),
+            "first_nonfinite_leaves": _payload_nonfinite_leaf_summaries(tree),
+        }
+
+    diagnostics: dict[str, Any] = {"root": _branch(payload)}
+    ntx_payload = payload
+    if isinstance(payload, dict):
+        for branch_name in ("geometry", "ntx_support"):
+            if branch_name in payload:
+                diagnostics[branch_name] = _branch(payload[branch_name])
+        if "ntx_support" in payload:
+            ntx_payload = payload["ntx_support"]
+    for branch_name in (
+        "center_channels",
+        "face_channels",
+        "center_prepared",
+        "face_prepared",
+        "center_surfaces",
+        "face_surfaces",
+    ):
+        if hasattr(ntx_payload, branch_name):
+            diagnostics[f"ntx_support.{branch_name}"] = _branch(
+                getattr(ntx_payload, branch_name)
+            )
+    return diagnostics
+
+
 def _tree_array_l2_norm(payload) -> float:
     leaves = jax.tree_util.tree_leaves(payload)
     total = jnp.asarray(0.0, dtype=jnp.float64)
@@ -2502,6 +2582,40 @@ def _run_realtime_geometry_support_segment_probe(
             f"elapsed_s={time.perf_counter() - t_phase:.3f}",
             flush=True,
         )
+        pre_support_all_finite = True
+        print("[autodiff-gate] realtime support/geometry-payload cotangent precheck:")
+        for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
+            support_bar = support_bars[objective_i]
+            branch_diagnostics = _payload_branch_diagnostics(support_bar)
+            root_summary = branch_diagnostics["root"]["summary"]
+            if not root_summary["all_floating_leaves_finite"]:
+                pre_support_all_finite = False
+            print(
+                f"  - {objective_name}: "
+                f"support_bar_l2={branch_diagnostics['root']['l2']:.6e} "
+                f"support_bar_all_finite={root_summary['all_floating_leaves_finite']}"
+            )
+            if not root_summary["all_floating_leaves_finite"]:
+                for branch_name, branch_summary in branch_diagnostics.items():
+                    branch_leaf_summary = branch_summary["summary"]
+                    if branch_leaf_summary["all_floating_leaves_finite"]:
+                        continue
+                    nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
+                    first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]
+                    print(
+                        f"      first bad branch={branch_name} "
+                        f"l2={branch_summary['l2']:.6e} "
+                        f"array_leaves={branch_leaf_summary['n_array_leaves']} "
+                        f"first_nonfinite_leaf={first_nonfinite}",
+                        flush=True,
+                    )
+                    break
+        if not pre_support_all_finite:
+            raise FloatingPointError(
+                "Realtime geometry payload pullback skipped because transport reverse "
+                "produced nonfinite support/geometry payload cotangents. See the "
+                "precheck branch output above for the first bad payload leaf."
+            )
 
         geom_cfg = config.get("geometry", {})
         geometry_parameter_name = str(args.reverse_geometry_parameter)
@@ -2562,6 +2676,7 @@ def _run_realtime_geometry_support_segment_probe(
             surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            progress_label="[autodiff-gate] realtime geometry payload pullback:",
         )
         geometry_pullback_mode = "payload_state_raw_block_transpose"
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
@@ -2587,10 +2702,14 @@ def _run_realtime_geometry_support_segment_probe(
         realtime_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
+        support_bar_branch_diagnostics_by_objective = {}
         for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
             support_bar = support_bars[objective_i]
             support_bar_summary_by_objective[objective_name] = _payload_leaf_summary(support_bar)
             support_bar_l2_by_objective[objective_name] = _tree_array_l2_norm(support_bar)
+            support_bar_branch_diagnostics_by_objective[objective_name] = (
+                _payload_branch_diagnostics(support_bar)
+            )
 
         support_summary = _payload_leaf_summary(support_payload)
         report = {
@@ -2658,6 +2777,9 @@ def _run_realtime_geometry_support_segment_probe(
             "support_payload_summary": support_summary,
             "support_bar_summary_by_objective": support_bar_summary_by_objective,
             "support_bar_l2_by_objective": support_bar_l2_by_objective,
+            "support_bar_branch_diagnostics_by_objective": (
+                support_bar_branch_diagnostics_by_objective
+            ),
             "support_reuse_count": int(support_reuse_count),
             "support_rebuild_count": int(support_rebuild_count),
             "elapsed_s": float(elapsed_s),
@@ -2717,6 +2839,18 @@ def _run_realtime_geometry_support_segment_probe(
                 f"support_bar_array_leaves={summary['n_array_leaves']} "
                 f"support_bar_all_finite={summary['all_floating_leaves_finite']}"
             )
+            branch_diagnostics = support_bar_branch_diagnostics_by_objective[objective_name]
+            for branch_name, branch_summary in branch_diagnostics.items():
+                branch_leaf_summary = branch_summary["summary"]
+                nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
+                first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]["path"]
+                print(
+                    f"      {branch_name}: "
+                    f"l2={branch_summary['l2']:.6e} "
+                    f"array_leaves={branch_leaf_summary['n_array_leaves']} "
+                    f"all_finite={branch_leaf_summary['all_floating_leaves_finite']} "
+                    f"first_nonfinite_leaf={first_nonfinite}"
+                )
         outpath = _report_path("realtime_geometry_support_segment")
         outpath.write_text(json.dumps(report, indent=2))
         print(f"Wrote {outpath.relative_to(ROOT)}")
