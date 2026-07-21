@@ -190,16 +190,6 @@ def _adjoint_solve_jax_scipy(A, b, cfg):
     )
 
 
-def _adjoint_solve_bicgstab(A, b, cfg):
-    return jax.scipy.sparse.linalg.bicgstab(
-        A,
-        b,
-        tol=cfg.adjoint_tol,
-        atol=0.0,
-        maxiter=cfg.adjoint_restart * cfg.adjoint_maxiter,
-    )
-
-
 def _manual_implicit_pullback(
     *,
     params,
@@ -324,6 +314,16 @@ def main() -> None:
     parser.add_argument("--adjoint-restart", type=int, default=30)
     parser.add_argument("--adjoint-maxiter", type=int, default=300)
     parser.add_argument(
+        "--forward-linear-maxiter",
+        type=int,
+        default=300,
+        help=(
+            "GMRES maxiter for the frozen forward tangent solve A dz = rhs. "
+            "Kept separate from --adjoint-maxiter so reverse-solve budget "
+            "sweeps do not move the forward-JVP reference."
+        ),
+    )
+    parser.add_argument(
         "--implicit-solver-device",
         type=str,
         default="default",
@@ -331,6 +331,21 @@ def main() -> None:
         help=(
             "Device placement for VMEX implicit AD parameters. 'default' preserves "
             "old vmec_jax behavior by leaving placement to JAX; 'auto' uses VMEX policy."
+        ),
+    )
+    parser.add_argument(
+        "--block-transpose-probe-chunk-size",
+        type=int,
+        default=1,
+        help="Probe chunk size for the optional raw-block-transpose reverse initializer.",
+    )
+    parser.add_argument(
+        "--block-transpose-corrector-max-restarts",
+        type=int,
+        default=-1,
+        help=(
+            "Max GMRES restarts for the optional block-transpose-initialized reverse "
+            "corrector. Use -1 to use the same budget as --adjoint-maxiter."
         ),
     )
     parser.add_argument("--skip-reverse-check", action="store_true")
@@ -358,6 +373,7 @@ def main() -> None:
         adjoint_restart=args.adjoint_restart,
         adjoint_maxiter=args.adjoint_maxiter,
     )
+    forward_cfg = dataclasses.replace(cfg, adjoint_maxiter=int(args.forward_linear_maxiter))
     params0 = _implicit_params_from_input_for_script(inp, solver_device=args.implicit_solver_device)
     row, col = _param_index(inp, family, m, n)
     base_value = _param_value(params0, family, row, col)
@@ -368,7 +384,8 @@ def main() -> None:
         f"input={Path(args.vmec_input).resolve()} objective={args.objective} "
         f"parameter={family}:{m}:{n} ns={cfg.resolution.ns} ftol={cfg.ftol:.6e} "
         f"mboz={args.mboz} nboz={args.nboz} surfaces={','.join(f'{s:.3f}' for s in surfaces)} "
-        f"formulation={args.formulation} implicit_solver_device={args.implicit_solver_device}",
+        f"formulation={args.formulation} implicit_solver_device={args.implicit_solver_device} "
+        f"forward_linear_maxiter={forward_cfg.adjoint_maxiter} reverse_adjoint_maxiter={cfg.adjoint_maxiter}",
         flush=True,
     )
     print(
@@ -422,7 +439,7 @@ def main() -> None:
     state_tangent = _manual_implicit_forward_state_tangent(
         params=params0,
         param_tangent=tangent,
-        cfg=cfg,
+        cfg=forward_cfg,
         x_star=x_star,
         dof_mask=dof_mask,
         formulation=args.formulation,
@@ -496,19 +513,9 @@ def main() -> None:
             formulation=args.formulation,
             adjoint_solve=_adjoint_solve_jax_scipy,
         )
-        bicgstab_param_bar = _manual_implicit_pullback(
-            params=params0,
-            cfg=cfg,
-            x_star=x_star,
-            dof_mask=dof_mask,
-            state_bar=state_bar,
-            formulation=args.formulation,
-            adjoint_solve=_adjoint_solve_bicgstab,
-        )
         field_name = _param_field(family)
         reverse_grad = jnp.asarray(getattr(param_bar, field_name), dtype=jnp.float64)[row, col]
         scipy_reverse_grad = jnp.asarray(getattr(scipy_param_bar, field_name), dtype=jnp.float64)[row, col]
-        bicgstab_reverse_grad = jnp.asarray(getattr(bicgstab_param_bar, field_name), dtype=jnp.float64)[row, col]
         builtin_param_bar = im.implicit_state_pullback_multi_rhs(
             params0,
             cfg,
@@ -520,11 +527,37 @@ def main() -> None:
             getattr(builtin_param_bar, field_name),
             dtype=jnp.float64,
         )[0, row, col]
+        block_reverse_grad_f = None
+        if hasattr(im, "implicit_state_pullback_multi_rhs_block_transpose_init"):
+            block_param_bar = im.implicit_state_pullback_multi_rhs_block_transpose_init(
+                params0,
+                cfg,
+                x_star,
+                dof_mask,
+                jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), state_bar),
+                corrector_max_restarts=(
+                    None
+                    if int(args.block_transpose_corrector_max_restarts) < 0
+                    else int(args.block_transpose_corrector_max_restarts)
+                ),
+                probe_chunk_size=max(1, int(args.block_transpose_probe_chunk_size)),
+            )
+            block_reverse_grad = jnp.asarray(
+                getattr(block_param_bar, field_name),
+                dtype=jnp.float64,
+            )[0, row, col]
+            block_reverse_grad_f = float(jax.device_get(block_reverse_grad))
         state_dot_f = float(jax.device_get(state_dot_tangent))
         reverse_grad_f = float(jax.device_get(reverse_grad))
         scipy_reverse_grad_f = float(jax.device_get(scipy_reverse_grad))
-        bicgstab_reverse_grad_f = float(jax.device_get(bicgstab_reverse_grad))
         builtin_reverse_grad_f = float(jax.device_get(builtin_reverse_grad))
+        block_text = ""
+        if block_reverse_grad_f is not None:
+            block_text = (
+                f" block_transpose_init_reverse_param_grad={block_reverse_grad_f:.16e}"
+                f" rel_err_block_transpose_init_reverse_vs_jvp="
+                f"{_relative_error(block_reverse_grad_f, jvp_f):.6e}"
+            )
         print(
             f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
             f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
@@ -541,12 +574,11 @@ def main() -> None:
             f"[geometry-qi-linearized-fd] reverse_state_dot_tangent={state_dot_f:.16e} "
             f"reverse_param_grad={reverse_grad_f:.16e} "
             f"jax_scipy_reverse_param_grad={scipy_reverse_grad_f:.16e} "
-            f"bicgstab_reverse_param_grad={bicgstab_reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
+            f"{block_text} "
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_jax_scipy_reverse_vs_jvp={_relative_error(scipy_reverse_grad_f, jvp_f):.6e} "
-            f"rel_err_bicgstab_reverse_vs_jvp={_relative_error(bicgstab_reverse_grad_f, jvp_f):.6e} "
             f"rel_err_implicit_reverse_vs_jvp={_relative_error(builtin_reverse_grad_f, jvp_f):.6e}",
             flush=True,
         )
