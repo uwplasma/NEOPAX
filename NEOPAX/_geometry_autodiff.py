@@ -4487,9 +4487,13 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         )
         for leaf_i in float_leaf_indices
     )
-    state_bar_batch = jax.vmap(
-        lambda *payload_bar_leaves: payload_float_pullback(tuple(payload_bar_leaves))[0]
-    )(*batched_payload_float_bars)
+    def _single_state_bar_from_payload_bars(payload_bar_leaves):
+        return payload_float_pullback(tuple(payload_bar_leaves))[0]
+
+    state_bar_batch = jax.lax.map(
+        _single_state_bar_from_payload_bars,
+        batched_payload_float_bars,
+    )
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,
