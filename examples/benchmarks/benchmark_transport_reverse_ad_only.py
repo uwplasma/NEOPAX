@@ -36,6 +36,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector,
     build_ntx_exact_lij_support_from_param_vector,
+    geometry_payload_pullback_from_param_vector_raw_block_transpose,
 )
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
@@ -2548,105 +2549,21 @@ def _run_realtime_geometry_support_segment_probe(
             f"for {geometry_parameter_name}",
             flush=True,
         )
-        support_template = _support_from_geometry_deltas(baseline_geometry_deltas)
-        support_template = jax.block_until_ready(support_template)
-        support_template_leaves = jax.tree_util.tree_leaves(support_template)
-        support_float_leaf_indices = tuple(
-            leaf_i
-            for leaf_i, leaf in enumerate(support_template_leaves)
-            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        geometry_gradient_matrix = geometry_payload_pullback_from_param_vector_raw_block_transpose(
+            geometry_context,
+            baseline_geometry_deltas,
+            geometry_param_specs,
+            tuple(support_bars),
+            combined_payload=combined_geometry_payload,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
         )
-
-        def _support_float_leaves_from_geometry_deltas(geometry_deltas):
-            support_tree = _support_from_geometry_deltas(geometry_deltas)
-            support_leaves = jax.tree_util.tree_leaves(support_tree)
-            return tuple(jnp.asarray(support_leaves[leaf_i]) for leaf_i in support_float_leaf_indices)
-
-        @jax.custom_vjp
-        def _batched_support_float_leaves_from_geometry_delta_rows(geometry_delta_rows):
-            support_float_leaves = _support_float_leaves_from_geometry_deltas(geometry_delta_rows[0])
-            row_count = int(geometry_delta_rows.shape[0])
-            return tuple(
-                jnp.broadcast_to(
-                    jnp.asarray(leaf)[None, ...],
-                    (row_count,) + jnp.asarray(leaf).shape,
-                )
-                for leaf in support_float_leaves
-            )
-
-        def _batched_support_float_leaves_fwd(geometry_delta_rows):
-            support_float_leaves = _support_float_leaves_from_geometry_deltas(geometry_delta_rows[0])
-            row_count = int(geometry_delta_rows.shape[0])
-            batched_support_float_leaves = tuple(
-                jnp.broadcast_to(
-                    jnp.asarray(leaf)[None, ...],
-                    (row_count,) + jnp.asarray(leaf).shape,
-                )
-                for leaf in support_float_leaves
-            )
-            return batched_support_float_leaves, (geometry_delta_rows[0],)
-
-        def _batched_support_float_leaves_bwd(residual, batched_support_float_bars):
-            (geometry_deltas0,) = residual
-            _support_float_baseline_unused, support_float_pullback = jax.vjp(
-                _support_float_leaves_from_geometry_deltas,
-                geometry_deltas0,
-            )
-
-            def _row_pullback(*support_float_bar_leaves):
-                return support_float_pullback(tuple(support_float_bar_leaves))[0]
-
-            geometry_delta_bars = jax.vmap(_row_pullback)(*batched_support_float_bars)
-            return (geometry_delta_bars,)
-
-        _batched_support_float_leaves_from_geometry_delta_rows.defvjp(
-            _batched_support_float_leaves_fwd,
-            _batched_support_float_leaves_bwd,
-        )
-
-        baseline_geometry_delta_rows = jnp.broadcast_to(
-            baseline_geometry_deltas[None, :],
-            (len(OBJECTIVE_LABELS),) + baseline_geometry_deltas.shape,
-        )
-        _support_float_baseline = _batched_support_float_leaves_from_geometry_delta_rows(
-            baseline_geometry_delta_rows
-        )
-        _support_float_baseline = jax.block_until_ready(_support_float_baseline)
-        print(
-            "[autodiff-gate] progress: geometry support pullback ready "
-            f"floating_support_leaves={len(support_float_leaf_indices)} "
-            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
-            flush=True,
-        )
-
-        t_phase = time.perf_counter()
-        print(
-            "[autodiff-gate] progress: applying flat array-leaf batched geometry support pullback "
-            f"for {len(OBJECTIVE_LABELS)} objectives",
-            flush=True,
-        )
-        support_bar_leaves_by_objective = tuple(
-            jax.tree_util.tree_leaves(support_bar) for support_bar in support_bars
-        )
-        batched_support_float_bars = tuple(
-            jnp.stack(
-                [
-                    jnp.asarray(
-                        support_bar_leaves_by_objective[objective_i][leaf_i],
-                        dtype=jnp.asarray(support_template_leaves[leaf_i]).dtype,
-                    )
-                    for objective_i in range(len(OBJECTIVE_LABELS))
-                ],
-                axis=0,
-            )
-            for leaf_i in support_float_leaf_indices
-        )
-        _batched_support_float_value, batched_geometry_support_pullback = jax.vjp(
-            _batched_support_float_leaves_from_geometry_delta_rows,
-            baseline_geometry_delta_rows,
-        )
-        (geometry_gradient_matrix,) = batched_geometry_support_pullback(batched_support_float_bars)
-        geometry_pullback_mode = "flat_array_leaf_custom_vjp_batched_reverse"
+        geometry_pullback_mode = "payload_state_raw_block_transpose"
         geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
         print(
             "[autodiff-gate] progress: geometry support pullback complete "

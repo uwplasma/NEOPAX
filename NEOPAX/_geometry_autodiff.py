@@ -4327,6 +4327,29 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
+    return build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+        context,
+        state,
+        n_r=n_r,
+        n_theta=n_theta,
+        n_zeta=n_zeta,
+        n_xi=n_xi,
+        surface_backend=surface_backend,
+    )
+
+
+def build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "booz",
+):
+    """Build the realtime transport geometry payload from an already-solved VMEC state."""
+
     geometry = _build_neopax_geometry_from_state(context, state, n_r=n_r)
     support = build_ntx_exact_lij_support_from_vmec_state(
         context,
@@ -4338,6 +4361,114 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector(
         surface_backend=str(surface_backend),
     )
     return {"geometry": geometry, "ntx_support": support}
+
+
+def geometry_payload_pullback_from_param_vector_raw_block_transpose(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    payload_bars: Sequence[Any],
+    *,
+    combined_payload: bool,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "booz",
+    max_iter: int | None = None,
+    solver_device: str | None = None,
+) -> jnp.ndarray:
+    """Pull transport payload cotangents back to VMEC boundary harmonics.
+
+    The payload graph is differentiated only from payload leaves back to the
+    converged VMEC state.  The nonlinear VMEC solve pullback is then handled by
+    the validated raw block-tridiagonal transpose rule, matching the
+    geometry-objective table convention.
+    """
+
+    if not payload_bars:
+        raise ValueError("payload_bars must contain at least one objective cotangent tree.")
+    if not _using_current_vmec_jax_context(context):
+        raise ValueError("raw_block_transpose payload pullback requires the current VMEX implicit AD lane.")
+
+    param_entries = boundary_param_entries(context, param_specs)
+    implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
+        context,
+        jnp.asarray(param_deltas, dtype=jnp.float64),
+        param_entries,
+        max_iter=max_iter,
+        solver_device=solver_device,
+    )
+    if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+        raise AttributeError(
+            "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
+        )
+
+    state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+
+    def payload_from_state(state_inner):
+        if combined_payload:
+            return build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                context,
+                state_inner,
+                n_r=n_r,
+                n_theta=n_theta,
+                n_zeta=n_zeta,
+                n_xi=n_xi,
+                surface_backend=surface_backend,
+            )
+        geometry = _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)
+        return build_ntx_exact_lij_support_from_vmec_state(
+            context,
+            state_inner,
+            geometry,
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+        )
+
+    payload_template = payload_from_state(state)
+    payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
+    float_leaf_indices = tuple(
+        leaf_i
+        for leaf_i, leaf in enumerate(payload_template_leaves)
+        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+    )
+    if not float_leaf_indices:
+        raise ValueError("payload pullback found no floating leaves to differentiate.")
+
+    def payload_float_leaves_from_state(state_inner):
+        leaves = jax.tree_util.tree_leaves(payload_from_state(state_inner))
+        return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in float_leaf_indices)
+
+    _payload_float_baseline, payload_float_pullback = jax.vjp(payload_float_leaves_from_state, state)
+    payload_bar_leaves_by_objective = tuple(jax.tree_util.tree_leaves(payload_bar) for payload_bar in payload_bars)
+    batched_payload_float_bars = tuple(
+        jnp.stack(
+            [
+                jnp.asarray(
+                    payload_bar_leaves_by_objective[objective_i][leaf_i],
+                    dtype=jnp.asarray(payload_template_leaves[leaf_i]).dtype,
+                )
+                for objective_i in range(len(payload_bars))
+            ],
+            axis=0,
+        )
+        for leaf_i in float_leaf_indices
+    )
+    state_bar_batch = jax.vmap(
+        lambda *payload_bar_leaves: payload_float_pullback(tuple(payload_bar_leaves))[0]
+    )(*batched_payload_float_bars)
+    param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+        implicit_params,
+        implicit_cfg,
+        state,
+        dof_mask,
+        state_bar_batch,
+        probe_chunk_size=1,
+    )
+    return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
 
 
 def build_neopax_geometry_from_single_param(

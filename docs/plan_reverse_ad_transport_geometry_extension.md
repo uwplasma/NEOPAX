@@ -132,6 +132,17 @@ Interpretation:
 - Do not compare raw-block reverse against a different preconditioned
   GMRES-only forward target.
 
+Default reverse convention:
+
+- Geometry-objective tables should use the raw-block transpose VMEC
+  state-to-harmonic pullback by default.
+- Transport realtime-geometry reverse payloads should use the same split:
+  first pull geometry/Boozer/NTX payload cotangents back to the converged VMEC
+  state, then apply the raw-block transpose pullback to VMEC harmonics.
+- Generic VMEC solve VJPs, preconditioned multi-RHS helpers, and full
+  `geometry_delta -> payload` VJPs are diagnostics only until they are shown to
+  match this operator-paired convention.
+
 ## Relation To VMEX QI Optimization
 
 VMEX optimization examples call:
