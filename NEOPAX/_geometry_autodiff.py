@@ -4222,8 +4222,16 @@ def build_ntx_exact_lij_support_from_vmec_state(
 
     surface_backend_key = str(surface_backend).strip().lower()
     if surface_backend_key in {"vmec", "vmec_jax"}:
-        center_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_center_sample))
-        face_surfaces = _vmec_surfaces_from_state(s_values=_positive_transport_s_values(rho_face_sample))
+        center_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=_positive_transport_s_values(rho_center_sample),
+        )
+        face_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=_positive_transport_s_values(rho_face_sample),
+        )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
