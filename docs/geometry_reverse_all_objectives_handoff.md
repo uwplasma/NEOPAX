@@ -48,3 +48,94 @@ Expected next-session decision:
 
 Before editing:
 `git diff -- NEOPAX/_geometry_autodiff.py examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py docs/geometry_reverse_all_objectives_handoff.md`
+
+## 2026-07-21 update: raw-block pair vs GMRES-only pair
+
+The latest scalar QI diagnostic showed that the previous `~6.6e-03` / `~6.9e-03`
+target was not an operator-independent truth. It came from the preconditioned
+GMRES-only forward tangent path at a particular linear-solve budget. Increasing
+the forward linear budget moved that value, so it should not be used as the
+sole oracle for the raw-block reverse rule.
+
+Current key command:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --reference-fd=5.909044e-01 \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Observed raw-block forward result:
+
+- `frozen_linearized_fd=-3.0868613803103507e-03`
+- `forward_jvp=-3.0867443678659922e-03`
+
+Earlier raw-block transpose reverse result:
+
+- `raw_block_transpose_reverse_param_grad=-3.0867443806652517e-03`
+
+Interpretation:
+
+- The raw-block forward FD/JVP and raw-block transpose reverse are internally
+  consistent.
+- The previous mismatch was caused by comparing different linearized operator
+  families:
+  - preconditioned GMRES-only forward tangent,
+  - raw block-transpose reverse.
+- For the raw-block pair, the comparison should be:
+  `frozen_linearized_fd` / `forward_jvp` against
+  `raw_block_transpose_reverse_param_grad`.
+- For the preconditioned pair, the comparison should instead be:
+  preconditioned forward GMRES against preconditioned transpose GMRES, with
+  convergence/preconditioning fixed.
+
+Relation to VMEX QI optimization:
+
+- VMEX optimization examples call `opt.least_squares(..., jac="implicit")`.
+- Inside that implicit Jacobian path the default is `jac_solver="block"`.
+- That block optimization path is closer to the raw-block diagnostic than to
+  the drifting GMRES-only diagnostic, but it is not identical:
+  - it first solves the raw block-tridiagonal system,
+  - then applies a short preconditioned GMRES correction from that raw-block
+    initial guess:
+
+```text
+A_raw dz0 = -F_raw,p dp
+dz = GMRES(A_pre, -F_pre,p dp, x0=dz0, max_restarts=min(3, cfg.adjoint_maxiter))
+dJ = J_z dz + J_p dp
+```
+
+Recommended next test:
+
+- Add or expose a diagnostic forward mode matching the optimization path:
+  `raw_block_plus_correction`.
+- Compare it against a matching reverse rule:
+  a preconditioned transpose solve using the raw block-transpose solution as
+  a real preconditioner or robust warm-start, not as an unrelated raw-only
+  gradient.
+- Keep these as opt-in diagnostics until the operator pairing is validated.
+
+Do not change the production forward solver or the default VMEX optimization
+path while doing this comparison.
+
+Implementation note:
+
+- Added opt-in VMEX helper `implicit_state_tangent_block_corrected(...)`.
+- Added NEOPAX diagnostic switch `--forward-linear-solve-mode block_corrected`.
+- This mirrors the VMEX optimization `jac_solver="block"` single-direction
+  tangent pattern:
+
+```text
+A_raw dz0 = -F_raw,p dp
+dz = GMRES(A_pre, -F_pre,p dp, x0=dz0, max_restarts=min(3, cfg.adjoint_maxiter))
+dJ = J_z dz + J_p dp
+```
+
+- This helper is not used by default and should not affect existing VMEX
+  optimization behavior or NEOPAX forward solver paths.

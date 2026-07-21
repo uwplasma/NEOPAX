@@ -271,6 +271,22 @@ def _manual_implicit_forward_state_tangent(
             jnp.asarray(float("nan"), dtype=jnp.float64),
         )
 
+    if linear_solve_mode == "block_corrected":
+        state_tangent = im.implicit_state_tangent_block_corrected(
+            params,
+            cfg,
+            x_star,
+            dof_mask,
+            param_tangent,
+            probe_chunk_size=probe_chunk_size,
+        )
+        return (
+            state_tangent,
+            SimpleNamespace(solver="raw_block_plus_short_preconditioned_gmres"),
+            jnp.asarray(float("nan"), dtype=jnp.float64),
+            jnp.asarray(float("nan"), dtype=jnp.float64),
+        )
+
     F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
 
     def F_z(z):
@@ -348,11 +364,13 @@ def main() -> None:
         "--forward-linear-solve-mode",
         type=str,
         default="gmres",
-        choices=("gmres", "raw_block"),
+        choices=("gmres", "raw_block", "block_corrected"),
         help=(
             "Linear solver for the frozen forward tangent. 'gmres' uses the "
             "current preconditioned residual JVP; 'raw_block' uses the same "
-            "raw block-tridiagonal operator family as raw_block_transpose_reverse."
+            "raw block-tridiagonal operator family as raw_block_transpose_reverse; "
+            "'block_corrected' mirrors VMEX optimization's raw block solve plus "
+            "short preconditioned GMRES correction."
         ),
     )
     parser.add_argument(
