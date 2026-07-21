@@ -247,12 +247,31 @@ def _manual_implicit_forward_state_tangent(
     x_star,
     dof_mask,
     formulation: str,
+    linear_solve_mode: str,
+    probe_chunk_size: int,
 ):
     frozen = jax.lax.stop_gradient(x_star)
     edge_mask = im._edge_mask(cfg)
     P = im._dof_projector(cfg, dof_mask)
-    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
     z_star = P(x_star)
+
+    if linear_solve_mode == "raw_block":
+        state_tangent = im.implicit_state_tangent_raw_block(
+            params,
+            cfg,
+            x_star,
+            dof_mask,
+            param_tangent,
+            probe_chunk_size=probe_chunk_size,
+        )
+        return (
+            state_tangent,
+            SimpleNamespace(solver="raw_block_direct"),
+            jnp.asarray(float("nan"), dtype=jnp.float64),
+            jnp.asarray(float("nan"), dtype=jnp.float64),
+        )
+
+    F = im.residual_fn(cfg, frozen, dof_mask, formulation=formulation)
 
     def F_z(z):
         return F(z, params)
@@ -261,7 +280,9 @@ def _manual_implicit_forward_state_tangent(
         return F(z_star, prm)
 
     rhs = jax.tree.map(jnp.negative, jax.jvp(F_p, (params,), (param_tangent,))[1])
-    dz, _ = im._adjoint_solve(lambda v: jax.jvp(F_z, (z_star,), (v,))[1], rhs, cfg)
+    forward_matvec = lambda v: jax.jvp(F_z, (z_star,), (v,))[1]
+    dz, solve_info = im._adjoint_solve(forward_matvec, rhs, cfg)
+    residual = _tree_sub(forward_matvec(dz), rhs)
 
     def assemble_from_z_params(z, prm):
         return im._assemble(
@@ -276,7 +297,7 @@ def _manual_implicit_forward_state_tangent(
         assemble_from_z_params,
         (z_star, params),
         (dz, param_tangent),
-    )[1]
+    )[1], solve_info, _tree_l2(residual), _tree_l2(rhs)
 
 
 def _objective(context, objective_name: str, state):
@@ -324,6 +345,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--forward-linear-solve-mode",
+        type=str,
+        default="gmres",
+        choices=("gmres", "raw_block"),
+        help=(
+            "Linear solver for the frozen forward tangent. 'gmres' uses the "
+            "current preconditioned residual JVP; 'raw_block' uses the same "
+            "raw block-tridiagonal operator family as raw_block_transpose_reverse."
+        ),
+    )
+    parser.add_argument(
         "--implicit-solver-device",
         type=str,
         default="default",
@@ -347,6 +379,11 @@ def main() -> None:
             "Max GMRES restarts for the optional block-transpose-initialized reverse "
             "corrector. Use -1 to use the same budget as --adjoint-maxiter."
         ),
+    )
+    parser.add_argument(
+        "--run-right-preconditioned-reverse-check",
+        action="store_true",
+        help="Also run the experimental right-preconditioned transpose reverse check.",
     )
     parser.add_argument("--skip-reverse-check", action="store_true")
     args = parser.parse_args()
@@ -391,6 +428,7 @@ def main() -> None:
         f"parameter={family}:{m}:{n} ns={cfg.resolution.ns} ftol={cfg.ftol:.6e} "
         f"mboz={args.mboz} nboz={args.nboz} surfaces={','.join(f'{s:.3f}' for s in surfaces)} "
         f"formulation={args.formulation} implicit_solver_device={args.implicit_solver_device} "
+        f"forward_linear_solve_mode={args.forward_linear_solve_mode} "
         f"forward_linear_maxiter={forward_cfg.adjoint_maxiter} reverse_adjoint_maxiter={cfg.adjoint_maxiter}",
         flush=True,
     )
@@ -442,13 +480,19 @@ def main() -> None:
 
     print("[geometry-qi-linearized-fd] progress: frozen linearized FD along implicit tangent", flush=True)
     tangent = _param_unit_tangent_like(params0, family, row, col)
-    state_tangent = _manual_implicit_forward_state_tangent(
+    state_tangent, forward_solve_info, forward_res_l2, forward_rhs_l2 = _manual_implicit_forward_state_tangent(
         params=params0,
         param_tangent=tangent,
         cfg=forward_cfg,
         x_star=x_star,
         dof_mask=dof_mask,
         formulation=args.formulation,
+        linear_solve_mode=args.forward_linear_solve_mode,
+        probe_chunk_size=max(1, int(args.block_transpose_probe_chunk_size)),
+    )
+    forward_rel_res = forward_res_l2 / jnp.maximum(
+        forward_rhs_l2,
+        jnp.asarray(1.0e-300, dtype=jnp.float64),
     )
     step_arr = jnp.asarray(h, dtype=jnp.float64)
     state_minus = jax.tree.map(lambda x, t: x - step_arr * t, x_star, state_tangent)
@@ -471,6 +515,9 @@ def main() -> None:
     print(
         f"[geometry-qi-linearized-fd] frozen_linearized_fd={lin_fd_f:.16e} "
         f"forward_jvp={jvp_f:.16e} "
+        f"forward_linear_res_l2={float(jax.device_get(forward_res_l2)):.6e} "
+        f"forward_linear_rel_res={float(jax.device_get(forward_rel_res)):.6e} "
+        f"forward_linear_solver_info=({_solver_info_text(forward_solve_info)}) "
         f"rel_err_linfd_vs_jvp={_relative_error(lin_fd_f, jvp_f):.6e} "
         f"rel_err_linfd_vs_reference_fd={_relative_error(lin_fd_f, fd):.6e} "
         f"total_elapsed_s={time.perf_counter() - t0:.3f}",
@@ -535,6 +582,7 @@ def main() -> None:
         )[0, row, col]
         block_reverse_grad_f = None
         raw_block_reverse_grad_f = None
+        right_precond_reverse_grad_f = None
         if hasattr(im, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
             raw_block_param_bar = im.implicit_state_pullback_multi_rhs_raw_block_transpose(
                 params0,
@@ -549,6 +597,25 @@ def main() -> None:
                 dtype=jnp.float64,
             )[0, row, col]
             raw_block_reverse_grad_f = float(jax.device_get(raw_block_reverse_grad))
+        if (
+            bool(args.run_right_preconditioned_reverse_check)
+            and hasattr(im, "implicit_state_pullback_multi_rhs_block_transpose_right_preconditioned")
+        ):
+            right_precond_param_bar = (
+                im.implicit_state_pullback_multi_rhs_block_transpose_right_preconditioned(
+                    params0,
+                    cfg,
+                    x_star,
+                    dof_mask,
+                    jax.tree.map(lambda leaf: jnp.expand_dims(leaf, axis=0), state_bar),
+                    probe_chunk_size=max(1, int(args.block_transpose_probe_chunk_size)),
+                )
+            )
+            right_precond_reverse_grad = jnp.asarray(
+                getattr(right_precond_param_bar, field_name),
+                dtype=jnp.float64,
+            )[0, row, col]
+            right_precond_reverse_grad_f = float(jax.device_get(right_precond_reverse_grad))
         if hasattr(im, "implicit_state_pullback_multi_rhs_block_transpose_init"):
             block_param_bar = im.implicit_state_pullback_multi_rhs_block_transpose_init(
                 params0,
@@ -586,6 +653,14 @@ def main() -> None:
                 f" rel_err_raw_block_transpose_reverse_vs_jvp="
                 f"{_relative_error(raw_block_reverse_grad_f, jvp_f):.6e}"
             )
+        right_precond_text = ""
+        if right_precond_reverse_grad_f is not None:
+            right_precond_text = (
+                f" block_transpose_right_preconditioned_reverse_param_grad="
+                f"{right_precond_reverse_grad_f:.16e}"
+                f" rel_err_block_transpose_right_preconditioned_reverse_vs_jvp="
+                f"{_relative_error(right_precond_reverse_grad_f, jvp_f):.6e}"
+            )
         print(
             f"[geometry-qi-linearized-fd] implicit_pullback_diagnostics "
             f"rhs_diff_l2={float(jax.device_get(rhs_diff_l2)):.6e} "
@@ -603,7 +678,7 @@ def main() -> None:
             f"reverse_param_grad={reverse_grad_f:.16e} "
             f"jax_scipy_reverse_param_grad={scipy_reverse_grad_f:.16e} "
             f"implicit_reverse_param_grad={builtin_reverse_grad_f:.16e} "
-            f"{raw_block_text}{block_text} "
+            f"{raw_block_text}{right_precond_text}{block_text} "
             f"rel_err_state_dot_vs_jvp={_relative_error(state_dot_f, jvp_f):.6e} "
             f"rel_err_reverse_vs_jvp={_relative_error(reverse_grad_f, jvp_f):.6e} "
             f"rel_err_jax_scipy_reverse_vs_jvp={_relative_error(scipy_reverse_grad_f, jvp_f):.6e} "
