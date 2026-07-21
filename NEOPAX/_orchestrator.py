@@ -826,6 +826,10 @@ def prepare_transport_solver_components(
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
+        config=config,
+        source_models=runtime.models.source,
+        solver_cfg=solver_cfg,
+        boundary_models=bc,
     )
     solver = build_time_solver(solver_cfg)
     return {
