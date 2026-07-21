@@ -49,7 +49,10 @@ COLLISIONALITY_MODEL_NTSS_ZEFF = 4
 @jit
 def get_plasma_permitivity(state, species_mass, geometry, grid_x):
     """Return epsilon(r) used in Er diffusion/ambipolar source term."""
-    psi_fac = 1.0 + 1.0 / (geometry.enlogation * jnp.square(geometry.iota))
+    psi_den = geometry.enlogation * jnp.square(geometry.iota)
+    psi_den_active = jnp.abs(psi_den) > 0.0
+    psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
+    psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
     psi_fac = psi_fac.at[0].set(1.0)
     mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(species_mass[:, None] * state.density, axis=0)
     epsilon_r = mass_density * psi_fac / jnp.square(geometry.B0)

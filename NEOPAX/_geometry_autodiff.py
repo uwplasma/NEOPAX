@@ -3340,7 +3340,9 @@ def _safe_divide(num, den):
 
 def _safe_reciprocal(values):
     arr = jnp.asarray(values)
-    return jnp.where(jnp.abs(arr) > 0.0, 1.0 / arr, 0.0)
+    active = jnp.abs(arr) > 0.0
+    arr_safe = jnp.where(active, arr, 1.0)
+    return jnp.where(active, 1.0 / arr_safe, 0.0)
 
 
 def _find_boozer_mode_index(ixm_b, ixn_b, *, m_value: int, n_value: int) -> int | None:

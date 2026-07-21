@@ -916,7 +916,10 @@ def build_electric_field_equation(
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
-    psi_fac = 1.0 + 1.0 / (field.enlogation * jnp.square(field.iota))
+    psi_den = field.enlogation * jnp.square(field.iota)
+    psi_den_active = jnp.abs(psi_den) > 0.0
+    psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
+    psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
     psi_fac = psi_fac.at[0].set(1.0)
     permitivity_prefactor = psi_fac / jnp.square(field.B0)
     mid_idx = int(field.r_grid.shape[0] // 2)
