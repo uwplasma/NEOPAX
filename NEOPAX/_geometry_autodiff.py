@@ -3762,7 +3762,7 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
         return interpax.Interpolator1D(rho_grid, values, extrap=True)(rho_arr)
 
     a_b = jnp.asarray(geometry.a_b, dtype=jnp.float64)
-    psia_value = float(jnp.asarray(psia))
+    psia_value = jnp.asarray(psia, dtype=jnp.float64)
     r00_arr = jnp.asarray(r00, dtype=jnp.float64)
     b00 = _interp_geometry_field("B0")
     boozer_i = _interp_geometry_field("I_value")
@@ -3785,7 +3785,7 @@ def _build_ntx_runtime_channels_from_geometry(geometry, *, rho, psia, r00):
     fac_dkes_to_d31star = -(3.0 / 1.46) * iota * jnp.sqrt(epsilon_t) / 2.0
     return NTXRuntimeScanChannels(
         rho=rho_arr,
-        a_b=float(a_b),
+        a_b=a_b,
         psia=psia_value,
         b00=b00,
         r00=r00_arr,
