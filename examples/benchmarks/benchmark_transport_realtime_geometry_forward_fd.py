@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -79,12 +80,10 @@ def _profile_state_from_values(values, *, runtime, baseline_state, profile_cfg: 
 
 
 def _prepare_rollout(config: dict[str, Any], runtime, state0, *, solver_override=None):
-    components = prepare_transport_solver_components(
-        config,
-        runtime,
-        state0,
-        solver_override=solver_override,
-    )
+    kwargs = {}
+    if solver_override is not None and "solver_override" in inspect.signature(prepare_transport_solver_components).parameters:
+        kwargs["solver_override"] = solver_override
+    components = prepare_transport_solver_components(config, runtime, state0, **kwargs)
     solver = components["solver"]
     prepared_rollout = _build_prepared_radau_accepted_rollout(
         solver=solver,
