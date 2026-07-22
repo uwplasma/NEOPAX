@@ -65,7 +65,9 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_debug_local_accepted_step_transpose,
     _radau_eval_rhs,
     _radau_add_support_delta_trees,
+    _radau_replay_realized_accepted_slot,
     _radau_segment_reduced_cotangent_bwd_batched_call,
+    _radau_segment_reduced_cotangent_bwd_batched_with_slot_next_call,
     _radau_segment_reduced_cotangent_bwd_call,
     _radau_single_slot_support_cotangent_bwd_call,
     _radau_single_slot_support_cotangent_bwd_flat_batched_call,
@@ -1435,47 +1437,47 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
-    next_reduced_bars_by_segment = [None] * segment_count
-    for segment_index in range(segment_count - 1, -1, -1):
-        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
-        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-        next_reduced_bars_by_segment[segment_index] = reduced_bars
-        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
-            reverse_setup.execution_context,
-            cotangent_mode,
-            reduced_bars,
-            segment_start_carry,
-            segment_arrays,
-        )
-
     support_reuse_count = 0
     support_rebuild_count = 0
     for segment_index in range(segment_count - 1, -1, -1):
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-        slot_arrays = _take_tree_axis0(segment_arrays, 0)
-        slot_lagged_response_valid = bool(
-            np.asarray(jax.device_get(segment_start_carry.lagged_response_valid))
+        reduced_bars, step_start_carries, slot_next_reduced_bars = (
+            _radau_segment_reduced_cotangent_bwd_batched_with_slot_next_call(
+                reverse_setup.execution_context,
+                cotangent_mode,
+                reduced_bars,
+                segment_start_carry,
+                segment_arrays,
+            )
         )
-        slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
-        support_reuse_count += int(slot_lagged_response_valid)
-        support_rebuild_count += int(not slot_lagged_response_valid)
-        step_support_bar_leaves = _radau_single_slot_support_cotangent_bwd_flat_batched_call(
-            reverse_setup.execution_context,
-            slot_cotangent_mode,
-            next_reduced_bars_by_segment[segment_index],
-            segment_start_carry,
-            slot_arrays,
-            support_payload,
-        )
-        support_bar_leaves = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
-        )
-        step_support_bar_leaves_accum = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(step_support_bar_leaves_accum, step_support_bar_leaves)
-        )
+        segment_slot_count = int(jax.tree_util.tree_leaves(segment_arrays)[0].shape[0])
+        for slot_index in range(segment_slot_count - 1, -1, -1):
+            step_start_carry = _take_tree_axis0(step_start_carries, slot_index)
+            slot_arrays = _take_tree_axis0(segment_arrays, slot_index)
+            slot_next_reduced_bar = _take_tree_axis0(slot_next_reduced_bars, slot_index)
+            slot_lagged_response_valid = bool(
+                np.asarray(jax.device_get(step_start_carry.lagged_response_valid))
+            )
+            slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
+            support_reuse_count += int(slot_lagged_response_valid)
+            support_rebuild_count += int(not slot_lagged_response_valid)
+            step_support_bar_leaves = _radau_single_slot_support_cotangent_bwd_flat_batched_call(
+                reverse_setup.execution_context,
+                slot_cotangent_mode,
+                slot_next_reduced_bar,
+                step_start_carry,
+                slot_arrays,
+                support_payload,
+            )
+            support_bar_leaves = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
+            )
+            step_support_bar_leaves_accum = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(step_support_bar_leaves_accum, step_support_bar_leaves)
+            )
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
