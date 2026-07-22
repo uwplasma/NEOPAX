@@ -4439,6 +4439,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     max_iter: int | None = None,
     solver_device: str | None = None,
     progress_label: str | None = None,
+    return_branch_gradients: bool = False,
 ) -> jnp.ndarray:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -4643,6 +4644,8 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                     break
         return state_bar_batch_value
 
+    geometry_state_bar_batch = None
+    support_state_bar_batch = None
     if combined_payload:
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
         support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
@@ -4669,12 +4672,26 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             tuple(payload_bars),
         )
         _print_state_bar_batch_finiteness("combined", state_bar_batch)
+
+    if return_branch_gradients and combined_payload:
+        raw_block_state_bar_batch = jax.tree_util.tree_map(
+            lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
+                [geometry_bar, support_bar, total_bar],
+                axis=0,
+            ),
+            geometry_state_bar_batch,
+            support_state_bar_batch,
+            state_bar_batch,
+        )
+    else:
+        raw_block_state_bar_batch = state_bar_batch
+
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,
         state,
         dof_mask,
-        state_bar_batch,
+        raw_block_state_bar_batch,
         probe_chunk_size=1,
     )
     if progress_label is not None:
@@ -4705,7 +4722,15 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             f"raw_block_param_bar_first_nonfinite={first_bad}",
             flush=True,
         )
-    return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
+    gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
+    if return_branch_gradients and combined_payload:
+        row_count = len(payload_bars)
+        return {
+            "geometry": gradient_matrix[:row_count],
+            "ntx_support": gradient_matrix[row_count : 2 * row_count],
+            "combined": gradient_matrix[2 * row_count :],
+        }
+    return gradient_matrix
 
 
 def build_neopax_geometry_from_single_param(

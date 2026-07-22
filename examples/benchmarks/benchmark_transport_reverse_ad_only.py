@@ -7,7 +7,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +33,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _volume_average,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
+    boundary_param_entries,
     build_geometry_autodiff_context,
     build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector,
     build_ntx_exact_lij_support_from_param_vector,
@@ -426,8 +427,32 @@ def _format_reverse_geometry_parameter(parameter_name: str) -> str:
     return f"vmec:{family}:{m}:{n}"
 
 
+def _format_geometry_param_spec(param_spec: tuple[str, int, int]) -> str:
+    family, m, n = param_spec
+    return f"vmec:{str(family).strip().upper()}:{int(m)}:{int(n)}"
+
+
+def _parse_reverse_geometry_families(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ("RBC", "ZBS")
+    families = tuple(part.strip().upper() for part in str(value).split(",") if part.strip())
+    if not families:
+        raise ValueError("--reverse-geometry-families must contain at least one family.")
+    allowed = {"RBC", "ZBS"}
+    unknown = tuple(family for family in families if family not in allowed)
+    if unknown:
+        raise ValueError(
+            "--reverse-geometry-families currently supports "
+            f"{sorted(allowed)}; got {unknown}."
+        )
+    return families
+
+
 def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: str):
-    family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
+    if str(geometry_parameter).strip().lower() == "all":
+        family, m, n = ("RBC", 0, 0)
+    else:
+        family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
     geom_cfg = config.get("geometry", {})
     backend = str(geom_cfg.get("backend", "")).strip().lower()
     if backend not in _REALTIME_GEOMETRY_BACKENDS:
@@ -449,11 +474,75 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
 
 
 def _reverse_geometry_parameter_order(geometry_parameter: str) -> tuple[str, ...]:
+    if str(geometry_parameter).strip().lower() == "all":
+        return (*PARAMETER_ORDER, "vmec:all")
     return (*PARAMETER_ORDER, _format_reverse_geometry_parameter(geometry_parameter))
 
 
 def _geometry_param_specs_from_parameter_name(geometry_parameter: str) -> tuple[tuple[str, int, int], ...]:
     return (_parse_reverse_geometry_parameter(geometry_parameter),)
+
+
+def _all_geometry_param_specs_from_context(
+    geometry_context,
+    *,
+    families: tuple[str, ...],
+    nonzero_only: bool = True,
+) -> tuple[tuple[str, int, int], ...]:
+    specs: list[tuple[str, int, int]] = []
+    m_arr = np.asarray(jax.device_get(geometry_context.static.modes.m), dtype=int).reshape(-1)
+    n_arr = np.asarray(jax.device_get(geometry_context.static.modes.n), dtype=int).reshape(-1)
+    for family in families:
+        family_key = str(family).strip().upper()
+        boundary_field = "rbc" if family_key == "RBC" else "zbs"
+        boundary_values = np.asarray(
+            jax.device_get(getattr(geometry_context.boundary, boundary_field)),
+            dtype=float,
+        ).reshape(-1)
+        for m_value, n_value, coefficient in zip(m_arr.tolist(), n_arr.tolist(), boundary_values.tolist()):
+            if nonzero_only and not np.isfinite(coefficient):
+                continue
+            if nonzero_only and abs(float(coefficient)) == 0.0:
+                continue
+            specs.append((family_key, int(m_value), int(n_value)))
+    if not specs:
+        raise ValueError(
+            "No VMEC boundary harmonics matched the requested all-harmonic selector. "
+            "Try --reverse-geometry-include-zero-harmonics or a different "
+            "--reverse-geometry-families value."
+        )
+    return tuple(specs)
+
+
+def _geometry_param_specs_from_args(args, geometry_context) -> tuple[tuple[str, int, int], ...]:
+    geometry_parameter = str(args.reverse_geometry_parameter).strip()
+    if geometry_parameter.lower() != "all":
+        return _geometry_param_specs_from_parameter_name(geometry_parameter)
+    return _all_geometry_param_specs_from_context(
+        geometry_context,
+        families=_parse_reverse_geometry_families(args.reverse_geometry_families),
+        nonzero_only=not bool(args.reverse_geometry_include_zero_harmonics),
+    )
+
+
+def _baseline_geometry_delta_vector_for_specs(
+    geom_cfg: dict[str, Any],
+    geometry_param_specs: Sequence[tuple[str, int, int]],
+) -> jnp.ndarray:
+    deltas = np.zeros((len(geometry_param_specs),), dtype=np.float64)
+    configured_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
+    if configured_delta != 0.0:
+        configured_spec = (
+            str(geom_cfg.get("vmec_param_family", "RBC")).strip().upper(),
+            int(geom_cfg.get("vmec_param_m", 0)),
+            int(geom_cfg.get("vmec_param_n", 0)),
+        )
+        for i, spec in enumerate(geometry_param_specs):
+            normalized_spec = (str(spec[0]).strip().upper(), int(spec[1]), int(spec[2]))
+            if normalized_spec == configured_spec:
+                deltas[i] = configured_delta
+                break
+    return jnp.asarray(deltas, dtype=jnp.float64)
 
 
 def _add_trees(lhs, rhs):
@@ -2663,10 +2752,12 @@ def _run_realtime_geometry_support_segment_probe(
         geom_cfg = config.get("geometry", {})
         geometry_parameter_name = str(args.reverse_geometry_parameter)
         geometry_context = _geometry_context_from_config(config, geometry_parameter_name)
-        geometry_param_specs = _geometry_param_specs_from_parameter_name(geometry_parameter_name)
-        baseline_geometry_deltas = jnp.asarray(
-            [float(geom_cfg.get("vmec_param_delta", 0.0))],
-            dtype=jnp.float64,
+        geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
+        geometry_param_entries = boundary_param_entries(geometry_context, geometry_param_specs)
+        geometry_param_labels = tuple(_format_geometry_param_spec(spec) for spec in geometry_param_specs)
+        baseline_geometry_deltas = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg,
+            geometry_param_specs,
         )
 
         def _support_from_geometry_deltas(geometry_deltas):
@@ -2703,10 +2794,11 @@ def _run_realtime_geometry_support_segment_probe(
         t_phase = time.perf_counter()
         print(
             "[autodiff-gate] progress: building geometry support pullback "
-            f"for {geometry_parameter_name}",
+            f"for {geometry_parameter_name} "
+            f"(harmonic_count={len(geometry_param_specs)})",
             flush=True,
         )
-        geometry_gradient_matrix = geometry_payload_pullback_from_param_vector_raw_block_transpose(
+        geometry_gradient_result = geometry_payload_pullback_from_param_vector_raw_block_transpose(
             geometry_context,
             baseline_geometry_deltas,
             geometry_param_specs,
@@ -2720,9 +2812,18 @@ def _run_realtime_geometry_support_segment_probe(
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] realtime geometry payload pullback:",
+            return_branch_gradients=True,
         )
         geometry_pullback_mode = "payload_state_raw_block_transpose"
-        geometry_gradient_matrix = jax.block_until_ready(geometry_gradient_matrix)
+        geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
+        if isinstance(geometry_gradient_result, dict):
+            geometry_gradient_matrix = geometry_gradient_result["combined"]
+            geometry_branch_gradient_matrix = geometry_gradient_result.get("geometry")
+            ntx_support_branch_gradient_matrix = geometry_gradient_result.get("ntx_support")
+        else:
+            geometry_gradient_matrix = geometry_gradient_result
+            geometry_branch_gradient_matrix = None
+            ntx_support_branch_gradient_matrix = None
         print(
             "[autodiff-gate] progress: geometry support pullback complete "
             f"mode={geometry_pullback_mode} elapsed_s={time.perf_counter() - t_phase:.3f}",
@@ -2733,6 +2834,16 @@ def _run_realtime_geometry_support_segment_probe(
         objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
         profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
         geometry_gradient_np = np.asarray(jax.device_get(geometry_gradient_matrix), dtype=float)
+        geometry_branch_gradient_np = (
+            None
+            if geometry_branch_gradient_matrix is None
+            else np.asarray(jax.device_get(geometry_branch_gradient_matrix), dtype=float)
+        )
+        ntx_support_branch_gradient_np = (
+            None
+            if ntx_support_branch_gradient_matrix is None
+            else np.asarray(jax.device_get(ntx_support_branch_gradient_matrix), dtype=float)
+        )
         objective_finite_np = np.isfinite(objective_values_np)
         profile_gradient_finite_by_objective = {
             objective_name: bool(np.all(np.isfinite(profile_gradient_np[objective_i])))
@@ -2783,17 +2894,57 @@ def _run_realtime_geometry_support_segment_probe(
             },
             "geometry_gradient_reverse_ad": {
                 objective_name: {
-                    _format_reverse_geometry_parameter(geometry_parameter_name): float(
-                        geometry_gradient_np[objective_i, 0]
+                    geometry_label: float(value)
+                    for geometry_label, value in zip(
+                        geometry_param_labels,
+                        geometry_gradient_np[objective_i].tolist(),
                     )
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
+            "geometry_gradient_reverse_ad_by_branch": None
+            if geometry_branch_gradient_np is None or ntx_support_branch_gradient_np is None
+            else {
+                objective_name: {
+                    "geometry": {
+                        geometry_label: float(value)
+                        for geometry_label, value in zip(
+                            geometry_param_labels,
+                            geometry_branch_gradient_np[objective_i].tolist(),
+                        )
+                    },
+                    "ntx_support": {
+                        geometry_label: float(value)
+                        for geometry_label, value in zip(
+                            geometry_param_labels,
+                            ntx_support_branch_gradient_np[objective_i].tolist(),
+                        )
+                    },
+                    "combined": {
+                        geometry_label: float(value)
+                        for geometry_label, value in zip(
+                            geometry_param_labels,
+                            geometry_gradient_np[objective_i].tolist(),
+                        )
+                    },
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
             "geometry_baseline_values": {
-                _format_reverse_geometry_parameter(geometry_parameter_name): float(
-                    np.asarray(jax.device_get(baseline_geometry_deltas[0]), dtype=float)
+                geometry_label: float(entry["baseline_coefficient"]) + float(delta)
+                for geometry_label, entry, delta in zip(
+                    geometry_param_labels,
+                    geometry_param_entries,
+                    np.asarray(jax.device_get(baseline_geometry_deltas), dtype=float).tolist(),
                 )
             },
+            "geometry_parameter_order": list(geometry_param_labels),
+            "geometry_parameter_specs": [
+                {"family": family, "m": int(m), "n": int(n)}
+                for family, m, n in geometry_param_specs
+            ],
+            "geometry_parameter_selector": str(geometry_parameter_name),
+            "geometry_parameter_count": int(len(geometry_param_specs)),
             "accepted_step_limit": None
             if args.accepted_step_limit is None
             else int(args.accepted_step_limit),
@@ -2872,11 +3023,52 @@ def _run_realtime_geometry_support_segment_probe(
             for parameter_name in PARAMETER_ORDER:
                 value = report["profile_gradient_reverse_ad"][objective_name][parameter_name]
                 print(f"      d{objective_name}/d{parameter_name}: ad={value:.6e}")
-        geometry_label = _format_reverse_geometry_parameter(geometry_parameter_name)
         print("[autodiff-gate] reverse geometry gradients by objective:")
+        print(
+            "[autodiff-gate] reverse geometry parameter count: "
+            f"{len(geometry_param_labels)}",
+            flush=True,
+        )
         for objective_name in OBJECTIVE_LABELS:
-            value = report["geometry_gradient_reverse_ad"][objective_name][geometry_label]
-            print(f"  - d{objective_name}/d{geometry_label}: ad={value:.6e}")
+            values_by_parameter = report["geometry_gradient_reverse_ad"][objective_name]
+            finite = report["geometry_gradient_all_finite_by_objective"][objective_name]
+            print(f"  - {objective_name}: geometry_gradient_all_finite={finite}")
+            if len(geometry_param_labels) <= int(args.reverse_geometry_print_limit):
+                for geometry_label in geometry_param_labels:
+                    value = values_by_parameter[geometry_label]
+                    branch_suffix = ""
+                    branch_payload = report["geometry_gradient_reverse_ad_by_branch"]
+                    if branch_payload is not None:
+                        geometry_value = branch_payload[objective_name]["geometry"][geometry_label]
+                        ntx_value = branch_payload[objective_name]["ntx_support"][geometry_label]
+                        branch_suffix = (
+                            f" geometry_branch={geometry_value:.6e} "
+                            f"ntx_support_branch={ntx_value:.6e}"
+                        )
+                    print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
+            else:
+                objective_values_arr = geometry_gradient_np[OBJECTIVE_LABELS.index(objective_name)]
+                top_k = int(max(1, args.reverse_geometry_print_top_k))
+                top_k = min(top_k, len(geometry_param_labels))
+                order = np.argsort(-np.abs(objective_values_arr))[:top_k]
+                print(
+                    f"      printing top {top_k} |gradient| entries "
+                    f"(full table is in JSON)",
+                    flush=True,
+                )
+                for param_i in order.tolist():
+                    geometry_label = geometry_param_labels[int(param_i)]
+                    value = values_by_parameter[geometry_label]
+                    branch_suffix = ""
+                    branch_payload = report["geometry_gradient_reverse_ad_by_branch"]
+                    if branch_payload is not None:
+                        geometry_value = branch_payload[objective_name]["geometry"][geometry_label]
+                        ntx_value = branch_payload[objective_name]["ntx_support"][geometry_label]
+                        branch_suffix = (
+                            f" geometry_branch={geometry_value:.6e} "
+                            f"ntx_support_branch={ntx_value:.6e}"
+                        )
+                    print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
         print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
         for objective_name in OBJECTIVE_LABELS:
             summary = support_bar_summary_by_objective[objective_name]
@@ -3587,7 +3779,43 @@ def main() -> None:
         default="RBC:1:0",
         help=(
             "Realtime VMEC geometry parameter used when --reverse-parameter-mode "
-            "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0."
+            "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0. "
+            "Use 'all' to pull back to all selected VMEC boundary harmonics."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-geometry-families",
+        type=str,
+        default="RBC,ZBS",
+        help=(
+            "Comma-separated harmonic families used when --reverse-geometry-parameter all. "
+            "Currently supports RBC and ZBS."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-geometry-include-zero-harmonics",
+        action="store_true",
+        help=(
+            "When --reverse-geometry-parameter all, include zero-valued boundary "
+            "harmonics as well as nonzero harmonics."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-geometry-print-limit",
+        type=int,
+        default=16,
+        help=(
+            "Print every geometry harmonic gradient only when the selected harmonic "
+            "count is at most this value; otherwise print top-k by magnitude."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-geometry-print-top-k",
+        type=int,
+        default=12,
+        help=(
+            "Number of largest-magnitude geometry harmonic gradients printed per "
+            "objective when the full selected table is too large for stdout."
         ),
     )
     parser.add_argument(
