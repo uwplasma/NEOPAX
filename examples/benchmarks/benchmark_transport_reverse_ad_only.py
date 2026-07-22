@@ -1337,6 +1337,19 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    next_reduced_bars_by_segment = [None] * segment_count
+    for segment_index in range(segment_count - 1, -1, -1):
+        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
+        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        next_reduced_bars_by_segment[segment_index] = reduced_bars
+        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
+            reverse_setup.execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+        )
+
     support_reuse_count = 0
     support_rebuild_count = 0
     for segment_index in range(segment_count - 1, -1, -1):
@@ -1352,7 +1365,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         step_support_bar_leaves = _radau_single_slot_support_cotangent_bwd_flat_batched_call(
             reverse_setup.execution_context,
             slot_cotangent_mode,
-            reduced_bars,
+            next_reduced_bars_by_segment[segment_index],
             segment_start_carry,
             slot_arrays,
             support_payload,
@@ -1361,13 +1374,32 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
         )
-        reduced_bars = _radau_segment_reduced_cotangent_bwd_batched_call(
-            reverse_setup.execution_context,
-            cotangent_mode,
-            reduced_bars,
-            segment_start_carry,
-            segment_arrays,
+
+    initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
+    build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
+    allow_initial_cache_support_pullback = cotangent_mode in {
+        "full",
+        "full_initial_cache_support_pullback",
+        "initial_cache_support_pullback",
+    }
+    initial_cache_pullback_used = False
+    initial_cache_pullback_skipped = False
+    if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
+        initial_cache_support_bars = jax.vmap(
+            lambda lagged_bar: build_support_pullback(
+                carry0.y,
+                lagged_bar,
+                support_payload,
+            )
+        )(reduced_bars.lagged_response_cache)
+        initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(support_bar_leaves, initial_cache_support_bar_leaves)
         )
+        initial_cache_pullback_used = True
+    elif initial_lagged_response_valid and build_support_pullback is not None:
+        initial_cache_pullback_skipped = True
 
     def _full_carry_bar_from_reduced(reduced_bar):
         return dataclasses.replace(
@@ -1391,6 +1423,8 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         support_bars,
         support_reuse_count,
         support_rebuild_count,
+        initial_cache_pullback_used,
+        initial_cache_pullback_skipped,
     )
 
 
@@ -2566,6 +2600,8 @@ def _run_realtime_geometry_support_segment_probe(
             support_bars,
             support_reuse_count,
             support_rebuild_count,
+            initial_cache_pullback_used,
+            initial_cache_pullback_skipped,
         ) = _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             profile_values,
             runtime=baseline_runtime,
@@ -2782,6 +2818,8 @@ def _run_realtime_geometry_support_segment_probe(
             ),
             "support_reuse_count": int(support_reuse_count),
             "support_rebuild_count": int(support_rebuild_count),
+            "support_initial_cache_pullback_used": bool(initial_cache_pullback_used),
+            "support_initial_cache_pullback_skipped": bool(initial_cache_pullback_skipped),
             "elapsed_s": float(elapsed_s),
         }
         print(
@@ -2792,6 +2830,8 @@ def _run_realtime_geometry_support_segment_probe(
             f"reverse_stage_cotangent_mode_effective={support_probe_cotangent_mode} "
             f"support_reuse_count={support_reuse_count} "
             f"support_rebuild_count={support_rebuild_count} "
+            f"support_initial_cache_pullback_used={initial_cache_pullback_used} "
+            f"support_initial_cache_pullback_skipped={initial_cache_pullback_skipped} "
             f"elapsed_s={elapsed_s:.3f}",
             flush=True,
         )
