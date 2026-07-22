@@ -1432,6 +1432,9 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         )
         for leaf_i in range(len(_zero_support_leaves))
     )
+    objective_support_bar_leaves = support_bar_leaves
+    step_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
+    initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
@@ -1473,6 +1476,10 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
         )
+        step_support_bar_leaves_accum = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(step_support_bar_leaves_accum, step_support_bar_leaves)
+        )
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
@@ -1497,6 +1504,13 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, initial_cache_support_bar_leaves)
         )
+        initial_cache_support_bar_leaves_accum = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(
+                initial_cache_support_bar_leaves_accum,
+                initial_cache_support_bar_leaves,
+            )
+        )
         initial_cache_pullback_used = True
     elif initial_lagged_response_valid and build_support_pullback is not None:
         initial_cache_pullback_skipped = True
@@ -1518,6 +1532,26 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         )
         for objective_i in range(objective_count)
     )
+    component_support_bars_by_name = {
+        "objective_explicit": tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in objective_support_bar_leaves]
+            )
+            for objective_i in range(objective_count)
+        ),
+        "transport_rhs": tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in step_support_bar_leaves_accum]
+            )
+            for objective_i in range(objective_count)
+        ),
+        "initial_cache": tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in initial_cache_support_bar_leaves_accum]
+            )
+            for objective_i in range(objective_count)
+        ),
+    }
     if combined_geometry_payload:
         geometry = support_payload["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
@@ -1538,6 +1572,16 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         initial_geometry_bars = jax.vmap(
             lambda state_bar: initial_geometry_pullback(state_bar)[0]
         )(initial_state_bars)
+        component_support_bars_by_name["initial_profile"] = tuple(
+            {
+                "geometry": _sanitize_float_delta_bar_tree(
+                    support_payload["geometry"],
+                    jax.tree_util.tree_map(lambda value: value[objective_i], initial_geometry_bars),
+                ),
+                "ntx_support": zero_payload_bar["ntx_support"],
+            }
+            for objective_i in range(objective_count)
+        )
         support_bars = tuple(
             {
                 "geometry": _sanitize_float_delta_bar_tree(
@@ -1555,6 +1599,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         objective_values,
         gradient_matrix,
         support_bars,
+        component_support_bars_by_name,
         support_reuse_count,
         support_rebuild_count,
         initial_cache_pullback_used,
@@ -2738,6 +2783,7 @@ def _run_realtime_geometry_support_segment_probe(
             objective_values,
             profile_gradient_matrix,
             support_bars,
+            support_component_bars_by_name,
             support_reuse_count,
             support_rebuild_count,
             initial_cache_pullback_used,
@@ -2750,8 +2796,8 @@ def _run_realtime_geometry_support_segment_probe(
             reverse_setup=reverse_setup,
             support_payload=support_payload,
         )
-        objective_values, profile_gradient_matrix, support_bars = jax.block_until_ready(
-            (objective_values, profile_gradient_matrix, support_bars)
+        objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name = jax.block_until_ready(
+            (objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name)
         )
         print(
             "[autodiff-gate] progress: transport reverse profile/support cotangents complete "
@@ -2842,11 +2888,18 @@ def _run_realtime_geometry_support_segment_probe(
             f"(harmonic_count={len(geometry_param_specs)})",
             flush=True,
         )
+        support_component_names = tuple(support_component_bars_by_name)
+        geometry_pullback_payload_bars = tuple(support_bars)
+        for component_name in support_component_names:
+            geometry_pullback_payload_bars = (
+                *geometry_pullback_payload_bars,
+                *tuple(support_component_bars_by_name[component_name]),
+            )
         geometry_gradient_result = geometry_payload_pullback_from_param_vector_raw_block_transpose(
             geometry_context,
             baseline_geometry_deltas,
             geometry_param_specs,
-            tuple(support_bars),
+            geometry_pullback_payload_bars,
             combined_payload=combined_geometry_payload,
             n_r=int(geom_cfg.get("n_radial", 51)),
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
@@ -2860,12 +2913,37 @@ def _run_realtime_geometry_support_segment_probe(
         )
         geometry_pullback_mode = "payload_state_raw_block_transpose"
         geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
+        objective_count = int(len(OBJECTIVE_LABELS))
+        component_gradient_matrices = {}
+        component_geometry_branch_matrices = {}
+        component_ntx_support_branch_matrices = {}
+
+        def _split_component_rows(matrix):
+            if matrix is None:
+                return None, {}
+            total_matrix = matrix[:objective_count]
+            component_matrices = {}
+            row0 = objective_count
+            for component_name in support_component_names:
+                row1 = row0 + objective_count
+                component_matrices[component_name] = matrix[row0:row1]
+                row0 = row1
+            return total_matrix, component_matrices
+
         if isinstance(geometry_gradient_result, dict):
-            geometry_gradient_matrix = geometry_gradient_result["combined"]
-            geometry_branch_gradient_matrix = geometry_gradient_result.get("geometry")
-            ntx_support_branch_gradient_matrix = geometry_gradient_result.get("ntx_support")
+            geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
+                geometry_gradient_result["combined"]
+            )
+            geometry_branch_gradient_matrix, component_geometry_branch_matrices = _split_component_rows(
+                geometry_gradient_result.get("geometry")
+            )
+            ntx_support_branch_gradient_matrix, component_ntx_support_branch_matrices = _split_component_rows(
+                geometry_gradient_result.get("ntx_support")
+            )
         else:
-            geometry_gradient_matrix = geometry_gradient_result
+            geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
+                geometry_gradient_result
+            )
             geometry_branch_gradient_matrix = None
             ntx_support_branch_gradient_matrix = None
         print(
@@ -2888,6 +2966,18 @@ def _run_realtime_geometry_support_segment_probe(
             if ntx_support_branch_gradient_matrix is None
             else np.asarray(jax.device_get(ntx_support_branch_gradient_matrix), dtype=float)
         )
+        component_gradient_np_by_name = {
+            component_name: np.asarray(jax.device_get(component_matrix), dtype=float)
+            for component_name, component_matrix in component_gradient_matrices.items()
+        }
+        component_geometry_branch_np_by_name = {
+            component_name: np.asarray(jax.device_get(component_matrix), dtype=float)
+            for component_name, component_matrix in component_geometry_branch_matrices.items()
+        }
+        component_ntx_support_branch_np_by_name = {
+            component_name: np.asarray(jax.device_get(component_matrix), dtype=float)
+            for component_name, component_matrix in component_ntx_support_branch_matrices.items()
+        }
         objective_finite_np = np.isfinite(objective_values_np)
         profile_gradient_finite_by_objective = {
             objective_name: bool(np.all(np.isfinite(profile_gradient_np[objective_i])))
@@ -2971,6 +3061,52 @@ def _run_realtime_geometry_support_segment_probe(
                             geometry_gradient_np[objective_i].tolist(),
                         )
                     },
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "geometry_gradient_reverse_ad_by_component": {
+                objective_name: {
+                    component_name: {
+                        geometry_label: float(value)
+                        for geometry_label, value in zip(
+                            geometry_param_labels,
+                            component_matrix[objective_i].tolist(),
+                        )
+                    }
+                    for component_name, component_matrix in component_gradient_np_by_name.items()
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
+            "geometry_gradient_reverse_ad_by_component_and_branch": {
+                objective_name: {
+                    component_name: {
+                        "geometry": {
+                            geometry_label: float(value)
+                            for geometry_label, value in zip(
+                                geometry_param_labels,
+                                component_geometry_branch_np_by_name.get(component_name, component_matrix)[
+                                    objective_i
+                                ].tolist(),
+                            )
+                        },
+                        "ntx_support": {
+                            geometry_label: float(value)
+                            for geometry_label, value in zip(
+                                geometry_param_labels,
+                                component_ntx_support_branch_np_by_name.get(component_name, component_matrix)[
+                                    objective_i
+                                ].tolist(),
+                            )
+                        },
+                        "combined": {
+                            geometry_label: float(value)
+                            for geometry_label, value in zip(
+                                geometry_param_labels,
+                                component_matrix[objective_i].tolist(),
+                            )
+                        },
+                    }
+                    for component_name, component_matrix in component_gradient_np_by_name.items()
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
@@ -3090,6 +3226,13 @@ def _run_realtime_geometry_support_segment_probe(
                             f"ntx_support_branch={ntx_value:.6e}"
                         )
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
+                    component_payload = report["geometry_gradient_reverse_ad_by_component"]
+                    if component_payload:
+                        component_parts = [
+                            f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
+                            for component_name in support_component_names
+                        ]
+                        print("        components: " + " ".join(component_parts))
             else:
                 objective_values_arr = geometry_gradient_np[OBJECTIVE_LABELS.index(objective_name)]
                 top_k = int(max(1, args.reverse_geometry_print_top_k))
@@ -3113,6 +3256,13 @@ def _run_realtime_geometry_support_segment_probe(
                             f"ntx_support_branch={ntx_value:.6e}"
                         )
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
+                    component_payload = report["geometry_gradient_reverse_ad_by_component"]
+                    if component_payload:
+                        component_parts = [
+                            f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
+                            for component_name in support_component_names
+                        ]
+                        print("        components: " + " ".join(component_parts))
         print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
         for objective_name in OBJECTIVE_LABELS:
             summary = support_bar_summary_by_objective[objective_name]
