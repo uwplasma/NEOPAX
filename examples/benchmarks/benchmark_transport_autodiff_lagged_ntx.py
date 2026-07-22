@@ -253,12 +253,28 @@ def _softmax_objective(er_profile: jax.Array, *, beta: float = 16.0) -> jax.Arra
     return jax.scipy.special.logsumexp(beta_arr * er_profile) / beta_arr
 
 
-def _smooth_root_proxy(er_profile: jax.Array, rho_grid: jax.Array, *, beta: float = 24.0, eps: float = 1.0e-4):
+def _smooth_root_proxy(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    *,
+    beta: float = 24.0,
+    eps: float = 1.0e-4,
+    rho_min: float = 5.0e-2,
+):
     beta_arr = jnp.asarray(beta, dtype=er_profile.dtype)
     eps_arr = jnp.asarray(eps, dtype=er_profile.dtype)
-    smooth_abs = jnp.sqrt(er_profile * er_profile + eps_arr * eps_arr)
-    weights = jnp.exp(-beta_arr * smooth_abs)
-    return jnp.sum(rho_grid * weights) / jnp.maximum(jnp.sum(weights), jnp.asarray(1.0e-30, dtype=er_profile.dtype))
+    rho = jnp.asarray(rho_grid, dtype=er_profile.dtype)
+    er = jnp.asarray(er_profile, dtype=er_profile.dtype)
+    er_scale = jnp.maximum(eps_arr, jnp.asarray(5.0e-2, dtype=er.dtype) * jnp.max(jnp.abs(er)))
+    smooth_sign = jnp.tanh(er / er_scale)
+    cell_rho = jnp.asarray(0.5, dtype=rho.dtype) * (rho[:-1] + rho[1:])
+    sign_jump = (smooth_sign[1:] - smooth_sign[:-1]) ** 2
+    valid = cell_rho >= jnp.asarray(rho_min, dtype=rho.dtype)
+    logits = jnp.where(valid, beta_arr * sign_jump, jnp.asarray(-1.0e30, dtype=er.dtype))
+    weights = jax.nn.softmax(logits)
+    has_valid = jnp.any(valid)
+    root_rho = jnp.sum(cell_rho * weights)
+    return jnp.where(has_valid, root_rho, jnp.asarray(0.0, dtype=er.dtype))
 
 
 def _volume_average(profile: jax.Array, geometry) -> jax.Array:

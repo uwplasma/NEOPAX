@@ -1087,8 +1087,6 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
 
     if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
         raise ValueError("support payload reverse probe requires --reverse-segment-length.")
-    if int(reverse_setup.reverse_segment_length) != 1:
-        raise ValueError("support payload reverse probe currently requires --reverse-segment-length 1.")
     step_bwd_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
     ).strip().lower()
@@ -1272,8 +1270,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
     if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
         raise ValueError("support payload reverse probe requires --reverse-segment-length.")
-    if int(reverse_setup.reverse_segment_length) != 1:
-        raise ValueError("support payload reverse probe currently requires --reverse-segment-length 1.")
     step_bwd_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
     ).strip().lower()
