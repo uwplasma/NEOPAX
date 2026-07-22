@@ -28,6 +28,10 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _prepare_benchmark_config,
     _truncate_rollout_trace_by_accepted_steps,
 )
+from benchmark_transport_forward_fd_lane import (  # noqa: E402
+    _accepted_dt_sequence_from_trace,
+    _solve_on_fixed_dt_sequence,
+)
 from benchmark_transport_reverse_ad_only import (  # noqa: E402
     PARAMETER_ORDER,
     _geometry_context_from_config,
@@ -142,13 +146,22 @@ def _objectives_on_realtime_geometry_frozen_trace(
         state0,
         solver_override=solver_override,
     )
-    replay = _radau_run_prepared_on_realized_trace(
-        prepared_rollout,
-        execution_context,
-        frozen_trace,
-        replay_mode=str(replay_mode).strip().lower(),
-        carry0=prepared_rollout.initial_carry,
-    )
+    replay_mode_normalized = str(replay_mode).strip().lower()
+    if replay_mode_normalized == "accepted":
+        replay = _solve_on_fixed_dt_sequence(
+            prepared_rollout,
+            execution_context,
+            _accepted_dt_sequence_from_trace(frozen_trace),
+            use_direct_accepted_step_map_debug=False,
+        )
+    else:
+        replay = _radau_run_prepared_on_realized_trace(
+            prepared_rollout,
+            execution_context,
+            frozen_trace,
+            replay_mode=replay_mode_normalized,
+            carry0=prepared_rollout.initial_carry,
+        )
     return _objective_vector(replay["final_state"], runtime), replay
 
 
@@ -356,8 +369,11 @@ def main() -> None:
     parser.add_argument(
         "--replay-mode",
         choices=("attempt", "accepted"),
-        default="attempt",
-        help="Replay the baseline realized attempt trace or only accepted times.",
+        default="accepted",
+        help=(
+            "Frozen trace replay mode. 'accepted' uses the same solver-native fixed accepted-dt "
+            "map as benchmark_transport_frozen_fd_only; 'attempt' keeps the older diagnostic trace replay."
+        ),
     )
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
     args = parser.parse_args()
