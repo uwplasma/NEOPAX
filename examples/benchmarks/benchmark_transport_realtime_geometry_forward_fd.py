@@ -196,6 +196,16 @@ def _param_unit_tangent_like(params, entry: dict[str, Any]):
 
 
 def _manual_implicit_forward_state_tangent(*, params, param_tangent, cfg, x_star, dof_mask):
+    if hasattr(im, "implicit_state_tangent_raw_block"):
+        return im.implicit_state_tangent_raw_block(
+            params,
+            cfg,
+            x_star,
+            dof_mask,
+            param_tangent,
+            probe_chunk_size=1,
+        )
+
     frozen = jax.lax.stop_gradient(x_star)
     edge_mask = im._edge_mask(cfg)
     P = im._dof_projector(cfg, dof_mask)
