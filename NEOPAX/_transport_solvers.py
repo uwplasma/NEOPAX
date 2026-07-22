@@ -4838,6 +4838,216 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
     )
 
 
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Batched reduced accepted-step bwd plus support cotangent leaves.
+
+    This keeps the geometry/support payload pullback on the same batched stage
+    adjoints used for the profile reduced cotangent, avoiding a second support-
+    only replay that can drift when iterative stage adjoints are not exact.
+    """
+
+    if support is None:
+        reduced_bars = _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
+            kernel_context,
+            physics_context,
+            context,
+            lagged_response_branch,
+            carry_in,
+            next_reduced_bars,
+        )
+        return reduced_bars, tuple()
+    if not bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
+        raise ValueError("batched reduced_cotangent reverse step bwd requires reverse_direct_stage_adjoint=True.")
+
+    def _batched_zero_tangent_tree_like(primal_tree, batch_size):
+        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (batch_size,) + jnp.asarray(leaf).shape,
+            ),
+            zero_tree,
+        )
+
+    def _add_tangent_trees(lhs, rhs, primal):
+        lhs_aligned = _radau_align_tangent_tree_to_primal(lhs, primal)
+        rhs_aligned = _radau_align_tangent_tree_to_primal(rhs, primal)
+        if lhs_aligned is None:
+            return rhs_aligned
+        if rhs_aligned is None:
+            return lhs_aligned
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
+
+    objective_count = jnp.asarray(next_reduced_bars.y).shape[0]
+    zero_support_bar = _radau_zero_support_delta_tree_like(support)
+    primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    carry_for_linear_map = dataclasses.replace(
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_for_linear_map,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+    if lagged_response is None:
+        reduced_bars = _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
+            kernel_context,
+            physics_context,
+            context,
+            lagged_response_branch,
+            carry_in,
+            next_reduced_bars,
+        )
+        zero_support_leaves = tuple(
+            jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
+            for leaf in jax.tree_util.tree_leaves(zero_support_bar)
+        )
+        return reduced_bars, zero_support_leaves
+
+    trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
+    if physics_context.project_flat is not None:
+        _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
+        trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
+
+    dz_bars = (
+        primal_result.trial_dt
+        * kernel_context.b[None, :, None]
+        * trial_y_bars[:, None, :]
+    )
+    memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
+    if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+        residual_bars = jax.vmap(
+            lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
+                rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+            )
+        )(dz_bars)
+    else:
+        residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
+        )
+
+    residual_y_bars, _, residual_lagged_bars = jax.vmap(
+        lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            residual_bar,
+            compute_dt_bar=False,
+        )
+    )(residual_bars)
+    support_bars = jax.vmap(
+        lambda residual_bar: _radau_exact_stage_residual_support_pullback(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            residual_bar,
+            support,
+        )
+    )(residual_bars)
+
+    y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
+    lagged_cache_bars = _add_tangent_trees(
+        residual_lagged_bars,
+        next_reduced_bars.lagged_response_cache,
+        carry_for_linear_map.lagged_response_cache,
+    )
+    lagged_reference_y_bars = jnp.asarray(
+        next_reduced_bars.lagged_reference_y,
+        dtype=kernel_context.dtype,
+    )
+
+    if lagged_response_branch == "rebuild":
+        if physics_context.pullback_build_lagged_response is None:
+            raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        zero_rebuild_pullback = cotangent_mode in {
+            "zero_rebuild_pullback",
+            "zero_lagged_rebuild",
+            "rebuild_pullback_zero",
+        }
+        if zero_rebuild_pullback:
+            rebuild_flat_bars = jnp.zeros_like(y_bars)
+        else:
+            projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+            rebuild_state = physics_context.unpack_flat(projected_y)
+            rebuild_state_bars = jax.vmap(
+                lambda lagged_cache_bar: physics_context.pullback_build_lagged_response(
+                    rebuild_state,
+                    lagged_cache_bar,
+                    reverse_stage_cotangent_mode=cotangent_mode,
+                )
+            )(lagged_cache_bars)
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
+        y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
+
+        if physics_context.flat_rhs_build_support_pullback is not None and not zero_rebuild_pullback:
+            rebuild_support_bars = jax.vmap(
+                lambda lagged_cache_bar: physics_context.flat_rhs_build_support_pullback(
+                    carry_in.y,
+                    lagged_cache_bar,
+                    support,
+                )
+            )(lagged_cache_bars)
+            support_bars = _radau_add_support_delta_trees(
+                support_bars,
+                rebuild_support_bars,
+                support,
+            )
+        lagged_cache_bars = _batched_zero_tangent_tree_like(
+            carry_in.lagged_response_cache,
+            objective_count,
+        )
+        lagged_reference_y_bars = jnp.zeros(
+            (objective_count,) + jnp.shape(carry_in.lagged_reference_y),
+            dtype=jnp.asarray(carry_in.lagged_reference_y).dtype,
+        )
+
+    support_bars = _radau_sanitize_support_delta_bar_tree(support, support_bars)
+    return (
+        _RadauAcceptedStepReducedCotangent(
+            y=y_bars,
+            lagged_response_cache=lagged_cache_bars,
+            lagged_reference_y=lagged_reference_y_bars,
+        ),
+        tuple(jax.tree_util.tree_leaves(support_bars)),
+    )
+
+
 @partial(jax.jit, static_argnums=(0, 1), inline=False)
 def _radau_segment_reduced_cotangent_bwd_call(
     execution_context: _RadauSolveExecutionContext,
@@ -5464,6 +5674,140 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_slot_next_call(
         reverse=True,
     )
     return segment_start_reduced_bars, step_start_carries, slot_next_reduced_bars
+
+
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    segment_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    segment_start_carry: _RadauAcceptedStepCarry,
+    segment_arrays,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Grouped segment reverse plus accumulated batched support cotangent leaves."""
+
+    def _zero_reduced_cotangent_like(carry_value):
+        objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+
+        def _batched_zero_tangent_tree_like(primal_tree):
+            zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+            return jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                ),
+                zero_tree,
+            )
+
+        return _RadauAcceptedStepReducedCotangent(
+            y=jnp.zeros((objective_count,) + jnp.shape(carry_value.y), dtype=jnp.asarray(carry_value.y).dtype),
+            lagged_response_cache=_batched_zero_tangent_tree_like(carry_value.lagged_response_cache),
+            lagged_reference_y=jnp.zeros(
+                (objective_count,) + jnp.shape(carry_value.lagged_reference_y),
+                dtype=jnp.asarray(carry_value.lagged_reference_y).dtype,
+            ),
+        )
+
+    def _segment_collect_start_carries(carry, slot_xs):
+        next_carry, _ = _radau_replay_realized_accepted_slot(
+            execution_context,
+            carry,
+            *slot_xs,
+        )
+        return next_carry, carry
+
+    _, step_start_carries = jax.lax.scan(
+        _segment_collect_start_carries,
+        segment_start_carry,
+        segment_arrays,
+    )
+    mode = str(cotangent_mode).strip().lower()
+    zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+    force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
+    force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+    zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support)))
+    objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+    zero_support_bar_leaves = tuple(
+        jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
+        for leaf in zero_support_leaves
+    )
+
+    def _slot_bwd(carry, slot_xs):
+        slot_reduced_bars, support_bar_leaves = carry
+        step_start_carry, slot_arrays = slot_xs
+        if zero_step_bwd:
+            return (_zero_reduced_cotangent_like(step_start_carry), support_bar_leaves), None
+
+        (
+            active,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = slot_arrays
+
+        def _do_step_bwd(_):
+            carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
+            residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+
+            def _reuse_branch(_):
+                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "reuse",
+                    residual_carry,
+                    slot_reduced_bars,
+                    support,
+                )
+
+            def _rebuild_branch(_):
+                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    "rebuild",
+                    residual_carry,
+                    slot_reduced_bars,
+                    support,
+                )
+
+            if force_reuse_bwd:
+                return _reuse_branch(None)
+            if force_rebuild_bwd:
+                return _rebuild_branch(None)
+            return jax.lax.cond(
+                residual_carry.lagged_response_valid,
+                _reuse_branch,
+                _rebuild_branch,
+                operand=None,
+            )
+
+        def _skip_bwd(_):
+            return slot_reduced_bars, zero_support_bar_leaves
+
+        step_start_reduced_bars, step_support_bar_leaves = jax.lax.cond(
+            active,
+            _do_step_bwd,
+            _skip_bwd,
+            operand=None,
+        )
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
+        )
+        return (step_start_reduced_bars, support_bar_leaves), None
+
+    (segment_start_reduced_bars, segment_support_bar_leaves), _ = jax.lax.scan(
+        _slot_bwd,
+        (segment_reduced_bars, zero_support_bar_leaves),
+        (step_start_carries, segment_arrays),
+        reverse=True,
+    )
+    return segment_start_reduced_bars, segment_support_bar_leaves
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)

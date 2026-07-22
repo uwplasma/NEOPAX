@@ -67,11 +67,10 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_add_support_delta_trees,
     _radau_replay_realized_accepted_slot,
     _radau_segment_reduced_cotangent_bwd_batched_call,
-    _radau_segment_reduced_cotangent_bwd_batched_with_slot_next_call,
+    _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_segment_reduced_cotangent_bwd_call,
     _radau_segment_reduced_cotangent_bwd_with_support_call,
     _radau_single_slot_support_cotangent_bwd_call,
-    _radau_single_slot_support_cotangent_bwd_flat_batched_call,
     _radau_zero_support_delta_tree_like,
 )
 
@@ -1246,7 +1245,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     profile_cfg: dict,
     reverse_setup: _ReverseStaticSetup,
     support_payload,
-    support_bwd_mode: str = "batched",
 ):
     """Return all objective values, profile gradients, and realtime support cotangents.
 
@@ -1389,138 +1387,10 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
 
-    support_bwd_mode = str(support_bwd_mode).strip().lower()
-    if support_bwd_mode not in {"batched", "fused_per_objective"}:
-        raise ValueError(f"Unknown realtime geometry support bwd mode: {support_bwd_mode!r}")
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
-
-    if support_bwd_mode == "fused_per_objective":
-        objective_support_bars = []
-        profile_gradient_rows = []
-        initial_state_bar_rows = []
-        support_reuse_count = 0
-        support_rebuild_count = 0
-        initial_cache_pullback_used = False
-        initial_cache_pullback_skipped = False
-        for objective_i in range(objective_count):
-            reduced_bar = _RadauAcceptedStepReducedCotangent(
-                y=final_y_bars[objective_i],
-                lagged_response_cache=_radau_align_tangent_tree_to_primal(
-                    None,
-                    segmented_final_carry.lagged_response_cache,
-                ),
-                lagged_reference_y=jnp.zeros_like(segmented_final_carry.lagged_reference_y),
-            )
-            support_bar = objective_payload_bar_rows[objective_i]
-            objective_reuse_count = 0
-            objective_rebuild_count = 0
-            for segment_index in range(segment_count - 1, -1, -1):
-                segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
-                segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-                reduced_bar, segment_support_bar = _radau_segment_reduced_cotangent_bwd_with_support_call(
-                    reverse_setup.execution_context,
-                    cotangent_mode,
-                    reduced_bar,
-                    segment_start_carry,
-                    segment_arrays,
-                    support_payload,
-                )
-                support_bar = _radau_add_support_delta_trees(support_bar, segment_support_bar, support_payload)
-                segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
-                objective_reuse_count += int(np.count_nonzero(segment_lagged_valid))
-                objective_rebuild_count += int(
-                    segment_lagged_valid.size - np.count_nonzero(segment_lagged_valid)
-                )
-
-            initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
-            build_support_pullback = (
-                reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
-            )
-            allow_initial_cache_support_pullback = cotangent_mode in {
-                "full",
-                "full_initial_cache_support_pullback",
-                "initial_cache_support_pullback",
-            }
-            if (
-                initial_lagged_response_valid
-                and build_support_pullback is not None
-                and allow_initial_cache_support_pullback
-            ):
-                initial_cache_support_bar = build_support_pullback(
-                    carry0.y,
-                    reduced_bar.lagged_response_cache,
-                    support_payload,
-                )
-                support_bar = _radau_add_support_delta_trees(
-                    support_bar,
-                    initial_cache_support_bar,
-                    support_payload,
-                )
-                initial_cache_pullback_used = True
-            elif initial_lagged_response_valid and build_support_pullback is not None:
-                initial_cache_pullback_skipped = True
-
-            carry0_bar = dataclasses.replace(
-                jax.tree_util.tree_map(_zero_tangent_like, carry0),
-                y=reduced_bar.y,
-                lagged_response_cache=reduced_bar.lagged_response_cache,
-                lagged_reference_y=reduced_bar.lagged_reference_y,
-            )
-            initial_state_bar = initial_state_pullback(carry0_bar)[0]
-            initial_state_bar_rows.append(initial_state_bar)
-            profile_gradient_rows.append(profile_state_pullback(initial_state_bar)[0])
-            objective_support_bars.append(support_bar)
-            support_reuse_count = max(support_reuse_count, objective_reuse_count)
-            support_rebuild_count = max(support_rebuild_count, objective_rebuild_count)
-
-        support_bars = tuple(objective_support_bars)
-        gradient_matrix = jnp.stack(profile_gradient_rows, axis=0)
-        component_support_bars_by_name = {}
-        if combined_geometry_payload:
-            geometry = support_payload["geometry"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _initial_state_from_geometry_delta(geometry_delta):
-                runtime_with_geometry = dataclasses.replace(
-                    runtime,
-                    geometry=_add_float_delta_tree(geometry, geometry_delta),
-                )
-                return _initial_state_for_parameter_vector(
-                    parameter_values,
-                    baseline_state=baseline_state,
-                    profile_cfg=profile_cfg,
-                    runtime=runtime_with_geometry,
-                )
-
-            _, initial_geometry_pullback = jax.vjp(_initial_state_from_geometry_delta, geometry_delta0)
-            initial_geometry_bars = tuple(
-                initial_geometry_pullback(initial_state_bar)[0]
-                for initial_state_bar in initial_state_bar_rows
-            )
-            support_bars = tuple(
-                {
-                    "geometry": _sanitize_float_delta_bar_tree(
-                        support_payload["geometry"],
-                        _add_float_delta_tree(support_bar["geometry"], initial_geometry_bar),
-                    ),
-                    "ntx_support": support_bar["ntx_support"],
-                }
-                for support_bar, initial_geometry_bar in zip(support_bars, initial_geometry_bars)
-            )
-
-        return (
-            objective_values,
-            gradient_matrix,
-            support_bars,
-            component_support_bars_by_name,
-            support_reuse_count,
-            support_rebuild_count,
-            initial_cache_pullback_used,
-            initial_cache_pullback_skipped,
-        )
 
     reduced_bars = _RadauAcceptedStepReducedCotangent(
         y=final_y_bars,
@@ -1556,42 +1426,27 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     for segment_index in range(segment_count - 1, -1, -1):
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-        reduced_bars, step_start_carries, slot_next_reduced_bars = (
-            _radau_segment_reduced_cotangent_bwd_batched_with_slot_next_call(
+        reduced_bars, segment_support_bar_leaves = (
+            _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                 reverse_setup.execution_context,
                 cotangent_mode,
                 reduced_bars,
                 segment_start_carry,
                 segment_arrays,
-            )
-        )
-        segment_slot_count = int(jax.tree_util.tree_leaves(segment_arrays)[0].shape[0])
-        for slot_index in range(segment_slot_count - 1, -1, -1):
-            step_start_carry = _take_tree_axis0(step_start_carries, slot_index)
-            slot_arrays = _take_tree_axis0(segment_arrays, slot_index)
-            slot_next_reduced_bar = _take_tree_axis0(slot_next_reduced_bars, slot_index)
-            slot_lagged_response_valid = bool(
-                np.asarray(jax.device_get(step_start_carry.lagged_response_valid))
-            )
-            slot_cotangent_mode = "force_reuse_bwd" if slot_lagged_response_valid else "force_rebuild_bwd"
-            support_reuse_count += int(slot_lagged_response_valid)
-            support_rebuild_count += int(not slot_lagged_response_valid)
-            step_support_bar_leaves = _radau_single_slot_support_cotangent_bwd_flat_batched_call(
-                reverse_setup.execution_context,
-                slot_cotangent_mode,
-                slot_next_reduced_bar,
-                step_start_carry,
-                slot_arrays,
                 support_payload,
             )
-            support_bar_leaves = tuple(
-                accumulated + increment
-                for accumulated, increment in zip(support_bar_leaves, step_support_bar_leaves)
-            )
-            step_support_bar_leaves_accum = tuple(
-                accumulated + increment
-                for accumulated, increment in zip(step_support_bar_leaves_accum, step_support_bar_leaves)
-            )
+        )
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(support_bar_leaves, segment_support_bar_leaves)
+        )
+        step_support_bar_leaves_accum = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(step_support_bar_leaves_accum, segment_support_bar_leaves)
+        )
+        segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
+        support_reuse_count += int(np.count_nonzero(segment_lagged_valid))
+        support_rebuild_count += int(segment_lagged_valid.size - np.count_nonzero(segment_lagged_valid))
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
@@ -2907,7 +2762,6 @@ def _run_realtime_geometry_support_segment_probe(
             profile_cfg=profile_cfg,
             reverse_setup=reverse_setup,
             support_payload=support_payload,
-            support_bwd_mode=args.realtime_geometry_support_bwd_mode,
         )
         objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name = jax.block_until_ready(
             (objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name)
@@ -3260,7 +3114,7 @@ def _run_realtime_geometry_support_segment_probe(
             ),
             "realtime_geometry_derivative_complete": bool(combined_geometry_payload),
             "geometry_support_pullback_mode": geometry_pullback_mode,
-            "realtime_geometry_support_bwd_mode": str(args.realtime_geometry_support_bwd_mode),
+            "realtime_geometry_support_bwd_mode": "grouped_batched_fused_support",
             "realtime_geometry_diagnostics": realtime_geometry_diagnostics,
             "support_payload_summary": support_summary,
             "support_bar_summary_by_objective": support_bar_summary_by_objective,
@@ -3279,7 +3133,7 @@ def _run_realtime_geometry_support_segment_probe(
             "parameter_mode=profiles_plus_realtime_geometry "
             f"realtime_geometry_gradient_path={args.realtime_geometry_gradient_path} "
             "objective=all "
-            f"realtime_geometry_support_bwd_mode={args.realtime_geometry_support_bwd_mode} "
+            "realtime_geometry_support_bwd_mode=grouped_batched_fused_support "
             f"reverse_stage_cotangent_mode_effective={support_probe_cotangent_mode} "
             f"support_reuse_count={support_reuse_count} "
             f"support_rebuild_count={support_rebuild_count} "
@@ -4153,19 +4007,6 @@ def main() -> None:
             "'reverse_payload' runs the same realized-schedule reduced reverse "
             "replay with a combined runtime.geometry + NTX-support payload, then "
             "contracts that payload back to the selected VMEC harmonic."
-        ),
-    )
-    parser.add_argument(
-        "--realtime-geometry-support-bwd-mode",
-        type=str,
-        default="batched",
-        choices=("batched", "fused_per_objective"),
-        help=(
-            "Support-payload reverse implementation for realtime geometry with "
-            "--objective all. 'batched' is the fast multi-objective path with "
-            "component attribution. 'fused_per_objective' uses the older fused "
-            "segment reduced-cotangent+support pullback one objective at a time "
-            "as a correctness reference."
         ),
     )
     parser.add_argument(
