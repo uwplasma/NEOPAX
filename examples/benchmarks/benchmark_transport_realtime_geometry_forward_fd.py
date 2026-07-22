@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import inspect
 import json
@@ -45,7 +46,11 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_runtime_context_for_geometry_param,
     build_runtime_context_for_vmec_state,
 )
-from NEOPAX._orchestrator import build_runtime_context, prepare_transport_solver_components  # noqa: E402
+from NEOPAX._orchestrator import (  # noqa: E402
+    _execution_device_context,
+    build_runtime_context,
+    prepare_transport_solver_components,
+)
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
@@ -393,6 +398,9 @@ def main() -> None:
         ntx_exact_derivative_mode="direct",
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    device_context = _execution_device_context(config)
+    device_context.__enter__()
+    atexit.register(lambda: device_context.__exit__(None, None, None))
     profile_cfg = _baseline_profile_cfg(config)
     parameter_name = str(args.parameter)
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
