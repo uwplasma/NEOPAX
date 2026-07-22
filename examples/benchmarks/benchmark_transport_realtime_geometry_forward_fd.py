@@ -431,6 +431,7 @@ def main() -> None:
 
     if parameter_is_profile:
         parameter_kind = "profile"
+        fixed_final_state_geometry_fd = None
         param_index = PARAMETER_ORDER.index(parameter_name)
         baseline_value = float(profile_cfg[parameter_name])
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
@@ -486,6 +487,30 @@ def main() -> None:
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
         )
+        print(
+            "[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic",
+            flush=True,
+        )
+        if geometry_fd_lane == "frozen_linearized":
+            minus_runtime_fixed, _ = _runtime_for_frozen_linearized_geometry_step(
+                config,
+                frozen_linearized_bundle,
+                step_scale=(baseline_value - h) - baseline_value,
+                fixed_initial_er=fixed_initial_er,
+            )
+            plus_runtime_fixed, _ = _runtime_for_frozen_linearized_geometry_step(
+                config,
+                frozen_linearized_bundle,
+                step_scale=(baseline_value + h) - baseline_value,
+                fixed_initial_er=fixed_initial_er,
+            )
+        else:
+            minus_runtime_fixed, _ = _runtime_for_geometry_delta(config, parameter_name, baseline_value - h)
+            plus_runtime_fixed, _ = _runtime_for_geometry_delta(config, parameter_name, baseline_value + h)
+        fixed_final_state_geometry_fd = (
+            _objective_vector(_baseline_final_state, plus_runtime_fixed)
+            - _objective_vector(_baseline_final_state, minus_runtime_fixed)
+        ) / (2.0 * h)
         print("[autodiff-gate] progress: running realtime geometry fd_plus replay", flush=True)
         plus_objectives, plus_replay = _geometry_fd_objectives(
             config=config,
@@ -500,11 +525,18 @@ def main() -> None:
             fixed_initial_er=fixed_initial_er,
         )
 
-    minus_objectives, plus_objectives = jax.block_until_ready((minus_objectives, plus_objectives))
+    minus_objectives, plus_objectives, fixed_final_state_geometry_fd = jax.block_until_ready(
+        (minus_objectives, plus_objectives, fixed_final_state_geometry_fd)
+    )
     gradient_fd = (plus_objectives - minus_objectives) / (2.0 * h)
     gradient_fd = jax.block_until_ready(gradient_fd)
     gradient_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
     baseline_np = np.asarray(jax.device_get(baseline_objectives), dtype=float)
+    fixed_final_state_geometry_fd_np = (
+        None
+        if fixed_final_state_geometry_fd is None
+        else np.asarray(jax.device_get(fixed_final_state_geometry_fd), dtype=float)
+    )
 
     report = {
         "mode": "transport_realtime_geometry_forward_fd",
@@ -527,6 +559,9 @@ def main() -> None:
         "objective_labels": list(OBJECTIVE_LABELS),
         "objective_values": baseline_np.tolist(),
         "gradient_fd": gradient_np.tolist(),
+        "fixed_final_state_objective_geometry_fd": None
+        if fixed_final_state_geometry_fd_np is None
+        else fixed_final_state_geometry_fd_np.tolist(),
         "baseline_rollout": _adaptive_rollout_diagnostics(baseline_rollout),
         "minus_replay": {
             "final_state_finite": _tree_all_finite(minus_replay["final_state"]),
@@ -549,6 +584,10 @@ def main() -> None:
     print("[autodiff-gate] objective finite-difference gradients:")
     for label, value in zip(OBJECTIVE_LABELS, gradient_np.tolist()):
         print(f"  - {label}: fd={float(value):.6e}")
+    if fixed_final_state_geometry_fd_np is not None:
+        print("[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:")
+        for label, value in zip(OBJECTIVE_LABELS, fixed_final_state_geometry_fd_np.tolist()):
+            print(f"  - {label}: fd_explicit_geometry={float(value):.6e}")
 
     outpath = _report_path(parameter_name)
     outpath.write_text(json.dumps(report, indent=2))
