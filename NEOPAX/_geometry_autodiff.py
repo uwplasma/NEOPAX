@@ -4016,7 +4016,10 @@ def _traceable_vmec_field_tables_from_state(context: GeometryAutodiffContext, st
 
     bsubu_out = filter_covariant_jax(fields.bsubu)
     bsubv_out = filter_covariant_jax(fields.bsubv)
-    bmag = jnp.sqrt(2.0 * jnp.abs(jnp.asarray(fields.total_pressure) - jnp.asarray(fields.pressure)[:, None, None]))
+    pressure = jnp.asarray(fields.pressure)
+    bsq = 2.0 * (jnp.asarray(fields.total_pressure) - pressure[:, None, None])
+    tiny = jnp.asarray(jnp.finfo(pressure.dtype).tiny, dtype=pressure.dtype)
+    bmag = jnp.sqrt(jnp.maximum(bsq, tiny))
     gmnc = wrout_cos_coeffs_jax(jacobian.sqrt_g)
     bmnc = wrout_cos_coeffs_jax(bmag)
     bsupumnc = wrout_cos_coeffs_jax(fields.bsupu)
