@@ -4485,7 +4485,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
     def _print_state_bar_batch_finiteness(label, state_bar_batch_value):
         if progress_label is None:
-            return
+            return True
         leaves = jax.tree_util.tree_leaves(state_bar_batch_value)
         first_bad = None
         total_l2_sq = 0.0
@@ -4513,6 +4513,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             f"{label}_state_bar_first_nonfinite={first_bad}",
             flush=True,
         )
+        return all_finite
 
     def _zero_state_bar_batch():
         return jax.tree_util.tree_map(
@@ -4522,6 +4523,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
     def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
         payload_template = payload_fn(state)
+        payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
         payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
         float_leaf_indices = tuple(
             leaf_i
@@ -4594,7 +4596,48 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             _single_state_bar_from_payload_bars,
             batched_payload_float_bars,
         )
-        _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
+        branch_all_finite = _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
+        if (
+            progress_label is not None
+            and branch_name == "ntx_support"
+            and not branch_all_finite
+        ):
+            print(
+                f"{progress_label} isolating first nonfinite ntx_support payload leaf",
+                flush=True,
+            )
+            for leaf_i in active_float_leaf_indices:
+                path, template_leaf = payload_template_paths_and_leaves[leaf_i]
+                leaf_bars = jnp.stack(
+                    [
+                        jnp.asarray(
+                            payload_bar_leaves_by_objective[objective_i][leaf_i],
+                            dtype=jnp.asarray(template_leaf).dtype,
+                        )
+                        for objective_i in range(len(branch_bars))
+                    ],
+                    axis=0,
+                )
+
+                def single_payload_leaf_from_state(state_inner, leaf_index=leaf_i):
+                    return jnp.asarray(jax.tree_util.tree_leaves(payload_fn(state_inner))[leaf_index])
+
+                _leaf_baseline, single_leaf_pullback = jax.vjp(single_payload_leaf_from_state, state)
+                del _leaf_baseline
+                single_state_bar_batch = jax.lax.map(
+                    lambda leaf_bar: single_leaf_pullback(leaf_bar)[0],
+                    leaf_bars,
+                )
+                leaf_all_finite = _print_state_bar_batch_finiteness(
+                    f"ntx_support_leaf_{leaf_i}",
+                    single_state_bar_batch,
+                )
+                print(
+                    f"{progress_label} ntx_support_leaf_{leaf_i}_path={path}",
+                    flush=True,
+                )
+                if not leaf_all_finite:
+                    break
         return state_bar_batch_value
 
     if combined_payload:
