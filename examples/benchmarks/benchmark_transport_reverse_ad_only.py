@@ -2544,6 +2544,7 @@ def _run_realtime_geometry_support_segment_probe(
     neoclassical_cfg: dict[str, Any],
 ):
     combined_geometry_payload = str(args.realtime_geometry_gradient_path) == "reverse_payload"
+    ntx_surface_backend = str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz"))
     ntx_support_payload = _find_ntx_support_payload(baseline_runtime)
     support_payload = (
         {"geometry": baseline_runtime.geometry, "ntx_support": ntx_support_payload}
@@ -2572,6 +2573,11 @@ def _run_realtime_geometry_support_segment_probe(
     if args.objective == "all":
         early_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         print("[autodiff-gate] realtime geometry pre-reverse diagnostics:")
+        print(
+            "[autodiff-gate] realtime geometry NTX surface backend: "
+            f"{ntx_surface_backend}",
+            flush=True,
+        )
         for field_name in ("a_b", "R0", "r_grid", "Vprime", "Vprime_half", "overVprime", "integrated_volume"):
             if field_name not in early_geometry_diagnostics:
                 continue
@@ -2674,7 +2680,7 @@ def _run_realtime_geometry_support_segment_probe(
                     n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
                     n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
                     n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                    surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+                    surface_backend=ntx_surface_backend,
                     max_iter=geom_cfg.get("vmec_max_iter"),
                     step_size=geom_cfg.get("vmec_step_size"),
                     jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
@@ -2688,7 +2694,7 @@ def _run_realtime_geometry_support_segment_probe(
                 n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
                 n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
                 n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+                surface_backend=ntx_surface_backend,
                 max_iter=geom_cfg.get("vmec_max_iter"),
                 step_size=geom_cfg.get("vmec_step_size"),
                 jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
@@ -2710,7 +2716,7 @@ def _run_realtime_geometry_support_segment_probe(
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
             n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-            surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+            surface_backend=ntx_surface_backend,
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] realtime geometry payload pullback:",

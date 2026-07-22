@@ -4153,6 +4153,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
     n_zeta: int,
     n_xi: int,
     surface_backend: str = "booz",
+    progress_label: str | None = None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -4232,7 +4233,17 @@ def build_ntx_exact_lij_support_from_vmec_state(
         return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
 
     surface_backend_key = str(surface_backend).strip().lower()
+    if progress_label is not None:
+        print(
+            f"{progress_label} ntx_surface_backend={surface_backend_key}",
+            flush=True,
+        )
     if surface_backend_key in {"vmec", "vmec_jax"}:
+        if progress_label is not None:
+            print(
+                f"{progress_label} ntx_surface_branch=vmec_traceable",
+                flush=True,
+            )
         center_surfaces = _traceable_vmec_surfaces_from_state(
             context,
             state,
@@ -4244,12 +4255,17 @@ def build_ntx_exact_lij_support_from_vmec_state(
             s_values=_positive_transport_s_values(rho_face_sample),
         )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
+        if progress_label is not None:
+            print(
+                f"{progress_label} ntx_surface_branch=booz_traceable",
+                flush=True,
+            )
         center_surfaces = _surfaces_from_vmec_jax_state(
             state=state,
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=center_s_values,
+            s_values=_positive_transport_s_values(rho_center_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4259,7 +4275,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=face_s_values,
+            s_values=_positive_transport_s_values(rho_face_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4388,6 +4404,7 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_state(
     n_zeta: int,
     n_xi: int,
     surface_backend: str = "booz",
+    progress_label: str | None = None,
 ):
     """Build the realtime transport geometry payload from an already-solved VMEC state."""
 
@@ -4461,6 +4478,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             n_zeta=int(n_zeta),
             n_xi=int(n_xi),
             surface_backend=str(surface_backend),
+            progress_label=progress_label,
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
