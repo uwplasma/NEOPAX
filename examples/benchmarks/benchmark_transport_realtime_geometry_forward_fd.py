@@ -31,10 +31,6 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     _prepare_benchmark_config,
     _truncate_rollout_trace_by_accepted_steps,
 )
-from benchmark_transport_forward_fd_lane import (  # noqa: E402
-    _accepted_dt_sequence_from_trace,
-    _solve_on_fixed_dt_sequence,
-)
 from benchmark_transport_reverse_ad_only import (  # noqa: E402
     PARAMETER_ORDER,
     _geometry_context_from_config,
@@ -56,6 +52,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
     _radau_adaptive_schedule_rollout,
+    _radau_forward_fd_run_prepared_on_realized_trace,
     _radau_run_prepared_on_realized_trace,
 )
 from vmex.core import implicit as im  # noqa: E402
@@ -153,11 +150,12 @@ def _objectives_on_realtime_geometry_frozen_trace(
     )
     replay_mode_normalized = str(replay_mode).strip().lower()
     if replay_mode_normalized == "accepted":
-        replay = _solve_on_fixed_dt_sequence(
+        replay = _radau_forward_fd_run_prepared_on_realized_trace(
             prepared_rollout,
             execution_context,
-            _accepted_dt_sequence_from_trace(frozen_trace),
-            use_direct_accepted_step_map_debug=False,
+            frozen_trace,
+            replay_mode="accepted",
+            carry0=prepared_rollout.initial_carry,
         )
     else:
         replay = _radau_run_prepared_on_realized_trace(
