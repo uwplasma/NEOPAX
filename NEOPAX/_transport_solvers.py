@@ -4965,15 +4965,22 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             compute_dt_bar=False,
         )
     )(residual_bars)
-    support_bars = jax.vmap(
-        lambda residual_bar: _radau_exact_stage_residual_support_pullback(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-            lagged_response,
-            residual_bar,
-            support,
+    support_bar_leaves = jax.vmap(
+        lambda residual_bar: tuple(
+            jax.tree_util.tree_leaves(
+                _radau_sanitize_support_delta_bar_tree(
+                    support,
+                    _radau_exact_stage_residual_support_pullback(
+                        kernel_context,
+                        physics_context,
+                        carry_in,
+                        primal_result,
+                        lagged_response,
+                        residual_bar,
+                        support,
+                    ),
+                )
+            )
         )
     )(residual_bars)
 
@@ -5016,17 +5023,26 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
 
         if physics_context.flat_rhs_build_support_pullback is not None and not zero_rebuild_pullback:
-            rebuild_support_bars = jax.vmap(
-                lambda lagged_cache_bar: physics_context.flat_rhs_build_support_pullback(
-                    carry_in.y,
-                    lagged_cache_bar,
-                    support,
+            rebuild_support_bar_leaves = jax.vmap(
+                lambda lagged_cache_bar: tuple(
+                    jax.tree_util.tree_leaves(
+                        _radau_sanitize_support_delta_bar_tree(
+                            support,
+                            physics_context.flat_rhs_build_support_pullback(
+                                carry_in.y,
+                                lagged_cache_bar,
+                                support,
+                            ),
+                        )
+                    )
                 )
             )(lagged_cache_bars)
-            support_bars = _radau_add_support_delta_trees(
-                support_bars,
-                rebuild_support_bars,
-                support,
+            support_bar_leaves = tuple(
+                stage_leaf + rebuild_leaf
+                for stage_leaf, rebuild_leaf in zip(
+                    support_bar_leaves,
+                    rebuild_support_bar_leaves,
+                )
             )
         lagged_cache_bars = _batched_zero_tangent_tree_like(
             carry_in.lagged_response_cache,
@@ -5037,14 +5053,13 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             dtype=jnp.asarray(carry_in.lagged_reference_y).dtype,
         )
 
-    support_bars = _radau_sanitize_support_delta_bar_tree(support, support_bars)
     return (
         _RadauAcceptedStepReducedCotangent(
             y=y_bars,
             lagged_response_cache=lagged_cache_bars,
             lagged_reference_y=lagged_reference_y_bars,
         ),
-        tuple(jax.tree_util.tree_leaves(support_bars)),
+        support_bar_leaves,
     )
 
 
