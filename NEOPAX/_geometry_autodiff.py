@@ -4465,6 +4465,37 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
 
+    def _print_state_bar_batch_finiteness(label, state_bar_batch_value):
+        if progress_label is None:
+            return
+        leaves = jax.tree_util.tree_leaves(state_bar_batch_value)
+        first_bad = None
+        total_l2_sq = 0.0
+        all_finite = True
+        for leaf_i, leaf in enumerate(leaves):
+            arr = np.asarray(jax.device_get(leaf))
+            if not np.issubdtype(arr.dtype, np.inexact):
+                continue
+            finite = np.isfinite(arr)
+            if not bool(np.all(finite)):
+                all_finite = False
+                if first_bad is None:
+                    bad = np.argwhere(~finite)
+                    first_bad = {
+                        "leaf": int(leaf_i),
+                        "shape": tuple(int(v) for v in arr.shape),
+                        "index": None if bad.size == 0 else tuple(int(v) for v in bad[0]),
+                    }
+            finite_values = arr[finite]
+            if finite_values.size:
+                total_l2_sq += float(np.sum(finite_values * finite_values))
+        print(
+            f"{progress_label} {label}_state_bar_l2={total_l2_sq**0.5:.6e} "
+            f"{label}_state_bar_all_finite={all_finite} "
+            f"{label}_state_bar_first_nonfinite={first_bad}",
+            flush=True,
+        )
+
     def _zero_state_bar_batch():
         return jax.tree_util.tree_map(
             lambda leaf: jnp.broadcast_to(leaf[None, ...], (len(payload_bars),) + leaf.shape),
@@ -4541,10 +4572,12 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         def _single_state_bar_from_payload_bars(payload_bar_leaves):
             return payload_float_pullback(tuple(payload_bar_leaves))[0]
 
-        return jax.lax.map(
+        state_bar_batch_value = jax.lax.map(
             _single_state_bar_from_payload_bars,
             batched_payload_float_bars,
         )
+        _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
+        return state_bar_batch_value
 
     if combined_payload:
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
@@ -4564,12 +4597,14 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             geometry_state_bar_batch,
             support_state_bar_batch,
         )
+        _print_state_bar_batch_finiteness("combined", state_bar_batch)
     else:
         state_bar_batch = _state_bar_batch_from_payload_branch(
             "ntx_support",
             ntx_support_from_state,
             tuple(payload_bars),
         )
+        _print_state_bar_batch_finiteness("combined", state_bar_batch)
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,
@@ -4578,6 +4613,34 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         state_bar_batch,
         probe_chunk_size=1,
     )
+    if progress_label is not None:
+        param_bar_leaves = jax.tree_util.tree_leaves(param_bar_batch)
+        first_bad = None
+        total_l2_sq = 0.0
+        all_finite = True
+        for leaf_i, leaf in enumerate(param_bar_leaves):
+            arr = np.asarray(jax.device_get(leaf))
+            if not np.issubdtype(arr.dtype, np.inexact):
+                continue
+            finite = np.isfinite(arr)
+            if not bool(np.all(finite)):
+                all_finite = False
+                if first_bad is None:
+                    bad = np.argwhere(~finite)
+                    first_bad = {
+                        "leaf": int(leaf_i),
+                        "shape": tuple(int(v) for v in arr.shape),
+                        "index": None if bad.size == 0 else tuple(int(v) for v in bad[0]),
+                    }
+            finite_values = arr[finite]
+            if finite_values.size:
+                total_l2_sq += float(np.sum(finite_values * finite_values))
+        print(
+            f"{progress_label} raw_block_param_bar_l2={total_l2_sq**0.5:.6e} "
+            f"raw_block_param_bar_all_finite={all_finite} "
+            f"raw_block_param_bar_first_nonfinite={first_bad}",
+            flush=True,
+        )
     return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
 
 
