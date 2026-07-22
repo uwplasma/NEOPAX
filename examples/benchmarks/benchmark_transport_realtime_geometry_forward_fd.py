@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -369,7 +370,15 @@ def main() -> None:
     parser.add_argument("--fd-rel-step", type=float, default=3.0e-7)
     parser.add_argument("--fd-abs-step", type=float, default=1.0e-10)
     parser.add_argument("--accepted-step-limit", type=int, default=None)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="default",
+        help=(
+            "Benchmark placement. 'default' uses JAX's current default device, "
+            "'auto' leaves placement untouched, and 'cpu'/'gpu' force that backend."
+        ),
+    )
     parser.add_argument(
         "--geometry-fd-lane",
         choices=("frozen_linearized", "nonlinear_resolve"),
@@ -392,13 +401,20 @@ def main() -> None:
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
     args = parser.parse_args()
 
+    device_arg = str(args.device).strip().lower() if args.device is not None else "default"
+    config_device = None if device_arg == "default" else args.device
     config = _prepare_benchmark_config(
         config_path=Path(args.config),
-        device=args.device,
+        device=config_device,
         ntx_exact_derivative_mode="direct",
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
-    device_context = _execution_device_context(config)
+    if device_arg == "default":
+        device_context = jax.default_device(jax.devices()[0])
+    elif device_arg == "auto":
+        device_context = contextlib.nullcontext()
+    else:
+        device_context = _execution_device_context(config)
     device_context.__enter__()
     atexit.register(lambda: device_context.__exit__(None, None, None))
     profile_cfg = _baseline_profile_cfg(config)
