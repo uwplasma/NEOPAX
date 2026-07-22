@@ -51,7 +51,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_adaptive_schedule_rollout,
     _radau_run_prepared_on_realized_trace,
 )
-from vmec_jax.core import implicit as im  # noqa: E402
+from vmex.core import implicit as im  # noqa: E402
 
 
 def _report_path(parameter_name: str) -> Path:
