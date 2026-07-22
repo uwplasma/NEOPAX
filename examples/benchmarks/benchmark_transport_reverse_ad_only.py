@@ -1390,8 +1390,9 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
                 carry0.y,
                 lagged_bar,
                 support_payload,
-            )
-        )(reduced_bars.lagged_response_cache)
+            ),
+            reduced_bars.lagged_response_cache,
+        )
         initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
         support_bar_leaves = tuple(
             accumulated + increment
