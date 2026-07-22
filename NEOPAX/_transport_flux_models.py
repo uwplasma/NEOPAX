@@ -6176,6 +6176,256 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
+        center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
+        if center_response_bar is None:
+            return _support_bar_from_center_bars(
+                support,
+                _float_delta_tree_like(support.center_channels),
+                _float_delta_tree_like(support.center_prepared),
+            )
+
+        center_channels_bar = _float_delta_tree_like(support.center_channels)
+        center_prepared_bar = _float_delta_tree_like(support.center_prepared)
+        density = safe_density(state.density)
+        temperature = state.temperature
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        def _local_support_pullback(radius_index, local_field_bars, *, interpolated: bool):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.center_channels.drds,
+                radius_index,
+                axis=0,
+                keepdims=False,
+            )
+            er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(
+                temperature,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            density_local = jax.lax.dynamic_index_in_dim(
+                density,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            vthermal_local = jax.lax.dynamic_index_in_dim(
+                v_thermal,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            prepared_delta0 = _float_delta_tree_like(prepared)
+            drds_delta0 = jnp.zeros_like(drds_value)
+
+            def _response_from_support_delta(prepared_delta, drds_delta):
+                prepared_value = _add_float_delta_tree(prepared, prepared_delta)
+                drds_local = drds_value + drds_delta
+                if interpolated:
+                    return jax.vmap(
+                        lambda species_index: self._build_interpolated_moment_response_local(
+                            prepared_value,
+                            drds_value=drds_local,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )
+                    )(species_indices)
+                return jax.vmap(
+                    lambda species_index: self._build_coefficient_response_local(
+                        prepared_value,
+                        drds_value=drds_local,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            _, pullback = jax.vjp(
+                _response_from_support_delta,
+                prepared_delta0,
+                drds_delta0,
+            )
+            return pullback(local_field_bars)
+
+        def _add_local_prepared_bar(prepared_bar, radius_index, local_bar):
+            return jax.tree_util.tree_map(
+                lambda arr, local_arr: arr.at[radius_index].add(local_arr),
+                prepared_bar,
+                local_bar,
+            )
+
+        if isinstance(center_response_bar, NTXInterpolatedMomentResponse):
+            n_radius = int(state.Er.shape[0])
+            anchor_indices = self._response_anchor_indices(n_radius)
+            anchor_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)[anchor_indices]
+            target_rho = jnp.asarray(support.center_channels.rho, dtype=jnp.float64)
+            n_anchor = int(anchor_indices.shape[0])
+            response_field_bars = self._interpolated_response_field_bars(center_response_bar)
+            response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
+
+            def _per_anchor_forward(radius_index):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.center_prepared,
+                )
+                drds_value = jax.lax.dynamic_index_in_dim(
+                    support.center_channels.drds,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(
+                    temperature,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                density_local = jax.lax.dynamic_index_in_dim(
+                    density,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                vthermal_local = jax.lax.dynamic_index_in_dim(
+                    v_thermal,
+                    radius_index,
+                    axis=1,
+                    keepdims=False,
+                )
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            anchor_response = self._map_radius_axis_regularized_at_axis0(
+                _per_anchor_forward,
+                anchor_indices,
+                anchor_rho,
+            )
+            anchor_response_fields = (
+                anchor_response[0],
+                anchor_response[1],
+                anchor_response[2],
+                anchor_response[3],
+            )
+
+            def _forward_interpolated_fields_from_target_rho(target_rho_value):
+                return tuple(
+                    self._interpolate_anchor_values(anchor_indices, field, target_rho_value)
+                    for field in anchor_response_fields
+                )
+
+            (target_rho_bar,) = jax.linear_transpose(
+                _forward_interpolated_fields_from_target_rho,
+                jnp.zeros_like(target_rho),
+            )(response_field_bar_tuple)
+            center_channels_bar = dataclasses.replace(
+                center_channels_bar,
+                rho=center_channels_bar.rho + target_rho_bar,
+            )
+
+            raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices,
+                anchor_rho=anchor_rho,
+                target_rho=target_rho,
+                field_bars=response_field_bars,
+            )
+            raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
+            anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
+
+            def _pullback_one_anchor(anchor_pos):
+                radius_index = jax.lax.dynamic_index_in_dim(
+                    anchor_indices,
+                    anchor_pos,
+                    axis=0,
+                    keepdims=False,
+                )
+                local_field_bars = tuple(
+                    jax.lax.dynamic_index_in_dim(
+                        field_bar,
+                        anchor_pos,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    for field_bar in raw_anchor_response_fields
+                )
+                prepared_local_bar, drds_local_bar = _local_support_pullback(
+                    radius_index,
+                    local_field_bars,
+                    interpolated=True,
+                )
+                return radius_index, prepared_local_bar, drds_local_bar
+
+            def _accumulate_anchor(carry, anchor_pos):
+                channels_carry, prepared_carry = carry
+                radius_index, prepared_local_bar, drds_local_bar = _pullback_one_anchor(anchor_pos)
+                return (
+                    dataclasses.replace(
+                        channels_carry,
+                        drds=channels_carry.drds.at[radius_index].add(drds_local_bar),
+                    ),
+                    _add_local_prepared_bar(prepared_carry, radius_index, prepared_local_bar),
+                ), None
+
+            (center_channels_bar, center_prepared_bar), _ = jax.lax.scan(
+                _accumulate_anchor,
+                (center_channels_bar, center_prepared_bar),
+                anchor_positions,
+            )
+            return _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar)
+
+        if isinstance(center_response_bar, NTXPreparedCoefficientResponse):
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+            def _accumulate_radius(carry, radius_index):
+                channels_carry, prepared_carry = carry
+                local_bar = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    center_response_bar,
+                )
+                prepared_local_bar, drds_local_bar = _local_support_pullback(
+                    radius_index,
+                    local_bar,
+                    interpolated=False,
+                )
+                return (
+                    dataclasses.replace(
+                        channels_carry,
+                        drds=channels_carry.drds.at[radius_index].add(drds_local_bar),
+                    ),
+                    _add_local_prepared_bar(prepared_carry, radius_index, prepared_local_bar),
+                ), None
+
+            (center_channels_bar, center_prepared_bar), _ = jax.lax.scan(
+                _accumulate_radius,
+                (center_channels_bar, center_prepared_bar),
+                radius_indices,
+            )
+            return _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar)
+
         center_channels_delta0 = _float_delta_tree_like(support.center_channels)
         center_prepared_delta0 = _float_delta_tree_like(support.center_prepared)
         _, support_delta_pullback = jax.vjp(

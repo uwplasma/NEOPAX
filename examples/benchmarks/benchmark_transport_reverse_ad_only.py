@@ -1385,7 +1385,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     initial_cache_pullback_used = False
     initial_cache_pullback_skipped = False
     if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
-        initial_cache_support_bars = jax.vmap(
+        initial_cache_support_bars = jax.lax.map(
             lambda lagged_bar: build_support_pullback(
                 carry0.y,
                 lagged_bar,
