@@ -256,12 +256,20 @@ def _frozen_linearized_vmec_geometry_bundle(
     if len(specs) != 1:
         raise ValueError("This FD benchmark currently expects one geometry parameter.")
     (entry,) = boundary_param_entries(geometry_context, specs)
-    params0 = im.params_from_input(geometry_context.indata)
+    solver_device = str(geom_cfg.get("vmec_implicit_solver_device", "default"))
+    params0 = _implicit_params_with_boundary_deltas(
+        geometry_context,
+        im,
+        jnp.asarray([0.0], dtype=jnp.float64),
+        (entry,),
+        solver_device=solver_device,
+    )
     params = _implicit_params_with_boundary_deltas(
         geometry_context,
         im,
         jnp.asarray([baseline_delta], dtype=jnp.float64),
         (entry,),
+        solver_device=solver_device,
     )
     cfg_kwargs = {
         "mode": "cli",
@@ -410,13 +418,23 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     if device_arg == "default":
-        device_context = jax.default_device(jax.devices()[0])
+        default_backend = jax.default_backend()
+        selected_device = jax.local_devices(backend=default_backend)[0]
+        device_context = jax.default_device(selected_device)
     elif device_arg == "auto":
+        selected_device = None
         device_context = contextlib.nullcontext()
     else:
+        selected_device = None
         device_context = _execution_device_context(config)
     device_context.__enter__()
     atexit.register(lambda: device_context.__exit__(None, None, None))
+    print(
+        "[autodiff-gate] device placement: "
+        f"requested={device_arg} default_backend={jax.default_backend()} "
+        f"selected_device={selected_device}",
+        flush=True,
+    )
     profile_cfg = _baseline_profile_cfg(config)
     parameter_name = str(args.parameter)
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
