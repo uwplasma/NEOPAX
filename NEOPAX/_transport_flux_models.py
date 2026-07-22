@@ -2100,6 +2100,58 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         flat_full = jax.vmap(lambda values: jnp.interp(target_rho, anchor_rho, values))(flat_anchor)
         return flat_full.T.reshape((n_target,) + anchor_values.shape[1:])
 
+    def _pullback_interpolate_anchor_target_rho(
+        self,
+        anchor_indices,
+        anchor_values,
+        target_rho,
+        interpolated_values_bar,
+    ):
+        """Transpose the coordinate part of `_interpolate_anchor_values`.
+
+        JAX does not currently transpose `jnp.interp` with respect to the
+        interpolation coordinates in this nested use, so keep this tiny
+        piecewise-linear transpose explicit and leave value cotangents to the
+        existing anchor-value transpose.
+        """
+        anchor_rho = target_rho[anchor_indices]
+        n_anchor = int(anchor_indices.shape[0])
+        flat_anchor = jnp.asarray(anchor_values).reshape((n_anchor, -1))
+        flat_bar = jnp.asarray(interpolated_values_bar).reshape((target_rho.shape[0], -1))
+
+        hi = jnp.searchsorted(anchor_rho, target_rho, side="right")
+        hi = jnp.clip(hi, 1, n_anchor - 1)
+        lo = hi - 1
+        rho_lo = anchor_rho[lo]
+        rho_hi = anchor_rho[hi]
+        den = rho_hi - rho_lo
+        den_safe = jnp.where(jnp.abs(den) > 0.0, den, 1.0)
+        values_lo = flat_anchor[lo]
+        values_hi = flat_anchor[hi]
+        values_delta = values_hi - values_lo
+        active = jnp.logical_and(target_rho >= anchor_rho[0], target_rho <= anchor_rho[-1])
+        active_f = jnp.asarray(active, dtype=flat_bar.dtype)
+        slope = values_delta / den_safe[:, None]
+
+        target_bar = active_f * jnp.sum(flat_bar * slope, axis=1)
+        lo_anchor_bar = active_f * jnp.sum(
+            flat_bar * values_delta * ((target_rho - rho_hi) / (den_safe * den_safe))[:, None],
+            axis=1,
+        )
+        hi_anchor_bar = active_f * jnp.sum(
+            flat_bar * values_delta * (-(target_rho - rho_lo) / (den_safe * den_safe))[:, None],
+            axis=1,
+        )
+        return (
+            jnp.zeros_like(target_rho)
+            .at[jnp.arange(target_rho.shape[0], dtype=jnp.int32)]
+            .add(target_bar)
+            .at[anchor_indices[lo]]
+            .add(lo_anchor_bar)
+            .at[anchor_indices[hi]]
+            .add(hi_anchor_bar)
+        )
+
     def _regularize_axis_radius0(self, values_by_radius, radius_coordinates):
         radius_coordinates = jnp.asarray(radius_coordinates, dtype=jnp.float64)
         if int(radius_coordinates.shape[0]) < 4:
@@ -6332,16 +6384,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 anchor_response[3],
             )
 
-            def _forward_interpolated_fields_from_target_rho(target_rho_value):
-                return tuple(
-                    self._interpolate_anchor_values(anchor_indices, field, target_rho_value)
-                    for field in anchor_response_fields
+            target_rho_bar = jnp.zeros_like(target_rho)
+            for anchor_field, field_bar in zip(anchor_response_fields, response_field_bar_tuple, strict=True):
+                target_rho_bar = target_rho_bar + self._pullback_interpolate_anchor_target_rho(
+                    anchor_indices,
+                    anchor_field,
+                    target_rho,
+                    field_bar,
                 )
-
-            (target_rho_bar,) = jax.linear_transpose(
-                _forward_interpolated_fields_from_target_rho,
-                jnp.zeros_like(target_rho),
-            )(response_field_bar_tuple)
             center_channels_bar = dataclasses.replace(
                 center_channels_bar,
                 rho=center_channels_bar.rho + target_rho_bar,
