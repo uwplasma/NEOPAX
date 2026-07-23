@@ -482,6 +482,7 @@ def main() -> None:
     if parameter_is_profile:
         parameter_kind = "profile"
         fixed_final_state_geometry_fd = None
+        baseline_geometry_final_state_fd = None
         param_index = PARAMETER_ORDER.index(parameter_name)
         baseline_value = float(profile_cfg[parameter_name])
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
@@ -574,9 +575,20 @@ def main() -> None:
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
         )
+        baseline_geometry_final_state_fd = (
+            _objective_vector(plus_replay["final_state"], baseline_runtime)
+            - _objective_vector(minus_replay["final_state"], baseline_runtime)
+        ) / (2.0 * h)
 
-    minus_objectives, plus_objectives, fixed_final_state_geometry_fd = jax.block_until_ready(
-        (minus_objectives, plus_objectives, fixed_final_state_geometry_fd)
+    minus_objectives, plus_objectives, fixed_final_state_geometry_fd, baseline_geometry_final_state_fd = (
+        jax.block_until_ready(
+            (
+                minus_objectives,
+                plus_objectives,
+                fixed_final_state_geometry_fd,
+                baseline_geometry_final_state_fd,
+            )
+        )
     )
     gradient_fd = (plus_objectives - minus_objectives) / (2.0 * h)
     gradient_fd = jax.block_until_ready(gradient_fd)
@@ -586,6 +598,11 @@ def main() -> None:
         None
         if fixed_final_state_geometry_fd is None
         else np.asarray(jax.device_get(fixed_final_state_geometry_fd), dtype=float)
+    )
+    baseline_geometry_final_state_fd_np = (
+        None
+        if baseline_geometry_final_state_fd is None
+        else np.asarray(jax.device_get(baseline_geometry_final_state_fd), dtype=float)
     )
 
     report = {
@@ -612,6 +629,9 @@ def main() -> None:
         "fixed_final_state_objective_geometry_fd": None
         if fixed_final_state_geometry_fd_np is None
         else fixed_final_state_geometry_fd_np.tolist(),
+        "baseline_geometry_final_state_fd": None
+        if baseline_geometry_final_state_fd_np is None
+        else baseline_geometry_final_state_fd_np.tolist(),
         "baseline_rollout": _adaptive_rollout_diagnostics(baseline_rollout),
         "minus_replay": {
             "final_state_finite": _tree_all_finite(minus_replay["final_state"]),
@@ -638,6 +658,10 @@ def main() -> None:
         print("[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:")
         for label, value in zip(OBJECTIVE_LABELS, fixed_final_state_geometry_fd_np.tolist()):
             print(f"  - {label}: fd_explicit_geometry={float(value):.6e}")
+    if baseline_geometry_final_state_fd_np is not None:
+        print("[autodiff-gate] baseline-geometry final-state finite-difference gradients:")
+        for label, value in zip(OBJECTIVE_LABELS, baseline_geometry_final_state_fd_np.tolist()):
+            print(f"  - {label}: fd_final_state_geometry={float(value):.6e}")
 
     outpath = _report_path(parameter_name)
     outpath.write_text(json.dumps(report, indent=2))
