@@ -1299,32 +1299,6 @@ class ComposedEquationSystem:
             return model
         return dataclasses.replace(model, **updates)
 
-    @staticmethod
-    def _flux_model_with_support_payload(model, support):
-        if model is None:
-            return model, False
-        with_support_payload = getattr(model, "with_support_payload", None)
-        if callable(with_support_payload):
-            return with_support_payload(support), True
-        if not dataclasses.is_dataclass(model):
-            return model, False
-        updates = {}
-        changed = False
-        for field in dataclasses.fields(model):
-            value = getattr(model, field.name)
-            if not dataclasses.is_dataclass(value):
-                continue
-            new_value, child_changed = ComposedEquationSystem._flux_model_with_support_payload(
-                value,
-                support,
-            )
-            if child_changed:
-                updates[field.name] = new_value
-                changed = True
-        if not changed:
-            return model, False
-        return dataclasses.replace(model, **updates), True
-
     def with_geometry_payload(self, geometry):
         if self.config is None or self.solver_cfg is None or self.boundary_models is None:
             raise ValueError("Geometry-payload pullback requires equation-system construction metadata.")
@@ -1350,39 +1324,6 @@ class ComposedEquationSystem:
         )
         return dataclasses.replace(
             self,
-            equations=tuple(equations),
-            density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
-            temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
-            er_equation=next((eq for eq in equations if getattr(eq, "name", None) == "Er"), None),
-            shared_flux_model=flux_model if len(equations) > 1 else None,
-        )
-
-    def with_geometry_and_support_payload(self, geometry, support):
-        system = self.with_geometry_payload(geometry)
-        flux_model_source = system.shared_flux_model
-        if flux_model_source is None:
-            flux_model_source = next(
-                (
-                    getattr(eq, "flux_model", None)
-                    for eq in system.equations
-                    if getattr(eq, "flux_model", None) is not None
-                ),
-                None,
-            )
-        flux_model, changed = self._flux_model_with_support_payload(flux_model_source, support)
-        if not changed:
-            return system
-        equations = build_equation_system(
-            config=system.config,
-            species=system.species,
-            field=geometry,
-            flux_model=flux_model,
-            source_models=system.source_models,
-            solver_cfg=system.solver_cfg,
-            boundary_models=system.boundary_models,
-        )
-        return dataclasses.replace(
-            system,
             equations=tuple(equations),
             density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
             temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
@@ -1573,22 +1514,10 @@ class ComposedEquationSystem:
                 support,
                 **kwargs,
             )
-            geometry_bar = _float_delta_tree_like(geometry)
-            flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
-            if flux_response_bar is not None:
-                geometry_delta0 = _float_delta_tree_like(geometry)
-                _, geometry_delta_pullback = jax.vjp(
-                    lambda geometry_delta: self.with_geometry_and_support_payload(
-                        _add_float_delta_tree(geometry, geometry_delta),
-                        support,
-                    ).build_lagged_response(state, **kwargs),
-                    geometry_delta0,
-                )
-                (geometry_bar,) = geometry_delta_pullback(lagged_response_bar)
             return self._realtime_geometry_payload_bar(
                 {"ntx_support": support, "geometry": geometry},
                 support_bar,
-                geometry_bar,
+                _float_delta_tree_like(geometry),
             )
         working_state, _eidx = self._prepare_working_state(state)
         flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
