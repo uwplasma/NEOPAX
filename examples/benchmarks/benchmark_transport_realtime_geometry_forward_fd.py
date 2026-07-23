@@ -33,9 +33,11 @@ from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
 )
 from benchmark_transport_reverse_ad_only import (  # noqa: E402
     PARAMETER_ORDER,
+    _find_ntx_support_payload,
     _geometry_context_from_config,
     _geometry_param_specs_from_parameter_name,
     _initial_state_for_parameter_vector,
+    _runtime_with_ntx_support_payload,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
@@ -405,6 +407,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
+    parser.add_argument(
+        "--split-payload-fd-diagnostic",
+        action="store_true",
+        help=(
+            "For realtime geometry parameters, additionally split the final-state FD "
+            "diagnostic into geometry-metric-only and NTX-support-only branches."
+        ),
+    )
     args = parser.parse_args()
 
     device_arg = str(args.device).strip().lower() if args.device is not None else "default"
@@ -483,6 +493,8 @@ def main() -> None:
         parameter_kind = "profile"
         fixed_final_state_geometry_fd = None
         baseline_geometry_final_state_fd = None
+        geometry_only_final_state_fd = None
+        ntx_support_only_final_state_fd = None
         param_index = PARAMETER_ORDER.index(parameter_name)
         baseline_value = float(profile_cfg[parameter_name])
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
@@ -579,14 +591,93 @@ def main() -> None:
             _objective_vector(plus_replay["final_state"], baseline_runtime)
             - _objective_vector(minus_replay["final_state"], baseline_runtime)
         ) / (2.0 * h)
+        geometry_only_final_state_fd = None
+        ntx_support_only_final_state_fd = None
+        if args.split_payload_fd_diagnostic:
+            print(
+                "[autodiff-gate] progress: running split payload final-state FD diagnostic",
+                flush=True,
+            )
+            baseline_support = _find_ntx_support_payload(baseline_runtime)
+            minus_support = _find_ntx_support_payload(minus_runtime_fixed)
+            plus_support = _find_ntx_support_payload(plus_runtime_fixed)
+            minus_geometry_only_runtime = _runtime_with_ntx_support_payload(
+                minus_runtime_fixed,
+                baseline_support,
+            )
+            plus_geometry_only_runtime = _runtime_with_ntx_support_payload(
+                plus_runtime_fixed,
+                baseline_support,
+            )
+            minus_support_only_runtime = _runtime_with_ntx_support_payload(
+                baseline_runtime,
+                minus_support,
+            )
+            plus_support_only_runtime = _runtime_with_ntx_support_payload(
+                baseline_runtime,
+                plus_support,
+            )
+            _minus_geometry_only_objectives, minus_geometry_only_replay = _objectives_on_realtime_geometry_frozen_trace(
+                config=config,
+                runtime=minus_geometry_only_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                profile_values=profile_values,
+                frozen_trace=frozen_trace,
+                replay_mode=args.replay_mode,
+            )
+            _plus_geometry_only_objectives, plus_geometry_only_replay = _objectives_on_realtime_geometry_frozen_trace(
+                config=config,
+                runtime=plus_geometry_only_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                profile_values=profile_values,
+                frozen_trace=frozen_trace,
+                replay_mode=args.replay_mode,
+            )
+            _minus_support_only_objectives, minus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
+                config=config,
+                runtime=minus_support_only_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                profile_values=profile_values,
+                frozen_trace=frozen_trace,
+                replay_mode=args.replay_mode,
+            )
+            _plus_support_only_objectives, plus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
+                config=config,
+                runtime=plus_support_only_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                profile_values=profile_values,
+                frozen_trace=frozen_trace,
+                replay_mode=args.replay_mode,
+            )
+            geometry_only_final_state_fd = (
+                _objective_vector(plus_geometry_only_replay["final_state"], baseline_runtime)
+                - _objective_vector(minus_geometry_only_replay["final_state"], baseline_runtime)
+            ) / (2.0 * h)
+            ntx_support_only_final_state_fd = (
+                _objective_vector(plus_support_only_replay["final_state"], baseline_runtime)
+                - _objective_vector(minus_support_only_replay["final_state"], baseline_runtime)
+            ) / (2.0 * h)
 
-    minus_objectives, plus_objectives, fixed_final_state_geometry_fd, baseline_geometry_final_state_fd = (
+    (
+        minus_objectives,
+        plus_objectives,
+        fixed_final_state_geometry_fd,
+        baseline_geometry_final_state_fd,
+        geometry_only_final_state_fd,
+        ntx_support_only_final_state_fd,
+    ) = (
         jax.block_until_ready(
             (
                 minus_objectives,
                 plus_objectives,
                 fixed_final_state_geometry_fd,
                 baseline_geometry_final_state_fd,
+                geometry_only_final_state_fd,
+                ntx_support_only_final_state_fd,
             )
         )
     )
@@ -603,6 +694,16 @@ def main() -> None:
         None
         if baseline_geometry_final_state_fd is None
         else np.asarray(jax.device_get(baseline_geometry_final_state_fd), dtype=float)
+    )
+    geometry_only_final_state_fd_np = (
+        None
+        if geometry_only_final_state_fd is None
+        else np.asarray(jax.device_get(geometry_only_final_state_fd), dtype=float)
+    )
+    ntx_support_only_final_state_fd_np = (
+        None
+        if ntx_support_only_final_state_fd is None
+        else np.asarray(jax.device_get(ntx_support_only_final_state_fd), dtype=float)
     )
 
     report = {
@@ -632,6 +733,12 @@ def main() -> None:
         "baseline_geometry_final_state_fd": None
         if baseline_geometry_final_state_fd_np is None
         else baseline_geometry_final_state_fd_np.tolist(),
+        "geometry_only_final_state_fd": None
+        if geometry_only_final_state_fd_np is None
+        else geometry_only_final_state_fd_np.tolist(),
+        "ntx_support_only_final_state_fd": None
+        if ntx_support_only_final_state_fd_np is None
+        else ntx_support_only_final_state_fd_np.tolist(),
         "baseline_rollout": _adaptive_rollout_diagnostics(baseline_rollout),
         "minus_replay": {
             "final_state_finite": _tree_all_finite(minus_replay["final_state"]),
@@ -662,6 +769,14 @@ def main() -> None:
         print("[autodiff-gate] baseline-geometry final-state finite-difference gradients:")
         for label, value in zip(OBJECTIVE_LABELS, baseline_geometry_final_state_fd_np.tolist()):
             print(f"  - {label}: fd_final_state_geometry={float(value):.6e}")
+    if geometry_only_final_state_fd_np is not None:
+        print("[autodiff-gate] geometry-only final-state finite-difference gradients:")
+        for label, value in zip(OBJECTIVE_LABELS, geometry_only_final_state_fd_np.tolist()):
+            print(f"  - {label}: fd_final_state_geometry_branch={float(value):.6e}")
+    if ntx_support_only_final_state_fd_np is not None:
+        print("[autodiff-gate] NTX-support-only final-state finite-difference gradients:")
+        for label, value in zip(OBJECTIVE_LABELS, ntx_support_only_final_state_fd_np.tolist()):
+            print(f"  - {label}: fd_final_state_ntx_support_branch={float(value):.6e}")
 
     outpath = _report_path(parameter_name)
     outpath.write_text(json.dumps(report, indent=2))
