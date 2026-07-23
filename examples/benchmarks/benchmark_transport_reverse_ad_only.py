@@ -1131,13 +1131,6 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         initial_carry,
     )
 
-    def _objective_from_final_y(final_y_value):
-        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-        return _objective_scalar_by_index(final_state, runtime, objective_index)
-
-    objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
-    (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
-
     (
         carry0,
         active_mask,
@@ -1164,6 +1157,18 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
     )
     if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
+
+    # The support probe's backward pass is the segmented accepted-replay map.
+    # Seed objective cotangents at that same replay final state, not at the
+    # full adaptive schedule final state, so FD/reverse compare the same map.
+    final_y_for_objective = segmented_final_carry.y
+
+    def _objective_from_final_y(final_y_value):
+        final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+        return _objective_scalar_by_index(final_state, runtime, objective_index)
+
+    objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y_for_objective)
+    (final_y_bar,) = objective_pullback(jnp.ones_like(objective_value))
 
     reduced_bar = _RadauAcceptedStepReducedCotangent(
         y=final_y_bar,
@@ -1317,49 +1322,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         initial_carry,
     )
 
-    objective_count = int(len(OBJECTIVE_LABELS))
-    objective_values_rows = []
-    final_y_bar_rows = []
-    objective_payload_bar_rows = []
-    combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
-    zero_payload_bar = _radau_zero_support_delta_tree_like(support_payload)
-    for objective_i in range(objective_count):
-        def _objective_from_final_y(final_y_value, objective_index=objective_i):
-            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-            return _objective_scalar_by_index(final_state, runtime, objective_index)
-
-        objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y)
-        objective_values_rows.append(objective_value)
-        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
-        if combined_geometry_payload:
-            final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y)
-            geometry = support_payload["geometry"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _objective_from_geometry_delta(geometry_delta, objective_index=objective_i):
-                runtime_with_geometry = dataclasses.replace(
-                    runtime,
-                    geometry=_add_float_delta_tree(geometry, geometry_delta),
-                )
-                return _objective_scalar_by_index(
-                    final_state_for_geometry,
-                    runtime_with_geometry,
-                    objective_index,
-                )
-
-            _, geometry_objective_pullback = jax.vjp(_objective_from_geometry_delta, geometry_delta0)
-            (geometry_objective_bar,) = geometry_objective_pullback(jnp.ones_like(objective_value))
-            objective_payload_bar_rows.append(
-                {
-                    "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
-                    "ntx_support": zero_payload_bar["ntx_support"],
-                }
-            )
-        else:
-            objective_payload_bar_rows.append(zero_payload_bar)
-    objective_values = jnp.stack(objective_values_rows, axis=0)
-    final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
-
     (
         carry0,
         active_mask,
@@ -1386,6 +1348,57 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     )
     if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
+
+    # The support probe's backward pass is the segmented accepted-replay map.
+    # Seed objective cotangents and explicit-geometry objective bars at that
+    # same replay final state. Using the full adaptive final state here makes
+    # the reported reverse derivative inconsistent with accepted-replay FD.
+    final_y_for_objective = segmented_final_carry.y
+
+    objective_count = int(len(OBJECTIVE_LABELS))
+    objective_values_rows = []
+    final_y_bar_rows = []
+    objective_payload_bar_rows = []
+    combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
+    zero_payload_bar = _radau_zero_support_delta_tree_like(support_payload)
+    for objective_i in range(objective_count):
+        def _objective_from_final_y(final_y_value, objective_index=objective_i):
+            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+            return _objective_scalar_by_index(final_state, runtime, objective_index)
+
+        objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y_for_objective)
+        objective_values_rows.append(objective_value)
+        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
+        if combined_geometry_payload:
+            final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                final_y_for_objective
+            )
+            geometry = support_payload["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+
+            def _objective_from_geometry_delta(geometry_delta, objective_index=objective_i):
+                runtime_with_geometry = dataclasses.replace(
+                    runtime,
+                    geometry=_add_float_delta_tree(geometry, geometry_delta),
+                )
+                return _objective_scalar_by_index(
+                    final_state_for_geometry,
+                    runtime_with_geometry,
+                    objective_index,
+                )
+
+            _, geometry_objective_pullback = jax.vjp(_objective_from_geometry_delta, geometry_delta0)
+            (geometry_objective_bar,) = geometry_objective_pullback(jnp.ones_like(objective_value))
+            objective_payload_bar_rows.append(
+                {
+                    "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
+                    "ntx_support": zero_payload_bar["ntx_support"],
+                }
+            )
+        else:
+            objective_payload_bar_rows.append(zero_payload_bar)
+    objective_values = jnp.stack(objective_values_rows, axis=0)
+    final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
 
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
