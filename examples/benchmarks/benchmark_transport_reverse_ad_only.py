@@ -3057,6 +3057,19 @@ def _run_realtime_geometry_support_segment_probe(
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
+            "geometry_gradient_reverse_ad_final_state_components": {
+                objective_name: {
+                    geometry_label: float(
+                        sum(
+                            component_matrix[objective_i, geometry_i]
+                            for component_name, component_matrix in component_gradient_np_by_name.items()
+                            if component_name != "objective_explicit"
+                        )
+                    )
+                    for geometry_i, geometry_label in enumerate(geometry_param_labels)
+                }
+                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
+            },
             "geometry_gradient_reverse_ad_by_component_and_branch": {
                 objective_name: {
                     component_name: {
@@ -3215,6 +3228,17 @@ def _run_realtime_geometry_support_segment_probe(
                             for component_name in support_component_names
                         ]
                         print("        components: " + " ".join(component_parts))
+                        final_state_components = report.get(
+                            "geometry_gradient_reverse_ad_final_state_components",
+                            {},
+                        )
+                        if objective_name in final_state_components:
+                            dynamic_value = final_state_components[objective_name][geometry_label]
+                            print(
+                                "        final_state_components_sum="
+                                f"{dynamic_value:.6e} "
+                                "(compare to FD fd_final_state_geometry)"
+                            )
             else:
                 objective_values_arr = geometry_gradient_np[OBJECTIVE_LABELS.index(objective_name)]
                 top_k = int(max(1, args.reverse_geometry_print_top_k))
@@ -3245,6 +3269,17 @@ def _run_realtime_geometry_support_segment_probe(
                             for component_name in support_component_names
                         ]
                         print("        components: " + " ".join(component_parts))
+                        final_state_components = report.get(
+                            "geometry_gradient_reverse_ad_final_state_components",
+                            {},
+                        )
+                        if objective_name in final_state_components:
+                            dynamic_value = final_state_components[objective_name][geometry_label]
+                            print(
+                                "        final_state_components_sum="
+                                f"{dynamic_value:.6e} "
+                                "(compare to FD fd_final_state_geometry)"
+                            )
         print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
         for objective_name in OBJECTIVE_LABELS:
             summary = support_bar_summary_by_objective[objective_name]
