@@ -110,9 +110,11 @@ def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mo
     }:
         return state
     amb_cfg = dict(config.get("ambipolarity", {}))
-    # Keep the production TOML unchanged, but use the JAX vmap root path for the
-    # opt-in AD boundary so the root profile stays inside the traced graph.
-    amb_cfg["er_ambipolar_blocksize"] = 0
+    # Keep the production TOML unchanged, but use JAX-side chunking for the
+    # opt-in AD boundary so the root profile stays traced without fusing all
+    # radii and all scan points into one large NTX kernel.
+    amb_cfg["er_ambipolar_blocksize"] = int(amb_cfg.get("er_ambipolar_blocksize", 1) or 1)
+    amb_cfg["er_ambipolar_scan_batch_mode"] = "hybrid"
     model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
     entropy_model_name = config.get("neoclassical", {}).get(
         "entropy_model",

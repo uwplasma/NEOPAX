@@ -1294,11 +1294,12 @@ def solve_ambipolarity_roots_radial_jax(state, config, params, model_name, flux_
         raise ValueError("State must have an 'Er' attribute.")
 
     er_ambipolar_blocksize = amb_cfg.get("er_ambipolar_blocksize", None)
-    if er_ambipolar_blocksize not in (None, 0, "0", ""):
-        raise ValueError(
-            "Differentiable initial-Er ambipolarity currently requires "
-            "er_ambipolar_blocksize unset/0 so the root solve is a single JAX vmap."
-        )
+    if er_ambipolar_blocksize in (None, "", 0, "0"):
+        radial_batch_size = None
+    else:
+        radial_batch_size = int(er_ambipolar_blocksize)
+        if radial_batch_size <= 0:
+            radial_batch_size = None
 
     er_ambipolar_scan_batch_mode = _normalize_er_scan_batch_mode(
         amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap")
@@ -1386,7 +1387,12 @@ def solve_ambipolarity_roots_radial_jax(state, config, params, model_name, flux_
 
         raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
 
-    return jax.vmap(root_finder_for_radius)(jnp.arange(n_radial, dtype=jnp.int32))
+    radial_indices = jnp.arange(n_radial, dtype=jnp.int32)
+    if radial_batch_size is None:
+        return jax.vmap(root_finder_for_radius)(radial_indices)
+    if radial_batch_size == 1:
+        return jax.lax.map(root_finder_for_radius, radial_indices)
+    return jax.lax.map(root_finder_for_radius, radial_indices, batch_size=radial_batch_size)
 
 
 # --- JIT/differentiable radial root-finder with blocksize option ---
