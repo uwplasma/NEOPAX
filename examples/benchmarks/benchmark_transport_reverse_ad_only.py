@@ -121,24 +121,84 @@ def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mo
         runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
     )
     entropy_model = get_entropy_model(entropy_model_name)
-    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
-        state=state,
-        config=config,
-        params={
-            "species": runtime.species,
-            "energy_grid": runtime.energy_grid,
-            "geometry": runtime.geometry,
-            "database": runtime.database,
-            "solver_parameters": runtime.solver_parameters,
-        },
-        model_name=model_name,
-        flux_model=runtime.models.flux,
-        entropy_model=entropy_model,
-        amb_cfg=amb_cfg,
-    )
-    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
-    er_init = jnp.where(jnp.isfinite(best_roots), best_roots, state.Er)
-    return dataclasses.replace(state, Er=er_init)
+    params = {
+        "species": runtime.species,
+        "energy_grid": runtime.energy_grid,
+        "geometry": runtime.geometry,
+        "database": runtime.database,
+        "solver_parameters": runtime.solver_parameters,
+    }
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+
+    def _selected_roots(state_inner):
+        _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
+            state=state_inner,
+            config=config,
+            params=params,
+            model_name=model_name,
+            flux_model=runtime.models.flux,
+            entropy_model=entropy_model,
+            amb_cfg=amb_cfg,
+        )
+        best_roots = jnp.asarray(best_roots, dtype=state_inner.Er.dtype)
+        return jnp.where(jnp.isfinite(best_roots), best_roots, state_inner.Er)
+
+    def _charge_flux_residuals(state_inner, er_profile):
+        state_with_er = dataclasses.replace(state_inner, Er=er_profile)
+        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+        if local_particle_flux is None:
+            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+
+        def _residual_i(i):
+            gamma = local_particle_flux(i, er_profile[i])
+            return jnp.sum(charge_qp * gamma)
+
+        indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
+        return jax.lax.map(_residual_i, indices)
+
+    def _implicit_state_bar(state_inner, er_profile, er_bar):
+        er_profile = jnp.asarray(er_profile, dtype=state_inner.Er.dtype)
+        er_bar = jnp.asarray(er_bar, dtype=state_inner.Er.dtype)
+        finite_mask = jnp.isfinite(er_profile)
+
+        def _residual_i_er(i, er_value):
+            er_eval = er_profile.at[i].set(er_value)
+            return _charge_flux_residuals(state_inner, er_eval)[i]
+
+        indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+        dres_der = jax.lax.map(
+            lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+            indices,
+        )
+        safe_dres_der = jnp.where(
+            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+            dres_der,
+            jnp.inf,
+        )
+        residual_bar = jnp.where(finite_mask, -er_bar / safe_dres_der, 0.0)
+        _, residual_pullback = jax.vjp(
+            lambda state_value: _charge_flux_residuals(state_value, er_profile),
+            state_inner,
+        )
+        (state_residual_bar,) = residual_pullback(residual_bar)
+        return state_residual_bar
+
+    @jax.custom_vjp
+    def _replace_er_with_selected_root(state_inner):
+        return dataclasses.replace(state_inner, Er=_selected_roots(state_inner))
+
+    def _replace_er_fwd(state_inner):
+        er_profile = _selected_roots(state_inner)
+        return dataclasses.replace(state_inner, Er=er_profile), (state_inner, er_profile)
+
+    def _replace_er_bwd(residuals, state_bar):
+        state_inner, er_profile = residuals
+        direct_bar = dataclasses.replace(state_bar, Er=jnp.zeros_like(state_inner.Er))
+        root_bar = _implicit_state_bar(state_inner, er_profile, state_bar.Er)
+        return (_add_trees(direct_bar, root_bar),)
+
+    _replace_er_with_selected_root.defvjp(_replace_er_fwd, _replace_er_bwd)
+    return _replace_er_with_selected_root(state)
 
 
 def _objective_scalar_by_index(final_state, runtime, objective_index: int):
