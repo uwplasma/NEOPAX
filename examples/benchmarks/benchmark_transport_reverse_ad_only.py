@@ -1778,7 +1778,16 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
     gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
     if initial_er_root_support_bars is not None:
-        initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
+        raw_initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
+        initial_er_root_support_bar_leaves = tuple(
+            jnp.zeros_like(accumulated)
+            if jnp.asarray(increment).dtype == jax.dtypes.float0
+            else jnp.asarray(increment)
+            for accumulated, increment in zip(
+                support_bar_leaves,
+                raw_initial_er_root_support_bar_leaves,
+            )
+        )
         support_bar_leaves = tuple(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, initial_er_root_support_bar_leaves)
@@ -1810,7 +1819,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         ),
     }
     if initial_er_root_support_bars is not None:
-        initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
         component_support_bars_by_name["initial_er_root"] = tuple(
             support_treedef.unflatten(
                 [jnp.asarray(leaf)[objective_i] for leaf in initial_er_root_support_bar_leaves]
