@@ -97,18 +97,20 @@ def _initial_er_root_ad_mode(value: str | None) -> str:
     return mode
 
 
-def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mode: str):
+def _initial_er_root_enabled(config: dict[str, Any], mode: str) -> bool:
     mode = _initial_er_root_ad_mode(mode)
     if mode == "off":
-        return state
+        return False
     profiles_cfg = config.get("profiles", {})
     init_mode = str(profiles_cfg.get("er_initialization_mode", "analytical")).strip().lower()
-    if init_mode not in {
+    return init_mode in {
         "ambipolar_min_entropy",
         "ambipolar_best_root",
         "ambipolarity_best_root",
-    }:
-        return state
+    }
+
+
+def _initial_er_root_setup(config: dict[str, Any], runtime):
     amb_cfg = dict(config.get("ambipolarity", {}))
     # Keep the production TOML unchanged, but use JAX-side chunking for the
     # opt-in AD boundary so the root profile stays traced without fusing all
@@ -128,74 +130,107 @@ def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mo
         "database": runtime.database,
         "solver_parameters": runtime.solver_parameters,
     }
+    return amb_cfg, model_name, entropy_model, params
+
+
+def _initial_er_selected_root_profile(state, *, config: dict[str, Any], runtime):
+    amb_cfg, model_name, entropy_model, params = _initial_er_root_setup(config, runtime)
+    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
+        state=state,
+        config=config,
+        params=params,
+        model_name=model_name,
+        flux_model=runtime.models.flux,
+        entropy_model=entropy_model,
+        amb_cfg=amb_cfg,
+    )
+    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
+    finite_mask = jnp.isfinite(best_roots)
+    return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+
+
+def _initial_er_charge_flux_residuals(state, er_profile, *, runtime):
     charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
 
-    def _selected_roots(state_inner):
-        _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
-            state=state_inner,
-            config=config,
-            params=params,
-            model_name=model_name,
-            flux_model=runtime.models.flux,
-            entropy_model=entropy_model,
-            amb_cfg=amb_cfg,
-        )
-        best_roots = jnp.asarray(best_roots, dtype=state_inner.Er.dtype)
-        return jnp.where(jnp.isfinite(best_roots), best_roots, state_inner.Er)
+    def _residual_i(i):
+        gamma = local_particle_flux(i, er_profile[i])
+        return jnp.sum(charge_qp * gamma)
 
-    def _charge_flux_residuals(state_inner, er_profile):
-        state_with_er = dataclasses.replace(state_inner, Er=er_profile)
-        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
-        if local_particle_flux is None:
-            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+    indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
+    return jax.lax.map(_residual_i, indices)
 
-        def _residual_i(i):
-            gamma = local_particle_flux(i, er_profile[i])
-            return jnp.sum(charge_qp * gamma)
 
-        indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
-        return jax.lax.map(_residual_i, indices)
+def _initial_er_residual_bar(state, er_profile, er_bar, finite_mask, *, runtime):
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    er_bar = jnp.asarray(er_bar, dtype=state.Er.dtype)
+    finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
-    def _implicit_state_bar(state_inner, er_profile, er_bar):
-        er_profile = jnp.asarray(er_profile, dtype=state_inner.Er.dtype)
-        er_bar = jnp.asarray(er_bar, dtype=state_inner.Er.dtype)
-        finite_mask = jnp.isfinite(er_profile)
+    def _residual_i_er(i, er_value):
+        er_eval = er_profile.at[i].set(er_value)
+        return _initial_er_charge_flux_residuals(state, er_eval, runtime=runtime)[i]
 
-        def _residual_i_er(i, er_value):
-            er_eval = er_profile.at[i].set(er_value)
-            return _charge_flux_residuals(state_inner, er_eval)[i]
+    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+    dres_der = jax.lax.map(
+        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+        indices,
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+        dres_der,
+        jnp.inf,
+    )
+    return jnp.where(finite_mask, -er_bar / safe_dres_der, 0.0)
 
-        indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
-        dres_der = jax.lax.map(
-            lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
-            indices,
-        )
-        safe_dres_der = jnp.where(
-            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
-            dres_der,
-            jnp.inf,
-        )
-        residual_bar = jnp.where(finite_mask, -er_bar / safe_dres_der, 0.0)
-        _, residual_pullback = jax.vjp(
-            lambda state_value: _charge_flux_residuals(state_value, er_profile),
-            state_inner,
-        )
-        (state_residual_bar,) = residual_pullback(residual_bar)
-        return state_residual_bar
+
+def _initial_er_root_state_bar(state, er_profile, finite_mask, state_bar, *, runtime):
+    residual_bar = _initial_er_residual_bar(
+        state,
+        er_profile,
+        state_bar.Er,
+        finite_mask,
+        runtime=runtime,
+    )
+    _, residual_pullback = jax.vjp(
+        lambda state_value: _initial_er_charge_flux_residuals(state_value, er_profile, runtime=runtime),
+        state,
+    )
+    (state_residual_bar,) = residual_pullback(residual_bar)
+    direct_bar = dataclasses.replace(state_bar, Er=jnp.zeros_like(state.Er))
+    return _add_trees(direct_bar, state_residual_bar)
+
+
+def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mode: str):
+    if not _initial_er_root_enabled(config, mode):
+        return state
 
     @jax.custom_vjp
     def _replace_er_with_selected_root(state_inner):
-        return dataclasses.replace(state_inner, Er=_selected_roots(state_inner))
+        er_profile, _ = _initial_er_selected_root_profile(state_inner, config=config, runtime=runtime)
+        return dataclasses.replace(state_inner, Er=er_profile)
 
     def _replace_er_fwd(state_inner):
-        er_profile = _selected_roots(state_inner)
-        return dataclasses.replace(state_inner, Er=er_profile), (state_inner, er_profile)
+        er_profile, finite_mask = _initial_er_selected_root_profile(
+            state_inner,
+            config=config,
+            runtime=runtime,
+        )
+        return dataclasses.replace(state_inner, Er=er_profile), (state_inner, er_profile, finite_mask)
 
     def _replace_er_bwd(residuals, state_bar):
-        state_inner, er_profile = residuals
-        direct_bar = dataclasses.replace(state_bar, Er=jnp.zeros_like(state_inner.Er))
-        root_bar = _implicit_state_bar(state_inner, er_profile, state_bar.Er)
-        return (_add_trees(direct_bar, root_bar),)
+        state_inner, er_profile, finite_mask = residuals
+        return (
+            _initial_er_root_state_bar(
+                state_inner,
+                er_profile,
+                finite_mask,
+                state_bar,
+                runtime=runtime,
+            ),
+        )
 
     _replace_er_with_selected_root.defvjp(_replace_er_fwd, _replace_er_bwd)
     return _replace_er_with_selected_root(state)
@@ -1434,18 +1469,30 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             zero_tree,
         )
 
+    initial_er_root_enabled = _initial_er_root_enabled(config, initial_er_root_ad)
+
     def _state_from_profiles(p):
         return _initial_state_for_parameter_vector(
             p,
             config=config,
-            initial_er_root_ad=initial_er_root_ad,
+            initial_er_root_ad="off",
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
         )
 
     phase_start = time.perf_counter()
-    initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
+    pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
+    initial_state = (
+        _state_with_initial_er_root_ad(
+            pre_root_initial_state,
+            config=config,
+            runtime=runtime,
+            mode=initial_er_root_ad,
+        )
+        if initial_er_root_enabled
+        else pre_root_initial_state
+    )
     initial_state = jax.block_until_ready(initial_state)
     print(
         "[autodiff-gate] progress: support reverse profile-state vjp ready "
@@ -1676,7 +1723,66 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
     carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
     initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(carry0_bars)
+    initial_er_root_support_bars = None
+    if initial_er_root_enabled:
+        er_profile, finite_mask = _initial_er_selected_root_profile(
+            pre_root_initial_state,
+            config=config,
+            runtime=runtime,
+        )
+
+        def _root_support_runtime(payload):
+            runtime_payload = runtime
+            if combined_geometry_payload:
+                runtime_payload = dataclasses.replace(runtime_payload, geometry=payload["geometry"])
+                runtime_payload = _runtime_with_ntx_support_payload(
+                    runtime_payload,
+                    payload["ntx_support"],
+                )
+            else:
+                runtime_payload = _runtime_with_ntx_support_payload(runtime_payload, payload)
+            return runtime_payload
+
+        def _root_boundary_pullback_one(state_bar):
+            pre_root_state_bar = _initial_er_root_state_bar(
+                pre_root_initial_state,
+                er_profile,
+                finite_mask,
+                state_bar,
+                runtime=runtime,
+            )
+            residual_bar = _initial_er_residual_bar(
+                pre_root_initial_state,
+                er_profile,
+                state_bar.Er,
+                finite_mask,
+                runtime=runtime,
+            )
+
+            def _residuals_from_support(payload):
+                return _initial_er_charge_flux_residuals(
+                    pre_root_initial_state,
+                    er_profile,
+                    runtime=_root_support_runtime(payload),
+                )
+
+            _, support_pullback = jax.vjp(_residuals_from_support, support_payload)
+            (root_support_bar,) = support_pullback(residual_bar)
+            return pre_root_state_bar, root_support_bar
+
+        pre_root_initial_state_bars, initial_er_root_support_bars = jax.lax.map(
+            _root_boundary_pullback_one,
+            initial_state_bars,
+        )
+        initial_state_bars = pre_root_initial_state_bars
+
     gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
+    if initial_er_root_support_bars is not None:
+        initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(support_bar_leaves, initial_er_root_support_bar_leaves)
+        )
     support_bars = tuple(
         support_treedef.unflatten(
             [jnp.asarray(leaf)[objective_i] for leaf in support_bar_leaves]
@@ -1703,6 +1809,14 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             for objective_i in range(objective_count)
         ),
     }
+    if initial_er_root_support_bars is not None:
+        initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
+        component_support_bars_by_name["initial_er_root"] = tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in initial_er_root_support_bar_leaves]
+            )
+            for objective_i in range(objective_count)
+        )
     if combined_geometry_payload:
         geometry = support_payload["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
@@ -1715,7 +1829,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             return _initial_state_for_parameter_vector(
                 parameter_values,
                 config=config,
-                initial_er_root_ad=initial_er_root_ad,
+                initial_er_root_ad="off",
                 baseline_state=baseline_state,
                 profile_cfg=profile_cfg,
                 runtime=runtime_with_geometry,
