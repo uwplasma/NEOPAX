@@ -1804,26 +1804,16 @@ def _vmec_booz_qi_maxj_scalar_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> dict[str, jnp.ndarray]:
-    optimization = _import_vmec_jax_optimization()
-    from balloon_jax.objectives import maximum_j_residual_from_boozer_output
-
-    booz = dict(_boozer_output_from_state(context, state))
-    booz["surfaces"] = jnp.asarray(context.surface_s, dtype=jnp.float64)
-
-    qi = optimization.quasi_isodynamic_residual(
-        bmnc_b=booz["bmnc_b"],
-        xm_b=booz["ixm_b"],
-        xn_b=booz["ixn_b"],
-        iota_b=booz["iota_b"],
-        nfp=int(context.cfg.nfp),
-    )
-    maxj = maximum_j_residual_from_boozer_output(
+    booz = _boozer_output_from_state(context, state)
+    diagnostics = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
+        context,
         booz,
-        surfaces=context.surface_s,
+        include_qi=True,
+        include_maxj=True,
     )
     return {
-        "qi_objective": jnp.asarray(qi["total"], dtype=jnp.float64),
-        "maxj_objective": jnp.asarray(maxj.diagnostics["total"], dtype=jnp.float64),
+        "qi_objective": jnp.asarray(diagnostics["qi_objective"], dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(diagnostics["maxj_objective"], dtype=jnp.float64),
     }
 
 
@@ -1836,13 +1826,75 @@ def _vmec_booz_qi_scalar_objective_from_state(
     n_bounce: int = 51,
 ) -> dict[str, jnp.ndarray]:
     booz = _boozer_output_from_state(context, state)
-    return _vmec_booz_qi_scalar_objective_from_boozer(
+    diagnostics = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
         context,
         booz,
-        nphi=nphi,
-        nalpha=nalpha,
-        n_bounce=n_bounce,
+        include_qi=True,
+        include_maxj=False,
     )
+    return {
+        "qi_objective": jnp.asarray(diagnostics["qi_objective"], dtype=jnp.float64),
+    }
+
+
+def _vmec_j_invariant_qi_maxj_objectives_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    include_qi: bool,
+    include_maxj: bool,
+) -> dict[str, jnp.ndarray]:
+    booz = _boozer_output_from_state(context, state)
+    return _vmec_j_invariant_qi_maxj_objectives_from_boozer(
+        context,
+        booz,
+        include_qi=include_qi,
+        include_maxj=include_maxj,
+    )
+
+
+def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
+    context: GeometryAutodiffContext,
+    booz,
+    *,
+    include_qi: bool,
+    include_maxj: bool,
+) -> dict[str, jnp.ndarray]:
+    """Keep the existing Boozer path and only swap the QI/max-J post-processing."""
+
+    vmec_backend = _import_vmec_jax()
+    helper = getattr(vmec_backend, "j_invariant_qi_maxj_residual_from_boozer", None)
+    if helper is None:
+        raise AttributeError(
+            "The active VMEC backend does not expose j_invariant_qi_maxj_residual_from_boozer. "
+            "This benchmark path is intentionally restricted to the existing Boozer output plus "
+            "the VMEX J-based QI/max-J post-processing."
+        )
+
+    gi_b = jnp.asarray(booz["bvco_b"], dtype=jnp.float64) + (
+        jnp.asarray(booz["iota_b"], dtype=jnp.float64) * jnp.asarray(booz["buco_b"], dtype=jnp.float64)
+    )
+    surface_indices = np.asarray(context.surface_indices, dtype=np.int32).reshape(-1)
+    s_half = 0.5 * (
+        np.asarray(context.static.s[:-1], dtype=float)
+        + np.asarray(context.static.s[1:], dtype=float)
+    )
+    s_b = jnp.asarray(s_half[surface_indices], dtype=jnp.float64)
+    diagnostics = helper(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["ixm_b"],
+        xn_b=booz["ixn_b"],
+        iota_b=booz["iota_b"],
+        gi_b=gi_b,
+        s_b=s_b,
+        nfp=int(context.cfg.nfp),
+        include_qi=bool(include_qi),
+        include_maxj=bool(include_maxj),
+    )
+    return {
+        "qi_objective": jnp.asarray(diagnostics.get("qi_objective", 0.0), dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(diagnostics.get("maxj_objective", 0.0), dtype=jnp.float64),
+    }
 
 
 def _vmec_booz_qi_scalar_objective_from_boozer(
@@ -1873,17 +1925,23 @@ def _geometry_full_ad_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> dict[str, jnp.ndarray]:
-    """One AD gate vector for VMEC scalars, Boozer scalars, and Boozer QI."""
+    """One AD gate vector for VMEC scalars, Boozer scalars, and J-based QI/max-J."""
 
     vmec_scalars = _vmec_core_scalar_objectives_from_state(context, state)
     booz = _boozer_output_from_state(context, state)
     boozer_scalars = _vmec_booz_light_scalar_observables_from_boozer(context, state, booz)
-    qi = _vmec_booz_qi_scalar_objective_from_boozer(context, booz)
+    qi_maxj = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
+        context,
+        booz,
+        include_qi=True,
+        include_maxj=True,
+    )
 
     out = {f"vmec_{name}": jnp.asarray(value, dtype=jnp.float64) for name, value in vmec_scalars.items()}
     for name, value in boozer_scalars.items():
         out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
-    out["boozer_qi_objective"] = jnp.asarray(qi["qi_objective"], dtype=jnp.float64)
+    out["boozer_qi_objective"] = jnp.asarray(qi_maxj["qi_objective"], dtype=jnp.float64)
+    out["boozer_maxj_objective"] = jnp.asarray(qi_maxj["maxj_objective"], dtype=jnp.float64)
     return out
 
 
@@ -2213,11 +2271,12 @@ def _observable_items_from_state(
     elif kind == "vmec_booz_qi_maxj_scalar_objectives":
         observables = _vmec_booz_qi_maxj_scalar_objectives_from_state(context, state)
     elif kind == "vmec_qi_maxj_scalar_objectives":
-        observables = _vmec_qi_maxj_shared_diagnostics_from_state(context, state)
-        observables = {
-            "qi_objective": jnp.asarray(observables["qi_objective"], dtype=jnp.float64),
-            "maxj_objective": jnp.asarray(observables["maxj_objective"], dtype=jnp.float64),
-        }
+        observables = _vmec_j_invariant_qi_maxj_objectives_from_state(
+            context,
+            state,
+            include_qi=True,
+            include_maxj=True,
+        )
     elif kind == "vmec_dmerc_objectives":
         raise _vmec_dmerc_unavailable_error()
     else:
@@ -2268,6 +2327,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "boozer_aspect_proxy",
             "boozer_b10_over_b00_mean",
             "boozer_qi_objective",
+            "boozer_maxj_objective",
         ]
     if kind == "vmec_iotaf_scalar_observables":
         return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
@@ -3181,22 +3241,38 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
     _progress("aspect proxy cotangents ready", aspect_proxy_state_bar)
 
-    qi_index = names.index("boozer_qi_objective")
-
-    def qi_scalar(booz_inner):
-        values = _vmec_booz_qi_scalar_objective_from_boozer(context, booz_with_modes(booz_inner))
-        return jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(())
-
-    qi_value, qi_pullback = jax.vjp(qi_scalar, booz)
-    values_by_name["boozer_qi_objective"] = qi_value
-    qi_unit_boozer_bar = qi_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
-    qi_boozer_bar = _tree_scale_unit_cotangent(
-        qi_unit_boozer_bar,
-        cotangents[:, qi_index],
+    j_qi_maxj_indices = (
+        names.index("boozer_qi_objective"),
+        names.index("boozer_maxj_objective"),
     )
-    _progress("qi cotangents ready", qi_boozer_bar)
 
-    booz_bar = _tree_add_all(boozer_bar, qi_boozer_bar)
+    def j_qi_maxj_vector(booz_inner):
+        values = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
+            context,
+            booz_with_modes(booz_inner),
+            include_qi=True,
+            include_maxj=True,
+        )
+        return jnp.stack(
+            [
+                jnp.asarray(values["qi_objective"], dtype=jnp.float64).reshape(()),
+                jnp.asarray(values["maxj_objective"], dtype=jnp.float64).reshape(()),
+            ]
+        )
+
+    j_qi_maxj_values, j_qi_maxj_pullback = jax.vjp(j_qi_maxj_vector, booz)
+    values_by_name["boozer_qi_objective"] = j_qi_maxj_values[0]
+    values_by_name["boozer_maxj_objective"] = j_qi_maxj_values[1]
+    j_qi_maxj_basis = jax.vmap(lambda cot: j_qi_maxj_pullback(cot)[0])(
+        jnp.eye(2, dtype=jnp.float64)
+    )
+    j_qi_maxj_boozer_bar = _tree_weighted_basis_sum(
+        j_qi_maxj_basis,
+        cotangents[:, j_qi_maxj_indices],
+    )
+    _progress("j-qi/maxj Boozer cotangents ready", j_qi_maxj_boozer_bar)
+
+    booz_bar = _tree_add_all(boozer_bar, j_qi_maxj_boozer_bar)
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
@@ -3304,11 +3380,12 @@ def vmec_qi_maxj_scalar_objectives_from_single_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
-    diagnostics = _vmec_qi_maxj_shared_diagnostics_from_state(context, state)
-    return {
-        "qi_objective": jnp.asarray(diagnostics["qi_objective"], dtype=jnp.float64),
-        "maxj_objective": jnp.asarray(diagnostics["maxj_objective"], dtype=jnp.float64),
-    }
+    return _vmec_j_invariant_qi_maxj_objectives_from_state(
+        context,
+        state,
+        include_qi=True,
+        include_maxj=True,
+    )
 
 
 def vmec_booz_qi_maxj_scalar_objectives_from_single_param(

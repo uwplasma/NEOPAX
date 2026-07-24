@@ -397,10 +397,9 @@ def main() -> None:
         help=(
             "Observable group to compare. 'geometry_full_ad_objectives' is the "
             "combined gate: current vmec_jax.core.optimize scalars, Boozer "
-            "reduced quantities, and Boozer QI in one reverse Jacobian. "
-            "'vmec_booz_qi_scalar_objectives' tests the Boozer/QI path without "
-            "requiring balloon_jax/Max-J. "
-            "Max-J is kept only in the explicit QI/max-J diagnostic mode for now. "
+            "reduced quantities, and the VMEX shared-J QI/max-J objectives in "
+            "one reverse Jacobian. 'vmec_booz_qi_scalar_objectives' tests the "
+            "same shared-J QI path on its own. "
             "'vmec_dmerc_objectives' intentionally errors until DMerc has a "
             "pure-JAX state-level implementation."
         ),

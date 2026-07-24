@@ -45,6 +45,7 @@ OBJECTIVE_ALIASES = {
     "aspect_proxy": "boozer_aspect_proxy",
     "b10_over_b00_mean": "boozer_b10_over_b00_mean",
     "qi_objective": "boozer_qi_objective",
+    "maxj_objective": "boozer_maxj_objective",
 }
 
 
@@ -331,7 +332,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Diagnostic-only frozen-linearized FD for NEOPAX geometry_full_ad_objectives "
-            "such as boozer_qi_objective. Does not edit vmec_jax or NEOPAX production lanes."
+            "such as boozer_qi_objective and boozer_maxj_objective. "
+            "Does not edit vmec_jax or NEOPAX production lanes."
         )
     )
     parser.add_argument("--vmec-input", default=str(DEFAULT_VMEC_INPUT))
