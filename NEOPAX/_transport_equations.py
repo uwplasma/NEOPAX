@@ -1514,10 +1514,20 @@ class ComposedEquationSystem:
                 support,
                 **kwargs,
             )
+            geometry_delta0 = _float_delta_tree_like(geometry)
+            _, geometry_pullback = jax.vjp(
+                lambda geometry_delta: self.with_geometry_payload(
+                    _add_float_delta_tree(geometry, geometry_delta)
+                ).build_lagged_response(
+                    state,
+                ),
+                geometry_delta0,
+            )
+            (geometry_bar,) = geometry_pullback(lagged_response_bar)
             return self._realtime_geometry_payload_bar(
                 {"ntx_support": support, "geometry": geometry},
                 support_bar,
-                _float_delta_tree_like(geometry),
+                geometry_bar,
             )
         working_state, _eidx = self._prepare_working_state(state)
         flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
