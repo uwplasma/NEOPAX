@@ -1287,7 +1287,7 @@ class ComposedEquationSystem:
         updates = {}
         for field in dataclasses.fields(model):
             value = getattr(model, field.name)
-            if field.name == "geometry":
+            if field.name in {"geometry", "field"}:
                 if value is not geometry:
                     updates[field.name] = geometry
                 continue
