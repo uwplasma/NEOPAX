@@ -110,7 +110,9 @@ Interpretation:
 
 ## Current Reverse Evidence
 
-The latest reverse component split before this note showed the pressure mismatch:
+### Before the `field`/`geometry` payload fix
+
+The reverse component split before the `field`/`geometry` fix showed the pressure mismatch:
 
 ```text
 total_pressure_volume_average:
@@ -128,6 +130,120 @@ baseline-geometry final-state FD ~= 5.835553e-05
 ```
 
 Therefore the remaining bug is not the explicit objective geometry pullback and not simply a missing lagged NTX rebuild term. The bad term is the reverse final-state/support cotangent accumulation, specifically the transport-RHS/support contribution feeding `step_support_bar_leaves_accum`.
+
+### FD payload-reconstruction diagnostic
+
+The FD script with `--split-payload-fd-diagnostic` now directly compares:
+
+```text
+prepared runtime geometry map:
+  prepare_transport_solver_components(perturbed_runtime).equation_system
+
+reverse payload reconstruction map:
+  baseline_equation_system.with_geometry_payload(perturbed_geometry)
+```
+
+Before the fix, pressure differed:
+
+```text
+local RHS geometry finite-difference component sums:
+  - pressure: fd_prepared_geometry=1.630660e+03
+              fd_with_geometry_payload=1.709301e+03
+              diff=7.864125e+01
+```
+
+Root cause: `ComposedEquationSystem.with_geometry_payload(...)` only replaced nested dataclass
+fields named `geometry`. The turbulent power model used in the realtime benchmark is
+`PowerAnalyticalTurbulentTransportModel`, which stores the same transport geometry object as
+field name `field`. Therefore the reverse payload reconstruction left this turbulence model on
+baseline geometry while the prepared FD map used perturbed geometry.
+
+Patch:
+
+```python
+if field.name in {"geometry", "field"}:
+    updates[field.name] = geometry
+```
+
+After syncing that patch, the FD diagnostic confirmed the maps agree locally:
+
+```text
+local RHS geometry finite-difference component sums:
+  - density:  diff=0.000000e+00
+  - pressure: diff=0.000000e+00
+  - Er:       diff=0.000000e+00
+```
+
+This confirms the stale turbulence-geometry reconstruction bug is fixed.
+
+### Reverse after the `field`/`geometry` payload fix
+
+The post-fix reverse run moved much closer to FD:
+
+```text
+softmax_Er:
+  FD = -4.739435e+01
+  AD = -4.739231e+01
+
+Er2_volume_average:
+  FD = -1.672623e+02
+  AD = -1.672543e+02
+
+Er_volume_average:
+  FD = -1.809277e+01
+  AD = -1.809122e+01
+
+electron_temperature_volume_average_keV:
+  FD = -2.246442e-02
+  AD = -2.327820e-02
+
+total_pressure_volume_average:
+  FD = -7.747999e-02
+  AD = -7.605590e-02
+
+alpha_power_volume_average_mw_m3:
+  FD =  1.253217e-03
+  AD =  1.374368e-03
+```
+
+The branch split shows NTX support and explicit objective geometry are already consistent:
+
+```text
+pressure NTX:
+  FD ~= 1.126255e-04
+  AD ~= 1.124851e-04
+
+pressure explicit:
+  FD ~= -7.753834e-02
+  AD ~= -7.753767e-02
+```
+
+The remaining mismatch is in the geometry-only final-state/transport-RHS branch:
+
+```text
+FD geometry-only final-state pressure ~= -5.428072e-05
+AD transport_rhs.geometry pressure     ~=  1.369281e-03
+```
+
+### Current patch waiting for test
+
+Because the post-fix run still has `support_rebuild_count=12`, a remaining missing direct-geometry
+term may come from lagged-response rebuilds. The previous lagged-rebuild attempt was done before
+the `field`/`geometry` fix and therefore used a stale turbulence geometry map. A narrower reverse-only
+patch has now been added:
+
+```text
+ComposedEquationSystem.pullback_build_lagged_response_support_payload(...)
+```
+
+For combined realtime payloads it now computes:
+
+```text
+ntx_support_bar = existing NTX/support build-lagged-response pullback
+geometry_bar    = VJP of with_geometry_payload(...).build_lagged_response(state)
+```
+
+This should be tested with the same reverse command. It does not alter the forward solver path.
 
 ## Suspected Code Path
 
@@ -176,11 +292,19 @@ These diagnostics only add `jax.block_until_ready` and prints; they are intended
 
 ## Important Caution
 
-A previous attempt to add a geometry VJP through `pullback_build_lagged_response_support_payload` did not move the numbers and increased timings. That change should not be kept as a fix for the current mismatch unless a new diagnostic proves the lagged-response rebuild branch is actually the missing term.
+The lagged-rebuild geometry pullback must remain reverse-only. Do not rebuild or perturb the
+production forward runtime/schedule to test this. The safe comparison remains:
+
+```text
+FD accepted replay with frozen linearized geometry
+vs
+reverse payload cotangent through the same accepted replay schedule
+```
 
 ## Next Steps
 
-1. Run the reverse command again with the new timing diagnostics.
+1. Run the reverse command again after the `pullback_build_lagged_response_support_payload`
+   geometry-branch patch.
 2. Compare reverse `geometry_branch` and `ntx_support_branch` final-state components against FD:
    - `fd_final_state_geometry_branch`
    - `fd_final_state_ntx_support_branch`
