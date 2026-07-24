@@ -7,8 +7,8 @@
 mode = "transport"
 
 [geometry]
-vmec_file = "./examples/inputs/wout_w7x.nc"
-boozer_file = "./examples/inputs/boozmn_w7x.nc"
+vmec_file = "../../outputs/quick_run/stage1_equilibrium/wout_w7x_t3d.nc"
+boozer_file = "../../outputs/quick_run/stage2_boozer/boozmn_w7x_t3d.nc"
 n_radial = 9
 rho_edge = 0.7
 
@@ -18,7 +18,7 @@ entropy_model = "none"
 
 [turbulence]
 flux_model = "fluxes_r_file"
-turbulence_file = "./examples/outputs/w7x_trinity3d_stage4_t_ion/neopax_fluxes.h5"
+turbulence_file = "../../outputs/quick_run/stage4_turbulence/neopax_fluxes.h5"
 
 [classical]
 flux_model = "none"
@@ -28,7 +28,7 @@ n_x = 4
 
 [species]
 n_species = 2
-names = ["e", "H"]
+names = ["e", "ion"]
 mass_mp = [0.000544617, 1.0]
 charge_qp = [-1.0, 1.0]
 
@@ -99,8 +99,8 @@ radau_error_estimator = "embedded2"
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
 t0 = 0.0
-t_final = 1.0e-4
-dt = 1.0e-8
+t_final = 20.0
+dt = 10.
 rtol = 1.0e-6
 atol = 1.0e-8
 max_step = 1.0

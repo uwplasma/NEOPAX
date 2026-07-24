@@ -495,6 +495,8 @@ def main() -> None:
         baseline_geometry_final_state_fd = None
         geometry_only_final_state_fd = None
         ntx_support_only_final_state_fd = None
+        local_rhs_geometry_fd = None
+        local_rhs_geometry_payload_fd = None
         param_index = PARAMETER_ORDER.index(parameter_name)
         baseline_value = float(profile_cfg[parameter_name])
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
@@ -593,6 +595,8 @@ def main() -> None:
         ) / (2.0 * h)
         geometry_only_final_state_fd = None
         ntx_support_only_final_state_fd = None
+        local_rhs_geometry_fd = None
+        local_rhs_geometry_payload_fd = None
         if args.split_payload_fd_diagnostic:
             print(
                 "[autodiff-gate] progress: running split payload final-state FD diagnostic",
@@ -661,6 +665,60 @@ def main() -> None:
                 _objective_vector(plus_support_only_replay["final_state"], baseline_runtime)
                 - _objective_vector(minus_support_only_replay["final_state"], baseline_runtime)
             ) / (2.0 * h)
+            print(
+                "[autodiff-gate] progress: running local RHS geometry-payload FD diagnostic",
+                flush=True,
+            )
+            baseline_equation_system = baseline_components["equation_system"]
+            baseline_solver = baseline_components["solver"]
+            t0 = jnp.asarray(getattr(baseline_solver, "t0", 0.0), dtype=jnp.float64)
+            baseline_lagged_response = baseline_equation_system.build_lagged_response(
+                baseline_profile_state
+            )
+
+            def _rhs_component_sums(rhs_value):
+                return jnp.asarray(
+                    [
+                        jnp.sum(jnp.asarray(rhs_value.density, dtype=jnp.float64)),
+                        jnp.sum(jnp.asarray(rhs_value.pressure, dtype=jnp.float64)),
+                        jnp.sum(jnp.asarray(rhs_value.Er, dtype=jnp.float64)),
+                    ],
+                    dtype=jnp.float64,
+                )
+
+            def _local_prepared_rhs_sums(runtime_value):
+                components_value = prepare_transport_solver_components(
+                    config,
+                    runtime_value,
+                    baseline_profile_state,
+                )
+                rhs_value = components_value["equation_system"].evaluate_with_lagged_response(
+                    t0,
+                    baseline_profile_state,
+                    runtime_value.species,
+                    baseline_lagged_response,
+                )
+                return _rhs_component_sums(rhs_value)
+
+            def _local_payload_rhs_sums(runtime_value):
+                rhs_value = baseline_equation_system.with_geometry_payload(
+                    runtime_value.geometry
+                ).evaluate_with_lagged_response(
+                    t0,
+                    baseline_profile_state,
+                    baseline_runtime.species,
+                    baseline_lagged_response,
+                )
+                return _rhs_component_sums(rhs_value)
+
+            local_rhs_geometry_fd = (
+                _local_prepared_rhs_sums(plus_geometry_only_runtime)
+                - _local_prepared_rhs_sums(minus_geometry_only_runtime)
+            ) / (2.0 * h)
+            local_rhs_geometry_payload_fd = (
+                _local_payload_rhs_sums(plus_geometry_only_runtime)
+                - _local_payload_rhs_sums(minus_geometry_only_runtime)
+            ) / (2.0 * h)
 
     (
         minus_objectives,
@@ -669,6 +727,8 @@ def main() -> None:
         baseline_geometry_final_state_fd,
         geometry_only_final_state_fd,
         ntx_support_only_final_state_fd,
+        local_rhs_geometry_fd,
+        local_rhs_geometry_payload_fd,
     ) = (
         jax.block_until_ready(
             (
@@ -678,6 +738,8 @@ def main() -> None:
                 baseline_geometry_final_state_fd,
                 geometry_only_final_state_fd,
                 ntx_support_only_final_state_fd,
+                local_rhs_geometry_fd,
+                local_rhs_geometry_payload_fd,
             )
         )
     )
@@ -704,6 +766,16 @@ def main() -> None:
         None
         if ntx_support_only_final_state_fd is None
         else np.asarray(jax.device_get(ntx_support_only_final_state_fd), dtype=float)
+    )
+    local_rhs_geometry_fd_np = (
+        None
+        if local_rhs_geometry_fd is None
+        else np.asarray(jax.device_get(local_rhs_geometry_fd), dtype=float)
+    )
+    local_rhs_geometry_payload_fd_np = (
+        None
+        if local_rhs_geometry_payload_fd is None
+        else np.asarray(jax.device_get(local_rhs_geometry_payload_fd), dtype=float)
     )
 
     report = {
@@ -739,6 +811,24 @@ def main() -> None:
         "ntx_support_only_final_state_fd": None
         if ntx_support_only_final_state_fd_np is None
         else ntx_support_only_final_state_fd_np.tolist(),
+        "local_rhs_geometry_fd_component_sums": None
+        if local_rhs_geometry_fd_np is None
+        else {
+            name: float(value)
+            for name, value in zip(
+                ("density", "pressure", "Er"),
+                local_rhs_geometry_fd_np.tolist(),
+            )
+        },
+        "local_rhs_geometry_payload_fd_component_sums": None
+        if local_rhs_geometry_payload_fd_np is None
+        else {
+            name: float(value)
+            for name, value in zip(
+                ("density", "pressure", "Er"),
+                local_rhs_geometry_payload_fd_np.tolist(),
+            )
+        },
         "baseline_rollout": _adaptive_rollout_diagnostics(baseline_rollout),
         "minus_replay": {
             "final_state_finite": _tree_all_finite(minus_replay["final_state"]),
@@ -777,6 +867,19 @@ def main() -> None:
         print("[autodiff-gate] NTX-support-only final-state finite-difference gradients:")
         for label, value in zip(OBJECTIVE_LABELS, ntx_support_only_final_state_fd_np.tolist()):
             print(f"  - {label}: fd_final_state_ntx_support_branch={float(value):.6e}")
+    if local_rhs_geometry_fd_np is not None and local_rhs_geometry_payload_fd_np is not None:
+        print("[autodiff-gate] local RHS geometry finite-difference component sums:")
+        for label, prepared_value, payload_value in zip(
+            ("density", "pressure", "Er"),
+            local_rhs_geometry_fd_np.tolist(),
+            local_rhs_geometry_payload_fd_np.tolist(),
+        ):
+            print(
+                f"  - {label}: "
+                f"fd_prepared_geometry={float(prepared_value):.6e} "
+                f"fd_with_geometry_payload={float(payload_value):.6e} "
+                f"diff={float(payload_value - prepared_value):.6e}"
+            )
 
     outpath = _report_path(parameter_name)
     outpath.write_text(json.dumps(report, indent=2))

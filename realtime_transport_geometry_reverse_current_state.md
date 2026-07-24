@@ -1,20 +1,34 @@
 # Realtime Transport Geometry Reverse AD Current State
 
-Date: 2026-07-22
+Date: 2026-07-23
 
 ## Goal
 
-Extend the already-benchmarked profile reverse AD lane to realtime VMEC geometry, without contaminating:
+Extend the validated profile reverse AD lane to realtime VMEC geometry without changing forward-solver math, frozen-geometry profile reverse behavior, or the realtime VMEC forward construction.
 
-- the forward transport solver,
-- the frozen geometry/profile reverse benchmark,
-- the realtime forward solver geometry construction.
+The realtime geometry reverse lane should:
 
-The realtime geometry reverse lane should use the same primal geometry construction as the realtime forward solver and should pull transport-objective cotangents back to VMEC boundary harmonics.
+- use the same primal geometry construction as the realtime forward solver,
+- recover the frozen-geometry/profile reverse lane as the geometry-frozen limit,
+- pull transport-objective cotangents back to VMEC harmonics,
+- eventually print gradients for all selected VMEC harmonics.
 
-## Current Baseline Commands
+## Current Reference Commands
 
-Reverse AD realtime geometry/profile benchmark:
+Realtime geometry FD with accepted replay and split-payload diagnostic:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --split-payload-fd-diagnostic
+```
+
+Realtime geometry reverse AD:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
@@ -25,202 +39,150 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --ntx-exact-derivative-mode direct \
   --ntx-exact-derivative-field-pullback-mode generic_jvp \
   --objective all \
-  --accepted-step-limit 2 \
+  --accepted-step-limit 16 \
   --radau-jacobian-reuse-mode legacy \
   --timing-mode jit-warm \
-  --reverse-segment-length 1 \
+  --reverse-segment-length 4 \
   --reverse-stage-adjoint-solve-mode bicgstab \
   --reverse-rhs-transpose-mode explicit_ntx_interpolated \
   --reverse-step-bwd-mode reduced_cotangent
 ```
 
-Realtime geometry forward FD comparison:
+## Current FD Evidence
 
-```bash
-python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
-  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
-  --parameter RBC:1:0 \
-  --geometry-fd-lane frozen_linearized \
-  --accepted-step-limit 2 \
-  --radau-jacobian-reuse-mode legacy \
-  --replay-mode accepted
-```
-
-Profile FD comparison:
-
-```bash
-python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
-  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
-  --parameter n0 \
-  --accepted-step-limit 2 \
-  --radau-jacobian-reuse-mode legacy \
-  --replay-mode accepted
-```
-
-## Fixed / Verified
-
-- Realtime geometry quantities are finite in reverse:
-  - `a_b = 1.1778251713416479`
-  - `R0 = 12.088114677251474`
-  - `integrated_volume = 331.0187969899648`
-  - `r_grid`, `Vprime`, `Vprime_half`, `overVprime` all finite.
-
-- NTX surface backend for the realtime TOML is `vmec`.
-
-- The reverse profile gradients match realtime FD profile gradients for `n0` on the accepted-step replay benchmark.
-
-- The old NaN issue in VMEC traceable NTX support was fixed by making the derived `bmag` construction safe near non-positive roundoff:
-  - file: `NEOPAX/_geometry_autodiff.py`
-  - branch: `_vmec_jax_wout_surface_with_frozen_sampling`
-
-- The reverse geometry payload now prints branch and component splits:
-  - `geometry_branch`
-  - `ntx_support_branch`
-  - `objective_explicit`
-  - `transport_rhs`
-  - `initial_cache`
-  - `initial_profile`
-
-- The reverse all-harmonic infrastructure has been started:
-  - `--reverse-geometry-parameter all`
-  - `--reverse-geometry-families`
-  - `--reverse-geometry-include-zero-harmonics`
-  - print limiting via top-k.
-
-## Current Reverse vs FD Numbers
-
-FD geometry benchmark for `RBC:1:0`, frozen-linearized geometry lane, accepted replay:
+The latest FD split for `RBC:1:0`, 16 accepted steps, frozen-linearized geometry lane:
 
 ```text
-softmax_Er                         -4.184389e+00
-smooth_root_proxy                   1.875871e-12
-Er2_volume_average                  1.648737e+01
-Er_volume_average                  -3.687997e+00
-electron_temperature_volume_average -2.088060e-02
-total_pressure_volume_average      -1.168713e-01
-alpha_power_volume_average         -2.485351e-03
+objective finite-difference gradients:
+  softmax_Er                         -4.739435e+01
+  smooth_root_proxy                  -2.922456e-02
+  Er2_volume_average                 -1.672623e+02
+  Er_volume_average                  -1.809277e+01
+  electron_temperature_volume_average -2.246442e-02
+  total_pressure_volume_average      -7.747999e-02
+  alpha_power_volume_average          1.253217e-03
+
+fixed-final-state explicit geometry finite-difference gradients:
+  softmax_Er                          0.000000e+00
+  smooth_root_proxy                   0.000000e+00
+  Er2_volume_average                  3.543218e-01
+  Er_volume_average                  -5.370992e-02
+  electron_temperature_volume_average -1.286930e-02
+  total_pressure_volume_average      -7.753834e-02
+  alpha_power_volume_average         -1.924327e-03
+
+baseline-geometry final-state finite-difference gradients:
+  softmax_Er                         -4.739435e+01
+  smooth_root_proxy                  -2.922456e-02
+  Er2_volume_average                 -1.676166e+02
+  Er_volume_average                  -1.803906e+01
+  electron_temperature_volume_average -9.595126e-03
+  total_pressure_volume_average       5.835553e-05
+  alpha_power_volume_average          3.177544e-03
+
+geometry-only final-state finite-difference gradients:
+  softmax_Er                         -1.721271e+01
+  smooth_root_proxy                  -1.910128e-02
+  Er2_volume_average                 -1.913312e+02
+  Er_volume_average                  -2.719813e+00
+  electron_temperature_volume_average -4.539670e-03
+  total_pressure_volume_average      -5.428072e-05
+  alpha_power_volume_average          7.258337e-04
+
+NTX-support-only final-state finite-difference gradients:
+  softmax_Er                         -3.018171e+01
+  smooth_root_proxy                  -1.012344e-02
+  Er2_volume_average                  2.371468e+01
+  Er_volume_average                  -1.531924e+01
+  electron_temperature_volume_average -5.055458e-03
+  total_pressure_volume_average       1.126255e-04
+  alpha_power_volume_average          2.451711e-03
 ```
 
-Reverse AD `RBC:1:0` from latest component-split run:
+Interpretation:
+
+- The explicit objective geometry term is correct and dominates pressure.
+- FD says pressure final-state sensitivity is nearly zero:
+  `-5.428072e-05 + 1.126255e-04 = 5.834478e-05`.
+- FD says Te/pressure/alpha mismatches are not from missing NTX support alone.
+- The FD split is consistent internally:
+  explicit geometry + baseline-geometry final-state = full FD.
+
+## Current Reverse Evidence
+
+The latest reverse component split before this note showed the pressure mismatch:
 
 ```text
-softmax_Er                         -4.180080e+00
-smooth_root_proxy                   2.075771e-12
-Er2_volume_average                  1.863731e+01
-Er_volume_average                  -3.708129e+00
-electron_temperature_volume_average -1.381016e-02
-total_pressure_volume_average      -7.726593e-02
-alpha_power_volume_average         -1.759807e-03
+total_pressure_volume_average:
+  objective_explicit      ~= -7.753767e-02
+  transport_rhs           ~=  7.320592e-03
+  initial_cache           ~=  2.196721e-05
+  final_state_components  ~=  7.342559e-03
+  total reverse           ~= -7.019511e-02
 ```
 
-`softmax_Er` and `Er_volume_average` are close. `Er2`, `Te`, pressure, and alpha still differ.
-
-## Important Diagnostic Result
-
-The remaining mismatch is not mainly from NTX support for the non-Er objectives. The latest split shows:
+FD says the corresponding final-state contribution should be:
 
 ```text
-electron_temperature:
-  objective_explicit = -1.295823e-02
-  transport_rhs      = -5.271512e-04
-  initial_cache      = -3.247714e-04
-  initial_profile    = ~0
-
-total_pressure:
-  objective_explicit = -7.766514e-02
-  transport_rhs      =  4.557137e-04
-  initial_cache      = -5.650149e-05
-  initial_profile    = ~0
-
-alpha_power:
-  objective_explicit = -1.927415e-03
-  transport_rhs      =  6.560537e-05
-  initial_cache      =  1.020021e-04
-  initial_profile    = ~0
+baseline-geometry final-state FD ~= 5.835553e-05
 ```
 
-For these objectives, the discrepancy is concentrated in the direct explicit geometry objective path, especially the volume-average use of `Vprime` and `r_grid`.
+Therefore the remaining bug is not the explicit objective geometry pullback and not simply a missing lagged NTX rebuild term. The bad term is the reverse final-state/support cotangent accumulation, specifically the transport-RHS/support contribution feeding `step_support_bar_leaves_accum`.
 
-The added initial analytical profile geometry pullback is effectively zero for `RBC:1:0` in this setup. This is consistent with the profile builder using normalized radius `x = r_grid / r_grid[-1]`, so pure/minor-radius-like changes mostly cancel.
+## Suspected Code Path
 
-## Latest Added Diagnostic
-
-`examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py` now prints a fixed-final-state explicit geometry FD diagnostic for realtime geometry parameters:
+The suspicious reverse path is:
 
 ```text
-fixed-final-state explicit geometry finite-difference gradients
+benchmark_transport_reverse_ad_only.py
+  _reverse_all_objectives_support_payload_bar_for_parameter_vector
+    -> _radau_segment_reduced_cotangent_bwd_batched_with_support_call
+      -> _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
+        -> _radau_exact_stage_residual_support_pullback
+        -> physics_context.flat_rhs_lagged_response_support_pullback
+        -> ComposedEquationSystem.pullback_evaluate_with_lagged_response_support_payload
 ```
 
-This evaluates:
+The specific accumulated reverse component is:
 
 ```text
-fixed final transport state + perturbed realtime geometry objective only
+step_support_bar_leaves_accum
 ```
 
-It should be compared directly against the reverse component:
+This component is printed as:
 
 ```text
-objective_explicit
+transport_rhs
 ```
 
-If this FD diagnostic does not match `objective_explicit`, the bug is specifically in the explicit geometry-objective pullback for volume averages / `Vprime` / `r_grid`.
-
-## Ambipolar Root-Finder AD Status
-
-The transport RHS ambipolarity path is already differentiated:
-
-- `Gamma` enters density via `div Gamma`.
-- `Q` enters pressure via `div Q`.
-- `Gamma` enters Er via ambipolar charge flux.
-- NTX support payload cotangents receive the corresponding `Gamma/Q/Upar` bars.
-
-The missing piece for full realtime geometry AD is initial Er root-finder differentiation:
+and contributes to:
 
 ```text
-VMEC harmonic -> ambipolar root finder -> initial Er -> rollout -> objective
+final_state_components_sum
 ```
 
-Current FD and reverse geometry comparison intentionally freeze initial Er for the frozen-linearized geometry FD lane, so this branch is not active in the current comparison.
+## Timing Diagnostics Added
 
-When enabling this, do not differentiate through scan/root selection. Use a frozen selected-root implicit rule:
+`examples/benchmarks/benchmark_transport_reverse_ad_only.py` currently has diagnostic sync timing around:
 
-```text
-G_i(Er_i, state, geometry, support) = sum_s q_s Gamma_s(i, Er_i) = 0
-dEr_i/dp = - (dG_i/dp) / (dG_i/dEr_i)
-```
+- realtime geometry runtime build,
+- solver component preparation,
+- support reverse profile-state VJP,
+- support reverse initial-carry VJP,
+- support reverse realized-schedule VJP forward residual capture,
+- segmented cotangent sweep.
 
-Reverse form:
+These diagnostics only add `jax.block_until_ready` and prints; they are intended to identify why reverse appears slower before the segment reverse compile. They should not change math.
 
-```text
-G_bar_i = - Er_bar_i / (dG_i/dEr_i)
-```
+## Important Caution
 
-Then pull `G_bar_i` through the local ambipolar residual into geometry/support/profile quantities.
+A previous attempt to add a geometry VJP through `pullback_build_lagged_response_support_payload` did not move the numbers and increased timings. That change should not be kept as a fix for the current mismatch unless a new diagnostic proves the lagged-response rebuild branch is actually the missing term.
 
-## Next Step
+## Next Steps
 
-Run the updated FD geometry benchmark and inspect the new explicit-geometry-only FD printout:
-
-```bash
-python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
-  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
-  --parameter RBC:1:0 \
-  --geometry-fd-lane frozen_linearized \
-  --accepted-step-limit 2 \
-  --radau-jacobian-reuse-mode legacy \
-  --replay-mode accepted
-```
-
-Compare:
-
-```text
-fixed-final-state explicit geometry FD
-```
-
-against reverse:
-
-```text
-objective_explicit
-```
-
-If they match, the remaining full FD mismatch is in replayed transport geometry coupling. If they do not match, fix the explicit geometry objective pullback first.
+1. Run the reverse command again with the new timing diagnostics.
+2. Compare reverse `geometry_branch` and `ntx_support_branch` final-state components against FD:
+   - `fd_final_state_geometry_branch`
+   - `fd_final_state_ntx_support_branch`
+3. Inspect whether `_execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support` is using the same lagged response and stage states as the accepted replay FD.
+4. If needed, add a local single-step FD-vs-reverse support diagnostic for the pressure RHS/support cotangent, not a full-run workaround.

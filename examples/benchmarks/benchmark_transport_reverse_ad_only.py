@@ -1302,7 +1302,14 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             profile_cfg=profile_cfg,
         )
 
+    phase_start = time.perf_counter()
     initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
+    initial_state = jax.block_until_ready(initial_state)
+    print(
+        "[autodiff-gate] progress: support reverse profile-state vjp ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
 
     def _carry_from_state(state_value):
         return _reverse_initial_carry_from_state_with_static_setup(
@@ -1313,13 +1320,28 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             prepared_rollout_static=reverse_setup.prepared_rollout,
         )
 
+    phase_start = time.perf_counter()
     initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
+    initial_carry = jax.block_until_ready(initial_carry)
+    print(
+        "[autodiff-gate] progress: support reverse initial carry vjp ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
+
+    phase_start = time.perf_counter()
     final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         reverse_setup.execution_context,
         reverse_setup.max_total_steps,
         reverse_setup.stop_after_accepted_steps,
         reverse_setup.reverse_segment_length,
         initial_carry,
+    )
+    final_y, residuals = jax.block_until_ready((final_y, residuals))
+    print(
+        "[autodiff-gate] progress: support reverse realized-schedule vjp forward ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
     )
 
     (
@@ -1436,6 +1458,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     support_reuse_count = 0
     support_rebuild_count = 0
+    phase_start = time.perf_counter()
     for segment_index in range(segment_count - 1, -1, -1):
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
@@ -1460,6 +1483,12 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
         support_reuse_count += int(np.count_nonzero(segment_lagged_valid))
         support_rebuild_count += int(segment_lagged_valid.size - np.count_nonzero(segment_lagged_valid))
+    reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
+    print(
+        "[autodiff-gate] progress: support reverse segmented cotangent sweep ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
@@ -3228,6 +3257,20 @@ def _run_realtime_geometry_support_segment_probe(
                             for component_name in support_component_names
                         ]
                         print("        components: " + " ".join(component_parts))
+                        component_branch_payload = report.get(
+                            "geometry_gradient_reverse_ad_by_component_and_branch",
+                            {},
+                        )
+                        if component_branch_payload:
+                            for component_name in support_component_names:
+                                branch_values = component_branch_payload[objective_name][component_name]
+                                geometry_component = branch_values["geometry"][geometry_label]
+                                ntx_component = branch_values["ntx_support"][geometry_label]
+                                print(
+                                    "        component_branches: "
+                                    f"{component_name}.geometry={geometry_component:.6e} "
+                                    f"{component_name}.ntx_support={ntx_component:.6e}"
+                                )
                         final_state_components = report.get(
                             "geometry_gradient_reverse_ad_final_state_components",
                             {},
@@ -3269,6 +3312,20 @@ def _run_realtime_geometry_support_segment_probe(
                             for component_name in support_component_names
                         ]
                         print("        components: " + " ".join(component_parts))
+                        component_branch_payload = report.get(
+                            "geometry_gradient_reverse_ad_by_component_and_branch",
+                            {},
+                        )
+                        if component_branch_payload:
+                            for component_name in support_component_names:
+                                branch_values = component_branch_payload[objective_name][component_name]
+                                geometry_component = branch_values["geometry"][geometry_label]
+                                ntx_component = branch_values["ntx_support"][geometry_label]
+                                print(
+                                    "        component_branches: "
+                                    f"{component_name}.geometry={geometry_component:.6e} "
+                                    f"{component_name}.ntx_support={ntx_component:.6e}"
+                                )
                         final_state_components = report.get(
                             "geometry_gradient_reverse_ad_final_state_components",
                             {},
@@ -3691,7 +3748,15 @@ def _run_realtime_geometry_reverse_mode(
     # Use the same entrypoint as the realtime forward solver for the primal
     # runtime.  Geometry-context helpers below are only for derivative-side
     # support-payload pullbacks against VMEC harmonics.
+    phase_start = time.perf_counter()
     baseline_runtime, baseline_state = build_runtime_context(config)
+    jax.block_until_ready(jax.tree_util.tree_leaves(baseline_state))
+    print(
+        "[autodiff-gate] progress: realtime geometry runtime build ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
+    phase_start = time.perf_counter()
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
         baseline_state=baseline_state,
@@ -3699,6 +3764,12 @@ def _run_realtime_geometry_reverse_mode(
         runtime=baseline_runtime,
     )
     baseline_components = prepare_transport_solver_components(config, baseline_runtime, baseline_profile_state)
+    jax.block_until_ready(jax.tree_util.tree_leaves(baseline_profile_state))
+    print(
+        "[autodiff-gate] progress: realtime geometry solver components ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
     static_solver = baseline_components["solver"]
     print(
         "[autodiff-gate] realtime geometry device: "

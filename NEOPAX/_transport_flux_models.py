@@ -7608,6 +7608,54 @@ def _spectrax_perturb_species_indices(labels, species_names):
     return jnp.asarray(indices, dtype=jnp.int32)
 
 
+def _spectrax_response_label_kind_codes(labels):
+    mapping = {
+        "density_gradient": 0,
+        "temperature_gradient": 1,
+    }
+    codes = []
+    for raw in labels:
+        key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw).strip().lower()
+        if key == "base":
+            raise ValueError("response_label='base' is not a valid perturbation channel for SPECTRAX FD response data.")
+        if key not in mapping:
+            raise ValueError(f"Unsupported SPECTRAX response_label {raw!r}.")
+        codes.append(mapping[key])
+    return jnp.asarray(codes, dtype=jnp.int32)
+
+
+def _spectrax_response_labels_to_kind_and_species(labels, species_names):
+    kind_codes = []
+    species_indices = []
+    lookup = {str(name).strip().lower(): idx for idx, name in enumerate(species_names)}
+    for raw in labels:
+        key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw).strip().lower()
+        if key == "base":
+            raise ValueError("response_label='base' is not a valid perturbation channel for SPECTRAX FD response data.")
+        if key.startswith("fd_n_"):
+            species_key = key[len("fd_n_") :]
+            kind_code = 0
+        elif key.startswith("fd_t_"):
+            species_key = key[len("fd_t_") :]
+            kind_code = 1
+        elif key in {"fd_er", "fd_e_r"}:
+            raise ValueError(
+                "SPECTRAX response_label 'fd_er' is not yet supported by NEOPAX fluxes_r_file lagged_response_mode='fd'."
+            )
+        else:
+            raise ValueError(f"Unsupported SPECTRAX response_label {raw!r}.")
+        if species_key not in lookup:
+            raise ValueError(
+                f"Unknown SPECTRAX response_label species tag {species_key!r} for NEOPAX species {species_names!r}."
+            )
+        species_indices.append(lookup[species_key])
+        kind_codes.append(kind_code)
+    return (
+        jnp.asarray(kind_codes, dtype=jnp.int32),
+        jnp.asarray(species_indices, dtype=jnp.int32),
+    )
+
+
 def read_flux_profile_file(path, n_species):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
@@ -7638,16 +7686,14 @@ def read_flux_profile_file(path, n_species):
 def read_flux_profile_fd_response_file(path, n_species, species_names):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
-        required = {
+        shared_required = {
             "Gamma_perturb",
             "Q_perturb",
             "perturb_delta",
             "perturb_present",
-            "perturb_kind",
-            "perturb_species",
         }
-        if not required.issubset(keys):
-            missing = ", ".join(sorted(required - keys))
+        if not shared_required.issubset(keys):
+            missing = ", ".join(sorted(shared_required - keys))
             raise ValueError(
                 f"Flux file '{path}' is missing SPECTRAX FD lagged-response datasets: {missing}."
             )
@@ -7655,8 +7701,22 @@ def read_flux_profile_fd_response_file(path, n_species, species_names):
         q_perturb = _normalize_perturb_species_flux_dataset(f["Q_perturb"][...], n_species)
         perturb_delta = jnp.asarray(f["perturb_delta"][...], dtype=float)
         perturb_present = jnp.asarray(f["perturb_present"][...], dtype=bool)
-        perturb_kind_codes = _spectrax_perturb_kind_codes(f["perturb_kind"][...])
-        perturb_species_indices = _spectrax_perturb_species_indices(f["perturb_species"][...], species_names)
+        if {"perturb_kind", "perturb_species"}.issubset(keys):
+            perturb_kind_codes = _spectrax_perturb_kind_codes(f["perturb_kind"][...])
+            perturb_species_indices = _spectrax_perturb_species_indices(f["perturb_species"][...], species_names)
+        elif {"response_label", "perturb_species"}.issubset(keys):
+            perturb_kind_codes = _spectrax_response_label_kind_codes(f["response_label"][...])
+            perturb_species_indices = _spectrax_perturb_species_indices(f["perturb_species"][...], species_names)
+        elif "response_label" in keys:
+            perturb_kind_codes, perturb_species_indices = _spectrax_response_labels_to_kind_and_species(
+                f["response_label"][...],
+                species_names,
+            )
+        else:
+            raise ValueError(
+                f"Flux file '{path}' is missing SPECTRAX FD perturbation labels. "
+                "Expected either (perturb_kind, perturb_species) or response_label."
+            )
     return (
         gamma_perturb,
         q_perturb,
