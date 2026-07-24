@@ -2813,40 +2813,48 @@ def _run_realtime_geometry_support_segment_probe(
             f"elapsed_s={time.perf_counter() - t_phase:.3f}",
             flush=True,
         )
-        pre_support_all_finite = True
-        print("[autodiff-gate] realtime support/geometry-payload cotangent precheck:")
-        for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
-            support_bar = support_bars[objective_i]
-            branch_diagnostics = _payload_branch_diagnostics(support_bar)
-            root_summary = branch_diagnostics["root"]["summary"]
-            if not root_summary["all_floating_leaves_finite"]:
-                pre_support_all_finite = False
+        skip_support_bar_diagnostics = bool(args.skip_realtime_geometry_support_bar_diagnostics)
+        if skip_support_bar_diagnostics:
             print(
-                f"  - {objective_name}: "
-                f"support_bar_l2={branch_diagnostics['root']['l2']:.6e} "
-                f"support_bar_all_finite={root_summary['all_floating_leaves_finite']}"
+                "[autodiff-gate] realtime support/geometry-payload cotangent precheck skipped "
+                "(--skip-realtime-geometry-support-bar-diagnostics)",
+                flush=True,
             )
-            if not root_summary["all_floating_leaves_finite"]:
-                for branch_name, branch_summary in branch_diagnostics.items():
-                    branch_leaf_summary = branch_summary["summary"]
-                    if branch_leaf_summary["all_floating_leaves_finite"]:
-                        continue
-                    nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
-                    first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]
-                    print(
-                        f"      first bad branch={branch_name} "
-                        f"l2={branch_summary['l2']:.6e} "
-                        f"array_leaves={branch_leaf_summary['n_array_leaves']} "
-                        f"first_nonfinite_leaf={first_nonfinite}",
-                        flush=True,
-                    )
-                    break
-        if not pre_support_all_finite:
-            raise FloatingPointError(
-                "Realtime geometry payload pullback skipped because transport reverse "
-                "produced nonfinite support/geometry payload cotangents. See the "
-                "precheck branch output above for the first bad payload leaf."
-            )
+        else:
+            pre_support_all_finite = True
+            print("[autodiff-gate] realtime support/geometry-payload cotangent precheck:")
+            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
+                support_bar = support_bars[objective_i]
+                branch_diagnostics = _payload_branch_diagnostics(support_bar)
+                root_summary = branch_diagnostics["root"]["summary"]
+                if not root_summary["all_floating_leaves_finite"]:
+                    pre_support_all_finite = False
+                print(
+                    f"  - {objective_name}: "
+                    f"support_bar_l2={branch_diagnostics['root']['l2']:.6e} "
+                    f"support_bar_all_finite={root_summary['all_floating_leaves_finite']}"
+                )
+                if not root_summary["all_floating_leaves_finite"]:
+                    for branch_name, branch_summary in branch_diagnostics.items():
+                        branch_leaf_summary = branch_summary["summary"]
+                        if branch_leaf_summary["all_floating_leaves_finite"]:
+                            continue
+                        nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
+                        first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]
+                        print(
+                            f"      first bad branch={branch_name} "
+                            f"l2={branch_summary['l2']:.6e} "
+                            f"array_leaves={branch_leaf_summary['n_array_leaves']} "
+                            f"first_nonfinite_leaf={first_nonfinite}",
+                            flush=True,
+                        )
+                        break
+            if not pre_support_all_finite:
+                raise FloatingPointError(
+                    "Realtime geometry payload pullback skipped because transport reverse "
+                    "produced nonfinite support/geometry payload cotangents. See the "
+                    "precheck branch output above for the first bad payload leaf."
+                )
 
         geom_cfg = config.get("geometry", {})
         geometry_parameter_name = str(args.reverse_geometry_parameter)
@@ -3005,15 +3013,20 @@ def _run_realtime_geometry_support_segment_probe(
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
         support_bar_branch_diagnostics_by_objective = {}
-        for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
-            support_bar = support_bars[objective_i]
-            support_bar_summary_by_objective[objective_name] = _payload_leaf_summary(support_bar)
-            support_bar_l2_by_objective[objective_name] = _tree_array_l2_norm(support_bar)
-            support_bar_branch_diagnostics_by_objective[objective_name] = (
-                _payload_branch_diagnostics(support_bar)
-            )
+        if not skip_support_bar_diagnostics:
+            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS):
+                support_bar = support_bars[objective_i]
+                support_bar_summary_by_objective[objective_name] = _payload_leaf_summary(support_bar)
+                support_bar_l2_by_objective[objective_name] = _tree_array_l2_norm(support_bar)
+                support_bar_branch_diagnostics_by_objective[objective_name] = (
+                    _payload_branch_diagnostics(support_bar)
+                )
 
-        support_summary = _payload_leaf_summary(support_payload)
+        support_summary = (
+            {}
+            if skip_support_bar_diagnostics
+            else _payload_leaf_summary(support_payload)
+        )
         report = {
             "mode": "transport_reverse_ad_only",
             "parameter_mode": str(args.reverse_parameter_mode),
@@ -3078,7 +3091,7 @@ def _run_realtime_geometry_support_segment_probe(
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
-            "geometry_gradient_reverse_ad_by_component": {
+            "geometry_gradient_reverse_ad_by_component": {} if not include_component_pullbacks else {
                 objective_name: {
                     component_name: {
                         geometry_label: float(value)
@@ -3091,7 +3104,7 @@ def _run_realtime_geometry_support_segment_probe(
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
-            "geometry_gradient_reverse_ad_final_state_components": {
+            "geometry_gradient_reverse_ad_final_state_components": {} if not include_component_pullbacks else {
                 objective_name: {
                     geometry_label: float(
                         sum(
@@ -3104,7 +3117,7 @@ def _run_realtime_geometry_support_segment_probe(
                 }
                 for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
             },
-            "geometry_gradient_reverse_ad_by_component_and_branch": {
+            "geometry_gradient_reverse_ad_by_component_and_branch": {} if not include_component_pullbacks else {
                 objective_name: {
                     component_name: {
                         "geometry": {
@@ -3167,6 +3180,7 @@ def _run_realtime_geometry_support_segment_probe(
             "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
             "realtime_geometry_component_pullbacks": bool(include_component_pullbacks),
+            "realtime_geometry_support_bar_diagnostics_skipped": bool(skip_support_bar_diagnostics),
             "realtime_primal_runtime_builder": "build_runtime_context",
             "realtime_geometry_derivative_boundary": (
                 "runtime_geometry_and_ntx_exact_lij_support_payload"
@@ -3343,27 +3357,33 @@ def _run_realtime_geometry_support_segment_probe(
                                 f"{dynamic_value:.6e} "
                                 "(compare to FD fd_final_state_geometry)"
                             )
-        print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
-        for objective_name in OBJECTIVE_LABELS:
-            summary = support_bar_summary_by_objective[objective_name]
+        if skip_support_bar_diagnostics:
             print(
-                f"  - {objective_name}: "
-                f"support_bar_l2={support_bar_l2_by_objective[objective_name]:.6e} "
-                f"support_bar_array_leaves={summary['n_array_leaves']} "
-                f"support_bar_all_finite={summary['all_floating_leaves_finite']}"
+                "[autodiff-gate] realtime support/geometry-payload cotangent diagnostics skipped",
+                flush=True,
             )
-            branch_diagnostics = support_bar_branch_diagnostics_by_objective[objective_name]
-            for branch_name, branch_summary in branch_diagnostics.items():
-                branch_leaf_summary = branch_summary["summary"]
-                nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
-                first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]["path"]
+        else:
+            print("[autodiff-gate] realtime support/geometry-payload cotangents by objective:")
+            for objective_name in OBJECTIVE_LABELS:
+                summary = support_bar_summary_by_objective[objective_name]
                 print(
-                    f"      {branch_name}: "
-                    f"l2={branch_summary['l2']:.6e} "
-                    f"array_leaves={branch_leaf_summary['n_array_leaves']} "
-                    f"all_finite={branch_leaf_summary['all_floating_leaves_finite']} "
-                    f"first_nonfinite_leaf={first_nonfinite}"
+                    f"  - {objective_name}: "
+                    f"support_bar_l2={support_bar_l2_by_objective[objective_name]:.6e} "
+                    f"support_bar_array_leaves={summary['n_array_leaves']} "
+                    f"support_bar_all_finite={summary['all_floating_leaves_finite']}"
                 )
+                branch_diagnostics = support_bar_branch_diagnostics_by_objective[objective_name]
+                for branch_name, branch_summary in branch_diagnostics.items():
+                    branch_leaf_summary = branch_summary["summary"]
+                    nonfinite_leaves = branch_summary["first_nonfinite_leaves"]
+                    first_nonfinite = None if not nonfinite_leaves else nonfinite_leaves[0]["path"]
+                    print(
+                        f"      {branch_name}: "
+                        f"l2={branch_summary['l2']:.6e} "
+                        f"array_leaves={branch_leaf_summary['n_array_leaves']} "
+                        f"all_finite={branch_leaf_summary['all_floating_leaves_finite']} "
+                        f"first_nonfinite_leaf={first_nonfinite}"
+                    )
         outpath = _report_path("realtime_geometry_support_segment")
         outpath.write_text(json.dumps(report, indent=2))
         print(f"Wrote {outpath.relative_to(ROOT)}")
@@ -4153,6 +4173,16 @@ def main() -> None:
             "diagnostic support components back to VMEC harmonics. Off by default "
             "to avoid several extra payload-to-VMEC RHS batches once the "
             "decomposition has been validated."
+        ),
+    )
+    parser.add_argument(
+        "--skip-realtime-geometry-support-bar-diagnostics",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry reverse_payload all-objective runs, "
+            "skip support/geometry payload cotangent l2/finiteness tree diagnostics "
+            "and JSON summaries. This does not skip the support cotangents used for "
+            "the derivative; it only avoids extra host-side diagnostic scans."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")

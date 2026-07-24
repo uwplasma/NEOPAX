@@ -433,6 +433,43 @@ added to make those component pullbacks opt-in:
 Default behavior now skips the component rows and keeps only the production gradients plus the
 geometry-vs-NTX branch split. Use the flag only when re-debugging the decomposition.
 
+Latest default run without `--realtime-geometry-component-pullbacks`:
+
+```text
+runtime build:                         222.214 s
+support reverse realized-schedule VJP: 439.673 s
+segmented cotangent sweep:            1463.032 s
+geometry payload -> VMEC pullback:     457.899 s
+total elapsed:                        2903.023 s
+```
+
+The gradients remained unchanged and matched FD:
+
+```text
+softmax_Er:                         reverse=-4.739373e+01
+smooth_root_proxy:                  reverse=-3.002664e-02
+Er2_volume_average:                 reverse=-1.672605e+02
+Er_volume_average:                  reverse=-1.809261e+01
+electron_temperature_volume_average reverse=-2.246430e-02
+total_pressure_volume_average:      reverse=-7.747942e-02
+alpha_power_volume_average:         reverse= 1.253233e-03
+```
+
+The first run after adding the flag printed empty `components:` lines and
+`final_state_components_sum=0.000000e+00`. That was only a reporting artifact:
+component pullbacks were intentionally skipped. The report construction has been fixed so component
+dictionaries are empty unless `--realtime-geometry-component-pullbacks` is explicitly enabled.
+
+Another benchmark-only option was added to avoid support-bar diagnostic scans:
+
+```bash
+--skip-realtime-geometry-support-bar-diagnostics
+```
+
+This does not skip the support/geometry payload cotangents used for the derivative. It only skips
+the l2/finiteness tree summaries, branch diagnostics, and JSON diagnostic payload for those support
+bars. The VMEC payload pullback still performs its own active-leaf and finiteness checks.
+
 Recommended next efficiency work:
 
 1. Add an objective-block-size option for the realtime support sweep, e.g. process 1-2 objective
