@@ -2897,7 +2897,12 @@ def _run_realtime_geometry_support_segment_probe(
             f"(harmonic_count={len(geometry_param_specs)})",
             flush=True,
         )
-        support_component_names = tuple(support_component_bars_by_name)
+        include_component_pullbacks = bool(args.realtime_geometry_component_pullbacks)
+        support_component_names = (
+            tuple(support_component_bars_by_name)
+            if include_component_pullbacks
+            else tuple()
+        )
         geometry_pullback_payload_bars = tuple(support_bars)
         for component_name in support_component_names:
             geometry_pullback_payload_bars = (
@@ -3161,6 +3166,7 @@ def _run_realtime_geometry_support_segment_probe(
             ),
             "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
             "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
+            "realtime_geometry_component_pullbacks": bool(include_component_pullbacks),
             "realtime_primal_runtime_builder": "build_runtime_context",
             "realtime_geometry_derivative_boundary": (
                 "runtime_geometry_and_ntx_exact_lij_support_payload"
@@ -4136,6 +4142,17 @@ def main() -> None:
             "Also probe the generic support VJP through build_lagged_response. "
             "This is intentionally off by default because that map materializes "
             "a very large NTX graph and can OOM."
+        ),
+    )
+    parser.add_argument(
+        "--realtime-geometry-component-pullbacks",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry reverse_payload runs, also pull "
+            "objective_explicit/transport_rhs/initial_cache/initial_profile "
+            "diagnostic support components back to VMEC harmonics. Off by default "
+            "to avoid several extra payload-to-VMEC RHS batches once the "
+            "decomposition has been validated."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")

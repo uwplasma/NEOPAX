@@ -310,3 +310,135 @@ reverse payload cotangent through the same accepted replay schedule
    - `fd_final_state_ntx_support_branch`
 3. Inspect whether `_execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support` is using the same lagged response and stage states as the accepted replay FD.
 4. If needed, add a local single-step FD-vs-reverse support diagnostic for the pressure RHS/support cotangent, not a full-run workaround.
+
+## 2026-07-24 Confirmed Reverse/FD Match
+
+The latest reverse run with the narrow direct-geometry lagged-response pullback now matches the
+frozen-linearized accepted-replay FD decomposition for `RBC:1:0`, `accepted-step-limit=16`.
+
+Reverse command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent
+```
+
+Reference FD command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --split-payload-fd-diagnostic
+```
+
+Full objective gradients:
+
+```text
+softmax_Er:                         FD=-4.739435e+01  reverse=-4.739373e+01
+smooth_root_proxy:                  FD=-2.922456e-02  reverse=-3.002664e-02
+Er2_volume_average:                 FD=-1.672623e+02  reverse=-1.672605e+02
+Er_volume_average:                  FD=-1.809277e+01  reverse=-1.809261e+01
+electron_temperature_volume_average FD=-2.246442e-02  reverse=-2.246430e-02
+total_pressure_volume_average:      FD=-7.747999e-02  reverse=-7.747942e-02
+alpha_power_volume_average:         FD= 1.253217e-03  reverse= 1.253233e-03
+```
+
+The old pressure/temperature/alpha mismatch is resolved. The key final-state component comparison:
+
+```text
+electron_temperature final-state: FD=-9.595126e-03  reverse=-9.595115e-03
+pressure final-state:             FD= 5.835553e-05  reverse= 5.824472e-05
+alpha final-state:                FD= 3.177544e-03  reverse= 3.177545e-03
+```
+
+The branch split also agrees:
+
+```text
+electron_temperature geometry branch:   FD=-4.539670e-03  reverse=-4.534735e-03
+electron_temperature NTX branch:        FD=-5.055458e-03  reverse=-4.762568e-03 plus initial-cache NTX=-2.928711e-04
+
+pressure geometry branch:               FD=-5.428072e-05  reverse= transport_rhs.geometry 1.096956e-04 plus initial-cache.geometry -1.639422e-04
+pressure NTX branch:                    FD= 1.126255e-04  reverse= transport_rhs.ntx_support 9.052378e-05 plus initial-cache.ntx_support 2.196751e-05
+
+alpha geometry branch:                  FD= 7.258337e-04  reverse= transport_rhs.geometry 7.330155e-04 plus initial-cache.geometry -7.181233e-06
+alpha NTX branch:                       FD= 2.451711e-03  reverse= transport_rhs.ntx_support 2.302918e-03 plus initial-cache.ntx_support 1.487927e-04
+```
+
+Conclusion: the derivative math for realtime geometry reverse payload is now consistent with the
+accepted-replay frozen-linearized FD benchmark. The remaining issue is performance/compilation:
+
+```text
+runtime build:                         224.414 s
+support reverse realized-schedule VJP: 442.729 s
+segmented cotangent sweep:            1875.798 s
+total elapsed:                        3224.061 s
+```
+
+The next work should focus on reducing the cost of
+`_radau_segment_reduced_cotangent_bwd_batched_with_support_call` and the support cotangent sweep,
+without changing the now-matching reverse math.
+
+## 2026-07-24 Efficiency Notes
+
+The largest confirmed cost is still the all-objective support cotangent sweep:
+
+```text
+support reverse segmented cotangent sweep: 1875.798 s
+geometry payload -> VMEC pullback:          321.047 s
+```
+
+The segment sweep is expensive because the current all-objective path carries a batched support
+cotangent tree through each accepted Radau step:
+
+```text
+7 objectives x 159 support/geometry payload leaves x each segment step
+```
+
+Inside each accepted-step reverse, `_execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support`
+does a `vmap` over objective rows for the support-payload pullback. This saves re-running the replay
+for each objective, but creates a very large XLA graph and high peak memory.
+
+The final payload-to-VMEC pullback was also doing diagnostic work by default. It sent the total
+support bars plus component bars:
+
+```text
+total, objective_explicit, transport_rhs, initial_cache, initial_profile
+```
+
+With branch diagnostics enabled, this multiplies the VMEC raw-block RHS rows. A benchmark flag was
+added to make those component pullbacks opt-in:
+
+```bash
+--realtime-geometry-component-pullbacks
+```
+
+Default behavior now skips the component rows and keeps only the production gradients plus the
+geometry-vs-NTX branch split. Use the flag only when re-debugging the decomposition.
+
+Recommended next efficiency work:
+
+1. Add an objective-block-size option for the realtime support sweep, e.g. process 1-2 objective
+   rows per compiled kernel instead of all 7. This should reduce compile size and peak memory,
+   with a controllable runtime tradeoff.
+2. Add a production mode that contracts support bars directly to selected VMEC harmonics in chunks,
+   rather than materializing and retaining full support cotangent trees for all objectives.
+3. Keep the validated math path fixed: accepted replay schedule, reverse payload split
+   `{geometry, ntx_support}`, and raw-block VMEC transpose.
