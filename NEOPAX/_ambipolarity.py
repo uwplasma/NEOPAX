@@ -457,7 +457,9 @@ def initialize_ambipolar_best_roots_fast(state, config, params, flux_model, amb_
             else:
                 er_vec = jnp.asarray([er_value], dtype=Er.dtype)
             fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
-            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
+            gamma = fluxes.get("Gamma_total", None)
+            if gamma is None:
+                gamma = fluxes.get("Gamma", None)
             if gamma is None:
                 raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
             gamma = gamma[:, i]
@@ -1220,6 +1222,171 @@ AMBIPOLARITY_MODEL_REGISTRY = {}
 
 def register_ambipolarity_model(name: str, func):
     AMBIPOLARITY_MODEL_REGISTRY[str(name).strip().lower()] = func
+
+
+def _ambipolarity_local_charge_flux_setup(state, params, flux_model):
+    """Return common local ambipolar residual closures for JAX radial root solves."""
+    import dataclasses
+
+    Er = getattr(state, "Er", None)
+    if Er is None:
+        raise ValueError("State must have an 'Er' attribute.")
+    n_radial = Er.shape[0] if hasattr(Er, "shape") and len(Er.shape) == 1 else 1
+    charge_qp = jnp.asarray(params["species"].charge_qp)
+
+    geometry = getattr(flux_model, "geometry", None)
+    r_grid = getattr(geometry, "r_grid", None)
+    skip_axis_root = False
+    if r_grid is not None:
+        try:
+            skip_axis_root = bool(abs(float(np.asarray(r_grid)[0])) <= 1.0e-14)
+        except Exception:
+            skip_axis_root = False
+
+    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+
+    def _evaluate_gamma_and_entropy(i, er):
+        if local_particle_flux is not None:
+            gamma = local_particle_flux(i, er)
+        else:
+            er_value = jnp.asarray(er, dtype=Er.dtype)
+            if n_radial > 1:
+                er_vec = Er.at[i].set(er_value)
+            else:
+                er_vec = jnp.asarray([er_value], dtype=Er.dtype)
+            fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
+            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
+            if gamma is None:
+                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
+            gamma = gamma[:, i]
+        return (
+            jnp.sum(charge_qp * gamma),
+            jnp.sum(jnp.abs(gamma)),
+        )
+
+    def gamma_func_factory(i):
+        def gamma(er):
+            gamma_val, _ = _evaluate_gamma_and_entropy(i, er)
+            return gamma_val
+        return gamma
+
+    def entropy_func_factory(i):
+        def entropy(er):
+            _, entropy_val = _evaluate_gamma_and_entropy(i, er)
+            return entropy_val
+        return entropy
+
+    return n_radial, skip_axis_root, local_particle_flux, gamma_func_factory, entropy_func_factory
+
+
+def solve_ambipolarity_roots_radial_jax(state, config, params, model_name, flux_model, entropy_model, amb_cfg):
+    """JAX-returning ambipolar root solve for AD benchmark boundaries.
+
+    This mirrors the full radial vmap path used by ``solve_ambipolarity_roots_radial``
+    but intentionally returns JAX arrays instead of host NumPy arrays. It is meant
+    for opt-in AD benchmark use; host-blocked ambipolar root solves remain in the
+    production initializer.
+    """
+    del config, entropy_model
+
+    Er = getattr(state, "Er", None)
+    if Er is None:
+        raise ValueError("State must have an 'Er' attribute.")
+
+    er_ambipolar_blocksize = amb_cfg.get("er_ambipolar_blocksize", None)
+    if er_ambipolar_blocksize not in (None, 0, "0", ""):
+        raise ValueError(
+            "Differentiable initial-Er ambipolarity currently requires "
+            "er_ambipolar_blocksize unset/0 so the root solve is a single JAX vmap."
+        )
+
+    er_ambipolar_scan_batch_mode = _normalize_er_scan_batch_mode(
+        amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap")
+    )
+    er_ambipolar_scan_batch_size = amb_cfg.get("er_ambipolar_scan_batch_size", None)
+    if er_ambipolar_scan_batch_size is not None:
+        er_ambipolar_scan_batch_size = int(er_ambipolar_scan_batch_size)
+        if er_ambipolar_scan_batch_size == 0:
+            er_ambipolar_scan_batch_size = None
+
+    (
+        n_radial,
+        skip_axis_root,
+        _local_particle_flux,
+        gamma_func_factory,
+        entropy_func_factory,
+    ) = _ambipolarity_local_charge_flux_setup(state, params, flux_model)
+    del _local_particle_flux
+
+    root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(str(model_name).strip().lower())
+    if root_finder is None:
+        raise ValueError(f"Unknown ambipolarity model: {model_name}")
+
+    def root_finder_for_radius(i):
+        model_name_normalized = str(model_name).strip().lower()
+        if model_name_normalized in ("two_stage", "adaptive"):
+            max_roots_local = int(amb_cfg.get("er_ambipolar_max_roots", 3))
+            zero_roots = jnp.full((max_roots_local,), jnp.nan, dtype=jnp.float64).at[0].set(0.0)
+            zero_entropies = jnp.zeros((max_roots_local,), dtype=jnp.float64)
+            zero_best = jnp.asarray(0.0, dtype=jnp.float64)
+            zero_n_roots = jnp.asarray(1, dtype=jnp.int32)
+
+            def _skip_center(_):
+                return zero_roots, zero_entropies, zero_best, zero_n_roots
+
+            def _run_root_finder(_):
+                args = {
+                    "Er_range": (
+                        float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                        float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                    ),
+                    "n_coarse": int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+                    "n_refine": int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+                    "max_roots": max_roots_local,
+                    "tol": float(amb_cfg.get("er_ambipolar_tol", 1e-6)),
+                    "x_tol": float(amb_cfg.get("er_ambipolar_x_tol", 1e-6)),
+                    "maxiter": int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                    "er_scan_batch_mode": er_ambipolar_scan_batch_mode,
+                    "er_scan_batch_size": er_ambipolar_scan_batch_size,
+                    "Gamma_func": gamma_func_factory(i),
+                    "entropy_func": entropy_func_factory(i),
+                }
+                if model_name_normalized == "adaptive":
+                    args.update({
+                        "n_init": int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+                        "n_subdiv": int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+                        "n_rounds": int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+                        "max_brackets": int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+                    })
+                    args.pop("n_coarse", None)
+                return root_finder(**args)
+
+            if skip_axis_root:
+                return jax.lax.cond(
+                    jnp.asarray(i, dtype=jnp.int32) == 0,
+                    _skip_center,
+                    _run_root_finder,
+                    operand=None,
+                )
+            return _run_root_finder(None)
+
+        if model_name_normalized in ("multistart", "multistart_clustered"):
+            return root_finder(
+                Gamma_func=gamma_func_factory(i),
+                entropy_func=entropy_func_factory(i),
+                Er_range=(
+                    float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                    float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                ),
+                n_starts=int(amb_cfg.get("er_ambipolar_n_starts", 32)),
+                tol=float(amb_cfg.get("er_ambipolar_tol", 1e-6)),
+                maxiter=int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                cluster_tol=float(amb_cfg.get("er_ambipolar_cluster_tol", 1e-3)),
+            )
+
+        raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
+
+    return jax.vmap(root_finder_for_radius)(jnp.arange(n_radial, dtype=jnp.int32))
 
 
 # --- JIT/differentiable radial root-finder with blocksize option ---

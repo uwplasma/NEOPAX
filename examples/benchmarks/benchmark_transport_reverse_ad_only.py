@@ -39,6 +39,8 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_ntx_exact_lij_support_from_param_vector,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
 )
+from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial_jax  # noqa: E402
+from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._transport_flux_models import (  # noqa: E402
@@ -77,6 +79,61 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 _REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+
+
+def _initial_er_root_ad_mode(value: str | None) -> str:
+    mode = str(value or "off").strip().lower()
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "0": "off",
+        "jax": "jax_selected_root",
+        "selected_jax": "jax_selected_root",
+        "jax_selected": "jax_selected_root",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"off", "jax_selected_root"}:
+        raise ValueError("--initial-Er-root-ad must be one of: off, jax_selected_root")
+    return mode
+
+
+def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mode: str):
+    mode = _initial_er_root_ad_mode(mode)
+    if mode == "off":
+        return state
+    profiles_cfg = config.get("profiles", {})
+    init_mode = str(profiles_cfg.get("er_initialization_mode", "analytical")).strip().lower()
+    if init_mode not in {
+        "ambipolar_min_entropy",
+        "ambipolar_best_root",
+        "ambipolarity_best_root",
+    }:
+        return state
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
+    entropy_model_name = config.get("neoclassical", {}).get(
+        "entropy_model",
+        runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
+    )
+    entropy_model = get_entropy_model(entropy_model_name)
+    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
+        state=state,
+        config=config,
+        params={
+            "species": runtime.species,
+            "energy_grid": runtime.energy_grid,
+            "geometry": runtime.geometry,
+            "database": runtime.database,
+            "solver_parameters": runtime.solver_parameters,
+        },
+        model_name=model_name,
+        flux_model=runtime.models.flux,
+        entropy_model=entropy_model,
+        amb_cfg=amb_cfg,
+    )
+    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
+    er_init = jnp.where(jnp.isfinite(best_roots), best_roots, state.Er)
+    return dataclasses.replace(state, Er=er_init)
 
 
 def _objective_scalar_by_index(final_state, runtime, objective_index: int):
@@ -382,6 +439,8 @@ def _initial_state_for_parameter_vector(
     baseline_state,
     profile_cfg: dict,
     runtime,
+    config: dict[str, Any] | None = None,
+    initial_er_root_ad: str = "off",
 ):
     cfg = dict(profile_cfg)
     for name, value in zip(PARAMETER_ORDER, parameter_values):
@@ -396,11 +455,17 @@ def _initial_state_for_parameter_vector(
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
     pressure_state = density_state * temperature_state
-    return dataclasses.replace(
+    state = dataclasses.replace(
         baseline_state,
         density=density_state,
         pressure=pressure_state,
     )
+    mode = _initial_er_root_ad_mode(initial_er_root_ad)
+    if mode != "off":
+        if config is None:
+            raise ValueError("config is required when initial_er_root_ad is enabled.")
+        state = _state_with_initial_er_root_ad(state, config=config, runtime=runtime, mode=mode)
+    return state
 
 
 def _parse_reverse_geometry_parameter(parameter_name: str) -> tuple[str, int, int]:
@@ -1245,11 +1310,13 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
 def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     parameter_values,
     *,
+    config: dict[str, Any],
     runtime,
     baseline_state,
     profile_cfg: dict,
     reverse_setup: _ReverseStaticSetup,
     support_payload,
+    initial_er_root_ad: str = "off",
 ):
     """Return all objective values, profile gradients, and realtime support cotangents.
 
@@ -1297,6 +1364,8 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     def _state_from_profiles(p):
         return _initial_state_for_parameter_vector(
             p,
+            config=config,
+            initial_er_root_ad=initial_er_root_ad,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
@@ -1572,6 +1641,8 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             )
             return _initial_state_for_parameter_vector(
                 parameter_values,
+                config=config,
+                initial_er_root_ad=initial_er_root_ad,
                 baseline_state=baseline_state,
                 profile_cfg=profile_cfg,
                 runtime=runtime_with_geometry,

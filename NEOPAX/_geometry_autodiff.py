@@ -1961,6 +1961,13 @@ def _cummax(values):
     return jax.lax.associative_scan(jnp.maximum, values)
 
 
+def _smooth_signed_sqrt(values, eps: float = 1.0e-9):
+    values = jnp.asarray(values, dtype=jnp.float64)
+    eps_arr = jnp.asarray(eps, dtype=values.dtype)
+    abs_smooth = jnp.sqrt(values * values + eps_arr * eps_arr)
+    return values / jnp.sqrt(abs_smooth + eps_arr)
+
+
 def _apply_smooth_goodman_transform(b_line, phi_coords):
     b_line = jnp.asarray(b_line, dtype=jnp.float64)
     phi_coords = jnp.asarray(phi_coords, dtype=jnp.float64)
@@ -1989,10 +1996,14 @@ def _apply_smooth_goodman_transform(b_line, phi_coords):
 def _compute_j_pair(phi_coords, b_input, b_target, bj_levels, dl_dphi, db_dpsi, *, nphi_int: int = 128):
     b_target = jnp.asarray(b_target, dtype=jnp.float64)
     phi_coords = jnp.asarray(phi_coords, dtype=jnp.float64)
-    indices = jnp.arange(b_target.shape[0], dtype=jnp.int32)
-    indmin = jnp.argmin(b_target)
-    b_l = jnp.where(indices <= indmin, b_target, jnp.asarray(1.1, dtype=b_target.dtype))
-    b_r = jnp.where(indices >= indmin, b_target, jnp.asarray(1.1, dtype=b_target.dtype))
+    indices = jnp.arange(b_target.shape[0], dtype=jnp.float64)
+    s_indmin = _soft_min_idx(b_target)
+    high = jnp.asarray(1.1 * jnp.max(b_target), dtype=b_target.dtype)
+    branch_sharpness = jnp.asarray(6.0, dtype=b_target.dtype)
+    left_mask = jax.nn.sigmoid(branch_sharpness * (s_indmin - indices))
+    right_mask = 1.0 - left_mask
+    b_l = left_mask * b_target + (1.0 - left_mask) * high
+    b_r = right_mask * b_target + (1.0 - right_mask) * high
     p1 = jnp.interp(bj_levels, jnp.flip(b_l), jnp.flip(phi_coords))
     p2 = jnp.interp(bj_levels, b_r, phi_coords)
     t = jnp.linspace(0.0, 1.0, int(nphi_int), dtype=b_target.dtype)
@@ -2003,9 +2014,9 @@ def _compute_j_pair(phi_coords, b_input, b_target, bj_levels, dl_dphi, db_dpsi, 
     dn_g = jnp.interp(phi_grid, phi_coords, db_dpsi)
     bj_v = bj_levels[:, None]
     res_i = 1.0 - bi_g / (bj_v + 1.0e-9)
-    vi_g = jnp.sign(res_i) * jnp.sqrt(jnp.abs(res_i) + 1.0e-9)
+    vi_g = _smooth_signed_sqrt(res_i)
     res_c = 1.0 - bc_g / (bj_v + 1.0e-9)
-    vc_g = jnp.sign(res_c) * jnp.sqrt(jnp.abs(res_c) + 1.0e-9)
+    vc_g = _smooth_signed_sqrt(res_c)
     v_target_stab = jnp.sqrt(jnp.maximum(bj_v - bc_g, 0.0) + 1.0e-9)
     ji = jnp.trapezoid(vi_g * dl_g, x=phi_grid, axis=1)
     jc = jnp.trapezoid(vc_g * dl_g, x=phi_grid, axis=1)
