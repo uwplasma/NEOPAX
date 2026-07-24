@@ -1299,6 +1299,61 @@ class ComposedEquationSystem:
             return model
         return dataclasses.replace(model, **updates)
 
+    @staticmethod
+    def _direct_geometry_build_lagged_response_bar(model, geometry, state, response_bar):
+        """Geometry cotangent for non-NTX lagged-response rebuilds.
+
+        The NTX exact model exposes its realtime geometry through an explicit
+        support payload and is handled by the ntx_support branch.  This helper
+        only covers transport submodels that store the transport geometry
+        directly as ``field``/``geometry`` and build a lagged response from it
+        (for example the turbulent power-over-n model).
+        """
+        if model is None or response_bar is None:
+            return _float_delta_tree_like(geometry)
+
+        if (
+            dataclasses.is_dataclass(model)
+            and hasattr(model, "neoclassical_model")
+            and hasattr(model, "turbulent_model")
+            and hasattr(model, "classical_model")
+        ):
+            bars = []
+            for model_name, response_name in (
+                ("turbulent_model", "turbulent_response"),
+                ("classical_model", "classical_response"),
+            ):
+                submodel = getattr(model, model_name, None)
+                subresponse_bar = getattr(response_bar, response_name, None)
+                bars.append(
+                    ComposedEquationSystem._direct_geometry_build_lagged_response_bar(
+                        submodel,
+                        geometry,
+                        state,
+                        subresponse_bar,
+                    )
+                )
+            return jax.tree_util.tree_map(lambda *values: sum(values), *bars)
+
+        if not dataclasses.is_dataclass(model) or not callable(getattr(model, "build_lagged_response", None)):
+            return _float_delta_tree_like(geometry)
+
+        field_names = {field.name for field in dataclasses.fields(model)}
+        geometry_field_names = tuple(name for name in ("geometry", "field") if name in field_names)
+        if not geometry_field_names:
+            return _float_delta_tree_like(geometry)
+
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _response_from_geometry_delta(geometry_delta):
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            updates = {name: geometry_value for name in geometry_field_names}
+            return dataclasses.replace(model, **updates).build_lagged_response(state)
+
+        _, geometry_pullback = jax.vjp(_response_from_geometry_delta, geometry_delta0)
+        (geometry_bar,) = geometry_pullback(response_bar)
+        return _sanitize_float_delta_bar_tree(geometry, geometry_bar)
+
     def with_geometry_payload(self, geometry):
         if self.config is None or self.solver_cfg is None or self.boundary_models is None:
             raise ValueError("Geometry-payload pullback requires equation-system construction metadata.")
@@ -1514,16 +1569,14 @@ class ComposedEquationSystem:
                 support,
                 **kwargs,
             )
-            geometry_delta0 = _float_delta_tree_like(geometry)
-            _, geometry_pullback = jax.vjp(
-                lambda geometry_delta: self.with_geometry_payload(
-                    _add_float_delta_tree(geometry, geometry_delta)
-                ).build_lagged_response(
-                    state,
-                ),
-                geometry_delta0,
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
+            geometry_bar = self._direct_geometry_build_lagged_response_bar(
+                self.shared_flux_model,
+                geometry,
+                working_state,
+                flux_response_bar,
             )
-            (geometry_bar,) = geometry_pullback(lagged_response_bar)
             return self._realtime_geometry_payload_bar(
                 {"ntx_support": support, "geometry": geometry},
                 support_bar,
