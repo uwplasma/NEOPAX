@@ -37,6 +37,7 @@ from benchmark_transport_reverse_ad_only import (  # noqa: E402
     _geometry_context_from_config,
     _geometry_param_specs_from_parameter_name,
     _initial_state_for_parameter_vector,
+    _initial_er_root_ad_mode,
     _runtime_with_ntx_support_payload,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
@@ -75,9 +76,19 @@ def _tree_all_finite(tree) -> bool:
     return True
 
 
-def _profile_state_from_values(values, *, runtime, baseline_state, profile_cfg: dict[str, Any]):
+def _profile_state_from_values(
+    values,
+    *,
+    config: dict[str, Any] | None = None,
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    initial_er_root_ad: str = "off",
+):
     return _initial_state_for_parameter_vector(
         values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
@@ -137,9 +148,12 @@ def _objectives_on_realtime_geometry_frozen_trace(
     frozen_trace,
     replay_mode: str,
     solver_override=None,
+    initial_er_root_ad: str = "off",
 ):
     state0 = _profile_state_from_values(
         profile_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -334,6 +348,7 @@ def _geometry_fd_objectives(
     geometry_fd_lane: str,
     frozen_linearized_bundle: dict[str, Any] | None = None,
     fixed_initial_er=None,
+    initial_er_root_ad: str = "off",
 ):
     if str(geometry_fd_lane).strip().lower() == "frozen_linearized":
         if frozen_linearized_bundle is None:
@@ -355,6 +370,7 @@ def _geometry_fd_objectives(
         profile_values=profile_values,
         frozen_trace=frozen_trace,
         replay_mode=replay_mode,
+        initial_er_root_ad=initial_er_root_ad,
     )
 
 
@@ -415,7 +431,19 @@ def main() -> None:
             "diagnostic into geometry-metric-only and NTX-support-only branches."
         ),
     )
+    parser.add_argument(
+        "--initial-Er-root-ad",
+        dest="initial_er_root_ad",
+        default="off",
+        choices=("off", "jax_selected_root"),
+        help=(
+            "Opt-in FD diagnostic for ambipolar initial Er. 'off' preserves the "
+            "current oracle. 'jax_selected_root' recomputes the selected best-root "
+            "profile with the same JAX-returning path used by the reverse benchmark."
+        ),
+    )
     args = parser.parse_args()
+    initial_er_root_ad = _initial_er_root_ad_mode(args.initial_er_root_ad)
 
     device_arg = str(args.device).strip().lower() if args.device is not None else "default"
     config_device = None if device_arg == "default" else args.device
@@ -447,6 +475,11 @@ def main() -> None:
     parameter_name = str(args.parameter)
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
     parameter_is_profile = parameter_name in PARAMETER_ORDER
+    if parameter_is_profile and initial_er_root_ad != "off":
+        raise SystemExit(
+            "[autodiff-gate] --initial-Er-root-ad is currently wired only for "
+            "realtime-geometry FD parameters in this script."
+        )
     frozen_linearized_bundle = None
     if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
         baseline_runtime, baseline_state = build_runtime_context(config)
@@ -465,6 +498,8 @@ def main() -> None:
     profile_values = jnp.asarray([float(profile_cfg[name]) for name in PARAMETER_ORDER], dtype=jnp.float64)
     baseline_profile_state = _profile_state_from_values(
         profile_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -485,7 +520,11 @@ def main() -> None:
     baseline_objectives = jax.block_until_ready(baseline_objectives)
     fixed_initial_er = (
         jax.lax.stop_gradient(baseline_state.Er)
-        if (not parameter_is_profile and geometry_fd_lane == "frozen_linearized")
+        if (
+            not parameter_is_profile
+            and geometry_fd_lane == "frozen_linearized"
+            and initial_er_root_ad == "off"
+        )
         else None
     )
 
@@ -551,6 +590,7 @@ def main() -> None:
             geometry_fd_lane=geometry_fd_lane,
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
+            initial_er_root_ad=initial_er_root_ad,
         )
         print(
             "[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic",
@@ -588,6 +628,7 @@ def main() -> None:
             geometry_fd_lane=geometry_fd_lane,
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
+            initial_er_root_ad=initial_er_root_ad,
         )
         baseline_geometry_final_state_fd = (
             _objective_vector(plus_replay["final_state"], baseline_runtime)
@@ -629,6 +670,7 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                initial_er_root_ad=initial_er_root_ad,
             )
             _plus_geometry_only_objectives, plus_geometry_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -638,6 +680,7 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                initial_er_root_ad=initial_er_root_ad,
             )
             _minus_support_only_objectives, minus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -647,6 +690,7 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                initial_er_root_ad=initial_er_root_ad,
             )
             _plus_support_only_objectives, plus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -656,6 +700,7 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                initial_er_root_ad=initial_er_root_ad,
             )
             geometry_only_final_state_fd = (
                 _objective_vector(plus_geometry_only_replay["final_state"], baseline_runtime)

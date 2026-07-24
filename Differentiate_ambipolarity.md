@@ -269,3 +269,40 @@ Do not smooth branch selection unless a separate smooth objective/root policy is
    geometry, or both?
 5. Should branch-switch FD diagnostics be added to the FD benchmark first, or only after the implicit
    root rule exists?
+
+## Current Implementation Status
+
+Phase 1 has started with an explicit opt-in switch:
+
+```bash
+--initial-Er-root-ad jax_selected_root
+```
+
+Implemented wiring:
+
+```text
+benchmark_transport_reverse_ad_only.py
+benchmark_transport_realtime_geometry_forward_fd.py
+```
+
+Default behavior remains:
+
+```bash
+--initial-Er-root-ad off
+```
+
+Meaning of the current opt-in mode:
+
+```text
+jax_selected_root recomputes the selected ambipolar best-root profile with a JAX-returning
+root path at the initial-state boundary, so FD/reverse diagnostics can include the
+initial-Er dependence.
+```
+
+Important limitation:
+
+```text
+This is not yet the final branch-fixed implicit custom VJP rule described above.
+It is the safe first implementation layer needed to expose the dependency in the
+same benchmark entrypoints without changing the validated default paths.
+```

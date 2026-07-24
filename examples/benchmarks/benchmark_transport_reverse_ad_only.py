@@ -110,6 +110,9 @@ def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mo
     }:
         return state
     amb_cfg = dict(config.get("ambipolarity", {}))
+    # Keep the production TOML unchanged, but use the JAX vmap root path for the
+    # opt-in AD boundary so the root profile stays inside the traced graph.
+    amb_cfg["er_ambipolar_blocksize"] = 0
     model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
     entropy_model_name = config.get("neoclassical", {}).get(
         "entropy_model",
@@ -886,14 +889,18 @@ def _reverse_initial_carry_from_state_with_static_setup(
 def _reverse_objective_for_parameter_vector(
     parameter_values,
     *,
+    config: dict[str, Any],
     runtime,
     baseline_state,
     profile_cfg: dict,
     objective_index: int,
     reverse_setup: _ReverseStaticSetup,
+    initial_er_root_ad: str = "off",
 ):
     state0 = _initial_state_for_parameter_vector(
         parameter_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
@@ -919,13 +926,17 @@ def _reverse_objective_for_parameter_vector(
 def _reverse_objective_vector_for_parameter_vector(
     parameter_values,
     *,
+    config: dict[str, Any],
     runtime,
     baseline_state,
     profile_cfg: dict,
     reverse_setup: _ReverseStaticSetup,
+    initial_er_root_ad: str = "off",
 ):
     state0 = _initial_state_for_parameter_vector(
         parameter_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
@@ -2210,6 +2221,7 @@ def _prepare_reverse_static_setup(
     runtime,
     baseline_state,
     profile_cfg: dict,
+    initial_er_root_ad: str = "off",
     accepted_step_limit_override: int | None = None,
     reverse_segment_length: int | None = None,
     reverse_direct_stage_adjoint: bool = False,
@@ -2223,6 +2235,8 @@ def _prepare_reverse_static_setup(
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
@@ -2526,12 +2540,16 @@ def _run_realtime_geometry_payload_boundary_probe(
     swapped_runtime = _runtime_with_ntx_support_payload(baseline_runtime, support_payload)
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
+        config=config,
+        initial_er_root_ad=args.initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=baseline_runtime,
     )
     swapped_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
+        config=config,
+        initial_er_root_ad=args.initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=swapped_runtime,
@@ -2686,6 +2704,8 @@ def _run_realtime_geometry_support_pullback_probe(
     support_payload = _find_ntx_support_payload(baseline_runtime)
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
+        config=config,
+        initial_er_root_ad=args.initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=baseline_runtime,
@@ -2817,6 +2837,7 @@ def _run_realtime_geometry_support_segment_probe(
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
+        initial_er_root_ad=args.initial_er_root_ad,
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=args.reverse_segment_length,
         reverse_direct_stage_adjoint=True,
@@ -2870,11 +2891,13 @@ def _run_realtime_geometry_support_segment_probe(
             initial_cache_pullback_skipped,
         ) = _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             profile_values,
+            config=config,
             runtime=baseline_runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             reverse_setup=reverse_setup,
             support_payload=support_payload,
+            initial_er_root_ad=args.initial_er_root_ad,
         )
         objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name = jax.block_until_ready(
             (objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name)
@@ -3569,6 +3592,8 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
     def _state_from_profiles(values):
         return _initial_state_for_parameter_vector(
             values,
+            config=config,
+            initial_er_root_ad=args.initial_er_root_ad,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             runtime=baseline_runtime,
@@ -3581,6 +3606,7 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
+        initial_er_root_ad=args.initial_er_root_ad,
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=args.reverse_segment_length,
         reverse_direct_stage_adjoint=True,
@@ -3856,6 +3882,8 @@ def _run_realtime_geometry_reverse_mode(
     phase_start = time.perf_counter()
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
+        config=config,
+        initial_er_root_ad=args.initial_er_root_ad,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=baseline_runtime,
@@ -4254,6 +4282,18 @@ def main() -> None:
             "skip support/geometry payload cotangent l2/finiteness tree diagnostics "
             "and JSON summaries. This does not skip the support cotangents used for "
             "the derivative; it only avoids extra host-side diagnostic scans."
+        ),
+    )
+    parser.add_argument(
+        "--initial-Er-root-ad",
+        dest="initial_er_root_ad",
+        default="off",
+        choices=("off", "jax_selected_root"),
+        help=(
+            "Opt-in AD treatment for ambipolar initial Er. 'off' preserves the "
+            "validated benchmark behavior. 'jax_selected_root' recomputes the "
+            "same selected best-root profile with a JAX-returning root path so "
+            "the initial-Er boundary can participate in VJP/JVP diagnostics."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
@@ -4706,6 +4746,7 @@ def main() -> None:
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
+        initial_er_root_ad=args.initial_er_root_ad,
         accepted_step_limit_override=args.accepted_step_limit,
         reverse_segment_length=reverse_segment_length,
         reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
@@ -4813,10 +4854,12 @@ def main() -> None:
 
         objective_vector_fn = lambda p: _reverse_objective_vector_for_parameter_vector(  # noqa: E731
             p,
+            config=config,
             runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             reverse_setup=reverse_setup,
+            initial_er_root_ad=args.initial_er_root_ad,
         )
 
         print("[autodiff-gate] progress: running reverse custom-VJP for all objectives", flush=True)
@@ -5032,11 +5075,13 @@ def main() -> None:
 
     objective_fn = lambda p: _reverse_objective_for_parameter_vector(  # noqa: E731
         p,
+        config=config,
         runtime=runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         objective_index=objective_index,
         reverse_setup=reverse_setup,
+        initial_er_root_ad=args.initial_er_root_ad,
     )
 
     print("[autodiff-gate] progress: running reverse custom-VJP", flush=True)
