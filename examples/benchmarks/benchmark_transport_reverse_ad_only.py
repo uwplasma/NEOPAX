@@ -44,9 +44,20 @@ from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._transport_flux_models import (  # noqa: E402
+    DENSITY_STATE_TO_PHYSICAL,
     _add_float_delta_tree,
+    _collisionality_kind,
+    _extract_right_constraints,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
+    _support_bar_from_center_bars,
+    get_Thermodynamical_Forces_A1,
+    get_Thermodynamical_Forces_A2,
+    get_Thermodynamical_Forces_A3,
+    get_gradient_density,
+    get_gradient_temperature,
+    get_v_thermal,
+    safe_density,
 )
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedCotangent,
@@ -381,6 +392,188 @@ def _find_ntx_support_payload(runtime):
     if support is None:
         raise ValueError("No preloaded NTX exact-runtime support payload was found in the realtime runtime.")
     return support
+
+
+def _find_ntx_exact_support_model(model):
+    if (
+        model is not None
+        and callable(getattr(model, "with_support_payload", None))
+        and callable(getattr(model, "_solve_lij_prepared_local", None))
+    ):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = _find_ntx_exact_support_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def _batched_zero_float_delta_tree_like(tree, batch_size):
+    return jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(
+            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            else jnp.zeros_like(jnp.asarray(leaf)),
+            (batch_size,) + jnp.asarray(leaf).shape,
+        ),
+        tree,
+    )
+
+
+def _compact_initial_er_ntx_support_pullback(
+    *,
+    runtime,
+    state,
+    er_profile,
+    residual_bars,
+    support,
+):
+    """Compact support pullback for the initial-Er ambipolar residual.
+
+    This mirrors the local NTX particle-flux evaluator but transposes only the
+    per-radius prepared support and drds entries.  It avoids a full-payload VJP
+    through ``build_local_particle_flux_evaluator``.
+    """
+    model = _find_ntx_exact_support_model(runtime.models.flux)
+    if model is None:
+        raise ValueError("Could not find an NTX exact-runtime model for compact initial-Er support pullback.")
+
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    objective_count = int(residual_bars.shape[0])
+    density = safe_density(state.density)
+    temperature = state.temperature
+    v_thermal = get_v_thermal(model.species.mass, temperature)
+    species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+    collisionality_kind = _collisionality_kind(model.collisionality_model)
+    density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+        model.bc_density,
+        density,
+    )
+    temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+        model.bc_temperature,
+        temperature,
+    )
+    dndr_all = jax.vmap(
+        lambda density_a, right_value, right_grad: get_gradient_density(
+            density_a,
+            model.geometry.r_grid,
+            model.geometry.r_grid_half,
+            model.geometry.dr,
+            right_face_constraint=right_value,
+            right_face_grad_constraint=right_grad,
+        )
+    )(density, density_right_constraint, density_right_grad_constraint)
+    dTdr_all = jax.vmap(
+        lambda temperature_a, right_value, right_grad: get_gradient_temperature(
+            temperature_a,
+            model.geometry.r_grid,
+            model.geometry.r_grid_half,
+            model.geometry.dr,
+            right_face_constraint=right_value,
+            right_face_grad_constraint=right_grad,
+        )
+    )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
+
+    center_channels_bar = _batched_zero_float_delta_tree_like(support.center_channels, objective_count)
+    center_prepared_bar = _batched_zero_float_delta_tree_like(support.center_prepared, objective_count)
+    radius_indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
+
+    def _add_local_prepared_bar(prepared_bar, radius_index, local_bar):
+        return jax.tree_util.tree_map(
+            lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
+            prepared_bar,
+            local_bar,
+        )
+
+    def _accumulate_radius(carry, radius_index):
+        channels_carry, prepared_carry = carry
+        prepared = jax.tree_util.tree_map(
+            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+            support.center_prepared,
+        )
+        drds_value = jax.lax.dynamic_index_in_dim(
+            support.center_channels.drds,
+            radius_index,
+            axis=0,
+            keepdims=False,
+        )
+        er_scalar = jax.lax.dynamic_index_in_dim(er_profile, radius_index, axis=0, keepdims=False)
+        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+        dndr_local = jax.lax.dynamic_index_in_dim(dndr_all, radius_index, axis=1, keepdims=False)
+        dTdr_local = jax.lax.dynamic_index_in_dim(dTdr_all, radius_index, axis=1, keepdims=False)
+        gamma_bars = residual_bars[:, radius_index, None] * charge_qp[None, :]
+        prepared_delta0 = _float_delta_tree_like(prepared)
+        drds_delta0 = jnp.zeros_like(drds_value)
+
+        def _gamma_from_local_support_delta(prepared_delta, drds_delta):
+            prepared_value = _add_float_delta_tree(prepared, prepared_delta)
+            drds_local = drds_value + drds_delta
+            er_local_profile = jnp.asarray(er_profile).at[radius_index].set(er_scalar)
+            lij = jax.vmap(
+                lambda species_index: model._solve_lij_prepared_local(
+                    prepared_value,
+                    drds_value=drds_local,
+                    species_index=species_index,
+                    er_value=er_scalar,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                    derivative_mode_override="direct",
+                )
+            )(species_indices)
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                    charge,
+                    density_a,
+                    temperature_a,
+                    dndr_a,
+                    dTdr_a,
+                    er_local_profile,
+                )
+            )(model.species.charge, density, temperature, dndr_all, dTdr_all)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
+            a3 = get_Thermodynamical_Forces_A3(er_local_profile)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+            return -density_phys * (
+                lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
+            )
+
+        _, local_pullback = jax.vjp(
+            _gamma_from_local_support_delta,
+            prepared_delta0,
+            drds_delta0,
+        )
+        prepared_local_bars, drds_local_bars = jax.vmap(lambda gamma_bar: local_pullback(gamma_bar))(
+            gamma_bars
+        )
+        return (
+            dataclasses.replace(
+                channels_carry,
+                drds=channels_carry.drds.at[:, radius_index].add(drds_local_bars),
+            ),
+            _add_local_prepared_bar(prepared_carry, radius_index, prepared_local_bars),
+        ), None
+
+    (center_channels_bar, center_prepared_bar), _ = jax.lax.scan(
+        _accumulate_radius,
+        (center_channels_bar, center_prepared_bar),
+        radius_indices,
+    )
+    batched_support_bar = _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar)
+    return _sanitize_float_delta_bar_tree(
+        jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape),
+            support,
+        ),
+        batched_support_bar,
+    )
 
 
 def _payload_leaf_summary(payload) -> dict[str, Any]:
@@ -1763,18 +1956,6 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
             runtime=runtime,
         )
 
-        def _root_support_runtime(payload):
-            runtime_payload = runtime
-            if combined_geometry_payload:
-                runtime_payload = _runtime_with_geometry_payload(runtime_payload, payload["geometry"])
-                runtime_payload = _runtime_with_ntx_support_payload(
-                    runtime_payload,
-                    payload["ntx_support"],
-                )
-            else:
-                runtime_payload = _runtime_with_ntx_support_payload(runtime_payload, payload)
-            return runtime_payload
-
         er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
@@ -1819,22 +2000,55 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         )
         pre_root_initial_state_bars = _add_trees(direct_initial_state_bars, state_residual_bars)
 
-        def _residuals_from_support(payload):
-            return _initial_er_charge_flux_residuals(
-                pre_root_initial_state,
-                er_profile,
-                runtime=_root_support_runtime(payload),
-            )
+        if combined_geometry_payload:
+            geometry = support_payload["geometry"]
+            ntx_support = support_payload["ntx_support"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
 
-        _, support_pullback = jax.vjp(_residuals_from_support, support_payload)
-        initial_er_root_support_bars = jax.vmap(lambda residual_bar: support_pullback(residual_bar)[0])(
-            residual_bars
-        )
+            def _residuals_from_geometry_delta(geometry_delta):
+                runtime_with_geometry = _runtime_with_geometry_payload(
+                    runtime,
+                    _add_float_delta_tree(geometry, geometry_delta),
+                )
+                runtime_with_geometry = _runtime_with_ntx_support_payload(
+                    runtime_with_geometry,
+                    ntx_support,
+                )
+                return _initial_er_charge_flux_residuals(
+                    pre_root_initial_state,
+                    er_profile,
+                    runtime=runtime_with_geometry,
+                )
+
+            _, geometry_pullback = jax.vjp(_residuals_from_geometry_delta, geometry_delta0)
+            geometry_bars = jax.vmap(lambda residual_bar: geometry_pullback(residual_bar)[0])(
+                residual_bars
+            )
+            ntx_runtime = _runtime_with_geometry_payload(runtime, geometry)
+            ntx_bars = _compact_initial_er_ntx_support_pullback(
+                runtime=ntx_runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=ntx_support,
+            )
+            initial_er_root_support_bars = {
+                "geometry": geometry_bars,
+                "ntx_support": ntx_bars,
+            }
+        else:
+            initial_er_root_support_bars = _compact_initial_er_ntx_support_pullback(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
+            )
         pre_root_initial_state_bars, initial_er_root_support_bars = jax.block_until_ready(
             (pre_root_initial_state_bars, initial_er_root_support_bars)
         )
         print(
-            "[autodiff-gate] progress: initial-Er root boundary fused pullback ready "
+            "[autodiff-gate] progress: initial-Er root boundary compact pullback ready "
             f"elapsed_s={time.perf_counter() - phase_start:.3f}",
             flush=True,
         )
