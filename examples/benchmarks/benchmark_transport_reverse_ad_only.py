@@ -50,7 +50,6 @@ from NEOPAX._transport_flux_models import (  # noqa: E402
     _extract_right_constraints,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
-    _support_bar_from_center_bars,
     get_Thermodynamical_Forces_A1,
     get_Thermodynamical_Forces_A2,
     get_Thermodynamical_Forces_A3,
@@ -409,19 +408,7 @@ def _find_ntx_exact_support_model(model):
     return None
 
 
-def _batched_zero_float_delta_tree_like(tree, batch_size):
-    return jax.tree_util.tree_map(
-        lambda leaf: jnp.broadcast_to(
-            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
-            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-            else jnp.zeros_like(jnp.asarray(leaf)),
-            (batch_size,) + jnp.asarray(leaf).shape,
-        ),
-        tree,
-    )
-
-
-def _compact_initial_er_ntx_support_pullback(
+def _compact_initial_er_ntx_support_pullback_leaves(
     *,
     runtime,
     state,
@@ -476,26 +463,42 @@ def _compact_initial_er_ntx_support_pullback(
         )
     )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
 
-    center_channels_bar = _batched_zero_float_delta_tree_like(support.center_channels, objective_count)
-    center_prepared_bar = _batched_zero_float_delta_tree_like(support.center_prepared, objective_count)
     radius_indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
 
-    def _add_local_prepared_bar(prepared_bar, radius_index, local_bar):
-        return jax.tree_util.tree_map(
-            lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
-            prepared_bar,
-            local_bar,
+    def _batched_zero_tree_leaves(tree):
+        return tuple(
+            jnp.broadcast_to(
+                jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+                if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                else jnp.zeros_like(jnp.asarray(leaf)),
+                (objective_count,) + jnp.asarray(leaf).shape,
+            )
+            for leaf in jax.tree_util.tree_leaves(tree)
         )
 
-    def _add_local_prepared_objective_bar(prepared_bar, objective_index, radius_index, local_bar):
-        return jax.tree_util.tree_map(
-            lambda arr, local_arr: arr.at[objective_index, radius_index].add(local_arr),
-            prepared_bar,
-            local_bar,
-        )
+    center_channels_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(
+            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            else jnp.zeros_like(jnp.asarray(leaf)),
+            (objective_count,) + jnp.asarray(leaf).shape,
+        ),
+        support.center_channels,
+    )
+    center_prepared_bar_leaves = _batched_zero_tree_leaves(support.center_prepared)
+    face_channels_bar_leaves = _batched_zero_tree_leaves(support.face_channels)
+    face_prepared_bar_leaves = _batched_zero_tree_leaves(support.face_prepared)
+
+    def _split_flat_vector(flat, sizes, shapes, treedef):
+        leaves = []
+        offset = 0
+        for size, shape in zip(sizes, shapes, strict=True):
+            leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+            offset += size
+        return treedef.unflatten(leaves), flat[offset]
 
     def _accumulate_radius(carry, radius_index):
-        channels_carry, prepared_carry = carry
+        channels_carry, prepared_leaf_carry = carry
         prepared = jax.tree_util.tree_map(
             lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
             support.center_prepared,
@@ -510,13 +513,23 @@ def _compact_initial_er_ntx_support_pullback(
         temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
         density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
         vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
-        dndr_local = jax.lax.dynamic_index_in_dim(dndr_all, radius_index, axis=1, keepdims=False)
-        dTdr_local = jax.lax.dynamic_index_in_dim(dTdr_all, radius_index, axis=1, keepdims=False)
         gamma_bars = residual_bars[:, radius_index, None] * charge_qp[None, :]
         prepared_delta0 = _float_delta_tree_like(prepared)
-        drds_delta0 = jnp.zeros_like(drds_value)
+        prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+        prepared_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0)
+        prepared_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0)
+        flat_delta0 = jnp.concatenate(
+            [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
+            + [jnp.ravel(jnp.zeros_like(drds_value))]
+        )
 
-        def _gamma_from_local_support_delta(prepared_delta, drds_delta):
+        def _gamma_from_local_support_flat(flat_delta):
+            prepared_delta, drds_delta = _split_flat_vector(
+                flat_delta,
+                prepared_delta_sizes,
+                prepared_delta_shapes,
+                prepared_delta_treedef,
+            )
             prepared_value = _add_float_delta_tree(prepared, prepared_delta)
             drds_local = drds_value + drds_delta
             er_local_profile = jnp.asarray(er_profile).at[radius_index].set(er_scalar)
@@ -552,53 +565,41 @@ def _compact_initial_er_ntx_support_pullback(
                 + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
             )
 
-        _, local_pullback = jax.vjp(
-            _gamma_from_local_support_delta,
-            prepared_delta0,
-            drds_delta0,
-        )
+        local_jacobian = jax.jacrev(_gamma_from_local_support_flat)(flat_delta0)
+        flat_bars = jnp.tensordot(gamma_bars, local_jacobian, axes=([1], [0]))
+        prepared_flat_size = int(sum(prepared_delta_sizes))
+        drds_bars = flat_bars[:, prepared_flat_size]
 
-        def _accumulate_objective(objective_index, objective_carry):
-            channels_obj_carry, prepared_obj_carry = objective_carry
-            gamma_bar = jax.lax.dynamic_index_in_dim(
-                gamma_bars,
-                objective_index,
-                axis=0,
-                keepdims=False,
-            )
-            prepared_local_bar, drds_local_bar = local_pullback(gamma_bar)
-            return (
-                dataclasses.replace(
-                    channels_obj_carry,
-                    drds=channels_obj_carry.drds.at[objective_index, radius_index].add(drds_local_bar),
-                ),
-                _add_local_prepared_objective_bar(
-                    prepared_obj_carry,
-                    objective_index,
-                    radius_index,
-                    prepared_local_bar,
-                ),
-            )
+        updated_prepared_leaves = []
+        offset = 0
+        for carry_leaf, size, shape in zip(
+            prepared_leaf_carry,
+            prepared_delta_sizes,
+            prepared_delta_shapes,
+            strict=True,
+        ):
+            local_bar = jnp.reshape(flat_bars[:, offset : offset + size], (objective_count,) + shape)
+            updated_prepared_leaves.append(carry_leaf.at[:, radius_index].add(local_bar))
+            offset += size
 
-        return jax.lax.fori_loop(
-            0,
-            objective_count,
-            _accumulate_objective,
-            (channels_carry, prepared_carry),
+        return (
+            dataclasses.replace(
+                channels_carry,
+                drds=channels_carry.drds.at[:, radius_index].add(drds_bars),
+            ),
+            tuple(updated_prepared_leaves),
         ), None
 
-    (center_channels_bar, center_prepared_bar), _ = jax.lax.scan(
+    (center_channels_bar, center_prepared_bar_leaves), _ = jax.lax.scan(
         _accumulate_radius,
-        (center_channels_bar, center_prepared_bar),
+        (center_channels_bar, center_prepared_bar_leaves),
         radius_indices,
     )
-    batched_support_bar = _support_bar_from_center_bars(support, center_channels_bar, center_prepared_bar)
-    return _sanitize_float_delta_bar_tree(
-        jax.tree_util.tree_map(
-            lambda leaf: jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape),
-            support,
-        ),
-        batched_support_bar,
+    return (
+        tuple(jax.tree_util.tree_leaves(center_channels_bar))
+        + face_channels_bar_leaves
+        + tuple(center_prepared_bar_leaves)
+        + face_prepared_bar_leaves
     )
 
 
@@ -2051,19 +2052,18 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
                 residual_bars
             )
             ntx_runtime = _runtime_with_geometry_payload(runtime, geometry)
-            ntx_bars = _compact_initial_er_ntx_support_pullback(
+            ntx_bar_leaves = _compact_initial_er_ntx_support_pullback_leaves(
                 runtime=ntx_runtime,
                 state=pre_root_initial_state,
                 er_profile=er_profile,
                 residual_bars=residual_bars,
                 support=ntx_support,
             )
-            initial_er_root_support_bars = {
-                "geometry": geometry_bars,
-                "ntx_support": ntx_bars,
-            }
+            initial_er_root_support_bars = (
+                tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
+            )
         else:
-            initial_er_root_support_bars = _compact_initial_er_ntx_support_pullback(
+            initial_er_root_support_bars = _compact_initial_er_ntx_support_pullback_leaves(
                 runtime=runtime,
                 state=pre_root_initial_state,
                 er_profile=er_profile,
@@ -2082,7 +2082,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
 
     gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
     if initial_er_root_support_bars is not None:
-        raw_initial_er_root_support_bar_leaves = jax.tree_util.tree_leaves(initial_er_root_support_bars)
+        raw_initial_er_root_support_bar_leaves = tuple(initial_er_root_support_bars)
         initial_er_root_support_bar_leaves = tuple(
             jnp.zeros_like(accumulated)
             if jnp.asarray(increment).dtype == jax.dtypes.float0

@@ -2235,18 +2235,18 @@ def _vmec_qi_maxj_shared_diagnostics_from_state(
             return ji, jc, djc
 
         ji_all, jc_all, djc_all = jax.vmap(_per_line, in_axes=(0, 0, 0), out_axes=(0, 0, 0))(b_surface, dl_surface, db_surface)
-        ji_pow = jnp.abs(ji_all) ** p_j
-        jc_pow = jnp.abs(jc_all) ** p_j
-        ni = jnp.asarray(float(nalpha_value), dtype=jnp.float64)
-        nc = jnp.asarray(float(nalpha_value), dtype=jnp.float64)
-        sum_ji2 = jnp.sum(ji_pow**2, axis=0)
-        sum_jc2 = jnp.sum(jc_pow**2, axis=0)
+        ji_pow = jnp.power(ji_all, p_j)
+        jc_pow = jnp.power(jc_all, p_j)
+        nalpha_f = jnp.asarray(float(nalpha_value), dtype=jnp.float64)
         sum_ji = jnp.sum(ji_pow, axis=0)
         sum_jc = jnp.sum(jc_pow, axis=0)
-        diff_sq_per_bj = (nc * sum_ji2) + (ni * sum_jc2) - (2.0 * sum_ji * sum_jc)
-        total_diff_sq = jnp.mean(diff_sq_per_bj)
-        mean_denom = (jnp.mean(ji_pow) + jnp.mean(jc_pow)) ** 2
-        qi_surface = jnp.sqrt(total_diff_sq / (mean_denom + 1.0e-10))
+        sum_ji_sq = jnp.sum(ji_pow * ji_pow, axis=0)
+        sum_jc_sq = jnp.sum(jc_pow * jc_pow, axis=0)
+        qi_pair_sum = nalpha_f * (sum_ji_sq + sum_jc_sq) - 2.0 * sum_ji * sum_jc
+        qi_num = jnp.sum(qi_pair_sum)
+        mean_denom = ((jnp.sum(sum_ji + sum_jc) / (2.0 * float(n_bounce_value))) ** 2) + 1.0e-10
+        qi_surface = jnp.sqrt(jnp.maximum(qi_num, 0.0) / mean_denom)
+
         maxj_surface = jnp.sqrt(jnp.mean(jnp.maximum(djc_all, 0.0) ** 2))
         return qi_surface, maxj_surface
 
