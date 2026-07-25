@@ -487,6 +487,13 @@ def _compact_initial_er_ntx_support_pullback(
             local_bar,
         )
 
+    def _add_local_prepared_objective_bar(prepared_bar, objective_index, radius_index, local_bar):
+        return jax.tree_util.tree_map(
+            lambda arr, local_arr: arr.at[objective_index, radius_index].add(local_arr),
+            prepared_bar,
+            local_bar,
+        )
+
     def _accumulate_radius(carry, radius_index):
         channels_carry, prepared_carry = carry
         prepared = jax.tree_util.tree_map(
@@ -550,15 +557,34 @@ def _compact_initial_er_ntx_support_pullback(
             prepared_delta0,
             drds_delta0,
         )
-        prepared_local_bars, drds_local_bars = jax.vmap(lambda gamma_bar: local_pullback(gamma_bar))(
-            gamma_bars
-        )
-        return (
-            dataclasses.replace(
-                channels_carry,
-                drds=channels_carry.drds.at[:, radius_index].add(drds_local_bars),
-            ),
-            _add_local_prepared_bar(prepared_carry, radius_index, prepared_local_bars),
+
+        def _accumulate_objective(objective_index, objective_carry):
+            channels_obj_carry, prepared_obj_carry = objective_carry
+            gamma_bar = jax.lax.dynamic_index_in_dim(
+                gamma_bars,
+                objective_index,
+                axis=0,
+                keepdims=False,
+            )
+            prepared_local_bar, drds_local_bar = local_pullback(gamma_bar)
+            return (
+                dataclasses.replace(
+                    channels_obj_carry,
+                    drds=channels_obj_carry.drds.at[objective_index, radius_index].add(drds_local_bar),
+                ),
+                _add_local_prepared_objective_bar(
+                    prepared_obj_carry,
+                    objective_index,
+                    radius_index,
+                    prepared_local_bar,
+                ),
+            )
+
+        return jax.lax.fori_loop(
+            0,
+            objective_count,
+            _accumulate_objective,
+            (channels_carry, prepared_carry),
         ), None
 
     (center_channels_bar, center_prepared_bar), _ = jax.lax.scan(
