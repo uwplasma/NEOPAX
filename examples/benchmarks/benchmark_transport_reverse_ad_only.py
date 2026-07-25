@@ -1775,42 +1775,66 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
                 runtime_payload = _runtime_with_ntx_support_payload(runtime_payload, payload)
             return runtime_payload
 
-        def _root_boundary_pullback_one(state_bar):
-            pre_root_state_bar = _initial_er_root_state_bar(
+        er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
+        finite_mask = jnp.asarray(finite_mask, dtype=bool)
+
+        def _residual_i_er(i, er_value):
+            er_eval = er_profile.at[i].set(er_value)
+            return _initial_er_charge_flux_residuals(
                 pre_root_initial_state,
-                er_profile,
-                finite_mask,
-                state_bar,
+                er_eval,
                 runtime=runtime,
-            )
-            residual_bar = _initial_er_residual_bar(
-                pre_root_initial_state,
+            )[i]
+
+        radial_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+        dres_der = jax.lax.map(
+            lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+            radial_indices,
+        )
+        safe_dres_der = jnp.where(
+            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+            dres_der,
+            jnp.inf,
+        )
+        residual_bars = jnp.where(
+            finite_mask[None, :],
+            -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
+            0.0,
+        )
+
+        _, state_residual_pullback = jax.vjp(
+            lambda state_value: _initial_er_charge_flux_residuals(
+                state_value,
                 er_profile,
-                state_bar.Er,
-                finite_mask,
                 runtime=runtime,
-            )
-
-            def _residuals_from_support(payload):
-                return _initial_er_charge_flux_residuals(
-                    pre_root_initial_state,
-                    er_profile,
-                    runtime=_root_support_runtime(payload),
-                )
-
-            _, support_pullback = jax.vjp(_residuals_from_support, support_payload)
-            (root_support_bar,) = support_pullback(residual_bar)
-            return pre_root_state_bar, root_support_bar
-
-        pre_root_initial_state_bars, initial_er_root_support_bars = jax.lax.map(
-            _root_boundary_pullback_one,
+            ),
+            pre_root_initial_state,
+        )
+        state_residual_bars = jax.vmap(lambda residual_bar: state_residual_pullback(residual_bar)[0])(
+            residual_bars
+        )
+        direct_initial_state_bars = dataclasses.replace(
             initial_state_bars,
+            Er=jnp.zeros_like(initial_state_bars.Er),
+        )
+        pre_root_initial_state_bars = _add_trees(direct_initial_state_bars, state_residual_bars)
+
+        def _residuals_from_support(payload):
+            return _initial_er_charge_flux_residuals(
+                pre_root_initial_state,
+                er_profile,
+                runtime=_root_support_runtime(payload),
+            )
+
+        _, support_pullback = jax.vjp(_residuals_from_support, support_payload)
+        initial_er_root_support_bars = jax.vmap(lambda residual_bar: support_pullback(residual_bar)[0])(
+            residual_bars
         )
         pre_root_initial_state_bars, initial_er_root_support_bars = jax.block_until_ready(
             (pre_root_initial_state_bars, initial_er_root_support_bars)
         )
         print(
-            "[autodiff-gate] progress: initial-Er root boundary pullback ready "
+            "[autodiff-gate] progress: initial-Er root boundary fused pullback ready "
             f"elapsed_s={time.perf_counter() - phase_start:.3f}",
             flush=True,
         )
