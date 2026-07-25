@@ -2083,6 +2083,21 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
     if initial_er_root_support_bars is not None:
         raw_initial_er_root_support_bar_leaves = tuple(initial_er_root_support_bars)
+        if len(raw_initial_er_root_support_bar_leaves) != len(support_bar_leaves):
+            raise ValueError(
+                "Initial-Er root support pullback produced "
+                f"{len(raw_initial_er_root_support_bar_leaves)} leaves, but support payload expects "
+                f"{len(support_bar_leaves)} leaves."
+            )
+        for leaf_i, (accumulated, increment) in enumerate(
+            zip(support_bar_leaves, raw_initial_er_root_support_bar_leaves, strict=True)
+        ):
+            if jnp.asarray(increment).shape != jnp.asarray(accumulated).shape:
+                raise ValueError(
+                    "Initial-Er root support pullback leaf shape mismatch at "
+                    f"leaf {leaf_i}: got {jnp.asarray(increment).shape}, "
+                    f"expected {jnp.asarray(accumulated).shape}."
+                )
         initial_er_root_support_bar_leaves = tuple(
             jnp.zeros_like(accumulated)
             if jnp.asarray(increment).dtype == jax.dtypes.float0
