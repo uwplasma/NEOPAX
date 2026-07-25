@@ -333,6 +333,37 @@ def _runtime_with_ntx_support_payload(runtime, support):
     )
 
 
+def _replace_geometry_payload_in_model(model, geometry):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if field.name in {"geometry", "field"}:
+            if value is not geometry:
+                updates[field.name] = geometry
+                changed = True
+            continue
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_geometry_payload_in_model(value, geometry)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def _runtime_with_geometry_payload(runtime, geometry):
+    flux_model, _changed = _replace_geometry_payload_in_model(runtime.models.flux, geometry)
+    return dataclasses.replace(
+        runtime,
+        geometry=geometry,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
 def _find_ntx_support_payload_in_model(model):
     support = getattr(model, "support", None)
     if support is not None and hasattr(model, "with_support_payload"):
@@ -1725,6 +1756,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(carry0_bars)
     initial_er_root_support_bars = None
     if initial_er_root_enabled:
+        phase_start = time.perf_counter()
         er_profile, finite_mask = _initial_er_selected_root_profile(
             pre_root_initial_state,
             config=config,
@@ -1734,7 +1766,7 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         def _root_support_runtime(payload):
             runtime_payload = runtime
             if combined_geometry_payload:
-                runtime_payload = dataclasses.replace(runtime_payload, geometry=payload["geometry"])
+                runtime_payload = _runtime_with_geometry_payload(runtime_payload, payload["geometry"])
                 runtime_payload = _runtime_with_ntx_support_payload(
                     runtime_payload,
                     payload["ntx_support"],
@@ -1773,6 +1805,14 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         pre_root_initial_state_bars, initial_er_root_support_bars = jax.lax.map(
             _root_boundary_pullback_one,
             initial_state_bars,
+        )
+        pre_root_initial_state_bars, initial_er_root_support_bars = jax.block_until_ready(
+            (pre_root_initial_state_bars, initial_er_root_support_bars)
+        )
+        print(
+            "[autodiff-gate] progress: initial-Er root boundary pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
         )
         initial_state_bars = pre_root_initial_state_bars
 
