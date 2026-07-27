@@ -479,3 +479,385 @@ Recommended next efficiency work:
    rather than materializing and retaining full support cotangent trees for all objectives.
 3. Keep the validated math path fixed: accepted replay schedule, reverse payload split
    `{geometry, ntx_support}`, and raw-block VMEC transpose.
+
+## 2026-07-25 07:46 Europe/Lisbon - Compact Initial-Er Ambipolar Root Pullback
+
+Current status: the realtime-geometry reverse benchmark now has a benchmark-local compact
+custom rule for the initial-Er ambipolar root boundary contribution. The goal was to keep the
+full all-objective reverse behavior, avoid the generic support VJP memory/time blow-up, and not
+contaminate the forward solver path.
+
+Validated command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --skip-realtime-geometry-support-bar-diagnostics \
+  --initial-Er-root-ad jax_selected_root
+```
+
+Important timing from the validated 16-step run:
+
+```text
+runtime build:                              229.139 s
+solver components:                           31.411 s
+support reverse profile-state vjp:           31.444 s
+support reverse initial carry vjp:           20.789 s
+support reverse realized-schedule forward:  440.787 s
+support reverse segmented cotangent sweep: 1509.917 s
+initial-Er root boundary compact pullback:  193.092 s
+transport reverse cotangents complete:     2733.853 s
+geometry support pullback:                  357.038 s
+total elapsed:                             3091.119 s
+```
+
+For comparison, the earlier generic root-boundary support VJP took about `2067.233 s` by itself,
+and the generic total was about `4906.118 s`. The compact rule therefore cut the root-boundary
+piece by about `10.7x` and reduced the total run by roughly `1815 s` (`~37%`) in this benchmark.
+
+Validated reverse geometry gradients for `RBC:1:0` with the compact initial-Er root rule:
+
+```text
+softmax_Er:                         reverse=-6.262655e+01
+smooth_root_proxy:                  reverse=-3.759502e-04
+Er2_volume_average:                 reverse=-2.711843e+02
+Er_volume_average:                  reverse=-2.364607e+01
+electron_temperature_volume_average reverse=-2.244850e-02
+total_pressure_volume_average:      reverse=-7.752044e-02
+alpha_power_volume_average:         reverse= 1.207392e-03
+```
+
+Corresponding split into direct geometry and NTX-support branches:
+
+```text
+softmax_Er:                         geometry=-2.293057e+01  ntx_support=-3.969599e+01
+smooth_root_proxy:                  geometry=-1.141335e-04  ntx_support=-2.618166e-04
+Er2_volume_average:                 geometry=-2.818629e+02  ntx_support= 1.067862e+01
+Er_volume_average:                  geometry=-3.431351e+00  ntx_support=-2.021472e+01
+electron_temperature_volume_average geometry=-1.752381e-02  ntx_support=-4.924686e-03
+total_pressure_volume_average:      geometry=-7.785517e-02  ntx_support= 3.347248e-04
+alpha_power_volume_average:         geometry=-1.260815e-03  ntx_support= 2.468207e-03
+```
+
+FD-on reference from the matching realtime-geometry FD run with `--initial-Er-root-ad jax_selected_root`:
+
+```text
+softmax_Er:                         fd=-6.262725e+01
+smooth_root_proxy:                  fd=-5.576405e-04
+Er2_volume_average:                 fd=-2.712344e+02
+Er_volume_average:                  fd=-2.364403e+01
+electron_temperature_volume_average fd=-2.244865e-02
+total_pressure_volume_average:      fd=-7.752101e-02
+alpha_power_volume_average:         fd= 1.207392e-03
+```
+
+Conclusion: the compact root pullback preserves the full all-objective reverse path and matches
+the FD-on derivatives closely for the main objectives. The `smooth_root_proxy` derivative should
+be treated cautiously because the proxy definition was changed/restored during debugging; if it
+matters, re-run FD and reverse from the same exact code state before using that one as a gate.
+
+Implementation notes:
+
+- The benchmark-local helper is `_compact_initial_er_ntx_support_pullback_leaves` in
+  `examples/benchmarks/benchmark_transport_reverse_ad_only.py`.
+- It avoids a generic VJP through the full NTX support tree and avoids constructing batched NTX
+  dataclasses, which caused static metadata/object-shape failures.
+- It scans over radii with `jax.lax.scan`, builds valid unbatched local prepared supports, computes
+  a local `jacrev` of the ambipolar particle-flux residual with respect to flattened local support
+  leaves plus local `drds`, and contracts all objective residual cotangents at once with
+  `jnp.tensordot`.
+- It returns flat support-bar leaves in the `NTXExactLijRuntimeSupport` treedef order and keeps
+  face-channel/prepared bars zero for this root-boundary contribution.
+- A guard checks root support-bar leaf count and shape against the existing support-bar leaves
+  before adding them, so tree mismatches fail loudly.
+- This is benchmark-side only and should not change the production forward solver behavior.
+
+Validation checks performed after the edit:
+
+```text
+python -m py_compile examples\benchmarks\benchmark_transport_reverse_ad_only.py
+git diff --check -- examples\benchmarks\benchmark_transport_reverse_ad_only.py
+```
+
+Both checks passed.
+
+Recommended next steps:
+
+1. Keep this compact rule as the active path for all-objective realtime-geometry reverse tests with
+   `--initial-Er-root-ad jax_selected_root`.
+2. If more runtime reduction is needed, focus next on primal/reverse schedule fusion or support-bar
+   contraction to selected VMEC harmonics, not on per-objective loopholes.
+3. Re-check `smooth_root_proxy` only after deciding the final proxy definition, since that objective
+   was intentionally in flux.
+
+Efficiency phase note: with the realtime-geometry reverse math now matching the FD-on benchmark for
+the main objectives, the next work can shift from correctness recovery to time/memory efficiency.
+The main remaining cost centers are the realized-schedule reverse sweep and the final geometry
+support pullback, so future changes should target those without changing the validated derivative
+path.
+
+## Optimization API Extraction State
+
+The validated realtime-geometry reverse path is being lifted out of
+`examples/benchmarks/benchmark_transport_reverse_ad_only.py` into internal NEOPAX APIs without
+changing the derivative math.
+
+Current extracted modules:
+
+- `NEOPAX/_reverse_ad_parameters.py`
+  Defines `ProfileParameterSpec`, `VmecBoundaryParameterSpec`, `ReverseADParameterSet`, VMEC
+  harmonic discovery helpers, and stable mixed parameter ordering.
+- `NEOPAX/_reverse_ad_initial_er.py`
+  Owns the compact initial-Er ambipolar root support pullback that replaced the slow generic VJP.
+- `NEOPAX/_reverse_ad_transport.py`
+  Owns the JAX-native realtime-geometry transport table boundary:
+  `RealtimeGeometryTransportReverseTableRequest`,
+  `RealtimeGeometryTransportReverseTableResult`,
+  `transport_realtime_geometry_reverse_table(...)`,
+  `realtime_geometry_payload_pullback_result(...)`,
+  `realtime_geometry_transport_reverse_table_from_payload_cotangents(...)`, and the grouped-runner
+  contract. It also owns `realtime_geometry_transport_reverse_grouped_inputs(...)`, which builds
+  the table context and grouped report runner from a supplied segmented executor, plus
+  `realtime_geometry_transport_reverse_support_segment_executor(...)`, which wraps a supplied
+  segmented probe callback, and `run_realtime_geometry_support_segment_reverse_table_core(...)`,
+  which is the non-printing internal core boundary around that callback.
+- `NEOPAX/_reverse_ad_optimization.py`
+  Owns VMEX-style least-squares terms and residual/Jacobian assembly:
+  `LeastSquaresTerm`, `transport_least_squares_terms(...)`,
+  `evaluate_transport_realtime_geometry_least_squares(...)`,
+  `build_transport_realtime_geometry_least_squares_runner(...)`, and
+  `scalar_loss_and_gradient_from_least_squares(...)`.
+
+Current canonical optimization smoke stack:
+
+```text
+benchmark smoke / future optimizer script
+  -> build_transport_realtime_geometry_least_squares_runner(...)
+  -> RealtimeGeometryTransportReverseTableRequest
+  -> evaluate_transport_realtime_geometry_least_squares(...)
+  -> transport_realtime_geometry_reverse_table(...)
+  -> validated grouped reverse table result
+  -> residuals + Jacobian
+```
+
+Current benchmark status:
+
+- `--optimization-api-smoke` in `benchmark_transport_reverse_ad_only.py` now calls
+  `build_transport_realtime_geometry_least_squares_runner(...)` and then evaluates the returned
+  runner on the benchmark-selected terms.
+- The benchmark still supplies the temporary segmented probe callback
+  `_run_realtime_geometry_support_segment_probe(...)`; internals now wrap it into the grouped
+  executor used by optimization smoke paths.
+- The benchmark still owns printing and JSON report writing.
+- The normal benchmark CLI behavior remains intact.
+
+Validation performed for the extracted API layer:
+
+```text
+python -m py_compile NEOPAX\_reverse_ad_optimization.py NEOPAX\_reverse_ad_transport.py \
+  examples\benchmarks\benchmark_transport_reverse_ad_only.py NEOPAX\_reverse_ad_parameters.py \
+  NEOPAX\_reverse_ad_initial_er.py
+git diff --check -- NEOPAX/_reverse_ad_optimization.py NEOPAX/_reverse_ad_transport.py \
+  examples/benchmarks/benchmark_transport_reverse_ad_only.py plan_reverse_ad_optimization_lane.md
+```
+
+Additional lightweight smokes passed:
+
+- direct table-builder API path,
+- grouped-runner API path,
+- grouped-builder-through-table-API path,
+- least-squares evaluator with profile + VMEC parameter ordering,
+- repeated transport objective terms using one table row and multiple residual rows,
+- request/term mismatch guard,
+- non-transport term rejection for the transport-specific evaluator.
+
+No full GPU benchmark has been rerun after the API extraction-only changes.
+
+Completed extraction step:
+
+The benchmark-specific construction of:
+
+```text
+geometry specs from args
+ReverseADParameterSet
+RealtimeGeometryTransportReverseTableContext
+RealtimeGeometryTransportReverseTableRequest
+run_grouped_report
+```
+
+has been further internalized. The internal transport helper now builds the
+`RealtimeGeometryTransportReverseTableContext` and grouped report runner, while the internal
+optimization factory builds the `RealtimeGeometryTransportReverseTableRequest` and returns a
+least-squares runner. The internal transport core now enforces `return_report=True`, suppresses
+probe output, threads table context, and validates the returned JAX-native table result. The
+benchmark still owns geometry-spec selection from CLI args and still supplies the temporary
+segmented probe callback `_run_realtime_geometry_support_segment_probe(...)` until that final heavy
+runner is migrated.
+
+Concrete next steps:
+
+1. Move the actual segmented executor out of the benchmark.
+   Context construction, objective='all' grouping, request construction, and least-squares runner
+   creation are internal. The non-printing internal core boundary is also in place. The remaining
+   benchmark-owned heavy wiring is the probe implementation
+   `_run_realtime_geometry_support_segment_probe(...)`.
+
+2. Optimizer-facing runner factory is now present.
+   Current shape:
+
+   ```python
+   build_transport_realtime_geometry_least_squares_runner(...)
+   ```
+
+   returning a callable that evaluates:
+
+   ```text
+   least-squares terms -> LeastSquaresEvaluation
+   ```
+
+3. Keep benchmark behavior unchanged.
+   `--optimization-api-smoke` calls the new runner factory, and normal benchmark CLI/reporting
+   remains as-is.
+
+4. Validate with lightweight smokes.
+   Check request construction, parameter ordering, objective mismatch guards, and direct/grouped
+   runner equivalence.
+
+5. Run one full GPU smoke only after wiring is stable.
+   Use `--optimization-api-smoke` with the known realtime geometry command to confirm no numerical
+   or path drift.
+
+After that, the next larger migration step is moving the actual segmented grouped executor out of
+the benchmark.
+
+Latest extraction step:
+
+The stable setup immediately before the segmented realtime-geometry support reverse sweep has now
+been moved into `_reverse_ad_transport.py` as
+`prepare_realtime_geometry_support_segment_core_setup(...)` and
+`RealtimeGeometrySupportSegmentCoreSetup`. This internal helper owns:
+
+```text
+reverse_payload vs NTX-only payload selection
+NTX surface backend metadata
+profile parameter value slicing
+reverse static setup construction
+early geometry diagnostics capture
+```
+
+The benchmark still owns the actual heavy segmented support pullback function
+`_run_realtime_geometry_support_segment_probe(...)`; it now delegates the reusable setup and then
+continues with the same local variables and same reverse math as before. No full GPU benchmark has
+been rerun after this extraction-only change.
+
+Latest extraction step:
+
+The all-objective grouped support-cotangent orchestration has also been moved into
+`_reverse_ad_transport.py` as `realtime_geometry_support_cotangents_from_parameter_vector(...)` and
+`RealtimeGeometrySupportCotangentResult`. This helper owns the stable internal result shape for:
+
+```text
+objective_values
+profile_gradient_matrix
+support_bars
+support_component_bars_by_name
+support_reuse_count / support_rebuild_count
+initial-cache pullback flags
+```
+
+The helper still calls the same benchmark-supplied grouped reverse callback exactly once and then
+performs the same `jax.block_until_ready` synchronization that the benchmark previously performed
+inline. The low-level segmented JAX reverse implementation is still in the benchmark; only the
+orchestration/result boundary moved inward.
+
+Latest extraction step:
+
+The runtime path for the all-objective segmented support reverse kernel now routes through
+`_reverse_ad_transport.py` via
+`realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(...)`. The
+benchmark builds a `RealtimeGeometrySupportReverseDependencies` bundle containing the still
+benchmark-owned objective/profile/root/runtime helper callbacks, then immediately calls the
+internal kernel. This preserves the same JAX operations and the same single grouped reverse pass,
+but moves the active implementation into NEOPAX internals.
+
+Cleanup completed for this step: the old all-objective benchmark body was removed after the
+internal routing pass. The benchmark now keeps the single-objective support helper and profile-only
+helpers for their existing CLI modes, while the all-objective support kernel is a thin dependency
+wrapper around the internal implementation.
+
+## Current Checkpoint - Reverse AD Optimization Extraction
+
+Current code state:
+
+- The active all-objective realtime-geometry support reverse kernel lives in
+  `NEOPAX/_reverse_ad_transport.py` as
+  `realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(...)`.
+- The benchmark function
+  `_reverse_all_objectives_support_payload_bar_for_parameter_vector(...)` is now a thin wrapper.
+  It builds `RealtimeGeometrySupportReverseDependencies` from benchmark-local helper callbacks and
+  immediately calls the internal kernel.
+- The old duplicated all-objective benchmark body has been removed.
+- The benchmark still intentionally owns the profile-only reduced reverse helper and the
+  single-objective support probe helper because those support existing CLI/debug modes.
+- `realtime_geometry_support_cotangents_from_parameter_vector(...)` owns the grouped
+  all-objective support-cotangent result boundary and still calls the wrapper exactly once.
+- `realtime_geometry_transport_reverse_table_from_payload_cotangents(...)` owns the support payload
+  to VMEC-harmonic table assembly using the validated raw-block transpose path.
+- The optimization-facing least-squares runner factory exists in `_reverse_ad_optimization.py`.
+
+Validation status after the cleanup:
+
+```text
+python -m py_compile NEOPAX\_reverse_ad_transport.py \
+  examples\benchmarks\benchmark_transport_reverse_ad_only.py \
+  NEOPAX\_reverse_ad_optimization.py NEOPAX\_reverse_ad_parameters.py \
+  NEOPAX\_reverse_ad_initial_er.py
+
+git diff --check -- NEOPAX/_reverse_ad_transport.py \
+  examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  realtime_transport_geometry_reverse_current_state.md \
+  plan_reverse_ad_optimization_lane.md
+```
+
+Both checks passed. No full GPU benchmark has been rerun after the extraction/cleanup-only
+changes.
+
+Current known warnings:
+
+- Git reports that `examples/benchmarks/benchmark_transport_reverse_ad_only.py` and this markdown
+  file may be converted from LF to CRLF the next time Git touches them. This is line-ending
+  bookkeeping, not a Python/JAX behavior change.
+
+Next steps:
+
+1. Move the dependency callbacks out of the benchmark where appropriate.
+   Start with low-risk helpers such as objective label handling or state/profile construction only
+   if they can be moved without changing numerics.
+
+2. Decide whether the single-objective support probe should remain benchmark-only.
+   It is still useful as a diagnostic path, so the safe default is to keep it in the benchmark unless
+   optimization needs it.
+
+3. Add a non-benchmark smoke/regression for the internal API.
+   Prefer fake/small objects first so it does not require a full GPU transport run.
+
+4. Run one full GPU validation only after the internal API seams are stable.
+   Use the known `profiles_plus_realtime_geometry` command with `--optimization-api-smoke` and
+   compare against the saved FD/reverse values.
+
+5. After validation, expose a production-facing optimization entry point.
+   The likely shape is a VMEX-style least-squares runner accepting transport terms plus VMEC
+   geometry terms, grouped internally into reverse-table blocks.

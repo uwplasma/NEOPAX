@@ -1,0 +1,251 @@
+"""Reverse-AD helpers for differentiable initial-Er ambipolar roots."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import jax
+import jax.numpy as jnp
+
+from ._transport_flux_models import (
+    DENSITY_STATE_TO_PHYSICAL,
+    _add_float_delta_tree,
+    _collisionality_kind,
+    _extract_right_constraints,
+    _float_delta_tree_like,
+    get_Thermodynamical_Forces_A1,
+    get_Thermodynamical_Forces_A2,
+    get_Thermodynamical_Forces_A3,
+    get_gradient_density,
+    get_gradient_temperature,
+    get_v_thermal,
+    safe_density,
+)
+
+
+def find_ntx_exact_support_model(model):
+    """Return the nested NTX exact-runtime model that owns prepared Lij solves."""
+
+    if (
+        model is not None
+        and callable(getattr(model, "with_support_payload", None))
+        and callable(getattr(model, "_solve_lij_prepared_local", None))
+    ):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_exact_support_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def compact_initial_er_ntx_support_pullback_leaves(
+    *,
+    runtime,
+    state,
+    er_profile,
+    residual_bars,
+    support,
+):
+    """Compact support pullback for the initial-Er ambipolar residual.
+
+    This mirrors the local NTX particle-flux evaluator but transposes only the
+    per-radius prepared support and drds entries. It avoids a full-payload VJP
+    through ``build_local_particle_flux_evaluator`` and returns flat support-bar
+    leaves in the ``NTXExactLijRuntimeSupport`` pytree order expected by the
+    realtime-geometry reverse payload path.
+    """
+
+    model = find_ntx_exact_support_model(runtime.models.flux)
+    if model is None:
+        raise ValueError("Could not find an NTX exact-runtime model for compact initial-Er support pullback.")
+
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2:
+        raise ValueError(
+            "compact initial-Er support pullback expects residual_bars with shape "
+            "(objective_count, radial_count)."
+        )
+    if er_profile.ndim != 1:
+        raise ValueError("compact initial-Er support pullback expects a 1D er_profile.")
+    if int(residual_bars.shape[1]) != int(er_profile.shape[0]):
+        raise ValueError(
+            "compact initial-Er support pullback residual radial dimension does not match er_profile: "
+            f"residual_bars.shape={residual_bars.shape}, er_profile.shape={er_profile.shape}."
+        )
+    objective_count = int(residual_bars.shape[0])
+    density = safe_density(state.density)
+    temperature = state.temperature
+    v_thermal = get_v_thermal(model.species.mass, temperature)
+    species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+    collisionality_kind = _collisionality_kind(model.collisionality_model)
+    density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+        model.bc_density,
+        density,
+    )
+    temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+        model.bc_temperature,
+        temperature,
+    )
+    dndr_all = jax.vmap(
+        lambda density_a, right_value, right_grad: get_gradient_density(
+            density_a,
+            model.geometry.r_grid,
+            model.geometry.r_grid_half,
+            model.geometry.dr,
+            right_face_constraint=right_value,
+            right_face_grad_constraint=right_grad,
+        )
+    )(density, density_right_constraint, density_right_grad_constraint)
+    dTdr_all = jax.vmap(
+        lambda temperature_a, right_value, right_grad: get_gradient_temperature(
+            temperature_a,
+            model.geometry.r_grid,
+            model.geometry.r_grid_half,
+            model.geometry.dr,
+            right_face_constraint=right_value,
+            right_face_grad_constraint=right_grad,
+        )
+    )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
+
+    radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+
+    def _batched_zero_tree_leaves(tree):
+        return tuple(
+            jnp.broadcast_to(
+                jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+                if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                else jnp.zeros_like(jnp.asarray(leaf)),
+                (objective_count,) + jnp.asarray(leaf).shape,
+            )
+            for leaf in jax.tree_util.tree_leaves(tree)
+        )
+
+    center_channels_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(
+            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            else jnp.zeros_like(jnp.asarray(leaf)),
+            (objective_count,) + jnp.asarray(leaf).shape,
+        ),
+        support.center_channels,
+    )
+    center_prepared_bar_leaves = _batched_zero_tree_leaves(support.center_prepared)
+    face_channels_bar_leaves = _batched_zero_tree_leaves(support.face_channels)
+    face_prepared_bar_leaves = _batched_zero_tree_leaves(support.face_prepared)
+
+    def _split_flat_vector(flat, sizes, shapes, treedef):
+        leaves = []
+        offset = 0
+        for size, shape in zip(sizes, shapes, strict=True):
+            leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+            offset += size
+        return treedef.unflatten(leaves), flat[offset]
+
+    def _accumulate_radius(carry, radius_index):
+        channels_carry, prepared_leaf_carry = carry
+        prepared = jax.tree_util.tree_map(
+            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+            support.center_prepared,
+        )
+        drds_value = jax.lax.dynamic_index_in_dim(
+            support.center_channels.drds,
+            radius_index,
+            axis=0,
+            keepdims=False,
+        )
+        er_scalar = jax.lax.dynamic_index_in_dim(er_profile, radius_index, axis=0, keepdims=False)
+        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+        gamma_bars = residual_bars[:, radius_index, None] * charge_qp[None, :]
+        prepared_delta0 = _float_delta_tree_like(prepared)
+        prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+        prepared_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0)
+        prepared_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0)
+        flat_delta0 = jnp.concatenate(
+            [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
+            + [jnp.ravel(jnp.zeros_like(drds_value))]
+        )
+
+        def _gamma_from_local_support_flat(flat_delta):
+            prepared_delta, drds_delta = _split_flat_vector(
+                flat_delta,
+                prepared_delta_sizes,
+                prepared_delta_shapes,
+                prepared_delta_treedef,
+            )
+            prepared_value = _add_float_delta_tree(prepared, prepared_delta)
+            drds_local = drds_value + drds_delta
+            er_local_profile = jnp.asarray(er_profile).at[radius_index].set(er_scalar)
+            lij = jax.vmap(
+                lambda species_index: model._solve_lij_prepared_local(
+                    prepared_value,
+                    drds_value=drds_local,
+                    species_index=species_index,
+                    er_value=er_scalar,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                    derivative_mode_override="direct",
+                )
+            )(species_indices)
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                    charge,
+                    density_a,
+                    temperature_a,
+                    dndr_a,
+                    dTdr_a,
+                    er_local_profile,
+                )
+            )(model.species.charge, density, temperature, dndr_all, dTdr_all)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
+            a3 = get_Thermodynamical_Forces_A3(er_local_profile)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+            return -density_phys * (
+                lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
+            )
+
+        local_jacobian = jax.jacrev(_gamma_from_local_support_flat)(flat_delta0)
+        flat_bars = jnp.tensordot(gamma_bars, local_jacobian, axes=([1], [0]))
+        prepared_flat_size = int(sum(prepared_delta_sizes))
+        drds_bars = flat_bars[:, prepared_flat_size]
+
+        updated_prepared_leaves = []
+        offset = 0
+        for carry_leaf, size, shape in zip(
+            prepared_leaf_carry,
+            prepared_delta_sizes,
+            prepared_delta_shapes,
+            strict=True,
+        ):
+            local_bar = jnp.reshape(flat_bars[:, offset : offset + size], (objective_count,) + shape)
+            updated_prepared_leaves.append(carry_leaf.at[:, radius_index].add(local_bar))
+            offset += size
+
+        return (
+            dataclasses.replace(
+                channels_carry,
+                drds=channels_carry.drds.at[:, radius_index].add(drds_bars),
+            ),
+            tuple(updated_prepared_leaves),
+        ), None
+
+    (center_channels_bar, center_prepared_bar_leaves), _ = jax.lax.scan(
+        _accumulate_radius,
+        (center_channels_bar, center_prepared_bar_leaves),
+        radius_indices,
+    )
+    return (
+        tuple(jax.tree_util.tree_leaves(center_channels_bar))
+        + face_channels_bar_leaves
+        + tuple(center_prepared_bar_leaves)
+        + face_prepared_bar_leaves
+    )

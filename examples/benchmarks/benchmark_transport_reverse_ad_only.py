@@ -35,28 +35,44 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
     build_geometry_autodiff_context,
-    build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector,
-    build_ntx_exact_lij_support_from_param_vector,
-    geometry_payload_pullback_from_param_vector_raw_block_transpose,
 )
 from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial_jax  # noqa: E402
 from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
+from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
+    compact_initial_er_ntx_support_pullback_leaves,
+    find_ntx_exact_support_model,
+)
+from NEOPAX._reverse_ad_parameters import (  # noqa: E402
+    VmecBoundaryParameterSpec,
+    discover_vmec_boundary_parameter_specs,
+    normalize_vmec_boundary_families,
+    reverse_ad_parameter_set,
+    vmec_boundary_tuples,
+)
+from NEOPAX._reverse_ad_optimization import (  # noqa: E402
+    build_transport_realtime_geometry_least_squares_runner,
+    transport_least_squares_terms,
+)
+from NEOPAX._reverse_ad_transport import (  # noqa: E402
+    grouped_transport_reverse_report_builder,
+    grouped_transport_reverse_table_result_builder,
+    prepare_realtime_geometry_support_segment_core_setup,
+    RealtimeGeometrySupportReverseDependencies,
+    realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector,
+    realtime_geometry_support_cotangents_from_parameter_vector,
+    realtime_geometry_transport_reverse_table_from_payload_cotangents,
+    realtime_geometry_transport_reverse_grouped_inputs,
+    realtime_geometry_transport_reverse_support_segment_executor,
+    realtime_geometry_transport_reverse_diagnostic_gradient_entries,
+    realtime_geometry_transport_reverse_metadata_entries,
+    transport_reverse_table_report_entries,
+)
 from NEOPAX._transport_flux_models import (  # noqa: E402
-    DENSITY_STATE_TO_PHYSICAL,
     _add_float_delta_tree,
-    _collisionality_kind,
-    _extract_right_constraints,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
-    get_Thermodynamical_Forces_A1,
-    get_Thermodynamical_Forces_A2,
-    get_Thermodynamical_Forces_A3,
-    get_gradient_density,
-    get_gradient_temperature,
-    get_v_thermal,
-    safe_density,
 )
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedCotangent,
@@ -394,18 +410,7 @@ def _find_ntx_support_payload(runtime):
 
 
 def _find_ntx_exact_support_model(model):
-    if (
-        model is not None
-        and callable(getattr(model, "with_support_payload", None))
-        and callable(getattr(model, "_solve_lij_prepared_local", None))
-    ):
-        return model
-    if dataclasses.is_dataclass(model) and not isinstance(model, type):
-        for field in dataclasses.fields(model):
-            found = _find_ntx_exact_support_model(getattr(model, field.name))
-            if found is not None:
-                return found
-    return None
+    return find_ntx_exact_support_model(model)
 
 
 def _compact_initial_er_ntx_support_pullback_leaves(
@@ -416,190 +421,12 @@ def _compact_initial_er_ntx_support_pullback_leaves(
     residual_bars,
     support,
 ):
-    """Compact support pullback for the initial-Er ambipolar residual.
-
-    This mirrors the local NTX particle-flux evaluator but transposes only the
-    per-radius prepared support and drds entries.  It avoids a full-payload VJP
-    through ``build_local_particle_flux_evaluator``.
-    """
-    model = _find_ntx_exact_support_model(runtime.models.flux)
-    if model is None:
-        raise ValueError("Could not find an NTX exact-runtime model for compact initial-Er support pullback.")
-
-    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
-    objective_count = int(residual_bars.shape[0])
-    density = safe_density(state.density)
-    temperature = state.temperature
-    v_thermal = get_v_thermal(model.species.mass, temperature)
-    species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
-    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
-    collisionality_kind = _collisionality_kind(model.collisionality_model)
-    density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
-        model.bc_density,
-        density,
-    )
-    temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
-        model.bc_temperature,
-        temperature,
-    )
-    dndr_all = jax.vmap(
-        lambda density_a, right_value, right_grad: get_gradient_density(
-            density_a,
-            model.geometry.r_grid,
-            model.geometry.r_grid_half,
-            model.geometry.dr,
-            right_face_constraint=right_value,
-            right_face_grad_constraint=right_grad,
-        )
-    )(density, density_right_constraint, density_right_grad_constraint)
-    dTdr_all = jax.vmap(
-        lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-            temperature_a,
-            model.geometry.r_grid,
-            model.geometry.r_grid_half,
-            model.geometry.dr,
-            right_face_constraint=right_value,
-            right_face_grad_constraint=right_grad,
-        )
-    )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
-
-    radius_indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
-
-    def _batched_zero_tree_leaves(tree):
-        return tuple(
-            jnp.broadcast_to(
-                jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
-                if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-                else jnp.zeros_like(jnp.asarray(leaf)),
-                (objective_count,) + jnp.asarray(leaf).shape,
-            )
-            for leaf in jax.tree_util.tree_leaves(tree)
-        )
-
-    center_channels_bar = jax.tree_util.tree_map(
-        lambda leaf: jnp.broadcast_to(
-            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
-            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-            else jnp.zeros_like(jnp.asarray(leaf)),
-            (objective_count,) + jnp.asarray(leaf).shape,
-        ),
-        support.center_channels,
-    )
-    center_prepared_bar_leaves = _batched_zero_tree_leaves(support.center_prepared)
-    face_channels_bar_leaves = _batched_zero_tree_leaves(support.face_channels)
-    face_prepared_bar_leaves = _batched_zero_tree_leaves(support.face_prepared)
-
-    def _split_flat_vector(flat, sizes, shapes, treedef):
-        leaves = []
-        offset = 0
-        for size, shape in zip(sizes, shapes, strict=True):
-            leaves.append(jnp.reshape(flat[offset : offset + size], shape))
-            offset += size
-        return treedef.unflatten(leaves), flat[offset]
-
-    def _accumulate_radius(carry, radius_index):
-        channels_carry, prepared_leaf_carry = carry
-        prepared = jax.tree_util.tree_map(
-            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-            support.center_prepared,
-        )
-        drds_value = jax.lax.dynamic_index_in_dim(
-            support.center_channels.drds,
-            radius_index,
-            axis=0,
-            keepdims=False,
-        )
-        er_scalar = jax.lax.dynamic_index_in_dim(er_profile, radius_index, axis=0, keepdims=False)
-        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
-        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
-        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
-        gamma_bars = residual_bars[:, radius_index, None] * charge_qp[None, :]
-        prepared_delta0 = _float_delta_tree_like(prepared)
-        prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(prepared_delta0)
-        prepared_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0)
-        prepared_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0)
-        flat_delta0 = jnp.concatenate(
-            [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
-            + [jnp.ravel(jnp.zeros_like(drds_value))]
-        )
-
-        def _gamma_from_local_support_flat(flat_delta):
-            prepared_delta, drds_delta = _split_flat_vector(
-                flat_delta,
-                prepared_delta_sizes,
-                prepared_delta_shapes,
-                prepared_delta_treedef,
-            )
-            prepared_value = _add_float_delta_tree(prepared, prepared_delta)
-            drds_local = drds_value + drds_delta
-            er_local_profile = jnp.asarray(er_profile).at[radius_index].set(er_scalar)
-            lij = jax.vmap(
-                lambda species_index: model._solve_lij_prepared_local(
-                    prepared_value,
-                    drds_value=drds_local,
-                    species_index=species_index,
-                    er_value=er_scalar,
-                    temperature_local=temperature_local,
-                    density_local=density_local,
-                    vthermal_local=vthermal_local,
-                    collisionality_kind=collisionality_kind,
-                    derivative_mode_override="direct",
-                )
-            )(species_indices)
-            a1 = jax.vmap(
-                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-                    charge,
-                    density_a,
-                    temperature_a,
-                    dndr_a,
-                    dTdr_a,
-                    er_local_profile,
-                )
-            )(model.species.charge, density, temperature, dndr_all, dTdr_all)
-            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
-            a3 = get_Thermodynamical_Forces_A3(er_local_profile)
-            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
-            return -density_phys * (
-                lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
-                + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
-                + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
-            )
-
-        local_jacobian = jax.jacrev(_gamma_from_local_support_flat)(flat_delta0)
-        flat_bars = jnp.tensordot(gamma_bars, local_jacobian, axes=([1], [0]))
-        prepared_flat_size = int(sum(prepared_delta_sizes))
-        drds_bars = flat_bars[:, prepared_flat_size]
-
-        updated_prepared_leaves = []
-        offset = 0
-        for carry_leaf, size, shape in zip(
-            prepared_leaf_carry,
-            prepared_delta_sizes,
-            prepared_delta_shapes,
-            strict=True,
-        ):
-            local_bar = jnp.reshape(flat_bars[:, offset : offset + size], (objective_count,) + shape)
-            updated_prepared_leaves.append(carry_leaf.at[:, radius_index].add(local_bar))
-            offset += size
-
-        return (
-            dataclasses.replace(
-                channels_carry,
-                drds=channels_carry.drds.at[:, radius_index].add(drds_bars),
-            ),
-            tuple(updated_prepared_leaves),
-        ), None
-
-    (center_channels_bar, center_prepared_bar_leaves), _ = jax.lax.scan(
-        _accumulate_radius,
-        (center_channels_bar, center_prepared_bar_leaves),
-        radius_indices,
-    )
-    return (
-        tuple(jax.tree_util.tree_leaves(center_channels_bar))
-        + face_channels_bar_leaves
-        + tuple(center_prepared_bar_leaves)
-        + face_prepared_bar_leaves
+    return compact_initial_er_ntx_support_pullback_leaves(
+        runtime=runtime,
+        state=state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        support=support,
     )
 
 
@@ -851,19 +678,10 @@ def _format_geometry_param_spec(param_spec: tuple[str, int, int]) -> str:
 
 
 def _parse_reverse_geometry_families(value: str | None) -> tuple[str, ...]:
-    if value is None:
-        return ("RBC", "ZBS")
-    families = tuple(part.strip().upper() for part in str(value).split(",") if part.strip())
-    if not families:
-        raise ValueError("--reverse-geometry-families must contain at least one family.")
-    allowed = {"RBC", "ZBS"}
-    unknown = tuple(family for family in families if family not in allowed)
-    if unknown:
-        raise ValueError(
-            "--reverse-geometry-families currently supports "
-            f"{sorted(allowed)}; got {unknown}."
-        )
-    return families
+    try:
+        return normalize_vmec_boundary_families(value)
+    except ValueError as exc:
+        raise ValueError(f"--reverse-geometry-families {exc}") from exc
 
 
 def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: str):
@@ -907,29 +725,19 @@ def _all_geometry_param_specs_from_context(
     families: tuple[str, ...],
     nonzero_only: bool = True,
 ) -> tuple[tuple[str, int, int], ...]:
-    specs: list[tuple[str, int, int]] = []
-    m_arr = np.asarray(jax.device_get(geometry_context.static.modes.m), dtype=int).reshape(-1)
-    n_arr = np.asarray(jax.device_get(geometry_context.static.modes.n), dtype=int).reshape(-1)
-    for family in families:
-        family_key = str(family).strip().upper()
-        boundary_field = "rbc" if family_key == "RBC" else "zbs"
-        boundary_values = np.asarray(
-            jax.device_get(getattr(geometry_context.boundary, boundary_field)),
-            dtype=float,
-        ).reshape(-1)
-        for m_value, n_value, coefficient in zip(m_arr.tolist(), n_arr.tolist(), boundary_values.tolist()):
-            if nonzero_only and not np.isfinite(coefficient):
-                continue
-            if nonzero_only and abs(float(coefficient)) == 0.0:
-                continue
-            specs.append((family_key, int(m_value), int(n_value)))
-    if not specs:
+    try:
+        specs = discover_vmec_boundary_parameter_specs(
+            geometry_context,
+            families=families,
+            nonzero_only=nonzero_only,
+        )
+    except ValueError as exc:
         raise ValueError(
             "No VMEC boundary harmonics matched the requested all-harmonic selector. "
             "Try --reverse-geometry-include-zero-harmonics or a different "
             "--reverse-geometry-families value."
-        )
-    return tuple(specs)
+        ) from exc
+    return vmec_boundary_tuples(specs)
 
 
 def _geometry_param_specs_from_args(args, geometry_context) -> tuple[tuple[str, int, int], ...]:
@@ -1677,527 +1485,36 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
     support_payload,
     initial_er_root_ad: str = "off",
 ):
-    """Return all objective values, profile gradients, and realtime support cotangents.
+    """Return all objective values, profile gradients, and realtime support cotangents."""
 
-    This is the realtime-geometry extension of the regular multi-RHS reduced
-    profile reverse path: profile cotangents and optional support cotangents are
-    propagated through the same realized-schedule reverse pass.
-    """
-
-    if reverse_setup.reverse_segment_length is None or int(reverse_setup.reverse_segment_length) <= 0:
-        raise ValueError("support payload reverse probe requires --reverse-segment-length.")
-    step_bwd_mode = str(
-        getattr(reverse_setup.execution_context.physics_context, "reverse_step_bwd_mode", "current")
-    ).strip().lower()
-    if step_bwd_mode not in {
-        "reduced_cotangent",
-        "reduced_cotangent_lean_replay",
-        "reduced_cotangent_recompute_replay",
-        "lean_replay",
-        "recompute_replay",
-        "reduced",
-        "state_only",
-        "final_state",
-    }:
-        raise ValueError("support payload reverse probe requires a reduced-cotangent reverse step bwd mode.")
-
-    def _zero_tangent_like(x):
-        arr = jnp.asarray(x)
-        if jnp.issubdtype(arr.dtype, jnp.inexact):
-            return jnp.zeros_like(arr)
-        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
-
-    def _take_tree_axis0(tree, index: int):
-        return jax.tree_util.tree_map(lambda value: value[index], tree)
-
-    def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
-        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
-        return jax.tree_util.tree_map(
-            lambda leaf: jnp.broadcast_to(
-                jnp.asarray(leaf)[None, ...],
-                (batch_size,) + jnp.asarray(leaf).shape,
-            ),
-            zero_tree,
-        )
-
-    initial_er_root_enabled = _initial_er_root_enabled(config, initial_er_root_ad)
-
-    def _state_from_profiles(p):
-        return _initial_state_for_parameter_vector(
-            p,
-            config=config,
-            initial_er_root_ad="off",
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-        )
-
-    phase_start = time.perf_counter()
-    pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
-    initial_state = (
-        _state_with_initial_er_root_ad(
-            pre_root_initial_state,
-            config=config,
-            runtime=runtime,
-            mode=initial_er_root_ad,
-        )
-        if initial_er_root_enabled
-        else pre_root_initial_state
-    )
-    initial_state = jax.block_until_ready(initial_state)
-    print(
-        "[autodiff-gate] progress: support reverse profile-state vjp ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
-        flush=True,
-    )
-
-    def _carry_from_state(state_value):
-        return _reverse_initial_carry_from_state_with_static_setup(
-            solver=reverse_setup.solver,
-            state=state_value,
-            solve_vector_field=reverse_setup.solve_vector_field,
-            species=runtime.species,
-            prepared_rollout_static=reverse_setup.prepared_rollout,
-        )
-
-    phase_start = time.perf_counter()
-    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
-    initial_carry = jax.block_until_ready(initial_carry)
-    print(
-        "[autodiff-gate] progress: support reverse initial carry vjp ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
-        flush=True,
-    )
-
-    phase_start = time.perf_counter()
-    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
-        reverse_setup.execution_context,
-        reverse_setup.max_total_steps,
-        reverse_setup.stop_after_accepted_steps,
-        reverse_setup.reverse_segment_length,
-        initial_carry,
-    )
-    final_y, residuals = jax.block_until_ready((final_y, residuals))
-    print(
-        "[autodiff-gate] progress: support reverse realized-schedule vjp forward ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
-        flush=True,
-    )
-
-    (
-        carry0,
-        active_mask,
-        accepted_mask,
-        attempted_dts,
-        next_dts,
-        next_recent_reject_count,
-        next_regrowth_cooldown,
-        next_easy_growth_streak,
-        next_lagged_response_valid,
-        segment_start_carries,
-        segmented_final_carry,
-        segmented_replay_arrays,
-    ) = residuals
-    del (
-        active_mask,
-        accepted_mask,
-        attempted_dts,
-        next_dts,
-        next_recent_reject_count,
-        next_regrowth_cooldown,
-        next_easy_growth_streak,
-        next_lagged_response_valid,
-    )
-    if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
-        raise ValueError("support payload reverse probe requires segmented reverse residuals.")
-
-    # The support probe's backward pass is the segmented accepted-replay map.
-    # Seed objective cotangents and explicit-geometry objective bars at that
-    # same replay final state. Using the full adaptive final state here makes
-    # the reported reverse derivative inconsistent with accepted-replay FD.
-    final_y_for_objective = segmented_final_carry.y
-
-    objective_count = int(len(OBJECTIVE_LABELS))
-    objective_values_rows = []
-    final_y_bar_rows = []
-    objective_payload_bar_rows = []
-    combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
-    zero_payload_bar = _radau_zero_support_delta_tree_like(support_payload)
-    for objective_i in range(objective_count):
-        def _objective_from_final_y(final_y_value, objective_index=objective_i):
-            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-            return _objective_scalar_by_index(final_state, runtime, objective_index)
-
-        objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y_for_objective)
-        objective_values_rows.append(objective_value)
-        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
-        if combined_geometry_payload:
-            final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(
-                final_y_for_objective
-            )
-            geometry = support_payload["geometry"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _objective_from_geometry_delta(geometry_delta, objective_index=objective_i):
-                runtime_with_geometry = dataclasses.replace(
-                    runtime,
-                    geometry=_add_float_delta_tree(geometry, geometry_delta),
-                )
-                return _objective_scalar_by_index(
-                    final_state_for_geometry,
-                    runtime_with_geometry,
-                    objective_index,
-                )
-
-            _, geometry_objective_pullback = jax.vjp(_objective_from_geometry_delta, geometry_delta0)
-            (geometry_objective_bar,) = geometry_objective_pullback(jnp.ones_like(objective_value))
-            objective_payload_bar_rows.append(
-                {
-                    "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
-                    "ntx_support": zero_payload_bar["ntx_support"],
-                }
-            )
-        else:
-            objective_payload_bar_rows.append(zero_payload_bar)
-    objective_values = jnp.stack(objective_values_rows, axis=0)
-    final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
-
-    cotangent_mode = str(
-        getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
-    ).strip().lower()
-    segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
-
-    reduced_bars = _RadauAcceptedStepReducedCotangent(
-        y=final_y_bars,
-        lagged_response_cache=_batched_zero_tangent_tree_like(
-            segmented_final_carry.lagged_response_cache,
-            objective_count,
+    dependencies = RealtimeGeometrySupportReverseDependencies(
+        initial_er_root_enabled=_initial_er_root_enabled,
+        initial_state_for_parameter_vector=_initial_state_for_parameter_vector,
+        state_with_initial_er_root_ad=_state_with_initial_er_root_ad,
+        reverse_initial_carry_from_state_with_static_setup=(
+            _reverse_initial_carry_from_state_with_static_setup
         ),
-        lagged_reference_y=jnp.zeros(
-            (objective_count,) + jnp.shape(segmented_final_carry.lagged_reference_y),
-            dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
+        objective_scalar_by_index=_objective_scalar_by_index,
+        add_trees=_add_trees,
+        initial_er_selected_root_profile=_initial_er_selected_root_profile,
+        initial_er_charge_flux_residuals=_initial_er_charge_flux_residuals,
+        compact_initial_er_ntx_support_pullback_leaves=(
+            _compact_initial_er_ntx_support_pullback_leaves
         ),
+        runtime_with_geometry_payload=_runtime_with_geometry_payload,
+        runtime_with_ntx_support_payload=_runtime_with_ntx_support_payload,
     )
-    _zero_support_leaves, support_treedef = jax.tree_util.tree_flatten(zero_payload_bar)
-    objective_payload_bar_leaves = tuple(
-        jax.tree_util.tree_leaves(payload_bar)
-        for payload_bar in objective_payload_bar_rows
-    )
-    support_bar_leaves = tuple(
-        jnp.stack(
-            [
-                jnp.asarray(objective_payload_bar_leaves[objective_i][leaf_i])
-                for objective_i in range(objective_count)
-            ],
-            axis=0,
-        )
-        for leaf_i in range(len(_zero_support_leaves))
-    )
-    objective_support_bar_leaves = support_bar_leaves
-    step_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
-    initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
-    support_reuse_count = 0
-    support_rebuild_count = 0
-    phase_start = time.perf_counter()
-    for segment_index in range(segment_count - 1, -1, -1):
-        segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
-        segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
-        reduced_bars, segment_support_bar_leaves = (
-            _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
-                reverse_setup.execution_context,
-                cotangent_mode,
-                reduced_bars,
-                segment_start_carry,
-                segment_arrays,
-                support_payload,
-            )
-        )
-        support_bar_leaves = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(support_bar_leaves, segment_support_bar_leaves)
-        )
-        step_support_bar_leaves_accum = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(step_support_bar_leaves_accum, segment_support_bar_leaves)
-        )
-        segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
-        support_reuse_count += int(np.count_nonzero(segment_lagged_valid))
-        support_rebuild_count += int(segment_lagged_valid.size - np.count_nonzero(segment_lagged_valid))
-    reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
-    print(
-        "[autodiff-gate] progress: support reverse segmented cotangent sweep ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
-        flush=True,
-    )
-
-    initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
-    build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
-    allow_initial_cache_support_pullback = cotangent_mode in {
-        "full",
-        "full_initial_cache_support_pullback",
-        "initial_cache_support_pullback",
-    }
-    initial_cache_pullback_used = False
-    initial_cache_pullback_skipped = False
-    if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
-        initial_cache_support_bars = jax.lax.map(
-            lambda lagged_bar: build_support_pullback(
-                carry0.y,
-                lagged_bar,
-                support_payload,
-            ),
-            reduced_bars.lagged_response_cache,
-        )
-        initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
-        support_bar_leaves = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(support_bar_leaves, initial_cache_support_bar_leaves)
-        )
-        initial_cache_support_bar_leaves_accum = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(
-                initial_cache_support_bar_leaves_accum,
-                initial_cache_support_bar_leaves,
-            )
-        )
-        initial_cache_pullback_used = True
-    elif initial_lagged_response_valid and build_support_pullback is not None:
-        initial_cache_pullback_skipped = True
-
-    def _full_carry_bar_from_reduced(reduced_bar):
-        return dataclasses.replace(
-            jax.tree_util.tree_map(_zero_tangent_like, carry0),
-            y=reduced_bar.y,
-            lagged_response_cache=reduced_bar.lagged_response_cache,
-            lagged_reference_y=reduced_bar.lagged_reference_y,
-        )
-
-    carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
-    initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(carry0_bars)
-    initial_er_root_support_bars = None
-    if initial_er_root_enabled:
-        phase_start = time.perf_counter()
-        er_profile, finite_mask = _initial_er_selected_root_profile(
-            pre_root_initial_state,
-            config=config,
-            runtime=runtime,
-        )
-
-        er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
-        finite_mask = jnp.asarray(finite_mask, dtype=bool)
-
-        def _residual_i_er(i, er_value):
-            er_eval = er_profile.at[i].set(er_value)
-            return _initial_er_charge_flux_residuals(
-                pre_root_initial_state,
-                er_eval,
-                runtime=runtime,
-            )[i]
-
-        radial_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
-        dres_der = jax.lax.map(
-            lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
-            radial_indices,
-        )
-        safe_dres_der = jnp.where(
-            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
-            dres_der,
-            jnp.inf,
-        )
-        residual_bars = jnp.where(
-            finite_mask[None, :],
-            -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
-            0.0,
-        )
-
-        _, state_residual_pullback = jax.vjp(
-            lambda state_value: _initial_er_charge_flux_residuals(
-                state_value,
-                er_profile,
-                runtime=runtime,
-            ),
-            pre_root_initial_state,
-        )
-        state_residual_bars = jax.vmap(lambda residual_bar: state_residual_pullback(residual_bar)[0])(
-            residual_bars
-        )
-        direct_initial_state_bars = dataclasses.replace(
-            initial_state_bars,
-            Er=jnp.zeros_like(initial_state_bars.Er),
-        )
-        pre_root_initial_state_bars = _add_trees(direct_initial_state_bars, state_residual_bars)
-
-        if combined_geometry_payload:
-            geometry = support_payload["geometry"]
-            ntx_support = support_payload["ntx_support"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _residuals_from_geometry_delta(geometry_delta):
-                runtime_with_geometry = _runtime_with_geometry_payload(
-                    runtime,
-                    _add_float_delta_tree(geometry, geometry_delta),
-                )
-                runtime_with_geometry = _runtime_with_ntx_support_payload(
-                    runtime_with_geometry,
-                    ntx_support,
-                )
-                return _initial_er_charge_flux_residuals(
-                    pre_root_initial_state,
-                    er_profile,
-                    runtime=runtime_with_geometry,
-                )
-
-            _, geometry_pullback = jax.vjp(_residuals_from_geometry_delta, geometry_delta0)
-            geometry_bars = jax.vmap(lambda residual_bar: geometry_pullback(residual_bar)[0])(
-                residual_bars
-            )
-            ntx_runtime = _runtime_with_geometry_payload(runtime, geometry)
-            ntx_bar_leaves = _compact_initial_er_ntx_support_pullback_leaves(
-                runtime=ntx_runtime,
-                state=pre_root_initial_state,
-                er_profile=er_profile,
-                residual_bars=residual_bars,
-                support=ntx_support,
-            )
-            initial_er_root_support_bars = (
-                tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
-            )
-        else:
-            initial_er_root_support_bars = _compact_initial_er_ntx_support_pullback_leaves(
-                runtime=runtime,
-                state=pre_root_initial_state,
-                er_profile=er_profile,
-                residual_bars=residual_bars,
-                support=support_payload,
-            )
-        pre_root_initial_state_bars, initial_er_root_support_bars = jax.block_until_ready(
-            (pre_root_initial_state_bars, initial_er_root_support_bars)
-        )
-        print(
-            "[autodiff-gate] progress: initial-Er root boundary compact pullback ready "
-            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
-            flush=True,
-        )
-        initial_state_bars = pre_root_initial_state_bars
-
-    gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
-    if initial_er_root_support_bars is not None:
-        raw_initial_er_root_support_bar_leaves = tuple(initial_er_root_support_bars)
-        if len(raw_initial_er_root_support_bar_leaves) != len(support_bar_leaves):
-            raise ValueError(
-                "Initial-Er root support pullback produced "
-                f"{len(raw_initial_er_root_support_bar_leaves)} leaves, but support payload expects "
-                f"{len(support_bar_leaves)} leaves."
-            )
-        for leaf_i, (accumulated, increment) in enumerate(
-            zip(support_bar_leaves, raw_initial_er_root_support_bar_leaves, strict=True)
-        ):
-            if jnp.asarray(increment).shape != jnp.asarray(accumulated).shape:
-                raise ValueError(
-                    "Initial-Er root support pullback leaf shape mismatch at "
-                    f"leaf {leaf_i}: got {jnp.asarray(increment).shape}, "
-                    f"expected {jnp.asarray(accumulated).shape}."
-                )
-        initial_er_root_support_bar_leaves = tuple(
-            jnp.zeros_like(accumulated)
-            if jnp.asarray(increment).dtype == jax.dtypes.float0
-            else jnp.asarray(increment)
-            for accumulated, increment in zip(
-                support_bar_leaves,
-                raw_initial_er_root_support_bar_leaves,
-            )
-        )
-        support_bar_leaves = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(support_bar_leaves, initial_er_root_support_bar_leaves)
-        )
-    support_bars = tuple(
-        support_treedef.unflatten(
-            [jnp.asarray(leaf)[objective_i] for leaf in support_bar_leaves]
-        )
-        for objective_i in range(objective_count)
-    )
-    component_support_bars_by_name = {
-        "objective_explicit": tuple(
-            support_treedef.unflatten(
-                [jnp.asarray(leaf)[objective_i] for leaf in objective_support_bar_leaves]
-            )
-            for objective_i in range(objective_count)
-        ),
-        "transport_rhs": tuple(
-            support_treedef.unflatten(
-                [jnp.asarray(leaf)[objective_i] for leaf in step_support_bar_leaves_accum]
-            )
-            for objective_i in range(objective_count)
-        ),
-        "initial_cache": tuple(
-            support_treedef.unflatten(
-                [jnp.asarray(leaf)[objective_i] for leaf in initial_cache_support_bar_leaves_accum]
-            )
-            for objective_i in range(objective_count)
-        ),
-    }
-    if initial_er_root_support_bars is not None:
-        component_support_bars_by_name["initial_er_root"] = tuple(
-            support_treedef.unflatten(
-                [jnp.asarray(leaf)[objective_i] for leaf in initial_er_root_support_bar_leaves]
-            )
-            for objective_i in range(objective_count)
-        )
-    if combined_geometry_payload:
-        geometry = support_payload["geometry"]
-        geometry_delta0 = _float_delta_tree_like(geometry)
-
-        def _initial_state_from_geometry_delta(geometry_delta):
-            runtime_with_geometry = dataclasses.replace(
-                runtime,
-                geometry=_add_float_delta_tree(geometry, geometry_delta),
-            )
-            return _initial_state_for_parameter_vector(
-                parameter_values,
-                config=config,
-                initial_er_root_ad="off",
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                runtime=runtime_with_geometry,
-            )
-
-        _, initial_geometry_pullback = jax.vjp(_initial_state_from_geometry_delta, geometry_delta0)
-        initial_geometry_bars = jax.vmap(
-            lambda state_bar: initial_geometry_pullback(state_bar)[0]
-        )(initial_state_bars)
-        component_support_bars_by_name["initial_profile"] = tuple(
-            {
-                "geometry": _sanitize_float_delta_bar_tree(
-                    support_payload["geometry"],
-                    jax.tree_util.tree_map(lambda value: value[objective_i], initial_geometry_bars),
-                ),
-                "ntx_support": zero_payload_bar["ntx_support"],
-            }
-            for objective_i in range(objective_count)
-        )
-        support_bars = tuple(
-            {
-                "geometry": _sanitize_float_delta_bar_tree(
-                    support_payload["geometry"],
-                    _add_trees(
-                        support_bar["geometry"],
-                        jax.tree_util.tree_map(lambda value: value[objective_i], initial_geometry_bars),
-                    ),
-                ),
-                "ntx_support": support_bar["ntx_support"],
-            }
-            for objective_i, support_bar in enumerate(support_bars)
-        )
-    return (
-        objective_values,
-        gradient_matrix,
-        support_bars,
-        component_support_bars_by_name,
-        support_reuse_count,
-        support_rebuild_count,
-        initial_cache_pullback_used,
-        initial_cache_pullback_skipped,
+    return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
+        parameter_values,
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        reverse_setup=reverse_setup,
+        support_payload=support_payload,
+        initial_er_root_ad=initial_er_root_ad,
+        objective_labels=OBJECTIVE_LABELS,
+        dependencies=dependencies,
     )
 
 
@@ -3323,37 +2640,33 @@ def _run_realtime_geometry_support_segment_probe(
     baseline_state,
     profile_cfg: dict,
     neoclassical_cfg: dict[str, Any],
+    return_report: bool = False,
 ):
-    combined_geometry_payload = str(args.realtime_geometry_gradient_path) == "reverse_payload"
-    ntx_surface_backend = str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz"))
-    ntx_support_payload = _find_ntx_support_payload(baseline_runtime)
-    support_payload = (
-        {"geometry": baseline_runtime.geometry, "ntx_support": ntx_support_payload}
-        if combined_geometry_payload
-        else ntx_support_payload
-    )
-    profile_values = baseline_values[: len(PARAMETER_ORDER)]
-    support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
-    reverse_setup = _prepare_reverse_static_setup(
-        profile_values,
+    if return_report and str(args.objective) != "all":
+        raise ValueError("return_report=True is only supported for the grouped objective='all' path.")
+    core_setup = prepare_realtime_geometry_support_segment_core_setup(
+        args=args,
         config=config,
-        runtime=baseline_runtime,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
-        initial_er_root_ad=args.initial_er_root_ad,
-        accepted_step_limit_override=args.accepted_step_limit,
-        reverse_segment_length=args.reverse_segment_length,
-        reverse_direct_stage_adjoint=True,
-        reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
-        reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
-        reverse_stage_cotangent_mode=support_probe_cotangent_mode,
-        reverse_step_bwd_mode=args.reverse_step_bwd_mode,
-        reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
-        reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
-        reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
+        neoclassical_cfg=neoclassical_cfg,
+        parameter_order=PARAMETER_ORDER,
+        find_ntx_support_payload=_find_ntx_support_payload,
+        prepare_reverse_static_setup=_prepare_reverse_static_setup,
+        geometry_volume_diagnostics=_geometry_volume_diagnostics,
     )
+    combined_geometry_payload = core_setup.combined_geometry_payload
+    ntx_surface_backend = core_setup.ntx_surface_backend
+    support_payload = core_setup.support_payload
+    profile_values = core_setup.profile_values
+    support_probe_cotangent_mode = core_setup.support_probe_cotangent_mode
+    reverse_setup = core_setup.reverse_setup
     if args.objective == "all":
-        early_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
+        early_geometry_diagnostics = core_setup.early_geometry_diagnostics
+        if early_geometry_diagnostics is None:
+            early_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         print("[autodiff-gate] realtime geometry pre-reverse diagnostics:")
         print(
             "[autodiff-gate] realtime geometry NTX surface backend: "
@@ -3383,28 +2696,27 @@ def _run_realtime_geometry_support_segment_probe(
         )
         t_start = time.perf_counter()
         t_phase = time.perf_counter()
-        (
-            objective_values,
-            profile_gradient_matrix,
-            support_bars,
-            support_component_bars_by_name,
-            support_reuse_count,
-            support_rebuild_count,
-            initial_cache_pullback_used,
-            initial_cache_pullback_skipped,
-        ) = _reverse_all_objectives_support_payload_bar_for_parameter_vector(
-            profile_values,
+        support_cotangent_result = realtime_geometry_support_cotangents_from_parameter_vector(
+            reverse_all_objectives_support_payload_bar=(
+                _reverse_all_objectives_support_payload_bar_for_parameter_vector
+            ),
+            profile_values=profile_values,
             config=config,
-            runtime=baseline_runtime,
+            baseline_runtime=baseline_runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
             reverse_setup=reverse_setup,
             support_payload=support_payload,
             initial_er_root_ad=args.initial_er_root_ad,
         )
-        objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name = jax.block_until_ready(
-            (objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name)
-        )
+        objective_values = support_cotangent_result.objective_values
+        profile_gradient_matrix = support_cotangent_result.profile_gradient_matrix
+        support_bars = support_cotangent_result.support_bars
+        support_component_bars_by_name = support_cotangent_result.support_component_bars_by_name
+        support_reuse_count = support_cotangent_result.support_reuse_count
+        support_rebuild_count = support_cotangent_result.support_rebuild_count
+        initial_cache_pullback_used = support_cotangent_result.initial_cache_pullback_used
+        initial_cache_pullback_skipped = support_cotangent_result.initial_cache_pullback_skipped
         print(
             "[autodiff-gate] progress: transport reverse profile/support cotangents complete "
             f"elapsed_s={time.perf_counter() - t_phase:.3f}",
@@ -3464,37 +2776,6 @@ def _run_realtime_geometry_support_segment_probe(
             geometry_param_specs,
         )
 
-        def _support_from_geometry_deltas(geometry_deltas):
-            if combined_geometry_payload:
-                return build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector(
-                    geometry_context,
-                    geometry_deltas,
-                    geometry_param_specs,
-                    lane="ad",
-                    n_r=int(geom_cfg.get("n_radial", 51)),
-                    n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-                    n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-                    n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                    surface_backend=ntx_surface_backend,
-                    max_iter=geom_cfg.get("vmec_max_iter"),
-                    step_size=geom_cfg.get("vmec_step_size"),
-                    jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-                )
-            return build_ntx_exact_lij_support_from_param_vector(
-                geometry_context,
-                geometry_deltas,
-                geometry_param_specs,
-                lane="ad",
-                n_r=int(geom_cfg.get("n_radial", 51)),
-                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                surface_backend=ntx_surface_backend,
-                max_iter=geom_cfg.get("vmec_max_iter"),
-                step_size=geom_cfg.get("vmec_step_size"),
-                jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-            )
-
         t_phase = time.perf_counter()
         print(
             "[autodiff-gate] progress: building geometry support pullback "
@@ -3503,22 +2784,18 @@ def _run_realtime_geometry_support_segment_probe(
             flush=True,
         )
         include_component_pullbacks = bool(args.realtime_geometry_component_pullbacks)
-        support_component_names = (
-            tuple(support_component_bars_by_name)
-            if include_component_pullbacks
-            else tuple()
-        )
-        geometry_pullback_payload_bars = tuple(support_bars)
-        for component_name in support_component_names:
-            geometry_pullback_payload_bars = (
-                *geometry_pullback_payload_bars,
-                *tuple(support_component_bars_by_name[component_name]),
-            )
-        geometry_gradient_result = geometry_payload_pullback_from_param_vector_raw_block_transpose(
-            geometry_context,
-            baseline_geometry_deltas,
-            geometry_param_specs,
-            geometry_pullback_payload_bars,
+        assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+            objective_labels=OBJECTIVE_LABELS,
+            profile_parameter_labels=PARAMETER_ORDER,
+            geometry_parameter_labels=geometry_param_labels,
+            objective_values=objective_values,
+            profile_gradient_matrix=profile_gradient_matrix,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=baseline_geometry_deltas,
+            geometry_param_specs=geometry_param_specs,
+            support_bars=tuple(support_bars),
+            support_component_bars_by_name=support_component_bars_by_name,
+            include_component_pullbacks=include_component_pullbacks,
             combined_payload=combined_geometry_payload,
             n_r=int(geom_cfg.get("n_radial", 51)),
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
@@ -3528,43 +2805,16 @@ def _run_realtime_geometry_support_segment_probe(
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] realtime geometry payload pullback:",
-            return_branch_gradients=True,
         )
-        geometry_pullback_mode = "payload_state_raw_block_transpose"
-        geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
-        objective_count = int(len(OBJECTIVE_LABELS))
-        component_gradient_matrices = {}
-        component_geometry_branch_matrices = {}
-        component_ntx_support_branch_matrices = {}
-
-        def _split_component_rows(matrix):
-            if matrix is None:
-                return None, {}
-            total_matrix = matrix[:objective_count]
-            component_matrices = {}
-            row0 = objective_count
-            for component_name in support_component_names:
-                row1 = row0 + objective_count
-                component_matrices[component_name] = matrix[row0:row1]
-                row0 = row1
-            return total_matrix, component_matrices
-
-        if isinstance(geometry_gradient_result, dict):
-            geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
-                geometry_gradient_result["combined"]
-            )
-            geometry_branch_gradient_matrix, component_geometry_branch_matrices = _split_component_rows(
-                geometry_gradient_result.get("geometry")
-            )
-            ntx_support_branch_gradient_matrix, component_ntx_support_branch_matrices = _split_component_rows(
-                geometry_gradient_result.get("ntx_support")
-            )
-        else:
-            geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
-                geometry_gradient_result
-            )
-            geometry_branch_gradient_matrix = None
-            ntx_support_branch_gradient_matrix = None
+        table_result = assembly_result.table_result
+        geometry_pullback_result = assembly_result.payload_pullback_result
+        geometry_pullback_mode = geometry_pullback_result.pullback_mode
+        geometry_gradient_matrix = geometry_pullback_result.geometry_gradient_matrix
+        geometry_branch_gradient_matrix = geometry_pullback_result.geometry_branch_gradient_matrix
+        ntx_support_branch_gradient_matrix = geometry_pullback_result.ntx_support_branch_gradient_matrix
+        component_gradient_matrices = geometry_pullback_result.component_gradient_matrices
+        component_geometry_branch_matrices = geometry_pullback_result.component_geometry_branch_matrices
+        component_ntx_support_branch_matrices = geometry_pullback_result.component_ntx_support_branch_matrices
         print(
             "[autodiff-gate] progress: geometry support pullback complete "
             f"mode={geometry_pullback_mode} elapsed_s={time.perf_counter() - t_phase:.3f}",
@@ -3572,9 +2822,6 @@ def _run_realtime_geometry_support_segment_probe(
         )
         elapsed_s = time.perf_counter() - t_start
 
-        objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
-        profile_gradient_np = np.asarray(jax.device_get(profile_gradient_matrix), dtype=float)
-        geometry_gradient_np = np.asarray(jax.device_get(geometry_gradient_matrix), dtype=float)
         geometry_branch_gradient_np = (
             None
             if geometry_branch_gradient_matrix is None
@@ -3597,15 +2844,10 @@ def _run_realtime_geometry_support_segment_probe(
             component_name: np.asarray(jax.device_get(component_matrix), dtype=float)
             for component_name, component_matrix in component_ntx_support_branch_matrices.items()
         }
-        objective_finite_np = np.isfinite(objective_values_np)
-        profile_gradient_finite_by_objective = {
-            objective_name: bool(np.all(np.isfinite(profile_gradient_np[objective_i])))
-            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-        }
-        geometry_gradient_finite_by_objective = {
-            objective_name: bool(np.all(np.isfinite(geometry_gradient_np[objective_i])))
-            for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-        }
+        table_report_entries = transport_reverse_table_report_entries(
+            table_result=table_result,
+        )
+        geometry_gradient_np = np.asarray(jax.device_get(geometry_gradient_matrix), dtype=float)
         realtime_geometry_diagnostics = _geometry_volume_diagnostics(baseline_runtime.geometry)
         support_bar_summary_by_objective = {}
         support_bar_l2_by_objective = {}
@@ -3624,182 +2866,67 @@ def _run_realtime_geometry_support_segment_probe(
             if skip_support_bar_diagnostics
             else _payload_leaf_summary(support_payload)
         )
-        report = {
-            "mode": "transport_reverse_ad_only",
-            "parameter_mode": str(args.reverse_parameter_mode),
-            "config_path": str(Path(args.config)),
-            "objective_name": "all",
-            "objective_order": list(OBJECTIVE_LABELS),
-            "parameter_order": list(PARAMETER_ORDER),
-            "profile_baseline_values": np.asarray(jax.device_get(profile_values), dtype=float).tolist(),
-            "objective_values": {
-                name: float(value) for name, value in zip(OBJECTIVE_LABELS, objective_values_np.tolist())
-            },
-            "objective_finite": {
-                name: bool(value) for name, value in zip(OBJECTIVE_LABELS, objective_finite_np.tolist())
-            },
-            "profile_gradient_all_finite_by_objective": profile_gradient_finite_by_objective,
-            "geometry_gradient_all_finite_by_objective": geometry_gradient_finite_by_objective,
-            "profile_gradient_reverse_ad": {
-                objective_name: {
-                    parameter_name: float(value)
-                    for parameter_name, value in zip(
-                        PARAMETER_ORDER,
-                        profile_gradient_np[objective_i].tolist(),
-                    )
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_gradient_reverse_ad": {
-                objective_name: {
-                    geometry_label: float(value)
-                    for geometry_label, value in zip(
-                        geometry_param_labels,
-                        geometry_gradient_np[objective_i].tolist(),
-                    )
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_gradient_reverse_ad_by_branch": None
-            if geometry_branch_gradient_np is None or ntx_support_branch_gradient_np is None
-            else {
-                objective_name: {
-                    "geometry": {
-                        geometry_label: float(value)
-                        for geometry_label, value in zip(
-                            geometry_param_labels,
-                            geometry_branch_gradient_np[objective_i].tolist(),
-                        )
-                    },
-                    "ntx_support": {
-                        geometry_label: float(value)
-                        for geometry_label, value in zip(
-                            geometry_param_labels,
-                            ntx_support_branch_gradient_np[objective_i].tolist(),
-                        )
-                    },
-                    "combined": {
-                        geometry_label: float(value)
-                        for geometry_label, value in zip(
-                            geometry_param_labels,
-                            geometry_gradient_np[objective_i].tolist(),
-                        )
-                    },
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_gradient_reverse_ad_by_component": {} if not include_component_pullbacks else {
-                objective_name: {
-                    component_name: {
-                        geometry_label: float(value)
-                        for geometry_label, value in zip(
-                            geometry_param_labels,
-                            component_matrix[objective_i].tolist(),
-                        )
-                    }
-                    for component_name, component_matrix in component_gradient_np_by_name.items()
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_gradient_reverse_ad_final_state_components": {} if not include_component_pullbacks else {
-                objective_name: {
-                    geometry_label: float(
-                        sum(
-                            component_matrix[objective_i, geometry_i]
-                            for component_name, component_matrix in component_gradient_np_by_name.items()
-                            if component_name != "objective_explicit"
-                        )
-                    )
-                    for geometry_i, geometry_label in enumerate(geometry_param_labels)
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_gradient_reverse_ad_by_component_and_branch": {} if not include_component_pullbacks else {
-                objective_name: {
-                    component_name: {
-                        "geometry": {
-                            geometry_label: float(value)
-                            for geometry_label, value in zip(
-                                geometry_param_labels,
-                                component_geometry_branch_np_by_name.get(component_name, component_matrix)[
-                                    objective_i
-                                ].tolist(),
-                            )
-                        },
-                        "ntx_support": {
-                            geometry_label: float(value)
-                            for geometry_label, value in zip(
-                                geometry_param_labels,
-                                component_ntx_support_branch_np_by_name.get(component_name, component_matrix)[
-                                    objective_i
-                                ].tolist(),
-                            )
-                        },
-                        "combined": {
-                            geometry_label: float(value)
-                            for geometry_label, value in zip(
-                                geometry_param_labels,
-                                component_matrix[objective_i].tolist(),
-                            )
-                        },
-                    }
-                    for component_name, component_matrix in component_gradient_np_by_name.items()
-                }
-                for objective_i, objective_name in enumerate(OBJECTIVE_LABELS)
-            },
-            "geometry_baseline_values": {
-                geometry_label: float(entry["baseline_coefficient"]) + float(delta)
-                for geometry_label, entry, delta in zip(
-                    geometry_param_labels,
-                    geometry_param_entries,
-                    np.asarray(jax.device_get(baseline_geometry_deltas), dtype=float).tolist(),
-                )
-            },
-            "geometry_parameter_order": list(geometry_param_labels),
-            "geometry_parameter_specs": [
-                {"family": family, "m": int(m), "n": int(n)}
-                for family, m, n in geometry_param_specs
-            ],
-            "geometry_parameter_selector": str(geometry_parameter_name),
-            "geometry_parameter_count": int(len(geometry_param_specs)),
-            "accepted_step_limit": None
+        metadata_entries = realtime_geometry_transport_reverse_metadata_entries(
+            parameter_mode=str(args.reverse_parameter_mode),
+            config_path=str(Path(args.config)),
+            objective_labels=OBJECTIVE_LABELS,
+            profile_parameter_labels=PARAMETER_ORDER,
+            profile_values=profile_values,
+            geometry_parameter_labels=geometry_param_labels,
+            geometry_parameter_entries=geometry_param_entries,
+            baseline_geometry_deltas=baseline_geometry_deltas,
+            geometry_parameter_specs=geometry_param_specs,
+            geometry_parameter_selector=str(geometry_parameter_name),
+            accepted_step_limit=None
             if args.accepted_step_limit is None
             else int(args.accepted_step_limit),
-            "reverse_segment_length": None
+            reverse_segment_length=None
             if args.reverse_segment_length is None
             else int(args.reverse_segment_length),
-            "reverse_stage_cotangent_mode_requested": str(args.reverse_stage_cotangent_mode),
-            "reverse_stage_cotangent_mode_effective": support_probe_cotangent_mode,
-            "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
-            "ntx_exact_derivative_field_pullback_mode": str(
+            reverse_stage_cotangent_mode_requested=str(args.reverse_stage_cotangent_mode),
+            reverse_stage_cotangent_mode_effective=support_probe_cotangent_mode,
+            ntx_exact_derivative_mode=str(args.ntx_exact_derivative_mode),
+            ntx_exact_derivative_field_pullback_mode=str(
                 args.ntx_exact_derivative_field_pullback_mode
             ),
-            "ntx_exact_surface_backend": str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
-            "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
-            "realtime_geometry_component_pullbacks": bool(include_component_pullbacks),
-            "realtime_geometry_support_bar_diagnostics_skipped": bool(skip_support_bar_diagnostics),
-            "realtime_primal_runtime_builder": "build_runtime_context",
-            "realtime_geometry_derivative_boundary": (
-                "runtime_geometry_and_ntx_exact_lij_support_payload"
-                if combined_geometry_payload
-                else "ntx_exact_lij_support_payload_only_diagnostic"
-            ),
-            "realtime_geometry_derivative_complete": bool(combined_geometry_payload),
-            "geometry_support_pullback_mode": geometry_pullback_mode,
-            "realtime_geometry_support_bwd_mode": "grouped_batched_fused_support",
-            "realtime_geometry_diagnostics": realtime_geometry_diagnostics,
-            "support_payload_summary": support_summary,
-            "support_bar_summary_by_objective": support_bar_summary_by_objective,
-            "support_bar_l2_by_objective": support_bar_l2_by_objective,
-            "support_bar_branch_diagnostics_by_objective": (
-                support_bar_branch_diagnostics_by_objective
-            ),
-            "support_reuse_count": int(support_reuse_count),
-            "support_rebuild_count": int(support_rebuild_count),
-            "support_initial_cache_pullback_used": bool(initial_cache_pullback_used),
-            "support_initial_cache_pullback_skipped": bool(initial_cache_pullback_skipped),
-            "elapsed_s": float(elapsed_s),
+            ntx_exact_surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+            realtime_geometry_gradient_path=str(args.realtime_geometry_gradient_path),
+            realtime_geometry_component_pullbacks=bool(include_component_pullbacks),
+            realtime_geometry_support_bar_diagnostics_skipped=bool(skip_support_bar_diagnostics),
+            realtime_geometry_derivative_complete=bool(combined_geometry_payload),
+            geometry_support_pullback_mode=geometry_pullback_mode,
+            realtime_geometry_diagnostics=realtime_geometry_diagnostics,
+            support_payload_summary=support_summary,
+            support_bar_summary_by_objective=support_bar_summary_by_objective,
+            support_bar_l2_by_objective=support_bar_l2_by_objective,
+            support_bar_branch_diagnostics_by_objective=support_bar_branch_diagnostics_by_objective,
+            support_reuse_count=support_reuse_count,
+            support_rebuild_count=support_rebuild_count,
+            support_initial_cache_pullback_used=initial_cache_pullback_used,
+            support_initial_cache_pullback_skipped=initial_cache_pullback_skipped,
+            elapsed_s=elapsed_s,
+        )
+        diagnostic_gradient_entries = realtime_geometry_transport_reverse_diagnostic_gradient_entries(
+            objective_labels=OBJECTIVE_LABELS,
+            geometry_parameter_labels=geometry_param_labels,
+            geometry_gradient_matrix_np=geometry_gradient_np,
+            geometry_branch_gradient_matrix_np=geometry_branch_gradient_np,
+            ntx_support_branch_gradient_matrix_np=ntx_support_branch_gradient_np,
+            component_gradient_np_by_name=component_gradient_np_by_name,
+            component_geometry_branch_np_by_name=component_geometry_branch_np_by_name,
+            component_ntx_support_branch_np_by_name=component_ntx_support_branch_np_by_name,
+            include_component_pullbacks=include_component_pullbacks,
+        )
+        report = {
+            **metadata_entries,
+            **table_report_entries,
+            **diagnostic_gradient_entries,
         }
+        if return_report:
+            return {
+                **report,
+                "transport_reverse_table_result": table_result,
+            }
         print(
             "[autodiff-gate] mode=transport_reverse_ad_only "
             "parameter_mode=profiles_plus_realtime_geometry "
@@ -4077,6 +3204,193 @@ def _run_realtime_geometry_support_segment_probe(
             f"  - {parameter_name}: ad={report['profile_gradient_reverse_ad'][parameter_name]:.6e}"
         )
     outpath = _report_path("realtime_geometry_support_segment")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
+def _make_realtime_geometry_support_segment_builder_inputs(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    """Return the shared grouped-runner inputs for transport optimization builders."""
+
+    support_segment_executor = realtime_geometry_transport_reverse_support_segment_executor(
+        support_segment_probe=_run_realtime_geometry_support_segment_probe,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+    )
+
+    grouped_inputs = realtime_geometry_transport_reverse_grouped_inputs(
+        args=args,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+        support_segment_executor=support_segment_executor,
+    )
+    return grouped_inputs.table_context, grouped_inputs.run_grouped_report
+
+
+def _make_realtime_geometry_support_segment_report_builder(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    """Return a grouped transport reverse report builder for optimization adapters."""
+
+    table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
+        args=args,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+    )
+
+    return grouped_transport_reverse_report_builder(
+        objective_labels=OBJECTIVE_LABELS,
+        run_grouped_report=run_grouped_report,
+        table_context=table_context,
+    )
+
+
+def _make_realtime_geometry_support_segment_table_result_builder(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    """Return a grouped transport reverse table-result builder for optimization adapters."""
+
+    table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
+        args=args,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+    )
+
+    return grouped_transport_reverse_table_result_builder(
+        objective_labels=OBJECTIVE_LABELS,
+        run_grouped_report=run_grouped_report,
+        table_context=table_context,
+    )
+
+
+def _run_realtime_geometry_optimization_api_smoke(
+    *,
+    args,
+    config: dict[str, Any],
+    geometry_context,
+    baseline_values,
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+    neoclassical_cfg: dict[str, Any],
+):
+    """Exercise the production-style transport least-squares API on the benchmark path."""
+
+    geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
+    parameter_set = reverse_ad_parameter_set(
+        vmec_boundary=tuple(
+            VmecBoundaryParameterSpec(family, m, n)
+            for family, m, n in geometry_param_specs
+        ),
+    )
+    objective_names = (
+        OBJECTIVE_LABELS
+        if str(args.objective) == "all"
+        else (str(args.objective),)
+    )
+    terms = transport_least_squares_terms(objective_names)
+    table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
+        args=args,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+    )
+    runner = build_transport_realtime_geometry_least_squares_runner(
+        config,
+        objective_names=objective_names,
+        parameter_set=parameter_set,
+        table_context=table_context,
+        run_grouped_report=run_grouped_report,
+        objective_labels=OBJECTIVE_LABELS,
+        options={"quiet": True},
+    )
+    print(
+        "[autodiff-gate] progress: running realtime geometry optimization API smoke",
+        flush=True,
+    )
+    evaluation = runner(terms)
+    result = evaluation.result
+    residuals = evaluation.residuals
+    jacobian = evaluation.jacobian
+    elapsed_s = evaluation.elapsed_s
+    residuals_np = np.asarray(jax.device_get(residuals), dtype=float)
+    jacobian_np = np.asarray(jax.device_get(jacobian), dtype=float)
+    objective_values_np = {
+        label: float(np.asarray(jax.device_get(value), dtype=float))
+        for label, value in result.objective_values.items()
+    }
+    report = {
+        "mode": "transport_reverse_ad_only_optimization_api_smoke",
+        "parameter_mode": str(args.reverse_parameter_mode),
+        "config_path": str(Path(args.config)),
+        "objective_name": str(args.objective),
+        "objective_order": list(objective_names),
+        "residual_labels": list(result.residual_labels),
+        "parameter_order": list(result.parameter_labels),
+        "objective_values": objective_values_np,
+        "residuals": residuals_np.tolist(),
+        "jacobian": jacobian_np.tolist(),
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
+        "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
+        "initial_er_root_ad": str(args.initial_er_root_ad),
+        "elapsed_s": float(elapsed_s),
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only_optimization_api_smoke "
+        f"objective={args.objective} "
+        f"residual_count={len(result.residual_labels)} "
+        f"parameter_count={len(result.parameter_labels)} "
+        f"elapsed_s={elapsed_s:.3f}",
+        flush=True,
+    )
+    print("[autodiff-gate] optimization API residuals/Jacobian rows:")
+    for row_i, label in enumerate(result.residual_labels):
+        print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
+        for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
+            print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
+    outpath = _report_path("optimization_api_smoke")
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
@@ -4406,6 +3720,24 @@ def _run_realtime_geometry_reverse_mode(
         f"local_devices={[str(device) for device in jax.local_devices()]}",
         flush=True,
     )
+    if bool(args.optimization_api_smoke):
+        if str(args.realtime_geometry_gradient_path) != "reverse_payload":
+            raise SystemExit(
+                "[autodiff-gate] --optimization-api-smoke currently requires "
+                "--realtime-geometry-gradient-path reverse_payload so it exercises "
+                "the validated full realtime geometry table."
+            )
+        _run_realtime_geometry_optimization_api_smoke(
+            args=args,
+            config=config,
+            geometry_context=geometry_context,
+            baseline_values=baseline_values,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+        )
+        return
     if str(args.realtime_geometry_gradient_path) == "payload_boundary_probe":
         _run_realtime_geometry_payload_boundary_probe(
             args=args,
@@ -4785,6 +4117,16 @@ def main() -> None:
             "skip support/geometry payload cotangent l2/finiteness tree diagnostics "
             "and JSON summaries. This does not skip the support cotangents used for "
             "the derivative; it only avoids extra host-side diagnostic scans."
+        ),
+    )
+    parser.add_argument(
+        "--optimization-api-smoke",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry runs, exercise the production-style "
+            "least-squares API through the direct JAX table-result builder and then "
+            "exit. This uses the same validated grouped reverse runner but does not "
+            "write the normal benchmark report."
         ),
     )
     parser.add_argument(
