@@ -156,11 +156,16 @@ class BoundaryConditionModel:
             lg = inferred_left_grad if left_grad is None else left_grad
             arr_ext = arr_ext.at[0].set(arr_ext[1] - lg * self.dr)
         elif left_type == "robin":
-            lv = ref[0]
             lg = inferred_left_grad if left_grad is None else left_grad
-            ll = self._infer_decay_length(lv, lg) if left_decay is None else left_decay
-            robin_left_grad = lv / (ll + 1e-12)
-            arr_ext = arr_ext.at[0].set(arr_ext[1] - robin_left_grad * self.dr)
+            ll = (self._infer_decay_length(ref[0], lg)
+                  if left_decay is None else left_decay)
+            if left_value is None:
+                robin_left_grad = ref[0] / (ll + 1e-12)
+                arr_ext = arr_ext.at[0].set(arr_ext[1] - robin_left_grad * self.dr)
+            else:
+                w = ll / (self.dr + 1e-12)
+                arr_ext = arr_ext.at[0].set(
+                    (left_value + w * arr_ext[1]) / (1.0 + w))
         else:
             raise ValueError(f"Unsupported left BC type: {self.left_type}")
 
@@ -171,11 +176,19 @@ class BoundaryConditionModel:
             rg = inferred_right_grad if right_grad is None else right_grad
             arr_ext = arr_ext.at[-1].set(arr_ext[-2] + rg * self.dr)
         elif right_type == "robin":
-            rv = ref[-1]
             rg = inferred_right_grad if right_grad is None else right_grad
-            rl = self._infer_decay_length(rv, rg) if right_decay is None else right_decay
-            robin_right_grad = -rv / (rl + 1e-12)
-            arr_ext = arr_ext.at[-1].set(arr_ext[-2] + robin_right_grad * self.dr)
+            rl = (self._infer_decay_length(ref[-1], rg)
+                  if right_decay is None else right_decay)
+            if right_value is None:
+                # homogeneous: decay with length rl, anchored on the reference edge
+                robin_right_grad = -ref[-1] / (rl + 1e-12)
+                arr_ext = arr_ext.at[-1].set(arr_ext[-2] + robin_right_grad * self.dr)
+            else:
+                # inhomogeneous: u + rl * du/dn = right_value at the boundary.
+                # rl -> 0 recovers Dirichlet(right_value); rl -> inf recovers Neumann.
+                w = rl / (self.dr + 1e-12)
+                arr_ext = arr_ext.at[-1].set(
+                    (right_value + w * arr_ext[-2]) / (1.0 + w))
         else:
             raise ValueError(f"Unsupported right BC type: {self.right_type}")
 
@@ -300,8 +313,17 @@ def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_
                 if right_decay is None
                 else _as_like_template(right_decay, default_arr)
             )
-            rv = (4.0 * u_im1 - u_im2) / (3.0 + 2.0 * dx / (decay + 1e-12))
-            rg = -rv / (decay + 1e-12)
+            if right_value is None:
+                rv = (4.0 * u_im1 - u_im2) / (3.0 + 2.0 * dx / (decay + 1e-12))
+                rg = -rv / (decay + 1e-12)
+            else:
+                # inhomogeneous Robin u + decay * du/dx = right_value, closed with
+                # the same second-order one-sided face stencil as the homogeneous
+                # branch (which it reproduces exactly for right_value = 0).
+                val = _as_like_template(right_value, default_arr)
+                ratio = 2.0 * dx / (decay + 1e-12)
+                rv = ((4.0 * u_im1 - u_im2) + ratio * val) / (3.0 + ratio)
+                rg = (val - rv) / (decay + 1e-12)
             return rv, rg
 
     if right_type == "dirichlet":
