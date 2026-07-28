@@ -511,6 +511,26 @@ Do not introduce Python loops over objectives as the production strategy.
 11. Add combined residual/Jacobian assembly for transport + geometry + regularization terms.
 12. Add scalar weighted-loss convenience wrapper as `0.5 * r @ r`.
 13. Only after validation, expose TOML-driven optimization mode.
+14. Add VMEX-style packed/scaled VMEC boundary parameterization for optimization scripts.
+   Update: `_reverse_ad_parameters.py` now exposes `vmex_boundary_parameterization(...)`,
+   `vmex_packed_boundary_parameter_specs(...)`, VMEX independent-mode validation, and ESS-style
+   boundary scales. This is parameter-layer only: explicit benchmark specs such as `RBC:1:0` remain
+   unchanged, while optimization callers can opt into VMEX-like packed DOFs that exclude
+   `m=0,n<=0` and include initially-zero harmonics up to `max_mode`.
+15. Add an ambipolar-root-only optimization lane for Er-related objectives without transport time
+    evolution.
+   Update: `_reverse_ad_optimization.py` now exposes
+   `build_initial_er_root_only_least_squares_runner(...)`,
+   `evaluate_initial_er_root_only_least_squares(...)`, and
+   `initial_er_root_only_reverse_table(...)`. This path evaluates only
+   `softmax_Er`, `smooth_root_proxy`, `Er2_volume_average`, and `Er_volume_average` from a
+   caller-supplied TOML/runtime-backed selected-root state builder. It does not run the Radau
+   transport time map.
+16. Add explicit profile-DOF selection for optimization parameter sets.
+   Update: `_reverse_ad_parameters.py` now exposes `reverse_ad_optimization_parameter_set(...)`
+   with `include_profiles=True/False`. The realtime-geometry optimization smoke also accepts
+   `--optimization-api-profile-dofs include|exclude`; `exclude` gives geometry-only optimization
+   while still evaluating transport objectives.
 
 ## Key Invariants
 
@@ -521,3 +541,11 @@ Do not introduce Python loops over objectives as the production strategy.
 - Benchmarks remain validation clients, not production math owners.
 - Forward solver behavior is unchanged unless an explicit reverse-AD/optimization path is selected.
 - Root branch selection is not differentiated; only the selected-root residual path is differentiated.
+- VMEX-packed optimization excludes fixed/non-independent boundary modes (`m=0,n<=0`) by
+  construction; explicit diagnostic/benchmark parameter specs remain permissive.
+- The initial-Er root-only optimization lane is not a zero-step transport solve. It is a separate
+  Er-objective table over the selected initial ambipolar root, with TOML-derived runtime/state
+  supplied by the caller.
+- Excluding profile DOFs changes only the optimization parameter vector columns. It does not freeze
+  profiles inside the physics evaluation; profiles still come from the TOML/baseline state unless
+  another selected parameter changes them.

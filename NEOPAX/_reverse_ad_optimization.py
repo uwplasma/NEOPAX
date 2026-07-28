@@ -134,6 +134,55 @@ TransportRealtimeGeometryLeastSquaresRunner = Callable[
     [Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
     LeastSquaresEvaluation,
 ]
+InitialErRootOnlyStateBuilder = Callable[[object], object]
+InitialErRootOnlyLeastSquaresRunner = Callable[
+    [object, Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
+    LeastSquaresEvaluation,
+]
+INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
+    "softmax_Er",
+    "smooth_root_proxy",
+    "Er2_volume_average",
+    "Er_volume_average",
+)
+
+
+def normalize_initial_er_root_only_objective_names(objective_names: Sequence[str] | str) -> tuple[str, ...]:
+    """Return validated Er-only objective names for the initial-root optimization lane."""
+
+    if isinstance(objective_names, str):
+        raw_names = tuple(part.strip() for part in objective_names.split(",") if part.strip())
+    else:
+        raw_names = tuple(str(name).strip() for name in objective_names if str(name).strip())
+    if not raw_names:
+        raise ValueError("At least one initial-Er root-only objective is required.")
+    unknown = tuple(name for name in raw_names if name not in INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+    if unknown:
+        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+        raise ValueError(
+            "Initial-Er root-only optimization supports only Er-related objectives; "
+            f"unsupported={unknown!r}, choices are: {allowed}."
+        )
+    return raw_names
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialErRootOnlyReverseTableRequest:
+    """Request for Er-root-only objectives without transport time evolution."""
+
+    objective_names: tuple[str, ...]
+    parameter_set: ReverseADParameterSet
+    parameter_values: object
+    runtime: object
+    rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder
+    options: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        names = normalize_initial_er_root_only_objective_names(self.objective_names)
+        object.__setattr__(self, "objective_names", names)
+        object.__setattr__(self, "parameter_values", jnp.asarray(self.parameter_values))
+
+
 def transport_objective(name: str) -> ObjectiveRef:
     return ObjectiveRef("transport", name)
 
@@ -362,6 +411,179 @@ def residuals_and_jacobian_reverse_ad(
         parameter_set=parameter_set,
         backend_results=backend_results,
     )
+
+
+def _initial_er_root_only_volume_average(profile, geometry):
+    profile_arr = jnp.asarray(profile)
+    vprime = jnp.asarray(geometry.Vprime, dtype=profile_arr.dtype)
+    r_grid = jnp.asarray(geometry.r_grid, dtype=profile_arr.dtype)
+    volume = jnp.trapezoid(vprime, x=r_grid)
+    integral = jnp.trapezoid(profile_arr * vprime, x=r_grid)
+    return integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=profile_arr.dtype))
+
+
+def _initial_er_root_only_objective_values(
+    state,
+    runtime,
+    objective_names: Sequence[str],
+    *,
+    options: Mapping[str, object] | None = None,
+):
+    names = normalize_initial_er_root_only_objective_names(objective_names)
+    opts = {} if options is None else options
+    er = jnp.asarray(state.Er)
+    geometry = runtime.geometry
+    rho_grid = jnp.asarray(geometry.rho_grid, dtype=er.dtype)
+    softmax_beta = float(opts.get("softmax_Er_beta", 16.0))
+    smooth_root_beta = float(opts.get("smooth_root_proxy_beta", 24.0))
+    smooth_root_eps = float(opts.get("smooth_root_proxy_eps", 1.0e-4))
+
+    def _one(name: str):
+        if name == "softmax_Er":
+            beta = jnp.asarray(softmax_beta, dtype=er.dtype)
+            return jax.scipy.special.logsumexp(beta * er) / beta
+        if name == "smooth_root_proxy":
+            beta = jnp.asarray(smooth_root_beta, dtype=er.dtype)
+            eps = jnp.asarray(smooth_root_eps, dtype=er.dtype)
+            smooth_abs = jnp.sqrt(er * er + eps * eps)
+            weights = jnp.exp(-beta * smooth_abs)
+            return jnp.sum(rho_grid * weights) / jnp.maximum(
+                jnp.sum(weights),
+                jnp.asarray(1.0e-30, dtype=er.dtype),
+            )
+        if name == "Er2_volume_average":
+            return _initial_er_root_only_volume_average(er * er, geometry)
+        if name == "Er_volume_average":
+            return _initial_er_root_only_volume_average(er, geometry)
+        raise ValueError(f"Unsupported initial-Er root-only objective {name!r}.")
+
+    return jnp.stack([_one(name) for name in names])
+
+
+def initial_er_root_only_reverse_table(
+    request: InitialErRootOnlyReverseTableRequest,
+) -> ObjectiveTableResult:
+    """Evaluate Er-root-only objective values and Jacobian with no time evolution."""
+
+    parameter_values = jnp.asarray(request.parameter_values)
+
+    def _values_from_parameter_vector(values):
+        rooted_state = request.rooted_state_from_parameter_vector(values)
+        return _initial_er_root_only_objective_values(
+            rooted_state,
+            request.runtime,
+            request.objective_names,
+            options=request.options,
+        )
+
+    objective_values, pullback = jax.vjp(_values_from_parameter_vector, parameter_values)
+    objective_basis = jnp.eye(len(request.objective_names), dtype=objective_values.dtype)
+    objective_jacobian = jax.vmap(lambda cotangent: pullback(cotangent)[0])(objective_basis)
+    return ObjectiveTableResult(
+        objective_names=request.objective_names,
+        values=objective_values,
+        jacobian=objective_jacobian,
+    )
+
+
+def evaluate_initial_er_root_only_least_squares(
+    config: Mapping[str, object],
+    *,
+    request: InitialErRootOnlyReverseTableRequest,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    options: Mapping[str, object] | None = None,
+) -> LeastSquaresEvaluation:
+    """Evaluate least squares for selected initial ambipolar-Er root objectives only."""
+
+    normalized_terms = normalize_least_squares_terms(terms)
+    grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+    unsupported_families = tuple(family for family in grouped_terms if family != "transport")
+    if unsupported_families:
+        raise NotImplementedError(
+            "evaluate_initial_er_root_only_least_squares only supports transport/Er terms; "
+            f"got families {unsupported_families!r}."
+        )
+    requested_term_objectives = _unique_objective_names(grouped_terms.get("transport", ()))
+    if requested_term_objectives != request.objective_names:
+        raise ValueError(
+            "Initial-Er root-only request objectives must match the transport least-squares "
+            "terms in first-use order: "
+            f"request={request.objective_names!r}, terms={requested_term_objectives!r}."
+        )
+    t_start = time.perf_counter()
+    table_result = initial_er_root_only_reverse_table(request)
+    result = residuals_and_jacobian_reverse_ad(
+        config,
+        parameter_set=request.parameter_set,
+        terms=normalized_terms,
+        backends={"transport": lambda _names, _parameter_set, _options: table_result},
+        options=options,
+    )
+    residuals = jax.block_until_ready(result.residuals)
+    jacobian = jax.block_until_ready(result.jacobian)
+    elapsed_s = time.perf_counter() - t_start
+    return LeastSquaresEvaluation(
+        result=result,
+        residuals=residuals,
+        jacobian=jacobian,
+        elapsed_s=float(elapsed_s),
+    )
+
+
+def build_initial_er_root_only_least_squares_runner(
+    config: Mapping[str, object],
+    *,
+    runtime,
+    parameter_set: ReverseADParameterSet,
+    rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder,
+    objective_names: Sequence[str] | str | None = None,
+    options: Mapping[str, object] | None = None,
+) -> InitialErRootOnlyLeastSquaresRunner:
+    """Build a TOML-backed runner for ambipolar-root Er objectives without rollout.
+
+    The caller owns TOML/config preparation and supplies a state builder that
+    maps the active parameter vector to a state whose ``Er`` is the selected
+    ambipolar root.  This keeps the inner AD path independent of file/config
+    parsing while preserving the TOML-derived runtime, profiles, geometry, and
+    ambipolarity settings.
+    """
+
+    normalized_objectives = (
+        None
+        if objective_names is None
+        else normalize_initial_er_root_only_objective_names(objective_names)
+    )
+    runner_options = {} if options is None else dict(options)
+
+    def _runner(
+        parameter_values,
+        terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    ) -> LeastSquaresEvaluation:
+        normalized_terms = normalize_least_squares_terms(terms)
+        grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+        active_objectives = (
+            normalized_objectives
+            if normalized_objectives is not None
+            else normalize_initial_er_root_only_objective_names(
+                _unique_objective_names(grouped_terms.get("transport", ()))
+            )
+        )
+        request = InitialErRootOnlyReverseTableRequest(
+            objective_names=active_objectives,
+            parameter_set=parameter_set,
+            parameter_values=parameter_values,
+            runtime=runtime,
+            rooted_state_from_parameter_vector=rooted_state_from_parameter_vector,
+            options=runner_options,
+        )
+        return evaluate_initial_er_root_only_least_squares(
+            config,
+            request=request,
+            terms=normalized_terms,
+            options=runner_options,
+        )
+
+    return _runner
 
 
 def evaluate_transport_reverse_table_least_squares(

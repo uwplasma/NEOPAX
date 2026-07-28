@@ -25,6 +25,7 @@ PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
 )
 
 VMEC_BOUNDARY_FAMILIES: tuple[str, ...] = ("RBC", "ZBS")
+VMEX_BOUNDARY_SCALE_MODES: tuple[str, ...] = ("ess", "none", "unit", "identity")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -117,6 +118,119 @@ class ReverseADParameterSet:
         return vmec_boundary_tuples(self.vmec_boundary_specs)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class VmexBoundaryParameterization:
+    """VMEX-style packed VMEC boundary parameter layout and scaling.
+
+    The explicit ``RBC:m:n`` parser remains intentionally permissive for
+    diagnostics.  This object is the optimization-facing convention: it mirrors
+    VMEX packed boundary DOFs and carries the scale vector used by optimizers.
+    """
+
+    specs: tuple[VmecBoundaryParameterSpec, ...]
+    scales: tuple[float, ...]
+    scale_mode: str = "ess"
+    ess_alpha: float = 1.0
+
+    def __post_init__(self) -> None:
+        specs = tuple(self.specs)
+        scales = tuple(float(value) for value in self.scales)
+        if len(specs) != len(scales):
+            raise ValueError(
+                "VMEX boundary parameterization requires one scale per parameter: "
+                f"parameter_count={len(specs)} scale_count={len(scales)}."
+            )
+        validate_vmex_boundary_parameter_specs(specs)
+        scale_mode = str(self.scale_mode).strip().lower()
+        if scale_mode not in VMEX_BOUNDARY_SCALE_MODES:
+            allowed = ", ".join(VMEX_BOUNDARY_SCALE_MODES)
+            raise ValueError(f"Unsupported VMEX boundary scale mode {self.scale_mode!r}; choices are: {allowed}.")
+        object.__setattr__(self, "specs", specs)
+        object.__setattr__(self, "scales", scales)
+        object.__setattr__(self, "scale_mode", scale_mode)
+        object.__setattr__(self, "ess_alpha", float(self.ess_alpha))
+
+    @property
+    def parameter_set(self) -> ReverseADParameterSet:
+        return ReverseADParameterSet(profile_specs=(), vmec_boundary_specs=self.specs)
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        return parameter_labels(self.specs)
+
+    @property
+    def vmec_tuples(self) -> tuple[tuple[str, int, int], ...]:
+        return vmec_boundary_tuples(self.specs)
+
+    @property
+    def x_scale(self):
+        """Return the scale vector for optimizers that accept physical DOFs plus ``x_scale``."""
+
+        return jnp.asarray(self.scales, dtype=jnp.float64)
+
+    def scaled_to_physical_delta(self, scaled_values):
+        """Map optimization-space deltas to physical VMEC boundary deltas."""
+
+        return jnp.asarray(scaled_values, dtype=jnp.float64) * self.x_scale
+
+    def physical_to_scaled_delta(self, physical_values):
+        """Map physical VMEC boundary deltas to scaled optimization coordinates."""
+
+        return jnp.asarray(physical_values, dtype=jnp.float64) / self.x_scale
+
+
+def is_vmex_independent_boundary_mode(m: int, n: int) -> bool:
+    """Return whether ``(m, n)`` is an independent VMEX packed-boundary DOF."""
+
+    m_value = int(m)
+    n_value = int(n)
+    return m_value > 0 or (m_value == 0 and n_value > 0)
+
+
+def validate_vmex_boundary_parameter_specs(
+    specs: Sequence[VmecBoundaryParameterSpec],
+    *,
+    allow_fixed: bool = False,
+) -> tuple[VmecBoundaryParameterSpec, ...]:
+    """Validate specs against the VMEX packed-boundary independent-mode rule."""
+
+    active_specs = tuple(specs)
+    if allow_fixed:
+        return active_specs
+    fixed = tuple(spec.label for spec in active_specs if not is_vmex_independent_boundary_mode(spec.m, spec.n))
+    if fixed:
+        raise ValueError(
+            "VMEX packed boundary optimization excludes fixed/non-independent modes: "
+            f"{', '.join(fixed)}. Use explicit benchmark specs for diagnostics if needed."
+        )
+    return active_specs
+
+
+def vmex_boundary_mode_level(spec: VmecBoundaryParameterSpec) -> int:
+    """Return the VMEX mode level used by ESS-style boundary scaling."""
+
+    return max(abs(int(spec.m)), abs(int(spec.n)))
+
+
+def vmex_boundary_parameter_scales(
+    specs: Sequence[VmecBoundaryParameterSpec],
+    *,
+    scale_mode: str = "ess",
+    ess_alpha: float = 1.0,
+) -> tuple[float, ...]:
+    """Return VMEX-style optimizer scales for a packed boundary parameter list."""
+
+    active_specs = validate_vmex_boundary_parameter_specs(tuple(specs))
+    normalized_mode = str(scale_mode).strip().lower()
+    if normalized_mode not in VMEX_BOUNDARY_SCALE_MODES:
+        allowed = ", ".join(VMEX_BOUNDARY_SCALE_MODES)
+        raise ValueError(f"Unsupported VMEX boundary scale mode {scale_mode!r}; choices are: {allowed}.")
+    if normalized_mode in {"none", "unit", "identity"} or float(ess_alpha) <= 0.0:
+        return tuple(1.0 for _ in active_specs)
+    alpha = float(ess_alpha)
+    return tuple(float(np.exp(-alpha * vmex_boundary_mode_level(spec)) / np.exp(-alpha)) for spec in active_specs)
+
+
 def normalize_profile_parameter_name(name: str) -> str:
     """Return a validated canonical profile parameter name."""
 
@@ -203,6 +317,29 @@ def reverse_ad_parameter_set(
                 parsed_vmec_specs.append(parse_vmec_boundary_parameter_spec(str(item)))
         vmec_specs = tuple(parsed_vmec_specs)
     return ReverseADParameterSet(profile_specs=profile_specs, vmec_boundary_specs=vmec_specs)
+
+
+def reverse_ad_optimization_parameter_set(
+    *,
+    include_profiles: bool = True,
+    profiles: Sequence[str] | str | None = None,
+    vmec_boundary: Sequence[str | VmecBoundaryParameterSpec] | str | None = None,
+) -> ReverseADParameterSet:
+    """Build an optimization parameter layout with optional profile DOFs.
+
+    This is the intent-explicit optimization wrapper around
+    ``reverse_ad_parameter_set``.  Set ``include_profiles=False`` for
+    geometry-only optimization while still differentiating transport objectives
+    with respect to the selected VMEC boundary DOFs.
+    """
+
+    if not include_profiles and profiles is not None:
+        raise ValueError("profiles must be omitted when include_profiles=False.")
+    return reverse_ad_parameter_set(
+        profiles=profiles,
+        vmec_boundary=vmec_boundary,
+        default_profiles=bool(include_profiles),
+    )
 
 
 def parse_vmec_boundary_parameter_specs(
@@ -322,6 +459,104 @@ def normalize_vmec_boundary_families(families: Sequence[str] | str | None) -> tu
     return raw_families
 
 
+def _geometry_context_mode_arrays(geometry_context) -> tuple[np.ndarray, np.ndarray]:
+    m_arr = np.asarray(jax.device_get(geometry_context.static.modes.m), dtype=int).reshape(-1)
+    n_arr = np.asarray(jax.device_get(geometry_context.static.modes.n), dtype=int).reshape(-1)
+    if m_arr.shape != n_arr.shape:
+        raise ValueError(f"VMEC mode arrays have different shapes: m_shape={m_arr.shape}, n_shape={n_arr.shape}.")
+    if m_arr.size == 0:
+        raise ValueError("VMEC mode arrays are empty; cannot build boundary parameterization.")
+    return m_arr, n_arr
+
+
+def _geometry_context_boundary_coefficients(geometry_context, family: str) -> np.ndarray:
+    boundary_field = "rbc" if family == "RBC" else "zbs"
+    return np.asarray(jax.device_get(getattr(geometry_context.boundary, boundary_field)), dtype=float).reshape(-1)
+
+
+def vmex_packed_boundary_parameter_specs(
+    geometry_context,
+    *,
+    max_mode: int,
+    families: Sequence[str] | str | None = None,
+    nonzero_only: bool = False,
+) -> tuple[VmecBoundaryParameterSpec, ...]:
+    """Build VMEX optimizer-style packed fixed-boundary harmonic specs.
+
+    This follows the VMEX mode rule ``m > 0 or (m == 0 and n > 0)`` and uses
+    family-major ordering: all selected modes for ``RBC``, then all selected
+    modes for ``ZBS``.  Unlike diagnostic discovery, zero coefficients are
+    included by default because VMEX optimization can open initially-zero DOFs.
+    """
+
+    max_mode_value = int(max_mode)
+    if max_mode_value < 0:
+        raise ValueError(f"max_mode must be non-negative, got {max_mode!r}.")
+    selected_families = normalize_vmec_boundary_families(families)
+    m_arr, n_arr = _geometry_context_mode_arrays(geometry_context)
+    mode_index_by_pair: dict[tuple[int, int], int] = {}
+    for index, (m_value, n_value) in enumerate(zip(m_arr.tolist(), n_arr.tolist(), strict=True)):
+        mode_pair = (int(m_value), int(n_value))
+        if mode_pair in mode_index_by_pair:
+            raise ValueError(f"Duplicate VMEC mode {mode_pair} found in geometry context.")
+        mode_index_by_pair[mode_pair] = index
+
+    m_limit = min(max_mode_value, int(np.max(m_arr)))
+    n_limit = min(max_mode_value, int(np.max(np.abs(n_arr))))
+    specs: list[VmecBoundaryParameterSpec] = []
+    for family in selected_families:
+        boundary_values = _geometry_context_boundary_coefficients(geometry_context, family) if nonzero_only else None
+        if boundary_values is not None and boundary_values.shape != m_arr.shape:
+            raise ValueError(
+                "VMEC boundary coefficient array shape does not match mode arrays for "
+                f"{family}: coefficient_shape={boundary_values.shape}, m_shape={m_arr.shape}."
+            )
+        for m_value in range(0, m_limit + 1):
+            for n_value in range(-n_limit, n_limit + 1):
+                if not is_vmex_independent_boundary_mode(m_value, n_value):
+                    continue
+                mode_index = mode_index_by_pair.get((m_value, n_value))
+                if mode_index is None:
+                    continue
+                if boundary_values is not None:
+                    coefficient = float(boundary_values[mode_index])
+                    if not np.isfinite(coefficient) or abs(coefficient) == 0.0:
+                        continue
+                specs.append(VmecBoundaryParameterSpec(family, m_value, n_value))
+    if not specs:
+        raise ValueError(
+            "No VMEX packed boundary harmonics matched the requested selector. "
+            "Try a larger max_mode, nonzero_only=False, or a different family list."
+        )
+    return tuple(specs)
+
+
+def vmex_boundary_parameterization(
+    geometry_context,
+    *,
+    max_mode: int,
+    families: Sequence[str] | str | None = None,
+    scale_mode: str = "ess",
+    ess_alpha: float = 1.0,
+    nonzero_only: bool = False,
+) -> VmexBoundaryParameterization:
+    """Return VMEX-style packed boundary specs plus optimizer scales."""
+
+    specs = vmex_packed_boundary_parameter_specs(
+        geometry_context,
+        max_mode=max_mode,
+        families=families,
+        nonzero_only=nonzero_only,
+    )
+    scales = vmex_boundary_parameter_scales(specs, scale_mode=scale_mode, ess_alpha=ess_alpha)
+    return VmexBoundaryParameterization(
+        specs=specs,
+        scales=scales,
+        scale_mode=scale_mode,
+        ess_alpha=ess_alpha,
+    )
+
+
 def discover_vmec_boundary_parameter_specs(
     geometry_context,
     *,
@@ -336,15 +571,10 @@ def discover_vmec_boundary_parameter_specs(
     """
 
     selected_families = normalize_vmec_boundary_families(families)
-    m_arr = np.asarray(jax.device_get(geometry_context.static.modes.m), dtype=int).reshape(-1)
-    n_arr = np.asarray(jax.device_get(geometry_context.static.modes.n), dtype=int).reshape(-1)
+    m_arr, n_arr = _geometry_context_mode_arrays(geometry_context)
     specs: list[VmecBoundaryParameterSpec] = []
     for family in selected_families:
-        boundary_field = "rbc" if family == "RBC" else "zbs"
-        boundary_values = np.asarray(
-            jax.device_get(getattr(geometry_context.boundary, boundary_field)),
-            dtype=float,
-        ).reshape(-1)
+        boundary_values = _geometry_context_boundary_coefficients(geometry_context, family)
         if boundary_values.shape != m_arr.shape or boundary_values.shape != n_arr.shape:
             raise ValueError(
                 "VMEC boundary coefficient array shape does not match mode arrays for "

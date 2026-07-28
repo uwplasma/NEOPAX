@@ -306,3 +306,46 @@ This is not yet the final branch-fixed implicit custom VJP rule described above.
 It is the safe first implementation layer needed to expose the dependency in the
 same benchmark entrypoints without changing the validated default paths.
 ```
+
+Additional optimization-facing root-only lane:
+
+```text
+_reverse_ad_optimization.py now exposes an initial-Er root-only least-squares API:
+
+- build_initial_er_root_only_least_squares_runner(...)
+- evaluate_initial_er_root_only_least_squares(...)
+- initial_er_root_only_reverse_table(...)
+```
+
+Scope:
+
+```text
+This evaluates Er-related objectives directly from the selected initial ambipolar root:
+
+- softmax_Er
+- smooth_root_proxy
+- Er2_volume_average
+- Er_volume_average
+```
+
+This path deliberately does not run the Radau transport time map. The TOML/config still supplies
+runtime, geometry, profiles, NTX model, and ambipolar root settings through the caller-provided
+state builder:
+
+```text
+parameter vector -> TOML/runtime-backed selected-root state -> Er objective table
+```
+
+Implementation detail:
+
+```text
+The Er-only table uses one selected-root/objective primal evaluation and one batched reverse VJP
+over the requested Er objective cotangents. It does not use a second jacrev primal replay.
+```
+
+Still missing:
+
+```text
+Wire a production/benchmark state-builder factory that constructs the selected-root state from
+profile and/or VMEC packed boundary parameters using the same validated TOML preparation path.
+```

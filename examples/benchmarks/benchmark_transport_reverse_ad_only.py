@@ -48,6 +48,7 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
     VmecBoundaryParameterSpec,
     discover_vmec_boundary_parameter_specs,
     normalize_vmec_boundary_families,
+    reverse_ad_optimization_parameter_set,
     reverse_ad_parameter_set,
     vmec_boundary_tuples,
 )
@@ -2796,7 +2797,7 @@ def _run_realtime_geometry_support_segment_probe(
             support_bars=tuple(support_bars),
             support_component_bars_by_name=support_component_bars_by_name,
             include_component_pullbacks=include_component_pullbacks,
-            combined_payload=combined_geometry_payload,
+            combined_geometry_payload=combined_geometry_payload,
             n_r=int(geom_cfg.get("n_radial", 51)),
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
@@ -3315,7 +3316,9 @@ def _run_realtime_geometry_optimization_api_smoke(
     """Exercise the production-style transport least-squares API on the benchmark path."""
 
     geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
-    parameter_set = reverse_ad_parameter_set(
+    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    parameter_set = reverse_ad_optimization_parameter_set(
+        include_profiles=include_profile_dofs,
         vmec_boundary=tuple(
             VmecBoundaryParameterSpec(family, m, n)
             for family, m, n in geometry_param_specs
@@ -3371,6 +3374,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "objective_values": objective_values_np,
         "residuals": residuals_np.tolist(),
         "jacobian": jacobian_np.tolist(),
+        "optimization_api_profile_dofs": str(getattr(args, "optimization_api_profile_dofs", "include")),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
         "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
@@ -4127,6 +4131,16 @@ def main() -> None:
             "least-squares API through the direct JAX table-result builder and then "
             "exit. This uses the same validated grouped reverse runner but does not "
             "write the normal benchmark report."
+        ),
+    )
+    parser.add_argument(
+        "--optimization-api-profile-dofs",
+        choices=("include", "exclude"),
+        default="include",
+        help=(
+            "Only for --optimization-api-smoke. Choose whether the optimization "
+            "parameter vector includes profile DOFs in addition to realtime VMEC "
+            "geometry DOFs. Use 'exclude' for geometry-only optimization."
         ),
     )
     parser.add_argument(
