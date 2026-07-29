@@ -191,6 +191,26 @@ def _initial_er_charge_flux_residuals(state, er_profile, *, runtime):
     return jax.lax.map(_residual_i, indices)
 
 
+def _initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+
+    def _residual_i_er(i, er_value):
+        er_eval = er_profile.at[i].set(er_value)
+        state_with_er = dataclasses.replace(state, Er=er_eval)
+        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+        if local_particle_flux is None:
+            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+        gamma = local_particle_flux(i, er_value)
+        return jnp.sum(charge_qp * gamma)
+
+    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+    return jax.lax.map(
+        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+        indices,
+    )
+
+
 def _initial_er_residual_bar(state, er_profile, er_bar, finite_mask, *, runtime):
     er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
     er_bar = jnp.asarray(er_bar, dtype=state.Er.dtype)
@@ -1499,6 +1519,9 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         add_trees=_add_trees,
         initial_er_selected_root_profile=_initial_er_selected_root_profile,
         initial_er_charge_flux_residuals=_initial_er_charge_flux_residuals,
+        initial_er_charge_flux_residual_er_derivative=(
+            _initial_er_charge_flux_residual_er_derivative
+        ),
         compact_initial_er_ntx_support_pullback_leaves=(
             _compact_initial_er_ntx_support_pullback_leaves
         ),
