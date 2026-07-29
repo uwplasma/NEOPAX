@@ -3547,7 +3547,6 @@ def _run_initial_er_root_only_optimization_api_smoke(
         baseline_geometry = support_payload["geometry"]
         baseline_ntx_support = support_payload["ntx_support"]
         geometry_delta0 = _float_delta_tree_like(baseline_geometry)
-        ntx_delta0 = _float_delta_tree_like(baseline_ntx_support)
         profile_dim = len(PARAMETER_ORDER) if include_profile_dofs else 0
         geometry_param_labels = tuple(_format_geometry_param_spec(spec) for spec in geometry_param_specs)
         baseline_geometry_deltas = _baseline_geometry_delta_vector_for_specs(
@@ -3555,58 +3554,121 @@ def _run_initial_er_root_only_optimization_api_smoke(
             geometry_param_specs,
         )
 
-        def _values_from_profile_values(profile_values):
-            rooted_state = _rooted_state_from_profile_values(profile_values)
-            return _initial_er_root_only_objective_values(
-                rooted_state,
-                baseline_runtime,
-                objective_names,
-            )
-
-        if include_profile_dofs:
-            profile_objective_values, profile_pullback = jax.vjp(
-                _values_from_profile_values,
-                profile_values0,
-            )
-            objective_basis = jnp.eye(len(objective_names), dtype=profile_objective_values.dtype)
-            profile_gradient_matrix = jax.vmap(lambda cotangent: profile_pullback(cotangent)[0])(
-                objective_basis
-            )
-        else:
-            profile_objective_values = _values_from_profile_values(profile_values0)
-            objective_basis = jnp.eye(len(objective_names), dtype=profile_objective_values.dtype)
-            profile_gradient_matrix = jnp.zeros(
-                (len(objective_names), 0),
-                dtype=profile_objective_values.dtype,
-            )
-
-        def _values_from_payload_delta(geometry_delta, ntx_delta):
-            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-            ntx_support = _add_float_delta_tree(baseline_ntx_support, ntx_delta)
-            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
-            runtime = _runtime_with_ntx_support_payload(runtime, ntx_support)
-            rooted_state = _initial_state_for_parameter_vector(
-                profile_values0,
+        def _pre_root_state_from_profile_values(profile_values):
+            return _initial_state_for_parameter_vector(
+                profile_values,
                 config=config,
-                initial_er_root_ad=args.initial_er_root_ad,
+                initial_er_root_ad="off",
                 baseline_state=baseline_state,
                 profile_cfg=profile_cfg,
-                runtime=runtime,
+                runtime=baseline_runtime,
             )
+
+        pre_root_state = _pre_root_state_from_profile_values(profile_values0)
+        er_profile, finite_mask = _initial_er_selected_root_profile(
+            pre_root_state,
+            config=config,
+            runtime=baseline_runtime,
+        )
+        er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
+        finite_mask = jnp.asarray(finite_mask, dtype=bool)
+        rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+
+        def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
+            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
+            runtime = _runtime_with_ntx_support_payload(runtime, baseline_ntx_support)
             return _initial_er_root_only_objective_values(
-                rooted_state,
+                state_value,
                 runtime,
                 objective_names,
             )
 
-        _payload_objective_values, payload_pullback = jax.vjp(
-            _values_from_payload_delta,
+        profile_objective_values, objective_pullback = jax.vjp(
+            _values_from_rooted_state_and_geometry,
+            rooted_state,
             geometry_delta0,
-            ntx_delta0,
         )
+        objective_count = len(objective_names)
+        objective_basis = jnp.eye(objective_count, dtype=profile_objective_values.dtype)
+        rooted_state_bars, direct_geometry_bars = jax.vmap(
+            lambda cotangent: objective_pullback(cotangent)
+        )(objective_basis)
+
+        dres_der = _initial_er_charge_flux_residual_er_derivative(
+            pre_root_state,
+            er_profile,
+            runtime=baseline_runtime,
+        )
+        safe_dres_der = jnp.where(
+            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+            dres_der,
+            jnp.inf,
+        )
+        residual_bars = jnp.where(
+            finite_mask[None, :],
+            -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
+            0.0,
+        )
+        state_residual_bars = compact_initial_er_state_pullback(
+            residual_scalar_fn=_initial_er_charge_flux_residual_scalar,
+            state=pre_root_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            runtime=baseline_runtime,
+        )
+        direct_pre_root_state_bars = dataclasses.replace(
+            rooted_state_bars,
+            Er=jnp.zeros_like(rooted_state_bars.Er),
+        )
+        pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
+
+        if include_profile_dofs:
+            _, profile_pullback = jax.vjp(
+                _pre_root_state_from_profile_values,
+                profile_values0,
+            )
+            profile_gradient_matrix = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
+                pre_root_state_bars
+            )
+        else:
+            profile_gradient_matrix = jnp.zeros(
+                (objective_count, 0),
+                dtype=profile_objective_values.dtype,
+            )
+
+        def _residuals_from_geometry_delta(geometry_delta):
+            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
+            runtime = _runtime_with_ntx_support_payload(runtime, baseline_ntx_support)
+            return _initial_er_charge_flux_residuals(
+                pre_root_state,
+                er_profile,
+                runtime=runtime,
+            )
+
+        _, geometry_residual_pullback = jax.vjp(
+            _residuals_from_geometry_delta,
+            geometry_delta0,
+        )
+        residual_geometry_bars = jax.vmap(
+            lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
+        )(residual_bars)
+        geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
+        ntx_runtime = _runtime_with_geometry_payload(baseline_runtime, baseline_geometry)
+        ntx_bar_leaves = _compact_initial_er_ntx_support_pullback_leaves(
+            runtime=ntx_runtime,
+            state=pre_root_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            support=baseline_ntx_support,
+        )
+        _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
+        ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
         support_bars = []
-        for cotangent in objective_basis:
-            geometry_bar, ntx_bar = payload_pullback(cotangent)
+        for objective_index in range(objective_count):
+            geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
+            ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
             support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
         assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
             objective_labels=objective_names,
