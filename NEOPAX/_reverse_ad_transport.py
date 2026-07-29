@@ -1663,7 +1663,7 @@ def realtime_geometry_transport_reverse_support_segment_executor(
             support_segment_probe=support_segment_probe,
             args=builder_args,
             context=context,
-            suppress_output=True,
+            suppress_output=False,
         )
 
     return _executor
@@ -1918,7 +1918,7 @@ def run_internal_realtime_geometry_support_segment_probe(
         ntx_exact_surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         realtime_geometry_gradient_path=str(getattr(args, "realtime_geometry_gradient_path", "reverse_payload")),
         realtime_geometry_component_pullbacks=bool(getattr(args, "realtime_geometry_component_pullbacks", False)),
-        realtime_geometry_support_bar_diagnostics_skipped=True,
+        realtime_geometry_support_bar_diagnostics_skipped=bool(suppress_diagnostics),
         realtime_geometry_derivative_complete=bool(core_setup.combined_geometry_payload),
         geometry_support_pullback_mode=assembly_result.payload_pullback_result.pullback_mode,
         realtime_geometry_diagnostics={},

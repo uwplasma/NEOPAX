@@ -198,7 +198,7 @@ def main() -> int:
                 neoclassical_cfg=neoclassical_cfg,
             ),
             return_report=return_report,
-            suppress_diagnostics=True,
+            suppress_diagnostics=False,
         )
 
     support_segment_executor = realtime_geometry_transport_reverse_support_segment_executor(
@@ -231,7 +231,7 @@ def main() -> int:
         run_grouped_report=run_grouped_report,
         objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
         options={
-            "quiet": True,
+            "quiet": False,
             "accepted_step_limit": int(args.accepted_step_limit),
             "reverse_segment_length": int(args.reverse_segment_length),
             "initial_er_root_ad": str(args.initial_Er_root_ad),
