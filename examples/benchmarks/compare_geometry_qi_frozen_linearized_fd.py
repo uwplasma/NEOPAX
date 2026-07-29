@@ -560,7 +560,7 @@ def main() -> None:
             parameter_values=jnp.zeros((1,), dtype=jnp.float64),
             lane="ad",
             max_iter=cfg.adjoint_maxiter,
-            step_size=args.step_size,
+            step_size=None,
             final_vmec_pullback_mode="raw_block_transpose",
             solver_device=args.implicit_solver_device,
         )
