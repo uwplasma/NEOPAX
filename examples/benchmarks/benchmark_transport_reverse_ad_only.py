@@ -34,7 +34,6 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
-    build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector,
     build_geometry_autodiff_context,
 )
 from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial_jax  # noqa: E402
@@ -57,7 +56,11 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    LeastSquaresEvaluation,
     INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+    ObjectiveTableResult,
+    residuals_and_jacobian_reverse_ad,
+    _initial_er_root_only_objective_values,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
@@ -3510,38 +3513,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
     )
     neoclassical_cfg = {} if neoclassical_cfg is None else neoclassical_cfg
 
-    def _rooted_state_from_parameter_vector(values):
-        state, _runtime = _rooted_state_and_runtime_from_parameter_vector(values)
-        return state
-
-    def _rooted_state_and_runtime_from_parameter_vector(values):
-        values = jnp.asarray(values)
-        offset = 0
-        if include_profile_dofs:
-            profile_values = values[offset : offset + len(PARAMETER_ORDER)]
-            offset += len(PARAMETER_ORDER)
-        else:
-            profile_values = profile_values0
-        if include_geometry_dofs:
-            geometry_values = values[offset : offset + len(geometry_param_specs)]
-            payload = build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector(
-                geometry_context,
-                geometry_values,
-                geometry_param_specs,
-                lane=str(geom_cfg.get("vmec_lane", "ad")).strip().lower(),
-                n_r=int(geom_cfg.get("n_radial", 51)),
-                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
-                max_iter=geom_cfg.get("vmec_max_iter"),
-                step_size=geom_cfg.get("vmec_step_size"),
-                jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-            )
-            runtime = _runtime_with_geometry_payload(baseline_runtime, payload["geometry"])
-            runtime = _runtime_with_ntx_support_payload(runtime, payload["ntx_support"])
-        else:
-            runtime = baseline_runtime
+    def _rooted_state_from_profile_values(profile_values):
         return _initial_state_for_parameter_vector(
             profile_values,
             config=config,
@@ -3551,22 +3523,133 @@ def _run_initial_er_root_only_optimization_api_smoke(
             runtime=baseline_runtime,
         )
 
-    runner = build_initial_er_root_only_least_squares_runner(
-        config,
-        runtime=baseline_runtime,
-        parameter_set=parameter_set,
-        rooted_state_from_parameter_vector=_rooted_state_from_parameter_vector,
-        rooted_state_and_runtime_from_parameter_vector=(
-            _rooted_state_and_runtime_from_parameter_vector
-        ),
-        objective_names=objective_names,
-    )
     terms = transport_least_squares_terms(objective_names)
     print(
         "[autodiff-gate] progress: running initial-Er root-only optimization API smoke",
         flush=True,
     )
-    evaluation = runner(parameter_values, terms)
+    if not include_geometry_dofs:
+        runner = build_initial_er_root_only_least_squares_runner(
+            config,
+            runtime=baseline_runtime,
+            parameter_set=parameter_set,
+            rooted_state_from_parameter_vector=_rooted_state_from_profile_values,
+            objective_names=objective_names,
+        )
+        evaluation = runner(parameter_values, terms)
+    else:
+        support_payload = _find_ntx_support_payload(baseline_runtime)
+        if not isinstance(support_payload, dict):
+            support_payload = {
+                "geometry": baseline_runtime.geometry,
+                "ntx_support": support_payload,
+            }
+        baseline_geometry = support_payload["geometry"]
+        baseline_ntx_support = support_payload["ntx_support"]
+        geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+        ntx_delta0 = _float_delta_tree_like(baseline_ntx_support)
+        profile_dim = len(PARAMETER_ORDER) if include_profile_dofs else 0
+        geometry_param_labels = tuple(_format_geometry_param_spec(spec) for spec in geometry_param_specs)
+        baseline_geometry_deltas = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg,
+            geometry_param_specs,
+        )
+
+        def _values_from_profile_values(profile_values):
+            rooted_state = _rooted_state_from_profile_values(profile_values)
+            return _initial_er_root_only_objective_values(
+                rooted_state,
+                baseline_runtime,
+                objective_names,
+            )
+
+        if include_profile_dofs:
+            profile_objective_values, profile_pullback = jax.vjp(
+                _values_from_profile_values,
+                profile_values0,
+            )
+            objective_basis = jnp.eye(len(objective_names), dtype=profile_objective_values.dtype)
+            profile_gradient_matrix = jax.vmap(lambda cotangent: profile_pullback(cotangent)[0])(
+                objective_basis
+            )
+        else:
+            profile_objective_values = _values_from_profile_values(profile_values0)
+            objective_basis = jnp.eye(len(objective_names), dtype=profile_objective_values.dtype)
+            profile_gradient_matrix = jnp.zeros(
+                (len(objective_names), 0),
+                dtype=profile_objective_values.dtype,
+            )
+
+        def _values_from_payload_delta(geometry_delta, ntx_delta):
+            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+            ntx_support = _add_float_delta_tree(baseline_ntx_support, ntx_delta)
+            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
+            runtime = _runtime_with_ntx_support_payload(runtime, ntx_support)
+            rooted_state = _initial_state_for_parameter_vector(
+                profile_values0,
+                config=config,
+                initial_er_root_ad=args.initial_er_root_ad,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                runtime=runtime,
+            )
+            return _initial_er_root_only_objective_values(
+                rooted_state,
+                runtime,
+                objective_names,
+            )
+
+        _payload_objective_values, payload_pullback = jax.vjp(
+            _values_from_payload_delta,
+            geometry_delta0,
+            ntx_delta0,
+        )
+        support_bars = []
+        for cotangent in objective_basis:
+            geometry_bar, ntx_bar = payload_pullback(cotangent)
+            support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
+        assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+            objective_labels=objective_names,
+            profile_parameter_labels=PARAMETER_ORDER[:profile_dim],
+            geometry_parameter_labels=geometry_param_labels,
+            objective_values=profile_objective_values,
+            profile_gradient_matrix=profile_gradient_matrix,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=baseline_geometry_deltas,
+            geometry_param_specs=geometry_param_specs,
+            support_bars=tuple(support_bars),
+            support_component_bars_by_name={},
+            include_component_pullbacks=False,
+            combined_geometry_payload=True,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            progress_label="[autodiff-gate] initial-Er root-only geometry payload pullback:",
+        )
+        table_result = ObjectiveTableResult(
+            objective_names=tuple(objective_names),
+            values=profile_objective_values,
+            jacobian=assembly_result.table_result.jacobian,
+        )
+        t_eval = time.perf_counter()
+        result = residuals_and_jacobian_reverse_ad(
+            config,
+            parameter_set=parameter_set,
+            terms=terms,
+            backends={"transport": lambda _names, _parameter_set, _options: table_result},
+        )
+        residuals = jax.block_until_ready(result.residuals)
+        jacobian = jax.block_until_ready(result.jacobian)
+        evaluation = LeastSquaresEvaluation(
+            result=result,
+            residuals=residuals,
+            jacobian=jacobian,
+            elapsed_s=float(time.perf_counter() - t_eval),
+        )
     result = evaluation.result
     residuals_np = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
     jacobian_np = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
