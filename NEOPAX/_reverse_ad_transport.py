@@ -2101,7 +2101,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
             objective_labels=objective_names,
             profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
-            geometry_parameter_labels=tuple(spec.label for spec in parameter_set.vmec_boundary_specs),
+            geometry_parameter_labels=tuple(spec.vmec_label for spec in parameter_set.vmec_boundary_specs),
             objective_values=selected_objective_values,
             profile_gradient_matrix=selected_profile_matrix,
             geometry_context=geometry_context,

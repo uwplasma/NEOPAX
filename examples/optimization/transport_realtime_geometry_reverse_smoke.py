@@ -92,7 +92,12 @@ def parse_args():
     parser.add_argument("--optimization-api-profile-dofs", choices=("include", "exclude"), default="include")
     parser.add_argument("--reverse-stage-adjoint-solve-mode", default="bicgstab")
     parser.add_argument("--reverse-rhs-transpose-mode", default="explicit_ntx_interpolated")
+    parser.add_argument("--reverse-stage-cotangent-mode", default="full")
     parser.add_argument("--reverse-step-bwd-mode", default="reduced_cotangent")
+    parser.add_argument("--reverse-stage-adjoint-memory-mode", default="default")
+    parser.add_argument("--reverse-stage-adjoint-iter-maxiter", type=int, default=40)
+    parser.add_argument("--reverse-stage-adjoint-iter-tol", type=float, default=1.0e-10)
+    parser.add_argument("--hide-solver-iterations", action="store_true")
     parser.add_argument("--output", default="outputs/autodiff_transport_lagged_ntx/reverse_ad/internal_optimization_smoke_2step.json")
     return parser.parse_args()
 
@@ -101,8 +106,9 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     solver_cfg = config.setdefault("transport_solver", {})
-    if args.accepted_step_limit is not None:
-        solver_cfg["stop_after_accepted_steps"] = int(args.accepted_step_limit)
+    if args.hide_solver_iterations:
+        solver_cfg["debug_stage_markers"] = False
+        solver_cfg["debug_walltime_attempts"] = False
 
     runtime, baseline_state = build_runtime_context(config)
     if baseline_state is None:
@@ -134,16 +140,20 @@ def main() -> int:
         geometry_context=geometry_context,
         baseline_geometry_deltas=geometry_deltas,
         n_r=int(config.get("geometry", {}).get("n_radial", 51)),
-        n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 5)),
-        n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 21)),
-        n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 33)),
+        n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+        n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+        n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
         surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
         accepted_step_limit=int(args.accepted_step_limit),
         reverse_segment_length=int(args.reverse_segment_length),
         initial_er_root_ad=str(args.initial_Er_root_ad),
         reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+        reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
         reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+        reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
+        reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
+        reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
         progress_label="[autodiff-gate] internal optimization smoke payload pullback",
     )
     objective_names = _objective_names(args.objective)
@@ -157,6 +167,13 @@ def main() -> int:
             "accepted_step_limit": int(args.accepted_step_limit),
             "reverse_segment_length": int(args.reverse_segment_length),
             "initial_er_root_ad": str(args.initial_Er_root_ad),
+            "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+            "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+            "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+            "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+            "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+            "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+            "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         },
     )
     print(
@@ -188,6 +205,13 @@ def main() -> int:
         "accepted_step_limit": int(args.accepted_step_limit),
         "reverse_segment_length": int(args.reverse_segment_length),
         "initial_er_root_ad": str(args.initial_Er_root_ad),
+        "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+        "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+        "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+        "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+        "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+        "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+        "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "elapsed_s": float(evaluation.elapsed_s),
     }
     outpath = ROOT / args.output
