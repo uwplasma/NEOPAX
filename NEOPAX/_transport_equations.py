@@ -272,7 +272,7 @@ class DensityEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(Gamma_faces_raw)
         source_components = assemble_density_source_components(
-            source_outputs if self.source_model is not None else None,
+            None if self.source_model is None else (self.source_model(state) if source_outputs is None else source_outputs),
             state,
             self.species,
         )
@@ -529,7 +529,7 @@ class TemperatureEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(total_energy_flux_faces)
         source_components = assemble_pressure_source_components(
-            source_outputs if self.source_model is not None else None,
+            None if self.source_model is None else (self.source_model(state) if source_outputs is None else source_outputs),
             state,
             self.species,
         )

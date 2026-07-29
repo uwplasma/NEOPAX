@@ -87,8 +87,12 @@ toggle_temperature = [false, true]
 toggle_Er = false
 
 [sources]
-temperature = []
+temperature = ["power_exchange"]
 density = []
+
+[sources.parameters.power_exchange]
+mode = "all"
+coulomb_log_mode = "ntssfusion"
 
 [transport_solver]
 density_floor = 1.0e-3
@@ -108,11 +112,11 @@ atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
-stop_after_accepted_steps = 10
+stop_after_accepted_steps = 20
 throw = false
 debug_stage_markers = true
 debug_disable_jit = false
-save_n = 10
+save_n = 2
 temperature_include_work_term = true
 temperature_include_neo_convection = true
 temperature_include_turbulent_convection = false

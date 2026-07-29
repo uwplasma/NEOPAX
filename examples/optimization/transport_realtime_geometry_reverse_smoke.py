@@ -18,7 +18,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from NEOPAX._geometry_autodiff import build_geometry_autodiff_context
-from NEOPAX._orchestrator import build_runtime_context, load_config
+from examples.benchmarks.benchmark_transport_forward_fd_lane import (
+    _baseline_profile_cfg,
+    _prepare_benchmark_config,
+)
+from NEOPAX._orchestrator import build_runtime_context
 from NEOPAX._reverse_ad_optimization import (
     build_transport_realtime_geometry_least_squares_runner,
     transport_least_squares_terms,
@@ -84,12 +88,18 @@ def _objective_names(value: str):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--device", choices=("default", "cpu", "gpu"), default="default")
     parser.add_argument("--reverse-geometry-parameter", default="RBC:1:0")
     parser.add_argument("--objective", default="all")
     parser.add_argument("--accepted-step-limit", type=int, default=2)
     parser.add_argument("--reverse-segment-length", type=int, default=1)
     parser.add_argument("--initial-Er-root-ad", default="jax_selected_root")
     parser.add_argument("--optimization-api-profile-dofs", choices=("include", "exclude"), default="include")
+    parser.add_argument("--ntx-exact-derivative-mode", default="direct")
+    parser.add_argument("--ntx-exact-derivative-field-pullback-mode", default="generic_jvp")
+    parser.add_argument("--ntx-exact-derivative-pullback-boundary", default=None)
+    parser.add_argument("--ntx-exact-derivative-pullback-algebra", default=None)
+    parser.add_argument("--radau-jacobian-reuse-mode", default="legacy")
     parser.add_argument("--reverse-stage-adjoint-solve-mode", default="bicgstab")
     parser.add_argument("--reverse-rhs-transpose-mode", default="explicit_ntx_interpolated")
     parser.add_argument("--reverse-stage-cotangent-mode", default="full")
@@ -104,16 +114,20 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    config = load_config(args.config)
-    solver_cfg = config.setdefault("transport_solver", {})
-    if args.hide_solver_iterations:
-        solver_cfg["debug_stage_markers"] = False
-        solver_cfg["debug_walltime_attempts"] = False
+    config = _prepare_benchmark_config(
+        Path(args.config),
+        device=args.device,
+        ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
+        ntx_exact_derivative_field_pullback_mode=args.ntx_exact_derivative_field_pullback_mode,
+        ntx_exact_derivative_pullback_boundary=args.ntx_exact_derivative_pullback_boundary,
+        ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
+        radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
+    )
 
     runtime, baseline_state = build_runtime_context(config)
     if baseline_state is None:
         raise RuntimeError("transport runtime did not return an initial state.")
-    profile_cfg = dict(config.get("profiles", {}))
+    profile_cfg = _baseline_profile_cfg(config)
     neoclassical_cfg = dict(config.get("neoclassical", {}))
     geometry_specs = tuple(spec.as_tuple() for spec in parse_vmec_boundary_parameter_specs(args.reverse_geometry_parameter))
     if not geometry_specs:
@@ -205,6 +219,9 @@ def main() -> int:
         "accepted_step_limit": int(args.accepted_step_limit),
         "reverse_segment_length": int(args.reverse_segment_length),
         "initial_er_root_ad": str(args.initial_Er_root_ad),
+        "ntx_exact_derivative_mode": str(args.ntx_exact_derivative_mode),
+        "ntx_exact_derivative_field_pullback_mode": str(args.ntx_exact_derivative_field_pullback_mode),
+        "radau_jacobian_reuse_mode": str(args.radau_jacobian_reuse_mode),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
