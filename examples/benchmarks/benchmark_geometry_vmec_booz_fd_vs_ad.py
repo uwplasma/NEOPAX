@@ -20,13 +20,14 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     geometry_observable_names_for_kind,
     five_point_fd_single_param,
     geometry_observable_batched_cotangent_pullback_from_param_vector,
-    geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_kind_from_param_vector,
     geometry_observable_kind_from_single_param,
     geometry_observable_multi_rhs_pullback_from_param_vector,
     geometry_observable_weighted_sum_from_param_vector,
     rel_error,
 )
+from NEOPAX._reverse_ad_optimization import geometry_full_ad_reverse_table  # noqa: E402
+from NEOPAX._reverse_ad_parameters import ReverseADParameterSet, VmecBoundaryParameterSpec  # noqa: E402
 
 DEFAULT_VMEC_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires"
 
@@ -325,18 +326,28 @@ def _custom_vjp_reverse_table(
     zeros = jnp.zeros((len(param_specs),), dtype=jnp.float64)
     objective_cotangents = jnp.eye(len(objective_names), dtype=jnp.float64)
     if args.mode == "geometry_full_ad_objectives":
-        return geometry_full_ad_objective_table_pullback_from_param_vector(
-            context,
-            zeros,
-            param_specs,
-            objective_cotangents,
+        parameter_set = ReverseADParameterSet(
+            vmec_boundary_specs=tuple(
+                VmecBoundaryParameterSpec(family, m_value, n_value)
+                for family, m_value, n_value in param_specs
+            )
+        )
+        table_result = geometry_full_ad_reverse_table(
+            context=context,
+            parameter_set=parameter_set,
             objective_names=objective_names,
+            parameter_values=zeros,
             lane="ad",
             max_iter=resolved_max_iter,
             step_size=resolved_step_size,
             final_vmec_pullback_mode=args.final_vmec_pullback_mode,
             solver_device=args.implicit_solver_device,
         )
+        values_by_name = {
+            name: table_result.values[i]
+            for i, name in enumerate(table_result.objective_names)
+        }
+        return values_by_name, table_result.jacobian
     return geometry_observable_multi_rhs_pullback_from_param_vector(
         context,
         zeros,

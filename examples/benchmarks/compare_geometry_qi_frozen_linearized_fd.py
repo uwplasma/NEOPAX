@@ -25,6 +25,8 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     build_geometry_autodiff_context,
     geometry_observable_kind_from_single_param,
 )
+from NEOPAX._reverse_ad_optimization import geometry_full_ad_reverse_table  # noqa: E402
+from NEOPAX._reverse_ad_parameters import ReverseADParameterSet, VmecBoundaryParameterSpec  # noqa: E402
 
 im = _import_vmec_jax_implicit()
 
@@ -544,6 +546,33 @@ def main() -> None:
         flush=True,
     )
     if not args.skip_reverse_check:
+        print(
+            "[geometry-qi-linearized-fd] progress: optimization-internal geometry reverse table check",
+            flush=True,
+        )
+        parameter_set = ReverseADParameterSet(
+            vmec_boundary_specs=(VmecBoundaryParameterSpec(family, m, n),)
+        )
+        internal_table = geometry_full_ad_reverse_table(
+            context=context,
+            parameter_set=parameter_set,
+            objective_names=(args.objective,),
+            parameter_values=jnp.zeros((1,), dtype=jnp.float64),
+            lane="ad",
+            max_iter=cfg.adjoint_maxiter,
+            step_size=args.step_size,
+            final_vmec_pullback_mode="raw_block_transpose",
+            solver_device=args.implicit_solver_device,
+        )
+        internal_value_f = float(jax.device_get(internal_table.values[0]))
+        internal_reverse_grad_f = float(jax.device_get(internal_table.jacobian[0, 0]))
+        print(
+            "[geometry-qi-linearized-fd] optimization_internal_reverse_table "
+            f"value={internal_value_f:.16e} "
+            f"raw_block_transpose_param_grad={internal_reverse_grad_f:.16e} "
+            f"rel_err_internal_reverse_vs_jvp={_relative_error(internal_reverse_grad_f, jvp_f):.6e}",
+            flush=True,
+        )
         print("[geometry-qi-linearized-fd] progress: same-baseline reverse pullback check", flush=True)
         _objective_value, objective_vjp = jax.vjp(lambda state: _objective(context, args.objective, state), x_star)
         state_bar = objective_vjp(jnp.asarray(1.0, dtype=jnp.float64))[0]

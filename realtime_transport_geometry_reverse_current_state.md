@@ -944,3 +944,226 @@ Expected result:
   optimization parameters.
 - This smoke still builds the realtime-geometry runtime, but it should not prepare or run the Radau
   time-evolution solver.
+
+## Optimization Lane Step 1 Checkpoint
+
+Date: 2026-07-29
+
+Current state:
+
+- `_reverse_ad_optimization.py` now has a geometry full-AD objective-table backend:
+  `geometry_full_ad_reverse_table(...)` and `geometry_full_ad_reverse_table_backend(...)`.
+- `benchmark_geometry_vmec_booz_fd_vs_ad.py` now uses that internal backend for
+  `geometry_full_ad_objectives` objective-table reverse mode, then adapts the result back to the
+  same benchmark output format as before.
+- Geometry objective aliases now accept VMEX-like names such as `qi`, `maxj`, `aspect_ratio`,
+  `iota`, `well`, and `mirror`, mapping them to the canonical
+  `geometry_full_ad_objectives` table names.
+- The geometry backend uses the validated geometry benchmark path:
+  `geometry_full_ad_objective_table_pullback_from_param_vector(...)` with
+  `final_vmec_pullback_mode="raw_block_transpose"` by default.
+- Geometry objectives now require at least one VMEC boundary parameter in the optimization
+  parameter set. Profile-only optimization runs should omit geometry terms rather than receiving
+  silently-zero geometry residuals.
+- The optimization-plan file now records the active benchmark tools for geometry AD,
+  frozen-linearized geometry FD, root-only Er optimization smoke, and two-step realtime
+  transport optimization smoke.
+
+Validation run locally:
+
+```text
+python -m py_compile NEOPAX\_reverse_ad_optimization.py
+git diff --check -- NEOPAX/_reverse_ad_optimization.py plan_reverse_ad_optimization_lane.md
+```
+
+Both checks passed. The only messages were Git line-ending warnings on Windows.
+
+Geometry AD benchmark command for the optimization seed:
+
+```text
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode objective_table \
+  --final-vmec-pullback-mode raw_block_transpose \
+  --skip-fd-check
+```
+
+Next steps:
+
+- Add combined residual/Jacobian assembly for mixed transport + geometry least-squares terms.
+- Add the scalar weighted-loss convenience wrapper `0.5 * r @ r`.
+- Wire VMEX-style packed/scaled geometry parameterization into the optimization runner, converting
+  scaled optimizer coordinates to physical VMEC boundary deltas before calling the geometry table.
+- Add first example scripts:
+  geometry-only QI/maxJ/aspect/iota/mirror/softmaxEr optimization from
+  `examples/inputs/input.QI_nfp2_initial`, and profile-only Er/root-transition tuning.
+- Keep benchmark files as validation clients; do not change their default numerical behavior.
+
+## 16-Step Transport Optimization API Smoke
+
+Date: 2026-07-29
+
+Command:
+
+```text
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --skip-realtime-geometry-support-bar-diagnostics \
+  --initial-Er-root-ad jax_selected_root \
+  --optimization-api-smoke
+```
+
+Result:
+
+- Runtime build ready: `222.776 s`.
+- Solver components ready: `31.350 s`.
+- Optimization API smoke elapsed: `3126.731 s`.
+- Device: GPU, `baseline_values_device=cuda:0`.
+- Residual count: `7`.
+- Parameter count: `5`.
+
+Jacobian rows:
+
+```text
+transport:softmax_Er
+  dn0=-5.0838282415568408e+00
+  dT0=4.1306249928548100e+00
+  ddensity_shape_power=-1.1591644624461980e-01
+  dtemperature_shape_power=4.2417414653234697e+00
+  dvmec:RBC:1:0=-6.2626550584360913e+01
+
+transport:smooth_root_proxy
+  dn0=-5.8593750000000000e-03
+  dT0=-7.7788585014637937e-05
+  ddensity_shape_power=-1.3650089969452495e-07
+  dtemperature_shape_power=2.3783611385449557e-03
+  dvmec:RBC:1:0=-3.7595015613984747e-04
+
+transport:Er2_volume_average
+  dn0=-6.8729867376835294e+00
+  dT0=3.6065316917000459e+01
+  ddensity_shape_power=3.7772605808640574e+00
+  dtemperature_shape_power=-9.9007831215974562e+00
+  dvmec:RBC:1:0=-2.7118432937475063e+02
+
+transport:Er_volume_average
+  dn0=-2.3765676300577470e+00
+  dT0=1.0952038126424903e+00
+  ddensity_shape_power=-1.0966510378096389e-01
+  dtemperature_shape_power=-3.1844641881012514e-01
+  dvmec:RBC:1:0=-2.3646073953442198e+01
+
+transport:electron_temperature_volume_average_keV
+  dn0=3.2044199169065646e-03
+  dT0=3.5042845972161463e-01
+  ddensity_shape_power=-1.7862537077364612e-04
+  dtemperature_shape_power=1.5035680183819486e+00
+  dvmec:RBC:1:0=-2.2448497948865054e-02
+
+transport:total_pressure_volume_average
+  dn0=7.9065460031525578e+00
+  dT0=1.8293618203570214e+00
+  ddensity_shape_power=2.3978045308837445e-01
+  dtemperature_shape_power=7.6008795466190691e+00
+  dvmec:RBC:1:0=-7.7520440608481067e-02
+
+transport:alpha_power_volume_average_mw_m3
+  dn0=2.7390173486511626e-01
+  dT0=8.1435927075356962e-02
+  ddensity_shape_power=2.3105926577552259e-03
+  dtemperature_shape_power=2.7792303880127184e-01
+  dvmec:RBC:1:0=1.2073916077413038e-03
+```
+
+Interpretation:
+
+- This confirms the 16-step reverse-AD optimization API smoke reaches the same validated numerical
+  regime as the benchmark reverse path.
+- The geometry column for `RBC:1:0` matches the previously validated full 16-step values, including
+  the ambipolar selected-root AD path.
+- The result was written to
+  `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_optimization_api_smoke.json`.
+
+Comparison to the matching 16-step realtime-geometry frozen-linearized FD run:
+
+```text
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+| Objective | 16-step FD d/dRBC:1:0 | 16-step reverse optimization API d/dRBC:1:0 | abs diff | rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | `-6.2627250000000000e+01` | `-6.2626550584360913e+01` | `6.994156e-04` | `1.116791e-05` |
+| `smooth_root_proxy` | `-5.5764050000000004e-04` | `-3.7595015613984747e-04` | `1.816903e-04` | `3.258198e-01` |
+| `Er2_volume_average` | `-2.7123439999999999e+02` | `-2.7118432937475063e+02` | `5.007063e-02` | `1.846028e-04` |
+| `Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073953442198e+01` | `2.043953e-03` | `8.644691e-05` |
+| `electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497948865054e-02` | `1.520511e-07` | `6.773286e-06` |
+| `total_pressure_volume_average` | `-7.7521010000000001e-02` | `-7.7520440608481067e-02` | `5.693915e-07` | `7.344996e-06` |
+| `alpha_power_volume_average_mw_m3` | `1.2073920000000001e-03` | `1.2073916077413038e-03` | `3.922587e-10` | `3.248810e-07` |
+
+Conclusion:
+
+- The reverse optimization API agrees with 16-step FD for the main transport and geometry-sensitive
+  objectives.
+- `smooth_root_proxy` has a relatively large relative difference because the derivative magnitude is
+  very small and the smooth proxy is sensitive to the root/sign-transition construction. Its
+  absolute difference remains small.
+
+## Geometry-Objective Frozen VMEX Benchmark Through Internals
+
+Current status:
+
+- `compare_geometry_qi_frozen_linearized_fd.py` now keeps the same frozen-linearized FD/JVP logic
+  for geometry objectives, but its production reverse-equivalent line is routed through
+  `geometry_full_ad_reverse_table(...)`.
+- This means QI/maxJ/aspect/iota/mirror frozen VMEX comparisons now exercise the same
+  optimization-facing internal geometry objective table used by future least-squares scripts.
+- The low-level same-baseline diagnostics remain in the benchmark as extra checks, but they are no
+  longer the only reverse quantity available in that script.
+
+Geometry-objective frozen FD vs internal optimization-table AD command:
+
+```text
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Expected new line in the output:
+
+```text
+[geometry-qi-linearized-fd] optimization_internal_reverse_table value=... raw_block_transpose_param_grad=... rel_err_internal_reverse_vs_jvp=...
+```
+
+This line is the one to compare against `frozen_linearized_fd` / `forward_jvp` when checking the
+optimization-facing geometry objective path.

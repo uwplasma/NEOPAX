@@ -23,6 +23,10 @@ from ._reverse_ad_parameters import (
     VmecBoundaryParameterSpec,
     parameter_labels,
 )
+from ._geometry_autodiff import (
+    geometry_full_ad_objective_table_pullback_from_param_vector,
+    geometry_observable_names_for_kind,
+)
 from ._reverse_ad_transport import (
     RealtimeGeometryTransportReverseTableContext,
     RealtimeGeometryTransportReverseTableRequest,
@@ -145,6 +149,36 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "Er2_volume_average",
     "Er_volume_average",
 )
+GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
+    "aspect_ratio": "vmec_aspect_ratio",
+    "vmec_aspect_ratio": "vmec_aspect_ratio",
+    "volume_total": "vmec_volume_total",
+    "vmec_volume_total": "vmec_volume_total",
+    "iota": "vmec_iota_mean",
+    "mean_iota": "vmec_iota_mean",
+    "iota_mean": "vmec_iota_mean",
+    "vmec_iota_mean": "vmec_iota_mean",
+    "magnetic_well": "vmec_magnetic_well",
+    "well": "vmec_magnetic_well",
+    "vmec_magnetic_well": "vmec_magnetic_well",
+    "mirror": "vmec_mirror_ratio",
+    "mirror_ratio": "vmec_mirror_ratio",
+    "vmec_mirror_ratio": "vmec_mirror_ratio",
+    "beta_volume": "vmec_beta_volume",
+    "vmec_beta_volume": "vmec_beta_volume",
+    "boozer_iota_b_mean": "boozer_iota_b_mean",
+    "boozer_b00_mean": "boozer_b00_mean",
+    "boozer_buco_b_mean": "boozer_buco_b_mean",
+    "boozer_bvco_b_mean": "boozer_bvco_b_mean",
+    "boozer_aspect_proxy": "boozer_aspect_proxy",
+    "boozer_b10_over_b00_mean": "boozer_b10_over_b00_mean",
+    "qi": "boozer_qi_objective",
+    "qi_objective": "boozer_qi_objective",
+    "boozer_qi_objective": "boozer_qi_objective",
+    "maxj": "boozer_maxj_objective",
+    "maxj_objective": "boozer_maxj_objective",
+    "boozer_maxj_objective": "boozer_maxj_objective",
+}
 
 
 def normalize_initial_er_root_only_objective_names(objective_names: Sequence[str] | str) -> tuple[str, ...]:
@@ -936,6 +970,143 @@ def transport_reverse_table_result_builder_backend(
             table_result,
             requested_objectives,
             parameter_set,
+        )
+
+    return _backend
+
+
+def normalize_geometry_full_ad_objective_names(objective_names: Sequence[str]) -> tuple[str, ...]:
+    """Normalize VMEX-like geometry objective names to the full AD table labels."""
+
+    requested = tuple(str(name).strip() for name in objective_names)
+    if not requested or any(not name for name in requested):
+        raise ValueError("At least one non-empty geometry objective name is required.")
+    available = set(geometry_observable_names_for_kind("geometry_full_ad_objectives"))
+    normalized = []
+    for name in requested:
+        canonical = GEOMETRY_FULL_AD_OBJECTIVE_ALIASES.get(name, name)
+        if canonical not in available:
+            choices = ", ".join(sorted(GEOMETRY_FULL_AD_OBJECTIVE_ALIASES))
+            raise ValueError(
+                f"Unknown geometry objective {name!r}; use a geometry_full_ad objective "
+                f"or one of these aliases: {choices}."
+            )
+        normalized.append(canonical)
+    return tuple(normalized)
+
+
+def geometry_full_ad_reverse_table(
+    *,
+    context,
+    parameter_set: ReverseADParameterSet,
+    objective_names: Sequence[str],
+    parameter_values=None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    final_vmec_pullback_mode: str = "raw_block_transpose",
+    solver_device: str | None = "default",
+) -> ObjectiveTableResult:
+    """Evaluate the validated full-geometry reverse table for optimization terms.
+
+    The returned Jacobian columns follow ``parameter_set.specs``. Profile columns
+    are zero because geometry-only objectives do not depend on transport profile
+    DOFs; VMEC-boundary columns are pulled with the same raw-block table path used
+    by the geometry AD benchmarks.
+    """
+
+    requested_objectives = tuple(str(name).strip() for name in objective_names)
+    canonical_objectives = normalize_geometry_full_ad_objective_names(requested_objectives)
+    vmec_specs = tuple(spec for spec in parameter_set.specs if isinstance(spec, VmecBoundaryParameterSpec))
+    if not vmec_specs:
+        raise ValueError(
+            "Geometry objectives require at least one VMEC boundary parameter in the optimization "
+            "parameter set. Omit geometry terms for profile-only optimization runs."
+        )
+
+    full_objective_names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    objective_cotangents = jnp.zeros((len(canonical_objectives), len(full_objective_names)), dtype=jnp.float64)
+    for row_i, canonical_name in enumerate(canonical_objectives):
+        objective_cotangents = objective_cotangents.at[row_i, full_objective_names.index(canonical_name)].set(1.0)
+
+    if parameter_values is None:
+        parameter_values_arr = jnp.zeros((len(parameter_set.specs),), dtype=jnp.float64)
+    else:
+        parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
+    if tuple(parameter_values_arr.shape) != (len(parameter_set.specs),):
+        raise ValueError(
+            "geometry_full_ad_reverse_table parameter_values must have shape "
+            f"({len(parameter_set.specs)},); got {tuple(parameter_values_arr.shape)}."
+        )
+    vmec_param_deltas = jnp.asarray(
+        [parameter_values_arr[i] for i, spec in enumerate(parameter_set.specs) if isinstance(spec, VmecBoundaryParameterSpec)],
+        dtype=jnp.float64,
+    )
+
+    values_by_name, vmec_gradient_matrix = geometry_full_ad_objective_table_pullback_from_param_vector(
+        context,
+        vmec_param_deltas,
+        tuple(spec.as_tuple() for spec in vmec_specs),
+        objective_cotangents,
+        objective_names=full_objective_names,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        final_vmec_pullback_mode=final_vmec_pullback_mode,
+        solver_device=solver_device,
+    )
+    objective_values = jnp.stack(
+        [jnp.asarray(values_by_name[name], dtype=jnp.float64).reshape(()) for name in canonical_objectives]
+    )
+    vmec_column_lookup = {spec: column_i for column_i, spec in enumerate(vmec_specs)}
+    jacobian_rows = []
+    for row_i in range(len(requested_objectives)):
+        columns = []
+        for spec in parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                columns.append(jnp.asarray(0.0, dtype=jnp.float64))
+            elif isinstance(spec, VmecBoundaryParameterSpec):
+                columns.append(vmec_gradient_matrix[row_i, vmec_column_lookup[spec]])
+            else:
+                raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
+        jacobian_rows.append(jnp.stack(columns))
+    return ObjectiveTableResult(
+        objective_names=requested_objectives,
+        values=objective_values,
+        jacobian=jnp.stack(jacobian_rows, axis=0),
+    )
+
+
+def geometry_full_ad_reverse_table_backend(
+    *,
+    context,
+    parameter_values=None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    final_vmec_pullback_mode: str = "raw_block_transpose",
+    solver_device: str | None = "default",
+) -> ObjectiveTableBackend:
+    """Return a geometry backend for ``residuals_and_jacobian_reverse_ad``."""
+
+    def _backend(
+        objective_names: tuple[str, ...],
+        parameter_set: ReverseADParameterSet,
+        options: Mapping[str, object],
+    ) -> ObjectiveTableResult:
+        opts = {} if options is None else dict(options)
+        return geometry_full_ad_reverse_table(
+            context=context,
+            parameter_set=parameter_set,
+            objective_names=objective_names,
+            parameter_values=opts.get("parameter_values", parameter_values),
+            lane=str(opts.get("geometry_lane", lane)),
+            max_iter=opts.get("geometry_max_iter", max_iter),
+            step_size=opts.get("geometry_step_size", step_size),
+            final_vmec_pullback_mode=str(
+                opts.get("geometry_final_vmec_pullback_mode", final_vmec_pullback_mode)
+            ),
+            solver_device=opts.get("geometry_solver_device", solver_device),
         )
 
     return _backend

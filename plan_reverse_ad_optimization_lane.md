@@ -508,6 +508,20 @@ Do not introduce Python loops over objectives as the production strategy.
    reduced objects first.
 9. Run one full GPU validation with `--optimization-api-smoke` after the API seams are stable.
 10. Add grouped geometry/QI reverse-table backend using `raw_block_transpose`.
+   Update: `_reverse_ad_optimization.py` now exposes
+   `geometry_full_ad_reverse_table(...)` and `geometry_full_ad_reverse_table_backend(...)`.
+   This is the geometry-only objective-table backend for optimization terms such as QI/maxJ,
+   aspect ratio, iota, well, and mirror. It uses the validated
+   `geometry_full_ad_objective_table_pullback_from_param_vector(...)` path with
+   `final_vmec_pullback_mode="raw_block_transpose"` by default, so the VMEC harmonic
+   pullback matches the geometry benchmark path rather than the non-converged generic adjoint
+   helpers. The backend expects physical VMEC boundary deltas; VMEX-style scaled optimizer
+   coordinates should be converted through the parameterization before this table is called.
+   Update: `benchmark_geometry_vmec_booz_fd_vs_ad.py` now routes
+   `--mode geometry_full_ad_objectives --reverse-derivative-mode objective_table` through
+   `geometry_full_ad_reverse_table(...)` and only adapts the internal table result back to the
+   benchmark's legacy print format. This keeps the benchmark as a validation client of the
+   optimization-facing geometry backend.
 11. Add combined residual/Jacobian assembly for transport + geometry + regularization terms.
 12. Add scalar weighted-loss convenience wrapper as `0.5 * r @ r`.
 13. Only after validation, expose TOML-driven optimization mode.
@@ -549,3 +563,84 @@ Do not introduce Python loops over objectives as the production strategy.
 - Excluding profile DOFs changes only the optimization parameter vector columns. It does not freeze
   profiles inside the physics evaluation; profiles still come from the TOML/baseline state unless
   another selected parameter changes them.
+
+## Benchmark Tools
+
+These are the validation commands to keep available while building the optimization lane.
+
+Geometry full-objective reverse table, AD only:
+
+```bash
+python ./examples/benchmarks/benchmark_geometry_vmec_booz_fd_vs_ad.py \
+  --mode geometry_full_ad_objectives \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --param-specs RBC:1:0,ZBS:1:0 \
+  --fd-rel-step 3e-7 \
+  --fd-abs-step 1e-10 \
+  --ad-backend implicit \
+  --fd-lane ad \
+  --reverse-derivative-mode objective_table \
+  --final-vmec-pullback-mode raw_block_transpose \
+  --skip-fd-check
+```
+
+Frozen-linearized geometry FD check for QI/maxJ-style Boozer objectives:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Frozen-linearized geometry FD check for VMEC-only objectives:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --parameter RBC:1:0 \
+  --objective vmec_iota_mean \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Initial-Er ambipolar-root-only optimization smoke, using the compact payload pullback:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+Two-step realtime transport optimization smoke:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --skip-realtime-geometry-support-bar-diagnostics \
+  --initial-Er-root-ad jax_selected_root \
+  --optimization-api-smoke
+```
