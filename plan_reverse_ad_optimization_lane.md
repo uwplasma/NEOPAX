@@ -540,6 +540,15 @@ Do not introduce Python loops over objectives as the production strategy.
    `softmax_Er`, `smooth_root_proxy`, `Er2_volume_average`, and `Er_volume_average` from a
    caller-supplied TOML/runtime-backed selected-root state builder. It does not run the Radau
    transport time map.
+   Update: the geometry-active root-only compact table path is now internalized as
+   `geometry_active_initial_er_root_only_reverse_table(...)`. It mirrors the benchmark-validated
+   compact path: selected-root objective VJP, compact state residual pullback, compact NTX support
+   pullback, and raw-block realtime geometry payload pullback. The benchmark
+   `--initial-Er-root-only-optimization-smoke` path now calls this internal table builder instead of
+   owning the geometry-active assembly block locally.
+   Update: selected-root setup/residual helpers and runtime geometry/support payload replacement
+   helpers now live in `_reverse_ad_initial_er.py`, with the benchmark delegating through local
+   compatibility wrappers.
 16. Add explicit profile-DOF selection for optimization parameter sets.
    Update: `_reverse_ad_parameters.py` now exposes `reverse_ad_optimization_parameter_set(...)`
    with `include_profiles=True/False`. The realtime-geometry optimization smoke also accepts
@@ -644,3 +653,110 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --initial-Er-root-ad jax_selected_root \
   --optimization-api-smoke
 ```
+
+## First Optimization Script Plan
+
+Target:
+
+- Add a VMEX-style optimization script for geometry-only optimization from
+  `examples/inputs/input.QI_nfp2_initial`.
+- Optimize VMEC boundary harmonics only at first; do not include profile DOFs.
+- Objective terms should include geometry terms such as QI/maxJ, aspect ratio, iota, mirror/well,
+  plus an ambipolarity/transport Er term such as `transport.softmax_Er` targeting max Er `30`.
+
+Hard efficiency invariant:
+
+- One optimizer residual/Jacobian evaluation should do one VMEX implicit geometry solve for the
+  current geometry point.
+- Geometry objective terms must be grouped into one
+  `geometry_full_ad_reverse_table(...)` call, not one call per term.
+- Ambipolarity/transport initial-Er terms must reuse the same geometry state/payload when possible,
+  rather than independently rebuilding VMEX geometry for the Er objective.
+- The production strategy must remain grouped table pullbacks, not Python loops over objective
+  rows.
+
+Validated pieces already available:
+
+- `vmex_boundary_parameterization(...)` and `VmexBoundaryParameterization` in
+  `_reverse_ad_parameters.py` provide VMEX-like packed/scaled boundary DOFs.
+- `geometry_full_ad_reverse_table(...)` in `_reverse_ad_optimization.py` provides the grouped
+  geometry objective table for QI/maxJ/aspect/iota/mirror/well using `raw_block_transpose`.
+- `initial_er_root_only_reverse_table(...)` and
+  `build_initial_er_root_only_least_squares_runner(...)` provide compact selected-root Er objective
+  derivatives without Radau time evolution.
+- `residuals_and_jacobian_reverse_ad(...)`, `assemble_least_squares_result(...)`, and
+  `scalar_loss_and_gradient_from_least_squares(...)` provide the least-squares assembly shell.
+
+Missing implementation pieces:
+
+1. Add a combined geometry + initial-Er-root-only table runner.
+   It should accept one physical VMEC boundary-delta vector and one mixed term list, split terms by
+   family, evaluate grouped geometry rows once, evaluate grouped Er/root rows once, then assemble a
+   single `LeastSquaresEvaluation`.
+2. Add a shared geometry payload boundary for this runner.
+   The first safe version can call the existing validated geometry table and root-only table
+   separately. The next efficiency pass should share the VMEX state/Boozer/NTX payload so QI/maxJ
+   and Er terms do not trigger duplicate geometry solves.
+3. Add scaled-coordinate optimizer bridge.
+   Convert `x_scaled -> physical_deltas` using `VmexBoundaryParameterization.x_scale`, evaluate the
+   physical Jacobian, then return `jac_scaled = jac_physical * x_scale`.
+4. Add an example script:
+   `examples/optimization/optimize_geometry_qi_ambipolar_er.py`.
+   The script should have `--smoke-only` first, then optional SciPy `least_squares` iterations.
+5. Add smoke output.
+   Print residual labels, objective values, scaled/unscaled Jacobian columns, active VMEC labels,
+   and timing. This is the first validation gate before optimizer iterations.
+
+Current implementation status:
+
+- Implemented piece 1 in `_reverse_ad_optimization.py`:
+  `evaluate_geometry_initial_er_root_only_least_squares(...)` and
+  `build_geometry_initial_er_root_only_least_squares_runner(...)`.
+- The combined runner preserves the validated grouped behavior:
+  geometry terms are sent to `geometry_full_ad_reverse_table_backend(...)` and initial-Er terms are
+  sent to `initial_er_root_only_reverse_table(...)`.
+- Implemented piece 3's generic column-scaling adapter:
+  `scale_least_squares_evaluation_columns(...)` and
+  `build_scaled_parameter_least_squares_runner(...)`.
+- The current combined runner is the first safe version from piece 2: it composes the two validated
+  grouped tables and does not yet share the VMEX state/Boozer/NTX payload between geometry and
+  initial-Er terms.
+
+Suggested first script term shape:
+
+```python
+terms = [
+    (geometry.qi, 0.0, QI_WEIGHT),
+    (geometry.maxj, 0.0, MAXJ_WEIGHT),
+    (geometry.aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
+    (geometry.iota, IOTA_TARGET, IOTA_WEIGHT),
+    (geometry.mirror, MIRROR_TARGET, MIRROR_WEIGHT),
+    (transport.softmax_Er, 30.0, ER_WEIGHT),
+]
+```
+
+Validation sequence for the script:
+
+1. Run `--smoke-only` with a tiny packed geometry set, e.g. max mode 1.
+2. Compare selected geometry columns against
+   `compare_geometry_qi_frozen_linearized_fd.py` for `boozer_qi_objective`,
+   `boozer_maxj_objective`, `vmec_iota_mean`, and `vmec_mirror_ratio`.
+3. Compare selected Er column against the root-only optimization smoke for `softmax_Er`.
+4. Only then enable optimizer iterations.
+## 2026-07-29 Internal Transport Reverse Smoke
+
+- Ported the full realtime-geometry transport reverse AD execution seam into `NEOPAX._reverse_ad_transport`: profile/root state construction, lagged-response-aware initial carry custom VJP, reverse static Radau setup, default compact support-cotangent dependencies, and the raw-block VMEC payload table-result builder.
+- Added `examples/optimization/transport_realtime_geometry_reverse_smoke.py` as a benchmark-free optimization smoke entry point. It calls the internal table-result builder and the optimization least-squares shell directly.
+- Intended 2 accepted-step smoke command:
+
+```bash
+python ./examples/optimization/transport_realtime_geometry_reverse_smoke.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --accepted-step-limit 2 \
+  --reverse-segment-length 1 \
+  --initial-Er-root-ad jax_selected_root
+```
+
+- Local Windows compile passed for the touched files. A cheap runtime `--help` import was not possible in this shell because this environment is missing `tomli/toml`; run the smoke in the JAX/NEOPAX environment.

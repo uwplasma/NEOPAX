@@ -18,14 +18,27 @@ import jax
 import jax.numpy as jnp
 
 from ._reverse_ad_parameters import (
+    PROFILE_PARAMETER_ORDER,
     ProfileParameterSpec,
     ReverseADParameterSet,
     VmecBoundaryParameterSpec,
     parameter_labels,
 )
+from ._transport_flux_models import _add_float_delta_tree, _float_delta_tree_like
 from ._geometry_autodiff import (
     geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_names_for_kind,
+)
+from ._reverse_ad_initial_er import (
+    compact_initial_er_ntx_support_pullback_leaves,
+    compact_initial_er_state_pullback,
+    find_ntx_support_payload,
+    initial_er_charge_flux_residual_er_derivative,
+    initial_er_charge_flux_residual_scalar,
+    initial_er_charge_flux_residuals,
+    initial_er_selected_root_profile,
+    runtime_with_geometry_payload,
+    runtime_with_ntx_support_payload,
 )
 from ._reverse_ad_transport import (
     RealtimeGeometryTransportReverseTableContext,
@@ -35,6 +48,7 @@ from ._reverse_ad_transport import (
     TransportReverseReportRunner,
     TransportReverseTableResultBuilder,
     normalize_transport_objective_names,
+    realtime_geometry_transport_reverse_table_from_payload_cotangents,
     realtime_geometry_transport_reverse_table_request,
     transport_realtime_geometry_reverse_table,
 )
@@ -140,6 +154,10 @@ TransportRealtimeGeometryLeastSquaresRunner = Callable[
 ]
 InitialErRootOnlyStateBuilder = Callable[[object], object]
 InitialErRootOnlyLeastSquaresRunner = Callable[
+    [object, Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
+    LeastSquaresEvaluation,
+]
+GeometryInitialErRootOnlyLeastSquaresRunner = Callable[
     [object, Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
     LeastSquaresEvaluation,
 ]
@@ -616,6 +634,418 @@ def build_initial_er_root_only_least_squares_runner(
             terms=normalized_terms,
             options=runner_options,
         )
+
+    return _runner
+
+
+def _add_trees(lhs, rhs):
+    if lhs is None:
+        return rhs
+    if rhs is None:
+        return lhs
+    return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+
+def geometry_active_initial_er_root_only_reverse_table(
+    *,
+    config: Mapping[str, object],
+    objective_names: Sequence[str] | str,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    runtime,
+    profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    geometry_context,
+    baseline_geometry_deltas,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "vmec",
+    max_iter: int | None = None,
+    solver_device: str | None = "default",
+    progress_label: str | None = None,
+) -> ObjectiveTableResult:
+    """Return compact initial-Er objective table for active realtime geometry.
+
+    This is the internalized version of the benchmark's geometry-active
+    `--initial-Er-root-only-optimization-smoke` path.  It keeps the selected
+    ambipolar branch fixed, uses the compact root residual transposes, and maps
+    geometry/support payload cotangents to VMEC boundary columns with the same
+    raw-block payload pullback used by the realtime reverse benchmark.
+    """
+
+    requested_objectives = normalize_initial_er_root_only_objective_names(objective_names)
+    parameter_values_arr = jnp.asarray(parameter_values)
+    profile_values_arr = jnp.asarray(profile_values)
+    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
+    if not vmec_specs:
+        raise ValueError("geometry_active_initial_er_root_only_reverse_table requires VMEC boundary parameters.")
+    if parameter_values_arr.ndim != 1 or int(parameter_values_arr.shape[0]) != len(parameter_set.specs):
+        raise ValueError(
+            "parameter_values must be a 1D vector matching the reverse-AD parameter set; "
+            f"got shape={parameter_values_arr.shape}, parameter_count={len(parameter_set.specs)}."
+        )
+    baseline_geometry_deltas = jnp.asarray(baseline_geometry_deltas, dtype=jnp.float64)
+    if baseline_geometry_deltas.ndim != 1 or int(baseline_geometry_deltas.shape[0]) != len(vmec_specs):
+        raise ValueError(
+            "baseline_geometry_deltas must match VMEC boundary parameter count; "
+            f"got shape={baseline_geometry_deltas.shape}, vmec_parameter_count={len(vmec_specs)}."
+        )
+
+    support_payload = find_ntx_support_payload(runtime)
+    if not isinstance(support_payload, dict):
+        support_payload = {
+            "geometry": runtime.geometry,
+            "ntx_support": support_payload,
+        }
+    baseline_geometry = support_payload["geometry"]
+    baseline_ntx_support = support_payload["ntx_support"]
+    geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+
+    pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
+    er_profile, finite_mask = initial_er_selected_root_profile(
+        pre_root_state,
+        config=dict(config),
+        runtime=runtime,
+    )
+    er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
+    finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+
+    def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        return _initial_er_root_only_objective_values(
+            state_value,
+            runtime_with_geometry,
+            requested_objectives,
+        )
+
+    objective_values, objective_pullback = jax.vjp(
+        _values_from_rooted_state_and_geometry,
+        rooted_state,
+        geometry_delta0,
+    )
+    objective_count = len(requested_objectives)
+    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
+    rooted_state_bars, direct_geometry_bars = jax.vmap(
+        lambda cotangent: objective_pullback(cotangent)
+    )(objective_basis)
+
+    dres_der = initial_er_charge_flux_residual_er_derivative(
+        pre_root_state,
+        er_profile,
+        runtime=runtime,
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+        dres_der,
+        jnp.inf,
+    )
+    residual_bars = jnp.where(
+        finite_mask[None, :],
+        -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
+        0.0,
+    )
+    state_residual_bars = compact_initial_er_state_pullback(
+        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        runtime=runtime,
+    )
+    direct_pre_root_state_bars = dataclasses.replace(
+        rooted_state_bars,
+        Er=jnp.zeros_like(rooted_state_bars.Er),
+    )
+    pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
+
+    profile_specs = tuple(parameter_set.profile_specs)
+    if profile_specs:
+        _, profile_pullback = jax.vjp(
+            pre_root_state_from_profile_values,
+            profile_values_arr,
+        )
+        profile_gradient_all = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
+            pre_root_state_bars
+        )
+    else:
+        profile_gradient_all = jnp.zeros((objective_count, 0), dtype=jnp.asarray(objective_values).dtype)
+    canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+    if profile_specs:
+        profile_gradient_matrix_for_payload = jnp.stack(
+            [profile_gradient_all[:, canonical_profile_lookup[spec.name]] for spec in profile_specs],
+            axis=1,
+        )
+    else:
+        profile_gradient_matrix_for_payload = profile_gradient_all
+
+    def _residuals_from_geometry_delta(geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        return initial_er_charge_flux_residuals(
+            pre_root_state,
+            er_profile,
+            runtime=runtime_with_geometry,
+        )
+
+    _, geometry_residual_pullback = jax.vjp(
+        _residuals_from_geometry_delta,
+        geometry_delta0,
+    )
+    residual_geometry_bars = jax.vmap(
+        lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
+    )(residual_bars)
+    geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
+
+    ntx_runtime = runtime_with_geometry_payload(runtime, baseline_geometry)
+    ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
+        runtime=ntx_runtime,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        support=baseline_ntx_support,
+    )
+    _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
+    ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
+    support_bars = []
+    for objective_index in range(objective_count):
+        geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
+        ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
+        support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
+
+    geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
+    assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+        objective_labels=requested_objectives,
+        profile_parameter_labels=tuple(spec.name for spec in profile_specs),
+        geometry_parameter_labels=tuple(spec.label for spec in vmec_specs),
+        objective_values=objective_values,
+        profile_gradient_matrix=profile_gradient_matrix_for_payload,
+        geometry_context=geometry_context,
+        baseline_geometry_deltas=baseline_geometry_deltas,
+        geometry_param_specs=geometry_param_tuples,
+        support_bars=tuple(support_bars),
+        support_component_bars_by_name={},
+        include_component_pullbacks=False,
+        combined_geometry_payload=True,
+        n_r=int(n_r),
+        n_theta=int(n_theta),
+        n_zeta=int(n_zeta),
+        n_xi=int(n_xi),
+        surface_backend=str(surface_backend),
+        max_iter=max_iter,
+        solver_device=solver_device,
+        progress_label=progress_label,
+    )
+
+    geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
+    profile_gradient_matrix = jnp.asarray(assembly_result.table_result.profile_gradient_matrix)
+    jacobian_rows = []
+    profile_lookup = {spec.name: i for i, spec in enumerate(profile_specs)}
+    geometry_lookup = {spec.label: i for i, spec in enumerate(vmec_specs)}
+    for _row_i in range(objective_count):
+        columns = []
+        for spec in parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                columns.append(profile_gradient_matrix[_row_i, profile_lookup[spec.name]])
+            elif isinstance(spec, VmecBoundaryParameterSpec):
+                columns.append(geometry_gradient_matrix[_row_i, geometry_lookup[spec.label]])
+            else:
+                raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
+        jacobian_rows.append(jnp.stack(columns))
+
+    return ObjectiveTableResult(
+        objective_names=requested_objectives,
+        values=objective_values,
+        jacobian=jnp.stack(jacobian_rows, axis=0),
+    )
+
+
+def evaluate_geometry_initial_er_root_only_least_squares(
+    config: Mapping[str, object],
+    *,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    geometry_context,
+    runtime=None,
+    rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder | None = None,
+    options: Mapping[str, object] | None = None,
+    root_options: Mapping[str, object] | None = None,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_final_vmec_pullback_mode: str = "raw_block_transpose",
+    geometry_solver_device: str | None = "default",
+) -> LeastSquaresEvaluation:
+    """Evaluate grouped geometry objectives plus initial-Er root objectives.
+
+    This is the optimization-facing composition layer.  It intentionally routes
+    each family through the already validated grouped reverse table backend:
+    one geometry table for all requested VMEC/Boozer objectives and one compact
+    initial-Er table for all requested Er-root objectives.
+    """
+
+    normalized_terms = normalize_least_squares_terms(terms)
+    grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+    unsupported_families = tuple(
+        family for family in grouped_terms if family not in {"geometry", "transport"}
+    )
+    if unsupported_families:
+        raise NotImplementedError(
+            "evaluate_geometry_initial_er_root_only_least_squares supports only "
+            f"geometry and transport/initial-Er terms; got families {unsupported_families!r}."
+        )
+    if "transport" in grouped_terms and (runtime is None or rooted_state_from_parameter_vector is None):
+        raise ValueError(
+            "Transport initial-Er terms require both runtime and "
+            "rooted_state_from_parameter_vector."
+        )
+
+    parameter_values_arr = jnp.asarray(parameter_values)
+    backend_options = {} if options is None else dict(options)
+    backend_options.setdefault("parameter_values", parameter_values_arr)
+    backends: dict[ObjectiveFamily, ObjectiveTableBackend] = {}
+    if "geometry" in grouped_terms:
+        backends["geometry"] = geometry_full_ad_reverse_table_backend(
+            context=geometry_context,
+            parameter_values=parameter_values_arr,
+            lane=geometry_lane,
+            max_iter=geometry_max_iter,
+            step_size=geometry_step_size,
+            final_vmec_pullback_mode=geometry_final_vmec_pullback_mode,
+            solver_device=geometry_solver_device,
+        )
+    if "transport" in grouped_terms:
+        root_runner_options = {} if root_options is None else dict(root_options)
+
+        def _transport_backend(
+            objective_names: tuple[str, ...],
+            parameter_set_inner: ReverseADParameterSet,
+            options_inner: Mapping[str, object],
+        ) -> ObjectiveTableResult:
+            del options_inner
+            request = InitialErRootOnlyReverseTableRequest(
+                objective_names=normalize_initial_er_root_only_objective_names(objective_names),
+                parameter_set=parameter_set_inner,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                rooted_state_from_parameter_vector=rooted_state_from_parameter_vector,
+                options=root_runner_options,
+            )
+            return initial_er_root_only_reverse_table(request)
+
+        backends["transport"] = _transport_backend
+
+    t_start = time.perf_counter()
+    result = residuals_and_jacobian_reverse_ad(
+        config,
+        parameter_set=parameter_set,
+        terms=normalized_terms,
+        backends=backends,
+        options=backend_options,
+    )
+    residuals = jax.block_until_ready(result.residuals)
+    jacobian = jax.block_until_ready(result.jacobian)
+    elapsed_s = time.perf_counter() - t_start
+    return LeastSquaresEvaluation(
+        result=result,
+        residuals=residuals,
+        jacobian=jacobian,
+        elapsed_s=float(elapsed_s),
+    )
+
+
+def build_geometry_initial_er_root_only_least_squares_runner(
+    config: Mapping[str, object],
+    *,
+    parameter_set: ReverseADParameterSet,
+    geometry_context,
+    runtime=None,
+    rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder | None = None,
+    options: Mapping[str, object] | None = None,
+    root_options: Mapping[str, object] | None = None,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_final_vmec_pullback_mode: str = "raw_block_transpose",
+    geometry_solver_device: str | None = "default",
+) -> GeometryInitialErRootOnlyLeastSquaresRunner:
+    """Build a runner for geometry terms and initial-Er root-only transport terms."""
+
+    runner_options = {} if options is None else dict(options)
+    runner_root_options = {} if root_options is None else dict(root_options)
+
+    def _runner(
+        parameter_values,
+        terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    ) -> LeastSquaresEvaluation:
+        return evaluate_geometry_initial_er_root_only_least_squares(
+            config,
+            parameter_set=parameter_set,
+            parameter_values=parameter_values,
+            terms=terms,
+            geometry_context=geometry_context,
+            runtime=runtime,
+            rooted_state_from_parameter_vector=rooted_state_from_parameter_vector,
+            options=runner_options,
+            root_options=runner_root_options,
+            geometry_lane=geometry_lane,
+            geometry_max_iter=geometry_max_iter,
+            geometry_step_size=geometry_step_size,
+            geometry_final_vmec_pullback_mode=geometry_final_vmec_pullback_mode,
+            geometry_solver_device=geometry_solver_device,
+        )
+
+    return _runner
+
+
+def scale_least_squares_evaluation_columns(
+    evaluation: LeastSquaresEvaluation,
+    column_scale,
+) -> LeastSquaresEvaluation:
+    """Scale Jacobian columns for an optimizer parameterization.
+
+    If the inner runner differentiates with respect to physical deltas
+    ``p = scale * x``, the optimizer-facing Jacobian with respect to ``x`` is
+    ``J_p * scale``.
+    """
+
+    jacobian_physical = jnp.asarray(evaluation.jacobian)
+    scale = jnp.asarray(column_scale, dtype=jacobian_physical.dtype)
+    if scale.ndim != 1:
+        raise ValueError(f"column_scale must be one-dimensional; got shape={scale.shape}.")
+    if jacobian_physical.ndim != 2:
+        raise ValueError(f"least-squares jacobian must be two-dimensional; got shape={jacobian_physical.shape}.")
+    if int(scale.shape[0]) != int(jacobian_physical.shape[1]):
+        raise ValueError(
+            "column_scale length must match the least-squares jacobian parameter count; "
+            f"got scale.shape={scale.shape}, jacobian.shape={jacobian_physical.shape}."
+        )
+    jacobian = jacobian_physical * scale[jnp.newaxis, :]
+    result = dataclasses.replace(evaluation.result, jacobian=jacobian)
+    return dataclasses.replace(evaluation, result=result, jacobian=jacobian)
+
+
+def build_scaled_parameter_least_squares_runner(
+    runner: GeometryInitialErRootOnlyLeastSquaresRunner | InitialErRootOnlyLeastSquaresRunner,
+    *,
+    column_scale,
+):
+    """Wrap a physical-parameter runner with optimizer-scaled parameters."""
+
+    scale = jnp.asarray(column_scale, dtype=jnp.float64)
+
+    def _runner(
+        scaled_parameter_values,
+        terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    ) -> LeastSquaresEvaluation:
+        physical_parameter_values = jnp.asarray(scaled_parameter_values, dtype=scale.dtype) * scale
+        evaluation = runner(physical_parameter_values, terms)
+        return scale_least_squares_evaluation_columns(evaluation, scale)
 
     return _runner
 

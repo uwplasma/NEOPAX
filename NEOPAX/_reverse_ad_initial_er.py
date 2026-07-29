@@ -7,6 +7,8 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 
+from ._ambipolarity import solve_ambipolarity_roots_radial_jax
+from ._entropy_models import get_entropy_model
 from ._transport_flux_models import (
     DENSITY_STATE_TO_PHYSICAL,
     _add_float_delta_tree,
@@ -21,6 +23,187 @@ from ._transport_flux_models import (
     get_v_thermal,
     safe_density,
 )
+
+
+def initial_er_root_setup(config: dict, runtime):
+    """Return the TOML/runtime-backed setup for selected ambipolar-Er AD."""
+
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    # Keep the production TOML unchanged, but use JAX-side chunking for the
+    # AD boundary so the root profile stays traced without fusing all radii and
+    # scan points into one large NTX kernel.
+    amb_cfg["er_ambipolar_blocksize"] = int(amb_cfg.get("er_ambipolar_blocksize", 1) or 1)
+    amb_cfg["er_ambipolar_scan_batch_mode"] = "hybrid"
+    model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
+    entropy_model_name = config.get("neoclassical", {}).get(
+        "entropy_model",
+        runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
+    )
+    entropy_model = get_entropy_model(entropy_model_name)
+    params = {
+        "species": runtime.species,
+        "energy_grid": runtime.energy_grid,
+        "geometry": runtime.geometry,
+        "database": runtime.database,
+        "solver_parameters": runtime.solver_parameters,
+    }
+    return amb_cfg, model_name, entropy_model, params
+
+
+def initial_er_selected_root_profile(state, *, config: dict, runtime):
+    """Return the selected ambipolar Er profile and finite-root mask."""
+
+    amb_cfg, model_name, entropy_model, params = initial_er_root_setup(config, runtime)
+    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
+        state=state,
+        config=config,
+        params=params,
+        model_name=model_name,
+        flux_model=runtime.models.flux,
+        entropy_model=entropy_model,
+        amb_cfg=amb_cfg,
+    )
+    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
+    finite_mask = jnp.isfinite(best_roots)
+    return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+
+
+def initial_er_charge_flux_residuals(state, er_profile, *, runtime):
+    """Return charge-weighted particle-flux residuals at the selected root."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+
+    def _residual_i(i):
+        gamma = local_particle_flux(i, er_profile[i])
+        return jnp.sum(charge_qp * gamma)
+
+    indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
+    return jax.lax.map(_residual_i, indices)
+
+
+def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
+    """Return one scalar charge-flux residual for compact transposition."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+    gamma = local_particle_flux(radius_index, er_profile[radius_index])
+    return jnp.sum(charge_qp * gamma)
+
+
+def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
+    """Return d residual / d Er at each radius for selected-root AD."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+
+    def _residual_i_er(i, er_value):
+        er_eval = er_profile.at[i].set(er_value)
+        state_with_er = dataclasses.replace(state, Er=er_eval)
+        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+        if local_particle_flux is None:
+            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+        gamma = local_particle_flux(i, er_value)
+        return jnp.sum(charge_qp * gamma)
+
+    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+    return jax.lax.map(
+        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+        indices,
+    )
+
+
+def _replace_ntx_support_payload_in_model(model, support):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if hasattr(model, "with_support_payload"):
+        return model.with_support_payload(support), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_ntx_support_payload_in_model(value, support)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def runtime_with_ntx_support_payload(runtime, support):
+    """Return runtime with an explicit NTX exact-runtime support payload."""
+
+    flux_model, changed = _replace_ntx_support_payload_in_model(runtime.models.flux, support)
+    if not changed:
+        raise ValueError("Could not find an NTX exact-runtime model that accepts an explicit support payload.")
+    return dataclasses.replace(
+        runtime,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def _replace_geometry_payload_in_model(model, geometry):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if field.name in {"geometry", "field"}:
+            if value is not geometry:
+                updates[field.name] = geometry
+                changed = True
+            continue
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_geometry_payload_in_model(value, geometry)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def runtime_with_geometry_payload(runtime, geometry):
+    """Return runtime with transport geometry payload replaced everywhere needed."""
+
+    flux_model, _changed = _replace_geometry_payload_in_model(runtime.models.flux, geometry)
+    return dataclasses.replace(
+        runtime,
+        geometry=geometry,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def find_ntx_support_payload_in_model(model):
+    """Return the nested NTX support payload from a flux model."""
+
+    support = getattr(model, "support", None)
+    if support is not None and hasattr(model, "with_support_payload"):
+        return support
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_support_payload_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def find_ntx_support_payload(runtime):
+    """Return the preloaded NTX exact-runtime support payload from a runtime."""
+
+    support = find_ntx_support_payload_in_model(runtime.models.flux)
+    if support is None:
+        raise ValueError("No preloaded NTX exact-runtime support payload was found in the realtime runtime.")
+    return support
 
 
 def find_ntx_exact_support_model(model):

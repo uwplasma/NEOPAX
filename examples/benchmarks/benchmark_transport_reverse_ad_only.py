@@ -36,14 +36,20 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
     build_geometry_autodiff_context,
 )
-from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial_jax  # noqa: E402
-from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     compact_initial_er_state_pullback,
     compact_initial_er_ntx_support_pullback_leaves,
     find_ntx_exact_support_model,
+    find_ntx_support_payload as _core_find_ntx_support_payload,
+    initial_er_charge_flux_residual_er_derivative as _core_initial_er_charge_flux_residual_er_derivative,
+    initial_er_charge_flux_residual_scalar as _core_initial_er_charge_flux_residual_scalar,
+    initial_er_charge_flux_residuals as _core_initial_er_charge_flux_residuals,
+    initial_er_root_setup as _core_initial_er_root_setup,
+    initial_er_selected_root_profile as _core_initial_er_selected_root_profile,
+    runtime_with_geometry_payload as _core_runtime_with_geometry_payload,
+    runtime_with_ntx_support_payload as _core_runtime_with_ntx_support_payload,
 )
 from NEOPAX._reverse_ad_parameters import (  # noqa: E402
     VmecBoundaryParameterSpec,
@@ -56,11 +62,10 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    geometry_active_initial_er_root_only_reverse_table,
     LeastSquaresEvaluation,
     INITIAL_ER_ROOT_ONLY_OBJECTIVES,
-    ObjectiveTableResult,
     residuals_and_jacobian_reverse_ad,
-    _initial_er_root_only_objective_values,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
@@ -145,86 +150,31 @@ def _initial_er_root_enabled(config: dict[str, Any], mode: str) -> bool:
 
 
 def _initial_er_root_setup(config: dict[str, Any], runtime):
-    amb_cfg = dict(config.get("ambipolarity", {}))
-    # Keep the production TOML unchanged, but use JAX-side chunking for the
-    # opt-in AD boundary so the root profile stays traced without fusing all
-    # radii and all scan points into one large NTX kernel.
-    amb_cfg["er_ambipolar_blocksize"] = int(amb_cfg.get("er_ambipolar_blocksize", 1) or 1)
-    amb_cfg["er_ambipolar_scan_batch_mode"] = "hybrid"
-    model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
-    entropy_model_name = config.get("neoclassical", {}).get(
-        "entropy_model",
-        runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
-    )
-    entropy_model = get_entropy_model(entropy_model_name)
-    params = {
-        "species": runtime.species,
-        "energy_grid": runtime.energy_grid,
-        "geometry": runtime.geometry,
-        "database": runtime.database,
-        "solver_parameters": runtime.solver_parameters,
-    }
-    return amb_cfg, model_name, entropy_model, params
+    return _core_initial_er_root_setup(config, runtime)
 
 
 def _initial_er_selected_root_profile(state, *, config: dict[str, Any], runtime):
-    amb_cfg, model_name, entropy_model, params = _initial_er_root_setup(config, runtime)
-    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
-        state=state,
-        config=config,
-        params=params,
-        model_name=model_name,
-        flux_model=runtime.models.flux,
-        entropy_model=entropy_model,
-        amb_cfg=amb_cfg,
-    )
-    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
-    finite_mask = jnp.isfinite(best_roots)
-    return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+    return _core_initial_er_selected_root_profile(state, config=config, runtime=runtime)
 
 
 def _initial_er_charge_flux_residuals(state, er_profile, *, runtime):
-    charge_qp = jnp.asarray(runtime.species.charge_qp)
-    state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
-    if local_particle_flux is None:
-        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
-
-    def _residual_i(i):
-        gamma = local_particle_flux(i, er_profile[i])
-        return jnp.sum(charge_qp * gamma)
-
-    indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
-    return jax.lax.map(_residual_i, indices)
+    return _core_initial_er_charge_flux_residuals(state, er_profile, runtime=runtime)
 
 
 def _initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
-    charge_qp = jnp.asarray(runtime.species.charge_qp)
-    state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
-    if local_particle_flux is None:
-        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
-    gamma = local_particle_flux(radius_index, er_profile[radius_index])
-    return jnp.sum(charge_qp * gamma)
+    return _core_initial_er_charge_flux_residual_scalar(
+        state,
+        er_profile,
+        radius_index,
+        runtime=runtime,
+    )
 
 
 def _initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
-    charge_qp = jnp.asarray(runtime.species.charge_qp)
-    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
-
-    def _residual_i_er(i, er_value):
-        er_eval = er_profile.at[i].set(er_value)
-        state_with_er = dataclasses.replace(state, Er=er_eval)
-        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
-        if local_particle_flux is None:
-            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
-        gamma = local_particle_flux(i, er_value)
-        return jnp.sum(charge_qp * gamma)
-
-    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
-    return jax.lax.map(
-        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
-        indices,
+    return _core_initial_er_charge_flux_residual_er_derivative(
+        state,
+        er_profile,
+        runtime=runtime,
     )
 
 
@@ -386,13 +336,7 @@ def _replace_ntx_support_payload_in_model(model, support):
 
 
 def _runtime_with_ntx_support_payload(runtime, support):
-    flux_model, changed = _replace_ntx_support_payload_in_model(runtime.models.flux, support)
-    if not changed:
-        raise ValueError("Could not find an NTX exact-runtime model that accepts an explicit support payload.")
-    return dataclasses.replace(
-        runtime,
-        models=dataclasses.replace(runtime.models, flux=flux_model),
-    )
+    return _core_runtime_with_ntx_support_payload(runtime, support)
 
 
 def _replace_geometry_payload_in_model(model, geometry):
@@ -418,12 +362,7 @@ def _replace_geometry_payload_in_model(model, geometry):
 
 
 def _runtime_with_geometry_payload(runtime, geometry):
-    flux_model, _changed = _replace_geometry_payload_in_model(runtime.models.flux, geometry)
-    return dataclasses.replace(
-        runtime,
-        geometry=geometry,
-        models=dataclasses.replace(runtime.models, flux=flux_model),
-    )
+    return _core_runtime_with_geometry_payload(runtime, geometry)
 
 
 def _find_ntx_support_payload_in_model(model):
@@ -439,10 +378,7 @@ def _find_ntx_support_payload_in_model(model):
 
 
 def _find_ntx_support_payload(runtime):
-    support = _find_ntx_support_payload_in_model(runtime.models.flux)
-    if support is None:
-        raise ValueError("No preloaded NTX exact-runtime support payload was found in the realtime runtime.")
-    return support
+    return _core_find_ntx_support_payload(runtime)
 
 
 def _find_ntx_exact_support_model(model):
@@ -3538,17 +3474,6 @@ def _run_initial_er_root_only_optimization_api_smoke(
         )
         evaluation = runner(parameter_values, terms)
     else:
-        support_payload = _find_ntx_support_payload(baseline_runtime)
-        if not isinstance(support_payload, dict):
-            support_payload = {
-                "geometry": baseline_runtime.geometry,
-                "ntx_support": support_payload,
-            }
-        baseline_geometry = support_payload["geometry"]
-        baseline_ntx_support = support_payload["ntx_support"]
-        geometry_delta0 = _float_delta_tree_like(baseline_geometry)
-        profile_dim = len(PARAMETER_ORDER) if include_profile_dofs else 0
-        geometry_param_labels = tuple(_format_geometry_param_spec(spec) for spec in geometry_param_specs)
         baseline_geometry_deltas = _baseline_geometry_delta_vector_for_specs(
             geom_cfg,
             geometry_param_specs,
@@ -3564,125 +3489,16 @@ def _run_initial_er_root_only_optimization_api_smoke(
                 runtime=baseline_runtime,
             )
 
-        pre_root_state = _pre_root_state_from_profile_values(profile_values0)
-        er_profile, finite_mask = _initial_er_selected_root_profile(
-            pre_root_state,
+        table_result = geometry_active_initial_er_root_only_reverse_table(
             config=config,
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            parameter_values=parameter_values,
             runtime=baseline_runtime,
-        )
-        er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
-        finite_mask = jnp.asarray(finite_mask, dtype=bool)
-        rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
-
-        def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
-            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
-            runtime = _runtime_with_ntx_support_payload(runtime, baseline_ntx_support)
-            return _initial_er_root_only_objective_values(
-                state_value,
-                runtime,
-                objective_names,
-            )
-
-        profile_objective_values, objective_pullback = jax.vjp(
-            _values_from_rooted_state_and_geometry,
-            rooted_state,
-            geometry_delta0,
-        )
-        objective_count = len(objective_names)
-        objective_basis = jnp.eye(objective_count, dtype=profile_objective_values.dtype)
-        rooted_state_bars, direct_geometry_bars = jax.vmap(
-            lambda cotangent: objective_pullback(cotangent)
-        )(objective_basis)
-
-        dres_der = _initial_er_charge_flux_residual_er_derivative(
-            pre_root_state,
-            er_profile,
-            runtime=baseline_runtime,
-        )
-        safe_dres_der = jnp.where(
-            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
-            dres_der,
-            jnp.inf,
-        )
-        residual_bars = jnp.where(
-            finite_mask[None, :],
-            -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
-            0.0,
-        )
-        state_residual_bars = compact_initial_er_state_pullback(
-            residual_scalar_fn=_initial_er_charge_flux_residual_scalar,
-            state=pre_root_state,
-            er_profile=er_profile,
-            residual_bars=residual_bars,
-            runtime=baseline_runtime,
-        )
-        direct_pre_root_state_bars = dataclasses.replace(
-            rooted_state_bars,
-            Er=jnp.zeros_like(rooted_state_bars.Er),
-        )
-        pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
-
-        if include_profile_dofs:
-            _, profile_pullback = jax.vjp(
-                _pre_root_state_from_profile_values,
-                profile_values0,
-            )
-            profile_gradient_matrix = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
-                pre_root_state_bars
-            )
-        else:
-            profile_gradient_matrix = jnp.zeros(
-                (objective_count, 0),
-                dtype=profile_objective_values.dtype,
-            )
-
-        def _residuals_from_geometry_delta(geometry_delta):
-            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-            runtime = _runtime_with_geometry_payload(baseline_runtime, geometry)
-            runtime = _runtime_with_ntx_support_payload(runtime, baseline_ntx_support)
-            return _initial_er_charge_flux_residuals(
-                pre_root_state,
-                er_profile,
-                runtime=runtime,
-            )
-
-        _, geometry_residual_pullback = jax.vjp(
-            _residuals_from_geometry_delta,
-            geometry_delta0,
-        )
-        residual_geometry_bars = jax.vmap(
-            lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
-        )(residual_bars)
-        geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
-        ntx_runtime = _runtime_with_geometry_payload(baseline_runtime, baseline_geometry)
-        ntx_bar_leaves = _compact_initial_er_ntx_support_pullback_leaves(
-            runtime=ntx_runtime,
-            state=pre_root_state,
-            er_profile=er_profile,
-            residual_bars=residual_bars,
-            support=baseline_ntx_support,
-        )
-        _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
-        ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
-        support_bars = []
-        for objective_index in range(objective_count):
-            geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
-            ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
-            support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
-        assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
-            objective_labels=objective_names,
-            profile_parameter_labels=PARAMETER_ORDER[:profile_dim],
-            geometry_parameter_labels=geometry_param_labels,
-            objective_values=profile_objective_values,
-            profile_gradient_matrix=profile_gradient_matrix,
+            profile_values=profile_values0,
+            pre_root_state_from_profile_values=_pre_root_state_from_profile_values,
             geometry_context=geometry_context,
             baseline_geometry_deltas=baseline_geometry_deltas,
-            geometry_param_specs=geometry_param_specs,
-            support_bars=tuple(support_bars),
-            support_component_bars_by_name={},
-            include_component_pullbacks=False,
-            combined_geometry_payload=True,
             n_r=int(geom_cfg.get("n_radial", 51)),
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
@@ -3691,17 +3507,6 @@ def _run_initial_er_root_only_optimization_api_smoke(
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] initial-Er root-only geometry payload pullback:",
-        )
-        table_result = ObjectiveTableResult(
-            objective_names=tuple(objective_names),
-            values=profile_objective_values,
-            jacobian=jnp.concatenate(
-                (
-                    assembly_result.table_result.profile_gradient_matrix,
-                    assembly_result.table_result.geometry_gradient_matrix,
-                ),
-                axis=1,
-            ),
         )
         t_eval = time.perf_counter()
         result = residuals_and_jacobian_reverse_ad(

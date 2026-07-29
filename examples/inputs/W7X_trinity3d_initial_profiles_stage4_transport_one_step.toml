@@ -7,8 +7,8 @@
 mode = "transport"
 
 [geometry]
-vmec_file = "../../outputs/quick_run/stage1_equilibrium/wout_w7x_t3d.nc"
-boozer_file = "../../outputs/quick_run/stage2_boozer/boozmn_w7x_t3d.nc"
+vmec_file = "./examples/inputs/wout_w7x.nc"
+boozer_file = "./examples/inputs/boozmn_w7x.nc"
 n_radial = 9
 rho_edge = 0.7
 
@@ -18,7 +18,8 @@ entropy_model = "none"
 
 [turbulence]
 flux_model = "fluxes_r_file"
-turbulence_file = "../../outputs/quick_run/stage4_turbulence/neopax_fluxes.h5"
+turbulence_file = "./examples/inputs/neopax_fluxes_w7x_t3d.h5"
+lagged_response_mode = "fd"
 
 [classical]
 flux_model = "none"
@@ -57,7 +58,7 @@ type = "dirichlet"
 
 [boundary.density.right.value]
 e = 0.29
-H = 0.29
+ion = 0.29
 
 [boundary.temperature.left]
 type = "neumann"
@@ -70,7 +71,7 @@ type = "dirichlet"
 
 [boundary.temperature.right.value]
 e = 0.8
-H = 0.8
+ion = 0.8
 
 [boundary.Er.left]
 type = "dirichlet"
@@ -94,19 +95,20 @@ density_floor = 1.0e-3
 temperature_floor = 1.0e-3
 transport_solver_backend = "radau"
 integrator = "radau"
+radau_rhs_mode = "lagged_response"
 radau_num_stages = 7
 radau_error_estimator = "embedded2"
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
 t0 = 0.0
 t_final = 20.0
-dt = 10.
+dt = 10.0
 rtol = 1.0e-6
 atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
-stop_after_accepted_steps = 1
+stop_after_accepted_steps = 10
 throw = false
 debug_stage_markers = true
 debug_disable_jit = false

@@ -7686,19 +7686,21 @@ def read_flux_profile_file(path, n_species):
 def read_flux_profile_fd_response_file(path, n_species, species_names):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
-        shared_required = {
-            "Gamma_perturb",
-            "Q_perturb",
-            "perturb_delta",
-            "perturb_present",
-        }
-        if not shared_required.issubset(keys):
-            missing = ", ".join(sorted(shared_required - keys))
+        gamma_key = "Gamma_perturb" if "Gamma_perturb" in keys else "Gamma_perturbed"
+        q_key = "Q_perturb" if "Q_perturb" in keys else "Q_perturbed"
+        shared_required = {"perturb_delta", "perturb_present"}
+        missing = []
+        if gamma_key not in keys:
+            missing.append("Gamma_perturb or Gamma_perturbed")
+        if q_key not in keys:
+            missing.append("Q_perturb or Q_perturbed")
+        missing.extend(sorted(shared_required - keys))
+        if missing:
             raise ValueError(
-                f"Flux file '{path}' is missing SPECTRAX FD lagged-response datasets: {missing}."
+                f"Flux file '{path}' is missing SPECTRAX FD lagged-response datasets: {', '.join(missing)}."
             )
-        gamma_perturb = _normalize_perturb_species_flux_dataset(f["Gamma_perturb"][...], n_species)
-        q_perturb = _normalize_perturb_species_flux_dataset(f["Q_perturb"][...], n_species)
+        gamma_perturb = _normalize_perturb_species_flux_dataset(f[gamma_key][...], n_species)
+        q_perturb = _normalize_perturb_species_flux_dataset(f[q_key][...], n_species)
         perturb_delta = jnp.asarray(f["perturb_delta"][...], dtype=float)
         perturb_present = jnp.asarray(f["perturb_present"][...], dtype=bool)
         if {"perturb_kind", "perturb_species"}.issubset(keys):

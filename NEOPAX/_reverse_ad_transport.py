@@ -1,9 +1,9 @@
 """Reusable transport reverse-AD report-builder helpers.
 
 This module owns production-facing transport reverse-AD seams that have been
-lifted out of benchmark reporting. The segmented transport cotangent runner is
-still supplied by the benchmark for now, while validated downstream pieces such
-as the VMEC raw-block payload pullback live here.
+lifted out of benchmark reporting. It provides the compact segmented transport
+cotangent path and the VMEC raw-block payload pullback used by optimization
+callers, while keeping report formatting outside the AD graph.
 """
 
 from __future__ import annotations
@@ -21,16 +21,40 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._geometry_autodiff import geometry_payload_pullback_from_param_vector_raw_block_transpose
+from ._orchestrator import prepare_transport_solver_components
+from ._profiles import AnalyticalProfileModel
+from ._reverse_ad_initial_er import (
+    compact_initial_er_ntx_support_pullback_leaves,
+    compact_initial_er_state_pullback,
+    find_ntx_support_payload,
+    initial_er_charge_flux_residual_er_derivative,
+    initial_er_charge_flux_residual_scalar,
+    initial_er_charge_flux_residuals,
+    initial_er_selected_root_profile,
+    runtime_with_geometry_payload,
+    runtime_with_ntx_support_payload,
+)
 from ._reverse_ad_parameters import ReverseADParameterSet
 from ._transport_flux_models import (
+    PRESSURE_SOURCE_STATE_TO_MW_M3,
     _add_float_delta_tree,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
 from ._transport_solvers import (
     _RadauAcceptedStepReducedCotangent,
+    _build_prepared_radau_accepted_rollout,
+    _build_prepared_radau_execution_context,
+    _extract_fixed_temperature_projection,
+    _extract_state_regularization,
+    _make_radau_initial_step_state,
+    _make_solver_state_transform,
+    _radau_adaptive_schedule_rollout,
+    _project_flat_state_if_needed,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
     _radau_align_tangent_tree_to_primal,
+    _radau_carry_from_step_state,
+    _radau_eval_rhs,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_zero_support_delta_tree_like,
 )
@@ -228,6 +252,662 @@ class RealtimeGeometrySupportReverseDependencies:
             value = getattr(self, field.name)
             if not callable(value):
                 raise TypeError(f"{field.name} must be callable.")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RealtimeGeometryReverseStaticSetup:
+    """Static Radau reverse setup shared by benchmarks and optimization callers."""
+
+    solver: object
+    solve_vector_field: object
+    prepared_rollout: object
+    execution_context: object
+    stop_after_accepted_steps: int | None
+    max_total_steps: int
+    reverse_segment_length: int | None
+
+
+TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
+    "softmax_Er",
+    "smooth_root_proxy",
+    "Er2_volume_average",
+    "Er_volume_average",
+    "electron_temperature_volume_average_keV",
+    "total_pressure_volume_average",
+    "alpha_power_volume_average_mw_m3",
+)
+TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
+    "n0",
+    "T0",
+    "density_shape_power",
+    "temperature_shape_power",
+)
+
+
+def initial_er_root_ad_mode(value: str | None) -> str:
+    mode = str(value or "off").strip().lower()
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "0": "off",
+        "jax": "jax_selected_root",
+        "selected_jax": "jax_selected_root",
+        "jax_selected": "jax_selected_root",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"off", "jax_selected_root"}:
+        raise ValueError("initial_er_root_ad must be one of: off, jax_selected_root")
+    return mode
+
+
+def initial_er_root_enabled(config: Mapping[str, Any], mode: str) -> bool:
+    mode = initial_er_root_ad_mode(mode)
+    if mode == "off":
+        return False
+    profiles_cfg = config.get("profiles", {})
+    init_mode = str(profiles_cfg.get("er_initialization_mode", "analytical")).strip().lower()
+    return init_mode in {
+        "ambipolar_min_entropy",
+        "ambipolar_best_root",
+        "ambipolarity_best_root",
+    }
+
+
+def add_trees(lhs, rhs):
+    if lhs is None:
+        return rhs
+    if rhs is None:
+        return lhs
+    return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+
+def parameterized_profile_set(
+    profile_cfg: Mapping[str, Any],
+    geometry,
+    n_species: int,
+    *,
+    parameter_name: str,
+    parameter_value,
+):
+    cfg = dict(profile_cfg)
+    cfg[parameter_name] = parameter_value
+    model = AnalyticalProfileModel(
+        n0=cfg.get("n0", 4.21),
+        n_edge=cfg.get("n_edge", 0.6),
+        T0=cfg.get("T0", 17.8),
+        T_edge=cfg.get("T_edge", 0.7),
+        c_density=None if cfg.get("c_density") is None else tuple(cfg.get("c_density")),
+        c_temperature=None if cfg.get("c_temperature") is None else tuple(cfg.get("c_temperature")),
+        density_shape_power=cfg.get("density_shape_power", 2.0),
+        temperature_shape_power=cfg.get("temperature_shape_power", 2.0),
+        n_scale=cfg.get("n_scale", 1.0),
+        T_scale=cfg.get("T_scale", 1.0),
+        er0_scale=cfg.get("er0_scale", 100.0),
+        er0_peak_rho=cfg.get("er0_peak_rho", 0.8),
+        charge_qp=None if cfg.get("charge_qp") is None else tuple(cfg.get("charge_qp")),
+    )
+    return model.build(geometry, n_species)
+
+
+def initial_state_for_parameter_vector(
+    parameter_values,
+    *,
+    baseline_state,
+    profile_cfg: Mapping[str, Any],
+    runtime,
+    config: Mapping[str, Any] | None = None,
+    initial_er_root_ad: str = "off",
+):
+    cfg = dict(profile_cfg)
+    for name, value in zip(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER, parameter_values):
+        cfg[name] = value
+    profile_set = parameterized_profile_set(
+        cfg,
+        runtime.geometry,
+        runtime.species.number_species,
+        parameter_name=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0],
+        parameter_value=cfg[TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0]],
+    )
+    density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
+    temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
+    pressure_state = density_state * temperature_state
+    state = dataclasses.replace(
+        baseline_state,
+        density=density_state,
+        pressure=pressure_state,
+    )
+    mode = initial_er_root_ad_mode(initial_er_root_ad)
+    if mode != "off":
+        if config is None:
+            raise ValueError("config is required when initial_er_root_ad is enabled.")
+        state = state_with_initial_er_root_ad(state, config=config, runtime=runtime, mode=mode)
+    return state
+
+
+def initial_er_root_state_bar(state, er_profile, finite_mask, state_bar, *, runtime):
+    dres_der = initial_er_charge_flux_residual_er_derivative(
+        state,
+        er_profile,
+        runtime=runtime,
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+        dres_der,
+        jnp.inf,
+    )
+    residual_bar = jnp.where(
+        finite_mask,
+        -jnp.asarray(state_bar.Er) / safe_dres_der,
+        0.0,
+    )
+    state_residual_bar = compact_initial_er_state_pullback(
+        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+        state=state,
+        er_profile=er_profile,
+        residual_bars=residual_bar,
+        runtime=runtime,
+    )
+    direct_bar = dataclasses.replace(state_bar, Er=jnp.zeros_like(state.Er))
+    return add_trees(direct_bar, state_residual_bar)
+
+
+def state_with_initial_er_root_ad(state, *, config: Mapping[str, Any], runtime, mode: str):
+    if not initial_er_root_enabled(config, mode):
+        return state
+
+    @jax.custom_vjp
+    def _replace_er_with_selected_root(state_inner):
+        er_profile, _ = initial_er_selected_root_profile(state_inner, config=dict(config), runtime=runtime)
+        return dataclasses.replace(state_inner, Er=er_profile)
+
+    def _replace_er_fwd(state_inner):
+        er_profile, finite_mask = initial_er_selected_root_profile(
+            state_inner,
+            config=dict(config),
+            runtime=runtime,
+        )
+        return dataclasses.replace(state_inner, Er=er_profile), (state_inner, er_profile, finite_mask)
+
+    def _replace_er_bwd(residuals, state_bar):
+        state_inner, er_profile, finite_mask = residuals
+        return (
+            initial_er_root_state_bar(
+                state_inner,
+                er_profile,
+                finite_mask,
+                state_bar,
+                runtime=runtime,
+            ),
+        )
+
+    _replace_er_with_selected_root.defvjp(_replace_er_fwd, _replace_er_bwd)
+    return _replace_er_with_selected_root(state)
+
+
+def softmax_objective(er_profile: jax.Array, *, beta: float = 16.0) -> jax.Array:
+    beta_arr = jnp.asarray(beta, dtype=er_profile.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * er_profile) / beta_arr
+
+
+def smooth_root_proxy(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    *,
+    beta: float = 24.0,
+    eps: float = 1.0e-4,
+):
+    beta_arr = jnp.asarray(beta, dtype=er_profile.dtype)
+    eps_arr = jnp.asarray(eps, dtype=er_profile.dtype)
+    smooth_abs = jnp.sqrt(er_profile * er_profile + eps_arr * eps_arr)
+    weights = jnp.exp(-beta_arr * smooth_abs)
+    return jnp.sum(rho_grid * weights) / jnp.maximum(jnp.sum(weights), jnp.asarray(1.0e-30, dtype=er_profile.dtype))
+
+
+def volume_average(profile: jax.Array, geometry) -> jax.Array:
+    volume = jnp.trapezoid(jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+    integral = jnp.trapezoid(profile * jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+    return integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=integral.dtype))
+
+
+def alpha_power_volume_average(final_state, runtime) -> jax.Array:
+    source_models = runtime.models.source or {}
+    pressure_source_model = source_models.get("temperature") if isinstance(source_models, dict) else None
+    if pressure_source_model is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    raw_sources = pressure_source_model(final_state)
+    alpha_power = raw_sources.get("AlphaPower") if isinstance(raw_sources, dict) else None
+    if alpha_power is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    alpha_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.asarray(alpha_power, dtype=final_state.pressure.dtype)
+    return volume_average(alpha_mw_m3, runtime.geometry)
+
+
+def electron_temperature_volume_average(final_state, runtime) -> jax.Array:
+    species_idx = getattr(runtime.species, "species_idx", {})
+    electron_idx = species_idx.get("e", 0)
+    temperature = jnp.asarray(final_state.temperature[electron_idx], dtype=final_state.pressure.dtype)
+    return volume_average(temperature, runtime.geometry)
+
+
+def total_pressure_volume_average(final_state, runtime) -> jax.Array:
+    total_pressure = jnp.sum(jnp.asarray(final_state.pressure, dtype=final_state.pressure.dtype), axis=0)
+    return volume_average(total_pressure, runtime.geometry)
+
+
+def objective_scalar_by_index(final_state, runtime, objective_index: int):
+    objective_name = TRANSPORT_REVERSE_OBJECTIVE_LABELS[int(objective_index)]
+    er = jnp.asarray(final_state.Er)
+    if objective_name == "softmax_Er":
+        return softmax_objective(er)
+    if objective_name == "smooth_root_proxy":
+        rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
+        return smooth_root_proxy(er, rho)
+    if objective_name == "Er2_volume_average":
+        return volume_average(er * er, runtime.geometry)
+    if objective_name == "Er_volume_average":
+        return volume_average(er, runtime.geometry)
+    if objective_name == "electron_temperature_volume_average_keV":
+        return electron_temperature_volume_average(final_state, runtime)
+    if objective_name == "total_pressure_volume_average":
+        return total_pressure_volume_average(final_state, runtime)
+    if objective_name == "alpha_power_volume_average_mw_m3":
+        return alpha_power_volume_average(final_state, runtime)
+    raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
+
+
+def lagged_response_pullback_from_owner(solve_vector_field):
+    owner = getattr(solve_vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_build_lagged_response", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
+def reverse_initial_carry_from_state_with_static_setup(
+    *,
+    solver,
+    state,
+    solve_vector_field,
+    species,
+    prepared_rollout_static,
+):
+    """Build the initial carry with the validated reverse-local lagged pullback."""
+
+    del solver
+    temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
+    density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
+    kernel_context = prepared_rollout_static.kernel_context
+    physics_context = prepared_rollout_static.physics_context
+    initial_carry_static = prepared_rollout_static.initial_carry
+    lagged_pullback_fn = lagged_response_pullback_from_owner(solve_vector_field)
+
+    def _flat_state_from_state(state_value):
+        flat_state, *_ = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        return flat_state
+
+    def _build_state_from_flat(flat_value, unpack_flat, project_flat):
+        return unpack_flat(_project_flat_state_if_needed(flat_value, project_flat))
+
+    @jax.custom_vjp
+    def _build_initial_carry(state_value):
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        lagged_state0 = _build_state_from_flat(flat_state0, unpack_flat, project_flat)
+        initial_lagged_response = (
+            physics_context.build_lagged_response(lagged_state0)
+            if (kernel_context.use_transport_lagged_response and physics_context.build_lagged_response is not None)
+            else None
+        )
+        initial_rhs = _radau_eval_rhs(
+            initial_carry_static.t,
+            flat_state0,
+            initial_lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+        step_state0 = _make_radau_initial_step_state(
+            initial_carry_static.t,
+            flat_state0,
+            initial_carry_static.dt,
+            kernel_context.dtype,
+            initial_rhs,
+            kernel_context.num_stages,
+            initial_carry_static.real_lu,
+            initial_carry_static.real_piv,
+            initial_carry_static.complex_lu,
+            initial_carry_static.complex_piv,
+            initial_lagged_response,
+            jnp.asarray(kernel_context.use_transport_lagged_response),
+            flat_state0,
+        )
+        return _radau_carry_from_step_state(step_state0)
+
+    def _build_initial_carry_fwd(state_value):
+        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        lagged_state0 = _build_state_from_flat(flat_state0, unpack_flat, project_flat)
+        initial_lagged_response = (
+            physics_context.build_lagged_response(lagged_state0)
+            if (kernel_context.use_transport_lagged_response and physics_context.build_lagged_response is not None)
+            else None
+        )
+        initial_rhs = _radau_eval_rhs(
+            initial_carry_static.t,
+            flat_state0,
+            initial_lagged_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+        step_state0 = _make_radau_initial_step_state(
+            initial_carry_static.t,
+            flat_state0,
+            initial_carry_static.dt,
+            kernel_context.dtype,
+            initial_rhs,
+            kernel_context.num_stages,
+            initial_carry_static.real_lu,
+            initial_carry_static.real_piv,
+            initial_carry_static.complex_lu,
+            initial_carry_static.complex_piv,
+            initial_lagged_response,
+            jnp.asarray(kernel_context.use_transport_lagged_response),
+            flat_state0,
+        )
+        carry0 = _radau_carry_from_step_state(step_state0)
+        residual = (state_value, flat_state0, lagged_state0, initial_lagged_response)
+        return carry0, residual
+
+    def _build_initial_carry_bwd(residual, carry_bar):
+        state_value, flat_state0, lagged_state0, initial_lagged_response = residual
+        _, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        flat_bar = jnp.asarray(carry_bar.y)
+        flat_bar = flat_bar + jnp.asarray(carry_bar.lagged_reference_y)
+
+        prev_stages_bar = jnp.asarray(carry_bar.prev_stages).reshape((kernel_context.num_stages, -1))
+        rhs_bar = jnp.sum(prev_stages_bar, axis=0)
+        lagged_bar = carry_bar.lagged_response_cache
+
+        def _tree_max_abs(tree):
+            values = []
+            for leaf in jax.tree_util.tree_leaves(tree):
+                arr = jnp.asarray(leaf)
+                if arr.dtype == jax.dtypes.float0:
+                    continue
+                if jnp.issubdtype(arr.dtype, jnp.number):
+                    values.append(jnp.max(jnp.abs(arr)))
+            if not values:
+                return jnp.asarray(0.0, dtype=flat_state0.dtype)
+            return jnp.max(jnp.stack([jnp.asarray(value, dtype=flat_state0.dtype) for value in values]))
+
+        def _zero_flat_bar():
+            return jnp.zeros_like(flat_state0)
+
+        def _rhs_state_pullback_fallback(lagged_response_value):
+            def _rhs_from_flat(flat_value):
+                return _radau_eval_rhs(
+                    initial_carry_static.t,
+                    flat_value,
+                    lagged_response_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )
+
+            _, rhs_pullback = jax.vjp(_rhs_from_flat, flat_state0)
+            (rhs_flat_bar,) = rhs_pullback(rhs_bar)
+            return rhs_flat_bar
+
+        def _nonzero_rhs_state_pullback(_):
+            if physics_context.flat_rhs_state_pullback is not None:
+                rhs_flat_bar_value = physics_context.flat_rhs_state_pullback(
+                    initial_carry_static.t,
+                    flat_state0,
+                    initial_lagged_response,
+                    rhs_bar,
+                )
+                if project_flat is not None:
+                    _, project_pullback = jax.vjp(project_flat, flat_state0)
+                    (rhs_flat_bar_value,) = project_pullback(rhs_flat_bar_value)
+                return rhs_flat_bar_value
+            return _rhs_state_pullback_fallback(initial_lagged_response)
+
+        rhs_flat_bar = jax.lax.cond(
+            _tree_max_abs(rhs_bar) > 0.0,
+            _nonzero_rhs_state_pullback,
+            lambda _: _zero_flat_bar(),
+            operand=None,
+        )
+        flat_bar = flat_bar + rhs_flat_bar
+
+        if initial_lagged_response is not None:
+            def _rhs_from_flat_and_lagged(flat_value, lagged_value):
+                return _radau_eval_rhs(
+                    initial_carry_static.t,
+                    flat_value,
+                    lagged_value,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )
+
+            def _zero_lagged_bar():
+                return _radau_align_tangent_tree_to_primal(None, initial_lagged_response)
+
+            def _nonzero_rhs_lagged_pullback(_):
+                if physics_context.flat_rhs_lagged_response_pullback is not None:
+                    return physics_context.flat_rhs_lagged_response_pullback(
+                        initial_carry_static.t,
+                        flat_state0,
+                        initial_lagged_response,
+                        rhs_bar,
+                    )
+                _, rhs_pullback = jax.vjp(_rhs_from_flat_and_lagged, flat_state0, initial_lagged_response)
+                _rhs_flat_bar_unused, rhs_lagged_bar_value = rhs_pullback(rhs_bar)
+                return rhs_lagged_bar_value
+
+            rhs_lagged_bar = jax.lax.cond(
+                _tree_max_abs(rhs_bar) > 0.0,
+                _nonzero_rhs_lagged_pullback,
+                lambda _: _zero_lagged_bar(),
+                operand=None,
+            )
+            lagged_bar = add_trees(lagged_bar, rhs_lagged_bar)
+
+            if lagged_pullback_fn is not None:
+                lagged_state_bar = lagged_pullback_fn(lagged_state0, lagged_bar)
+            else:
+                def _nonzero_lagged_state_pullback(_):
+                    def _build_lagged_from_state(lagged_state_value):
+                        return physics_context.build_lagged_response(lagged_state_value)
+
+                    _, lagged_pullback = jax.vjp(_build_lagged_from_state, lagged_state0)
+                    (lagged_state_bar_value,) = lagged_pullback(lagged_bar)
+                    return lagged_state_bar_value
+
+                lagged_state_bar = jax.lax.cond(
+                    _tree_max_abs(lagged_bar) > 0.0,
+                    _nonzero_lagged_state_pullback,
+                    lambda _: jax.tree_util.tree_map(jnp.zeros_like, lagged_state0),
+                    operand=None,
+                )
+
+            def _lagged_state_from_flat(flat_value):
+                return _build_state_from_flat(flat_value, unpack_flat, project_flat)
+
+            def _nonzero_lagged_state_flat_pullback(_):
+                _, lagged_state_flat_pullback = jax.vjp(_lagged_state_from_flat, flat_state0)
+                (lagged_flat_bar_value,) = lagged_state_flat_pullback(lagged_state_bar)
+                return lagged_flat_bar_value
+
+            lagged_flat_bar = jax.lax.cond(
+                _tree_max_abs(lagged_state_bar) > 0.0,
+                _nonzero_lagged_state_flat_pullback,
+                lambda _: _zero_flat_bar(),
+                operand=None,
+            )
+            flat_bar = flat_bar + lagged_flat_bar
+
+        _, state_pullback = jax.vjp(_flat_state_from_state, state_value)
+        (state_bar,) = state_pullback(flat_bar)
+        return (state_bar,)
+
+    _build_initial_carry.defvjp(_build_initial_carry_fwd, _build_initial_carry_bwd)
+    return _build_initial_carry(state)
+
+
+def prepare_reverse_static_setup(
+    parameter_values,
+    *,
+    config: Mapping[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: Mapping[str, Any],
+    initial_er_root_ad: str = "off",
+    accepted_step_limit_override: int | None = None,
+    reverse_segment_length: int | None = None,
+    reverse_direct_stage_adjoint: bool = False,
+    reverse_stage_adjoint_solve_mode: str = "structured",
+    reverse_rhs_transpose_mode: str = "generic",
+    reverse_stage_cotangent_mode: str = "full",
+    reverse_step_bwd_mode: str = "current",
+    reverse_stage_adjoint_memory_mode: str = "default",
+    reverse_stage_adjoint_iter_maxiter: int = 40,
+    reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+) -> RealtimeGeometryReverseStaticSetup:
+    state0_static = initial_state_for_parameter_vector(
+        parameter_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        runtime=runtime,
+    )
+    prepared_components_static = prepare_transport_solver_components(dict(config), runtime, state0_static)
+    solver = prepared_components_static["solver"]
+    solve_vector_field_static = prepared_components_static["solve_vector_field"]
+    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0_static,
+        vector_field=solve_vector_field_static,
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout_static,
+    )
+    if reverse_direct_stage_adjoint:
+        execution_context = dataclasses.replace(
+            execution_context,
+            physics_context=dataclasses.replace(
+                execution_context.physics_context,
+                reverse_direct_stage_adjoint=True,
+                reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
+                reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+                reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
+                reverse_step_bwd_mode=str(reverse_step_bwd_mode),
+                reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
+                reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
+                reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+            ),
+        )
+    stop_after_accepted_steps = (
+        int(accepted_step_limit_override)
+        if accepted_step_limit_override is not None
+        else getattr(solver, "stop_after_accepted_steps", None)
+    )
+    max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
+    if stop_after_accepted_steps is not None:
+        max_total_steps = min(
+            max_total_steps,
+            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+        )
+        schedule_probe = _radau_adaptive_schedule_rollout(
+            execution_context,
+            prepared_rollout_static.initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
+        max_total_steps = min(
+            max_total_steps,
+            max(actual_attempt_count + 2, int(stop_after_accepted_steps)),
+        )
+        accepted_limit = int(stop_after_accepted_steps)
+        active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
+        accepted_mask_np = np.asarray(jax.device_get(schedule_probe.trace.accepted_mask), dtype=bool)
+        next_lagged_valid_np = np.asarray(
+            jax.device_get(schedule_probe.trace.next_lagged_response_valid),
+            dtype=bool,
+        )
+        accepted_positions = np.nonzero(np.logical_and(active_mask_np, accepted_mask_np))[0][:accepted_limit]
+        incoming_valid = bool(np.asarray(jax.device_get(prepared_rollout_static.initial_carry.lagged_response_valid)))
+        lagged_branch_schedule: list[bool] = []
+        for accepted_position in accepted_positions:
+            lagged_branch_schedule.append(bool(incoming_valid))
+            incoming_valid = bool(next_lagged_valid_np[int(accepted_position)])
+        if len(lagged_branch_schedule) < accepted_limit:
+            lagged_branch_schedule.extend([bool(incoming_valid)] * (accepted_limit - len(lagged_branch_schedule)))
+        execution_context = dataclasses.replace(
+            execution_context,
+            physics_context=dataclasses.replace(
+                execution_context.physics_context,
+                reverse_lagged_branch_schedule=tuple(lagged_branch_schedule),
+            ),
+        )
+    return RealtimeGeometryReverseStaticSetup(
+        solver=solver,
+        solve_vector_field=solve_vector_field_static,
+        prepared_rollout=prepared_rollout_static,
+        execution_context=execution_context,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+        max_total_steps=max_total_steps,
+        reverse_segment_length=reverse_segment_length,
+    )
+
+
+def default_realtime_geometry_support_reverse_dependencies() -> RealtimeGeometrySupportReverseDependencies:
+    """Return the production/default dependency bundle for the compact reverse rule."""
+
+    return RealtimeGeometrySupportReverseDependencies(
+        initial_er_root_enabled=initial_er_root_enabled,
+        initial_state_for_parameter_vector=initial_state_for_parameter_vector,
+        state_with_initial_er_root_ad=state_with_initial_er_root_ad,
+        reverse_initial_carry_from_state_with_static_setup=reverse_initial_carry_from_state_with_static_setup,
+        objective_scalar_by_index=objective_scalar_by_index,
+        add_trees=add_trees,
+        initial_er_selected_root_profile=initial_er_selected_root_profile,
+        initial_er_charge_flux_residuals=initial_er_charge_flux_residuals,
+        initial_er_charge_flux_residual_scalar=initial_er_charge_flux_residual_scalar,
+        initial_er_charge_flux_residual_er_derivative=initial_er_charge_flux_residual_er_derivative,
+        compact_initial_er_state_pullback=compact_initial_er_state_pullback,
+        compact_initial_er_ntx_support_pullback_leaves=compact_initial_er_ntx_support_pullback_leaves,
+        runtime_with_geometry_payload=runtime_with_geometry_payload,
+        runtime_with_ntx_support_payload=runtime_with_ntx_support_payload,
+    )
 
 
 def realtime_geometry_transport_reverse_table_context(
@@ -859,7 +1539,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
 def realtime_geometry_support_cotangents_from_parameter_vector(
     *,
-    reverse_all_objectives_support_payload_bar: Callable[..., object],
+    reverse_all_objectives_support_payload_bar: Callable[..., object] | None = None,
     profile_values,
     config: Mapping[str, Any],
     baseline_runtime,
@@ -877,6 +1557,14 @@ def realtime_geometry_support_cotangents_from_parameter_vector(
     device synchronization without adding another reverse pass.
     """
 
+    if reverse_all_objectives_support_payload_bar is None:
+        def reverse_all_objectives_support_payload_bar(*args, **kwargs):
+            return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
+                *args,
+                objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+                dependencies=default_realtime_geometry_support_reverse_dependencies(),
+                **kwargs,
+            )
     if not callable(reverse_all_objectives_support_payload_bar):
         raise TypeError("reverse_all_objectives_support_payload_bar must be callable.")
     callback_result = reverse_all_objectives_support_payload_bar(
@@ -1284,6 +1972,159 @@ def transport_realtime_geometry_reverse_table(
         options=request.options,
         quiet_default=quiet_default,
     )
+
+
+def internal_realtime_geometry_transport_reverse_table_result_builder(
+    *,
+    table_context: RealtimeGeometryTransportReverseTableContext,
+    geometry_context,
+    baseline_geometry_deltas=None,
+    combined_geometry_payload: bool = True,
+    n_r: int = 51,
+    n_theta: int = 25,
+    n_zeta: int = 25,
+    n_xi: int = 64,
+    surface_backend: str = "vmec",
+    max_iter=None,
+    solver_device: str = "default",
+    accepted_step_limit: int | None = None,
+    reverse_segment_length: int | None = 1,
+    initial_er_root_ad: str = "off",
+    reverse_stage_adjoint_solve_mode: str = "bicgstab",
+    reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
+    reverse_stage_cotangent_mode: str = "full",
+    reverse_step_bwd_mode: str = "reduced_cotangent",
+    reverse_stage_adjoint_memory_mode: str = "default",
+    reverse_stage_adjoint_iter_maxiter: int = 40,
+    reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    progress_label: str | None = None,
+) -> TransportReverseTableResultBuilder:
+    """Build an optimization-facing full transport reverse table builder.
+
+    The returned callable owns the same compact support reverse and raw-block
+    VMEC payload pullback used by the validated benchmark path, without asking
+    benchmark code to provide callbacks.
+    """
+
+    if not isinstance(table_context, RealtimeGeometryTransportReverseTableContext):
+        raise TypeError("table_context must be a RealtimeGeometryTransportReverseTableContext.")
+    profile_values = jnp.asarray(
+        table_context.baseline_values[: len(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)]
+    )
+
+    def _row_indices(objective_names: Sequence[str]) -> tuple[int, ...]:
+        labels = tuple(TRANSPORT_REVERSE_OBJECTIVE_LABELS)
+        lookup = {name: i for i, name in enumerate(labels)}
+        return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
+
+    def _profile_column_indices(parameter_set: ReverseADParameterSet) -> tuple[int, ...]:
+        lookup = {name: i for i, name in enumerate(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)}
+        return tuple(lookup[spec.name] for spec in parameter_set.profile_specs)
+
+    def _builder(
+        objective_names: tuple[str, ...],
+        parameter_set: ReverseADParameterSet,
+        options: Mapping[str, object] | None,
+    ) -> RealtimeGeometryTransportReverseTableResult:
+        _validate_transport_reverse_parameter_set(parameter_set)
+        opts = {} if options is None else dict(options)
+        active_accepted_step_limit = opts.get("accepted_step_limit", accepted_step_limit)
+        active_reverse_segment_length = opts.get("reverse_segment_length", reverse_segment_length)
+        active_initial_er_root_ad = str(opts.get("initial_er_root_ad", initial_er_root_ad))
+        active_reverse_setup = prepare_reverse_static_setup(
+            profile_values,
+            config=table_context.config,
+            runtime=table_context.baseline_runtime,
+            baseline_state=table_context.baseline_state,
+            profile_cfg=table_context.profile_cfg,
+            initial_er_root_ad=active_initial_er_root_ad,
+            accepted_step_limit_override=(
+                None if active_accepted_step_limit is None else int(active_accepted_step_limit)
+            ),
+            reverse_segment_length=(
+                None if active_reverse_segment_length is None else int(active_reverse_segment_length)
+            ),
+            reverse_direct_stage_adjoint=True,
+            reverse_stage_adjoint_solve_mode=str(
+                opts.get("reverse_stage_adjoint_solve_mode", reverse_stage_adjoint_solve_mode)
+            ),
+            reverse_rhs_transpose_mode=str(opts.get("reverse_rhs_transpose_mode", reverse_rhs_transpose_mode)),
+            reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),
+            reverse_step_bwd_mode=str(opts.get("reverse_step_bwd_mode", reverse_step_bwd_mode)),
+            reverse_stage_adjoint_memory_mode=str(
+                opts.get("reverse_stage_adjoint_memory_mode", reverse_stage_adjoint_memory_mode)
+            ),
+            reverse_stage_adjoint_iter_maxiter=int(
+                opts.get("reverse_stage_adjoint_iter_maxiter", reverse_stage_adjoint_iter_maxiter)
+            ),
+            reverse_stage_adjoint_iter_tol=float(
+                opts.get("reverse_stage_adjoint_iter_tol", reverse_stage_adjoint_iter_tol)
+            ),
+        )
+        ntx_support_payload = find_ntx_support_payload(table_context.baseline_runtime)
+        support_payload = (
+            {"geometry": table_context.baseline_runtime.geometry, "ntx_support": ntx_support_payload}
+            if combined_geometry_payload
+            else ntx_support_payload
+        )
+        support_result = realtime_geometry_support_cotangents_from_parameter_vector(
+            profile_values=profile_values,
+            config=table_context.config,
+            baseline_runtime=table_context.baseline_runtime,
+            baseline_state=table_context.baseline_state,
+            profile_cfg=table_context.profile_cfg,
+            reverse_setup=active_reverse_setup,
+            support_payload=support_payload,
+            initial_er_root_ad=active_initial_er_root_ad,
+        )
+        rows = _row_indices(objective_names)
+        support_bars = tuple(support_result.support_bars[i] for i in rows)
+        component_bars = {
+            name: tuple(values[i] for i in rows)
+            for name, values in support_result.support_component_bars_by_name.items()
+        }
+        all_objective_values = jnp.asarray(support_result.objective_values)
+        all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)
+        profile_cols = _profile_column_indices(parameter_set)
+        selected_objective_values = all_objective_values[jnp.asarray(rows, dtype=jnp.int32)]
+        selected_profile_matrix = all_profile_gradient_matrix[
+            jnp.asarray(rows, dtype=jnp.int32),
+            :,
+        ]
+        if profile_cols:
+            selected_profile_matrix = selected_profile_matrix[:, jnp.asarray(profile_cols, dtype=jnp.int32)]
+        else:
+            selected_profile_matrix = selected_profile_matrix[:, :0]
+        vmec_specs = tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs)
+        if baseline_geometry_deltas is None:
+            active_baseline_geometry_deltas = jnp.zeros((len(vmec_specs),), dtype=jnp.float64)
+        else:
+            active_baseline_geometry_deltas = jnp.asarray(baseline_geometry_deltas, dtype=jnp.float64)
+        assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+            objective_labels=objective_names,
+            profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
+            geometry_parameter_labels=tuple(spec.label for spec in parameter_set.vmec_boundary_specs),
+            objective_values=selected_objective_values,
+            profile_gradient_matrix=selected_profile_matrix,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=active_baseline_geometry_deltas,
+            geometry_param_specs=vmec_specs,
+            support_bars=support_bars,
+            support_component_bars_by_name=component_bars,
+            include_component_pullbacks=False,
+            combined_geometry_payload=combined_geometry_payload,
+            n_r=int(opts.get("n_r", n_r)),
+            n_theta=int(opts.get("n_theta", n_theta)),
+            n_zeta=int(opts.get("n_zeta", n_zeta)),
+            n_xi=int(opts.get("n_xi", n_xi)),
+            surface_backend=str(opts.get("surface_backend", surface_backend)),
+            max_iter=opts.get("max_iter", max_iter),
+            solver_device=str(opts.get("solver_device", solver_device)),
+            progress_label=progress_label,
+        )
+        return assembly.table_result
+
+    return _builder
 
 
 def realtime_geometry_payload_pullback_result(
