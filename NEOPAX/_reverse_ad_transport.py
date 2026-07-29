@@ -216,7 +216,6 @@ class RealtimeGeometrySupportReverseDependencies:
     add_trees: Callable[[object, object], object]
     initial_er_selected_root_profile: Callable[..., object]
     initial_er_charge_flux_residuals: Callable[..., object]
-    initial_er_charge_flux_residual_er_derivative: Callable[..., object]
     compact_initial_er_ntx_support_pullback_leaves: Callable[..., object]
     runtime_with_geometry_payload: Callable[[object, object], object]
     runtime_with_ntx_support_payload: Callable[[object, object], object]
@@ -649,10 +648,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
-        dres_der = dependencies.initial_er_charge_flux_residual_er_derivative(
-            pre_root_initial_state,
-            er_profile,
-            runtime=runtime,
+        def _residual_i_er(i, er_value):
+            er_eval = er_profile.at[i].set(er_value)
+            return dependencies.initial_er_charge_flux_residuals(
+                pre_root_initial_state,
+                er_eval,
+                runtime=runtime,
+            )[i]
+
+        radial_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+        dres_der = jax.lax.map(
+            lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+            radial_indices,
         )
         safe_dres_der = jnp.where(
             jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
