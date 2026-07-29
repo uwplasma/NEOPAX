@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import time
 from pathlib import Path
 import sys
 
@@ -140,7 +141,7 @@ def parse_args():
     parser.add_argument("--reverse-stage-adjoint-iter-tol", type=float, default=1.0e-10)
     parser.add_argument("--realtime-geometry-component-pullbacks", action="store_true")
     parser.add_argument("--hide-solver-iterations", action="store_true")
-    parser.add_argument("--output", default="outputs/autodiff_transport_lagged_ntx/reverse_ad/internal_optimization_smoke_2step.json")
+    parser.add_argument("--output", default=None)
     return parser.parse_args()
 
 
@@ -156,9 +157,16 @@ def main() -> int:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
 
+    t_phase = time.perf_counter()
     runtime, baseline_state = build_runtime_context(config)
+    print(
+        "[autodiff-gate] progress: realtime geometry runtime build ready "
+        f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+        flush=True,
+    )
     if baseline_state is None:
         raise RuntimeError("transport runtime did not return an initial state.")
+    t_phase = time.perf_counter()
     profile_cfg = _baseline_profile_cfg(config)
     neoclassical_cfg = dict(config.get("neoclassical", {}))
     geometry_specs = tuple(spec.as_tuple() for spec in parse_vmec_boundary_parameter_specs(args.reverse_geometry_parameter))
@@ -219,6 +227,11 @@ def main() -> int:
         profile_cfg=profile_cfg,
         neoclassical_cfg=neoclassical_cfg,
         support_segment_executor=support_segment_executor,
+    )
+    print(
+        "[autodiff-gate] progress: realtime geometry optimization inputs ready "
+        f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+        flush=True,
     )
     table_context = grouped_inputs.table_context
     run_grouped_report = grouped_inputs.run_grouped_report
@@ -285,7 +298,13 @@ def main() -> int:
         "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
         "elapsed_s": float(evaluation.elapsed_s),
     }
-    outpath = ROOT / args.output
+    output_path = args.output
+    if output_path is None:
+        output_path = (
+            "outputs/autodiff_transport_lagged_ntx/reverse_ad/"
+            f"internal_optimization_smoke_{int(args.accepted_step_limit)}step.json"
+        )
+    outpath = ROOT / output_path
     outpath.parent.mkdir(parents=True, exist_ok=True)
     outpath.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Wrote {outpath.relative_to(ROOT)}")

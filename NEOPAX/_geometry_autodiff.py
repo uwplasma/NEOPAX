@@ -768,6 +768,49 @@ def _param_vector_gradient_from_implicit_param_grads(
     return jnp.stack(columns, axis=1)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryRawBlockSolve:
+    """Shared VMEC implicit solve payload for raw-block transpose pullbacks."""
+
+    implicit: Any
+    implicit_params: Any
+    implicit_cfg: Any
+    state: Any
+    dof_mask: Any
+    param_entries: tuple[dict[str, Any], ...]
+
+
+def geometry_raw_block_solve_from_param_vector(
+    context: "GeometryAutodiffContext",
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    max_iter: int | None = None,
+    solver_device: str | None = None,
+) -> GeometryRawBlockSolve:
+    """Solve VMEC once and keep the raw-block transpose auxiliary data."""
+
+    if not _using_current_vmec_jax_context(context):
+        raise ValueError("geometry_raw_block_solve_from_param_vector requires the current VMEX implicit AD lane.")
+    param_entries = boundary_param_entries(context, param_specs)
+    implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
+        context,
+        jnp.asarray(param_deltas, dtype=jnp.float64),
+        param_entries,
+        max_iter=max_iter,
+        solver_device=solver_device,
+    )
+    state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+    return GeometryRawBlockSolve(
+        implicit=implicit,
+        implicit_params=implicit_params,
+        implicit_cfg=implicit_cfg,
+        state=state,
+        dof_mask=dof_mask,
+        param_entries=param_entries,
+    )
+
+
 def _implicit_state_pullback_multi_rhs_with_assemble_rhs(
     implicit,
     params,
@@ -3060,6 +3103,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     jacobian_penalty: float = 1.0e3,
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = None,
+    raw_block_solve: GeometryRawBlockSolve | None = None,
 ) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Return geometry objective values and W @ d(objectives)/d(params).
 
@@ -3124,14 +3168,20 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     if final_mode == "raw_block_transpose":
         if str(lane).strip().lower() != "ad" or not _using_current_vmec_jax_context(context):
             raise ValueError("raw_block_transpose final VMEC pullback requires the current VMEX implicit AD lane.")
-        implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
-            context,
-            param_deltas,
-            param_entries,
-            max_iter=max_iter,
-            solver_device=solver_device,
-        )
-        state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+        if raw_block_solve is None:
+            raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                context,
+                param_deltas,
+                param_specs,
+                max_iter=max_iter,
+                solver_device=solver_device,
+            )
+        implicit = raw_block_solve.implicit
+        implicit_params = raw_block_solve.implicit_params
+        implicit_cfg = raw_block_solve.implicit_cfg
+        state = raw_block_solve.state
+        dof_mask = raw_block_solve.dof_mask
+        param_entries = raw_block_solve.param_entries
         _progress("vmec implicit state/raw-block aux ready", state)
     else:
         state, state_pullback = jax.vjp(solve_state, param_deltas)
@@ -4538,6 +4588,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     solver_device: str | None = None,
     progress_label: str | None = None,
     return_branch_gradients: bool = False,
+    raw_block_solve: GeometryRawBlockSolve | None = None,
 ) -> jnp.ndarray:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -4552,20 +4603,24 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     if not _using_current_vmec_jax_context(context):
         raise ValueError("raw_block_transpose payload pullback requires the current VMEX implicit AD lane.")
 
-    param_entries = boundary_param_entries(context, param_specs)
-    implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
-        context,
-        jnp.asarray(param_deltas, dtype=jnp.float64),
-        param_entries,
-        max_iter=max_iter,
-        solver_device=solver_device,
-    )
+    if raw_block_solve is None:
+        raw_block_solve = geometry_raw_block_solve_from_param_vector(
+            context,
+            jnp.asarray(param_deltas, dtype=jnp.float64),
+            param_specs,
+            max_iter=max_iter,
+            solver_device=solver_device,
+        )
+    implicit = raw_block_solve.implicit
+    implicit_params = raw_block_solve.implicit_params
+    implicit_cfg = raw_block_solve.implicit_cfg
+    state = raw_block_solve.state
+    dof_mask = raw_block_solve.dof_mask
+    param_entries = raw_block_solve.param_entries
     if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
-
-    state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
 
     def geometry_from_state(state_inner):
         return _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)

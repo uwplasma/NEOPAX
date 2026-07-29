@@ -26,6 +26,7 @@ from ._reverse_ad_parameters import (
 )
 from ._transport_flux_models import _add_float_delta_tree, _float_delta_tree_like
 from ._geometry_autodiff import (
+    build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_names_for_kind,
 )
@@ -665,6 +666,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     max_iter: int | None = None,
     solver_device: str | None = "default",
     progress_label: str | None = None,
+    raw_block_solve=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -699,15 +701,30 @@ def geometry_active_initial_er_root_only_reverse_table(
             "geometry": runtime.geometry,
             "ntx_support": support_payload,
         }
-    baseline_geometry = support_payload["geometry"]
-    baseline_ntx_support = support_payload["ntx_support"]
+    if raw_block_solve is None:
+        baseline_geometry = support_payload["geometry"]
+        baseline_ntx_support = support_payload["ntx_support"]
+    else:
+        current_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+            geometry_context,
+            raw_block_solve.state,
+            n_r=int(n_r),
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+        )
+        baseline_geometry = current_payload["geometry"]
+        baseline_ntx_support = current_payload["ntx_support"]
+    runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
+    runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
     geometry_delta0 = _float_delta_tree_like(baseline_geometry)
 
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
     er_profile, finite_mask = initial_er_selected_root_profile(
         pre_root_state,
         config=dict(config),
-        runtime=runtime,
+        runtime=runtime_for_geometry,
     )
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
@@ -715,7 +732,7 @@ def geometry_active_initial_er_root_only_reverse_table(
 
     def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
         geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
         runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
         return _initial_er_root_only_objective_values(
             state_value,
@@ -737,7 +754,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     dres_der = initial_er_charge_flux_residual_er_derivative(
         pre_root_state,
         er_profile,
-        runtime=runtime,
+        runtime=runtime_for_geometry,
     )
     safe_dres_der = jnp.where(
         jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
@@ -754,7 +771,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         state=pre_root_state,
         er_profile=er_profile,
         residual_bars=residual_bars,
-        runtime=runtime,
+        runtime=runtime_for_geometry,
     )
     direct_pre_root_state_bars = dataclasses.replace(
         rooted_state_bars,
@@ -784,7 +801,7 @@ def geometry_active_initial_er_root_only_reverse_table(
 
     def _residuals_from_geometry_delta(geometry_delta):
         geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
         runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
         return initial_er_charge_flux_residuals(
             pre_root_state,
@@ -801,7 +818,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     )(residual_bars)
     geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
-    ntx_runtime = runtime_with_geometry_payload(runtime, baseline_geometry)
+    ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
     ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
         runtime=ntx_runtime,
         state=pre_root_state,
@@ -839,6 +856,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         max_iter=max_iter,
         solver_device=solver_device,
         progress_label=progress_label,
+        raw_block_solve=raw_block_solve,
     )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
@@ -1436,6 +1454,7 @@ def geometry_full_ad_reverse_table(
     step_size: float | None = None,
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = "default",
+    raw_block_solve=None,
 ) -> ObjectiveTableResult:
     """Evaluate the validated full-geometry reverse table for optimization terms.
 
@@ -1484,6 +1503,7 @@ def geometry_full_ad_reverse_table(
         step_size=step_size,
         final_vmec_pullback_mode=final_vmec_pullback_mode,
         solver_device=solver_device,
+        raw_block_solve=raw_block_solve,
     )
     objective_values = jnp.stack(
         [jnp.asarray(values_by_name[name], dtype=jnp.float64).reshape(()) for name in canonical_objectives]
@@ -1516,6 +1536,7 @@ def geometry_full_ad_reverse_table_backend(
     step_size: float | None = None,
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = "default",
+    raw_block_solve=None,
 ) -> ObjectiveTableBackend:
     """Return a geometry backend for ``residuals_and_jacobian_reverse_ad``."""
 
@@ -1537,6 +1558,7 @@ def geometry_full_ad_reverse_table_backend(
                 opts.get("geometry_final_vmec_pullback_mode", final_vmec_pullback_mode)
             ),
             solver_device=opts.get("geometry_solver_device", solver_device),
+            raw_block_solve=opts.get("geometry_raw_block_solve", raw_block_solve),
         )
 
     return _backend
