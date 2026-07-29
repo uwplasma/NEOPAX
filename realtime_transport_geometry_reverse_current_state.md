@@ -861,3 +861,86 @@ Next steps:
 5. After validation, expose a production-facing optimization entry point.
    The likely shape is a VMEX-style least-squares runner accepting transport terms plus VMEC
    geometry terms, grouped internally into reverse-table blocks.
+
+## Current Checkpoint - Initial-Er Root-Only Optimization Smoke
+
+Date: 2026-07-29
+
+Current focus:
+
+- Validate the ambipolar initial-Er root-only optimization smoke using the same compact reverse
+  structure as the working realtime-geometry transport reverse path.
+- The root-only smoke is selected with `--initial-Er-root-only-optimization-smoke`; it is separate
+  from the already validated full reverse transport benchmark path.
+
+Bug found:
+
+- The geometry-active root-only smoke still contained a generic payload VJP through selected-root
+  construction. This was not equivalent to the good benchmark behavior and could trigger tracer
+  escape/OOM patterns.
+- The bad pattern was effectively `jax.vjp(payload_delta -> runtime -> selected root -> objectives)`.
+
+Correction applied:
+
+- The geometry-active root-only smoke now uses the same split root-boundary structure as the
+  validated full reverse path:
+  - build the pre-root initial state at the baseline runtime,
+  - evaluate the selected Er root once,
+  - take objective cotangents with respect to rooted state and direct geometry terms,
+  - convert `Er` cotangents to ambipolar residual cotangents via `dR/dEr`,
+  - use `compact_initial_er_state_pullback(...)` for state residual bars,
+  - use `_compact_initial_er_ntx_support_pullback_leaves(...)` for NTX-support residual bars,
+  - use `realtime_geometry_transport_reverse_table_from_payload_cotangents(...)` for the raw-block
+    VMEC harmonic pullback.
+- A follow-up wrapper bug was fixed: `RealtimeGeometryTransportReverseTableResult` has
+  `profile_gradient_matrix` and `geometry_gradient_matrix`, not `.jacobian`. The smoke wrapper now
+  concatenates `[profile_gradient_matrix | geometry_gradient_matrix]` in optimization parameter
+  order.
+
+Validation so far:
+
+```text
+python -m py_compile examples\benchmarks\benchmark_transport_reverse_ad_only.py
+git diff --check -- examples/benchmarks/benchmark_transport_reverse_ad_only.py
+```
+
+Both checks passed.
+
+Latest user run before the wrapper fix:
+
+```text
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+Observed behavior:
+
+- The compact raw-block geometry payload pullback completed.
+- The run then failed only at final smoke-result assembly with:
+  `AttributeError: 'RealtimeGeometryTransportReverseTableResult' object has no attribute 'jacobian'`.
+- That assembly bug is now patched.
+
+Next test to run:
+
+```text
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+Expected result:
+
+- It should get past the previous `.jacobian` AttributeError.
+- It should print root-only objective values and Jacobian rows for the active profile and geometry
+  optimization parameters.
+- This smoke still builds the realtime-geometry runtime, but it should not prepare or run the Radau
+  time-evolution solver.

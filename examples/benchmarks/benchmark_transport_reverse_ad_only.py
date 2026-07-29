@@ -3695,7 +3695,13 @@ def _run_initial_er_root_only_optimization_api_smoke(
         table_result = ObjectiveTableResult(
             objective_names=tuple(objective_names),
             values=profile_objective_values,
-            jacobian=assembly_result.table_result.jacobian,
+            jacobian=jnp.concatenate(
+                (
+                    assembly_result.table_result.profile_gradient_matrix,
+                    assembly_result.table_result.geometry_gradient_matrix,
+                ),
+                axis=1,
+            ),
         )
         t_eval = time.perf_counter()
         result = residuals_and_jacobian_reverse_ad(
