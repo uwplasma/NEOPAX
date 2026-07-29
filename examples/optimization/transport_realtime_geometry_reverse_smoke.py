@@ -174,6 +174,8 @@ def main() -> int:
     )
     setattr(args, "realtime_geometry_gradient_path", "reverse_payload")
     setattr(args, "skip_realtime_geometry_support_bar_diagnostics", True)
+    setattr(args, "initial_er_root_ad", str(args.initial_Er_root_ad))
+
     def _internal_support_segment_probe(
         *,
         args,
