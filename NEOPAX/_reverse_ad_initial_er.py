@@ -249,3 +249,79 @@ def compact_initial_er_ntx_support_pullback_leaves(
         + tuple(center_prepared_bar_leaves)
         + face_prepared_bar_leaves
     )
+
+
+def compact_initial_er_state_pullback(
+    *,
+    residual_scalar_fn,
+    state,
+    er_profile,
+    residual_bars,
+    runtime,
+):
+    """Compact state pullback for the initial-Er ambipolar residual.
+
+    The generic rule forms a VJP for the full radial residual vector and then
+    batches over objective cotangents. That is the memory-heavy path that can
+    OOM after the transport cotangent sweep. This transposes one scalar radial
+    residual at a time and contracts all objective residual bars immediately,
+    matching the compact/local behavior used for the NTX support payload.
+    """
+
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim == 1:
+        residual_bars = residual_bars[None, :]
+        squeeze_result = True
+    elif residual_bars.ndim == 2:
+        squeeze_result = False
+    else:
+        raise ValueError(
+            "compact initial-Er state pullback expects residual_bars with shape "
+            "(radial_count,) or (objective_count, radial_count)."
+        )
+    if er_profile.ndim != 1:
+        raise ValueError("compact initial-Er state pullback expects a 1D er_profile.")
+    if int(residual_bars.shape[1]) != int(er_profile.shape[0]):
+        raise ValueError(
+            "compact initial-Er state pullback residual radial dimension does not match er_profile: "
+            f"residual_bars.shape={residual_bars.shape}, er_profile.shape={er_profile.shape}."
+        )
+
+    objective_count = int(residual_bars.shape[0])
+
+    def _zero_batched_like(leaf):
+        arr = jnp.asarray(leaf)
+        if not jnp.issubdtype(arr.dtype, jnp.inexact):
+            arr = arr.astype(jnp.float64)
+        return jnp.broadcast_to(jnp.zeros_like(arr), (objective_count,) + arr.shape)
+
+    state_bar0 = jax.tree_util.tree_map(_zero_batched_like, state)
+    radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+
+    def _add_batched_trees(lhs, rhs):
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+    def _accumulate_radius(carry, radius_index):
+        _, residual_pullback = jax.vjp(
+            lambda state_value: residual_scalar_fn(
+                state_value,
+                er_profile,
+                radius_index,
+                runtime=runtime,
+            ),
+            state,
+        )
+        (state_bar_i,) = residual_pullback(jnp.asarray(1.0, dtype=er_profile.dtype))
+        weights = residual_bars[:, radius_index]
+
+        def _scale_leaf(leaf):
+            leaf_arr = jnp.asarray(leaf)
+            return weights.reshape((objective_count,) + (1,) * leaf_arr.ndim) * leaf_arr
+
+        return _add_batched_trees(carry, jax.tree_util.tree_map(_scale_leaf, state_bar_i)), None
+
+    state_bars, _ = jax.lax.scan(_accumulate_radius, state_bar0, radius_indices)
+    if squeeze_result:
+        return jax.tree_util.tree_map(lambda leaf: leaf[0], state_bars)
+    return state_bars

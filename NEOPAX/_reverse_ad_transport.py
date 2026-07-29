@@ -216,7 +216,9 @@ class RealtimeGeometrySupportReverseDependencies:
     add_trees: Callable[[object, object], object]
     initial_er_selected_root_profile: Callable[..., object]
     initial_er_charge_flux_residuals: Callable[..., object]
+    initial_er_charge_flux_residual_scalar: Callable[..., object]
     initial_er_charge_flux_residual_er_derivative: Callable[..., object]
+    compact_initial_er_state_pullback: Callable[..., object]
     compact_initial_er_ntx_support_pullback_leaves: Callable[..., object]
     runtime_with_geometry_payload: Callable[[object, object], object]
     runtime_with_ntx_support_payload: Callable[[object, object], object]
@@ -665,16 +667,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             0.0,
         )
 
-        _, state_residual_pullback = jax.vjp(
-            lambda state_value: dependencies.initial_er_charge_flux_residuals(
-                state_value,
-                er_profile,
-                runtime=runtime,
-            ),
-            pre_root_initial_state,
-        )
-        state_residual_bars = jax.vmap(lambda residual_bar: state_residual_pullback(residual_bar)[0])(
-            residual_bars
+        state_residual_bars = dependencies.compact_initial_er_state_pullback(
+            residual_scalar_fn=dependencies.initial_er_charge_flux_residual_scalar,
+            state=pre_root_initial_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            runtime=runtime,
         )
         direct_initial_state_bars = dataclasses.replace(
             initial_state_bars,

@@ -41,6 +41,7 @@ from NEOPAX._entropy_models import get_entropy_model  # noqa: E402
 from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
+    compact_initial_er_state_pullback,
     compact_initial_er_ntx_support_pullback_leaves,
     find_ntx_exact_support_model,
 )
@@ -191,6 +192,16 @@ def _initial_er_charge_flux_residuals(state, er_profile, *, runtime):
     return jax.lax.map(_residual_i, indices)
 
 
+def _initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+    gamma = local_particle_flux(radius_index, er_profile[radius_index])
+    return jnp.sum(charge_qp * gamma)
+
+
 def _initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
     charge_qp = jnp.asarray(runtime.species.charge_qp)
     er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
@@ -216,14 +227,10 @@ def _initial_er_residual_bar(state, er_profile, er_bar, finite_mask, *, runtime)
     er_bar = jnp.asarray(er_bar, dtype=state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
-    def _residual_i_er(i, er_value):
-        er_eval = er_profile.at[i].set(er_value)
-        return _initial_er_charge_flux_residuals(state, er_eval, runtime=runtime)[i]
-
-    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
-    dres_der = jax.lax.map(
-        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
-        indices,
+    dres_der = _initial_er_charge_flux_residual_er_derivative(
+        state,
+        er_profile,
+        runtime=runtime,
     )
     safe_dres_der = jnp.where(
         jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
@@ -241,11 +248,13 @@ def _initial_er_root_state_bar(state, er_profile, finite_mask, state_bar, *, run
         finite_mask,
         runtime=runtime,
     )
-    _, residual_pullback = jax.vjp(
-        lambda state_value: _initial_er_charge_flux_residuals(state_value, er_profile, runtime=runtime),
-        state,
+    state_residual_bar = compact_initial_er_state_pullback(
+        residual_scalar_fn=_initial_er_charge_flux_residual_scalar,
+        state=state,
+        er_profile=er_profile,
+        residual_bars=residual_bar,
+        runtime=runtime,
     )
-    (state_residual_bar,) = residual_pullback(residual_bar)
     direct_bar = dataclasses.replace(state_bar, Er=jnp.zeros_like(state.Er))
     return _add_trees(direct_bar, state_residual_bar)
 
@@ -1519,9 +1528,11 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         add_trees=_add_trees,
         initial_er_selected_root_profile=_initial_er_selected_root_profile,
         initial_er_charge_flux_residuals=_initial_er_charge_flux_residuals,
+        initial_er_charge_flux_residual_scalar=_initial_er_charge_flux_residual_scalar,
         initial_er_charge_flux_residual_er_derivative=(
             _initial_er_charge_flux_residual_er_derivative
         ),
+        compact_initial_er_state_pullback=compact_initial_er_state_pullback,
         compact_initial_er_ntx_support_pullback_leaves=(
             _compact_initial_er_ntx_support_pullback_leaves
         ),
