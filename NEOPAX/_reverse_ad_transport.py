@@ -20,7 +20,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._geometry_autodiff import geometry_payload_pullback_from_param_vector_raw_block_transpose
+from ._geometry_autodiff import (
+    boundary_param_entries,
+    build_geometry_autodiff_context,
+    geometry_payload_pullback_from_param_vector_raw_block_transpose,
+)
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
@@ -34,7 +38,12 @@ from ._reverse_ad_initial_er import (
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
 )
-from ._reverse_ad_parameters import ReverseADParameterSet
+from ._reverse_ad_parameters import (
+    ReverseADParameterSet,
+    discover_vmec_boundary_parameter_specs,
+    normalize_vmec_boundary_families,
+    vmec_boundary_tuples,
+)
 from ._transport_flux_models import (
     PRESSURE_SOURCE_STATE_TO_MW_M3,
     _add_float_delta_tree,
@@ -1628,12 +1637,12 @@ def realtime_geometry_transport_reverse_support_segment_executor(
     profile_cfg: Mapping[str, Any],
     neoclassical_cfg: Mapping[str, Any],
 ) -> TransportReverseSupportSegmentExecutor:
-    """Build the temporary executor wrapper around a segmented reverse probe.
+    """Build an executor wrapper around a segmented reverse probe.
 
-    The supplied probe still owns the heavy segmented reverse sweep during
-    migration.  This wrapper owns the reusable calling convention: grouped
-    optimization paths must request an internal report and receive the shared
-    runtime/config inputs.
+    The supplied probe may be the internal grouped implementation or a
+    benchmark diagnostic wrapper. This owns the reusable calling convention:
+    grouped optimization paths must request an internal report and receive the
+    shared runtime/config inputs.
     """
 
     if not callable(support_segment_probe):
@@ -1660,6 +1669,280 @@ def realtime_geometry_transport_reverse_support_segment_executor(
     return _executor
 
 
+def _format_geometry_param_spec(param_spec: tuple[str, int, int]) -> str:
+    family, m, n = param_spec
+    return f"vmec:{str(family).strip().upper()}:{int(m)}:{int(n)}"
+
+
+def _parse_reverse_geometry_parameter(parameter_name: str) -> tuple[str, int, int]:
+    parts = str(parameter_name).split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            "Reverse geometry parameters must use FAMILY:m:n, for example 'RBC:1:0'."
+        )
+    family = parts[0].strip().upper()
+    if not family:
+        raise ValueError("Reverse geometry parameter family cannot be empty.")
+    try:
+        return family, int(parts[1]), int(parts[2])
+    except ValueError as exc:
+        raise ValueError(
+            "Reverse geometry parameters must use integer m/n values, "
+            "for example 'RBC:1:0'."
+        ) from exc
+
+
+def _geometry_context_from_reverse_args(config: Mapping[str, Any], args):
+    geometry_parameter = str(getattr(args, "reverse_geometry_parameter", "RBC:1:0"))
+    if geometry_parameter.strip().lower() == "all":
+        family, m, n = ("RBC", 0, 0)
+    else:
+        family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
+    geom_cfg = config.get("geometry", {})
+    vmec_input_file = geom_cfg.get("vmec_input_file")
+    if vmec_input_file is None:
+        raise ValueError("Realtime geometry reverse mode requires geometry.vmec_input_file.")
+    return build_geometry_autodiff_context(
+        vmec_input_file,
+        param_family=family,
+        param_m=m,
+        param_n=n,
+        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
+        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+    )
+
+
+def _geometry_param_specs_from_reverse_args(args, geometry_context) -> tuple[tuple[str, int, int], ...]:
+    geometry_parameter = str(getattr(args, "reverse_geometry_parameter", "RBC:1:0")).strip()
+    if geometry_parameter.lower() != "all":
+        return (_parse_reverse_geometry_parameter(geometry_parameter),)
+    families = normalize_vmec_boundary_families(
+        getattr(args, "reverse_geometry_families", "RBC,ZBS")
+    )
+    try:
+        specs = discover_vmec_boundary_parameter_specs(
+            geometry_context,
+            families=families,
+            nonzero_only=not bool(getattr(args, "reverse_geometry_include_zero_harmonics", False)),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "No VMEC boundary harmonics matched the requested all-harmonic selector. "
+            "Try enabling zero harmonics or changing the requested families."
+        ) from exc
+    return vmec_boundary_tuples(specs)
+
+
+def _baseline_geometry_delta_vector_for_specs(
+    geom_cfg: Mapping[str, Any],
+    geometry_param_specs: Sequence[tuple[str, int, int]],
+) -> jax.Array:
+    deltas = np.zeros((len(geometry_param_specs),), dtype=np.float64)
+    configured_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
+    if configured_delta != 0.0:
+        configured_spec = (
+            str(geom_cfg.get("vmec_param_family", "RBC")).strip().upper(),
+            int(geom_cfg.get("vmec_param_m", 0)),
+            int(geom_cfg.get("vmec_param_n", 0)),
+        )
+        for i, spec in enumerate(geometry_param_specs):
+            normalized_spec = (str(spec[0]).strip().upper(), int(spec[1]), int(spec[2]))
+            if normalized_spec == configured_spec:
+                deltas[i] = configured_delta
+                break
+    return jnp.asarray(deltas, dtype=jnp.float64)
+
+
+def _array_finite_summary(value) -> dict[str, Any]:
+    arr = np.asarray(jax.device_get(jnp.asarray(value)))
+    finite = np.isfinite(arr)
+    finite_values = arr[finite]
+    first_nonfinite_index = None
+    if not bool(np.all(finite)):
+        first_nonfinite_index = [int(i) for i in np.argwhere(~finite)[0].tolist()]
+    return {
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "all_finite": bool(np.all(finite)),
+        "nan_count": int(np.isnan(arr).sum()),
+        "posinf_count": int(np.isposinf(arr).sum()),
+        "neginf_count": int(np.isneginf(arr).sum()),
+        "finite_min": None if finite_values.size == 0 else float(np.min(finite_values)),
+        "finite_max": None if finite_values.size == 0 else float(np.max(finite_values)),
+        "first_nonfinite_index": first_nonfinite_index,
+    }
+
+
+def geometry_volume_diagnostics(geometry) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    for name in (
+        "a_b",
+        "R0",
+        "rho_grid",
+        "rho_grid_half",
+        "r_grid",
+        "r_grid_half",
+        "Vprime",
+        "Vprime_half",
+        "overVprime",
+    ):
+        if hasattr(geometry, name):
+            diagnostics[name] = _array_finite_summary(getattr(geometry, name))
+    if hasattr(geometry, "Vprime") and hasattr(geometry, "r_grid"):
+        volume = jnp.trapezoid(
+            jnp.asarray(geometry.Vprime),
+            x=jnp.asarray(geometry.r_grid),
+        )
+        diagnostics["integrated_volume"] = _array_finite_summary(volume)
+        diagnostics["integrated_volume_value"] = float(np.asarray(jax.device_get(volume)))
+    return diagnostics
+
+
+def run_internal_realtime_geometry_support_segment_probe(
+    *,
+    args,
+    context: RealtimeGeometryTransportReverseTableContext,
+    return_report: bool = True,
+    suppress_diagnostics: bool = True,
+) -> TransportReverseReport:
+    """Run the benchmark-matched grouped realtime-geometry reverse table internally.
+
+    This is the all-objective grouped path used by optimization callers. It
+    keeps the compact support cotangent sweep and raw-block VMEC payload
+    pullback together, without importing benchmark modules.
+    """
+
+    if not return_report:
+        raise ValueError("Internal grouped realtime-geometry reverse requires return_report=True.")
+    if str(getattr(args, "objective", "all")) != "all":
+        raise ValueError("Internal grouped realtime-geometry reverse currently requires objective='all'.")
+    config = context.config
+    baseline_runtime = context.baseline_runtime
+    baseline_state = context.baseline_state
+    profile_cfg = context.profile_cfg
+    neoclassical_cfg = context.neoclassical_cfg
+    core_setup = prepare_realtime_geometry_support_segment_core_setup(
+        args=args,
+        config=config,
+        baseline_values=context.baseline_values,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+        parameter_order=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER,
+        find_ntx_support_payload=find_ntx_support_payload,
+        prepare_reverse_static_setup=prepare_reverse_static_setup,
+        geometry_volume_diagnostics=None if suppress_diagnostics else geometry_volume_diagnostics,
+    )
+    t_start = time.perf_counter()
+    t_phase = time.perf_counter()
+    support_cotangent_result = realtime_geometry_support_cotangents_from_parameter_vector(
+        profile_values=core_setup.profile_values,
+        config=config,
+        baseline_runtime=baseline_runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        reverse_setup=core_setup.reverse_setup,
+        support_payload=core_setup.support_payload,
+        initial_er_root_ad=getattr(args, "initial_er_root_ad", "off"),
+    )
+    if not suppress_diagnostics:
+        print(
+            "[autodiff-gate] progress: transport reverse profile/support cotangents complete "
+            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            flush=True,
+        )
+    geom_cfg = config.get("geometry", {})
+    geometry_context = _geometry_context_from_reverse_args(config, args)
+    geometry_param_specs = _geometry_param_specs_from_reverse_args(args, geometry_context)
+    geometry_param_entries = boundary_param_entries(geometry_context, geometry_param_specs)
+    geometry_param_labels = tuple(_format_geometry_param_spec(spec) for spec in geometry_param_specs)
+    baseline_geometry_deltas = _baseline_geometry_delta_vector_for_specs(
+        geom_cfg,
+        geometry_param_specs,
+    )
+    t_phase = time.perf_counter()
+    assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+        objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+        profile_parameter_labels=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER,
+        geometry_parameter_labels=geometry_param_labels,
+        objective_values=support_cotangent_result.objective_values,
+        profile_gradient_matrix=support_cotangent_result.profile_gradient_matrix,
+        geometry_context=geometry_context,
+        baseline_geometry_deltas=baseline_geometry_deltas,
+        geometry_param_specs=geometry_param_specs,
+        support_bars=tuple(support_cotangent_result.support_bars),
+        support_component_bars_by_name=support_cotangent_result.support_component_bars_by_name,
+        include_component_pullbacks=bool(getattr(args, "realtime_geometry_component_pullbacks", False)),
+        combined_geometry_payload=core_setup.combined_geometry_payload,
+        n_r=int(geom_cfg.get("n_radial", 51)),
+        n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+        n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+        n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+        surface_backend=core_setup.ntx_surface_backend,
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+        progress_label=None if suppress_diagnostics else "[autodiff-gate] realtime geometry payload pullback:",
+    )
+    if not suppress_diagnostics:
+        print(
+            "[autodiff-gate] progress: geometry support pullback complete "
+            f"mode={assembly_result.payload_pullback_result.pullback_mode} "
+            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+            flush=True,
+        )
+    table_result = assembly_result.table_result
+    metadata_entries = realtime_geometry_transport_reverse_metadata_entries(
+        parameter_mode=str(getattr(args, "reverse_parameter_mode", "profiles_plus_realtime_geometry")),
+        config_path=str(getattr(args, "config", "")),
+        objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+        profile_parameter_labels=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER,
+        profile_values=core_setup.profile_values,
+        geometry_parameter_labels=geometry_param_labels,
+        geometry_parameter_entries=geometry_param_entries,
+        baseline_geometry_deltas=baseline_geometry_deltas,
+        geometry_parameter_specs=geometry_param_specs,
+        geometry_parameter_selector=str(getattr(args, "reverse_geometry_parameter", "RBC:1:0")),
+        accepted_step_limit=None
+        if getattr(args, "accepted_step_limit", None) is None
+        else int(getattr(args, "accepted_step_limit")),
+        reverse_segment_length=None
+        if getattr(args, "reverse_segment_length", None) is None
+        else int(getattr(args, "reverse_segment_length")),
+        reverse_stage_cotangent_mode_requested=str(getattr(args, "reverse_stage_cotangent_mode", "full")),
+        reverse_stage_cotangent_mode_effective=core_setup.support_probe_cotangent_mode,
+        ntx_exact_derivative_mode=str(getattr(args, "ntx_exact_derivative_mode", "direct")),
+        ntx_exact_derivative_field_pullback_mode=str(
+            getattr(args, "ntx_exact_derivative_field_pullback_mode", "generic_jvp")
+        ),
+        ntx_exact_surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
+        realtime_geometry_gradient_path=str(getattr(args, "realtime_geometry_gradient_path", "reverse_payload")),
+        realtime_geometry_component_pullbacks=bool(getattr(args, "realtime_geometry_component_pullbacks", False)),
+        realtime_geometry_support_bar_diagnostics_skipped=True,
+        realtime_geometry_derivative_complete=bool(core_setup.combined_geometry_payload),
+        geometry_support_pullback_mode=assembly_result.payload_pullback_result.pullback_mode,
+        realtime_geometry_diagnostics={},
+        support_payload_summary={},
+        support_bar_summary_by_objective={},
+        support_bar_l2_by_objective={},
+        support_bar_branch_diagnostics_by_objective={},
+        support_reuse_count=support_cotangent_result.support_reuse_count,
+        support_rebuild_count=support_cotangent_result.support_rebuild_count,
+        support_initial_cache_pullback_used=support_cotangent_result.initial_cache_pullback_used,
+        support_initial_cache_pullback_skipped=support_cotangent_result.initial_cache_pullback_skipped,
+        elapsed_s=time.perf_counter() - t_start,
+    )
+    return {
+        **metadata_entries,
+        **transport_reverse_table_report_entries(table_result=table_result),
+        "geometry_gradient_reverse_ad_by_branch": None,
+        "geometry_gradient_reverse_ad_by_component": {},
+        "geometry_gradient_reverse_ad_final_state_components": {},
+        "geometry_gradient_reverse_ad_by_component_and_branch": {},
+        "transport_reverse_table_result": table_result,
+    }
+
+
 def run_realtime_geometry_support_segment_reverse_table_core(
     *,
     support_segment_probe: TransportReverseSupportSegmentProbe,
@@ -1669,7 +1952,6 @@ def run_realtime_geometry_support_segment_reverse_table_core(
 ) -> TransportReverseReport:
     """Run the segmented support probe as a non-printing reverse table core.
 
-    The heavy probe callback is still supplied externally during migration.
     This function owns the internal core calling convention: execute the probe
     with `return_report=True`, thread the table context, and require the
     JAX-native table result in the returned report.
@@ -1725,9 +2007,8 @@ def realtime_geometry_transport_reverse_grouped_inputs(
 ) -> RealtimeGeometryTransportReverseGroupedInputs:
     """Build shared context and grouped runner for realtime-geometry reverse tables.
 
-    The benchmark still supplies `support_segment_executor`, which owns the
-    segmented reverse sweep during migration.  This helper owns the reusable
-    context construction and objective='all' grouped-runner contract.
+    The support executor owns the segmented reverse sweep. This helper owns the
+    reusable context construction and objective='all' grouped-runner contract.
     """
 
     table_context = realtime_geometry_transport_reverse_table_context(

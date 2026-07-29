@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
+import copy
 import json
 from pathlib import Path
 import sys
@@ -17,14 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from NEOPAX._geometry_autodiff import build_geometry_autodiff_context
-from examples.benchmarks.benchmark_transport_forward_fd_lane import (
-    _baseline_profile_cfg,
-    _prepare_benchmark_config,
-)
-from examples.benchmarks.benchmark_transport_reverse_ad_only import (
-    _run_realtime_geometry_support_segment_probe,
-)
+import NEOPAX
 from NEOPAX._orchestrator import build_runtime_context
 from NEOPAX._reverse_ad_optimization import (
     build_transport_realtime_geometry_least_squares_runner,
@@ -38,31 +31,64 @@ from NEOPAX._reverse_ad_parameters import (
 from NEOPAX._reverse_ad_transport import (
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     realtime_geometry_transport_reverse_grouped_inputs,
+    realtime_geometry_transport_reverse_table_context,
     realtime_geometry_transport_reverse_support_segment_executor,
+    run_internal_realtime_geometry_support_segment_probe,
 )
 
 
 PROFILE_PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 
 
+def _prepare_smoke_config(
+    config_path: Path,
+    *,
+    device: str | None,
+    ntx_exact_derivative_mode: str | None = None,
+    ntx_exact_derivative_field_pullback_mode: str | None = None,
+    ntx_exact_derivative_pullback_boundary: str | None = None,
+    ntx_exact_derivative_pullback_algebra: str | None = None,
+    radau_jacobian_reuse_mode: str | None = None,
+) -> dict:
+    config = NEOPAX.prepare_config(config_path, device=device)
+    config = copy.deepcopy(config)
+    config.setdefault("general", {})["mode"] = "transport"
+    transport_output = config.setdefault("transport_output", {})
+    transport_output["transport_plot"] = False
+    transport_output["transport_write_hdf5"] = False
+    transport_output["transport_compare_ambipolarity_residual"] = False
+    transport_output["transport_scan_ambipolarity_residual"] = False
+    solver_cfg = config.setdefault("transport_solver", {})
+    solver_cfg["debug_stage_markers"] = False
+    solver_cfg["debug_disable_jit"] = False
+    solver_cfg["debug_walltime_attempts"] = False
+    if radau_jacobian_reuse_mode is not None:
+        solver_cfg["radau_jacobian_reuse_mode"] = str(radau_jacobian_reuse_mode)
+    if ntx_exact_derivative_mode is not None:
+        config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = str(ntx_exact_derivative_mode)
+    if ntx_exact_derivative_field_pullback_mode is not None:
+        config.setdefault("neoclassical", {})[
+            "ntx_exact_derivative_field_pullback_mode"
+        ] = str(ntx_exact_derivative_field_pullback_mode)
+    if ntx_exact_derivative_pullback_boundary is not None:
+        config.setdefault("neoclassical", {})[
+            "ntx_exact_derivative_pullback_boundary"
+        ] = str(ntx_exact_derivative_pullback_boundary)
+    if ntx_exact_derivative_pullback_algebra is not None:
+        config.setdefault("neoclassical", {})[
+            "ntx_exact_derivative_pullback_algebra"
+        ] = str(ntx_exact_derivative_pullback_algebra)
+    return config
+
+
+def _baseline_profile_cfg(config: dict) -> dict:
+    profiles = copy.deepcopy(config.get("profiles", {}))
+    profiles.setdefault("model", "standard_analytical")
+    return profiles
+
+
 def _profile_values(profile_cfg, dtype):
     return jnp.asarray([float(profile_cfg[name]) for name in PROFILE_PARAMETER_ORDER], dtype=dtype)
-
-
-def _geometry_context_from_config(config, first_spec):
-    geom_cfg = config.get("geometry", {})
-    vmec_input_file = geom_cfg.get("vmec_input_file")
-    if vmec_input_file is None:
-        raise ValueError("geometry.vmec_input_file is required for realtime geometry reverse smoke.")
-    family, m, n = first_spec
-    return build_geometry_autodiff_context(
-        vmec_input_file,
-        param_family=family,
-        param_m=m,
-        param_n=n,
-        mboz=geom_cfg.get("mboz", geom_cfg.get("vmec_mboz")),
-        nboz=geom_cfg.get("nboz", geom_cfg.get("vmec_nboz")),
-    )
 
 
 def _baseline_geometry_delta_vector(geom_cfg, geometry_specs):
@@ -120,7 +146,7 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    config = _prepare_benchmark_config(
+    config = _prepare_smoke_config(
         Path(args.config),
         device=args.device,
         ntx_exact_derivative_mode=args.ntx_exact_derivative_mode,
@@ -148,8 +174,33 @@ def main() -> int:
     )
     setattr(args, "realtime_geometry_gradient_path", "reverse_payload")
     setattr(args, "skip_realtime_geometry_support_bar_diagnostics", True)
+    def _internal_support_segment_probe(
+        *,
+        args,
+        config,
+        baseline_values,
+        baseline_runtime,
+        baseline_state,
+        profile_cfg,
+        neoclassical_cfg,
+        return_report=False,
+    ):
+        return run_internal_realtime_geometry_support_segment_probe(
+            args=args,
+            context=realtime_geometry_transport_reverse_table_context(
+                config=config,
+                baseline_values=baseline_values,
+                baseline_runtime=baseline_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                neoclassical_cfg=neoclassical_cfg,
+            ),
+            return_report=return_report,
+            suppress_diagnostics=True,
+        )
+
     support_segment_executor = realtime_geometry_transport_reverse_support_segment_executor(
-        support_segment_probe=_run_realtime_geometry_support_segment_probe,
+        support_segment_probe=_internal_support_segment_probe,
         config=config,
         baseline_values=baseline_values,
         baseline_runtime=runtime,

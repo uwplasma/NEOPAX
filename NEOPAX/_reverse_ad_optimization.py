@@ -1155,9 +1155,9 @@ def build_transport_realtime_geometry_least_squares_runner(
 ) -> TransportRealtimeGeometryLeastSquaresRunner:
     """Build a callable least-squares runner for realtime-geometry transport objectives.
 
-    This is the optimizer-facing wiring helper.  The actual heavy reverse
-    executor can still be supplied by a benchmark during migration, but request
-    construction and canonical evaluation live here.
+    This is the optimizer-facing wiring helper. The heavy reverse executor is
+    supplied as a grouped report runner so optimization can use the same
+    validated memory/graph behavior as the reverse benchmark.
     """
 
     request = realtime_geometry_transport_reverse_table_request(
