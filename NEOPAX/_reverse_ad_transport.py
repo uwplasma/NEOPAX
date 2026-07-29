@@ -1867,8 +1867,9 @@ def run_realtime_geometry_transport_reverse_table(
     """Run the validated grouped realtime-geometry transport reverse table.
 
     This is the named internal execution seam for the production optimization
-    lane. New optimization callers should prefer a `table_result_builder`;
-    `run_grouped_report` remains only for legacy/reporting adapters.
+    lane. For realtime-geometry transport, the grouped report runner is the
+    validated memory/graph behavior used by the benchmark. Direct table-result
+    builders should only become the default after matching this path.
     """
 
     return build_realtime_geometry_transport_reverse_report(
@@ -1924,9 +1925,10 @@ def transport_realtime_geometry_reverse_table(
 ) -> RealtimeGeometryTransportReverseTableResult:
     """Evaluate the realtime-geometry transport reverse table.
 
-    This is the stable internal API boundary for optimization callers. The
-    preferred path is a JAX-native `table_result_builder`; `run_grouped_report`
-    is retained as a compatibility adapter for benchmark/reporting code.
+    This is the stable internal API boundary for optimization callers. For the
+    realtime-geometry transport lane, `run_grouped_report` is currently the
+    benchmark-matched path. A direct `table_result_builder` is still accepted
+    for controlled experiments, but it is not the validated default.
     """
 
     if request is None:
@@ -1997,11 +1999,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     progress_label: str | None = None,
 ) -> TransportReverseTableResultBuilder:
-    """Build an optimization-facing full transport reverse table builder.
+    """Build an experimental direct full transport reverse table builder.
 
-    The returned callable owns the same compact support reverse and raw-block
-    VMEC payload pullback used by the validated benchmark path, without asking
-    benchmark code to provide callbacks.
+    This is useful for extraction work, but the grouped runner remains the
+    validated optimization path until this builder is proven to match the
+    benchmark memory behavior.
     """
 
     if not isinstance(table_context, RealtimeGeometryTransportReverseTableContext):

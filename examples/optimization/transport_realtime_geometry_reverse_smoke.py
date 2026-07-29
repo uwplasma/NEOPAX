@@ -22,6 +22,9 @@ from examples.benchmarks.benchmark_transport_forward_fd_lane import (
     _baseline_profile_cfg,
     _prepare_benchmark_config,
 )
+from examples.benchmarks.benchmark_transport_reverse_ad_only import (
+    _run_realtime_geometry_support_segment_probe,
+)
 from NEOPAX._orchestrator import build_runtime_context
 from NEOPAX._reverse_ad_optimization import (
     build_transport_realtime_geometry_least_squares_runner,
@@ -34,8 +37,8 @@ from NEOPAX._reverse_ad_parameters import (
 )
 from NEOPAX._reverse_ad_transport import (
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
-    internal_realtime_geometry_transport_reverse_table_result_builder,
-    realtime_geometry_transport_reverse_table_context,
+    realtime_geometry_transport_reverse_grouped_inputs,
+    realtime_geometry_transport_reverse_support_segment_executor,
 )
 
 
@@ -90,6 +93,8 @@ def parse_args():
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", choices=("default", "cpu", "gpu"), default="default")
     parser.add_argument("--reverse-geometry-parameter", default="RBC:1:0")
+    parser.add_argument("--reverse-geometry-families", default="RBC,ZBS")
+    parser.add_argument("--reverse-geometry-include-zero-harmonics", action="store_true")
     parser.add_argument("--objective", default="all")
     parser.add_argument("--accepted-step-limit", type=int, default=2)
     parser.add_argument("--reverse-segment-length", type=int, default=1)
@@ -107,6 +112,7 @@ def parse_args():
     parser.add_argument("--reverse-stage-adjoint-memory-mode", default="default")
     parser.add_argument("--reverse-stage-adjoint-iter-maxiter", type=int, default=40)
     parser.add_argument("--reverse-stage-adjoint-iter-tol", type=float, default=1.0e-10)
+    parser.add_argument("--realtime-geometry-component-pullbacks", action="store_true")
     parser.add_argument("--hide-solver-iterations", action="store_true")
     parser.add_argument("--output", default="outputs/autodiff_transport_lagged_ntx/reverse_ad/internal_optimization_smoke_2step.json")
     return parser.parse_args()
@@ -132,16 +138,18 @@ def main() -> int:
     geometry_specs = tuple(spec.as_tuple() for spec in parse_vmec_boundary_parameter_specs(args.reverse_geometry_parameter))
     if not geometry_specs:
         raise ValueError("--reverse-geometry-parameter must select at least one VMEC harmonic.")
-    geometry_context = _geometry_context_from_config(config, geometry_specs[0])
-    geometry_deltas = _baseline_geometry_delta_vector(config.get("geometry", {}), geometry_specs)
     profile_values = _profile_values(profile_cfg, jnp.asarray(baseline_state.pressure).dtype)
+    geometry_deltas = _baseline_geometry_delta_vector(config.get("geometry", {}), geometry_specs)
     baseline_values = jnp.concatenate([profile_values, geometry_deltas.astype(profile_values.dtype)])
     include_profiles = args.optimization_api_profile_dofs == "include"
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profiles,
         vmec_boundary=tuple(VmecBoundaryParameterSpec(*spec) for spec in geometry_specs),
     )
-    table_context = realtime_geometry_transport_reverse_table_context(
+    setattr(args, "realtime_geometry_gradient_path", "reverse_payload")
+    setattr(args, "skip_realtime_geometry_support_bar_diagnostics", True)
+    support_segment_executor = realtime_geometry_transport_reverse_support_segment_executor(
+        support_segment_probe=_run_realtime_geometry_support_segment_probe,
         config=config,
         baseline_values=baseline_values,
         baseline_runtime=runtime,
@@ -149,35 +157,28 @@ def main() -> int:
         profile_cfg=profile_cfg,
         neoclassical_cfg=neoclassical_cfg,
     )
-    table_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
-        table_context=table_context,
-        geometry_context=geometry_context,
-        baseline_geometry_deltas=geometry_deltas,
-        n_r=int(config.get("geometry", {}).get("n_radial", 51)),
-        n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-        n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-        n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-        surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
-        accepted_step_limit=int(args.accepted_step_limit),
-        reverse_segment_length=int(args.reverse_segment_length),
-        initial_er_root_ad=str(args.initial_Er_root_ad),
-        reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
-        reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
-        reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
-        reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
-        reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
-        reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
-        reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
-        progress_label="[autodiff-gate] internal optimization smoke payload pullback",
+    grouped_inputs = realtime_geometry_transport_reverse_grouped_inputs(
+        args=args,
+        config=config,
+        baseline_values=baseline_values,
+        baseline_runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+        support_segment_executor=support_segment_executor,
     )
+    table_context = grouped_inputs.table_context
+    run_grouped_report = grouped_inputs.run_grouped_report
     objective_names = _objective_names(args.objective)
     runner = build_transport_realtime_geometry_least_squares_runner(
         config,
         objective_names=objective_names,
         parameter_set=parameter_set,
         table_context=table_context,
-        table_result_builder=table_builder,
+        run_grouped_report=run_grouped_report,
+        objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
         options={
+            "quiet": True,
             "accepted_step_limit": int(args.accepted_step_limit),
             "reverse_segment_length": int(args.reverse_segment_length),
             "initial_er_root_ad": str(args.initial_Er_root_ad),
