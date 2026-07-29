@@ -1552,9 +1552,9 @@ def realtime_geometry_support_cotangents_from_parameter_vector(
 ) -> RealtimeGeometrySupportCotangentResult:
     """Run the grouped all-objective transport support-cotangent pullback.
 
-    The callback is still supplied by the benchmark while the implementation is
-    migrated. This helper owns the stable internal result shape and optional
-    device synchronization without adding another reverse pass.
+    By default this uses the internal compact reverse dependencies. A callback
+    can still be supplied by legacy benchmark adapters, but optimization callers
+    should use the default internal path.
     """
 
     if reverse_all_objectives_support_payload_bar is None:
@@ -1867,8 +1867,8 @@ def run_realtime_geometry_transport_reverse_table(
     """Run the validated grouped realtime-geometry transport reverse table.
 
     This is the named internal execution seam for the production optimization
-    lane.  At this stage the heavy runner is still supplied by the benchmark;
-    later steps can move that runner here without changing callers.
+    lane. New optimization callers should prefer a `table_result_builder`;
+    `run_grouped_report` remains only for legacy/reporting adapters.
     """
 
     return build_realtime_geometry_transport_reverse_report(
@@ -1924,11 +1924,9 @@ def transport_realtime_geometry_reverse_table(
 ) -> RealtimeGeometryTransportReverseTableResult:
     """Evaluate the realtime-geometry transport reverse table.
 
-    This is the stable internal API boundary for optimization callers.  The
-    expensive segmented reverse runner can still be supplied from the benchmark
-    while that code is being migrated, but callers interact with a
-    `RealtimeGeometryTransportReverseTableRequest` and receive the JAX-native
-    table result directly.
+    This is the stable internal API boundary for optimization callers. The
+    preferred path is a JAX-native `table_result_builder`; `run_grouped_report`
+    is retained as a compatibility adapter for benchmark/reporting code.
     """
 
     if request is None:
