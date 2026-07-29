@@ -34,6 +34,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
+    build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector,
     build_geometry_autodiff_context,
 )
 from NEOPAX._ambipolarity import solve_ambipolarity_roots_radial_jax  # noqa: E402
@@ -3442,6 +3443,8 @@ def _run_initial_er_root_only_optimization_api_smoke(
     baseline_runtime,
     baseline_state,
     profile_cfg: dict,
+    geometry_context=None,
+    neoclassical_cfg: dict[str, Any] | None = None,
 ):
     """Exercise initial ambipolar-Er objective optimization without time rollout."""
 
@@ -3463,18 +3466,84 @@ def _run_initial_er_root_only_optimization_api_smoke(
             "[autodiff-gate] initial-Er root-only smoke supports only Er objectives; "
             f"unsupported={unsupported!r}, choices are: {allowed}."
         )
-    parameter_set = reverse_ad_optimization_parameter_set(
-        include_profiles=True,
-        vmec_boundary=(),
+    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    include_geometry_dofs = str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    geometry_param_specs = (
+        _geometry_param_specs_from_args(args, geometry_context)
+        if include_geometry_dofs
+        else ()
     )
-    parameter_values = jnp.asarray(
+    parameter_set = reverse_ad_optimization_parameter_set(
+        include_profiles=include_profile_dofs,
+        vmec_boundary=tuple(
+            VmecBoundaryParameterSpec(family, m, n)
+            for family, m, n in geometry_param_specs
+        ),
+    )
+    if not parameter_set.specs:
+        raise SystemExit(
+            "[autodiff-gate] initial-Er root-only smoke has no active optimization parameters. "
+            "Use profile DOFs, realtime geometry DOFs, or both."
+        )
+    geom_cfg = config.get("geometry", {})
+    profile_values0 = jnp.asarray(
         [float(profile_cfg[name]) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
+    geometry_values0 = (
+        _baseline_geometry_delta_vector_for_specs(geom_cfg, geometry_param_specs)
+        if include_geometry_dofs
+        else jnp.asarray((), dtype=jnp.float64)
+    )
+    parameter_values = jnp.asarray(
+        (
+            list(np.asarray(profile_values0, dtype=float))
+            if include_profile_dofs
+            else []
+        )
+        + (
+            list(np.asarray(geometry_values0, dtype=float))
+            if include_geometry_dofs
+            else []
+        ),
+        dtype=jnp.asarray(baseline_state.pressure).dtype,
+    )
+    neoclassical_cfg = {} if neoclassical_cfg is None else neoclassical_cfg
 
     def _rooted_state_from_parameter_vector(values):
+        state, _runtime = _rooted_state_and_runtime_from_parameter_vector(values)
+        return state
+
+    def _rooted_state_and_runtime_from_parameter_vector(values):
+        values = jnp.asarray(values)
+        offset = 0
+        if include_profile_dofs:
+            profile_values = values[offset : offset + len(PARAMETER_ORDER)]
+            offset += len(PARAMETER_ORDER)
+        else:
+            profile_values = profile_values0
+        if include_geometry_dofs:
+            geometry_values = values[offset : offset + len(geometry_param_specs)]
+            payload = build_neopax_geometry_and_ntx_exact_lij_support_from_param_vector(
+                geometry_context,
+                geometry_values,
+                geometry_param_specs,
+                lane=str(geom_cfg.get("vmec_lane", "ad")).strip().lower(),
+                n_r=int(geom_cfg.get("n_radial", 51)),
+                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+                max_iter=geom_cfg.get("vmec_max_iter"),
+                step_size=geom_cfg.get("vmec_step_size"),
+                jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+            )
+            runtime = _runtime_with_geometry_payload(baseline_runtime, payload["geometry"])
+            runtime = _runtime_with_ntx_support_payload(runtime, payload["ntx_support"])
+        else:
+            runtime = baseline_runtime
         return _initial_state_for_parameter_vector(
-            values,
+            profile_values,
             config=config,
             initial_er_root_ad=args.initial_er_root_ad,
             baseline_state=baseline_state,
@@ -3487,6 +3556,9 @@ def _run_initial_er_root_only_optimization_api_smoke(
         runtime=baseline_runtime,
         parameter_set=parameter_set,
         rooted_state_from_parameter_vector=_rooted_state_from_parameter_vector,
+        rooted_state_and_runtime_from_parameter_vector=(
+            _rooted_state_and_runtime_from_parameter_vector
+        ),
         objective_names=objective_names,
     )
     terms = transport_least_squares_terms(objective_names)
@@ -3509,6 +3581,8 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "objective_order": list(objective_names),
         "residual_labels": list(result.residual_labels),
         "parameter_order": list(result.parameter_labels),
+        "optimization_api_profile_dofs": str(getattr(args, "optimization_api_profile_dofs", "include")),
+        "geometry_parameter_specs": [_format_geometry_param_spec(spec) for spec in geometry_param_specs],
         "objective_values": objective_values_np,
         "residuals": residuals_np.tolist(),
         "jacobian": jacobian_np.tolist(),
@@ -3841,6 +3915,8 @@ def _run_realtime_geometry_reverse_mode(
             baseline_runtime=baseline_runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
+            geometry_context=geometry_context,
+            neoclassical_cfg=neoclassical_cfg,
         )
         return
     phase_start = time.perf_counter()

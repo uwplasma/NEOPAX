@@ -135,6 +135,7 @@ TransportRealtimeGeometryLeastSquaresRunner = Callable[
     LeastSquaresEvaluation,
 ]
 InitialErRootOnlyStateBuilder = Callable[[object], object]
+InitialErRootOnlyStateRuntimeBuilder = Callable[[object], tuple[object, object]]
 InitialErRootOnlyLeastSquaresRunner = Callable[
     [object, Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
     LeastSquaresEvaluation,
@@ -175,6 +176,7 @@ class InitialErRootOnlyReverseTableRequest:
     parameter_values: object
     runtime: object
     rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder
+    rooted_state_and_runtime_from_parameter_vector: InitialErRootOnlyStateRuntimeBuilder | None = None
     options: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -468,10 +470,14 @@ def initial_er_root_only_reverse_table(
     parameter_values = jnp.asarray(request.parameter_values)
 
     def _values_from_parameter_vector(values):
-        rooted_state = request.rooted_state_from_parameter_vector(values)
+        if request.rooted_state_and_runtime_from_parameter_vector is None:
+            rooted_state = request.rooted_state_from_parameter_vector(values)
+            runtime = request.runtime
+        else:
+            rooted_state, runtime = request.rooted_state_and_runtime_from_parameter_vector(values)
         return _initial_er_root_only_objective_values(
             rooted_state,
-            request.runtime,
+            runtime,
             request.objective_names,
             options=request.options,
         )
@@ -536,6 +542,7 @@ def build_initial_er_root_only_least_squares_runner(
     runtime,
     parameter_set: ReverseADParameterSet,
     rooted_state_from_parameter_vector: InitialErRootOnlyStateBuilder,
+    rooted_state_and_runtime_from_parameter_vector: InitialErRootOnlyStateRuntimeBuilder | None = None,
     objective_names: Sequence[str] | str | None = None,
     options: Mapping[str, object] | None = None,
 ) -> InitialErRootOnlyLeastSquaresRunner:
@@ -574,6 +581,9 @@ def build_initial_er_root_only_least_squares_runner(
             parameter_values=parameter_values,
             runtime=runtime,
             rooted_state_from_parameter_vector=rooted_state_from_parameter_vector,
+            rooted_state_and_runtime_from_parameter_vector=(
+                rooted_state_and_runtime_from_parameter_vector
+            ),
             options=runner_options,
         )
         return evaluate_initial_er_root_only_least_squares(
