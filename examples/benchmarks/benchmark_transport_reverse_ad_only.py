@@ -54,7 +54,9 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
     vmec_boundary_tuples,
 )
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
+    build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    INITIAL_ER_ROOT_ONLY_OBJECTIVES,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
@@ -3433,6 +3435,104 @@ def _run_realtime_geometry_optimization_api_smoke(
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
 
+def _run_initial_er_root_only_optimization_api_smoke(
+    *,
+    args,
+    config: dict[str, Any],
+    baseline_runtime,
+    baseline_state,
+    profile_cfg: dict,
+):
+    """Exercise initial ambipolar-Er objective optimization without time rollout."""
+
+    if not _initial_er_root_enabled(config, str(args.initial_er_root_ad)):
+        raise SystemExit(
+            "[autodiff-gate] --initial-Er-root-only-optimization-smoke requires "
+            "an ambipolar Er initialization mode in the TOML and "
+            "--initial-Er-root-ad jax_selected_root."
+        )
+    objective_names = (
+        INITIAL_ER_ROOT_ONLY_OBJECTIVES
+        if str(args.objective) == "all"
+        else (str(args.objective),)
+    )
+    unsupported = tuple(name for name in objective_names if name not in INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+    if unsupported:
+        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+        raise SystemExit(
+            "[autodiff-gate] initial-Er root-only smoke supports only Er objectives; "
+            f"unsupported={unsupported!r}, choices are: {allowed}."
+        )
+    parameter_set = reverse_ad_optimization_parameter_set(
+        include_profiles=True,
+        vmec_boundary=(),
+    )
+    parameter_values = jnp.asarray(
+        [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+        dtype=jnp.asarray(baseline_state.pressure).dtype,
+    )
+
+    def _rooted_state_from_parameter_vector(values):
+        return _initial_state_for_parameter_vector(
+            values,
+            config=config,
+            initial_er_root_ad=args.initial_er_root_ad,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            runtime=baseline_runtime,
+        )
+
+    runner = build_initial_er_root_only_least_squares_runner(
+        config,
+        runtime=baseline_runtime,
+        parameter_set=parameter_set,
+        rooted_state_from_parameter_vector=_rooted_state_from_parameter_vector,
+        objective_names=objective_names,
+    )
+    terms = transport_least_squares_terms(objective_names)
+    print(
+        "[autodiff-gate] progress: running initial-Er root-only optimization API smoke",
+        flush=True,
+    )
+    evaluation = runner(parameter_values, terms)
+    result = evaluation.result
+    residuals_np = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+    jacobian_np = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+    objective_values_np = {
+        label: float(np.asarray(jax.device_get(value), dtype=float))
+        for label, value in result.objective_values.items()
+    }
+    report = {
+        "mode": "transport_reverse_ad_only_initial_er_root_only_optimization_api_smoke",
+        "config_path": str(Path(args.config)),
+        "objective_name": str(args.objective),
+        "objective_order": list(objective_names),
+        "residual_labels": list(result.residual_labels),
+        "parameter_order": list(result.parameter_labels),
+        "objective_values": objective_values_np,
+        "residuals": residuals_np.tolist(),
+        "jacobian": jacobian_np.tolist(),
+        "initial_er_root_ad": str(args.initial_er_root_ad),
+        "elapsed_s": float(evaluation.elapsed_s),
+    }
+    print(
+        "[autodiff-gate] mode=transport_reverse_ad_only_initial_er_root_only_optimization_api_smoke "
+        f"objective={args.objective} "
+        f"residual_count={len(result.residual_labels)} "
+        f"parameter_count={len(result.parameter_labels)} "
+        f"elapsed_s={evaluation.elapsed_s:.3f}",
+        flush=True,
+    )
+    print("[autodiff-gate] initial-Er root-only optimization residuals/Jacobian rows:")
+    for row_i, label in enumerate(result.residual_labels):
+        print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
+        for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
+            print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
+    outpath = _report_path("initial_er_root_only_optimization_api_smoke")
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+
+
 def _run_realtime_geometry_initial_carry_boundary_probe(
     *,
     args,
@@ -3734,6 +3834,15 @@ def _run_realtime_geometry_reverse_mode(
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
+    if bool(args.initial_er_root_only_optimization_smoke):
+        _run_initial_er_root_only_optimization_api_smoke(
+            args=args,
+            config=config,
+            baseline_runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+        )
+        return
     phase_start = time.perf_counter()
     baseline_profile_state = _initial_state_for_parameter_vector(
         baseline_values[: len(PARAMETER_ORDER)],
@@ -4175,6 +4284,15 @@ def main() -> None:
             "Only for --optimization-api-smoke. Choose whether the optimization "
             "parameter vector includes profile DOFs in addition to realtime VMEC "
             "geometry DOFs. Use 'exclude' for geometry-only optimization."
+        ),
+    )
+    parser.add_argument(
+        "--initial-Er-root-only-optimization-smoke",
+        dest="initial_er_root_only_optimization_smoke",
+        action="store_true",
+        help=(
+            "Exercise the initial ambipolar-Er optimization API for Er objectives "
+            "without preparing or running the Radau time-evolution solver."
         ),
     )
     parser.add_argument(
@@ -4628,6 +4746,15 @@ def main() -> None:
         return
 
     runtime, baseline_state = build_runtime_context(config)
+    if bool(args.initial_er_root_only_optimization_smoke):
+        _run_initial_er_root_only_optimization_api_smoke(
+            args=args,
+            config=config,
+            baseline_runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+        )
+        return
     baseline_values = jnp.asarray(
         [float(profile_cfg[name]) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
