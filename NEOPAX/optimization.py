@@ -5,20 +5,25 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections.abc import Sequence
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._geometry_autodiff import build_geometry_autodiff_context
+from ._geometry_autodiff import (
+    _input_with_boundary_deltas,
+    boundary_param_entries,
+    build_geometry_autodiff_context,
+)
 from ._reverse_ad_optimization import (
     LeastSquaresEvaluation,
+    LeastSquaresResult,
     LeastSquaresTerm,
+    ObjectiveTableResult,
     ObjectiveRef,
-    assemble_least_squares_result,
     geometry,
     geometry_full_ad_reverse_table,
-    normalize_least_squares_terms,
     scale_least_squares_evaluation_columns,
 )
 from ._reverse_ad_parameters import (
@@ -30,12 +35,42 @@ from ._reverse_ad_parameters import (
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class GeometryObjectiveTransform:
+    """Script-defined scalar geometry objective backed by one AD-table row."""
+
+    base: ObjectiveRef
+    value_fn: Callable[[object], object]
+    derivative_fn: Callable[[object], object]
+    label: str
+
+    @property
+    def objective(self) -> ObjectiveRef:
+        return self.base
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryLeastSquaresTerm:
+    """Geometry least-squares term with an optional scalar chain-rule transform."""
+
+    objective: ObjectiveRef
+    target: float
+    weight: float
+    label: str | None = None
+    value_fn: Callable[[object], object] | None = None
+    derivative_fn: Callable[[object], object] | None = None
+
+    @property
+    def residual_label(self) -> str:
+        return self.label or self.objective.label
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class GeometryLeastSquaresProblem:
     """Geometry-only least-squares problem using the validated geometry AD table."""
 
     context: object
     parameterization: VmexBoundaryParameterization
-    terms: tuple[LeastSquaresTerm, ...]
+    terms: tuple[GeometryLeastSquaresTerm, ...]
     lane: str = "ad"
     max_iter: int | None = None
     step_size: float | None = None
@@ -74,9 +109,7 @@ class GeometryLeastSquaresProblem:
             include_profiles=False,
             vmec_boundary=self.parameterization.specs,
         )
-        objective_names = tuple(
-            dict.fromkeys(term.objective.name for term in self.terms)
-        )
+        objective_names = tuple(dict.fromkeys(term.objective.name for term in self.terms))
         t_start = time.perf_counter()
         table = geometry_full_ad_reverse_table(
             context=self.context,
@@ -89,10 +122,10 @@ class GeometryLeastSquaresProblem:
             final_vmec_pullback_mode="raw_block_transpose",
             solver_device=self.solver_device,
         )
-        result = assemble_least_squares_result(
+        result = _assemble_geometry_least_squares_result(
             self.terms,
             parameter_set=parameter_set,
-            backend_results={"geometry": table},
+            table=table,
         )
         residuals = jax.block_until_ready(result.residuals)
         jacobian = jax.block_until_ready(result.jacobian)
@@ -110,10 +143,155 @@ class GeometryLeastSquaresProblem:
     def jacobian(self, scaled_parameter_values=None) -> np.ndarray:
         return np.asarray(jax.device_get(self.evaluate(scaled_parameter_values).jacobian), dtype=float)
 
+    def input_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return a VMEX input object with the current scaled boundary deltas applied."""
+
+        if scaled_parameter_values is None:
+            scaled_values = self.x0
+        else:
+            scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
+        physical_values = self.parameterization.scaled_to_physical_delta(scaled_values)
+        entries = boundary_param_entries(self.context, self.parameterization.vmec_tuples)
+        return _input_with_boundary_deltas(self.context, physical_values, entries)
+
+
+def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
+    """Return a named geometry objective reference."""
+
+    if isinstance(name, ObjectiveRef):
+        if name.family != "geometry":
+            raise ValueError(f"Expected a geometry ObjectiveRef, got {name.family!r}.")
+        return name
+    return ObjectiveRef("geometry", str(name))
+
+
+def transformed_geometry_objective(
+    base: str | ObjectiveRef,
+    value_fn: Callable[[object], object],
+    derivative_fn: Callable[[object], object] | None = None,
+    *,
+    label: str,
+) -> GeometryObjectiveTransform:
+    """Build a scalar transformed geometry objective from one table row."""
+
+    if derivative_fn is None:
+        derivative_fn = jax.grad(lambda x: jnp.asarray(value_fn(x), dtype=jnp.float64))
+    return GeometryObjectiveTransform(
+        base=geometry_objective(base),
+        value_fn=value_fn,
+        derivative_fn=derivative_fn,
+        label=str(label),
+    )
+
+
+def _normalize_geometry_least_squares_terms(
+    terms: Sequence[
+        GeometryLeastSquaresTerm
+        | LeastSquaresTerm
+        | tuple[ObjectiveRef | GeometryObjectiveTransform | str, float, float]
+    ],
+) -> tuple[GeometryLeastSquaresTerm, ...]:
+    normalized: list[GeometryLeastSquaresTerm] = []
+    for term in terms:
+        if isinstance(term, GeometryLeastSquaresTerm):
+            normalized.append(term)
+            continue
+        if isinstance(term, LeastSquaresTerm):
+            normalized.append(
+                GeometryLeastSquaresTerm(
+                    objective=geometry_objective(term.objective),
+                    target=float(term.target),
+                    weight=float(term.weight),
+                    label=term.label,
+                )
+            )
+            continue
+        if not isinstance(term, tuple) or len(term) != 3:
+            raise TypeError(
+                "Geometry terms must be GeometryLeastSquaresTerm instances, "
+                "LeastSquaresTerm instances, or (objective, target, weight) tuples."
+            )
+        objective, target, weight = term
+        if isinstance(objective, GeometryObjectiveTransform):
+            normalized.append(
+                GeometryLeastSquaresTerm(
+                    objective=objective.base,
+                    target=float(target),
+                    weight=float(weight),
+                    label=objective.label,
+                    value_fn=objective.value_fn,
+                    derivative_fn=objective.derivative_fn,
+                )
+            )
+        else:
+            normalized.append(
+                GeometryLeastSquaresTerm(
+                    objective=geometry_objective(objective),
+                    target=float(target),
+                    weight=float(weight),
+                )
+            )
+    if not normalized:
+        raise ValueError("At least one geometry least-squares term is required.")
+    for term in normalized:
+        if term.weight < 0.0:
+            raise ValueError(f"Geometry least-squares weights must be non-negative; got {term.weight}.")
+    return tuple(normalized)
+
+
+def _result_lookup(result: ObjectiveTableResult) -> dict[str, int]:
+    return {name: index for index, name in enumerate(result.objective_names)}
+
+
+def _assemble_geometry_least_squares_result(
+    terms: Sequence[GeometryLeastSquaresTerm],
+    *,
+    parameter_set,
+    table: ObjectiveTableResult,
+) -> LeastSquaresResult:
+    lookup = _result_lookup(table)
+    values = jnp.asarray(table.values)
+    jacobian_table = jnp.asarray(table.jacobian)
+    residual_rows = []
+    jacobian_rows = []
+    residual_labels = []
+    objective_values: dict[str, object] = {}
+    label_counts: dict[str, int] = {}
+    for term in terms:
+        row_index = lookup[term.objective.name]
+        base_value = values[row_index]
+        base_jacobian = jacobian_table[row_index]
+        if term.value_fn is None:
+            value = base_value
+            chain = jnp.asarray(1.0, dtype=base_value.dtype)
+        else:
+            value = term.value_fn(base_value)
+            chain = term.derivative_fn(base_value)
+        scale = jnp.asarray(np.sqrt(float(term.weight)), dtype=base_value.dtype)
+        residual_rows.append(scale * (value - jnp.asarray(term.target, dtype=base_value.dtype)))
+        jacobian_rows.append(scale * chain * base_jacobian)
+        base_label = term.residual_label
+        label_count = label_counts.get(base_label, 0)
+        label_counts[base_label] = label_count + 1
+        residual_label = base_label if label_count == 0 else f"{base_label}#{label_count + 1}"
+        residual_labels.append(residual_label)
+        objective_values[residual_label] = value
+    return LeastSquaresResult(
+        residuals=jnp.stack(residual_rows),
+        jacobian=jnp.stack(jacobian_rows),
+        residual_labels=tuple(residual_labels),
+        parameter_labels=parameter_set.vmec_prefixed_labels,
+        objective_values=objective_values,
+    )
+
 
 def geometry_least_squares_problem(
     vmec_input,
-    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    terms: Sequence[
+        GeometryLeastSquaresTerm
+        | LeastSquaresTerm
+        | tuple[ObjectiveRef | GeometryObjectiveTransform | str, float, float]
+    ],
     *,
     max_mode: int | None = None,
     parameters: str | Sequence[str] | None = None,
@@ -122,6 +300,7 @@ def geometry_least_squares_problem(
     ess_alpha: float = 1.0,
     mboz: int = 18,
     nboz: int = 18,
+    surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
     lane: str = "ad",
     max_iter: int | None = None,
     step_size: float | None = None,
@@ -140,6 +319,7 @@ def geometry_least_squares_problem(
         param_n=0,
         mboz=int(mboz),
         nboz=int(nboz),
+        surface_s=tuple(float(s) for s in surfaces),
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -160,7 +340,7 @@ def geometry_least_squares_problem(
             scale_mode=scale_mode,
             ess_alpha=float(ess_alpha),
         )
-    normalized_terms = normalize_least_squares_terms(terms, default_family="geometry")
+    normalized_terms = _normalize_geometry_least_squares_terms(terms)
     return GeometryLeastSquaresProblem(
         context=context,
         parameterization=parameterization,
@@ -204,8 +384,12 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
 
 
 __all__ = [
+    "GeometryLeastSquaresTerm",
+    "GeometryObjectiveTransform",
     "GeometryLeastSquaresProblem",
     "geometry",
+    "geometry_objective",
     "geometry_least_squares_problem",
     "least_squares",
+    "transformed_geometry_objective",
 ]
