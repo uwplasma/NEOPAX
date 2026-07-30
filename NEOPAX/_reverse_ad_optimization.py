@@ -450,6 +450,7 @@ def residuals_and_jacobian_reverse_ad(
     normalized_terms = normalize_least_squares_terms(terms)
     grouped_terms = group_least_squares_terms_by_family(normalized_terms)
     backend_options = {} if options is None else dict(options)
+    release_backend_graphs = bool(backend_options.pop("release_backend_graphs", False))
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     for family, family_terms in grouped_terms.items():
         backend = backends.get(family)
@@ -458,7 +459,15 @@ def residuals_and_jacobian_reverse_ad(
                 f"No reverse-AD backend is registered for objective family {family!r}."
             )
         objective_names = _unique_objective_names(family_terms)
-        backend_results[family] = backend(objective_names, parameter_set, backend_options)
+        table_result = backend(objective_names, parameter_set, backend_options)
+        if release_backend_graphs:
+            values, jacobian = jax.block_until_ready((table_result.values, table_result.jacobian))
+            table_result = ObjectiveTableResult(
+                objective_names=table_result.objective_names,
+                values=jnp.asarray(jax.device_get(values)),
+                jacobian=jnp.asarray(jax.device_get(jacobian)),
+            )
+        backend_results[family] = table_result
     return assemble_least_squares_result(
         normalized_terms,
         parameter_set=parameter_set,

@@ -387,7 +387,10 @@ def main() -> int:
         parameter_set=parameter_set,
         terms=active_terms,
         backends=backends,
-        options={"parameter_values": parameter_values},
+        options={
+            "parameter_values": parameter_values,
+            "release_backend_graphs": True,
+        },
     )
     residuals = jax.block_until_ready(result.residuals)
     jacobian = jax.block_until_ready(result.jacobian)
