@@ -722,7 +722,14 @@ def geometry_initial_er_root_only_least_squares_problem(
         n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
         n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
         n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-        surface_backend=str(surface_backend if surface_backend is not None else neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+        surface_backend=str(
+            surface_backend
+            if surface_backend is not None
+            else neoclassical_cfg.get(
+                "ntx_exact_surface_backend",
+                neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+            )
+        ),
         geometry_lane=geometry_lane,
         geometry_max_iter=geometry_max_iter,
         geometry_step_size=geometry_step_size,

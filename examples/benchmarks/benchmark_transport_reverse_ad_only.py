@@ -3503,7 +3503,12 @@ def _run_initial_er_root_only_optimization_api_smoke(
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
             n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-            surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+            surface_backend=str(
+                neoclassical_cfg.get(
+                    "ntx_exact_surface_backend",
+                    neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                )
+            ),
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] initial-Er root-only geometry payload pullback:",
