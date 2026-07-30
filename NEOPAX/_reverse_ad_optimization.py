@@ -1586,6 +1586,28 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 parameter_set,
                 parameter_values_arr,
             )
+            shared_payload = build_shared_geometry_transport_payload(
+                geometry_context=geometry_context,
+                parameter_set=parameter_set,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+            )
+            current_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                geometry_context,
+                shared_payload.raw_block_solve.state,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+            )
             transport_parameter_set = ReverseADParameterSet(
                 profile_specs=tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER),
                 vmec_boundary_specs=tuple(parameter_set.vmec_boundary_specs),
@@ -1606,36 +1628,44 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 runtime=runtime,
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                support_payload_override=current_support_payload,
+            )
+            (
+                transport_values,
+                transport_profile_gradient_matrix,
+                transport_payload_bars,
+            ) = jax.block_until_ready(
+                (
+                    transport_table_full.values,
+                    transport_table_full.profile_gradient_matrix,
+                    transport_table_full.payload_bars,
+                )
             )
             source_profile_lookup = {
                 spec.name: i for i, spec in enumerate(transport_parameter_set.profile_specs)
             }
             target_profile_gradient_columns = [
-                transport_table_full.profile_gradient_matrix[:, source_profile_lookup[spec.name]]
+                transport_profile_gradient_matrix[:, source_profile_lookup[spec.name]]
                 for spec in parameter_set.profile_specs
             ]
             target_profile_gradient_matrix = (
                 jnp.stack(target_profile_gradient_columns, axis=1)
                 if target_profile_gradient_columns
                 else jnp.zeros(
-                    (len(transport_table_full.objective_names), 0),
-                    dtype=jnp.asarray(transport_table_full.values).dtype,
+                    (len(requested_transport_objectives), 0),
+                    dtype=jnp.asarray(transport_values).dtype,
                 )
             )
             transport_table = ObjectiveCotangentTable(
                 objective_names=transport_table_full.objective_names,
-                values=transport_table_full.values,
+                values=transport_values,
                 profile_gradient_matrix=target_profile_gradient_matrix,
                 vmec_state_bars=None,
-                payload_bars=transport_table_full.payload_bars,
+                payload_bars=transport_payload_bars,
             )
+            del transport_table_full
             cotangent_tables_by_family["transport"] = transport_table
             geometry_cotangent_tables.append(transport_table)
-            shared_payload = SharedGeometryTransportPayload(
-                raw_block_solve=None,
-                vmec_parameter_values=vmec_parameter_values,
-                vmec_specs=tuple(parameter_set.vmec_boundary_specs),
-            )
 
     if "geometry" in grouped_terms and not geometry_cotangent_tables:
         if shared_payload is None and parameter_set.vmec_boundary_specs:
