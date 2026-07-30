@@ -4864,15 +4864,19 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         if combined_payload:
             geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
             support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
-            geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
-                "geometry",
-                geometry_from_state,
-                geometry_bars,
-            )
+            # Build the heavy NTX support VJP before the lighter geometry VJP so
+            # the support compile/execution does not overlap the geometry
+            # state-bar batch.  This preserves the same cotangent sum and final
+            # raw-block transpose while reducing peak device memory.
             support_state_bar_batch = _state_bar_batch_from_payload_branch(
                 "ntx_support",
                 ntx_support_from_state,
                 support_bars,
+            )
+            geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
+                "geometry",
+                geometry_from_state,
+                geometry_bars,
             )
             state_bar_batch = jax.tree_util.tree_map(
                 lambda geometry_bar, support_bar: geometry_bar + support_bar,

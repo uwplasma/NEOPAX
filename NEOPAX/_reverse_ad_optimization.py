@@ -1372,6 +1372,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         solver_device=solver_device,
         progress_label=progress_label,
         raw_block_solve=raw_block_solve,
+        return_branch_gradients=False,
     )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
@@ -1854,7 +1855,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
-                objective_names=requested_transport_objectives,
+                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
                 parameter_set=transport_parameter_set,
                 parameter_values=transport_parameter_values,
                 runtime=runtime,

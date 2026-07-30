@@ -2427,6 +2427,7 @@ def realtime_geometry_payload_pullback_result(
     solver_device: str = "default",
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
+    return_branch_gradients: bool = True,
 ) -> RealtimeGeometryPayloadPullbackResult:
     """Pull transport support-payload cotangents back to VMEC boundary harmonics.
 
@@ -2458,7 +2459,7 @@ def realtime_geometry_payload_pullback_result(
         max_iter=max_iter,
         solver_device=str(solver_device),
         progress_label=progress_label,
-        return_branch_gradients=True,
+        return_branch_gradients=bool(return_branch_gradients),
         raw_block_solve=raw_block_solve,
     )
     geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
@@ -2528,6 +2529,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
     solver_device: str = "default",
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
+    return_branch_gradients: bool = True,
 ) -> RealtimeGeometryTransportReverseAssemblyResult:
     """Assemble the JAX transport reverse table from support-payload cotangents."""
 
@@ -2548,6 +2550,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
         solver_device=solver_device,
         progress_label=progress_label,
         raw_block_solve=raw_block_solve,
+        return_branch_gradients=bool(return_branch_gradients),
     )
     table_result = realtime_geometry_transport_reverse_table_result(
         objective_labels=objective_labels,
