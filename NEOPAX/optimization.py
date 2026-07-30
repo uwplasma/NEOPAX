@@ -358,7 +358,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
     from scipy.optimize import least_squares as scipy_least_squares
 
     cache: dict[tuple[float, ...], LeastSquaresEvaluation] = {}
-    state: dict[str, object] = {"nres": None, "npar": problem.parameter_count}
+    verbose = int(kwargs.get("verbose", 0) or 0)
+    state: dict[str, object] = {"nres": None, "npar": problem.parameter_count, "eval_count": 0}
 
     def _key(x):
         return tuple(np.asarray(x, dtype=float).tolist())
@@ -378,11 +379,24 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         except Exception as exc:
             if state["nres"] is None:
                 raise
-            if int(kwargs.get("verbose", 0) or 0):
-                print(f"[NEOPAX least_squares] trial solve failed: {exc}")
+            state["eval_count"] = int(state["eval_count"]) + 1
+            if verbose:
+                print(
+                    f"[NEOPAX least_squares] eval={int(state['eval_count'])} "
+                    f"trial solve failed -> penalty residual: {exc}",
+                    flush=True,
+                )
             return np.full((int(state["nres"]),), 1.0e6, dtype=float)
         residuals = np.where(np.isfinite(residuals), residuals, 1.0e6)
         state["nres"] = int(residuals.size)
+        state["eval_count"] = int(state["eval_count"]) + 1
+        if verbose:
+            cost = 0.5 * float(residuals @ residuals)
+            print(
+                f"[NEOPAX least_squares] eval={int(state['eval_count'])} "
+                f"cost={cost:.6e} residual_norm={float(np.linalg.norm(residuals)):.6e}",
+                flush=True,
+            )
         return residuals
 
     def _jac(x):
@@ -391,8 +405,11 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         except Exception as exc:
             if state["nres"] is None:
                 raise
-            if int(kwargs.get("verbose", 0) or 0):
-                print(f"[NEOPAX least_squares] trial jacobian failed: {exc}")
+            if verbose:
+                print(
+                    f"[NEOPAX least_squares] trial jacobian failed -> zero jacobian: {exc}",
+                    flush=True,
+                )
             return np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
         return np.where(np.isfinite(jacobian), jacobian, 0.0)
 

@@ -43,7 +43,7 @@ IOTA_FLOOR = 0.15
 MIRROR_TARGET = 0.25
 
 QI_WEIGHT = 1.0
-MAXJ_WEIGHT = 0.0
+MAXJ_WEIGHT = 0.1
 ASPECT_WEIGHT = 1.0
 IOTA_WEIGHT = 100.0
 MIRROR_WEIGHT = 100.0
@@ -87,7 +87,7 @@ mirror_penalization = opt.transformed_geometry_objective(
 
 qi_terms = [
     (qi, 0.0, QI_WEIGHT),
-    # (qi_maxj_1, 0.0, MAXJ_WEIGHT),
+    (qi_maxj_1, 0.0, MAXJ_WEIGHT),
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     # (iota_shortfall, 0.0, IOTA_WEIGHT),
