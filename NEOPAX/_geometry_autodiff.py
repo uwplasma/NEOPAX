@@ -3561,7 +3561,10 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
 
 def _boozer_surface_indices_and_rho(static, rho_values):
     s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
-    surface_indices = jnp.unique(_surface_indices_for_s_values(static, s_values))
+    surface_indices_arr = np.unique(
+        np.asarray(_surface_indices_for_s_values(static, s_values), dtype=np.int32)
+    )
+    surface_indices = jnp.asarray(surface_indices_arr, dtype=jnp.int32)
     s_full = jnp.asarray(static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     sample_rho = jnp.sqrt(jnp.maximum(s_half[surface_indices], 0.0))
@@ -3733,12 +3736,24 @@ def _build_neopax_geometry_from_state(
     # B0(r_grid) use a frozen-like local slope.
     edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
     edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
-    requested_sample_rho = jnp.unique(
-        jnp.concatenate(
+    rho_half_np = np.sqrt(
+        np.maximum(
+            0.5
+            * (
+                np.asarray(context.static.s[1:], dtype=float)
+                + np.asarray(context.static.s[:-1], dtype=float)
+            ),
+            0.0,
+        )
+    )
+    rho_grid_half_np = np.asarray(jax.device_get(rho_grid_half), dtype=float)
+    edge_rho_np = rho_half_np[-edge_count:] if edge_count > 0 else rho_half_np[:0]
+    requested_sample_rho = np.unique(
+        np.concatenate(
             [
-                rho_grid_half[1:-1],
-                rho_half[1 : 1 + edge_count],
-                edge_rho,
+                rho_grid_half_np[1:-1],
+                rho_half_np[:edge_count],
+                edge_rho_np,
             ],
             axis=0,
         )
@@ -4490,11 +4505,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
         axis=0,
     )
     static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
-    r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
-    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
-    r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
-    r00_center = r00_interp(rho_center)
-    r00_face = r00_interp(rho_face)
     rho_center_sample = np.linspace(0.0, 1.0, int(rho_center.shape[0]), dtype=float)
     if int(rho_face.shape[0]) > 1:
         rho_face_sample = np.concatenate(
@@ -4507,6 +4517,12 @@ def build_ntx_exact_lij_support_from_vmec_state(
         )
     else:
         rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
+    r00_support_rho_np = np.unique(np.concatenate([rho_center_sample, rho_face_sample], axis=0))
+    r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
+    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
+    r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
+    r00_center = r00_interp(rho_center)
+    r00_face = r00_interp(rho_face)
     center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_sample)
     face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_sample)
 
