@@ -1854,7 +1854,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
-                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+                objective_names=requested_transport_objectives,
                 parameter_set=transport_parameter_set,
                 parameter_values=transport_parameter_values,
                 runtime=runtime,

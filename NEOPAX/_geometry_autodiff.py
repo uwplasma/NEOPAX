@@ -4805,10 +4805,15 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         def _single_state_bar_from_payload_bars(payload_bar_leaves):
             return payload_float_pullback(tuple(payload_bar_leaves))[0]
 
-        state_bar_batch_value = jax.lax.map(
-            _single_state_bar_from_payload_bars,
-            batched_payload_float_bars,
-        )
+        if len(branch_bars) == 1:
+            single_payload_float_bars = tuple(leaf[0] for leaf in batched_payload_float_bars)
+            single_state_bar = _single_state_bar_from_payload_bars(single_payload_float_bars)
+            state_bar_batch_value = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], single_state_bar)
+        else:
+            state_bar_batch_value = jax.lax.map(
+                _single_state_bar_from_payload_bars,
+                batched_payload_float_bars,
+            )
         branch_all_finite = _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
         if (
             progress_label is not None
