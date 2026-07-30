@@ -4835,9 +4835,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         rho_safe = jnp.where(rho_positive, rho_arr, 1.0)
         return jnp.where(rho_positive, jnp.asarray(geometry_inner.a_b, dtype=jnp.float64) / (2.0 * rho_safe), 0.0)
 
-    def _center_prepared_from_state(state_inner):
-        geometry_inner = geometry_from_state(state_inner)
-        center_count = int(jnp.asarray(geometry_inner.r_grid).shape[0])
+    def _center_prepared_from_state(state_inner, *, center_count: int):
         return _build_ntx_center_prepared_from_vmec_state(
             context,
             state_inner,
@@ -4900,6 +4898,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
         def _compact_initial_er_support_state_bar_batch():
             prepared_template = payload_template.center_prepared
+            prepared_leaves = jax.tree_util.tree_leaves(prepared_template)
+            if not prepared_leaves:
+                return None
+            center_count = int(jnp.asarray(prepared_leaves[0]).shape[0])
             prepared_paths = {
                 _tree_path_names(path): local_i
                 for local_i, (path, _leaf) in enumerate(
@@ -4931,7 +4933,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                         out.append(jnp.asarray(center_drds))
                     else:
                         if center_prepared is None:
-                            center_prepared = _center_prepared_from_state(state_inner)
+                            center_prepared = _center_prepared_from_state(
+                                state_inner,
+                                center_count=center_count,
+                            )
                             center_prepared_leaves = jax.tree_util.tree_leaves(center_prepared)
                         out.append(jnp.asarray(center_prepared_leaves[local_i]))
                 return tuple(out)
