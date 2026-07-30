@@ -4846,7 +4846,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             surface_backend=str(surface_backend),
         )
 
-    def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
+    def _payload_branch_pullback_setup(branch_name, payload_fn, branch_bars):
         payload_template = branch_bars[0]
         payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
         payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
@@ -4889,14 +4889,19 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 flush=True,
             )
         if not active_float_leaf_indices:
-            return _zero_state_bar_batch()
+            return {
+                "active": False,
+                "single_state_bar": lambda _objective_i: zero_like_state,
+            }
 
         active_leaf_paths = tuple(
             _tree_path_names(payload_template_paths_and_leaves[leaf_i][0])
             for leaf_i in active_float_leaf_indices
         )
 
-        def _compact_initial_er_support_state_bar_batch():
+        def _compact_initial_er_setup():
+            if branch_name != "ntx_support":
+                return None
             prepared_template = payload_template.center_prepared
             prepared_leaves = jax.tree_util.tree_leaves(prepared_template)
             if not prepared_leaves:
@@ -4960,30 +4965,26 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 for _kind, leaf_i, _local_i in compact_specs
             )
 
-            def _single_state_bar_from_compact_bars(compact_bar_leaves):
+            def _single_state_bar(objective_i):
+                compact_bar_leaves = tuple(
+                    jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
+                    for leaf in batched_compact_bars
+                )
                 return compact_pullback(tuple(compact_bar_leaves))[0]
 
-            if len(branch_bars) == 1:
-                single_compact_bars = tuple(leaf[0] for leaf in batched_compact_bars)
-                single_state_bar = _single_state_bar_from_compact_bars(single_compact_bars)
-                state_bar_batch_value = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], single_state_bar)
-            else:
-                state_bar_batch_value = jax.lax.map(
-                    _single_state_bar_from_compact_bars,
-                    batched_compact_bars,
-                )
             if progress_label is not None:
                 print(
                     f"{progress_label} {branch_name}_compact_initial_er_support_pullback=True",
                     flush=True,
                 )
-            return state_bar_batch_value
+            return {
+                "active": True,
+                "single_state_bar": _single_state_bar,
+            }
 
-        if branch_name == "ntx_support":
-            compact_state_bar_batch = _compact_initial_er_support_state_bar_batch()
-            if compact_state_bar_batch is not None:
-                _print_state_bar_batch_finiteness(branch_name, compact_state_bar_batch)
-                return compact_state_bar_batch
+        compact_setup = _compact_initial_er_setup()
+        if compact_setup is not None:
+            return compact_setup
 
         def payload_float_leaves_from_state(state_inner):
             leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
@@ -5008,18 +5009,24 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             for leaf_i in active_float_leaf_indices
         )
 
-        def _single_state_bar_from_payload_bars(payload_bar_leaves):
+        def _single_state_bar(objective_i):
+            payload_bar_leaves = tuple(
+                jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
+                for leaf in batched_payload_float_bars
+            )
             return payload_float_pullback(tuple(payload_bar_leaves))[0]
 
-        if len(branch_bars) == 1:
-            single_payload_float_bars = tuple(leaf[0] for leaf in batched_payload_float_bars)
-            single_state_bar = _single_state_bar_from_payload_bars(single_payload_float_bars)
-            state_bar_batch_value = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], single_state_bar)
-        else:
-            state_bar_batch_value = jax.lax.map(
-                _single_state_bar_from_payload_bars,
-                batched_payload_float_bars,
-            )
+        return {
+            "active": True,
+            "single_state_bar": _single_state_bar,
+        }
+
+    def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
+        setup = _payload_branch_pullback_setup(branch_name, payload_fn, branch_bars)
+        if not bool(setup["active"]):
+            return _zero_state_bar_batch()
+        state_bar_rows = tuple(setup["single_state_bar"](i) for i in range(len(branch_bars)))
+        state_bar_batch_value = jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *state_bar_rows)
         branch_all_finite = _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
         if (
             progress_label is not None
@@ -5109,6 +5116,71 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 state_bar_batch,
             )
         return state_bar_batch
+
+    def _try_stream_compact_payload_rows_to_param_matrix():
+        if (
+            not combined_payload
+            or return_branch_gradients
+            or return_state_bars
+            or extra_state_bars is not None
+            or extra_state_bars_factory is not None
+        ):
+            return None
+        geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
+        support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+        geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
+        support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
+        row_count = len(payload_bars)
+
+        def _single_gradient_row(objective_i):
+            geometry_state_bar = geometry_setup["single_state_bar"](objective_i)
+            support_state_bar = support_setup["single_state_bar"](objective_i)
+            state_bar = jax.tree_util.tree_map(
+                lambda geometry_leaf, support_leaf: geometry_leaf + support_leaf,
+                geometry_state_bar,
+                support_state_bar,
+            )
+            state_bar_batch = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], state_bar)
+            param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+                implicit_params,
+                implicit_cfg,
+                state,
+                dof_mask,
+                state_bar_batch,
+                probe_chunk_size=1,
+            )
+            return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)[0]
+
+        gradient_matrix_value = jax.lax.map(
+            _single_gradient_row,
+            jnp.arange(row_count, dtype=jnp.int32),
+        )
+        if progress_label is not None:
+            print(
+                f"{progress_label} streamed_compact_payload_rows_to_raw_block=True",
+                flush=True,
+            )
+        return gradient_matrix_value
+
+    streamed_gradient_matrix = _try_stream_compact_payload_rows_to_param_matrix()
+    if streamed_gradient_matrix is not None:
+        if progress_label is not None:
+            arr = np.asarray(jax.device_get(streamed_gradient_matrix))
+            finite = np.isfinite(arr)
+            all_finite = bool(np.all(finite))
+            finite_values = arr[finite]
+            l2 = float(np.sum(finite_values * finite_values) ** 0.5) if finite_values.size else 0.0
+            first_bad = None
+            if not all_finite:
+                bad = np.argwhere(~finite)
+                first_bad = None if bad.size == 0 else tuple(int(v) for v in bad[0])
+            print(
+                f"{progress_label} raw_block_param_bar_l2={l2:.6e} "
+                f"raw_block_param_bar_all_finite={all_finite} "
+                f"raw_block_param_bar_first_nonfinite={first_bad}",
+                flush=True,
+            )
+        return streamed_gradient_matrix
 
     raw_block_state_bar_batch = _payload_raw_block_state_bar_batch()
 
