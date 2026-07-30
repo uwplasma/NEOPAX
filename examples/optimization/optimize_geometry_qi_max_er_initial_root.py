@@ -248,34 +248,37 @@ def main() -> int:
     geometry_max_iter = args.geometry_max_iter
     if geometry_max_iter is None:
         geometry_max_iter = geom_cfg.get("vmec_max_iter")
-    if args.parameter_mode == "geometry_only" and any(
-        term[0].family in {"geometry", "transport"} for term in active_terms
-    ):
-        t_phase = time.perf_counter()
-        shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
-            context,
-            parameter_values,
-            tuple(spec.as_tuple() for spec in vmec_specs),
-            max_iter=geometry_max_iter,
-            solver_device=geometry_solver_device,
-        )
-        jax.block_until_ready(shared_raw_block_solve.state)
-        print(
-            "[optimization] progress: shared VMEC raw-block solve ready "
-            f"elapsed_s={time.perf_counter() - t_phase:.3f}",
-            flush=True,
-        )
     if any(term[0].family == "geometry" for term in active_terms):
-        backends["geometry"] = lambda names, ps, opts: geometry_full_ad_reverse_table(
-            context=context,
-            parameter_set=ps,
-            objective_names=names,
-            parameter_values=opts.get("parameter_values", parameter_values),
-            final_vmec_pullback_mode="raw_block_transpose",
-            max_iter=geometry_max_iter,
-            solver_device=geometry_solver_device,
-            raw_block_solve=shared_raw_block_solve,
-        )
+        def _geometry_backend(names, ps, opts):
+            nonlocal shared_raw_block_solve
+            if shared_raw_block_solve is None:
+                t_phase = time.perf_counter()
+                values_for_geometry = opts.get("parameter_values", parameter_values)
+                shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                    context,
+                    values_for_geometry,
+                    tuple(spec.as_tuple() for spec in vmec_specs),
+                    max_iter=geometry_max_iter,
+                    solver_device=geometry_solver_device,
+                )
+                jax.block_until_ready(shared_raw_block_solve.state)
+                print(
+                    "[optimization] progress: shared VMEC raw-block solve ready "
+                    f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+                    flush=True,
+                )
+            return geometry_full_ad_reverse_table(
+                context=context,
+                parameter_set=ps,
+                objective_names=names,
+                parameter_values=opts.get("parameter_values", parameter_values),
+                final_vmec_pullback_mode="raw_block_transpose",
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                raw_block_solve=shared_raw_block_solve,
+            )
+
+        backends["geometry"] = _geometry_backend
     if any(term[0].family == "transport" for term in active_terms):
         if args.parameter_mode == "geometry_only":
             neoclassical_cfg = config.get("neoclassical", {})
@@ -298,7 +301,6 @@ def main() -> int:
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
                 progress_label="[optimization] initial-Er root geometry pullback:",
-                raw_block_solve=shared_raw_block_solve,
             )
         else:
             from NEOPAX._reverse_ad_optimization import (
