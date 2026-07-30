@@ -6,12 +6,6 @@ Date: 2026-07-23
 
 Extend the validated profile reverse AD lane to realtime VMEC geometry without changing forward-solver math, frozen-geometry profile reverse behavior, or the realtime VMEC forward construction.
 
-## Protected Benchmark Behavior
-
-The validated benchmark/root-only reverse paths are protected. Do not change them, or any internal function they call, without explicitly checking first.
-
-In particular, `geometry_active_initial_er_root_only_reverse_table(...)` must keep the compact benchmark behavior: use the runtime geometry/NTX payload already present in the realtime transport runtime, apply the compact initial-Er residual pullbacks, and map payload cotangents to VMEC harmonics through the established raw-block payload pullback. It must not rebuild the current geometry/support from a shared VMEC raw-block solve and must not accept a shared `raw_block_solve` shortcut.
-
 The realtime geometry reverse lane should:
 
 - use the same primal geometry construction as the realtime forward solver,
