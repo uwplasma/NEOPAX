@@ -20,6 +20,7 @@ import numpy as np
 
 import NEOPAX
 from NEOPAX._geometry_autodiff import (
+    build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_geometry_autodiff_context,
     geometry_raw_block_solve_from_param_vector,
 )
@@ -243,30 +244,59 @@ def main() -> int:
     backends = {}
     active_terms = _terms(args)
     shared_raw_block_solve = None
+    shared_geometry_payload = None
     geom_cfg = config.get("geometry", {})
     geometry_solver_device = str(geom_cfg.get("vmec_implicit_solver_device", "default"))
     geometry_max_iter = args.geometry_max_iter
     if geometry_max_iter is None:
         geometry_max_iter = geom_cfg.get("vmec_max_iter")
+    neoclassical_cfg = config.get("neoclassical", {})
+
+    def _shared_raw_block_solve(opts):
+        nonlocal shared_raw_block_solve
+        if shared_raw_block_solve is None:
+            t_phase = time.perf_counter()
+            values_for_geometry = opts.get("parameter_values", parameter_values)
+            shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                context,
+                values_for_geometry,
+                tuple(spec.as_tuple() for spec in vmec_specs),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+            )
+            jax.block_until_ready(shared_raw_block_solve.state)
+            print(
+                "[optimization] progress: shared VMEC raw-block solve ready "
+                f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+                flush=True,
+            )
+        return shared_raw_block_solve
+
+    def _shared_transport_payload(opts):
+        nonlocal shared_geometry_payload
+        if shared_geometry_payload is None:
+            raw_solve = _shared_raw_block_solve(opts)
+            t_phase = time.perf_counter()
+            shared_geometry_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                context,
+                raw_solve.state,
+                n_r=int(geom_cfg.get("n_radial", 51)),
+                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+            )
+            jax.block_until_ready(jax.tree_util.tree_leaves(shared_geometry_payload))
+            print(
+                "[optimization] progress: shared realtime geometry/NTX payload ready "
+                f"elapsed_s={time.perf_counter() - t_phase:.3f}",
+                flush=True,
+            )
+        return shared_geometry_payload
+
     if any(term[0].family == "geometry" for term in active_terms):
         def _geometry_backend(names, ps, opts):
-            nonlocal shared_raw_block_solve
-            if shared_raw_block_solve is None:
-                t_phase = time.perf_counter()
-                values_for_geometry = opts.get("parameter_values", parameter_values)
-                shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
-                    context,
-                    values_for_geometry,
-                    tuple(spec.as_tuple() for spec in vmec_specs),
-                    max_iter=geometry_max_iter,
-                    solver_device=geometry_solver_device,
-                )
-                jax.block_until_ready(shared_raw_block_solve.state)
-                print(
-                    "[optimization] progress: shared VMEC raw-block solve ready "
-                    f"elapsed_s={time.perf_counter() - t_phase:.3f}",
-                    flush=True,
-                )
+            raw_solve = _shared_raw_block_solve(opts)
             return geometry_full_ad_reverse_table(
                 context=context,
                 parameter_set=ps,
@@ -275,33 +305,40 @@ def main() -> int:
                 final_vmec_pullback_mode="raw_block_transpose",
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
-                raw_block_solve=shared_raw_block_solve,
+                raw_block_solve=raw_solve,
             )
 
         backends["geometry"] = _geometry_backend
     if any(term[0].family == "transport" for term in active_terms):
         if args.parameter_mode == "geometry_only":
-            neoclassical_cfg = config.get("neoclassical", {})
             baseline_geometry_deltas = _baseline_geometry_deltas(config, vmec_specs)
-            backends["transport"] = lambda names, ps, opts: geometry_active_initial_er_root_only_reverse_table(
-                config=config,
-                objective_names=names,
-                parameter_set=ps,
-                parameter_values=opts.get("parameter_values", parameter_values),
-                runtime=runtime,
-                profile_values=profile_values0,
-                pre_root_state_from_profile_values=_pre_root_state_from_profile_values,
-                geometry_context=context,
-                baseline_geometry_deltas=baseline_geometry_deltas,
-                n_r=int(geom_cfg.get("n_radial", 51)),
-                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-                surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
-                max_iter=geometry_max_iter,
-                solver_device=geometry_solver_device,
-                progress_label="[optimization] initial-Er root geometry pullback:",
-            )
+
+            def _transport_backend(names, ps, opts):
+                raw_solve = _shared_raw_block_solve(opts)
+                payload = _shared_transport_payload(opts)
+                return geometry_active_initial_er_root_only_reverse_table(
+                    config=config,
+                    objective_names=names,
+                    parameter_set=ps,
+                    parameter_values=opts.get("parameter_values", parameter_values),
+                    runtime=runtime,
+                    profile_values=profile_values0,
+                    pre_root_state_from_profile_values=_pre_root_state_from_profile_values,
+                    geometry_context=context,
+                    baseline_geometry_deltas=baseline_geometry_deltas,
+                    n_r=int(geom_cfg.get("n_radial", 51)),
+                    n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                    n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                    n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                    surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+                    max_iter=geometry_max_iter,
+                    solver_device=geometry_solver_device,
+                    progress_label="[optimization] initial-Er root geometry pullback:",
+                    raw_block_solve=raw_solve,
+                    support_payload_override=payload,
+                )
+
+            backends["transport"] = _transport_backend
         else:
             from NEOPAX._reverse_ad_optimization import (
                 InitialErRootOnlyReverseTableRequest,
@@ -346,10 +383,7 @@ def main() -> int:
         parameter_set=parameter_set,
         terms=active_terms,
         backends=backends,
-        options={
-            "parameter_values": parameter_values,
-            "materialize_backend_results": True,
-        },
+        options={"parameter_values": parameter_values},
     )
     residuals = jax.block_until_ready(result.residuals)
     jacobian = jax.block_until_ready(result.jacobian)

@@ -450,7 +450,6 @@ def residuals_and_jacobian_reverse_ad(
     normalized_terms = normalize_least_squares_terms(terms)
     grouped_terms = group_least_squares_terms_by_family(normalized_terms)
     backend_options = {} if options is None else dict(options)
-    materialize_backend_results = bool(backend_options.pop("materialize_backend_results", False))
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     for family, family_terms in grouped_terms.items():
         backend = backends.get(family)
@@ -459,15 +458,7 @@ def residuals_and_jacobian_reverse_ad(
                 f"No reverse-AD backend is registered for objective family {family!r}."
             )
         objective_names = _unique_objective_names(family_terms)
-        table_result = backend(objective_names, parameter_set, backend_options)
-        if materialize_backend_results:
-            values, jacobian = jax.block_until_ready((table_result.values, table_result.jacobian))
-            table_result = ObjectiveTableResult(
-                objective_names=table_result.objective_names,
-                values=jnp.asarray(jax.device_get(values)),
-                jacobian=jnp.asarray(jax.device_get(jacobian)),
-            )
-        backend_results[family] = table_result
+        backend_results[family] = backend(objective_names, parameter_set, backend_options)
     return assemble_least_squares_result(
         normalized_terms,
         parameter_set=parameter_set,
@@ -676,6 +667,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     solver_device: str | None = "default",
     progress_label: str | None = None,
     raw_block_solve=None,
+    support_payload_override=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -704,7 +696,9 @@ def geometry_active_initial_er_root_only_reverse_table(
             f"got shape={baseline_geometry_deltas.shape}, vmec_parameter_count={len(vmec_specs)}."
         )
 
-    support_payload = find_ntx_support_payload(runtime)
+    support_payload = support_payload_override
+    if support_payload is None:
+        support_payload = find_ntx_support_payload(runtime)
     if not isinstance(support_payload, dict):
         support_payload = {
             "geometry": runtime.geometry,
@@ -718,7 +712,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         ],
         dtype=jnp.float64,
     )
-    use_runtime_payload = raw_block_solve is None
+    use_runtime_payload = raw_block_solve is None or support_payload_override is not None
     if raw_block_solve is not None:
         try:
             use_runtime_payload = bool(
