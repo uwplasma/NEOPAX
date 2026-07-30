@@ -26,7 +26,6 @@ from ._reverse_ad_parameters import (
 )
 from ._transport_flux_models import _add_float_delta_tree, _float_delta_tree_like
 from ._geometry_autodiff import (
-    build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_names_for_kind,
 )
@@ -666,7 +665,6 @@ def geometry_active_initial_er_root_only_reverse_table(
     max_iter: int | None = None,
     solver_device: str | None = "default",
     progress_label: str | None = None,
-    raw_block_solve=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -701,45 +699,14 @@ def geometry_active_initial_er_root_only_reverse_table(
             "geometry": runtime.geometry,
             "ntx_support": support_payload,
         }
-    vmec_parameter_values = jnp.asarray(
-        [
-            parameter_values_arr[i]
-            for i, spec in enumerate(parameter_set.specs)
-            if isinstance(spec, VmecBoundaryParameterSpec)
-        ],
-        dtype=jnp.float64,
-    )
-    use_runtime_payload = raw_block_solve is None
-    if raw_block_solve is not None:
-        try:
-            use_runtime_payload = bool(
-                jnp.allclose(vmec_parameter_values, baseline_geometry_deltas).item()
-            )
-        except Exception:
-            use_runtime_payload = False
-
+    baseline_geometry = support_payload["geometry"]
+    baseline_ntx_support = support_payload["ntx_support"]
+    runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
+    runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
+    geometry_delta0 = _float_delta_tree_like(baseline_geometry)
     profile_specs = tuple(parameter_set.profile_specs)
 
-    def _initial_er_payload_cotangents_for_current_geometry():
-        if use_runtime_payload:
-            baseline_geometry = support_payload["geometry"]
-            baseline_ntx_support = support_payload["ntx_support"]
-        else:
-            current_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                geometry_context,
-                raw_block_solve.state,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
-            )
-            baseline_geometry = current_payload["geometry"]
-            baseline_ntx_support = current_payload["ntx_support"]
-        runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
-        runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
-        geometry_delta0 = _float_delta_tree_like(baseline_geometry)
-
+    def _initial_er_payload_cotangents_from_runtime_payload():
         pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
         er_profile, finite_mask = initial_er_selected_root_profile(
             pre_root_state,
@@ -859,7 +826,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         profile_gradient_matrix_for_payload,
         support_bars,
         objective_count,
-    ) = _initial_er_payload_cotangents_for_current_geometry()
+    ) = _initial_er_payload_cotangents_from_runtime_payload()
     objective_values, profile_gradient_matrix_for_payload, support_bars = jax.block_until_ready(
         (objective_values, profile_gradient_matrix_for_payload, support_bars)
     )
@@ -886,7 +853,6 @@ def geometry_active_initial_er_root_only_reverse_table(
         max_iter=max_iter,
         solver_device=solver_device,
         progress_label=progress_label,
-        raw_block_solve=raw_block_solve,
     )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
