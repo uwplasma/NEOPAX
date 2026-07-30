@@ -358,6 +358,7 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
     from scipy.optimize import least_squares as scipy_least_squares
 
     cache: dict[tuple[float, ...], LeastSquaresEvaluation] = {}
+    state: dict[str, object] = {"nres": None, "npar": problem.parameter_count}
 
     def _key(x):
         return tuple(np.asarray(x, dtype=float).tolist())
@@ -372,10 +373,28 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         return evaluation
 
     def _fun(x):
-        return np.asarray(jax.device_get(_evaluate(x).residuals), dtype=float)
+        try:
+            residuals = np.asarray(jax.device_get(_evaluate(x).residuals), dtype=float)
+        except Exception as exc:
+            if state["nres"] is None:
+                raise
+            if int(kwargs.get("verbose", 0) or 0):
+                print(f"[NEOPAX least_squares] trial solve failed: {exc}")
+            return np.full((int(state["nres"]),), 1.0e6, dtype=float)
+        residuals = np.where(np.isfinite(residuals), residuals, 1.0e6)
+        state["nres"] = int(residuals.size)
+        return residuals
 
     def _jac(x):
-        return np.asarray(jax.device_get(_evaluate(x).jacobian), dtype=float)
+        try:
+            jacobian = np.asarray(jax.device_get(_evaluate(x).jacobian), dtype=float)
+        except Exception as exc:
+            if state["nres"] is None:
+                raise
+            if int(kwargs.get("verbose", 0) or 0):
+                print(f"[NEOPAX least_squares] trial jacobian failed: {exc}")
+            return np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
+        return np.where(np.isfinite(jacobian), jacobian, 0.0)
 
     x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
     x_scale = np.asarray(jax.device_get(problem.x_scale), dtype=float)
