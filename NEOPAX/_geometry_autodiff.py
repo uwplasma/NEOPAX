@@ -5117,7 +5117,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
         return state_bar_batch
 
-    def _try_stream_compact_payload_rows_to_param_matrix():
+    def _try_compact_payload_batch_to_param_matrix():
         if (
             not combined_payload
             or return_branch_gradients
@@ -5132,37 +5132,40 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
         row_count = len(payload_bars)
 
-        def _single_gradient_row(objective_i):
+        def _single_state_bar_row(objective_i):
             geometry_state_bar = geometry_setup["single_state_bar"](objective_i)
             support_state_bar = support_setup["single_state_bar"](objective_i)
-            state_bar = jax.tree_util.tree_map(
+            return jax.tree_util.tree_map(
                 lambda geometry_leaf, support_leaf: geometry_leaf + support_leaf,
                 geometry_state_bar,
                 support_state_bar,
             )
-            state_bar_batch = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], state_bar)
-            param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
-                implicit_params,
-                implicit_cfg,
-                state,
-                dof_mask,
-                state_bar_batch,
-                probe_chunk_size=1,
-            )
-            return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)[0]
 
-        gradient_matrix_value = jax.lax.map(
-            _single_gradient_row,
-            jnp.arange(row_count, dtype=jnp.int32),
+        state_bar_rows = tuple(_single_state_bar_row(i) for i in range(row_count))
+        state_bar_batch = jax.tree_util.tree_map(
+            lambda *leaves: jnp.stack(leaves, axis=0),
+            *state_bar_rows,
+        )
+        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+            implicit_params,
+            implicit_cfg,
+            state,
+            dof_mask,
+            state_bar_batch,
+            probe_chunk_size=1,
+        )
+        gradient_matrix_value = _param_vector_gradient_from_implicit_param_grads(
+            param_bar_batch,
+            param_entries,
         )
         if progress_label is not None:
             print(
-                f"{progress_label} streamed_compact_payload_rows_to_raw_block=True",
+                f"{progress_label} compact_payload_batch_to_raw_block=True",
                 flush=True,
             )
         return gradient_matrix_value
 
-    streamed_gradient_matrix = _try_stream_compact_payload_rows_to_param_matrix()
+    streamed_gradient_matrix = _try_compact_payload_batch_to_param_matrix()
     if streamed_gradient_matrix is not None:
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
