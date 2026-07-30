@@ -860,6 +860,9 @@ def geometry_active_initial_er_root_only_reverse_table(
         support_bars,
         objective_count,
     ) = _initial_er_payload_cotangents_for_current_geometry()
+    objective_values, profile_gradient_matrix_for_payload, support_bars = jax.block_until_ready(
+        (objective_values, profile_gradient_matrix_for_payload, support_bars)
+    )
 
     geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
     assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
