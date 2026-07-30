@@ -3609,6 +3609,35 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
 
 
+def _neopax_geometry_requested_sample_rho(context: GeometryAutodiffContext, *, n_r: int):
+    rho_grid = np.linspace(0.0, 1.0, int(n_r), dtype=float)
+    if int(n_r) > 1:
+        rho_grid_half = np.concatenate(
+            [
+                np.asarray([0.0], dtype=float),
+                0.5 * (rho_grid[:-1] + rho_grid[1:]),
+                np.asarray([1.0], dtype=float),
+            ],
+            axis=0,
+        )
+    else:
+        rho_grid_half = np.asarray([0.0, 1.0], dtype=float)
+    s_full = np.asarray(jax.device_get(context.static.s), dtype=float)
+    rho_half = np.sqrt(np.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))
+    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
+    return np.unique(
+        np.concatenate(
+            [
+                rho_grid_half[1:-1],
+                rho_half[:edge_count],
+                edge_rho,
+            ],
+            axis=0,
+        )
+    )
+
+
 def _vmec_r00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
     """Return traceable VMEC R(m=0,n=0) on requested rho values."""
 
@@ -3630,6 +3659,7 @@ def _build_neopax_geometry_from_state(
     state,
     *,
     n_r: int,
+    requested_sample_rho=None,
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
@@ -3734,30 +3764,8 @@ def _build_neopax_geometry_from_state(
     # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
     # half-mesh points at the axis and edge so extrapolated quantities such as
     # B0(r_grid) use a frozen-like local slope.
-    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
-    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
-    rho_half_np = np.sqrt(
-        np.maximum(
-            0.5
-            * (
-                np.asarray(context.static.s[1:], dtype=float)
-                + np.asarray(context.static.s[:-1], dtype=float)
-            ),
-            0.0,
-        )
-    )
-    rho_grid_half_np = np.asarray(jax.device_get(rho_grid_half), dtype=float)
-    edge_rho_np = rho_half_np[-edge_count:] if edge_count > 0 else rho_half_np[:0]
-    requested_sample_rho = np.unique(
-        np.concatenate(
-            [
-                rho_grid_half_np[1:-1],
-                rho_half_np[:edge_count],
-                edge_rho_np,
-            ],
-            axis=0,
-        )
-    )
+    if requested_sample_rho is None:
+        requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -4773,9 +4781,15 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
+    geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
 
     def geometry_from_state(state_inner):
-        return _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)
+        return _build_neopax_geometry_from_state(
+            context,
+            state_inner,
+            n_r=n_r,
+            requested_sample_rho=geometry_requested_sample_rho,
+        )
 
     def ntx_support_from_state(state_inner):
         geometry_inner = geometry_from_state(state_inner)
