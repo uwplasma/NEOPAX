@@ -12,7 +12,7 @@ import dataclasses
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +29,9 @@ from ._geometry_autodiff import (
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     geometry_full_ad_objective_table_pullback_from_param_vector,
     geometry_observable_names_for_kind,
+    geometry_payload_pullback_from_param_vector_raw_block_transpose,
+    geometry_raw_block_solve_from_param_vector,
+    geometry_raw_block_transpose_from_state_bars,
 )
 from ._reverse_ad_initial_er import (
     compact_initial_er_ntx_support_pullback_leaves,
@@ -162,6 +165,43 @@ GeometryInitialErRootOnlyLeastSquaresRunner = Callable[
     [object, Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]]],
     LeastSquaresEvaluation,
 ]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SharedGeometryTransportPayload:
+    """Shared VMEC/geometry/NTX primal data for mixed optimization objectives.
+
+    This is the first internal building block for fused optimization. It owns the
+    one VMEC raw-block solve for the current optimizer parameter vector and the
+    realtime transport payload derived from that VMEC state. Objective-specific
+    pullbacks should consume this object rather than rebuilding VMEC/Boozer/NTX
+    plumbing in example scripts.
+    """
+
+    raw_block_solve: Any
+    payload: Mapping[str, Any]
+    detached_payload: Mapping[str, Any]
+    runtime_with_payload: Any
+    vmec_parameter_values: object
+    vmec_specs: tuple[VmecBoundaryParameterSpec, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ObjectiveCotangentTable:
+    """Objective values plus pre-raw-block cotangents for fused optimization.
+
+    Geometry columns are intentionally not assembled here. The optimizer-fused
+    path should collect all VMEC-state/payload cotangents from geometry and
+    transport objectives, then apply one batched raw-block transpose.
+    """
+
+    objective_names: tuple[str, ...]
+    values: object
+    profile_gradient_matrix: object
+    vmec_state_bars: object | None = None
+    payload_bars: tuple[Mapping[str, Any], ...] = ()
+
+
 INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "softmax_Er",
     "smooth_root_proxy",
@@ -656,6 +696,386 @@ def _add_trees(lhs, rhs):
     return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
 
 
+def vmec_parameter_values_from_parameter_vector(
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+) -> jnp.ndarray:
+    """Extract VMEC-boundary columns from a mixed optimization vector."""
+
+    parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
+    if parameter_values_arr.ndim != 1 or int(parameter_values_arr.shape[0]) != len(parameter_set.specs):
+        raise ValueError(
+            "parameter_values must be a 1D vector matching the reverse-AD parameter set; "
+            f"got shape={parameter_values_arr.shape}, parameter_count={len(parameter_set.specs)}."
+        )
+    values = [
+        parameter_values_arr[i]
+        for i, spec in enumerate(parameter_set.specs)
+        if isinstance(spec, VmecBoundaryParameterSpec)
+    ]
+    return jnp.asarray(values, dtype=jnp.float64)
+
+
+def build_shared_geometry_transport_payload(
+    *,
+    geometry_context,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    runtime,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "vmec",
+    max_iter: int | None = None,
+    solver_device: str | None = "default",
+) -> SharedGeometryTransportPayload:
+    """Build one VMEC solve and one realtime geometry/NTX payload.
+
+    This helper supports mixed profile+geometry parameter vectors by extracting
+    only VMEC-boundary entries for the VMEC solve. It deliberately lives in
+    NEOPAX internals so thin optimization scripts do not own raw-block/payload
+    plumbing.
+    """
+
+    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
+    if not vmec_specs:
+        raise ValueError("A shared geometry/transport payload requires at least one VMEC boundary parameter.")
+    vmec_values = vmec_parameter_values_from_parameter_vector(parameter_set, parameter_values)
+    raw_block_solve = geometry_raw_block_solve_from_param_vector(
+        geometry_context,
+        vmec_values,
+        tuple(spec.as_tuple() for spec in vmec_specs),
+        max_iter=max_iter,
+        solver_device=solver_device,
+    )
+    payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+        geometry_context,
+        raw_block_solve.state,
+        n_r=int(n_r),
+        n_theta=int(n_theta),
+        n_zeta=int(n_zeta),
+        n_xi=int(n_xi),
+        surface_backend=str(surface_backend),
+    )
+    detached_payload = jax.tree_util.tree_map(jax.lax.stop_gradient, payload)
+    runtime_with_payload = runtime_with_geometry_payload(runtime, detached_payload["geometry"])
+    runtime_with_payload = runtime_with_ntx_support_payload(runtime_with_payload, detached_payload["ntx_support"])
+    return SharedGeometryTransportPayload(
+        raw_block_solve=raw_block_solve,
+        payload=payload,
+        detached_payload=detached_payload,
+        runtime_with_payload=runtime_with_payload,
+        vmec_parameter_values=vmec_values,
+        vmec_specs=vmec_specs,
+    )
+
+
+def initial_er_root_only_objective_cotangent_table(
+    *,
+    config: Mapping[str, object],
+    objective_names: Sequence[str] | str,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    runtime,
+    profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    support_payload_override=None,
+) -> ObjectiveCotangentTable:
+    """Return initial-Er root objective values plus profile/payload cotangents.
+
+    This is the compact root-only reverse path stopped before the final
+    payload-to-VMEC raw-block pullback. It is intentionally separate from the
+    benchmark-good assembled table so fused optimization can collect transport
+    and geometry cotangents first, then perform one shared geometry pullback.
+    """
+
+    requested_objectives = normalize_initial_er_root_only_objective_names(objective_names)
+    parameter_values_arr = jnp.asarray(parameter_values)
+    profile_values_arr = jnp.asarray(profile_values)
+    if parameter_values_arr.ndim != 1 or int(parameter_values_arr.shape[0]) != len(parameter_set.specs):
+        raise ValueError(
+            "parameter_values must be a 1D vector matching the reverse-AD parameter set; "
+            f"got shape={parameter_values_arr.shape}, parameter_count={len(parameter_set.specs)}."
+        )
+
+    support_payload = support_payload_override
+    if support_payload is None:
+        support_payload = find_ntx_support_payload(runtime)
+    if not isinstance(support_payload, dict):
+        support_payload = {
+            "geometry": runtime.geometry,
+            "ntx_support": support_payload,
+        }
+    baseline_geometry = support_payload["geometry"]
+    baseline_ntx_support = support_payload["ntx_support"]
+    runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
+    runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
+    geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+
+    pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
+    er_profile, finite_mask = initial_er_selected_root_profile(
+        pre_root_state,
+        config=dict(config),
+        runtime=runtime_for_geometry,
+    )
+    er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
+    finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+
+    def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        return _initial_er_root_only_objective_values(
+            state_value,
+            runtime_with_geometry,
+            requested_objectives,
+        )
+
+    objective_values, objective_pullback = jax.vjp(
+        _values_from_rooted_state_and_geometry,
+        rooted_state,
+        geometry_delta0,
+    )
+    objective_count = len(requested_objectives)
+    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
+    rooted_state_bars, direct_geometry_bars = jax.vmap(lambda cotangent: objective_pullback(cotangent))(
+        objective_basis
+    )
+
+    dres_der = initial_er_charge_flux_residual_er_derivative(
+        pre_root_state,
+        er_profile,
+        runtime=runtime_for_geometry,
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+        dres_der,
+        jnp.inf,
+    )
+    residual_bars = jnp.where(
+        finite_mask[None, :],
+        -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
+        0.0,
+    )
+    state_residual_bars = compact_initial_er_state_pullback(
+        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        runtime=runtime_for_geometry,
+    )
+    direct_pre_root_state_bars = dataclasses.replace(
+        rooted_state_bars,
+        Er=jnp.zeros_like(rooted_state_bars.Er),
+    )
+    pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
+
+    profile_specs = tuple(parameter_set.profile_specs)
+    if profile_specs:
+        _, profile_pullback = jax.vjp(
+            pre_root_state_from_profile_values,
+            profile_values_arr,
+        )
+        profile_gradient_all = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
+            pre_root_state_bars
+        )
+        canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_gradient_matrix = jnp.stack(
+            [profile_gradient_all[:, canonical_profile_lookup[spec.name]] for spec in profile_specs],
+            axis=1,
+        )
+    else:
+        profile_gradient_matrix = jnp.zeros((objective_count, 0), dtype=jnp.asarray(objective_values).dtype)
+
+    def _residuals_from_geometry_delta(geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        return initial_er_charge_flux_residuals(
+            pre_root_state,
+            er_profile,
+            runtime=runtime_with_geometry,
+        )
+
+    _, geometry_residual_pullback = jax.vjp(
+        _residuals_from_geometry_delta,
+        geometry_delta0,
+    )
+    residual_geometry_bars = jax.vmap(lambda residual_bar: geometry_residual_pullback(residual_bar)[0])(
+        residual_bars
+    )
+    geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
+
+    ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
+    ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
+        runtime=ntx_runtime,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        support=baseline_ntx_support,
+    )
+    _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
+    ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
+    support_bars = []
+    for objective_index in range(objective_count):
+        geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
+        ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
+        support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
+
+    return ObjectiveCotangentTable(
+        objective_names=requested_objectives,
+        values=objective_values,
+        profile_gradient_matrix=profile_gradient_matrix,
+        vmec_state_bars=None,
+        payload_bars=tuple(support_bars),
+    )
+
+
+def fused_geometry_parameter_matrix_from_cotangent_tables(
+    *,
+    geometry_context,
+    parameter_set: ReverseADParameterSet,
+    tables: Sequence[ObjectiveCotangentTable],
+    shared_payload: SharedGeometryTransportPayload,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "vmec",
+    max_iter: int | None = None,
+    solver_device: str | None = "default",
+) -> jnp.ndarray:
+    """Fuse objective-family cotangents and pull them once to VMEC columns."""
+
+    del parameter_set  # Geometry columns are ordered by shared_payload.vmec_specs.
+    if not shared_payload.vmec_specs:
+        raise ValueError("Fused geometry pullback requires at least one VMEC boundary parameter.")
+    state = shared_payload.raw_block_solve.state
+
+    def _zero_state_bar_batch(row_count: int):
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(jnp.zeros_like(leaf)[None, ...], (int(row_count),) + leaf.shape),
+            state,
+        )
+
+    table_state_bar_batches = []
+    for table in tables:
+        row_count = len(table.objective_names)
+        values = jnp.asarray(table.values)
+        if values.ndim != 1 or int(values.shape[0]) != row_count:
+            raise ValueError(
+                "ObjectiveCotangentTable values must have shape (objective_count,); "
+                f"got values.shape={values.shape}, objective_count={row_count}."
+            )
+        profile_gradient_matrix = jnp.asarray(table.profile_gradient_matrix)
+        if profile_gradient_matrix.ndim != 2 or int(profile_gradient_matrix.shape[0]) != row_count:
+            raise ValueError(
+                "ObjectiveCotangentTable profile_gradient_matrix must have one row per objective; "
+                f"got shape={profile_gradient_matrix.shape}, objective_count={row_count}."
+            )
+        if table.payload_bars and len(table.payload_bars) != row_count:
+            raise ValueError(
+                "ObjectiveCotangentTable payload_bars must have one cotangent tree per objective; "
+                f"got payload_count={len(table.payload_bars)}, objective_count={row_count}."
+            )
+        table_state_bar = _zero_state_bar_batch(row_count)
+        if table.vmec_state_bars is not None:
+            table_state_bar = jax.tree_util.tree_map(
+                lambda left, right: left + right,
+                table_state_bar,
+                table.vmec_state_bars,
+            )
+        if table.payload_bars:
+            payload_state_bar = geometry_payload_pullback_from_param_vector_raw_block_transpose(
+                geometry_context,
+                shared_payload.vmec_parameter_values,
+                tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
+                table.payload_bars,
+                combined_payload=True,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+                max_iter=max_iter,
+                solver_device=solver_device,
+                raw_block_solve=shared_payload.raw_block_solve,
+                return_state_bars=True,
+            )
+            table_state_bar = jax.tree_util.tree_map(
+                lambda left, right: left + right,
+                table_state_bar,
+                payload_state_bar,
+            )
+        table_state_bar_batches.append(table_state_bar)
+
+    if not table_state_bar_batches:
+        return jnp.zeros((0, len(shared_payload.vmec_specs)), dtype=jnp.float64)
+
+    state_bar_batch = jax.tree_util.tree_map(
+        lambda *leaves: jnp.concatenate(leaves, axis=0),
+        *table_state_bar_batches,
+    )
+    return geometry_raw_block_transpose_from_state_bars(
+        shared_payload.raw_block_solve,
+        state_bar_batch,
+        probe_chunk_size=1,
+    )
+
+
+def objective_table_result_from_cotangent_table(
+    table: ObjectiveCotangentTable,
+    *,
+    parameter_set: ReverseADParameterSet,
+    geometry_gradient_matrix,
+) -> ObjectiveTableResult:
+    """Expand one cotangent table into the full mixed-parameter Jacobian layout."""
+
+    objective_count = len(table.objective_names)
+    values = jnp.asarray(table.values)
+    profile_gradient_matrix = jnp.asarray(table.profile_gradient_matrix)
+    geometry_gradient_matrix = jnp.asarray(geometry_gradient_matrix)
+    profile_specs = tuple(parameter_set.profile_specs)
+    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
+    if values.ndim != 1 or int(values.shape[0]) != objective_count:
+        raise ValueError(
+            "ObjectiveCotangentTable values must have shape (objective_count,); "
+            f"got values.shape={values.shape}, objective_count={objective_count}."
+        )
+    if profile_gradient_matrix.shape != (objective_count, len(profile_specs)):
+        raise ValueError(
+            "ObjectiveCotangentTable profile_gradient_matrix shape does not match profile parameters: "
+            f"got {profile_gradient_matrix.shape}, expected {(objective_count, len(profile_specs))}."
+        )
+    if geometry_gradient_matrix.shape != (objective_count, len(vmec_specs)):
+        raise ValueError(
+            "geometry_gradient_matrix shape does not match VMEC parameters: "
+            f"got {geometry_gradient_matrix.shape}, expected {(objective_count, len(vmec_specs))}."
+        )
+
+    profile_lookup = {spec: i for i, spec in enumerate(profile_specs)}
+    vmec_lookup = {spec: i for i, spec in enumerate(vmec_specs)}
+    jacobian_rows = []
+    for row_i in range(objective_count):
+        columns = []
+        for spec in parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                columns.append(profile_gradient_matrix[row_i, profile_lookup[spec]])
+            elif isinstance(spec, VmecBoundaryParameterSpec):
+                columns.append(geometry_gradient_matrix[row_i, vmec_lookup[spec]])
+            else:
+                raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
+        jacobian_rows.append(jnp.stack(columns))
+
+    return ObjectiveTableResult(
+        objective_names=table.objective_names,
+        values=values,
+        jacobian=jnp.stack(jacobian_rows, axis=0),
+    )
+
+
 def geometry_active_initial_er_root_only_reverse_table(
     *,
     config: Mapping[str, object],
@@ -1007,6 +1427,181 @@ def evaluate_geometry_initial_er_root_only_least_squares(
         terms=normalized_terms,
         backends=backends,
         options=backend_options,
+    )
+    residuals = jax.block_until_ready(result.residuals)
+    jacobian = jax.block_until_ready(result.jacobian)
+    elapsed_s = time.perf_counter() - t_start
+    return LeastSquaresEvaluation(
+        result=result,
+        residuals=residuals,
+        jacobian=jacobian,
+        elapsed_s=float(elapsed_s),
+    )
+
+
+def _active_profile_values_from_parameter_vector(
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    baseline_profile_values,
+):
+    """Return full profile vector with active profile DOFs overwritten."""
+
+    values = jnp.asarray(parameter_values)
+    profiles = jnp.asarray(baseline_profile_values)
+    if values.ndim != 1 or int(values.shape[0]) != len(parameter_set.specs):
+        raise ValueError(
+            "parameter_values must be a 1D vector matching the reverse-AD parameter set; "
+            f"got shape={values.shape}, parameter_count={len(parameter_set.specs)}."
+        )
+    if profiles.ndim != 1 or int(profiles.shape[0]) != len(PROFILE_PARAMETER_ORDER):
+        raise ValueError(
+            "baseline_profile_values must follow PROFILE_PARAMETER_ORDER; "
+            f"got shape={profiles.shape}, expected ({len(PROFILE_PARAMETER_ORDER)},)."
+        )
+    profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+    for value, spec in zip(values, parameter_set.specs, strict=True):
+        if isinstance(spec, ProfileParameterSpec):
+            profiles = profiles.at[profile_lookup[spec.name]].set(value)
+    return profiles
+
+
+def evaluate_geometry_initial_er_root_only_least_squares_fused(
+    config: Mapping[str, object],
+    *,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    geometry_context,
+    runtime,
+    baseline_profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "vmec",
+    root_options: Mapping[str, object] | None = None,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_solver_device: str | None = "default",
+) -> LeastSquaresEvaluation:
+    """Evaluate geometry + initial-Er root terms with one fused VMEC pullback."""
+
+    del root_options  # Objective/root tuning can be threaded here once needed.
+    normalized_terms = normalize_least_squares_terms(terms)
+    grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+    unsupported_families = tuple(
+        family for family in grouped_terms if family not in {"geometry", "transport"}
+    )
+    if unsupported_families:
+        raise NotImplementedError(
+            "evaluate_geometry_initial_er_root_only_least_squares_fused supports only "
+            f"geometry and transport/initial-Er terms; got families {unsupported_families!r}."
+        )
+    if "geometry" in grouped_terms and not parameter_set.vmec_boundary_specs:
+        raise ValueError("Geometry objectives require VMEC boundary parameters.")
+
+    parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
+    t_start = time.perf_counter()
+    shared_payload = None
+    if parameter_set.vmec_boundary_specs:
+        shared_payload = build_shared_geometry_transport_payload(
+            geometry_context=geometry_context,
+            parameter_set=parameter_set,
+            parameter_values=parameter_values_arr,
+            runtime=runtime,
+            n_r=int(n_r),
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+            max_iter=geometry_max_iter,
+            solver_device=geometry_solver_device,
+        )
+
+    cotangent_tables_by_family: dict[ObjectiveFamily, ObjectiveCotangentTable] = {}
+    geometry_cotangent_tables: list[ObjectiveCotangentTable] = []
+    if "geometry" in grouped_terms:
+        if shared_payload is None:
+            raise ValueError("Geometry terms require shared VMEC payload data.")
+        geometry_table = geometry_full_ad_objective_cotangent_table(
+            context=geometry_context,
+            parameter_set=parameter_set,
+            objective_names=_unique_objective_names(grouped_terms["geometry"]),
+            parameter_values=parameter_values_arr,
+            shared_payload=shared_payload,
+            lane=geometry_lane,
+            max_iter=geometry_max_iter,
+            step_size=geometry_step_size,
+            solver_device=geometry_solver_device,
+        )
+        cotangent_tables_by_family["geometry"] = geometry_table
+        geometry_cotangent_tables.append(geometry_table)
+
+    if "transport" in grouped_terms:
+        active_profile_values = _active_profile_values_from_parameter_vector(
+            parameter_set,
+            parameter_values_arr,
+            baseline_profile_values,
+        )
+        runtime_for_transport = runtime if shared_payload is None else shared_payload.runtime_with_payload
+        support_payload = None if shared_payload is None else shared_payload.detached_payload
+        transport_table = initial_er_root_only_objective_cotangent_table(
+            config=config,
+            objective_names=_unique_objective_names(grouped_terms["transport"]),
+            parameter_set=parameter_set,
+            parameter_values=parameter_values_arr,
+            runtime=runtime_for_transport,
+            profile_values=active_profile_values,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            support_payload_override=support_payload,
+        )
+        cotangent_tables_by_family["transport"] = transport_table
+        if shared_payload is not None:
+            geometry_cotangent_tables.append(transport_table)
+
+    geometry_gradient_by_table_id: dict[int, object] = {}
+    if geometry_cotangent_tables:
+        if shared_payload is None:
+            raise ValueError("Geometry cotangents were produced without shared VMEC payload data.")
+        fused_geometry_matrix = fused_geometry_parameter_matrix_from_cotangent_tables(
+            geometry_context=geometry_context,
+            parameter_set=parameter_set,
+            tables=tuple(geometry_cotangent_tables),
+            shared_payload=shared_payload,
+            n_r=int(n_r),
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+            max_iter=geometry_max_iter,
+            solver_device=geometry_solver_device,
+        )
+        row0 = 0
+        for table in geometry_cotangent_tables:
+            row1 = row0 + len(table.objective_names)
+            geometry_gradient_by_table_id[id(table)] = fused_geometry_matrix[row0:row1]
+            row0 = row1
+
+    backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
+    for family, table in cotangent_tables_by_family.items():
+        geometry_gradient_matrix = geometry_gradient_by_table_id.get(id(table))
+        if geometry_gradient_matrix is None:
+            geometry_gradient_matrix = jnp.zeros(
+                (len(table.objective_names), len(parameter_set.vmec_boundary_specs)),
+                dtype=jnp.asarray(table.values).dtype,
+            )
+        backend_results[family] = objective_table_result_from_cotangent_table(
+            table,
+            parameter_set=parameter_set,
+            geometry_gradient_matrix=geometry_gradient_matrix,
+        )
+
+    result = assemble_least_squares_result(
+        normalized_terms,
+        parameter_set=parameter_set,
+        backend_results=backend_results,
     )
     residuals = jax.block_until_ready(result.residuals)
     jacobian = jax.block_until_ready(result.jacobian)
@@ -1485,6 +2080,76 @@ def normalize_geometry_full_ad_objective_names(objective_names: Sequence[str]) -
     return tuple(normalized)
 
 
+def geometry_full_ad_objective_cotangent_basis(
+    objective_names: Sequence[str],
+) -> tuple[tuple[str, ...], jnp.ndarray]:
+    """Return canonical geometry objective names and rows in full table order."""
+
+    requested_objectives = tuple(str(name).strip() for name in objective_names)
+    canonical_objectives = normalize_geometry_full_ad_objective_names(requested_objectives)
+    full_objective_names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    objective_cotangents = jnp.zeros((len(canonical_objectives), len(full_objective_names)), dtype=jnp.float64)
+    for row_i, canonical_name in enumerate(canonical_objectives):
+        objective_cotangents = objective_cotangents.at[row_i, full_objective_names.index(canonical_name)].set(1.0)
+    return canonical_objectives, objective_cotangents
+
+
+def geometry_full_ad_objective_cotangent_table(
+    *,
+    context,
+    parameter_set: ReverseADParameterSet,
+    objective_names: Sequence[str],
+    parameter_values=None,
+    shared_payload: SharedGeometryTransportPayload | None = None,
+    lane: str = "ad",
+    max_iter: int | None = None,
+    step_size: float | None = None,
+    solver_device: str | None = "default",
+) -> ObjectiveCotangentTable:
+    """Return geometry objective values and VMEC-state bars before raw-block pullback."""
+
+    requested_objectives = tuple(str(name).strip() for name in objective_names)
+    canonical_objectives, objective_cotangents = geometry_full_ad_objective_cotangent_basis(requested_objectives)
+    vmec_specs = tuple(spec for spec in parameter_set.specs if isinstance(spec, VmecBoundaryParameterSpec))
+    if not vmec_specs:
+        raise ValueError(
+            "Geometry objectives require at least one VMEC boundary parameter in the optimization parameter set."
+        )
+    if parameter_values is None:
+        parameter_values_arr = jnp.zeros((len(parameter_set.specs),), dtype=jnp.float64)
+    else:
+        parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
+    vmec_param_deltas = vmec_parameter_values_from_parameter_vector(parameter_set, parameter_values_arr)
+    full_objective_names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    raw_block_solve = None if shared_payload is None else shared_payload.raw_block_solve
+    values_by_name, vmec_state_bars = geometry_full_ad_objective_table_pullback_from_param_vector(
+        context,
+        vmec_param_deltas,
+        tuple(spec.as_tuple() for spec in vmec_specs),
+        objective_cotangents,
+        objective_names=full_objective_names,
+        lane=lane,
+        max_iter=max_iter,
+        step_size=step_size,
+        final_vmec_pullback_mode="raw_block_transpose",
+        solver_device=solver_device,
+        raw_block_solve=raw_block_solve,
+        return_state_bars=True,
+    )
+    objective_values = jnp.stack(
+        [jnp.asarray(values_by_name[name], dtype=jnp.float64).reshape(()) for name in canonical_objectives]
+    )
+    profile_specs = tuple(parameter_set.profile_specs)
+    profile_gradient_matrix = jnp.zeros((len(requested_objectives), len(profile_specs)), dtype=jnp.float64)
+    return ObjectiveCotangentTable(
+        objective_names=requested_objectives,
+        values=objective_values,
+        profile_gradient_matrix=profile_gradient_matrix,
+        vmec_state_bars=vmec_state_bars,
+        payload_bars=(),
+    )
+
+
 def geometry_full_ad_reverse_table(
     *,
     context,
@@ -1507,7 +2172,7 @@ def geometry_full_ad_reverse_table(
     """
 
     requested_objectives = tuple(str(name).strip() for name in objective_names)
-    canonical_objectives = normalize_geometry_full_ad_objective_names(requested_objectives)
+    canonical_objectives, objective_cotangents = geometry_full_ad_objective_cotangent_basis(requested_objectives)
     vmec_specs = tuple(spec for spec in parameter_set.specs if isinstance(spec, VmecBoundaryParameterSpec))
     if not vmec_specs:
         raise ValueError(
@@ -1516,10 +2181,6 @@ def geometry_full_ad_reverse_table(
         )
 
     full_objective_names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
-    objective_cotangents = jnp.zeros((len(canonical_objectives), len(full_objective_names)), dtype=jnp.float64)
-    for row_i, canonical_name in enumerate(canonical_objectives):
-        objective_cotangents = objective_cotangents.at[row_i, full_objective_names.index(canonical_name)].set(1.0)
-
     if parameter_values is None:
         parameter_values_arr = jnp.zeros((len(parameter_set.specs),), dtype=jnp.float64)
     else:

@@ -861,6 +861,30 @@ def _implicit_state_pullback_multi_rhs_with_assemble_rhs(
     return jax.tree.map(lambda left, right: left + right, implicit_param_bar, assemble_param_bar)
 
 
+def geometry_raw_block_transpose_from_state_bars(
+    raw_block_solve: GeometryRawBlockSolve,
+    state_bar_batch,
+    *,
+    probe_chunk_size: int = 1,
+) -> jnp.ndarray:
+    """Pull a batch of VMEC-state cotangents back to raw boundary parameters."""
+
+    implicit = raw_block_solve.implicit
+    if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+        raise AttributeError(
+            "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
+        )
+    param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+        raw_block_solve.implicit_params,
+        raw_block_solve.implicit_cfg,
+        raw_block_solve.state,
+        raw_block_solve.dof_mask,
+        state_bar_batch,
+        probe_chunk_size=int(probe_chunk_size),
+    )
+    return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, raw_block_solve.param_entries)
+
+
 def _boundary_with_boundary_deltas(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -3104,8 +3128,9 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
-) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
-    """Return geometry objective values and W @ d(objectives)/d(params).
+    return_state_bars: bool = False,
+) -> tuple[dict[str, jnp.ndarray], object]:
+    """Return geometry objective values and objective cotangents.
 
     This is the memory-conscious table path for the combined geometry gate.
     It avoids the generic ``jacrev(objective_vector)`` path because that path
@@ -3113,6 +3138,10 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     residual graph.  Instead, it builds state-level cotangents by objective
     group and applies the QI pullback once, then scales that cotangent into the
     requested output rows.
+
+    By default, the second return value is ``W @ d(objectives)/d(params)``.
+    If ``return_state_bars`` is true, the final VMEC raw-block pullback is
+    skipped and the second return value is the VMEC-state cotangent tree.
     """
 
     param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
@@ -3348,6 +3377,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
+    if bool(return_state_bars):
+        return values_by_name, state_bar
     if final_mode == "raw_block_transpose":
         if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
             raise AttributeError(
@@ -4589,13 +4620,19 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     progress_label: str | None = None,
     return_branch_gradients: bool = False,
     raw_block_solve: GeometryRawBlockSolve | None = None,
-) -> jnp.ndarray:
+    return_state_bars: bool = False,
+) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
     The payload graph is differentiated only from payload leaves back to the
     converged VMEC state.  The nonlinear VMEC solve pullback is then handled by
     the validated raw block-tridiagonal transpose rule, matching the
     geometry-objective table convention.
+
+    If ``return_state_bars`` is true, stop before the raw-block transpose and
+    return the assembled VMEC-state cotangent batch.  This lets optimization
+    paths fuse transport payload cotangents with geometry objective cotangents
+    before one final VMEC parameter pullback.
     """
 
     if not payload_bars:
@@ -4838,6 +4875,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         )
     else:
         raw_block_state_bar_batch = state_bar_batch
+
+    if bool(return_state_bars):
+        return raw_block_state_bar_batch
 
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,

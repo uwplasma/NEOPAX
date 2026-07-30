@@ -1,0 +1,370 @@
+# Optimization Path Plan
+
+Date: 2026-07-30
+
+## Guiding Rule
+
+Do not contaminate benchmark paths while developing the optimization path.
+
+The benchmark scripts and benchmark-validated internal paths are validation references. Optimization-specific plumbing must live in NEOPAX internals and thin optimization scripts. If a change would affect a benchmark path or a benchmark-validated function, stop and confirm before changing it.
+
+## Goal
+
+Build a VMEX-like optimization interface for NEOPAX objectives where user scripts mostly declare:
+
+- input VMEC geometry,
+- active profile and/or geometry parameters,
+- objective terms, targets, and weights,
+- optimizer settings.
+
+The script should not manually build raw-block solves, NTX payloads, backend dictionaries, or reverse table plumbing.
+
+Example user-facing shape:
+
+```python
+terms = [
+    (geometry.boozer_qi_objective, 0.0, QI_WEIGHT),
+    (geometry.boozer_maxj_objective, 0.0, MAXJ_WEIGHT),
+    (geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
+    (geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
+    (geometry.vmec_mirror_ratio, MIRROR_TARGET, MIRROR_WEIGHT),
+    (transport.softmax_Er, 30.0, ER_WEIGHT),
+]
+
+problem = build_geometry_transport_optimization_problem(
+    config_path=...,
+    vmec_input=...,
+    parameterization=...,
+    terms=terms,
+)
+```
+
+## Parameter Scope
+
+The optimizer must support the full parameter vector:
+
+```text
+x = [profile DOFs, VMEC geometry DOFs]
+```
+
+Required modes:
+
+- `profile_only`
+- `geometry_only`
+- `profiles_plus_geometry`
+
+Profile DOFs include the validated transport reverse profile parameters, such as:
+
+- `n0`
+- `T0`
+- `density_shape_power`
+- `temperature_shape_power`
+
+Geometry DOFs include VMEC boundary harmonics and VMEX-like parameterizations:
+
+- explicit specs such as `RBC:1:0`
+- packed/scaled parameterizations such as `vmex_packed`
+- discovered harmonic sets such as all nonzero `RBC/ZBS` modes
+
+## Shared Primal Point
+
+For each optimizer parameter vector, build one shared primal point:
+
+```text
+profile DOFs -> pre-root transport state
+geometry DOFs -> VMEC raw-block solve/state
+VMEC state -> NEOPAX geometry payload
+VMEC state -> NTX support payload
+pre-root state + geometry/NTX payload -> selected initial Er root
+```
+
+The shared object should hold:
+
+```text
+raw_block_solve
+vmec_state
+dof_mask
+param_entries
+geometry payload
+ntx_support payload
+pre-root profile state
+rooted initial-Er state
+```
+
+## Objective Families
+
+Geometry objectives depend on geometry DOFs:
+
+```text
+QI, maxJ, aspect, iota, mirror, well, etc.
+```
+
+Transport initial-Er objectives depend on profile and geometry DOFs:
+
+```text
+profile DOFs -> profile values/root residual/objective
+geometry DOFs -> geometry payload/NTX support/root residual/objective
+```
+
+The currently tested geometry-only case is only one slice of the full problem.
+
+## Correct Reverse Structure
+
+Do not run geometry and transport as two independent heavy pullback graphs that each perform their own final VMEC raw-block transpose.
+
+Instead split each objective into:
+
+```text
+objective value
+profile cotangent contribution
+VMEC-state / geometry-payload cotangent contribution
+direct parameter contribution if needed
+```
+
+Then fuse the final geometry pullback:
+
+```text
+geometry objective VMEC-state cotangents
++ transport Er-root geometry/NTX payload cotangents
+-> one batched raw-block transpose
+-> VMEC harmonic Jacobian columns
+```
+
+Profile columns are handled separately:
+
+```text
+transport Er-root residual cotangents
+-> compact profile/state pullback
+-> profile Jacobian columns
+```
+
+Geometry-only objectives get zero profile columns.
+
+## Final Jacobian Assembly
+
+Assemble all rows into:
+
+```text
+J = [profile columns | geometry columns]
+```
+
+For each residual row:
+
+```text
+geometry objective:
+  profile columns = 0
+  geometry columns = fused raw-block result
+
+transport Er-root objective:
+  profile columns = compact profile pullback
+  geometry columns = fused raw-block result
+```
+
+This gives the optimizer the same mathematical object as a monolithic least-squares graph:
+
+```text
+residual vector r
+Jacobian matrix J = dr/dx
+```
+
+without retaining multiple heavy VMEC/Boozer/NTX pullback graphs at once.
+
+## Validation Matrix
+
+Validate incrementally:
+
+- root-only benchmark unchanged,
+- full transport reverse benchmark unchanged,
+- geometry-only objective table unchanged,
+- `profile_only + Er-root`,
+- `geometry_only + Er-root`,
+- `geometry_only + QI/maxJ/aspect/iota/mirror`,
+- `geometry_only + QI + Er-root`,
+- `profiles_plus_geometry + Er-root`,
+- `profiles_plus_geometry + QI + Er-root`,
+- `vmex_packed` geometry DOFs.
+
+Each validation should compare against the corresponding benchmark or FD/frozen-linearized reference where available.
+
+## Step 1: Protected Reference State
+
+Status: completed as a guardrail; implementation Step 1 started below.
+
+Before implementing the fused optimization evaluator, keep the validated benchmark behavior as the reference state. Do not edit benchmark scripts to make optimization pass.
+
+Protected benchmark/reference commands:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+This validates the compact initial-Er root-only geometry-active path. The known-good `RBC:1:0` Jacobian entries are:
+
+```text
+transport:softmax_Er                         -5.1293330713e+01
+transport:smooth_root_proxy                   2.2505242252e-09
+transport:Er2_volume_average                 -1.8476397879e+02
+transport:Er_volume_average                  -2.0622727790e+01
+```
+
+```bash
+python ./examples/optimization/transport_realtime_geometry_reverse_smoke.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --accepted-step-limit 2 \
+  --reverse-segment-length 1 \
+  --initial-Er-root-ad jax_selected_root \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --radau-jacobian-reuse-mode legacy \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --hide-solver-iterations
+```
+
+This validates the 2-step internal realtime-geometry transport reverse path. The latest good `RBC:1:0` geometry-column entries were:
+
+```text
+transport:softmax_Er                         -5.1317446794e+01
+transport:smooth_root_proxy                   4.1615832428e-09
+transport:Er2_volume_average                 -1.8107833322e+02
+transport:Er_volume_average                  -2.0555620527e+01
+transport:electron_temperature_volume_average -1.3670544542e-02
+transport:total_pressure_volume_average      -7.7574038513e-02
+transport:alpha_power_volume_average         -1.7350582044e-03
+```
+
+Step 1 completion criteria:
+
+- benchmark scripts remain unmodified,
+- protected reference commands and expected values are recorded,
+- optimization work proceeds through NEOPAX internals and thin scripts only,
+- any future change to benchmark-validated internal behavior requires an explicit decision before editing.
+
+## Implementation Steps
+
+### Step 1: Internal Shared Primal Builder
+
+Status: implemented initial API.
+
+Add a NEOPAX-internal shared primal object for mixed geometry/transport optimization. It must:
+
+- accept a full mixed optimization vector `[profile DOFs | geometry DOFs]`,
+- extract VMEC-boundary entries without assuming `geometry_only`,
+- solve VMEC once through the raw-block-compatible lane,
+- build NEOPAX geometry and NTX support once,
+- provide a detached payload for objective-value/root computations,
+- retain the raw-block solve for the final VMEC harmonic pullback.
+
+Initial implementation:
+
+```python
+build_shared_geometry_transport_payload(...)
+```
+
+returns:
+
+```python
+SharedGeometryTransportPayload(
+    raw_block_solve=...,
+    payload=...,
+    detached_payload=...,
+    runtime_with_payload=...,
+    vmec_parameter_values=...,
+    vmec_specs=...,
+)
+```
+
+### Step 2: Objective Cotangent Collection API
+
+Status: implemented initial internal collectors.
+
+Refactor geometry and transport initial-Er objective paths so they can return objective values plus cotangents to shared VMEC state/payload, instead of immediately doing separate raw-block parameter pullbacks.
+
+Initial internal pieces:
+
+- `ObjectiveCotangentTable`
+- `geometry_full_ad_objective_cotangent_basis(...)`
+- `geometry_full_ad_objective_cotangent_table(...)`
+- `initial_er_root_only_objective_cotangent_table(...)`
+
+These are additive and are not wired into benchmark-good runs yet. The geometry cotangent table returns VMEC-state cotangents before the final raw-block transpose. The initial-Er root-only cotangent table returns compact profile columns and geometry/NTX payload cotangents before the final payload-to-VMEC pullback.
+
+### Step 3: Fused Raw-Block Geometry Pullback
+
+Status: implemented initial internal path and wired into the optimization smoke script.
+
+Concatenate VMEC-state/payload cotangents from geometry objectives and transport Er-root objectives, then run one batched raw-block transpose for all geometry columns.
+
+Initial internal pieces:
+
+- `geometry_raw_block_transpose_from_state_bars(...)`
+- `geometry_payload_pullback_from_param_vector_raw_block_transpose(..., return_state_bars=True)`
+- `fused_geometry_parameter_matrix_from_cotangent_tables(...)`
+
+These are opt-in and not wired into benchmark-good runs yet.
+
+The optimization-facing script now calls:
+
+```python
+evaluate_geometry_initial_er_root_only_least_squares_fused(...)
+```
+
+instead of manually constructing separate geometry and transport backends.
+This keeps raw-block solve, realtime geometry/NTX payload construction,
+cotangent collection, and final fused geometry pullback inside NEOPAX internals.
+
+Current script status:
+
+- `examples/optimization/optimize_geometry_qi_max_er_initial_root.py` is now a thin smoke/evaluation script.
+- It still owns TOML/config preparation, term declaration, parameter selection, and output formatting.
+- It no longer owns raw-block solve construction, shared geometry/NTX payload construction, backend dictionaries, or separate assembled pullback calls.
+- It exposes `profile_only`, `geometry_only`, and `profiles_plus_geometry` modes, with the initial parameter vector assembled in `ReverseADParameterSet.specs` order.
+
+### Step 4: Profile Column Assembly
+
+Status: pending.
+
+Add profile-gradient columns for transport objectives and zero profile columns for geometry-only objectives.
+
+### Step 5: Thin VMEX-Like Problem Builder
+
+Status: pending.
+
+Expose an internal builder that returns a clean residual/Jacobian callable. The example script should only declare terms, parameters, input files, and optimizer settings.
+
+### Step 6: Validation Gates
+
+Status: pending.
+
+Validate:
+
+- protected root-only benchmark unchanged,
+- protected 2-step transport reverse smoke unchanged,
+- geometry objective table unchanged,
+- mixed one-harmonic `QI + Er`,
+- mixed full geometry terms plus Er,
+- profile-only and profiles-plus-geometry modes,
+- packed/all-harmonic geometry parameterization.
+
+## Implementation Notes
+
+The current optimization script is a debugging scaffold and is too plumbing-heavy. Its raw-block solve and payload construction should move into NEOPAX internals.
+
+The long-term script should be thin and VMEX-like. It should not manually wire:
+
+- `shared_raw_block_solve`,
+- `shared_geometry_payload`,
+- backend dictionaries,
+- root-only reverse tables,
+- payload pullback internals.
+
+Those belong in the internal optimization problem builder.
