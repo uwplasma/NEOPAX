@@ -3662,6 +3662,7 @@ def _build_neopax_geometry_from_state(
     n_r: int,
     requested_sample_rho=None,
     boozer_surface_sampling=None,
+    booz_constants_grids=None,
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
@@ -3794,7 +3795,10 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    if booz_constants_grids is None:
+        booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    else:
+        booz_constants, booz_grids = booz_constants_grids
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=booz_constants,
@@ -4791,6 +4795,17 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         context.static,
         geometry_requested_sample_rho,
     )
+    geometry_boozer_inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    geometry_booz_constants_grids = _booz_constants_and_grids_for_inputs(
+        context,
+        geometry_boozer_inputs,
+    )
 
     def geometry_from_state(state_inner):
         return _build_neopax_geometry_from_state(
@@ -4799,6 +4814,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             n_r=n_r,
             requested_sample_rho=geometry_requested_sample_rho,
             boozer_surface_sampling=geometry_boozer_surface_sampling,
+            booz_constants_grids=geometry_booz_constants_grids,
         )
 
     def ntx_support_from_state(state_inner):
