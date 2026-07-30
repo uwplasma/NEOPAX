@@ -328,6 +328,7 @@ Current script status:
 - It still owns TOML/config preparation, term declaration, parameter selection, and output formatting.
 - It no longer owns raw-block solve construction, shared geometry/NTX payload construction, backend dictionaries, or separate assembled pullback calls.
 - It exposes `profile_only`, `geometry_only`, and `profiles_plus_geometry` modes, with the initial parameter vector assembled in `ReverseADParameterSet.specs` order.
+- The fused evaluator converts transport initial-Er payload cotangents to VMEC-state bars before building the geometry QI/Boozer cotangent table. This keeps the final raw-block transpose fused while avoiding overlap between the transport payload VJP and the heavier geometry objective graph.
 
 ### Step 4: Profile Column Assembly
 

@@ -1522,23 +1522,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
 
     cotangent_tables_by_family: dict[ObjectiveFamily, ObjectiveCotangentTable] = {}
     geometry_cotangent_tables: list[ObjectiveCotangentTable] = []
-    if "geometry" in grouped_terms:
-        if shared_payload is None:
-            raise ValueError("Geometry terms require shared VMEC payload data.")
-        geometry_table = geometry_full_ad_objective_cotangent_table(
-            context=geometry_context,
-            parameter_set=parameter_set,
-            objective_names=_unique_objective_names(grouped_terms["geometry"]),
-            parameter_values=parameter_values_arr,
-            shared_payload=shared_payload,
-            lane=geometry_lane,
-            max_iter=geometry_max_iter,
-            step_size=geometry_step_size,
-            solver_device=geometry_solver_device,
-        )
-        cotangent_tables_by_family["geometry"] = geometry_table
-        geometry_cotangent_tables.append(geometry_table)
-
     if "transport" in grouped_terms:
         active_profile_values = _active_profile_values_from_parameter_vector(
             parameter_set,
@@ -1559,7 +1542,47 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
         )
         cotangent_tables_by_family["transport"] = transport_table
         if shared_payload is not None:
+            payload_state_bar = geometry_payload_pullback_from_param_vector_raw_block_transpose(
+                geometry_context,
+                shared_payload.vmec_parameter_values,
+                tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
+                transport_table.payload_bars,
+                combined_payload=True,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                raw_block_solve=shared_payload.raw_block_solve,
+                return_state_bars=True,
+            )
+            payload_state_bar = jax.block_until_ready(payload_state_bar)
+            transport_table = dataclasses.replace(
+                transport_table,
+                vmec_state_bars=payload_state_bar,
+                payload_bars=(),
+            )
+            cotangent_tables_by_family["transport"] = transport_table
             geometry_cotangent_tables.append(transport_table)
+
+    if "geometry" in grouped_terms:
+        if shared_payload is None:
+            raise ValueError("Geometry terms require shared VMEC payload data.")
+        geometry_table = geometry_full_ad_objective_cotangent_table(
+            context=geometry_context,
+            parameter_set=parameter_set,
+            objective_names=_unique_objective_names(grouped_terms["geometry"]),
+            parameter_values=parameter_values_arr,
+            shared_payload=shared_payload,
+            lane=geometry_lane,
+            max_iter=geometry_max_iter,
+            step_size=geometry_step_size,
+            solver_device=geometry_solver_device,
+        )
+        cotangent_tables_by_family["geometry"] = geometry_table
+        geometry_cotangent_tables.append(geometry_table)
 
     geometry_gradient_by_table_id: dict[int, object] = {}
     if geometry_cotangent_tables:
