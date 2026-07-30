@@ -4846,6 +4846,30 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             surface_backend=str(surface_backend),
         )
 
+    def _batched_bar_tangent_contract(batched_bars, tangent_leaves):
+        total = None
+        for bars, tangent in zip(batched_bars, tangent_leaves, strict=True):
+            bars_arr = jnp.asarray(bars)
+            tangent_arr = jnp.asarray(tangent, dtype=bars_arr.dtype)
+            rows = int(bars_arr.shape[0])
+            contribution = jnp.reshape(bars_arr, (rows, -1)) @ jnp.ravel(tangent_arr)
+            total = contribution if total is None else total + contribution
+        if total is None:
+            return jnp.zeros((len(payload_bars),), dtype=jnp.float64)
+        return total
+
+    def _implicit_param_tangent_batch():
+        zero_params = jax.tree_util.tree_map(jnp.zeros_like, implicit_params)
+        tangents = []
+        for entry in param_entries:
+            field_name = entry["input_field"]
+            base = getattr(zero_params, field_name)
+            updates = {
+                field_name: base.at[int(entry["n_offset"]), int(entry["m_index"])].set(1.0)
+            }
+            tangents.append(dataclasses.replace(zero_params, **updates))
+        return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *tangents)
+
     def _payload_branch_pullback_setup(branch_name, payload_fn, branch_bars):
         payload_template = branch_bars[0]
         payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
@@ -4892,6 +4916,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             return {
                 "active": False,
                 "single_state_bar": lambda _objective_i: zero_like_state,
+                "tangent_contraction": lambda _state_tangent: jnp.zeros((len(payload_bars),), dtype=jnp.float64),
             }
 
         active_leaf_paths = tuple(
@@ -4946,11 +4971,6 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                         out.append(jnp.asarray(center_prepared_leaves[local_i]))
                 return tuple(out)
 
-            _compact_baseline, compact_pullback = jax.vjp(
-                compact_support_float_leaves_from_state,
-                state,
-            )
-            del _compact_baseline
             batched_compact_bars = tuple(
                 jnp.stack(
                     [
@@ -4964,13 +4984,32 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 )
                 for _kind, leaf_i, _local_i in compact_specs
             )
+            compact_pullback_cache = []
+
+            def _compact_pullback():
+                if not compact_pullback_cache:
+                    _compact_baseline, compact_pullback = jax.vjp(
+                        compact_support_float_leaves_from_state,
+                        state,
+                    )
+                    del _compact_baseline
+                    compact_pullback_cache.append(compact_pullback)
+                return compact_pullback_cache[0]
 
             def _single_state_bar(objective_i):
                 compact_bar_leaves = tuple(
                     jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
                     for leaf in batched_compact_bars
                 )
-                return compact_pullback(tuple(compact_bar_leaves))[0]
+                return _compact_pullback()(tuple(compact_bar_leaves))[0]
+
+            def _tangent_contraction(state_tangent):
+                _, tangent_leaves = jax.jvp(
+                    compact_support_float_leaves_from_state,
+                    (state,),
+                    (state_tangent,),
+                )
+                return _batched_bar_tangent_contract(batched_compact_bars, tangent_leaves)
 
             if progress_label is not None:
                 print(
@@ -4980,23 +5019,17 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             return {
                 "active": True,
                 "single_state_bar": _single_state_bar,
+                "tangent_contraction": _tangent_contraction,
             }
 
         compact_setup = _compact_initial_er_setup()
         if compact_setup is not None:
             return compact_setup
 
-        remat_payload_fn = jax.checkpoint(payload_fn)
-
         def payload_float_leaves_from_state(state_inner):
-            leaves = jax.tree_util.tree_leaves(remat_payload_fn(state_inner))
+            leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
             return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in active_float_leaf_indices)
 
-        _payload_float_baseline, payload_float_pullback = jax.vjp(
-            payload_float_leaves_from_state,
-            state,
-        )
-        del _payload_float_baseline
         batched_payload_float_bars = tuple(
             jnp.stack(
                 [
@@ -5010,22 +5043,37 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
             for leaf_i in active_float_leaf_indices
         )
-        if progress_label is not None:
-            print(
-                f"{progress_label} {branch_name}_generic_payload_remat=True",
-                flush=True,
-            )
+        payload_float_pullback_cache = []
+
+        def _payload_float_pullback():
+            if not payload_float_pullback_cache:
+                _payload_float_baseline, payload_float_pullback = jax.vjp(
+                    payload_float_leaves_from_state,
+                    state,
+                )
+                del _payload_float_baseline
+                payload_float_pullback_cache.append(payload_float_pullback)
+            return payload_float_pullback_cache[0]
 
         def _single_state_bar(objective_i):
             payload_bar_leaves = tuple(
                 jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
                 for leaf in batched_payload_float_bars
             )
-            return payload_float_pullback(tuple(payload_bar_leaves))[0]
+            return _payload_float_pullback()(tuple(payload_bar_leaves))[0]
+
+        def _tangent_contraction(state_tangent):
+            _, tangent_leaves = jax.jvp(
+                payload_float_leaves_from_state,
+                (state,),
+                (state_tangent,),
+            )
+            return _batched_bar_tangent_contract(batched_payload_float_bars, tangent_leaves)
 
         return {
             "active": True,
             "single_state_bar": _single_state_bar,
+            "tangent_contraction": _tangent_contraction,
         }
 
     def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
@@ -5124,55 +5172,50 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
         return state_bar_batch
 
-    def _try_compact_payload_batch_to_param_matrix():
+    def _try_compact_payload_tangent_contract_to_param_matrix():
         if (
             not combined_payload
             or return_branch_gradients
             or return_state_bars
             or extra_state_bars is not None
             or extra_state_bars_factory is not None
+            or not hasattr(implicit, "implicit_state_tangent_raw_block")
         ):
             return None
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
         support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
         geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
         support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
-        row_count = len(payload_bars)
+        if not param_entries:
+            return jnp.zeros((len(payload_bars), 0), dtype=jnp.float64)
+        param_tangent_batch = _implicit_param_tangent_batch()
 
-        def _single_state_bar_row(objective_i):
-            geometry_state_bar = geometry_setup["single_state_bar"](objective_i)
-            support_state_bar = support_setup["single_state_bar"](objective_i)
-            return jax.tree_util.tree_map(
-                lambda geometry_leaf, support_leaf: geometry_leaf + support_leaf,
-                geometry_state_bar,
-                support_state_bar,
+        def _single_gradient_column(param_tangent):
+            state_tangent = implicit.implicit_state_tangent_raw_block(
+                implicit_params,
+                implicit_cfg,
+                state,
+                dof_mask,
+                param_tangent,
+                probe_chunk_size=1,
+            )
+            return (
+                geometry_setup["tangent_contraction"](state_tangent)
+                + support_setup["tangent_contraction"](state_tangent)
             )
 
-        state_bar_rows = tuple(_single_state_bar_row(i) for i in range(row_count))
-        state_bar_batch = jax.tree_util.tree_map(
-            lambda *leaves: jnp.stack(leaves, axis=0),
-            *state_bar_rows,
-        )
-        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
-            state_bar_batch,
-            probe_chunk_size=1,
-        )
-        gradient_matrix_value = _param_vector_gradient_from_implicit_param_grads(
-            param_bar_batch,
-            param_entries,
+        gradient_columns = jax.lax.map(
+            _single_gradient_column,
+            param_tangent_batch,
         )
         if progress_label is not None:
             print(
-                f"{progress_label} compact_payload_batch_to_raw_block=True",
+                f"{progress_label} compact_payload_tangent_contract=True",
                 flush=True,
             )
-        return gradient_matrix_value
+        return jnp.swapaxes(gradient_columns, 0, 1)
 
-    streamed_gradient_matrix = _try_compact_payload_batch_to_param_matrix()
+    streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
     if streamed_gradient_matrix is not None:
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
