@@ -3661,6 +3661,7 @@ def _build_neopax_geometry_from_state(
     *,
     n_r: int,
     requested_sample_rho=None,
+    boozer_surface_sampling=None,
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
@@ -3767,6 +3768,10 @@ def _build_neopax_geometry_from_state(
     # B0(r_grid) use a frozen-like local slope.
     if requested_sample_rho is None:
         requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
+    if boozer_surface_sampling is None:
+        surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
+    else:
+        surface_indices, sample_rho = boozer_surface_sampling
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -3789,7 +3794,6 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
     booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
@@ -4783,6 +4787,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
     geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
+    geometry_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static,
+        geometry_requested_sample_rho,
+    )
 
     def geometry_from_state(state_inner):
         return _build_neopax_geometry_from_state(
@@ -4790,6 +4798,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             state_inner,
             n_r=n_r,
             requested_sample_rho=geometry_requested_sample_rho,
+            boozer_surface_sampling=geometry_boozer_surface_sampling,
         )
 
     def ntx_support_from_state(state_inner):
