@@ -1489,20 +1489,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
     parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
     t_start = time.perf_counter()
     shared_payload = None
-    if parameter_set.vmec_boundary_specs:
-        shared_payload = build_shared_geometry_transport_payload(
-            geometry_context=geometry_context,
-            parameter_set=parameter_set,
-            parameter_values=parameter_values_arr,
-            runtime=runtime,
-            n_r=int(n_r),
-            n_theta=int(n_theta),
-            n_zeta=int(n_zeta),
-            n_xi=int(n_xi),
-            surface_backend=str(surface_backend),
-            max_iter=geometry_max_iter,
-            solver_device=geometry_solver_device,
-        )
 
     cotangent_tables_by_family: dict[ObjectiveFamily, ObjectiveCotangentTable] = {}
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
@@ -1513,7 +1499,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             parameter_values_arr,
             baseline_profile_values,
         )
-        if shared_payload is None:
+        if not parameter_set.vmec_boundary_specs:
             transport_table = initial_er_root_only_objective_cotangent_table(
                 config=config,
                 objective_names=_unique_objective_names(grouped_terms["transport"]),
@@ -1525,6 +1511,10 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             )
             cotangent_tables_by_family["transport"] = transport_table
         else:
+            vmec_parameter_values = vmec_parameter_values_from_parameter_vector(
+                parameter_set,
+                parameter_values_arr,
+            )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
                 objective_names=_unique_objective_names(grouped_terms["transport"]),
@@ -1534,7 +1524,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
                 geometry_context=geometry_context,
-                baseline_geometry_deltas=shared_payload.vmec_parameter_values,
+                baseline_geometry_deltas=vmec_parameter_values,
                 n_r=int(n_r),
                 n_theta=int(n_theta),
                 n_zeta=int(n_zeta),
@@ -1542,7 +1532,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 surface_backend=str(surface_backend),
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
-                raw_block_solve=shared_payload.raw_block_solve,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
@@ -1554,6 +1543,20 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             )
 
     if "geometry" in grouped_terms:
+        if shared_payload is None and parameter_set.vmec_boundary_specs:
+            shared_payload = build_shared_geometry_transport_payload(
+                geometry_context=geometry_context,
+                parameter_set=parameter_set,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+            )
         if shared_payload is None:
             raise ValueError("Geometry terms require shared VMEC payload data.")
         geometry_table = geometry_full_ad_objective_cotangent_table(

@@ -329,7 +329,8 @@ Current script status:
 - It no longer owns raw-block solve construction, shared geometry/NTX payload construction, backend dictionaries, or separate assembled pullback calls.
 - It exposes `profile_only`, `geometry_only`, and `profiles_plus_geometry` modes, with the initial parameter vector assembled in `ReverseADParameterSet.specs` order.
 - The shared optimization object intentionally retains only the VMEC raw-block solve, not a full geometry/NTX payload.
-- The attempted transport payload-to-VMEC-state-bar shortcut OOMed for the mixed optimization run. The active optimization path therefore routes transport initial-Er geometry derivatives through the benchmark-compatible `geometry_active_initial_er_root_only_reverse_table(...)` path, while still reusing the shared VMEC raw-block solve. This preserves the validated root-only behavior instead of forcing a lower-level state-bar fusion that has not fit in memory.
+- The attempted transport payload-to-VMEC-state-bar shortcut OOMed for the mixed optimization run.
+- Passing a retained shared VMEC raw-block solve into the transport root-only pullback also OOMed. The active optimization path therefore routes transport initial-Er geometry derivatives through the benchmark-compatible `geometry_active_initial_er_root_only_reverse_table(...)` ownership model without passing a pre-existing raw-block solve. Geometry objectives build their raw-block solve afterward. This may duplicate the VMEC solve for now, but it preserves the validated root-only behavior and avoids the memory overlap.
 
 ### Step 4: Profile Column Assembly
 
