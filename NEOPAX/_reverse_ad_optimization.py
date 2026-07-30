@@ -1599,31 +1599,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
             )
-            (
-                transport_state_bars,
-                transport_raw_block_solve,
-            ) = geometry_payload_pullback_from_param_vector_raw_block_transpose(
-                geometry_context,
-                vmec_parameter_values,
-                tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
-                transport_table_full.payload_bars,
-                combined_payload=True,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
-                max_iter=geometry_max_iter,
-                solver_device=geometry_solver_device,
-                return_state_bars=True,
-                return_raw_block_solve=True,
-            )
-            transport_state_bars = jax.block_until_ready(transport_state_bars)
-            shared_payload = SharedGeometryTransportPayload(
-                raw_block_solve=transport_raw_block_solve,
-                vmec_parameter_values=vmec_parameter_values,
-                vmec_specs=tuple(parameter_set.vmec_boundary_specs),
-            )
             source_profile_lookup = {
                 spec.name: i for i, spec in enumerate(transport_parameter_set.profile_specs)
             }
@@ -1643,8 +1618,8 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 objective_names=transport_table_full.objective_names,
                 values=transport_table_full.values,
                 profile_gradient_matrix=target_profile_gradient_matrix,
-                vmec_state_bars=transport_state_bars,
-                payload_bars=(),
+                vmec_state_bars=None,
+                payload_bars=transport_table_full.payload_bars,
             )
             cotangent_tables_by_family["transport"] = transport_table
             geometry_cotangent_tables.append(transport_table)
