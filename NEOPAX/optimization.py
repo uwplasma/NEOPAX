@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 import time
 from collections.abc import Sequence
 from typing import Callable
@@ -16,22 +17,30 @@ from ._geometry_autodiff import (
     boundary_param_entries,
     build_geometry_autodiff_context,
 )
+from ._orchestrator import build_runtime_context
 from ._reverse_ad_optimization import (
     LeastSquaresEvaluation,
     LeastSquaresResult,
     LeastSquaresTerm,
     ObjectiveTableResult,
     ObjectiveRef,
+    evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     geometry,
     geometry_full_ad_reverse_table,
     scale_least_squares_evaluation_columns,
+    transport,
 )
 from ._reverse_ad_parameters import (
+    PROFILE_PARAMETER_ORDER,
+    ProfileParameterSpec,
     VmexBoundaryParameterization,
+    parse_profile_parameter_specs,
     parse_vmec_boundary_parameter_specs,
     reverse_ad_optimization_parameter_set,
     vmex_boundary_parameterization,
 )
+from ._reverse_ad_transport import initial_state_for_parameter_vector
+from .api import prepare_config
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -155,6 +164,156 @@ class GeometryLeastSquaresProblem:
         return _input_with_boundary_deltas(self.context, physical_values, entries)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryInitialErRootLeastSquaresProblem:
+    """Geometry objectives plus initial-Er root-only transport objectives.
+
+    This optimization-facing wrapper intentionally composes the benchmark-
+    validated internal reverse tables. It does not route through the experimental
+    fused payload path that caused the mixed-script OOMs.
+    """
+
+    config: dict
+    context: object
+    runtime: object
+    baseline_state: object
+    baseline_profile_values: object
+    parameter_set: object
+    geometry_parameterization: VmexBoundaryParameterization | None
+    profile_specs: tuple[ProfileParameterSpec, ...]
+    terms: tuple[LeastSquaresTerm, ...]
+    n_r: int
+    n_theta: int
+    n_zeta: int
+    n_xi: int
+    surface_backend: str = "vmec"
+    geometry_lane: str = "ad"
+    geometry_max_iter: int | None = None
+    geometry_step_size: float | None = None
+    geometry_solver_device: str | None = "default"
+
+    @property
+    def parameter_count(self) -> int:
+        return len(self.parameter_set.specs)
+
+    @property
+    def parameter_labels(self) -> tuple[str, ...]:
+        return self.parameter_set.labels
+
+    @property
+    def x0(self):
+        values = []
+        profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        for spec in self.parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                values.append(self.baseline_profile_values[profile_lookup[spec.name]])
+            else:
+                values.append(jnp.asarray(0.0, dtype=jnp.float64))
+        return jnp.asarray(values, dtype=jnp.float64)
+
+    @property
+    def x_scale(self):
+        geometry_scales = {}
+        if self.geometry_parameterization is not None:
+            geometry_scales = {
+                spec: scale
+                for spec, scale in zip(
+                    self.geometry_parameterization.specs,
+                    self.geometry_parameterization.scales,
+                    strict=True,
+                )
+            }
+        scales = []
+        for spec in self.parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                scales.append(1.0)
+            else:
+                scales.append(float(geometry_scales.get(spec, 1.0)))
+        return jnp.asarray(scales, dtype=jnp.float64)
+
+    def _scaled_to_physical(self, scaled_parameter_values):
+        scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
+        if tuple(scaled_values.shape) != (self.parameter_count,):
+            raise ValueError(
+                "scaled_parameter_values must have shape "
+                f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
+            )
+        physical_values = []
+        scale = self.x_scale
+        for i, spec in enumerate(self.parameter_set.specs):
+            if isinstance(spec, ProfileParameterSpec):
+                physical_values.append(scaled_values[i])
+            else:
+                physical_values.append(scaled_values[i] * scale[i])
+        return jnp.asarray(physical_values, dtype=jnp.float64)
+
+    def _pre_root_state_from_profile_values(self, profile_values):
+        return initial_state_for_parameter_vector(
+            profile_values,
+            config=self.config,
+            initial_er_root_ad="off",
+            baseline_state=self.baseline_state,
+            profile_cfg=self.config.get("profiles", {}),
+            runtime=self.runtime,
+        )
+
+    def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
+        """Evaluate residuals/Jacobian with respect to scaled optimizer variables."""
+
+        if scaled_parameter_values is None:
+            scaled_values = self.x0
+        else:
+            scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
+        physical_values = self._scaled_to_physical(scaled_values)
+        evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+            self.config,
+            parameter_set=self.parameter_set,
+            parameter_values=physical_values,
+            terms=self.terms,
+            geometry_context=self.context,
+            runtime=self.runtime,
+            baseline_profile_values=self.baseline_profile_values,
+            pre_root_state_from_profile_values=self._pre_root_state_from_profile_values,
+            n_r=self.n_r,
+            n_theta=self.n_theta,
+            n_zeta=self.n_zeta,
+            n_xi=self.n_xi,
+            surface_backend=self.surface_backend,
+            geometry_lane=self.geometry_lane,
+            geometry_max_iter=self.geometry_max_iter,
+            geometry_step_size=self.geometry_step_size,
+            geometry_solver_device=self.geometry_solver_device,
+        )
+        return scale_least_squares_evaluation_columns(evaluation, self.x_scale)
+
+    def residuals(self, scaled_parameter_values=None) -> np.ndarray:
+        return np.asarray(jax.device_get(self.evaluate(scaled_parameter_values).residuals), dtype=float)
+
+    def jacobian(self, scaled_parameter_values=None) -> np.ndarray:
+        return np.asarray(jax.device_get(self.evaluate(scaled_parameter_values).jacobian), dtype=float)
+
+    def input_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return a VMEX input object with the current scaled boundary deltas applied."""
+
+        if self.geometry_parameterization is None:
+            raise ValueError("This problem has no geometry parameterization.")
+        scaled_values = self.x0 if scaled_parameter_values is None else jnp.asarray(
+            scaled_parameter_values,
+            dtype=jnp.float64,
+        )
+        physical_values = self._scaled_to_physical(scaled_values)
+        geometry_values = jnp.asarray(
+            [
+                physical_values[i]
+                for i, spec in enumerate(self.parameter_set.specs)
+                if not isinstance(spec, ProfileParameterSpec)
+            ],
+            dtype=jnp.float64,
+        )
+        entries = boundary_param_entries(self.context, self.geometry_parameterization.vmec_tuples)
+        return _input_with_boundary_deltas(self.context, geometry_values, entries)
+
+
 def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
     """Return a named geometry objective reference."""
 
@@ -163,6 +322,16 @@ def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
             raise ValueError(f"Expected a geometry ObjectiveRef, got {name.family!r}.")
         return name
     return ObjectiveRef("geometry", str(name))
+
+
+def transport_objective(name: str | ObjectiveRef) -> ObjectiveRef:
+    """Return a named transport objective reference."""
+
+    if isinstance(name, ObjectiveRef):
+        if name.family != "transport":
+            raise ValueError(f"Expected a transport ObjectiveRef, got {name.family!r}.")
+        return name
+    return ObjectiveRef("transport", str(name))
 
 
 def transformed_geometry_objective(
@@ -236,6 +405,73 @@ def _normalize_geometry_least_squares_terms(
     for term in normalized:
         if term.weight < 0.0:
             raise ValueError(f"Geometry least-squares weights must be non-negative; got {term.weight}.")
+    return tuple(normalized)
+
+
+def _normalize_initial_er_root_least_squares_terms(
+    terms: Sequence[
+        GeometryLeastSquaresTerm | LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]
+    ],
+) -> tuple[LeastSquaresTerm, ...]:
+    normalized: list[LeastSquaresTerm] = []
+    for term in terms:
+        if isinstance(term, GeometryLeastSquaresTerm):
+            if term.value_fn is not None or term.derivative_fn is not None:
+                raise NotImplementedError(
+                    "Transformed geometry terms are supported by geometry_least_squares_problem, "
+                    "but not yet by the mixed geometry + initial-Er root optimizer. "
+                    "Use the base geometry objective row in mixed optimization for now."
+                )
+            normalized.append(
+                LeastSquaresTerm(
+                    objective=term.objective,
+                    target=term.target,
+                    weight=term.weight,
+                    label=term.label,
+                )
+            )
+            continue
+        if isinstance(term, LeastSquaresTerm):
+            if term.objective.family not in {"geometry", "transport"}:
+                raise ValueError(
+                    "Initial-Er root optimization supports only geometry and transport terms; "
+                    f"got {term.objective.family!r}."
+                )
+            normalized.append(term)
+            continue
+        if not isinstance(term, tuple) or len(term) != 3:
+            raise TypeError(
+                "Mixed geometry/initial-Er terms must be LeastSquaresTerm instances "
+                "or (objective, target, weight) tuples."
+            )
+        objective, target, weight = term
+        if isinstance(objective, GeometryObjectiveTransform):
+            raise NotImplementedError(
+                "Transformed geometry terms are supported by geometry_least_squares_problem, "
+                "but not yet by the mixed geometry + initial-Er root optimizer. "
+                "Use the base geometry objective row in mixed optimization for now."
+            )
+        if isinstance(objective, ObjectiveRef):
+            objective_ref = objective
+        else:
+            objective_ref = geometry_objective(objective)
+        if objective_ref.family not in {"geometry", "transport"}:
+            raise ValueError(
+                "Initial-Er root optimization supports only geometry and transport terms; "
+                f"got {objective_ref.family!r}."
+            )
+        normalized.append(
+            LeastSquaresTerm(
+                objective=objective_ref,
+                target=float(target),
+                weight=float(weight),
+            )
+        )
+    if not normalized:
+        raise ValueError("At least one least-squares term is required.")
+    for term in normalized:
+        if term.weight < 0.0:
+            raise ValueError(f"Least-squares weights must be non-negative; got {term.weight}.")
     return tuple(normalized)
 
 
@@ -352,6 +588,148 @@ def geometry_least_squares_problem(
     )
 
 
+def _prepare_initial_er_root_config(config_path, *, device: str | None, vmec_input) -> dict:
+    config = prepare_config(config_path, device=device)
+    config = copy.deepcopy(config)
+    config.setdefault("general", {})["mode"] = "transport"
+    transport_output = config.setdefault("transport_output", {})
+    transport_output["transport_plot"] = False
+    transport_output["transport_write_hdf5"] = False
+    transport_output["transport_compare_ambipolarity_residual"] = False
+    transport_output["transport_scan_ambipolarity_residual"] = False
+    solver_cfg = config.setdefault("transport_solver", {})
+    solver_cfg["debug_stage_markers"] = False
+    solver_cfg["debug_disable_jit"] = False
+    solver_cfg["debug_walltime_attempts"] = False
+    config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = "direct"
+    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "generic_jvp"
+    if vmec_input is not None:
+        config.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
+    return config
+
+
+def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
+    profiles = config.get("profiles", {})
+    values = []
+    for name in PROFILE_PARAMETER_ORDER:
+        raw = profiles[name]
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0]
+        values.append(float(raw))
+    return jnp.asarray(values, dtype=dtype)
+
+
+def geometry_initial_er_root_only_least_squares_problem(
+    config,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    *,
+    vmec_input=None,
+    max_mode: int | None = None,
+    parameters: str | Sequence[str] | None = None,
+    include_profiles: bool = False,
+    profile_parameters: str | Sequence[str] | None = "n0,T0,density_shape_power,temperature_shape_power",
+    families: str | Sequence[str] | None = "RBC,ZBS",
+    scale_mode: str = "ess",
+    ess_alpha: float = 1.0,
+    mboz: int = 18,
+    nboz: int = 18,
+    surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
+    n_r: int | None = None,
+    n_theta: int | None = None,
+    n_zeta: int | None = None,
+    n_xi: int | None = None,
+    surface_backend: str | None = None,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_solver_device: str | None = "default",
+    device: str | None = "default",
+) -> GeometryInitialErRootLeastSquaresProblem:
+    """Build an optimizer problem for geometry terms plus initial-Er root terms.
+
+    The returned problem is intentionally thin and script-friendly: users define
+    least-squares terms in the optimization script, while this helper owns the
+    transport runtime setup and validated reverse-table calls.
+    """
+
+    config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
+    geom_cfg = config_eff.get("geometry", {})
+    neoclassical_cfg = config_eff.get("neoclassical", {})
+    vmec_input_eff = geom_cfg.get("vmec_input_file")
+    if vmec_input_eff is None:
+        raise ValueError("geometry.vmec_input_file is required.")
+    context = build_geometry_autodiff_context(
+        vmec_input_eff,
+        param_family="RBC",
+        param_m=1,
+        param_n=0,
+        mboz=int(mboz),
+        nboz=int(nboz),
+        surface_s=tuple(float(s) for s in surfaces),
+    )
+    if parameters is not None:
+        specs = parse_vmec_boundary_parameter_specs(
+            ",".join(parameters) if not isinstance(parameters, str) else parameters
+        )
+        geometry_parameterization = VmexBoundaryParameterization(
+            specs=specs,
+            scales=tuple(1.0 for _ in specs),
+            scale_mode="unit",
+        )
+    else:
+        if max_mode is None:
+            raise ValueError("Either max_mode or explicit geometry parameters must be provided.")
+        geometry_parameterization = vmex_boundary_parameterization(
+            context,
+            max_mode=int(max_mode),
+            families=families,
+            scale_mode=scale_mode,
+            ess_alpha=float(ess_alpha),
+        )
+    profile_specs = (
+        parse_profile_parameter_specs(profile_parameters)
+        if include_profiles
+        else ()
+    )
+    parameter_set = reverse_ad_optimization_parameter_set(
+        include_profiles=bool(profile_specs),
+        profiles=tuple(spec.name for spec in profile_specs) if profile_specs else None,
+        vmec_boundary=geometry_parameterization.specs,
+    )
+    runtime, baseline_state = build_runtime_context(config_eff)
+    if baseline_state is None:
+        raise RuntimeError("transport runtime did not return an initial state.")
+    baseline_profile_values = _profile_values_from_config(
+        config_eff,
+        jnp.asarray(baseline_state.pressure).dtype,
+    )
+    if geometry_max_iter is None:
+        geometry_max_iter = geom_cfg.get("vmec_max_iter")
+    if geometry_solver_device is None:
+        geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
+    normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    return GeometryInitialErRootLeastSquaresProblem(
+        config=config_eff,
+        context=context,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        baseline_profile_values=baseline_profile_values,
+        parameter_set=parameter_set,
+        geometry_parameterization=geometry_parameterization,
+        profile_specs=profile_specs,
+        terms=normalized_terms,
+        n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+        n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+        n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+        n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+        surface_backend=str(surface_backend if surface_backend is not None else neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+        geometry_lane=geometry_lane,
+        geometry_max_iter=geometry_max_iter,
+        geometry_step_size=geometry_step_size,
+        geometry_solver_device=geometry_solver_device,
+    )
+
+
 def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
     """Run SciPy least_squares on a NEOPAX geometry least-squares problem."""
 
@@ -422,10 +800,14 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
 __all__ = [
     "GeometryLeastSquaresTerm",
     "GeometryObjectiveTransform",
+    "GeometryInitialErRootLeastSquaresProblem",
     "GeometryLeastSquaresProblem",
     "geometry",
     "geometry_objective",
+    "geometry_initial_er_root_only_least_squares_problem",
     "geometry_least_squares_problem",
     "least_squares",
     "transformed_geometry_objective",
+    "transport",
+    "transport_objective",
 ]

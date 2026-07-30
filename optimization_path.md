@@ -440,3 +440,64 @@ Next debugging steps:
   - optionally a compact raw-block solve/state-bar interface for appending geometry rows,
   without forcing the NTX support VJP to coexist with geometry objective data.
 - If one final raw-block transpose cannot be made memory-safe, the fallback should be an explicit optimization option that uses benchmark-table behavior for transport/root and geometry separately. That fallback is correct and benchmark-equivalent but not fully fused, so it should be a deliberate mode, not hidden as the default fused path.
+
+## Current State: 2026-07-30 Working Baseline Recovery
+
+What worked:
+
+- `examples/optimization/optimize_geometry_qi_only.py` is now the working VMEX-like geometry-only optimizer shape.
+- It calls `NEOPAX.optimization.geometry_least_squares_problem(...)`.
+- That public wrapper calls the internal `geometry_full_ad_reverse_table(...)`, the same geometry objective reverse table validated by the frozen-linearized FD/JVP benchmarks.
+- The geometry-only script keeps user-facing objective terms in the script and avoids benchmark imports or raw-block plumbing.
+
+What was going wrong:
+
+- `examples/optimization/optimize_geometry_qi_max_er_initial_root.py` had become a CLI-heavy diagnostic script.
+- Its mixed `QI + initial-Er root` path called the experimental fused payload evaluator:
+
+```text
+evaluate_geometry_initial_er_root_only_least_squares_fused(...)
+-> geometry_payload_pullback_from_param_vector_raw_block_transpose(...)
+-> _state_bar_batch_from_payload_branch("ntx_support", ...)
+```
+
+- That path OOMed before the geometry objective table could help, so the immediate issue was not QI/maxJ itself. It was the transport/root payload-to-VMEC support VJP being entered with the wrong optimization graph shape.
+- The benchmark-good initial-Er root-only path still worked because it goes through the compact benchmark-validated table assembly path:
+
+```text
+geometry_active_initial_er_root_only_reverse_table(...)
+-> realtime_geometry_transport_reverse_table_from_payload_cotangents(...)
+```
+
+What was redone now:
+
+- Added `NEOPAX.optimization.GeometryInitialErRootLeastSquaresProblem`.
+- Added `NEOPAX.optimization.geometry_initial_er_root_only_least_squares_problem(...)`.
+- This wrapper intentionally calls `evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(...)`, not the experimental fused payload evaluator.
+- Rewrote `examples/optimization/optimize_geometry_qi_max_er_initial_root.py` into the same style as the working geometry-only script:
+  - constants at the top,
+  - objective terms in the script,
+  - no benchmark imports,
+  - no direct raw-block/payload plumbing,
+  - no CLI flags.
+- Benchmark scripts were not edited.
+
+Important limitation:
+
+- This is the correct recovered baseline for optimization behavior, but it is not the final single-pullback fused implementation.
+- Mixed transformed geometry penalties are rejected for now instead of silently applying the wrong chain rule. Geometry-only transformed penalties still work through `geometry_least_squares_problem(...)`.
+- The mixed script currently uses a direct `vmec_mirror_ratio` target rather than a one-sided mirror penalty.
+
+Next implementation target:
+
+- Redo fused mixed optimization only after the recovered baseline is validated.
+- The fused version must be built from the benchmark-good table behavior, not by replacing it with a new lower-level payload VJP shape.
+- The desired future fuse is:
+
+```text
+benchmark-good transport/root compact table
++ geometry objective VMEC-state cotangents
+-> one memory-safe compact geometry raw-block transpose
+```
+
+- Until that exact graph is validated, the default optimization wrapper should remain benchmark-table based so optimization correctness and memory behavior match the trusted references.
