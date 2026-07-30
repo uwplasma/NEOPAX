@@ -4622,6 +4622,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_state_bars: bool = False,
     extra_state_bars: object | None = None,
+    extra_state_bars_factory=None,
     return_raw_block_solve: bool = False,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
@@ -4632,10 +4633,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     geometry-objective table convention.
 
     If ``return_state_bars`` is true, stop before the raw-block transpose and
-    return the assembled VMEC-state cotangent batch.  ``return_raw_block_solve``
-    additionally returns the raw-block solve owned by this compact pullback, so
-    fused callers can preserve benchmark-good payload-pullback ownership and
-    still reuse the same compact VMEC solve for the final transpose.
+    return the assembled VMEC-state cotangent batch.  ``extra_state_bars`` or
+    ``extra_state_bars_factory`` lets fused callers append already-assembled
+    VMEC-state cotangents before the same compact raw-block transpose.
     """
 
     if not payload_bars:
@@ -4837,47 +4837,53 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                     break
         return state_bar_batch_value
 
-    geometry_state_bar_batch = None
-    support_state_bar_batch = None
-    if combined_payload:
-        geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
-        support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
-        geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
-            "geometry",
-            geometry_from_state,
-            geometry_bars,
-        )
-        support_state_bar_batch = _state_bar_batch_from_payload_branch(
-            "ntx_support",
-            ntx_support_from_state,
-            support_bars,
-        )
-        state_bar_batch = jax.tree_util.tree_map(
-            lambda geometry_bar, support_bar: geometry_bar + support_bar,
-            geometry_state_bar_batch,
-            support_state_bar_batch,
-        )
-        _print_state_bar_batch_finiteness("combined", state_bar_batch)
-    else:
-        state_bar_batch = _state_bar_batch_from_payload_branch(
-            "ntx_support",
-            ntx_support_from_state,
-            tuple(payload_bars),
-        )
-        _print_state_bar_batch_finiteness("combined", state_bar_batch)
+    def _payload_raw_block_state_bar_batch():
+        geometry_state_bar_batch = None
+        support_state_bar_batch = None
+        if combined_payload:
+            geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
+            support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+            geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
+                "geometry",
+                geometry_from_state,
+                geometry_bars,
+            )
+            support_state_bar_batch = _state_bar_batch_from_payload_branch(
+                "ntx_support",
+                ntx_support_from_state,
+                support_bars,
+            )
+            state_bar_batch = jax.tree_util.tree_map(
+                lambda geometry_bar, support_bar: geometry_bar + support_bar,
+                geometry_state_bar_batch,
+                support_state_bar_batch,
+            )
+            _print_state_bar_batch_finiteness("combined", state_bar_batch)
+        else:
+            state_bar_batch = _state_bar_batch_from_payload_branch(
+                "ntx_support",
+                ntx_support_from_state,
+                tuple(payload_bars),
+            )
+            _print_state_bar_batch_finiteness("combined", state_bar_batch)
 
-    if return_branch_gradients and combined_payload:
-        raw_block_state_bar_batch = jax.tree_util.tree_map(
-            lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
-                [geometry_bar, support_bar, total_bar],
-                axis=0,
-            ),
-            geometry_state_bar_batch,
-            support_state_bar_batch,
-            state_bar_batch,
-        )
-    else:
-        raw_block_state_bar_batch = state_bar_batch
+        if return_branch_gradients and combined_payload:
+            return jax.tree_util.tree_map(
+                lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
+                    [geometry_bar, support_bar, total_bar],
+                    axis=0,
+                ),
+                geometry_state_bar_batch,
+                support_state_bar_batch,
+                state_bar_batch,
+            )
+        return state_bar_batch
+
+    raw_block_state_bar_batch = _payload_raw_block_state_bar_batch()
+
+    if extra_state_bars is None and extra_state_bars_factory is not None:
+        raw_block_state_bar_batch = jax.block_until_ready(raw_block_state_bar_batch)
+        extra_state_bars = extra_state_bars_factory(raw_block_solve)
 
     if bool(return_state_bars):
         if extra_state_bars is None:

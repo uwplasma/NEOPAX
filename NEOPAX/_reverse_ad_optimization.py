@@ -986,15 +986,17 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
     surface_backend: str = "vmec",
     max_iter: int | None = None,
     solver_device: str | None = "default",
+    extra_state_bars_factory=None,
 ) -> jnp.ndarray:
     """Fuse objective-family cotangents and pull them once to VMEC columns."""
 
     del parameter_set  # Geometry columns are ordered by shared_payload.vmec_specs.
     if not shared_payload.vmec_specs:
         raise ValueError("Fused geometry pullback requires at least one VMEC boundary parameter.")
-    state = shared_payload.raw_block_solve.state
-
     def _zero_state_bar_batch(row_count: int):
+        if shared_payload.raw_block_solve is None:
+            raise ValueError("Direct VMEC-state cotangent rows require an existing raw-block solve.")
+        state = shared_payload.raw_block_solve.state
         return jax.tree_util.tree_map(
             lambda leaf: jnp.broadcast_to(jnp.zeros_like(leaf)[None, ...], (int(row_count),) + leaf.shape),
             state,
@@ -1065,7 +1067,10 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
             solver_device=solver_device,
             raw_block_solve=shared_payload.raw_block_solve,
             extra_state_bars=extra_state_bar_batch,
+            extra_state_bars_factory=extra_state_bars_factory,
         )
+    if shared_payload.raw_block_solve is None:
+        raise ValueError("Direct VMEC-state cotangent rows require an existing raw-block solve.")
     return geometry_raw_block_transpose_from_state_bars(
         shared_payload.raw_block_solve,
         extra_state_bar_batch,
@@ -1557,6 +1562,8 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
     cotangent_tables_by_family: dict[ObjectiveFamily, ObjectiveCotangentTable] = {}
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     geometry_cotangent_tables: list[ObjectiveCotangentTable] = []
+    deferred_geometry_terms = grouped_terms.get("geometry", ())
+    deferred_geometry_table_holder: dict[str, ObjectiveCotangentTable] = {}
     if "transport" in grouped_terms:
         active_profile_values = _active_profile_values_from_parameter_vector(
             parameter_set,
@@ -1590,9 +1597,10 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 ],
                 axis=0,
             )
+            requested_transport_objectives = _unique_objective_names(grouped_terms["transport"])
             transport_table_full = initial_er_root_only_objective_cotangent_table(
                 config=config,
-                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+                objective_names=requested_transport_objectives,
                 parameter_set=transport_parameter_set,
                 parameter_values=transport_parameter_values,
                 runtime=runtime,
@@ -1623,8 +1631,13 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             )
             cotangent_tables_by_family["transport"] = transport_table
             geometry_cotangent_tables.append(transport_table)
+            shared_payload = SharedGeometryTransportPayload(
+                raw_block_solve=None,
+                vmec_parameter_values=vmec_parameter_values,
+                vmec_specs=tuple(parameter_set.vmec_boundary_specs),
+            )
 
-    if "geometry" in grouped_terms:
+    if "geometry" in grouped_terms and not geometry_cotangent_tables:
         if shared_payload is None and parameter_set.vmec_boundary_specs:
             shared_payload = build_shared_geometry_transport_payload(
                 geometry_context=geometry_context,
@@ -1659,6 +1672,27 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
     if geometry_cotangent_tables:
         if shared_payload is None:
             raise ValueError("Geometry cotangents were produced without shared VMEC payload data.")
+
+        def _deferred_geometry_state_bars(raw_block_solve):
+            geometry_shared_payload = SharedGeometryTransportPayload(
+                raw_block_solve=raw_block_solve,
+                vmec_parameter_values=shared_payload.vmec_parameter_values,
+                vmec_specs=shared_payload.vmec_specs,
+            )
+            geometry_table = geometry_full_ad_objective_cotangent_table(
+                context=geometry_context,
+                parameter_set=parameter_set,
+                objective_names=_unique_objective_names(deferred_geometry_terms),
+                parameter_values=parameter_values_arr,
+                shared_payload=geometry_shared_payload,
+                lane=geometry_lane,
+                max_iter=geometry_max_iter,
+                step_size=geometry_step_size,
+                solver_device=geometry_solver_device,
+            )
+            deferred_geometry_table_holder["geometry"] = geometry_table
+            return geometry_table.vmec_state_bars
+
         fused_geometry_matrix = fused_geometry_parameter_matrix_from_cotangent_tables(
             geometry_context=geometry_context,
             parameter_set=parameter_set,
@@ -1671,7 +1705,16 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             surface_backend=str(surface_backend),
             max_iter=geometry_max_iter,
             solver_device=geometry_solver_device,
+            extra_state_bars_factory=(
+                None
+                if not deferred_geometry_terms
+                else _deferred_geometry_state_bars
+            ),
         )
+        if "geometry" in deferred_geometry_table_holder:
+            geometry_table = deferred_geometry_table_holder["geometry"]
+            cotangent_tables_by_family["geometry"] = geometry_table
+            geometry_cotangent_tables.append(geometry_table)
         row0 = 0
         for table in geometry_cotangent_tables:
             row1 = row0 + len(table.objective_names)
