@@ -1000,7 +1000,8 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
             state,
         )
 
-    table_state_bar_batches = []
+    extra_state_bar_batches = []
+    payload_bars_for_pullback = []
     for table in tables:
         row_count = len(table.objective_names)
         values = jnp.asarray(table.values)
@@ -1028,39 +1029,46 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
                 table.vmec_state_bars,
             )
         if table.payload_bars:
-            payload_state_bar = geometry_payload_pullback_from_param_vector_raw_block_transpose(
-                geometry_context,
-                shared_payload.vmec_parameter_values,
-                tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
-                table.payload_bars,
-                combined_payload=True,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
-                max_iter=max_iter,
-                solver_device=solver_device,
-                raw_block_solve=shared_payload.raw_block_solve,
-                return_state_bars=True,
-            )
-            table_state_bar = jax.tree_util.tree_map(
-                lambda left, right: left + right,
-                table_state_bar,
-                payload_state_bar,
-            )
-        table_state_bar_batches.append(table_state_bar)
+            if table.vmec_state_bars is not None:
+                raise NotImplementedError(
+                    "Fused payload rows with additional direct VMEC-state bars are not supported yet; "
+                    "split this objective family into separate cotangent tables."
+                )
+            payload_bars_for_pullback.extend(table.payload_bars)
+        else:
+            extra_state_bar_batches.append(table_state_bar)
 
-    if not table_state_bar_batches:
+    if not payload_bars_for_pullback and not extra_state_bar_batches:
         return jnp.zeros((0, len(shared_payload.vmec_specs)), dtype=jnp.float64)
 
-    state_bar_batch = jax.tree_util.tree_map(
-        lambda *leaves: jnp.concatenate(leaves, axis=0),
-        *table_state_bar_batches,
+    extra_state_bar_batch = (
+        None
+        if not extra_state_bar_batches
+        else jax.tree_util.tree_map(
+            lambda *leaves: jnp.concatenate(leaves, axis=0),
+            *extra_state_bar_batches,
+        )
     )
+    if payload_bars_for_pullback:
+        return geometry_payload_pullback_from_param_vector_raw_block_transpose(
+            geometry_context,
+            shared_payload.vmec_parameter_values,
+            tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
+            tuple(payload_bars_for_pullback),
+            combined_payload=True,
+            n_r=int(n_r),
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+            max_iter=max_iter,
+            solver_device=solver_device,
+            raw_block_solve=shared_payload.raw_block_solve,
+            extra_state_bars=extra_state_bar_batch,
+        )
     return geometry_raw_block_transpose_from_state_bars(
         shared_payload.raw_block_solve,
-        state_bar_batch,
+        extra_state_bar_batch,
         probe_chunk_size=1,
     )
 
@@ -1582,7 +1590,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 ],
                 axis=0,
             )
-            transport_result = geometry_active_initial_er_root_only_reverse_table(
+            transport_table_full = initial_er_root_only_objective_cotangent_table(
                 config=config,
                 objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
                 parameter_set=transport_parameter_set,
@@ -1590,31 +1598,31 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 runtime=runtime,
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-                geometry_context=geometry_context,
-                baseline_geometry_deltas=vmec_parameter_values,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
-                max_iter=geometry_max_iter,
-                solver_device=geometry_solver_device,
-                progress_label="[optimization] initial-Er root geometry payload pullback:",
             )
-            transport_values, transport_jacobian = jax.block_until_ready(
-                (transport_result.values, transport_result.jacobian)
+            source_profile_lookup = {
+                spec.name: i for i, spec in enumerate(transport_parameter_set.profile_specs)
+            }
+            target_profile_gradient_columns = [
+                transport_table_full.profile_gradient_matrix[:, source_profile_lookup[spec.name]]
+                for spec in parameter_set.profile_specs
+            ]
+            target_profile_gradient_matrix = (
+                jnp.stack(target_profile_gradient_columns, axis=1)
+                if target_profile_gradient_columns
+                else jnp.zeros(
+                    (len(transport_table_full.objective_names), 0),
+                    dtype=jnp.asarray(transport_table_full.values).dtype,
+                )
             )
-            benchmark_shape_transport_result = ObjectiveTableResult(
-                objective_names=transport_result.objective_names,
-                values=transport_values,
-                jacobian=transport_jacobian,
+            transport_table = ObjectiveCotangentTable(
+                objective_names=transport_table_full.objective_names,
+                values=transport_table_full.values,
+                profile_gradient_matrix=target_profile_gradient_matrix,
+                vmec_state_bars=None,
+                payload_bars=transport_table_full.payload_bars,
             )
-            backend_results["transport"] = _adapt_objective_table_result(
-                benchmark_shape_transport_result,
-                source_parameter_set=transport_parameter_set,
-                target_parameter_set=parameter_set,
-                objective_names=_unique_objective_names(grouped_terms["transport"]),
-            )
+            cotangent_tables_by_family["transport"] = transport_table
+            geometry_cotangent_tables.append(transport_table)
 
     if "geometry" in grouped_terms:
         if shared_payload is None and parameter_set.vmec_boundary_specs:
@@ -1681,6 +1689,146 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             table,
             parameter_set=parameter_set,
             geometry_gradient_matrix=geometry_gradient_matrix,
+        )
+
+    result = assemble_least_squares_result(
+        normalized_terms,
+        parameter_set=parameter_set,
+        backend_results=backend_results,
+    )
+    residuals = jax.block_until_ready(result.residuals)
+    jacobian = jax.block_until_ready(result.jacobian)
+    elapsed_s = time.perf_counter() - t_start
+    return LeastSquaresEvaluation(
+        result=result,
+        residuals=residuals,
+        jacobian=jacobian,
+        elapsed_s=float(elapsed_s),
+    )
+
+
+def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+    config: Mapping[str, object],
+    *,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    geometry_context,
+    runtime,
+    baseline_profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str = "vmec",
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_solver_device: str | None = "default",
+) -> LeastSquaresEvaluation:
+    """Evaluate mixed objectives using only benchmark-validated table backends."""
+
+    normalized_terms = normalize_least_squares_terms(terms)
+    grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+    unsupported_families = tuple(
+        family for family in grouped_terms if family not in {"geometry", "transport"}
+    )
+    if unsupported_families:
+        raise NotImplementedError(
+            "evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables supports only "
+            f"geometry and transport/initial-Er terms; got families {unsupported_families!r}."
+        )
+
+    parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
+    backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
+    t_start = time.perf_counter()
+
+    if "transport" in grouped_terms:
+        active_profile_values = _active_profile_values_from_parameter_vector(
+            parameter_set,
+            parameter_values_arr,
+            baseline_profile_values,
+        )
+        requested_transport_objectives = _unique_objective_names(grouped_terms["transport"])
+        if parameter_set.vmec_boundary_specs:
+            vmec_parameter_values = vmec_parameter_values_from_parameter_vector(
+                parameter_set,
+                parameter_values_arr,
+            )
+            transport_parameter_set = ReverseADParameterSet(
+                profile_specs=tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER),
+                vmec_boundary_specs=tuple(parameter_set.vmec_boundary_specs),
+            )
+            transport_parameter_values = jnp.concatenate(
+                [
+                    jnp.asarray(active_profile_values, dtype=parameter_values_arr.dtype),
+                    jnp.asarray(vmec_parameter_values, dtype=parameter_values_arr.dtype),
+                ],
+                axis=0,
+            )
+            transport_result = geometry_active_initial_er_root_only_reverse_table(
+                config=config,
+                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+                parameter_set=transport_parameter_set,
+                parameter_values=transport_parameter_values,
+                runtime=runtime,
+                profile_values=active_profile_values,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                geometry_context=geometry_context,
+                baseline_geometry_deltas=vmec_parameter_values,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                progress_label="[optimization] initial-Er root geometry payload pullback:",
+            )
+            transport_values, transport_jacobian = jax.block_until_ready(
+                (transport_result.values, transport_result.jacobian)
+            )
+            backend_results["transport"] = _adapt_objective_table_result(
+                ObjectiveTableResult(
+                    objective_names=transport_result.objective_names,
+                    values=transport_values,
+                    jacobian=transport_jacobian,
+                ),
+                source_parameter_set=transport_parameter_set,
+                target_parameter_set=parameter_set,
+                objective_names=requested_transport_objectives,
+            )
+        else:
+            transport_table = initial_er_root_only_objective_cotangent_table(
+                config=config,
+                objective_names=requested_transport_objectives,
+                parameter_set=parameter_set,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                profile_values=active_profile_values,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            )
+            backend_results["transport"] = objective_table_result_from_cotangent_table(
+                transport_table,
+                parameter_set=parameter_set,
+                geometry_gradient_matrix=jnp.zeros(
+                    (len(transport_table.objective_names), len(parameter_set.vmec_boundary_specs)),
+                    dtype=jnp.asarray(transport_table.values).dtype,
+                ),
+            )
+
+    if "geometry" in grouped_terms:
+        backend_results["geometry"] = geometry_full_ad_reverse_table(
+            context=geometry_context,
+            parameter_set=parameter_set,
+            objective_names=_unique_objective_names(grouped_terms["geometry"]),
+            parameter_values=parameter_values_arr,
+            lane=geometry_lane,
+            max_iter=geometry_max_iter,
+            step_size=geometry_step_size,
+            final_vmec_pullback_mode="raw_block_transpose",
+            solver_device=geometry_solver_device,
         )
 
     result = assemble_least_squares_result(

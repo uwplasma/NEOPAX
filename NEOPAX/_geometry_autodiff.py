@@ -4621,6 +4621,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     return_branch_gradients: bool = False,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_state_bars: bool = False,
+    extra_state_bars: object | None = None,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -4630,9 +4631,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     geometry-objective table convention.
 
     If ``return_state_bars`` is true, stop before the raw-block transpose and
-    return the assembled VMEC-state cotangent batch.  This lets optimization
-    paths fuse transport payload cotangents with geometry objective cotangents
-    before one final VMEC parameter pullback.
+    return the assembled VMEC-state cotangent batch.  ``extra_state_bars`` lets
+    callers append already-assembled VMEC-state cotangents before the same final
+    raw-block transpose, which is the intended fused optimization boundary.
     """
 
     if not payload_bars:
@@ -4877,7 +4878,20 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raw_block_state_bar_batch = state_bar_batch
 
     if bool(return_state_bars):
-        return raw_block_state_bar_batch
+        if extra_state_bars is None:
+            return raw_block_state_bar_batch
+        return jax.tree_util.tree_map(
+            lambda payload_bar, extra_bar: jnp.concatenate([payload_bar, extra_bar], axis=0),
+            raw_block_state_bar_batch,
+            extra_state_bars,
+        )
+
+    if extra_state_bars is not None:
+        raw_block_state_bar_batch = jax.tree_util.tree_map(
+            lambda payload_bar, extra_bar: jnp.concatenate([payload_bar, extra_bar], axis=0),
+            raw_block_state_bar_batch,
+            extra_state_bars,
+        )
 
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
