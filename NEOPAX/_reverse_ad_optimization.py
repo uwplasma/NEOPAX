@@ -1599,21 +1599,10 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
             )
-            if shared_payload is None:
-                shared_payload = build_shared_geometry_transport_payload(
-                    geometry_context=geometry_context,
-                    parameter_set=parameter_set,
-                    parameter_values=parameter_values_arr,
-                    runtime=runtime,
-                    n_r=int(n_r),
-                    n_theta=int(n_theta),
-                    n_zeta=int(n_zeta),
-                    n_xi=int(n_xi),
-                    surface_backend=str(surface_backend),
-                    max_iter=geometry_max_iter,
-                    solver_device=geometry_solver_device,
-                )
-            transport_state_bars = geometry_payload_pullback_from_param_vector_raw_block_transpose(
+            (
+                transport_state_bars,
+                transport_raw_block_solve,
+            ) = geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 geometry_context,
                 vmec_parameter_values,
                 tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
@@ -1626,10 +1615,15 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 surface_backend=str(surface_backend),
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
-                raw_block_solve=shared_payload.raw_block_solve,
                 return_state_bars=True,
+                return_raw_block_solve=True,
             )
             transport_state_bars = jax.block_until_ready(transport_state_bars)
+            shared_payload = SharedGeometryTransportPayload(
+                raw_block_solve=transport_raw_block_solve,
+                vmec_parameter_values=vmec_parameter_values,
+                vmec_specs=tuple(parameter_set.vmec_boundary_specs),
+            )
             source_profile_lookup = {
                 spec.name: i for i, spec in enumerate(transport_parameter_set.profile_specs)
             }
