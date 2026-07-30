@@ -4986,8 +4986,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         if compact_setup is not None:
             return compact_setup
 
+        remat_payload_fn = jax.checkpoint(payload_fn)
+
         def payload_float_leaves_from_state(state_inner):
-            leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
+            leaves = jax.tree_util.tree_leaves(remat_payload_fn(state_inner))
             return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in active_float_leaf_indices)
 
         _payload_float_baseline, payload_float_pullback = jax.vjp(
@@ -5008,6 +5010,11 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
             for leaf_i in active_float_leaf_indices
         )
+        if progress_label is not None:
+            print(
+                f"{progress_label} {branch_name}_generic_payload_remat=True",
+                flush=True,
+            )
 
         def _single_state_bar(objective_i):
             payload_bar_leaves = tuple(
