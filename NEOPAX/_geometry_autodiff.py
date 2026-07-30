@@ -3663,6 +3663,7 @@ def _build_neopax_geometry_from_state(
     requested_sample_rho=None,
     boozer_surface_sampling=None,
     booz_constants_grids=None,
+    booz_mode_indices=None,
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
@@ -3813,12 +3814,15 @@ def _build_neopax_geometry_from_state(
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
     gmnc_b = jnp.asarray(out["gmnc_b"])
     rmnc_b = jnp.asarray(out["rmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
-    if mode00 is None:
-        raise ValueError("Boozer output is missing the (0,0) mode.")
-    mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+    if booz_mode_indices is None:
+        ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+        ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+        mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+        if mode00 is None:
+            raise ValueError("Boozer output is missing the (0,0) mode.")
+        mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+    else:
+        mode00, mode10 = booz_mode_indices
 
     r0_value = rmnc_b[-1, mode00]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
@@ -4806,6 +4810,24 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         context,
         geometry_boozer_inputs,
     )
+    _geometry_booz_constants, geometry_booz_grids = geometry_booz_constants_grids
+    geometry_booz_mode00 = _find_boozer_mode_index(
+        geometry_booz_grids.xm_b,
+        geometry_booz_grids.xn_b,
+        m_value=0,
+        n_value=0,
+    )
+    if geometry_booz_mode00 is None:
+        raise ValueError("Boozer grids are missing the (0,0) mode.")
+    geometry_booz_mode_indices = (
+        geometry_booz_mode00,
+        _find_boozer_mode_index(
+            geometry_booz_grids.xm_b,
+            geometry_booz_grids.xn_b,
+            m_value=1,
+            n_value=0,
+        ),
+    )
 
     def geometry_from_state(state_inner):
         return _build_neopax_geometry_from_state(
@@ -4815,6 +4837,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             requested_sample_rho=geometry_requested_sample_rho,
             boozer_surface_sampling=geometry_boozer_surface_sampling,
             booz_constants_grids=geometry_booz_constants_grids,
+            booz_mode_indices=geometry_booz_mode_indices,
         )
 
     def ntx_support_from_state(state_inner):
