@@ -1023,13 +1023,6 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
                 "ObjectiveCotangentTable payload_bars must have one cotangent tree per objective; "
                 f"got payload_count={len(table.payload_bars)}, objective_count={row_count}."
             )
-        table_state_bar = _zero_state_bar_batch(row_count)
-        if table.vmec_state_bars is not None:
-            table_state_bar = jax.tree_util.tree_map(
-                lambda left, right: left + right,
-                table_state_bar,
-                table.vmec_state_bars,
-            )
         if table.payload_bars:
             if table.vmec_state_bars is not None:
                 raise NotImplementedError(
@@ -1038,6 +1031,13 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
                 )
             payload_bars_for_pullback.extend(table.payload_bars)
         else:
+            table_state_bar = _zero_state_bar_batch(row_count)
+            if table.vmec_state_bars is not None:
+                table_state_bar = jax.tree_util.tree_map(
+                    lambda left, right: left + right,
+                    table_state_bar,
+                    table.vmec_state_bars,
+                )
             extra_state_bar_batches.append(table_state_bar)
 
     if not payload_bars_for_pullback and not extra_state_bar_batches:
