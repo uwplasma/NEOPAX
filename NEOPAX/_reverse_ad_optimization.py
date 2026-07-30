@@ -401,6 +401,62 @@ def _result_lookup(result: ObjectiveTableResult) -> dict[str, int]:
     return {name: index for index, name in enumerate(result.objective_names)}
 
 
+def _adapt_objective_table_result(
+    result: ObjectiveTableResult,
+    *,
+    source_parameter_set: ReverseADParameterSet,
+    target_parameter_set: ReverseADParameterSet,
+    objective_names: Sequence[str],
+) -> ObjectiveTableResult:
+    """Project a backend table to the objective/parameter layout requested by a caller."""
+
+    requested_objectives = tuple(str(name).strip() for name in objective_names if str(name).strip())
+    row_lookup = _result_lookup(result)
+    missing_objectives = tuple(name for name in requested_objectives if name not in row_lookup)
+    if missing_objectives:
+        available = ", ".join(result.objective_names)
+        raise ValueError(
+            f"Cannot adapt objective table; missing objectives {missing_objectives!r}. "
+            f"Available objectives are: {available}."
+        )
+
+    source_column_lookup: dict[object, int] = {}
+    for column_index, spec in enumerate(source_parameter_set.specs):
+        if isinstance(spec, ProfileParameterSpec):
+            source_column_lookup[("profile", spec.name)] = column_index
+        elif isinstance(spec, VmecBoundaryParameterSpec):
+            source_column_lookup[("vmec_boundary", spec.family, spec.m, spec.n)] = column_index
+        else:
+            raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
+
+    column_indices: list[int] = []
+    for spec in target_parameter_set.specs:
+        if isinstance(spec, ProfileParameterSpec):
+            key = ("profile", spec.name)
+        elif isinstance(spec, VmecBoundaryParameterSpec):
+            key = ("vmec_boundary", spec.family, spec.m, spec.n)
+        else:
+            raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
+        try:
+            column_indices.append(source_column_lookup[key])
+        except KeyError as exc:
+            raise ValueError(f"Cannot adapt objective table; missing parameter column {spec.label!r}.") from exc
+
+    row_indices = [row_lookup[name] for name in requested_objectives]
+    values = jnp.asarray(result.values)[jnp.asarray(row_indices, dtype=jnp.int32)]
+    jacobian = jnp.asarray(result.jacobian)
+    selected_rows = jacobian[jnp.asarray(row_indices, dtype=jnp.int32), :]
+    if column_indices:
+        selected_columns = selected_rows[:, jnp.asarray(column_indices, dtype=jnp.int32)]
+    else:
+        selected_columns = jnp.zeros((len(requested_objectives), 0), dtype=selected_rows.dtype)
+    return ObjectiveTableResult(
+        objective_names=requested_objectives,
+        values=values,
+        jacobian=selected_columns,
+    )
+
+
 def assemble_least_squares_result(
     terms: Sequence[LeastSquaresTerm],
     *,
@@ -1515,11 +1571,22 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 parameter_set,
                 parameter_values_arr,
             )
+            transport_parameter_set = ReverseADParameterSet(
+                profile_specs=tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER),
+                vmec_boundary_specs=tuple(parameter_set.vmec_boundary_specs),
+            )
+            transport_parameter_values = jnp.concatenate(
+                [
+                    jnp.asarray(active_profile_values, dtype=parameter_values_arr.dtype),
+                    jnp.asarray(vmec_parameter_values, dtype=parameter_values_arr.dtype),
+                ],
+                axis=0,
+            )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
-                objective_names=_unique_objective_names(grouped_terms["transport"]),
-                parameter_set=parameter_set,
-                parameter_values=parameter_values_arr,
+                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+                parameter_set=transport_parameter_set,
+                parameter_values=transport_parameter_values,
                 runtime=runtime,
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
@@ -1532,14 +1599,21 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 surface_backend=str(surface_backend),
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
+                progress_label="[optimization] initial-Er root geometry payload pullback:",
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
             )
-            backend_results["transport"] = ObjectiveTableResult(
+            benchmark_shape_transport_result = ObjectiveTableResult(
                 objective_names=transport_result.objective_names,
                 values=transport_values,
                 jacobian=transport_jacobian,
+            )
+            backend_results["transport"] = _adapt_objective_table_result(
+                benchmark_shape_transport_result,
+                source_parameter_set=transport_parameter_set,
+                target_parameter_set=parameter_set,
+                objective_names=_unique_objective_names(grouped_terms["transport"]),
             )
 
     if "geometry" in grouped_terms:

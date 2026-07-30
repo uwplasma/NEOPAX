@@ -328,9 +328,11 @@ Current script status:
 - It still owns TOML/config preparation, term declaration, parameter selection, and output formatting.
 - It no longer owns raw-block solve construction, shared geometry/NTX payload construction, backend dictionaries, or separate assembled pullback calls.
 - It exposes `profile_only`, `geometry_only`, and `profiles_plus_geometry` modes, with the initial parameter vector assembled in `ReverseADParameterSet.specs` order.
-- The shared optimization object intentionally retains only the VMEC raw-block solve, not a full geometry/NTX payload.
-- The attempted transport payload-to-VMEC-state-bar shortcut OOMed for the mixed optimization run.
-- Passing a retained shared VMEC raw-block solve into the transport root-only pullback also OOMed. The active optimization path therefore routes transport initial-Er geometry derivatives through the benchmark-compatible `geometry_active_initial_er_root_only_reverse_table(...)` ownership model without passing a pre-existing raw-block solve. Geometry objectives build their raw-block solve afterward. This may duplicate the VMEC solve for now, but it preserves the validated root-only behavior and avoids the memory overlap.
+- The benchmark-good initial-Er root-only graph shape is the reference behavior.
+- For geometry-active transport/root objectives, the optimization evaluator must internally call the same table shape used by the benchmark-good path: all `INITIAL_ER_ROOT_ONLY_OBJECTIVES`, canonical profile columns, and the active VMEC columns. The optimizer-facing result then slices to the requested objective rows and requested parameter columns.
+- The previous smaller-looking optimization call shape, e.g. only `softmax_Er` and only geometry columns, reached the same payload-to-state-bar code but changed the compiled graph and OOMed at `_state_bar_batch_from_payload_branch`.
+- The current implementation adds `_adapt_objective_table_result(...)` and routes geometry-active transport/root optimization through the benchmark-style table before projection. This does not touch benchmark-good scripts.
+- Shared/fused geometry work still needs to be built around the benchmark-style transport table, not by replacing it with a different payload map. Avoid passing retained payload objects or pre-existing raw-block solves into the transport/root pullback until that exact graph is validated.
 
 ### Step 4: Profile Column Assembly
 
