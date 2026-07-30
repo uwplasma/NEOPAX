@@ -286,6 +286,10 @@ def main() -> int:
                 n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
                 surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
             )
+            shared_geometry_payload = jax.tree_util.tree_map(
+                jax.lax.stop_gradient,
+                shared_geometry_payload,
+            )
             jax.block_until_ready(jax.tree_util.tree_leaves(shared_geometry_payload))
             print(
                 "[optimization] progress: shared realtime geometry/NTX payload ready "
