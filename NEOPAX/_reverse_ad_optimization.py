@@ -1505,6 +1505,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
         )
 
     cotangent_tables_by_family: dict[ObjectiveFamily, ObjectiveCotangentTable] = {}
+    backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     geometry_cotangent_tables: list[ObjectiveCotangentTable] = []
     if "transport" in grouped_terms:
         active_profile_values = _active_profile_values_from_parameter_vector(
@@ -1512,45 +1513,28 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             parameter_values_arr,
             baseline_profile_values,
         )
-        runtime_for_transport = runtime
-        support_payload = None
-        if shared_payload is not None:
-            current_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                geometry_context,
-                shared_payload.raw_block_solve.state,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
+        if shared_payload is None:
+            transport_table = initial_er_root_only_objective_cotangent_table(
+                config=config,
+                objective_names=_unique_objective_names(grouped_terms["transport"]),
+                parameter_set=parameter_set,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                profile_values=active_profile_values,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
             )
-            support_payload = jax.tree_util.tree_map(jax.lax.stop_gradient, current_payload)
-            support_payload = jax.block_until_ready(support_payload)
-            runtime_for_transport = runtime_with_geometry_payload(runtime, support_payload["geometry"])
-            runtime_for_transport = runtime_with_ntx_support_payload(
-                runtime_for_transport,
-                support_payload["ntx_support"],
-            )
-            del current_payload
-        transport_table = initial_er_root_only_objective_cotangent_table(
-            config=config,
-            objective_names=_unique_objective_names(grouped_terms["transport"]),
-            parameter_set=parameter_set,
-            parameter_values=parameter_values_arr,
-            runtime=runtime_for_transport,
-            profile_values=active_profile_values,
-            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-            support_payload_override=support_payload,
-        )
-        cotangent_tables_by_family["transport"] = transport_table
-        if shared_payload is not None:
-            del runtime_for_transport, support_payload
-            payload_state_bar = geometry_payload_pullback_from_param_vector_raw_block_transpose(
-                geometry_context,
-                shared_payload.vmec_parameter_values,
-                tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
-                transport_table.payload_bars,
-                combined_payload=True,
+            cotangent_tables_by_family["transport"] = transport_table
+        else:
+            transport_result = geometry_active_initial_er_root_only_reverse_table(
+                config=config,
+                objective_names=_unique_objective_names(grouped_terms["transport"]),
+                parameter_set=parameter_set,
+                parameter_values=parameter_values_arr,
+                runtime=runtime,
+                profile_values=active_profile_values,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                geometry_context=geometry_context,
+                baseline_geometry_deltas=shared_payload.vmec_parameter_values,
                 n_r=int(n_r),
                 n_theta=int(n_theta),
                 n_zeta=int(n_zeta),
@@ -1559,16 +1543,15 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
                 raw_block_solve=shared_payload.raw_block_solve,
-                return_state_bars=True,
             )
-            payload_state_bar = jax.block_until_ready(payload_state_bar)
-            transport_table = dataclasses.replace(
-                transport_table,
-                vmec_state_bars=payload_state_bar,
-                payload_bars=(),
+            transport_values, transport_jacobian = jax.block_until_ready(
+                (transport_result.values, transport_result.jacobian)
             )
-            cotangent_tables_by_family["transport"] = transport_table
-            geometry_cotangent_tables.append(transport_table)
+            backend_results["transport"] = ObjectiveTableResult(
+                objective_names=transport_result.objective_names,
+                values=transport_values,
+                jacobian=transport_jacobian,
+            )
 
     if "geometry" in grouped_terms:
         if shared_payload is None:
@@ -1610,7 +1593,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             geometry_gradient_by_table_id[id(table)] = fused_geometry_matrix[row0:row1]
             row0 = row1
 
-    backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     for family, table in cotangent_tables_by_family.items():
         geometry_gradient_matrix = geometry_gradient_by_table_id.get(id(table))
         if geometry_gradient_matrix is None:
