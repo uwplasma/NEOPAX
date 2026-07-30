@@ -169,19 +169,16 @@ GeometryInitialErRootOnlyLeastSquaresRunner = Callable[
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SharedGeometryTransportPayload:
-    """Shared VMEC/geometry/NTX primal data for mixed optimization objectives.
+    """Shared VMEC primal data for mixed optimization objectives.
 
     This is the first internal building block for fused optimization. It owns the
-    one VMEC raw-block solve for the current optimizer parameter vector and the
-    realtime transport payload derived from that VMEC state. Objective-specific
-    pullbacks should consume this object rather than rebuilding VMEC/Boozer/NTX
-    plumbing in example scripts.
+    one VMEC raw-block solve for the current optimizer parameter vector.
+    Geometry/NTX transport payloads are intentionally built locally by the
+    objective collector that needs them, so they are not retained while the
+    payload-to-state VJP rebuilds its own traceable payload.
     """
 
     raw_block_solve: Any
-    payload: Mapping[str, Any]
-    detached_payload: Mapping[str, Any]
-    runtime_with_payload: Any
     vmec_parameter_values: object
     vmec_specs: tuple[VmecBoundaryParameterSpec, ...]
 
@@ -730,12 +727,13 @@ def build_shared_geometry_transport_payload(
     max_iter: int | None = None,
     solver_device: str | None = "default",
 ) -> SharedGeometryTransportPayload:
-    """Build one VMEC solve and one realtime geometry/NTX payload.
+    """Build one VMEC solve for mixed geometry/transport optimization.
 
     This helper supports mixed profile+geometry parameter vectors by extracting
     only VMEC-boundary entries for the VMEC solve. It deliberately lives in
     NEOPAX internals so thin optimization scripts do not own raw-block/payload
-    plumbing.
+    plumbing. The realtime transport payload is not retained here to avoid
+    overlapping it with the payload VJP's traceable payload rebuild.
     """
 
     vmec_specs = tuple(parameter_set.vmec_boundary_specs)
@@ -749,23 +747,9 @@ def build_shared_geometry_transport_payload(
         max_iter=max_iter,
         solver_device=solver_device,
     )
-    payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-        geometry_context,
-        raw_block_solve.state,
-        n_r=int(n_r),
-        n_theta=int(n_theta),
-        n_zeta=int(n_zeta),
-        n_xi=int(n_xi),
-        surface_backend=str(surface_backend),
-    )
-    detached_payload = jax.tree_util.tree_map(jax.lax.stop_gradient, payload)
-    runtime_with_payload = runtime_with_geometry_payload(runtime, detached_payload["geometry"])
-    runtime_with_payload = runtime_with_ntx_support_payload(runtime_with_payload, detached_payload["ntx_support"])
+    del runtime, n_r, n_theta, n_zeta, n_xi, surface_backend
     return SharedGeometryTransportPayload(
         raw_block_solve=raw_block_solve,
-        payload=payload,
-        detached_payload=detached_payload,
-        runtime_with_payload=runtime_with_payload,
         vmec_parameter_values=vmec_values,
         vmec_specs=vmec_specs,
     )
@@ -1528,8 +1512,26 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
             parameter_values_arr,
             baseline_profile_values,
         )
-        runtime_for_transport = runtime if shared_payload is None else shared_payload.runtime_with_payload
-        support_payload = None if shared_payload is None else shared_payload.detached_payload
+        runtime_for_transport = runtime
+        support_payload = None
+        if shared_payload is not None:
+            current_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                geometry_context,
+                shared_payload.raw_block_solve.state,
+                n_r=int(n_r),
+                n_theta=int(n_theta),
+                n_zeta=int(n_zeta),
+                n_xi=int(n_xi),
+                surface_backend=str(surface_backend),
+            )
+            support_payload = jax.tree_util.tree_map(jax.lax.stop_gradient, current_payload)
+            support_payload = jax.block_until_ready(support_payload)
+            runtime_for_transport = runtime_with_geometry_payload(runtime, support_payload["geometry"])
+            runtime_for_transport = runtime_with_ntx_support_payload(
+                runtime_for_transport,
+                support_payload["ntx_support"],
+            )
+            del current_payload
         transport_table = initial_er_root_only_objective_cotangent_table(
             config=config,
             objective_names=_unique_objective_names(grouped_terms["transport"]),
@@ -1542,6 +1544,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
         )
         cotangent_tables_by_family["transport"] = transport_table
         if shared_payload is not None:
+            del runtime_for_transport, support_payload
             payload_state_bar = geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 geometry_context,
                 shared_payload.vmec_parameter_values,

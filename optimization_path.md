@@ -329,6 +329,7 @@ Current script status:
 - It no longer owns raw-block solve construction, shared geometry/NTX payload construction, backend dictionaries, or separate assembled pullback calls.
 - It exposes `profile_only`, `geometry_only`, and `profiles_plus_geometry` modes, with the initial parameter vector assembled in `ReverseADParameterSet.specs` order.
 - The fused evaluator converts transport initial-Er payload cotangents to VMEC-state bars before building the geometry QI/Boozer cotangent table. This keeps the final raw-block transpose fused while avoiding overlap between the transport payload VJP and the heavier geometry objective graph.
+- The shared optimization payload object intentionally retains only the VMEC raw-block solve, not a full geometry/NTX payload. Transport builds the current detached payload locally for Er-root values/cotangents and drops it before the payload-to-state VJP rebuilds its traceable payload. This avoids holding runtime payload + shared payload + VJP payload simultaneously.
 
 ### Step 4: Profile Column Assembly
 
