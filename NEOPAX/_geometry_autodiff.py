@@ -780,6 +780,13 @@ class GeometryRawBlockSolve:
     param_entries: tuple[dict[str, Any], ...]
 
 
+def _stop_gradient_if_jax_value(leaf):
+    try:
+        return jax.lax.stop_gradient(leaf)
+    except TypeError:
+        return leaf
+
+
 def geometry_raw_block_solve_from_param_vector(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -800,7 +807,16 @@ def geometry_raw_block_solve_from_param_vector(
         max_iter=max_iter,
         solver_device=solver_device,
     )
+    # The raw-block transpose below differentiates the residual with respect to
+    # the full VMEC parameter pytree and then extracts requested harmonic
+    # columns.  It does not need the traced construction history from the
+    # optimizer's compact parameter vector to the full VMEC input arrays.  Cutting
+    # that ancestry keeps the payload/state VJPs from scaling with the number of
+    # selected boundary harmonics.
+    implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
     state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+    state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
+    dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
     return GeometryRawBlockSolve(
         implicit=implicit,
         implicit_params=implicit_params,
