@@ -4342,6 +4342,94 @@ def _traceable_vmec_surfaces_from_state(context: GeometryAutodiffContext, state,
     )
 
 
+def _positive_transport_s_values_from_rho(rho_values):
+    rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
+    positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
+    if positive.size == 0:
+        return tuple(float(rho_value**2) for rho_value in rho_np)
+    first_transport_rho = float(np.min(positive))
+    return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
+
+
+def _build_ntx_center_prepared_from_vmec_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    center_count: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str,
+):
+    """Build only the center prepared NTX system used by compact root pullbacks."""
+
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
+
+    rho_center_sample = np.linspace(0.0, 1.0, int(center_count), dtype=float)
+    center_s_values = _positive_transport_s_values_from_rho(rho_center_sample)
+    surface_backend_key = str(surface_backend).strip().lower()
+
+    if surface_backend_key in {"vmec", "vmec_jax"}:
+        center_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=center_s_values,
+        )
+    elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
+        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
+        if surfaces_fn is None:
+            try:
+                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
+            except ImportError:
+                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
+
+                def surfaces_fn(**kwargs):
+                    s_values = kwargs.pop("s_values")
+                    return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
+
+        static_phipf = jnp.asarray(context.flux.phipf, dtype=jnp.float64)
+        static_s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+        static_phi = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=static_phipf.dtype),
+                jnp.cumsum(static_phipf[1:] * (static_s_full[1:] - static_s_full[:-1])),
+            ],
+            axis=0,
+        )
+        static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
+        center_surfaces = surfaces_fn(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            s_values=center_s_values,
+            mboz=int(context.mboz),
+            nboz=int(context.nboz),
+            psi_p=static_ntx_psia,
+        )
+    else:
+        raise ValueError(
+            "ntx_exact_surface_backend for realtime geometry must be one of "
+            "'vmec', 'booz', or 'auto'."
+        )
+
+    grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
+
+    def _stack_optional(*values):
+        first = values[0]
+        if first is None:
+            return None
+        return jnp.stack([jnp.asarray(value) for value in values], axis=0)
+
+    center_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in center_surfaces)
+    return jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
+
+
 def build_ntx_exact_lij_support_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -4422,14 +4510,6 @@ def build_ntx_exact_lij_support_from_vmec_state(
     center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_sample)
     face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_sample)
 
-    def _positive_transport_s_values(rho_values):
-        rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
-        positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
-        if positive.size == 0:
-            return tuple(float(rho_value**2) for rho_value in rho_np)
-        first_transport_rho = float(np.min(positive))
-        return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
-
     surface_backend_key = str(surface_backend).strip().lower()
     if progress_label is not None:
         print(
@@ -4445,12 +4525,12 @@ def build_ntx_exact_lij_support_from_vmec_state(
         center_surfaces = _traceable_vmec_surfaces_from_state(
             context,
             state,
-            s_values=_positive_transport_s_values(rho_center_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_center_sample),
         )
         face_surfaces = _traceable_vmec_surfaces_from_state(
             context,
             state,
-            s_values=_positive_transport_s_values(rho_face_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_face_sample),
         )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         if progress_label is not None:
@@ -4463,7 +4543,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=_positive_transport_s_values(rho_center_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_center_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4473,7 +4553,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=_positive_transport_s_values(rho_face_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_face_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4734,8 +4814,42 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             zero_like_state,
         )
 
+    def _tree_path_names(path):
+        names = []
+        for key in path:
+            name = getattr(key, "name", None)
+            if name is None:
+                name = getattr(key, "key", None)
+            if name is None:
+                name = str(key)
+            names.append(str(name))
+        return tuple(names)
+
+    def _center_drds_from_state(state_inner):
+        geometry_inner = geometry_from_state(state_inner)
+        rho_arr = (
+            jnp.asarray(geometry_inner.r_grid, dtype=jnp.float64)
+            / jnp.asarray(geometry_inner.a_b, dtype=jnp.float64)
+        )
+        rho_positive = rho_arr > 0.0
+        rho_safe = jnp.where(rho_positive, rho_arr, 1.0)
+        return jnp.where(rho_positive, jnp.asarray(geometry_inner.a_b, dtype=jnp.float64) / (2.0 * rho_safe), 0.0)
+
+    def _center_prepared_from_state(state_inner):
+        geometry_inner = geometry_from_state(state_inner)
+        center_count = int(jnp.asarray(geometry_inner.r_grid).shape[0])
+        return _build_ntx_center_prepared_from_vmec_state(
+            context,
+            state_inner,
+            center_count=center_count,
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+        )
+
     def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
-        payload_template = payload_fn(state)
+        payload_template = branch_bars[0]
         payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
         payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
         float_leaf_indices = tuple(
@@ -4778,6 +4892,93 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
         if not active_float_leaf_indices:
             return _zero_state_bar_batch()
+
+        active_leaf_paths = tuple(
+            _tree_path_names(payload_template_paths_and_leaves[leaf_i][0])
+            for leaf_i in active_float_leaf_indices
+        )
+
+        def _compact_initial_er_support_state_bar_batch():
+            prepared_template = payload_template.center_prepared
+            prepared_paths = {
+                _tree_path_names(path): local_i
+                for local_i, (path, _leaf) in enumerate(
+                    jax.tree_util.tree_flatten_with_path(prepared_template)[0]
+                )
+            }
+            compact_specs = []
+            for leaf_i, path_names in zip(active_float_leaf_indices, active_leaf_paths, strict=True):
+                if path_names == ("center_channels", "drds"):
+                    compact_specs.append(("center_drds", leaf_i, None))
+                    continue
+                if len(path_names) >= 2 and path_names[0] == "center_prepared":
+                    prepared_path = path_names[1:]
+                    if prepared_path not in prepared_paths:
+                        return None
+                    compact_specs.append(("center_prepared", leaf_i, prepared_paths[prepared_path]))
+                    continue
+                return None
+
+            def compact_support_float_leaves_from_state(state_inner):
+                center_drds = None
+                center_prepared = None
+                center_prepared_leaves = None
+                out = []
+                for kind, _leaf_i, local_i in compact_specs:
+                    if kind == "center_drds":
+                        if center_drds is None:
+                            center_drds = _center_drds_from_state(state_inner)
+                        out.append(jnp.asarray(center_drds))
+                    else:
+                        if center_prepared is None:
+                            center_prepared = _center_prepared_from_state(state_inner)
+                            center_prepared_leaves = jax.tree_util.tree_leaves(center_prepared)
+                        out.append(jnp.asarray(center_prepared_leaves[local_i]))
+                return tuple(out)
+
+            _compact_baseline, compact_pullback = jax.vjp(
+                compact_support_float_leaves_from_state,
+                state,
+            )
+            del _compact_baseline
+            batched_compact_bars = tuple(
+                jnp.stack(
+                    [
+                        jnp.asarray(
+                            payload_bar_leaves_by_objective[objective_i][leaf_i],
+                            dtype=jnp.asarray(payload_template_leaves[leaf_i]).dtype,
+                        )
+                        for objective_i in range(len(branch_bars))
+                    ],
+                    axis=0,
+                )
+                for _kind, leaf_i, _local_i in compact_specs
+            )
+
+            def _single_state_bar_from_compact_bars(compact_bar_leaves):
+                return compact_pullback(tuple(compact_bar_leaves))[0]
+
+            if len(branch_bars) == 1:
+                single_compact_bars = tuple(leaf[0] for leaf in batched_compact_bars)
+                single_state_bar = _single_state_bar_from_compact_bars(single_compact_bars)
+                state_bar_batch_value = jax.tree_util.tree_map(lambda leaf: leaf[None, ...], single_state_bar)
+            else:
+                state_bar_batch_value = jax.lax.map(
+                    _single_state_bar_from_compact_bars,
+                    batched_compact_bars,
+                )
+            if progress_label is not None:
+                print(
+                    f"{progress_label} {branch_name}_compact_initial_er_support_pullback=True",
+                    flush=True,
+                )
+            return state_bar_batch_value
+
+        if branch_name == "ntx_support":
+            compact_state_bar_batch = _compact_initial_er_support_state_bar_batch()
+            if compact_state_bar_batch is not None:
+                _print_state_bar_batch_finiteness(branch_name, compact_state_bar_batch)
+                return compact_state_bar_batch
 
         def payload_float_leaves_from_state(state_inner):
             leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
