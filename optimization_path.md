@@ -373,3 +373,70 @@ The long-term script should be thin and VMEX-like. It should not manually wire:
 - payload pullback internals.
 
 Those belong in the internal optimization problem builder.
+
+## Current State: 2026-07-30 07:25
+
+Goal:
+
+- Build a VMEX-like optimization path for geometry objectives plus initial-Er/root transport objectives.
+- Keep benchmark-good AD lanes untouched.
+- Use the same validated internal pieces as the benchmarks:
+  - geometry objective table for QI/maxJ/aspect/iota/mirror,
+  - compact initial-Er root cotangent construction,
+  - compact payload-to-VMEC raw-block transpose,
+  - raw-block VMEC parameter pullback.
+
+Known-good references:
+
+- Geometry objective benchmark with `compare_geometry_qi_frozen_linearized_fd.py` verifies the optimization-internal geometry table:
+  - `boozer_qi_objective` on `input.QI_nfp2_initial`, `RBC:1:0`: internal reverse table matches forward JVP at relative error about `2e-11`.
+  - `boozer_maxj_objective` on `input.QI_nfp2_initial`, `RBC:1:0`: internal reverse table matches forward JVP at relative error about `4e-11`.
+- Initial-Er root-only benchmark smoke verifies compact root AD and compact payload pullback for geometry-active transport rows.
+- Two-step internal realtime-geometry optimization smoke verifies transport time-evolution AD internals for `profiles_plus_realtime_geometry`.
+
+Current optimization script under test:
+
+```bash
+python ./examples/optimization/optimize_geometry_qi_max_er_initial_root.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --vmec-input ./examples/inputs/input.QI_nfp2_initial \
+  --parameter-mode geometry_only \
+  --geometry-parameters RBC:1:0 \
+  --max-er-target 30 \
+  --max-er-weight 1 \
+  --qi-weight 1 \
+  --maxj-weight 0 \
+  --aspect-weight 0 \
+  --iota-weight 0 \
+  --mirror-weight 0
+```
+
+Current code change:
+
+- Only `NEOPAX/_reverse_ad_optimization.py` is modified.
+- The optimization fused evaluator now blocks/materializes transport root cotangents before entering payload-to-VMEC pullback, matching the benchmark-good memory staging.
+- The optimization fused evaluator now requests only transport objective rows present in the least-squares terms. For the command above, this is only `softmax_Er`, not all four root-only objectives.
+- For zero VMEC geometry deltas, the fused evaluator now uses the runtime geometry/NTX payload for root cotangents instead of building a duplicate current payload.
+- For nonzero VMEC geometry deltas, the fused evaluator builds the current support payload from the shared raw-block VMEC state, uses it for root cotangents, then drops it before the payload-to-VMEC VJP.
+
+Current unresolved problem:
+
+- The optimization script still OOMs before QI/geometry objective table construction.
+- The OOM occurs inside `geometry_payload_pullback_from_param_vector_raw_block_transpose(...)`, during `_state_bar_batch_from_payload_branch("ntx_support", ...)`.
+- The failing allocation is in `booz_xform_jax` called from `_boozer_rmnc00_from_state_at_rho(...)` while constructing the VJP of `build_ntx_exact_lij_support_from_vmec_state(...)`.
+- The stack shows the failure happens in the transport/root payload-to-VMEC VJP, not in the final fused raw-block transpose and not in the QI objective table.
+
+Likely discrepancy still to investigate:
+
+- The benchmark-good root-only path enters payload-to-VMEC pullback through `realtime_geometry_transport_reverse_table_from_payload_cotangents(...)`, receives parameter gradients immediately, and does not need to retain any fused geometry-objective state-bar machinery.
+- The fused optimization path enters the lower-level `geometry_payload_pullback_from_param_vector_raw_block_transpose(...)` directly so that geometry-objective state bars can later be appended before one final raw-block transpose.
+- Even with QI deferred, this direct fused path may still retain extra Python/JAX references around the payload cotangent table or shared payload compared with the benchmark wrapper.
+
+Next debugging steps:
+
+- Compare live objects held by `evaluate_geometry_initial_er_root_only_least_squares_fused(...)` at the moment it calls `fused_geometry_parameter_matrix_from_cotangent_tables(...)` with the benchmark-good root-only call into `geometry_active_initial_er_root_only_reverse_table(...)`.
+- Check whether the fused path can call a benchmark-style compact helper that returns both:
+  - transport parameter-gradient rows, and
+  - optionally a compact raw-block solve/state-bar interface for appending geometry rows,
+  without forcing the NTX support VJP to coexist with geometry objective data.
+- If one final raw-block transpose cannot be made memory-safe, the fallback should be an explicit optimization option that uses benchmark-table behavior for transport/root and geometry separately. That fallback is correct and benchmark-equivalent but not fully fused, so it should be a deliberate mode, not hidden as the default fused path.

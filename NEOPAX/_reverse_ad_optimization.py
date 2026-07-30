@@ -1599,15 +1599,26 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
             )
-            current_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                geometry_context,
-                shared_payload.raw_block_solve.state,
-                n_r=int(n_r),
-                n_theta=int(n_theta),
-                n_zeta=int(n_zeta),
-                n_xi=int(n_xi),
-                surface_backend=str(surface_backend),
-            )
+            current_support_payload = None
+            try:
+                use_runtime_payload = bool(
+                    jnp.allclose(
+                        vmec_parameter_values,
+                        jnp.zeros_like(vmec_parameter_values),
+                    ).item()
+                )
+            except Exception:
+                use_runtime_payload = False
+            if not use_runtime_payload:
+                current_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                    geometry_context,
+                    shared_payload.raw_block_solve.state,
+                    n_r=int(n_r),
+                    n_theta=int(n_theta),
+                    n_zeta=int(n_zeta),
+                    n_xi=int(n_xi),
+                    surface_backend=str(surface_backend),
+                )
             transport_parameter_set = ReverseADParameterSet(
                 profile_specs=tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER),
                 vmec_boundary_specs=tuple(parameter_set.vmec_boundary_specs),
@@ -1641,6 +1652,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                     transport_table_full.payload_bars,
                 )
             )
+            del current_support_payload
             source_profile_lookup = {
                 spec.name: i for i, spec in enumerate(transport_parameter_set.profile_specs)
             }
