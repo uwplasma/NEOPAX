@@ -501,3 +501,160 @@ benchmark-good transport/root compact table
 ```
 
 - Until that exact graph is validated, the default optimization wrapper should remain benchmark-table based so optimization correctness and memory behavior match the trusted references.
+
+## Current State: 2026-07-30 Compact Optimization Pullback Debug
+
+Immediate objective:
+
+- Make `examples/optimization/optimize_geometry_qi_max_er_initial_root.py` run the VMEX-like mixed optimization setup without OOM and without contaminating benchmark scripts.
+- Preserve benchmark-good derivative behavior and revalidate any benchmark/internal path touched by the compact pullback changes.
+
+Current script under test:
+
+```bash
+python ./examples/optimization/optimize_geometry_qi_max_er_initial_root.py
+```
+
+The script currently starts with:
+
+```text
+max_mode=1
+parameter_count=8
+parameters=[
+  RBC:0:1, RBC:1:-1, RBC:1:0, RBC:1:1,
+  ZBS:0:1, ZBS:1:-1, ZBS:1:0, ZBS:1:1
+]
+```
+
+Current code changes:
+
+- Only `NEOPAX/_geometry_autodiff.py` is modified in the latest working tree checkpoint.
+- The compact optimization payload pullback now attempts a tangent-contraction route:
+
+```text
+VMEC boundary parameter tangent
+-> implicit_state_tangent_raw_block(...)
+-> payload JVP
+-> cotangent dot tangent
+-> objective-by-parameter geometry Jacobian block
+```
+
+- This is intended to avoid the previous OOM-prone route:
+
+```text
+payload cotangents
+-> generic payload VJP to VMEC state bars
+-> raw-block transpose to boundary parameters
+```
+
+- The fallback state-bar/VJP route remains available for benchmark diagnostics or callers that request branch/state bars.
+- The compact tangent route activates only when:
+
+```text
+combined_payload=True
+return_branch_gradients=False
+return_state_bars=False
+extra_state_bars is None
+extra_state_bars_factory is None
+implicit exposes implicit_state_tangent_raw_block
+```
+
+Important diagnostic print expected on the intended path:
+
+```text
+compact_payload_tangent_contract=True
+```
+
+What the latest attached run showed:
+
+- The optimization did enter the compact tangent path.
+- It no longer failed at the earlier `jax.vjp(...)` OOM site.
+- It failed inside `geometry_setup["tangent_contraction"]`, specifically while `jax.jvp(...)` evaluated `_build_neopax_geometry_from_state(...)`.
+- First failure after the compact path change:
+
+```text
+jnp.unique(...) ConcretizationTypeError
+```
+
+- Follow-up failure after replacing `jnp.unique` locally:
+
+```text
+TracerArrayConversionError at np.asarray(context.static.s[1:], dtype=float)
+```
+
+Root cause of those two failures:
+
+- The compact tangent path calls `_build_neopax_geometry_from_state(...)` under `jax.jvp(...)` and `jax.lax.map(...)`.
+- Any dynamic uniqueness or NumPy conversion inside that function can see JAX tracers.
+- The sampling radii are static sampling metadata, not physical differentiable values, so they should be computed outside the transformed payload function.
+
+Latest fix:
+
+- Added `_neopax_geometry_requested_sample_rho(context, n_r=...)`.
+- `geometry_payload_pullback_from_param_vector_raw_block_transpose(...)` now precomputes `geometry_requested_sample_rho` before defining the JVP'd `geometry_from_state(...)`.
+- `_build_neopax_geometry_from_state(...)` accepts `requested_sample_rho=...` so the transformed geometry function no longer computes sample uniqueness from traced values.
+- `r00_support_rho` for NTX support now uses static sorted unique sample grids (`rho_center_sample`, `rho_face_sample`) so interpolation coordinates stay well-defined.
+
+Checks passed after latest fix:
+
+```bash
+python -m py_compile NEOPAX/_geometry_autodiff.py NEOPAX/_reverse_ad_optimization.py NEOPAX/optimization.py examples/optimization/optimize_geometry_qi_max_er_initial_root.py
+git diff --check -- NEOPAX/_geometry_autodiff.py
+```
+
+Validation still needed:
+
+1. Rerun the mixed optimization script:
+
+```bash
+python ./examples/optimization/optimize_geometry_qi_max_er_initial_root.py
+```
+
+2. Confirm it prints:
+
+```text
+compact_payload_tangent_contract=True
+```
+
+3. If it completes the initial evaluation, compare the transport/root derivative rows against benchmark-good values for at least `RBC:1:0`.
+
+4. Recheck benchmark/internal derivative references because `_geometry_autodiff.py` changed:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+```bash
+python ./examples/optimization/transport_realtime_geometry_reverse_smoke.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --accepted-step-limit 2 \
+  --reverse-segment-length 1 \
+  --initial-Er-root-ad jax_selected_root \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --radau-jacobian-reuse-mode legacy \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --hide-solver-iterations
+```
+
+Current caution:
+
+- The compact tangent contraction is mathematically the same directional contraction,
+
+```text
+payload_bar dot d(payload)/d(parameter)
+```
+
+but it computes it by JVP rather than by VJP-to-state followed by raw-block transpose.
+- Because that changes AD execution order, derivative values must be rechecked against the benchmark-good references before this path is trusted for optimization.
+- Do not modify benchmark scripts as a workaround. If further failures occur, fix the internal compact path or explicitly fall back to benchmark-table behavior.

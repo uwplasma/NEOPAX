@@ -3560,7 +3560,8 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
-    s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
+    rho_values_np = np.asarray(rho_values, dtype=float).reshape(-1)
+    s_values = tuple(float(rho_value**2) for rho_value in rho_values_np)
     surface_indices_arr = np.unique(
         np.asarray(_surface_indices_for_s_values(static, s_values), dtype=np.int32)
     )
@@ -3580,7 +3581,7 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     different major-radius profile from the geometry object.
     """
     rho_arr = jnp.asarray(rho_values, dtype=jnp.float64)
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_arr)
+    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_values)
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
     inputs = _booz_xform_inputs_from_state(
