@@ -234,6 +234,18 @@ GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
     "maxj": "boozer_maxj_objective",
     "maxj_objective": "boozer_maxj_objective",
     "boozer_maxj_objective": "boozer_maxj_objective",
+    "qi_p05": "boozer_qi_objective_p05",
+    "qi_objective_p05": "boozer_qi_objective_p05",
+    "boozer_qi_objective_p05": "boozer_qi_objective_p05",
+    "maxj_p05": "boozer_maxj_objective_p05",
+    "maxj_objective_p05": "boozer_maxj_objective_p05",
+    "boozer_maxj_objective_p05": "boozer_maxj_objective_p05",
+    "qi_p2": "boozer_qi_objective_p2",
+    "qi_objective_p2": "boozer_qi_objective_p2",
+    "boozer_qi_objective_p2": "boozer_qi_objective_p2",
+    "maxj_p2": "boozer_maxj_objective_p2",
+    "maxj_objective_p2": "boozer_maxj_objective_p2",
+    "boozer_maxj_objective_p2": "boozer_maxj_objective_p2",
 }
 
 
