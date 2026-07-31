@@ -3343,7 +3343,9 @@ def _run_realtime_geometry_optimization_api_smoke(
         for label, value in result.objective_values.items()
     }
     report = {
-        "mode": "transport_reverse_ad_only_optimization_api_smoke",
+        "mode": "transport_reverse_ad_only_full_transport_shared_payload_smoke"
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else "transport_reverse_ad_only_optimization_api_smoke",
         "parameter_mode": str(args.reverse_parameter_mode),
         "config_path": str(Path(args.config)),
         "objective_name": str(args.objective),
@@ -3358,10 +3360,17 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
         "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
         "initial_er_root_ad": str(args.initial_er_root_ad),
+        "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
+        "shared_payload_note": (
+            "Full transport shared-path smoke uses the internal realtime-geometry "
+            "transport table-result builder once and writes JSON for offline "
+            "comparison against saved reference benchmark output."
+        ),
         "elapsed_s": float(elapsed_s),
     }
     print(
-        "[autodiff-gate] mode=transport_reverse_ad_only_optimization_api_smoke "
+        "[autodiff-gate] mode="
+        f"{report['mode']} "
         f"objective={args.objective} "
         f"residual_count={len(result.residual_labels)} "
         f"parameter_count={len(result.parameter_labels)} "
@@ -3373,7 +3382,11 @@ def _run_realtime_geometry_optimization_api_smoke(
         print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
         for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
             print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
-    outpath = _report_path("optimization_api_smoke")
+    outpath = _report_path(
+        "full_transport_shared_payload_smoke"
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else "optimization_api_smoke"
+    )
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
@@ -3983,10 +3996,10 @@ def _run_realtime_geometry_reverse_mode(
         f"local_devices={[str(device) for device in jax.local_devices()]}",
         flush=True,
     )
-    if bool(args.optimization_api_smoke):
+    if bool(args.optimization_api_smoke) or bool(args.full_transport_shared_payload_smoke):
         if str(args.realtime_geometry_gradient_path) != "reverse_payload":
             raise SystemExit(
-                "[autodiff-gate] --optimization-api-smoke currently requires "
+                "[autodiff-gate] --optimization-api-smoke/--full-transport-shared-payload-smoke currently requires "
                 "--realtime-geometry-gradient-path reverse_payload so it exercises "
                 "the validated full realtime geometry table."
             )
@@ -4390,6 +4403,16 @@ def main() -> None:
             "least-squares API through the direct JAX table-result builder and then "
             "exit. This uses the same validated grouped reverse runner but does not "
             "write the normal benchmark report."
+        ),
+    )
+    parser.add_argument(
+        "--full-transport-shared-payload-smoke",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry reverse_payload runs, execute only "
+            "the full transport internal realtime-geometry table path and write a "
+            "shared-path JSON report for offline comparison against saved reference "
+            "benchmark output. This does not run the reference path in the same process."
         ),
     )
     parser.add_argument(
