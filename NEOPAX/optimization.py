@@ -188,7 +188,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     parameter_set: object
     geometry_parameterization: VmexBoundaryParameterization | None
     profile_specs: tuple[ProfileParameterSpec, ...]
-    terms: tuple[LeastSquaresTerm, ...]
+    terms: tuple[GeometryLeastSquaresTerm | LeastSquaresTerm, ...]
     n_r: int
     n_theta: int
     n_zeta: int
@@ -272,11 +272,12 @@ class GeometryInitialErRootLeastSquaresProblem:
         else:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
         physical_values = self._scaled_to_physical(scaled_values)
-        evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+        base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
+        base_evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             self.config,
             parameter_set=self.parameter_set,
             parameter_values=physical_values,
-            terms=self.terms,
+            terms=base_terms,
             geometry_context=self.context,
             runtime=self.runtime,
             baseline_profile_values=self.baseline_profile_values,
@@ -290,6 +291,18 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_max_iter=self.geometry_max_iter,
             geometry_step_size=self.geometry_step_size,
             geometry_solver_device=self.geometry_solver_device,
+        )
+        result = _assemble_mixed_initial_er_root_result(
+            self.terms,
+            base_evaluation=base_evaluation,
+        )
+        residuals = jax.block_until_ready(result.residuals)
+        jacobian = jax.block_until_ready(result.jacobian)
+        evaluation = LeastSquaresEvaluation(
+            result=result,
+            residuals=residuals,
+            jacobian=jacobian,
+            elapsed_s=float(base_evaluation.elapsed_s),
         )
         return scale_least_squares_evaluation_columns(evaluation, self.x_scale)
 
@@ -467,23 +480,12 @@ def _normalize_initial_er_root_least_squares_terms(
     terms: Sequence[
         GeometryLeastSquaresTerm | LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]
     ],
-) -> tuple[LeastSquaresTerm, ...]:
-    normalized: list[LeastSquaresTerm] = []
+) -> tuple[GeometryLeastSquaresTerm | LeastSquaresTerm, ...]:
+    normalized: list[GeometryLeastSquaresTerm | LeastSquaresTerm] = []
     for term in terms:
         if isinstance(term, GeometryLeastSquaresTerm):
-            if term.value_fn is not None or term.derivative_fn is not None:
-                raise NotImplementedError(
-                    "Transformed geometry terms are supported by geometry_least_squares_problem, "
-                    "but not yet by the mixed geometry + initial-Er root optimizer. "
-                    "Use the base geometry objective row in mixed optimization for now."
-                )
             normalized.append(
-                LeastSquaresTerm(
-                    objective=term.objective,
-                    target=term.target,
-                    weight=term.weight,
-                    label=term.label,
-                )
+                term
             )
             continue
         if isinstance(term, LeastSquaresTerm):
@@ -501,11 +503,17 @@ def _normalize_initial_er_root_least_squares_terms(
             )
         objective, target, weight = term
         if isinstance(objective, GeometryObjectiveTransform):
-            raise NotImplementedError(
-                "Transformed geometry terms are supported by geometry_least_squares_problem, "
-                "but not yet by the mixed geometry + initial-Er root optimizer. "
-                "Use the base geometry objective row in mixed optimization for now."
+            normalized.append(
+                GeometryLeastSquaresTerm(
+                    objective=objective.base,
+                    target=float(target),
+                    weight=float(weight),
+                    label=objective.label,
+                    value_fn=objective.value_fn,
+                    derivative_fn=objective.derivative_fn,
+                )
             )
+            continue
         if isinstance(objective, ObjectiveRef):
             objective_ref = objective
         else:
@@ -528,6 +536,74 @@ def _normalize_initial_er_root_least_squares_terms(
         if term.weight < 0.0:
             raise ValueError(f"Least-squares weights must be non-negative; got {term.weight}.")
     return tuple(normalized)
+
+
+def _base_terms_for_mixed_initial_er_root(
+    terms: Sequence[GeometryLeastSquaresTerm | LeastSquaresTerm],
+) -> tuple[LeastSquaresTerm, ...]:
+    base_terms = []
+    for term in terms:
+        if isinstance(term, GeometryLeastSquaresTerm):
+            base_terms.append(
+                LeastSquaresTerm(
+                    objective=term.objective,
+                    target=0.0,
+                    weight=1.0,
+                    label=term.residual_label,
+                )
+            )
+        else:
+            base_terms.append(
+                LeastSquaresTerm(
+                    objective=term.objective,
+                    target=0.0,
+                    weight=1.0,
+                    label=term.residual_label,
+                )
+            )
+    return tuple(base_terms)
+
+
+def _assemble_mixed_initial_er_root_result(
+    terms: Sequence[GeometryLeastSquaresTerm | LeastSquaresTerm],
+    *,
+    base_evaluation: LeastSquaresEvaluation,
+) -> LeastSquaresResult:
+    base_values = jnp.asarray(base_evaluation.result.residuals)
+    base_jacobian = jnp.asarray(base_evaluation.result.jacobian)
+    residual_rows = []
+    jacobian_rows = []
+    residual_labels = []
+    objective_values: dict[str, object] = {}
+    label_counts: dict[str, int] = {}
+    for term_i, term in enumerate(terms):
+        base_value = base_values[term_i]
+        base_jacobian_row = base_jacobian[term_i]
+        if isinstance(term, GeometryLeastSquaresTerm) and term.value_fn is not None:
+            value = term.value_fn(base_value)
+            if term.derivative_fn is None:
+                chain = jax.grad(lambda x: jnp.asarray(term.value_fn(x), dtype=jnp.float64))(base_value)
+            else:
+                chain = term.derivative_fn(base_value)
+        else:
+            value = base_value
+            chain = jnp.asarray(1.0, dtype=base_value.dtype)
+        scale = jnp.asarray(np.sqrt(float(term.weight)), dtype=base_value.dtype)
+        residual_rows.append(scale * (value - jnp.asarray(term.target, dtype=base_value.dtype)))
+        jacobian_rows.append(scale * chain * base_jacobian_row)
+        base_label = term.residual_label
+        label_count = label_counts.get(base_label, 0)
+        label_counts[base_label] = label_count + 1
+        residual_label = base_label if label_count == 0 else f"{base_label}#{label_count + 1}"
+        residual_labels.append(residual_label)
+        objective_values[residual_label] = value
+    return LeastSquaresResult(
+        residuals=jnp.stack(residual_rows),
+        jacobian=jnp.stack(jacobian_rows),
+        residual_labels=tuple(residual_labels),
+        parameter_labels=base_evaluation.result.parameter_labels,
+        objective_values=objective_values,
+    )
 
 
 def _result_lookup(result: ObjectiveTableResult) -> dict[str, int]:
@@ -676,7 +752,11 @@ def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
 
 def geometry_initial_er_root_only_least_squares_problem(
     config,
-    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    terms: Sequence[
+        GeometryLeastSquaresTerm
+        | LeastSquaresTerm
+        | tuple[ObjectiveRef | GeometryObjectiveTransform | str, float, float]
+    ],
     *,
     vmec_input=None,
     max_mode: int | None = None,

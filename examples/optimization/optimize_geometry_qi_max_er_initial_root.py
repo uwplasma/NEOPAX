@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,10 +72,21 @@ qi_maxj_1 = opt.geometry.boozer_maxj_objective
 softmax_er = opt.transport.softmax_Er
 
 
+def mirror_penalization_value(mirror_ratio):
+    return jnp.maximum(mirror_ratio - MIRROR_TARGET, 0.0)
+
+
+mirror_penalization = opt.transformed_geometry_objective(
+    opt.geometry.vmec_mirror_ratio,
+    mirror_penalization_value,
+    label="mirror_penalization",
+)
+
+
 terms = [
     (qi, 0.0, QI_WEIGHT),
     (qi_maxj_1, 0.0, MAXJ_WEIGHT),
-    (opt.geometry.vmec_mirror_ratio, MIRROR_TARGET, MIRROR_WEIGHT),
+    (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
     (softmax_er, MAX_ER_TARGET, MAX_ER_WEIGHT),
@@ -111,6 +123,7 @@ def iteration_diagnostics(evaluation):
         f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
         f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio'):.8e} "
+        f"mirror_penalty={value('mirror_penalization'):.8e} "
         f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
         f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
