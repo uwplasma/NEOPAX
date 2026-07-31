@@ -208,7 +208,6 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
-    "bootstrap_current_softmax_abs_scaled",
 )
 _BOOTSTRAP_CURRENT_OBJECTIVE = "bootstrap_current_softmax_abs_scaled"
 GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
@@ -2153,7 +2152,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
-                objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+                objective_names=requested_transport_objectives,
                 parameter_set=transport_parameter_set,
                 parameter_values=transport_parameter_values,
                 runtime=runtime,

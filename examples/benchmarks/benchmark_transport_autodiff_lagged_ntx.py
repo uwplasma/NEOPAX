@@ -95,7 +95,6 @@ OBJECTIVE_LABELS = [
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
-    "bootstrap_current_softmax_abs_scaled",
 ]
 DEFAULT_FD_SWEEP_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
 STANDALONE_SUBSOLVE_LABELS = [

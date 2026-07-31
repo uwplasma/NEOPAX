@@ -3577,6 +3577,7 @@ def _boozer_rmnc00_from_state_at_rho(
     rho_values,
     *,
     boozer_surface_sampling=None,
+    booz_constants_grids=None,
 ):
     """Return Boozer R(m=0,n=0) on requested rho values.
 
@@ -3599,7 +3600,10 @@ def _boozer_rmnc00_from_state_at_rho(
         signgs=context.signgs,
         flux=context.flux,
     )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    if booz_constants_grids is None:
+        booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    else:
+        booz_constants, booz_grids = booz_constants_grids
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=booz_constants,
@@ -4485,6 +4489,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
     surface_backend: str = "booz",
     progress_label: str | None = None,
     r00_boozer_surface_sampling=None,
+    r00_booz_constants_grids=None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -4554,6 +4559,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         state,
         r00_support_rho_np,
         boozer_surface_sampling=r00_boozer_surface_sampling,
+        booz_constants_grids=r00_booz_constants_grids,
     )
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
@@ -4885,6 +4891,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             surface_backend=str(surface_backend),
             progress_label=progress_label,
             r00_boozer_surface_sampling=r00_boozer_surface_sampling,
+            r00_booz_constants_grids=geometry_booz_constants_grids,
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
