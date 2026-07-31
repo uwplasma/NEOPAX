@@ -1934,6 +1934,7 @@ def run_internal_realtime_geometry_support_segment_probe(
         max_iter=geom_cfg.get("vmec_max_iter"),
         solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
         progress_label=None if suppress_diagnostics else "[autodiff-gate] realtime geometry payload pullback:",
+        return_branch_gradients=False,
     )
     if not suppress_diagnostics:
         print(
@@ -2453,6 +2454,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             max_iter=opts.get("max_iter", max_iter),
             solver_device=str(opts.get("solver_device", solver_device)),
             progress_label=progress_label,
+            return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
         )
         return assembly.table_result
 

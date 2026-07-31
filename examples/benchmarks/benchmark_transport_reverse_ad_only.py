@@ -2802,6 +2802,10 @@ def _run_realtime_geometry_support_segment_probe(
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] realtime geometry payload pullback:",
+            return_branch_gradients=not (
+                bool(getattr(args, "optimization_api_smoke", False))
+                or bool(getattr(args, "full_transport_shared_payload_smoke", False))
+            ),
         )
         table_result = assembly_result.table_result
         geometry_pullback_result = assembly_result.payload_pullback_result

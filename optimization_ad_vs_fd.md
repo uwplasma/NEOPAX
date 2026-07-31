@@ -116,6 +116,18 @@ T0 root-only FD comparison:
 | `transport:Er_volume_average` | `9.3014742407775575e-01` | `9.2992190000000003e-01` | `2.255241e-04` | `2.425194e-04` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `2.1623657522770276e-01` | `2.1623760000000000e-01` | `1.024772e-06` | `4.739103e-06` |
 
+n0 root-only frozen-linearized-root FD comparison:
+
+| Objective | Shared-payload AD `d/dn0` | Root-only FD `d/dn0` | Abs diff | Rel diff | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `transport:softmax_Er` | `-4.3986401826353054e+00` | `-4.3985670000000003e+00` | `7.318264e-05` | `1.663784e-05` | ok |
+| `transport:smooth_root_proxy` | `5.1222741603851318e-09` | `-1.4856530000000001e-10` | `5.270839e-09` | not meaningful | tiny derivative/sign noise |
+| `transport:Er_transition_left` | `-1.4233550838687483e+00` | `-1.4233980000000002e+00` | `4.291613e-05` | `3.015048e-05` | ok |
+| `transport:Er_transition_right` | `-1.6478080431210720e+00` | `-1.6477620000000000e+00` | `4.604312e-05` | `2.794282e-05` | ok |
+| `transport:Er2_volume_average` | `-1.5277014691028512e+00` | `-1.5276720000000001e+00` | `2.946910e-05` | `1.929020e-05` | ok |
+| `transport:Er_volume_average` | `-2.0739439797793513e+00` | `-2.0739440000000000e+00` | `2.022065e-08` | `9.749853e-09` | ok |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-2.1467313139312133e-03` | `-2.1472470000000001e-03` | `5.156861e-07` | `2.401615e-04` | ok |
+
 Density-shape-power root-only FD comparison:
 
 | Objective | Shared-payload AD `d/ddensity_shape_power` | Root-only FD `d/ddensity_shape_power` | Abs diff | Rel diff |
@@ -151,6 +163,10 @@ Note:
   `1.8e-4` relative for `d/dRBC:1:0`.
 - The `temperature_shape_power` frozen-linearized root FD check validates all
   rows, including `Er2_volume_average` and `Er_volume_average`.
+- The `n0` frozen-linearized root FD check also validates all rows. The earlier
+  selected-root `n0` FD check had the same branch-reselection contamination in
+  the Er volume-average rows and should be kept as a branch-sensitivity
+  diagnostic, not as the AD-branch reference.
 - The earlier selected-root FD lane reselected roots at `p +/- h` and produced
   large mismatches for the two Er volume-average rows; that lane is useful as a
   branch-sensitivity diagnostic but is not the AD-branch reference.
