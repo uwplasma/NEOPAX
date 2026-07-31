@@ -202,6 +202,8 @@ class ObjectiveCotangentTable:
 INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "softmax_Er",
     "smooth_root_proxy",
+    "Er_transition_left",
+    "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
 )
@@ -592,6 +594,12 @@ def _initial_er_root_only_objective_values(
     softmax_beta = float(opts.get("softmax_Er_beta", 16.0))
     smooth_root_beta = float(opts.get("smooth_root_proxy_beta", 24.0))
     smooth_root_eps = float(opts.get("smooth_root_proxy_eps", 1.0e-4))
+    transition_left_index = int(opts.get("Er_transition_left_index", 20))
+    transition_right_index = int(opts.get("Er_transition_right_index", 21))
+
+    def _er_at_index(index: int):
+        clipped = max(0, min(int(index), int(er.shape[-1]) - 1))
+        return er[clipped]
 
     def _one(name: str):
         if name == "softmax_Er":
@@ -606,6 +614,10 @@ def _initial_er_root_only_objective_values(
                 jnp.sum(weights),
                 jnp.asarray(1.0e-30, dtype=er.dtype),
             )
+        if name == "Er_transition_left":
+            return _er_at_index(transition_left_index)
+        if name == "Er_transition_right":
+            return _er_at_index(transition_right_index)
         if name == "Er2_volume_average":
             return _initial_er_root_only_volume_average(er * er, geometry)
         if name == "Er_volume_average":

@@ -62,10 +62,13 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    evaluate_geometry_initial_er_root_only_least_squares_fused,
+    geometry as geometry_objectives,
     geometry_active_initial_er_root_only_reverse_table,
     LeastSquaresEvaluation,
     INITIAL_ER_ROOT_ONLY_OBJECTIVES,
     residuals_and_jacobian_reverse_ad,
+    LeastSquaresTerm,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
@@ -3489,6 +3492,81 @@ def _run_initial_er_root_only_optimization_api_smoke(
                 runtime=baseline_runtime,
             )
 
+        if bool(getattr(args, "initial_er_root_shared_payload_compare_smoke", False)):
+            print(
+                "[autodiff-gate] progress: running initial-Er shared-payload root-only smoke",
+                flush=True,
+            )
+            mixed_terms = tuple(terms) + (
+                LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
+                LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
+                LeastSquaresTerm(geometry_objectives.vmec_aspect_ratio),
+                LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
+                LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
+                LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+            )
+            evaluation = evaluate_geometry_initial_er_root_only_least_squares_fused(
+                config,
+                parameter_set=parameter_set,
+                parameter_values=parameter_values,
+                terms=mixed_terms,
+                geometry_context=geometry_context,
+                runtime=baseline_runtime,
+                baseline_profile_values=profile_values0,
+                pre_root_state_from_profile_values=_pre_root_state_from_profile_values,
+                n_r=int(geom_cfg.get("n_radial", 51)),
+                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(
+                    neoclassical_cfg.get(
+                        "ntx_exact_surface_backend",
+                        neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                    )
+                ),
+                geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+                geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            )
+            result = evaluation.result
+            residuals_np = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+            jacobian_np = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+            objective_values_np = {
+                label: float(np.asarray(jax.device_get(value), dtype=float))
+                for label, value in result.objective_values.items()
+            }
+            report = {
+                "mode": "transport_reverse_ad_only_initial_er_root_shared_payload_smoke",
+                "config_path": str(Path(args.config)),
+                "objective_name": str(args.objective),
+                "objective_order": list(objective_names),
+                "mixed_residual_labels": list(result.residual_labels),
+                "parameter_order": list(result.parameter_labels),
+                "optimization_api_profile_dofs": str(getattr(args, "optimization_api_profile_dofs", "include")),
+                "geometry_parameter_specs": [_format_geometry_param_spec(spec) for spec in geometry_param_specs],
+                "objective_values": objective_values_np,
+                "residuals": residuals_np.tolist(),
+                "jacobian": jacobian_np.tolist(),
+                "initial_er_root_ad": str(args.initial_er_root_ad),
+                "elapsed_s": float(evaluation.elapsed_s),
+            }
+            print(
+                "[autodiff-gate] mode=transport_reverse_ad_only_initial_er_root_shared_payload_smoke "
+                f"objective={args.objective} "
+                f"residual_count={len(result.residual_labels)} "
+                f"parameter_count={len(result.parameter_labels)} "
+                f"elapsed_s={evaluation.elapsed_s:.3f}",
+                flush=True,
+            )
+            print("[autodiff-gate] initial-Er shared-payload residuals/Jacobian rows:")
+            for row_i, label in enumerate(result.residual_labels):
+                print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
+                for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
+                    print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
+            outpath = _report_path("initial_er_root_shared_payload_smoke")
+            outpath.write_text(json.dumps(report, indent=2))
+            print(f"Wrote {outpath.relative_to(ROOT)}")
+            return
+
         table_result = geometry_active_initial_er_root_only_reverse_table(
             config=config,
             objective_names=objective_names,
@@ -3549,6 +3627,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "jacobian": jacobian_np.tolist(),
         "initial_er_root_ad": str(args.initial_er_root_ad),
         "elapsed_s": float(evaluation.elapsed_s),
+        "shared_payload_compare": shared_compare_report,
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only_initial_er_root_only_optimization_api_smoke "
@@ -4330,6 +4409,16 @@ def main() -> None:
         help=(
             "Exercise the initial ambipolar-Er optimization API for Er objectives "
             "without preparing or running the Radau time-evolution solver."
+        ),
+    )
+    parser.add_argument(
+        "--initial-Er-root-shared-payload-compare-smoke",
+        dest="initial_er_root_shared_payload_compare_smoke",
+        action="store_true",
+        help=(
+            "With --initial-Er-root-only-optimization-smoke and realtime geometry "
+            "DOFs, run only the shared-payload/fused root-only path and write "
+            "its own report for offline comparison against saved reference JSON."
         ),
     )
     parser.add_argument(
