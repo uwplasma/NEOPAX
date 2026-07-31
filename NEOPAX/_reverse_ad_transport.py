@@ -282,11 +282,14 @@ class RealtimeGeometryReverseStaticSetup:
 TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "softmax_Er",
     "smooth_root_proxy",
+    "Er_transition_left",
+    "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 )
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",
@@ -553,6 +556,10 @@ def objective_scalar_by_index(final_state, runtime, objective_index: int):
     if objective_name == "smooth_root_proxy":
         rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
         return smooth_root_proxy(er, rho)
+    if objective_name == "Er_transition_left":
+        return er[max(0, min(20, int(er.shape[-1]) - 1))]
+    if objective_name == "Er_transition_right":
+        return er[max(0, min(21, int(er.shape[-1]) - 1))]
     if objective_name == "Er2_volume_average":
         return volume_average(er * er, runtime.geometry)
     if objective_name == "Er_volume_average":

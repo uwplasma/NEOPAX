@@ -106,22 +106,22 @@ Density-shape-power root-only FD comparison:
 | `transport:Er_volume_average` | `-1.0160552610600834e-01` | `-1.0177440000000000e-01` | `1.688739e-04` | `1.659296e-03` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `-1.2293719020797775e-02` | `-1.2295100000000000e-02` | `1.380979e-06` | `1.123195e-04` |
 
-Temperature-shape-power root-only FD comparison:
+Temperature-shape-power root-only frozen-linearized-root FD comparison:
 
 | Objective | Shared-payload AD `d/dtemperature_shape_power` | Root-only FD `d/dtemperature_shape_power` | Abs diff | Rel diff | Status |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `transport:softmax_Er` | `2.2791745736947240e+00` | `2.2795300000000001e+00` | `3.554263e-04` | `1.559209e-04` | ok |
-| `transport:smooth_root_proxy` | `7.1122704574200364e-09` | `6.5422440000000002e-09` | `5.700265e-10` | `8.713011e-02` | tiny derivative |
-| `transport:Er_transition_left` | `-7.2635479673638610e+00` | `-7.2637190000000000e+00` | `1.710326e-04` | `2.354615e-05` | ok |
-| `transport:Er_transition_right` | `-6.3407456901369939e+00` | `-6.3402190000000003e+00` | `5.266901e-04` | `8.307128e-05` | ok |
-| `transport:Er2_volume_average` | `-1.5516698692271390e+01` | `-9.3128990000000008e+03` | `9.297382e+03` | `9.983338e-01` | mismatch |
-| `transport:Er_volume_average` | `-8.1985062107760931e-01` | `2.0701700000000001e+02` | `2.078369e+02` | `1.003960e+00` | mismatch |
-| `transport:bootstrap_current_softmax_abs_scaled` | `1.4395745357398442e+00` | `1.4395710000000002e+00` | `3.535740e-06` | `2.456107e-06` | ok |
+| `transport:softmax_Er` | `2.2791745736947240e+00` | `2.2789550000000001e+00` | `2.195737e-04` | `9.634841e-05` | ok |
+| `transport:smooth_root_proxy` | `7.1122704574200364e-09` | `7.1122720000000004e-09` | `1.542580e-15` | `2.168899e-07` | ok |
+| `transport:Er_transition_left` | `-7.2635479673638610e+00` | `-7.2632740000000002e+00` | `2.739674e-04` | `3.771954e-05` | ok |
+| `transport:Er_transition_right` | `-6.3407456901369939e+00` | `-6.3408630000000001e+00` | `1.173099e-04` | `1.850061e-05` | ok |
+| `transport:Er2_volume_average` | `-1.5516698692271390e+01` | `-1.5516820000000000e+01` | `1.213077e-04` | `7.817821e-06` | ok |
+| `transport:Er_volume_average` | `-8.1985062107760931e-01` | `-8.1985240000000001e-01` | `1.778922e-06` | `2.169808e-06` | ok |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4395745357398442e+00` | `1.4395700000000000e+00` | `4.535740e-06` | `3.150760e-06` | ok |
 
-The `temperature_shape_power` FD check is not uniformly validated yet:
-`softmax_Er`, transition samples, and bootstrap agree, but the root-only
-`Er2_volume_average` and `Er_volume_average` FD rows are inconsistent with the
-saved AD matrix and need a targeted follow-up.
+The `temperature_shape_power` frozen-linearized root FD check validates all
+rows. The earlier selected-root FD lane reselected roots at `p +/- h` and
+produced large mismatches for the two Er volume-average rows; that lane is a
+branch-sensitivity diagnostic, not the AD-branch reference.
 
 ## Existing Full-Transport FD Values
 
