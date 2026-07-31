@@ -46,21 +46,82 @@ Important note:
 
 ## Root-Only Transport / Ambipolarity Objectives
 
-The current saved shared-payload root-only smoke values are:
+The current saved shared-payload root-only smoke values now have matching
+root-only FD references from `benchmark_transport_realtime_geometry_forward_fd.py`
+with `--initial-Er-root-only-fd`.
 
-| Objective | Shared-payload value | Shared-payload `d/dRBC:1:0` | Root-only FD status |
-| --- | ---: | ---: | --- |
-| `transport:softmax_Er` | `2.0479476664720302e+01` | `-5.1293330714789889e+01` | no root-only FD found locally |
-| `transport:smooth_root_proxy` | `8.0591612259350128e-11` | `2.2505242252037452e-09` | no root-only FD found locally |
-| `transport:Er_transition_left` | `1.7657228878480385e+01` | `-2.0079770095990593e+01` | no root-only FD found locally |
-| `transport:Er_transition_right` | `1.8321801837429653e+01` | `-2.2278454387928971e+01` | no root-only FD found locally |
-| `transport:Er2_volume_average` | `2.5947838715347029e+02` | `-1.8476397875085149e+02` | no root-only FD found locally |
-| `transport:Er_volume_average` | `-3.5568787373760746e+00` | `-2.0622727790532899e+01` | no root-only FD found locally |
+| Objective | Shared-payload value | Shared-payload `d/dRBC:1:0` | Root-only FD value | Root-only FD `d/dRBC:1:0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0479476664720302e+01` | `-5.1293330925305824e+01` | `2.0479476574395946e+01` | `-5.1295189999999998e+01` | `1.859075e-03` | `3.624267e-05` |
+| `transport:smooth_root_proxy` | `8.0591612259350128e-11` | `2.2505242258459596e-09` | `8.0591615122458892e-11` | `2.1395930000000002e-09` | `1.109312e-10` | `5.184688e-02` |
+| `transport:Er_transition_left` | `1.7657228878480385e+01` | `-2.0079770135329596e+01` | `1.7657228840367615e+01` | `-2.0054269999999999e+01` | `2.550014e-02` | `1.271556e-03` |
+| `transport:Er_transition_right` | `1.8321801837429653e+01` | `-2.2278454432960640e+01` | `1.8321801790781215e+01` | `-2.2277920000000002e+01` | `5.344330e-04` | `2.398936e-05` |
+| `transport:Er2_volume_average` | `2.5947838715347029e+02` | `-1.8476398068474273e+02` | `2.5946722947647578e+02` | `-1.8458140000000000e+02` | `1.825807e-01` | `9.891608e-04` |
+| `transport:Er_volume_average` | `-3.5568787373760746e+00` | `-2.0622727802587601e+01` | `-3.5566293393826456e+00` | `-2.0614270000000001e+01` | `8.457803e-03` | `4.102887e-04` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3565451497857757e+00` | `-1.7061866715282692e+00` | `1.3565451791686551e+00` | `-1.7058819999999999e+00` | `3.046715e-04` | `1.786006e-04` |
 
-I did not find a saved finite-difference table for the root-only ambipolarity
-path in the local repo docs/outputs. The FD values currently saved in
-`realtime_transport_geometry_reverse_current_state.md` are for the full
-16-accepted-step transport evolution, not the root-only ambipolarity objective.
+The bootstrap current objective is included in this root-only table. The
+`smooth_root_proxy` row has a larger relative difference because the derivative
+is very small; the absolute difference is `1.1e-10`.
+
+Saved shared-payload AD derivative matrix for profile and geometry columns:
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0479476664720302e+01` | `-4.3986401826353054e+00` | `3.6880196309403508e+00` | `-9.7242344747717077e-02` | `2.2791745736947240e+00` | `-5.1293330925305824e+01` |
+| `transport:smooth_root_proxy` | `8.0591612259350128e-11` | `5.1222741603851318e-09` | `-1.8115024386721430e-10` | `2.1916977510205021e-20` | `7.1122704574200364e-09` | `2.2505242258459596e-09` |
+| `transport:Er_transition_left` | `1.7657228878480385e+01` | `-1.4233550838687483e+00` | `1.8190927365914935e+00` | `-1.2379524908495901e-02` | `-7.2635479673638610e+00` | `-2.0079770135329596e+01` |
+| `transport:Er_transition_right` | `1.8321801837429653e+01` | `-1.6478080431210720e+00` | `1.9848280655116410e+00` | `-1.7743713163044173e-02` | `-6.3407456901369939e+00` | `-2.2278454432960640e+01` |
+| `transport:Er2_volume_average` | `2.5947838715347029e+02` | `-1.5277014691028512e+00` | `3.3690713479802625e+01` | `3.9870316779057813e+00` | `-1.5516698692271390e+01` | `-1.8476398068474273e+02` |
+| `transport:Er_volume_average` | `-3.5568787373760746e+00` | `-2.0739439797793513e+00` | `9.3014742407775575e-01` | `-1.0160552610600834e-01` | `-8.1985062107760931e-01` | `-2.0622727802587601e+01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3565451497857757e+00` | `-2.1467313139312133e-03` | `2.1623657522770276e-01` | `-1.2293719020797775e-02` | `1.4395745357398442e+00` | `-1.7061866715282692e+00` |
+| `geometry:boozer_qi_objective` | `3.2109136309506734e-03` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `8.9989229071298027e-02` |
+| `geometry:boozer_maxj_objective` | `1.3389843913753852e-01` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `-1.1593167987268771e+00` |
+| `geometry:vmec_aspect_ratio` | `1.0015330918957178e+01` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `-5.4006784187006147e+00` |
+| `geometry:vmec_iota_mean` | `-5.9365259966101458e-01` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `2.4405140609263865e-01` |
+| `geometry:vmec_magnetic_well` | `-2.7476128749679612e-02` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `-1.1090116065531674e-02` |
+| `geometry:vmec_mirror_ratio` | `2.1153803467163693e-01` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `-5.9359094714046601e-01` |
+
+T0 root-only FD comparison:
+
+| Objective | Shared-payload AD `d/dT0` | Root-only FD `d/dT0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `3.6880196309403508e+00` | `3.6880290000000000e+00` | `9.369060e-06` | `2.540397e-06` |
+| `transport:smooth_root_proxy` | `-1.8115024386721430e-10` | `-1.4743910000000000e-10` | `3.371114e-11` | `2.286445e-01` |
+| `transport:Er_transition_left` | `1.8190927365914935e+00` | `1.8190790000000001e+00` | `1.373659e-05` | `7.551399e-06` |
+| `transport:Er_transition_right` | `1.9848280655116410e+00` | `1.9848350000000001e+00` | `6.934488e-06` | `3.493735e-06` |
+| `transport:Er2_volume_average` | `3.3690713479802625e+01` | `3.3684800000000000e+01` | `5.913480e-03` | `1.755534e-04` |
+| `transport:Er_volume_average` | `9.3014742407775575e-01` | `9.2992190000000003e-01` | `2.255241e-04` | `2.425194e-04` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `2.1623657522770276e-01` | `2.1623760000000000e-01` | `1.024772e-06` | `4.739103e-06` |
+
+Density-shape-power root-only FD comparison:
+
+| Objective | Shared-payload AD `d/ddensity_shape_power` | Root-only FD `d/ddensity_shape_power` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-9.7242344747717077e-02` | `-9.7335660000000000e-02` | `9.331525e-05` | `9.586954e-04` |
+| `transport:smooth_root_proxy` | `2.1916977510205021e-20` | `0.0000000000000000e+00` | `2.191698e-20` | not meaningful |
+| `transport:Er_transition_left` | `-1.2379524908495901e-02` | `-1.5275880000000000e-02` | `2.896355e-03` | `1.896032e-01` |
+| `transport:Er_transition_right` | `-1.7743713163044173e-02` | `-1.7620520000000000e-02` | `1.231932e-04` | `6.991460e-03` |
+| `transport:Er2_volume_average` | `3.9870316779057813e+00` | `3.9871900000000000e+00` | `1.583221e-04` | `3.970769e-05` |
+| `transport:Er_volume_average` | `-1.0160552610600834e-01` | `-1.0177440000000000e-01` | `1.688739e-04` | `1.659296e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.2293719020797775e-02` | `-1.2295100000000000e-02` | `1.380979e-06` | `1.123195e-04` |
+
+Temperature-shape-power root-only FD comparison:
+
+| Objective | Shared-payload AD `d/dtemperature_shape_power` | Root-only FD `d/dtemperature_shape_power` | Abs diff | Rel diff | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `transport:softmax_Er` | `2.2791745736947240e+00` | `2.2795300000000001e+00` | `3.554263e-04` | `1.559209e-04` | ok |
+| `transport:smooth_root_proxy` | `7.1122704574200364e-09` | `6.5422440000000002e-09` | `5.700265e-10` | `8.713011e-02` | tiny derivative |
+| `transport:Er_transition_left` | `-7.2635479673638610e+00` | `-7.2637190000000000e+00` | `1.710326e-04` | `2.354615e-05` | ok |
+| `transport:Er_transition_right` | `-6.3407456901369939e+00` | `-6.3402190000000003e+00` | `5.266901e-04` | `8.307128e-05` | ok |
+| `transport:Er2_volume_average` | `-1.5516698692271390e+01` | `-9.3128990000000008e+03` | `9.297382e+03` | `9.983338e-01` | mismatch |
+| `transport:Er_volume_average` | `-8.1985062107760931e-01` | `2.0701700000000001e+02` | `2.078369e+02` | `1.003960e+00` | mismatch |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4395745357398442e+00` | `1.4395710000000002e+00` | `3.535740e-06` | `2.456107e-06` | ok |
+
+The `temperature_shape_power` FD check is not uniformly validated yet:
+`softmax_Er`, transition samples, and bootstrap agree, but the root-only
+`Er2_volume_average` and `Er_volume_average` FD rows are inconsistent with the
+saved AD matrix and need a targeted follow-up.
 
 ## Existing Full-Transport FD Values
 

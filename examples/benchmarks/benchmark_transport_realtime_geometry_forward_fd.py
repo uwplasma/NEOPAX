@@ -45,6 +45,10 @@ from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     _initial_er_root_only_objective_values,
     normalize_initial_er_root_only_objective_names,
 )
+from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
+    initial_er_charge_flux_residual_er_derivative,
+    initial_er_charge_flux_residuals,
+)
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
     boundary_param_entries,
@@ -73,11 +77,12 @@ def _report_path(parameter_name: str) -> Path:
     return outdir / f"{safe_name}_forward_fd_summary.json"
 
 
-def _root_only_report_path(parameter_name: str) -> Path:
+def _root_only_report_path(parameter_name: str, *, root_fd_lane: str = "selected") -> Path:
     safe_name = parameter_name.replace(":", "_")
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "realtime_geometry_fd"
     outdir.mkdir(parents=True, exist_ok=True)
-    return outdir / f"{safe_name}_initial_er_root_only_fd_summary.json"
+    lane_suffix = "" if str(root_fd_lane) == "selected" else f"_{root_fd_lane}"
+    return outdir / f"{safe_name}_initial_er_root_only_fd{lane_suffix}_summary.json"
 
 
 def _tree_all_finite(tree) -> bool:
@@ -413,6 +418,63 @@ def _initial_er_root_only_objectives(
     return _initial_er_root_only_objective_values(state, runtime, objective_names), state
 
 
+def _initial_er_root_only_frozen_linearized_objectives(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    profile_values,
+    objective_names: tuple[str, ...],
+    baseline_er_profile,
+    baseline_residual,
+    baseline_dres_der,
+):
+    del config
+    pre_root_state = _profile_state_from_values(
+        profile_values,
+        initial_er_root_ad="off",
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+    )
+    residual_at_baseline_er = initial_er_charge_flux_residuals(
+        pre_root_state,
+        jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype),
+        runtime=runtime,
+    )
+    residual_delta = residual_at_baseline_er - jnp.asarray(baseline_residual, dtype=residual_at_baseline_er.dtype)
+    safe_dres_der = jnp.where(
+        jnp.abs(baseline_dres_der) > jnp.asarray(1.0e-30, dtype=residual_delta.dtype),
+        jnp.asarray(baseline_dres_der, dtype=residual_delta.dtype),
+        jnp.inf,
+    )
+    er_profile = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype) - residual_delta / safe_dres_der
+    rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+    return _initial_er_root_only_objective_values(rooted_state, runtime, objective_names), rooted_state
+
+
+def _root_only_er_fd_diagnostics(minus_state, baseline_state, plus_state, h: float) -> dict[str, Any]:
+    er_minus = np.asarray(jax.device_get(minus_state.Er), dtype=float)
+    er_baseline = np.asarray(jax.device_get(baseline_state.Er), dtype=float)
+    er_plus = np.asarray(jax.device_get(plus_state.Er), dtype=float)
+    d_er = (er_plus - er_minus) / (2.0 * float(h))
+    abs_d_er = np.abs(d_er)
+    top_count = int(min(8, abs_d_er.size))
+    top_indices = np.argsort(abs_d_er)[-top_count:][::-1]
+    return {
+        "Er_minus": er_minus.tolist(),
+        "Er_baseline": er_baseline.tolist(),
+        "Er_plus": er_plus.tolist(),
+        "dEr_fd": d_er.tolist(),
+        "dEr_fd_min": float(np.min(d_er)),
+        "dEr_fd_max": float(np.max(d_er)),
+        "dEr_fd_max_abs": float(np.max(abs_d_er)),
+        "dEr_fd_top_abs_indices": [int(index) for index in top_indices.tolist()],
+        "dEr_fd_top_abs_values": [float(d_er[index]) for index in top_indices.tolist()],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -489,6 +551,17 @@ def main() -> None:
             "Stop after the initial ambipolar Er construction and finite-difference "
             "root-only scalar objectives. This reuses the realtime geometry/profile "
             "FD setup in this script but does not run the Radau time evolution."
+        ),
+    )
+    parser.add_argument(
+        "--initial-Er-root-only-fd-root-lane",
+        dest="initial_er_root_only_fd_root_lane",
+        choices=("selected", "frozen_linearized"),
+        default="selected",
+        help=(
+            "Root-only FD oracle. 'selected' reruns the best-root selection at p +/- h. "
+            "'frozen_linearized' freezes the baseline selected root branch and applies "
+            "the same implicit residual linearization used by the AD rule."
         ),
     )
     parser.add_argument(
@@ -617,16 +690,6 @@ def main() -> None:
             minus_profile_values = profile_values
             plus_profile_values = profile_values
 
-        print("[autodiff-gate] progress: running initial-Er root-only fd_minus", flush=True)
-        minus_objectives, minus_rooted_state = _initial_er_root_only_objectives(
-            config=config,
-            runtime=minus_runtime,
-            baseline_state=minus_state,
-            profile_cfg=profile_cfg,
-            profile_values=minus_profile_values,
-            objective_names=objective_names,
-            initial_er_root_ad=initial_er_root_ad,
-        )
         print("[autodiff-gate] progress: running initial-Er root-only baseline", flush=True)
         baseline_objectives, baseline_rooted_state = _initial_er_root_only_objectives(
             config=config,
@@ -637,16 +700,76 @@ def main() -> None:
             objective_names=objective_names,
             initial_er_root_ad=initial_er_root_ad,
         )
+        root_fd_lane = str(args.initial_er_root_only_fd_root_lane)
+        if root_fd_lane == "frozen_linearized":
+            baseline_pre_root_state = _profile_state_from_values(
+                profile_values,
+                initial_er_root_ad="off",
+                runtime=baseline_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+            )
+            baseline_er_profile = jnp.asarray(baseline_rooted_state.Er, dtype=baseline_pre_root_state.Er.dtype)
+            baseline_residual = initial_er_charge_flux_residuals(
+                baseline_pre_root_state,
+                baseline_er_profile,
+                runtime=baseline_runtime,
+            )
+            baseline_dres_der = initial_er_charge_flux_residual_er_derivative(
+                baseline_pre_root_state,
+                baseline_er_profile,
+                runtime=baseline_runtime,
+            )
+            print(
+                "[autodiff-gate] progress: running initial-Er root-only fd_minus "
+                "(frozen-linearized root branch)",
+                flush=True,
+            )
+            minus_objectives, minus_rooted_state = _initial_er_root_only_frozen_linearized_objectives(
+                config=config,
+                runtime=minus_runtime,
+                baseline_state=minus_state,
+                profile_cfg=profile_cfg,
+                profile_values=minus_profile_values,
+                objective_names=objective_names,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
+            )
+        else:
+            print("[autodiff-gate] progress: running initial-Er root-only fd_minus", flush=True)
+            minus_objectives, minus_rooted_state = _initial_er_root_only_objectives(
+                config=config,
+                runtime=minus_runtime,
+                baseline_state=minus_state,
+                profile_cfg=profile_cfg,
+                profile_values=minus_profile_values,
+                objective_names=objective_names,
+                initial_er_root_ad=initial_er_root_ad,
+            )
         print("[autodiff-gate] progress: running initial-Er root-only fd_plus", flush=True)
-        plus_objectives, plus_rooted_state = _initial_er_root_only_objectives(
-            config=config,
-            runtime=plus_runtime,
-            baseline_state=plus_state,
-            profile_cfg=profile_cfg,
-            profile_values=plus_profile_values,
-            objective_names=objective_names,
-            initial_er_root_ad=initial_er_root_ad,
-        )
+        if root_fd_lane == "frozen_linearized":
+            plus_objectives, plus_rooted_state = _initial_er_root_only_frozen_linearized_objectives(
+                config=config,
+                runtime=plus_runtime,
+                baseline_state=plus_state,
+                profile_cfg=profile_cfg,
+                profile_values=plus_profile_values,
+                objective_names=objective_names,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
+            )
+        else:
+            plus_objectives, plus_rooted_state = _initial_er_root_only_objectives(
+                config=config,
+                runtime=plus_runtime,
+                baseline_state=plus_state,
+                profile_cfg=profile_cfg,
+                profile_values=plus_profile_values,
+                objective_names=objective_names,
+                initial_er_root_ad=initial_er_root_ad,
+            )
         minus_objectives, baseline_objectives, plus_objectives = jax.block_until_ready(
             (minus_objectives, baseline_objectives, plus_objectives)
         )
@@ -655,6 +778,12 @@ def main() -> None:
         gradient_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
         minus_np = np.asarray(jax.device_get(minus_objectives), dtype=float)
         plus_np = np.asarray(jax.device_get(plus_objectives), dtype=float)
+        er_fd_diagnostics = _root_only_er_fd_diagnostics(
+            minus_rooted_state,
+            baseline_rooted_state,
+            plus_rooted_state,
+            float(h),
+        )
         report = {
             "mode": "transport_realtime_geometry_initial_er_root_only_forward_fd",
             "config_path": str(Path(args.config)),
@@ -663,6 +792,7 @@ def main() -> None:
             "baseline_value": float(baseline_value),
             "fd_step": float(h),
             "geometry_fd_lane": str(geometry_fd_lane),
+            "root_fd_lane": str(root_fd_lane),
             "geometry_backend": str(config.get("geometry", {}).get("backend")),
             "vmec_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
             "ntx_exact_surface_backend": str(
@@ -674,6 +804,7 @@ def main() -> None:
             "objective_minus": minus_np.tolist(),
             "objective_plus": plus_np.tolist(),
             "gradient_fd": gradient_np.tolist(),
+            "Er_profile_fd_diagnostics": er_fd_diagnostics,
             "baseline_rooted_state_finite": _tree_all_finite(baseline_rooted_state),
             "minus_rooted_state_finite": _tree_all_finite(minus_rooted_state),
             "plus_rooted_state_finite": _tree_all_finite(plus_rooted_state),
@@ -682,7 +813,7 @@ def main() -> None:
             "[autodiff-gate] mode=transport_realtime_geometry_initial_er_root_only_forward_fd "
             f"parameter={parameter_name} parameter_kind={parameter_kind} "
             f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
-            f"geometry_fd_lane={geometry_fd_lane}",
+            f"geometry_fd_lane={geometry_fd_lane} root_fd_lane={root_fd_lane}",
             flush=True,
         )
         print("[autodiff-gate] initial-Er root-only objective values:")
@@ -691,7 +822,19 @@ def main() -> None:
         print("[autodiff-gate] initial-Er root-only finite-difference gradients:")
         for label, value in zip(objective_names, gradient_np.tolist()):
             print(f"  - {label}: fd={float(value):.6e}")
-        outpath = _root_only_report_path(parameter_name)
+        print(
+            "[autodiff-gate] initial-Er root-only dEr/dr_param profile diagnostic: "
+            f"min={er_fd_diagnostics['dEr_fd_min']:.6e} "
+            f"max={er_fd_diagnostics['dEr_fd_max']:.6e} "
+            f"max_abs={er_fd_diagnostics['dEr_fd_max_abs']:.6e}"
+        )
+        print("[autodiff-gate] initial-Er root-only largest |dEr/dr_param| radial indices:")
+        for index, value in zip(
+            er_fd_diagnostics["dEr_fd_top_abs_indices"],
+            er_fd_diagnostics["dEr_fd_top_abs_values"],
+        ):
+            print(f"  - i={index}: dEr_fd={value:.6e}")
+        outpath = _root_only_report_path(parameter_name, root_fd_lane=root_fd_lane)
         outpath.write_text(json.dumps(report, indent=2))
         print(f"Wrote {outpath.relative_to(ROOT)}")
         return

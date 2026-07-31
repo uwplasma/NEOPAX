@@ -90,11 +90,14 @@ PROFILE_VECTOR_PARAMETERS = ("n0", "T0", "density_shape_power", "temperature_sha
 OBJECTIVE_LABELS = [
     "softmax_Er",
     "smooth_root_proxy",
+    "Er_transition_left",
+    "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 ]
 DEFAULT_FD_SWEEP_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
 STANDALONE_SUBSOLVE_LABELS = [
@@ -340,6 +343,8 @@ def _bootstrap_current_softmax_abs_scaled(
 def _objective_vector(final_state, runtime) -> jax.Array:
     er = jnp.asarray(final_state.Er)
     rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
+    transition_left = er[max(0, min(20, int(er.shape[-1]) - 1))]
+    transition_right = er[max(0, min(21, int(er.shape[-1]) - 1))]
     er2_vol = _volume_average(er * er, runtime.geometry)
     er_vol = _volume_average(er, runtime.geometry)
     te_vol = _electron_temperature_volume_average(final_state, runtime)
@@ -350,6 +355,8 @@ def _objective_vector(final_state, runtime) -> jax.Array:
         [
             _softmax_objective(er),
             _smooth_root_proxy(er, rho),
+            transition_left,
+            transition_right,
             er2_vol,
             er_vol,
             te_vol,
