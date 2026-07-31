@@ -519,19 +519,30 @@ def bootstrap_current_softmax_abs_scaled(
     A value of 0.1 corresponds to 10 kA/m^2 in physical current density.
     """
 
-    if runtime.database is None:
-        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
-    _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
-        runtime.species,
-        runtime.energy_grid,
-        runtime.geometry,
-        runtime.database,
-        jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
-        jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
-        jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
-    )
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    if flux_model is not None:
+        fluxes = flux_model(final_state)
+        upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
+    else:
+        upar = None
+    if upar is None:
+        if runtime.database is None:
+            return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+        _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
+            runtime.species,
+            runtime.energy_grid,
+            runtime.geometry,
+            runtime.database,
+            jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
+            jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
+            jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
+        )
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
-    jboot = jnp.sum(jnp.asarray(upar, dtype=final_state.pressure.dtype) * charge_qp[None, :], axis=1)
+    upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)
+    if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+        jboot = jnp.sum(upar_arr * charge_qp[:, None], axis=0)
+    else:
+        jboot = jnp.sum(upar_arr * charge_qp[None, :], axis=1)
     jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
     smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
     beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
