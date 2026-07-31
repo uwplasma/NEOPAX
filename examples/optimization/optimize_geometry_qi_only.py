@@ -101,12 +101,19 @@ def iteration_diagnostics(evaluation):
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
     }
+
+    def value(*labels):
+        for label in labels:
+            if label in values:
+                return values[label]
+        return np.nan
+
     return (
-        f"aspect_ratio={values.get('vmec_aspect_ratio', np.nan):.8e} "
-        f"iota_mean={values.get('vmec_iota_mean', np.nan):.8e} "
-        f"magnetic_well={values.get('vmec_magnetic_well', np.nan):.8e} "
-        f"qi_cost={values.get('boozer_qi_objective', np.nan):.8e} "
-        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e}"
+        f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
+        f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
+        f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
+        f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
+        f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e}"
     )
 
 

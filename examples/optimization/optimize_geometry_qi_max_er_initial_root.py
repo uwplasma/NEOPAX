@@ -61,6 +61,7 @@ GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
 
 MAKE_WOUT_PLOTS = True
+SAVE_INITIAL_ER_PROFILE_EARLY = False
 
 
 # --------------------------- objective functions ---------------------------
@@ -85,13 +86,20 @@ def iteration_diagnostics(evaluation):
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
     }
+
+    def value(*labels):
+        for label in labels:
+            if label in values:
+                return values[label]
+        return np.nan
+
     return (
-        f"aspect_ratio={values.get('vmec_aspect_ratio', np.nan):.8e} "
-        f"iota_mean={values.get('vmec_iota_mean', np.nan):.8e} "
-        f"magnetic_well={values.get('vmec_magnetic_well', np.nan):.8e} "
-        f"qi_cost={values.get('boozer_qi_objective', np.nan):.8e} "
-        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e} "
-        f"softmax_Er={values.get('softmax_Er', np.nan):.8e}"
+        f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
+        f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
+        f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
+        f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
+        f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
+        f"softmax_Er={value('transport:softmax_Er', 'softmax_Er'):.8e}"
     )
 
 
@@ -184,6 +192,7 @@ def main() -> int:
     initial_input = None
     initial_problem = None
     initial_x = None
+    initial_er_profile_saved = False
     last_problem = None
     last_result = None
 
@@ -216,6 +225,11 @@ def main() -> int:
             initial_problem = problem
             initial_x = np.asarray(x, dtype=float).copy()
             initial_input = problem.input_from_scaled_parameters(x)
+            if SAVE_INITIAL_ER_PROFILE_EARLY and not initial_er_profile_saved:
+                initial_dir = OUT_DIR / "initial"
+                initial_dir.mkdir(parents=True, exist_ok=True)
+                save_er_profile(problem, x, initial_dir, "initial")
+                initial_er_profile_saved = True
         report("initial", problem, x)
         last_result = opt.least_squares(
             problem,
