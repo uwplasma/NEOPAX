@@ -3483,6 +3483,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "[autodiff-gate] progress: running initial-Er root-only optimization API smoke",
         flush=True,
     )
+    shared_compare_report = None
     if not include_geometry_dofs:
         runner = build_initial_er_root_only_least_squares_runner(
             config,
