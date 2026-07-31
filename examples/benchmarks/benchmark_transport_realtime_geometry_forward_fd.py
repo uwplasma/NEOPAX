@@ -40,6 +40,11 @@ from benchmark_transport_reverse_ad_only import (  # noqa: E402
     _initial_er_root_ad_mode,
     _runtime_with_ntx_support_payload,
 )
+from NEOPAX._reverse_ad_optimization import (  # noqa: E402
+    INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES,
+    _initial_er_root_only_objective_values,
+    normalize_initial_er_root_only_objective_names,
+)
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
     boundary_param_entries,
@@ -66,6 +71,13 @@ def _report_path(parameter_name: str) -> Path:
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "realtime_geometry_fd"
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir / f"{safe_name}_forward_fd_summary.json"
+
+
+def _root_only_report_path(parameter_name: str) -> Path:
+    safe_name = parameter_name.replace(":", "_")
+    outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "realtime_geometry_fd"
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir / f"{safe_name}_initial_er_root_only_fd_summary.json"
 
 
 def _tree_all_finite(tree) -> bool:
@@ -374,6 +386,33 @@ def _geometry_fd_objectives(
     )
 
 
+def _root_only_objective_names(raw: str) -> tuple[str, ...]:
+    if str(raw).strip().lower() == "all":
+        return INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES
+    return normalize_initial_er_root_only_objective_names(raw)
+
+
+def _initial_er_root_only_objectives(
+    *,
+    config: dict[str, Any],
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    profile_values,
+    objective_names: tuple[str, ...],
+    initial_er_root_ad: str,
+):
+    state = _profile_state_from_values(
+        profile_values,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+    )
+    return _initial_er_root_only_objective_values(state, runtime, objective_names), state
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -442,6 +481,25 @@ def main() -> None:
             "profile with the same JAX-returning path used by the reverse benchmark."
         ),
     )
+    parser.add_argument(
+        "--initial-Er-root-only-fd",
+        dest="initial_er_root_only_fd",
+        action="store_true",
+        help=(
+            "Stop after the initial ambipolar Er construction and finite-difference "
+            "root-only scalar objectives. This reuses the realtime geometry/profile "
+            "FD setup in this script but does not run the Radau time evolution."
+        ),
+    )
+    parser.add_argument(
+        "--root-only-objective",
+        default="all",
+        help=(
+            "Comma-separated initial-Er root-only objectives for "
+            "--initial-Er-root-only-fd, or 'all'. Choices are: "
+            + ", ".join(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
+        ),
+    )
     args = parser.parse_args()
     initial_er_root_ad = _initial_er_root_ad_mode(args.initial_er_root_ad)
 
@@ -475,7 +533,8 @@ def main() -> None:
     parameter_name = str(args.parameter)
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
     parameter_is_profile = parameter_name in PARAMETER_ORDER
-    if parameter_is_profile and initial_er_root_ad != "off":
+    root_only_fd = bool(args.initial_er_root_only_fd)
+    if parameter_is_profile and initial_er_root_ad != "off" and not root_only_fd:
         raise SystemExit(
             "[autodiff-gate] --initial-Er-root-ad is currently wired only for "
             "realtime-geometry FD parameters in this script."
@@ -499,11 +558,143 @@ def main() -> None:
     baseline_profile_state = _profile_state_from_values(
         profile_values,
         config=config,
-        initial_er_root_ad=initial_er_root_ad,
+        initial_er_root_ad="off" if root_only_fd else initial_er_root_ad,
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
     )
+
+    if root_only_fd:
+        if initial_er_root_ad == "off":
+            raise SystemExit(
+                "[autodiff-gate] --initial-Er-root-only-fd requires "
+                "--initial-Er-root-ad jax_selected_root."
+            )
+        objective_names = _root_only_objective_names(str(args.root_only_objective))
+        if parameter_is_profile:
+            parameter_kind = "profile"
+            param_index = PARAMETER_ORDER.index(parameter_name)
+            baseline_value = float(profile_cfg[parameter_name])
+            h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+            minus_runtime = baseline_runtime
+            plus_runtime = baseline_runtime
+            minus_state = baseline_state
+            plus_state = baseline_state
+            minus_profile_values = profile_values.at[param_index].set(
+                jnp.asarray(baseline_value - h, dtype=profile_values.dtype)
+            )
+            plus_profile_values = profile_values.at[param_index].set(
+                jnp.asarray(baseline_value + h, dtype=profile_values.dtype)
+            )
+        else:
+            parameter_kind = "realtime_geometry"
+            geom_cfg = config.get("geometry", {})
+            baseline_value = float(geom_cfg.get("vmec_param_delta", 0.0))
+            if geometry_fd_lane == "frozen_linearized":
+                if frozen_linearized_bundle is None:
+                    raise ValueError("Missing frozen-linearized geometry bundle.")
+                step_scale_value = float(frozen_linearized_bundle["coefficient_value"])
+            else:
+                geometry_context = _geometry_context_from_config(config, parameter_name)
+                specs = _geometry_param_specs_from_parameter_name(parameter_name)
+                (entry,) = boundary_param_entries(geometry_context, specs)
+                step_scale_value = float(entry["baseline_coefficient"]) + baseline_value
+            h = _fd_step(step_scale_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
+            if geometry_fd_lane == "frozen_linearized":
+                minus_runtime, minus_state = _runtime_for_frozen_linearized_geometry_step(
+                    config,
+                    frozen_linearized_bundle,
+                    step_scale=(baseline_value - h) - baseline_value,
+                )
+                plus_runtime, plus_state = _runtime_for_frozen_linearized_geometry_step(
+                    config,
+                    frozen_linearized_bundle,
+                    step_scale=(baseline_value + h) - baseline_value,
+                )
+            else:
+                minus_runtime, minus_state = _runtime_for_geometry_delta(config, parameter_name, baseline_value - h)
+                plus_runtime, plus_state = _runtime_for_geometry_delta(config, parameter_name, baseline_value + h)
+            minus_profile_values = profile_values
+            plus_profile_values = profile_values
+
+        print("[autodiff-gate] progress: running initial-Er root-only fd_minus", flush=True)
+        minus_objectives, minus_rooted_state = _initial_er_root_only_objectives(
+            config=config,
+            runtime=minus_runtime,
+            baseline_state=minus_state,
+            profile_cfg=profile_cfg,
+            profile_values=minus_profile_values,
+            objective_names=objective_names,
+            initial_er_root_ad=initial_er_root_ad,
+        )
+        print("[autodiff-gate] progress: running initial-Er root-only baseline", flush=True)
+        baseline_objectives, baseline_rooted_state = _initial_er_root_only_objectives(
+            config=config,
+            runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            profile_values=profile_values,
+            objective_names=objective_names,
+            initial_er_root_ad=initial_er_root_ad,
+        )
+        print("[autodiff-gate] progress: running initial-Er root-only fd_plus", flush=True)
+        plus_objectives, plus_rooted_state = _initial_er_root_only_objectives(
+            config=config,
+            runtime=plus_runtime,
+            baseline_state=plus_state,
+            profile_cfg=profile_cfg,
+            profile_values=plus_profile_values,
+            objective_names=objective_names,
+            initial_er_root_ad=initial_er_root_ad,
+        )
+        minus_objectives, baseline_objectives, plus_objectives = jax.block_until_ready(
+            (minus_objectives, baseline_objectives, plus_objectives)
+        )
+        gradient_fd = jax.block_until_ready((plus_objectives - minus_objectives) / (2.0 * h))
+        baseline_np = np.asarray(jax.device_get(baseline_objectives), dtype=float)
+        gradient_np = np.asarray(jax.device_get(gradient_fd), dtype=float)
+        minus_np = np.asarray(jax.device_get(minus_objectives), dtype=float)
+        plus_np = np.asarray(jax.device_get(plus_objectives), dtype=float)
+        report = {
+            "mode": "transport_realtime_geometry_initial_er_root_only_forward_fd",
+            "config_path": str(Path(args.config)),
+            "parameter_name": parameter_name,
+            "parameter_kind": parameter_kind,
+            "baseline_value": float(baseline_value),
+            "fd_step": float(h),
+            "geometry_fd_lane": str(geometry_fd_lane),
+            "geometry_backend": str(config.get("geometry", {}).get("backend")),
+            "vmec_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
+            "ntx_exact_surface_backend": str(
+                config.get("neoclassical", {}).get("ntx_exact_surface_backend", "booz")
+            ),
+            "initial_er_root_ad": str(initial_er_root_ad),
+            "objective_labels": list(objective_names),
+            "objective_values": baseline_np.tolist(),
+            "objective_minus": minus_np.tolist(),
+            "objective_plus": plus_np.tolist(),
+            "gradient_fd": gradient_np.tolist(),
+            "baseline_rooted_state_finite": _tree_all_finite(baseline_rooted_state),
+            "minus_rooted_state_finite": _tree_all_finite(minus_rooted_state),
+            "plus_rooted_state_finite": _tree_all_finite(plus_rooted_state),
+        }
+        print(
+            "[autodiff-gate] mode=transport_realtime_geometry_initial_er_root_only_forward_fd "
+            f"parameter={parameter_name} parameter_kind={parameter_kind} "
+            f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
+            f"geometry_fd_lane={geometry_fd_lane}",
+            flush=True,
+        )
+        print("[autodiff-gate] initial-Er root-only objective values:")
+        for label, value in zip(objective_names, baseline_np.tolist()):
+            print(f"  - {label}: value={float(value):.16e}")
+        print("[autodiff-gate] initial-Er root-only finite-difference gradients:")
+        for label, value in zip(objective_names, gradient_np.tolist()):
+            print(f"  - {label}: fd={float(value):.6e}")
+        outpath = _root_only_report_path(parameter_name)
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
+        return
 
     print("[autodiff-gate] progress: running baseline realtime rollout for FD trace", flush=True)
     baseline_components, baseline_rollout, _baseline_final_state = _schedule_rollout(
