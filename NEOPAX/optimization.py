@@ -15,9 +15,16 @@ import numpy as np
 from ._geometry_autodiff import (
     _input_with_boundary_deltas,
     boundary_param_entries,
+    build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_geometry_autodiff_context,
+    geometry_raw_block_solve_from_param_vector,
 )
 from ._orchestrator import build_runtime_context
+from ._reverse_ad_initial_er import (
+    initial_er_selected_root_profile,
+    runtime_with_geometry_payload,
+    runtime_with_ntx_support_payload,
+)
 from ._reverse_ad_optimization import (
     LeastSquaresEvaluation,
     LeastSquaresResult,
@@ -312,6 +319,54 @@ class GeometryInitialErRootLeastSquaresProblem:
         )
         entries = boundary_param_entries(self.context, self.geometry_parameterization.vmec_tuples)
         return _input_with_boundary_deltas(self.context, geometry_values, entries)
+
+    def initial_er_profile_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, selected initial ambipolar Er, and finite mask for optimizer variables."""
+
+        scaled_values = self.x0 if scaled_parameter_values is None else jnp.asarray(
+            scaled_parameter_values,
+            dtype=jnp.float64,
+        )
+        physical_values = self._scaled_to_physical(scaled_values)
+        profile_values = list(jnp.asarray(self.baseline_profile_values, dtype=jnp.float64))
+        geometry_values = []
+        profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        for i, spec in enumerate(self.parameter_set.specs):
+            if isinstance(spec, ProfileParameterSpec):
+                profile_values[profile_lookup[spec.name]] = physical_values[i]
+            else:
+                geometry_values.append(physical_values[i])
+        profile_values = jnp.asarray(profile_values, dtype=jnp.float64)
+        runtime_for_geometry = self.runtime
+        if geometry_values:
+            geometry_values = jnp.asarray(geometry_values, dtype=jnp.float64)
+            if not bool(np.allclose(np.asarray(jax.device_get(geometry_values), dtype=float), 0.0)):
+                raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                    self.context,
+                    geometry_values,
+                    tuple(spec.as_tuple() for spec in self.parameter_set.vmec_boundary_specs),
+                    max_iter=self.geometry_max_iter,
+                    solver_device=self.geometry_solver_device,
+                )
+                payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                    self.context,
+                    raw_block_solve.state,
+                    n_r=self.n_r,
+                    n_theta=self.n_theta,
+                    n_zeta=self.n_zeta,
+                    n_xi=self.n_xi,
+                    surface_backend=self.surface_backend,
+                )
+                runtime_for_geometry = runtime_with_geometry_payload(runtime_for_geometry, payload["geometry"])
+                runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, payload["ntx_support"])
+        pre_root_state = self._pre_root_state_from_profile_values(profile_values)
+        er_profile, finite_mask = initial_er_selected_root_profile(
+            pre_root_state,
+            config=dict(self.config),
+            runtime=runtime_for_geometry,
+        )
+        rho_grid = jnp.asarray(runtime_for_geometry.geometry.rho_grid, dtype=jnp.asarray(er_profile).dtype)
+        return rho_grid, er_profile, finite_mask
 
 
 def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
@@ -742,6 +797,7 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
 
     from scipy.optimize import least_squares as scipy_least_squares
 
+    iteration_reporter = kwargs.pop("iteration_reporter", None)
     cache: dict[tuple[float, ...], LeastSquaresEvaluation] = {}
     verbose = int(kwargs.get("verbose", 0) or 0)
     state: dict[str, object] = {"nres": None, "npar": problem.parameter_count, "eval_count": 0}
@@ -777,9 +833,14 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         state["eval_count"] = int(state["eval_count"]) + 1
         if verbose:
             cost = 0.5 * float(residuals @ residuals)
+            details = ""
+            if iteration_reporter is not None:
+                details_text = str(iteration_reporter(_evaluate(x))).strip()
+                if details_text:
+                    details = f" {details_text}"
             print(
                 f"[NEOPAX least_squares] eval={int(state['eval_count'])} "
-                f"cost={cost:.6e} residual_norm={float(np.linalg.norm(residuals)):.6e}",
+                f"cost={cost:.6e} residual_norm={float(np.linalg.norm(residuals)):.6e}{details}",
                 flush=True,
             )
         return residuals

@@ -1853,6 +1853,13 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 ],
                 axis=0,
             )
+            transport_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                geometry_context,
+                vmec_parameter_values,
+                tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+            )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
                 objective_names=INITIAL_ER_ROOT_ONLY_OBJECTIVES,
@@ -1862,7 +1869,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
                 geometry_context=geometry_context,
-                baseline_geometry_deltas=vmec_parameter_values,
+                baseline_geometry_deltas=jnp.zeros_like(vmec_parameter_values),
                 n_r=int(n_r),
                 n_theta=int(n_theta),
                 n_zeta=int(n_zeta),
@@ -1871,6 +1878,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
+                raw_block_solve=transport_raw_block_solve,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

@@ -96,6 +96,20 @@ qi_terms = [
 
 
 # --------------------------- reporting / plots ------------------------------
+def iteration_diagnostics(evaluation):
+    values = {
+        label: float(np.asarray(jax.device_get(value), dtype=float))
+        for label, value in evaluation.result.objective_values.items()
+    }
+    return (
+        f"aspect_ratio={values.get('vmec_aspect_ratio', np.nan):.8e} "
+        f"iota_mean={values.get('vmec_iota_mean', np.nan):.8e} "
+        f"magnetic_well={values.get('vmec_magnetic_well', np.nan):.8e} "
+        f"qi_cost={values.get('boozer_qi_objective', np.nan):.8e} "
+        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e}"
+    )
+
+
 def report(tag, problem, x):
     evaluation = problem.evaluate(x)
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
@@ -104,7 +118,7 @@ def report(tag, problem, x):
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
     }
-    print(f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f}")
+    print(f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f} {iteration_diagnostics(evaluation)}")
     for label, value in values.items():
         print(f"  - {label}: value={value:.16e}")
     print(f"  residual_norm={float(np.linalg.norm(residuals)):.6e}")
@@ -175,23 +189,33 @@ def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.
             print(f"wrote {path}")
 
 
-def write_outputs(optimized_input):
+def write_geometry_artifacts(input_obj, label):
+    artifact_dir = OUT_DIR / label
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    input_path = artifact_dir / f"input.QI_neopax_geometry_{label}"
+    input_obj.to_indata(input_path)
+    print(f"wrote {input_path}")
+
+    eq = vmex_opt.solve_equilibrium(input_obj)
+    wout_path = vj.write_wout(artifact_dir / f"wout_QI_neopax_geometry_{label}.nc", eq.wout)
+    print(f"wrote {wout_path}")
+    if MAKE_WOUT_PLOTS:
+        for _, path in vj.plot_wout(wout_path, artifact_dir).items():
+            print(f"wrote {path}")
+    if MAKE_J_POLAR_PLOTS:
+        plot_j_polar_contours(eq, artifact_dir)
+
+
+def write_outputs(optimized_input, initial_input):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed_copy = OUT_DIR / SEED_INPUT.name
     optimized_input_path = OUT_DIR / "input.QI_neopax_geometry_optimized"
-    optimized_input.to_indata(seed_copy)
+    initial_input.to_indata(seed_copy)
     optimized_input.to_indata(optimized_input_path)
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
-
-    eq = vmex_opt.solve_equilibrium(optimized_input)
-    wout_path = vj.write_wout(OUT_DIR / "wout_QI_neopax_geometry_optimized.nc", eq.wout)
-    print(f"wrote {wout_path}")
-    if MAKE_WOUT_PLOTS:
-        for _, path in vj.plot_wout(wout_path, OUT_DIR).items():
-            print(f"wrote {path}")
-    if MAKE_J_POLAR_PLOTS:
-        plot_j_polar_contours(eq, OUT_DIR)
+    write_geometry_artifacts(initial_input, "initial")
+    write_geometry_artifacts(optimized_input, "optimized")
 
 
 # --------------------------- continuation ladder ----------------------------
@@ -201,6 +225,7 @@ def main() -> int:
     x = None
     current_input = SEED_INPUT
     optimized_input = None
+    initial_input = None
     last_problem = None
     last_result = None
 
@@ -227,6 +252,8 @@ def main() -> int:
             f"parameters={list(problem.parameter_labels)}",
             flush=True,
         )
+        if initial_input is None:
+            initial_input = problem.input_from_scaled_parameters(x)
         report("initial", problem, x)
         last_result = opt.least_squares(
             problem,
@@ -234,6 +261,7 @@ def main() -> int:
             ftol=FTOL,
             xtol=XTOL,
             verbose=1,
+            iteration_reporter=iteration_diagnostics,
         )
         x = np.asarray(last_result.x, dtype=float)
         report(f"QI stage {max_mode}", problem, x)
@@ -260,8 +288,8 @@ def main() -> int:
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
-    if optimized_input is not None:
-        write_outputs(optimized_input)
+    if optimized_input is not None and initial_input is not None:
+        write_outputs(optimized_input, initial_input)
     return 0
 
 

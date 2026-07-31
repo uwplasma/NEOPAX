@@ -80,6 +80,21 @@ terms = [
 
 
 # --------------------------- reporting / outputs ---------------------------
+def iteration_diagnostics(evaluation):
+    values = {
+        label: float(np.asarray(jax.device_get(value), dtype=float))
+        for label, value in evaluation.result.objective_values.items()
+    }
+    return (
+        f"aspect_ratio={values.get('vmec_aspect_ratio', np.nan):.8e} "
+        f"iota_mean={values.get('vmec_iota_mean', np.nan):.8e} "
+        f"magnetic_well={values.get('vmec_magnetic_well', np.nan):.8e} "
+        f"qi_cost={values.get('boozer_qi_objective', np.nan):.8e} "
+        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e} "
+        f"softmax_Er={values.get('softmax_Er', np.nan):.8e}"
+    )
+
+
 def report(tag, problem, x):
     evaluation = problem.evaluate(x)
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
@@ -88,7 +103,7 @@ def report(tag, problem, x):
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
     }
-    print(f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f}")
+    print(f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f} {iteration_diagnostics(evaluation)}")
     for label, value in values.items():
         print(f"  - {label}: value={value:.16e}")
     print(f"  residual_norm={float(np.linalg.norm(residuals)):.6e}")
@@ -96,21 +111,67 @@ def report(tag, problem, x):
     return evaluation
 
 
-def write_outputs(optimized_input):
+def save_er_profile(problem, x, out_dir, label):
+    rho, er, finite_mask = problem.initial_er_profile_from_scaled_parameters(x)
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    er_np = np.asarray(jax.device_get(er), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    csv_path = out_dir / f"initial_er_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack([rho_np, er_np, finite_np.astype(float)]),
+        delimiter=",",
+        header="rho,Er,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping Er profile plot: {exc}")
+        return
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(rho_np, er_np, marker="o", linewidth=1.5)
+    ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("rho")
+    ax.set_ylabel("Er")
+    ax.set_title(f"Selected initial ambipolar Er profile ({label})")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    png_path = out_dir / f"initial_er_profile_{label}.png"
+    fig.savefig(png_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def write_geometry_artifacts(input_obj, label):
+    artifact_dir = OUT_DIR / label
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    input_path = artifact_dir / f"input.QI_neopax_geometry_max_er_{label}"
+    input_obj.to_indata(input_path)
+    print(f"wrote {input_path}")
+
+    eq = vmex_opt.solve_equilibrium(input_obj)
+    wout_path = vj.write_wout(artifact_dir / f"wout_QI_neopax_geometry_max_er_{label}.nc", eq.wout)
+    print(f"wrote {wout_path}")
+    if MAKE_WOUT_PLOTS:
+        for _, path in vj.plot_wout(wout_path, artifact_dir).items():
+            print(f"wrote {path}")
+    return artifact_dir
+
+
+def write_outputs(optimized_input, initial_input, initial_problem, initial_x, final_problem, final_x):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed_copy = OUT_DIR / SEED_INPUT.name
     optimized_input_path = OUT_DIR / "input.QI_neopax_geometry_max_er_optimized"
-    optimized_input.to_indata(seed_copy)
+    initial_input.to_indata(seed_copy)
     optimized_input.to_indata(optimized_input_path)
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
-
-    eq = vmex_opt.solve_equilibrium(optimized_input)
-    wout_path = vj.write_wout(OUT_DIR / "wout_QI_neopax_geometry_max_er_optimized.nc", eq.wout)
-    print(f"wrote {wout_path}")
-    if MAKE_WOUT_PLOTS:
-        for _, path in vj.plot_wout(wout_path, OUT_DIR).items():
-            print(f"wrote {path}")
+    initial_dir = write_geometry_artifacts(initial_input, "initial")
+    optimized_dir = write_geometry_artifacts(optimized_input, "optimized")
+    save_er_profile(initial_problem, initial_x, initial_dir, "initial")
+    save_er_profile(final_problem, final_x, optimized_dir, "optimized")
 
 
 # --------------------------- continuation ladder ----------------------------
@@ -120,6 +181,9 @@ def main() -> int:
     x = None
     current_input = SEED_INPUT
     optimized_input = None
+    initial_input = None
+    initial_problem = None
+    initial_x = None
     last_problem = None
     last_result = None
 
@@ -148,6 +212,10 @@ def main() -> int:
             f"parameters={list(problem.parameter_labels)}",
             flush=True,
         )
+        if initial_problem is None:
+            initial_problem = problem
+            initial_x = np.asarray(x, dtype=float).copy()
+            initial_input = problem.input_from_scaled_parameters(x)
         report("initial", problem, x)
         last_result = opt.least_squares(
             problem,
@@ -155,6 +223,7 @@ def main() -> int:
             ftol=FTOL,
             xtol=XTOL,
             verbose=1,
+            iteration_reporter=iteration_diagnostics,
         )
         x = np.asarray(last_result.x, dtype=float)
         report(f"QI + max-Er stage {max_mode}", problem, x)
@@ -166,7 +235,14 @@ def main() -> int:
         x = None
         last_problem = problem
 
-    if optimized_input is None or last_problem is None or last_result is None:
+    if (
+        optimized_input is None
+        or initial_input is None
+        or initial_problem is None
+        or initial_x is None
+        or last_problem is None
+        or last_result is None
+    ):
         raise RuntimeError("No optimization stage was executed.")
 
     summary = {
@@ -183,7 +259,14 @@ def main() -> int:
     summary_path = OUT_DIR / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
-    write_outputs(optimized_input)
+    write_outputs(
+        optimized_input,
+        initial_input,
+        initial_problem,
+        initial_x,
+        last_problem,
+        np.asarray(last_result.x, dtype=float),
+    )
     return 0
 
 

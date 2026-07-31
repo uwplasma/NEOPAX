@@ -658,3 +658,105 @@ payload_bar dot d(payload)/d(parameter)
 but it computes it by JVP rather than by VJP-to-state followed by raw-block transpose.
 - Because that changes AD execution order, derivative values must be rechecked against the benchmark-good references before this path is trusted for optimization.
 - Do not modify benchmark scripts as a workaround. If further failures occur, fix the internal compact path or explicitly fall back to benchmark-table behavior.
+
+## Current State: 2026-07-31 Compact Optimization Pullback Running
+
+Latest status:
+
+- `examples/optimization/optimize_geometry_qi_max_er_initial_root.py` now runs past the previous OOM and tracer/static-metadata failures.
+- The optimization path enters the intended compact tangent-contraction route:
+
+```text
+[optimization] initial-Er root geometry payload pullback: compact_payload_tangent_contract=True
+[optimization] initial-Er root geometry payload pullback: raw_block_param_bar_all_finite=True
+```
+
+Observed initial run excerpt:
+
+```text
+max_mode=1
+parameter_count=8
+parameters=[
+  RBC:0:1, RBC:1:-1, RBC:1:0, RBC:1:1,
+  ZBS:0:1, ZBS:1:-1, ZBS:1:0, ZBS:1:1
+]
+
+initial elapsed_s=303.518
+geometry:boozer_qi_objective        2.0475085800096847e-02
+geometry:boozer_maxj_objective      5.5724338478421238e-02
+geometry:vmec_mirror_ratio          2.0637638636935299e-01
+geometry:vmec_aspect_ratio          9.9971624846684968e+00
+geometry:vmec_iota_mean            -5.4821690487569552e-01
+transport:softmax_Er                2.1889949774620024e-01
+residual_norm                       2.979072e+01
+jacobian_shape                      (6, 8)
+```
+
+Least-squares iterations started and printed:
+
+```text
+[NEOPAX least_squares] eval=1 cost=4.437434e+02 residual_norm=2.979072e+01
+[NEOPAX least_squares] eval=2 cost=6.942995e+03 residual_norm=1.178388e+02
+[NEOPAX least_squares] eval=3 cost=4.449269e+02 residual_norm=2.983042e+01
+```
+
+Static/JVP transform fixes applied in `NEOPAX/_geometry_autodiff.py`:
+
+- Precompute geometry Boozer sample radii outside the JVP'd geometry builder.
+- Precompute Boozer surface indices/sample rho outside the JVP'd geometry builder.
+- Precompute Boozer constants/grids outside the JVP'd geometry builder.
+- Precompute Boozer `(m,n)=(0,0)` and `(1,0)` mode indices outside the JVP'd geometry builder.
+- Keep fallback behavior for normal/non-compact callers.
+
+Why this was needed:
+
+- The compact optimization route computes:
+
+```text
+VMEC parameter tangent -> state tangent -> JVP(payload) -> bar dot tangent
+```
+
+- Therefore `_build_neopax_geometry_from_state(...)` runs under JAX transforms.
+- Static setup that was harmless in concrete primal/benchmark staging becomes illegal under JVP if it calls Python `int`, `float`, `bool`, NumPy conversion, or dynamic `jnp.unique` on traced values.
+
+Immediate validation still required:
+
+1. Let the optimization script finish or stop at the planned `NFEV`.
+2. Re-run the root-only benchmark smoke:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke
+```
+
+3. Re-run the 2-step internal realtime-geometry reverse smoke:
+
+```bash
+python ./examples/optimization/transport_realtime_geometry_reverse_smoke.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --accepted-step-limit 2 \
+  --reverse-segment-length 1 \
+  --initial-Er-root-ad jax_selected_root \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --radau-jacobian-reuse-mode legacy \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --hide-solver-iterations
+```
+
+4. Compare derivative rows against saved benchmark-good values before trusting optimization results.
+
+Open performance note:
+
+- The first evaluation still has large compile/setup cost.
+- Subsequent evaluations are much faster for Boozer/J-invariant pieces, but the VMEC implicit solve and transport/root compact payload tangent contraction still dominate.
+- Future work should consider caching/static staging around repeated optimization evaluations without changing the validated AD graph.
