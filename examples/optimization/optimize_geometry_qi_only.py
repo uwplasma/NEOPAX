@@ -61,10 +61,6 @@ MAKE_J_POLAR_PLOTS = True
 # --------------------------- objective functions ---------------------------
 qi = opt.geometry.boozer_qi_objective
 qi_maxj_1 = opt.geometry.boozer_maxj_objective
-qi_p05 = opt.geometry.boozer_qi_objective_p05
-qi_maxj_p05 = opt.geometry.boozer_maxj_objective_p05
-qi_p2 = opt.geometry.boozer_qi_objective_p2
-qi_maxj_p2 = opt.geometry.boozer_maxj_objective_p2
 
 
 def iota_shortfall_value(mean_iota):
@@ -92,10 +88,6 @@ mirror_penalization = opt.transformed_geometry_objective(
 qi_terms = [
     (qi, 0.0, QI_WEIGHT),
     (qi_maxj_1, 0.0, MAXJ_WEIGHT),
-    (qi_p05, 0.0, QI_WEIGHT),
-    (qi_maxj_p05, 0.0, MAXJ_WEIGHT),
-    (qi_p2, 0.0, QI_WEIGHT),
-    (qi_maxj_p2, 0.0, MAXJ_WEIGHT),
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     # (iota_shortfall, 0.0, IOTA_WEIGHT),
@@ -114,11 +106,7 @@ def iteration_diagnostics(evaluation):
         f"iota_mean={values.get('vmec_iota_mean', np.nan):.8e} "
         f"magnetic_well={values.get('vmec_magnetic_well', np.nan):.8e} "
         f"qi_cost={values.get('boozer_qi_objective', np.nan):.8e} "
-        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e} "
-        f"qi_p05={values.get('boozer_qi_objective_p05', np.nan):.8e} "
-        f"maxJ_p05={values.get('boozer_maxj_objective_p05', np.nan):.8e} "
-        f"qi_p2={values.get('boozer_qi_objective_p2', np.nan):.8e} "
-        f"maxJ_p2={values.get('boozer_maxj_objective_p2', np.nan):.8e}"
+        f"maxJ_cost={values.get('boozer_maxj_objective', np.nan):.8e}"
     )
 
 
