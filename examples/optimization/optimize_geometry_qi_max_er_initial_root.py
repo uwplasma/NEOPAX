@@ -66,6 +66,12 @@ MAKE_J_POLAR_PLOTS = True
 SAVE_INITIAL_ER_PROFILE_EARLY = False
 
 
+def max_mode_schedule_values():
+    if np.isscalar(MAX_MODE_SCHEDULE):
+        return (int(MAX_MODE_SCHEDULE),)
+    return tuple(int(value) for value in MAX_MODE_SCHEDULE)
+
+
 # --------------------------- objective functions ---------------------------
 qi = opt.geometry.boozer_qi_objective
 qi_maxj_1 = opt.geometry.boozer_maxj_objective
@@ -291,7 +297,8 @@ def main() -> int:
     last_problem = None
     last_result = None
 
-    for max_mode in MAX_MODE_SCHEDULE:
+    max_mode_schedule = max_mode_schedule_values()
+    for max_mode in max_mode_schedule:
         print(f"\n===== NEOPAX geometry QI + max-Er stage, max_mode={max_mode} =====", flush=True)
         problem = opt.geometry_initial_er_root_only_least_squares_problem(
             TRANSPORT_CONFIG,
@@ -357,7 +364,7 @@ def main() -> int:
     summary = {
         "seed_input": str(SEED_INPUT),
         "transport_config": str(TRANSPORT_CONFIG),
-        "max_mode_schedule": list(MAX_MODE_SCHEDULE),
+        "max_mode_schedule": list(max_mode_schedule),
         "parameter_labels": list(last_problem.parameter_labels),
         "x": np.asarray(last_result.x, dtype=float).tolist(),
         "cost": float(last_result.cost),
