@@ -677,13 +677,22 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
     vmec_input_file = geom_cfg.get("vmec_input_file")
     if vmec_input_file is None:
         raise ValueError("Realtime geometry reverse mode requires geometry.vmec_input_file.")
+    surface_s_raw = geom_cfg.get(
+        "surface_s",
+        geom_cfg.get("vmec_surface_s", (0.1, 0.28, 0.46, 0.64, 0.82, 1.0)),
+    )
+    if isinstance(surface_s_raw, str):
+        surface_s = tuple(float(item.strip()) for item in surface_s_raw.split(",") if item.strip())
+    else:
+        surface_s = tuple(float(item) for item in surface_s_raw)
     return build_geometry_autodiff_context(
         vmec_input_file,
         param_family=family,
         param_m=m,
         param_n=n,
-        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
-        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 18))),
+        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 18))),
+        surface_s=surface_s,
     )
 
 
