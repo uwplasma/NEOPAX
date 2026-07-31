@@ -3571,7 +3571,13 @@ def _boozer_surface_indices_and_rho(static, rho_values):
     return surface_indices, sample_rho
 
 
-def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
+def _boozer_rmnc00_from_state_at_rho(
+    context: GeometryAutodiffContext,
+    state,
+    rho_values,
+    *,
+    boozer_surface_sampling=None,
+):
     """Return Boozer R(m=0,n=0) on requested rho values.
 
     The frozen NTX path derives r00 from boozermn rmnc_b on VMEC half-mesh
@@ -3580,7 +3586,10 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     different major-radius profile from the geometry object.
     """
     rho_arr = jnp.asarray(rho_values, dtype=jnp.float64)
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_values)
+    if boozer_surface_sampling is None:
+        surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_values)
+    else:
+        surface_indices, sample_rho = boozer_surface_sampling
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
     inputs = _booz_xform_inputs_from_state(
@@ -4475,6 +4484,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
     n_xi: int,
     surface_backend: str = "booz",
     progress_label: str | None = None,
+    r00_boozer_surface_sampling=None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -4539,7 +4549,12 @@ def build_ntx_exact_lij_support_from_vmec_state(
         rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
     r00_support_rho_np = np.unique(np.concatenate([rho_center_sample, rho_face_sample], axis=0))
     r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
-    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho_np)
+    r00_support = _boozer_rmnc00_from_state_at_rho(
+        context,
+        state,
+        r00_support_rho_np,
+        boozer_surface_sampling=r00_boozer_surface_sampling,
+    )
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
     r00_face = r00_interp(rho_face)
@@ -4798,6 +4813,25 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         context.static,
         geometry_requested_sample_rho,
     )
+    r00_center_sample = np.linspace(0.0, 1.0, int(n_r), dtype=float)
+    if int(n_r) > 1:
+        r00_face_sample = np.concatenate(
+            [
+                np.asarray([0.0], dtype=float),
+                0.5 * (r00_center_sample[:-1] + r00_center_sample[1:]),
+                np.asarray([1.0], dtype=float),
+            ],
+            axis=0,
+        )
+    else:
+        r00_face_sample = np.asarray([0.0, 1.0], dtype=float)
+    r00_support_rho_sample = np.unique(
+        np.concatenate([r00_center_sample, r00_face_sample], axis=0)
+    )
+    r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static,
+        r00_support_rho_sample,
+    )
     geometry_boozer_inputs = _booz_xform_inputs_from_state(
         state=state,
         static=context.static,
@@ -4850,6 +4884,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             n_xi=int(n_xi),
             surface_backend=str(surface_backend),
             progress_label=progress_label,
+            r00_boozer_surface_sampling=r00_boozer_surface_sampling,
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
