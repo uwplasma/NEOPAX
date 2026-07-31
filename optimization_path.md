@@ -760,3 +760,55 @@ Open performance note:
 - The first evaluation still has large compile/setup cost.
 - Subsequent evaluations are much faster for Boozer/J-invariant pieces, but the VMEC implicit solve and transport/root compact payload tangent contraction still dominate.
 - Future work should consider caching/static staging around repeated optimization evaluations without changing the validated AD graph.
+
+## Shared Root-Only Payload Smoke: Validated Single-Harmonic Benchmark
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --objective all \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-optimization-smoke \
+  --initial-Er-root-shared-payload-compare-smoke
+```
+
+Result:
+
+- Completed without OOM.
+- Runtime build: `309.876 s`.
+- Shared root-only smoke elapsed time: `485.368 s`.
+- Output written to
+  `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_initial_er_root_shared_payload_smoke.json`.
+- The run used the shared/fused root-only payload path and produced `12` residual rows over `5`
+  parameters: `n0`, `T0`, `density_shape_power`, `temperature_shape_power`, and
+  `vmec:RBC:1:0`.
+
+Key `d/dvmec:RBC:1:0` rows:
+
+| Row | Value | d/dRBC:1:0 |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0479476664720302e+01` | `-5.1293330714789889e+01` |
+| `transport:smooth_root_proxy` | `8.0591612259350128e-11` | `2.2505242252037452e-09` |
+| `transport:Er_transition_left` | `1.7657228878480385e+01` | `-2.0079770095990593e+01` |
+| `transport:Er_transition_right` | `1.8321801837429653e+01` | `-2.2278454387928971e+01` |
+| `transport:Er2_volume_average` | `2.5947838715347029e+02` | `-1.8476397875085149e+02` |
+| `transport:Er_volume_average` | `-3.5568787373760746e+00` | `-2.0622727790532899e+01` |
+| `geometry:boozer_qi_objective` | `1.1913614798130393e-03` | `1.7261150817519652e-02` |
+| `geometry:boozer_maxj_objective` | `5.1725507614818367e-02` | `-8.0802156302056483e-01` |
+| `geometry:vmec_aspect_ratio` | `1.0015330918957178e+01` | `-5.4006784187006147e+00` |
+| `geometry:vmec_iota_mean` | `-5.9365259966101458e-01` | `2.4405140609263865e-01` |
+| `geometry:vmec_magnetic_well` | `-2.7476128749679612e-02` | `-1.1090116065531674e-02` |
+| `geometry:vmec_mirror_ratio` | `2.1100247521308457e-01` | `-5.9979060848576748e-01` |
+
+Interpretation:
+
+- This validates the root-only shared-payload benchmark path for the single-harmonic
+  `RBC:1:0` case.
+- Geometry rows have zero profile columns, as expected.
+- Transport/root rows include both profile columns and the VMEC harmonic column, as expected.
+- This does not by itself validate the full Radau time-evolution shared path; that remains covered by
+  the separate full-transport shared payload smoke.

@@ -23,6 +23,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _adaptive_rollout_diagnostics,
     _alpha_power_volume_average,
     _baseline_profile_cfg,
+    _bootstrap_current_softmax_abs_scaled,
     _electron_temperature_volume_average,
     _objective_vector,
     _parameterized_profile_set,
@@ -271,6 +272,8 @@ def _objective_scalar_by_index(final_state, runtime, objective_index: int):
         return _total_pressure_volume_average(final_state, runtime)
     if objective_name == "alpha_power_volume_average_mw_m3":
         return _alpha_power_volume_average(final_state, runtime)
+    if objective_name == "bootstrap_current_softmax_abs_scaled":
+        return _bootstrap_current_softmax_abs_scaled(final_state, runtime)
     raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
 

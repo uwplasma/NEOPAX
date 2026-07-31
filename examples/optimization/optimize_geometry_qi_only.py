@@ -111,6 +111,7 @@ def iteration_diagnostics(evaluation):
     return (
         f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
+        f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio', 'geometry:mirror_penalization', 'mirror_penalization'):.8e} "
         f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
         f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e}"

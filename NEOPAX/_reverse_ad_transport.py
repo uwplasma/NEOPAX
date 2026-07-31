@@ -20,12 +20,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ._constants import elementary_charge
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_geometry_autodiff_context,
     GeometryRawBlockSolve,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
 )
+from ._neoclassical import get_Neoclassical_Fluxes_With_Momentum_Correction
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
@@ -285,6 +287,7 @@ TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 )
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",
@@ -504,6 +507,37 @@ def total_pressure_volume_average(final_state, runtime) -> jax.Array:
     return volume_average(total_pressure, runtime.geometry)
 
 
+def bootstrap_current_softmax_abs_scaled(
+    final_state,
+    runtime,
+    *,
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+) -> jax.Array:
+    """Smooth max(abs(Jboot)) in the historical ``Jboot * 1e-5`` scaling.
+
+    A value of 0.1 corresponds to 10 kA/m^2 in physical current density.
+    """
+
+    if runtime.database is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
+        runtime.species,
+        runtime.energy_grid,
+        runtime.geometry,
+        runtime.database,
+        jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
+        jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
+        jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
+    )
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
+    jboot = jnp.sum(jnp.asarray(upar, dtype=final_state.pressure.dtype) * charge_qp[None, :], axis=1)
+    jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
+
+
 def objective_scalar_by_index(final_state, runtime, objective_index: int):
     objective_name = TRANSPORT_REVERSE_OBJECTIVE_LABELS[int(objective_index)]
     er = jnp.asarray(final_state.Er)
@@ -522,6 +556,8 @@ def objective_scalar_by_index(final_state, runtime, objective_index: int):
         return total_pressure_volume_average(final_state, runtime)
     if objective_name == "alpha_power_volume_average_mw_m3":
         return alpha_power_volume_average(final_state, runtime)
+    if objective_name == "bootstrap_current_softmax_abs_scaled":
+        return bootstrap_current_softmax_abs_scaled(final_state, runtime)
     raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
 

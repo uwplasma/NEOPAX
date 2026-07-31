@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX  # noqa: E402
+from NEOPAX._constants import elementary_charge  # noqa: E402
+from NEOPAX._neoclassical import get_Neoclassical_Fluxes_With_Momentum_Correction  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._profiles import AnalyticalProfileModel  # noqa: E402
 from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
@@ -62,6 +64,7 @@ OBJECTIVE_LABELS = [
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 ]
 
 
@@ -235,6 +238,32 @@ def _total_pressure_volume_average(final_state, runtime) -> jax.Array:
     return _volume_average(total_pressure, runtime.geometry)
 
 
+def _bootstrap_current_softmax_abs_scaled(
+    final_state,
+    runtime,
+    *,
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+) -> jax.Array:
+    if runtime.database is None:
+        return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
+    _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
+        runtime.species,
+        runtime.energy_grid,
+        runtime.geometry,
+        runtime.database,
+        jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
+        jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
+        jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
+    )
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
+    jboot = jnp.sum(jnp.asarray(upar, dtype=final_state.pressure.dtype) * charge_qp[None, :], axis=1)
+    jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
+
+
 def _objective_vector(final_state, runtime) -> jax.Array:
     er = jnp.asarray(final_state.Er)
     rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
@@ -243,6 +272,7 @@ def _objective_vector(final_state, runtime) -> jax.Array:
     te_vol = _electron_temperature_volume_average(final_state, runtime)
     p_tot_vol = _total_pressure_volume_average(final_state, runtime)
     alpha_vol = _alpha_power_volume_average(final_state, runtime)
+    bootstrap_current = _bootstrap_current_softmax_abs_scaled(final_state, runtime)
     return jnp.stack(
         [
             _softmax_objective(er),
@@ -252,6 +282,7 @@ def _objective_vector(final_state, runtime) -> jax.Array:
             te_vol,
             p_tot_vol,
             alpha_vol,
+            bootstrap_current,
         ]
     )
 
