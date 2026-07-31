@@ -1205,6 +1205,7 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
 
     extra_state_bar_batches = []
     payload_bars_for_pullback = []
+    row_blocks: list[tuple[str, int]] = []
     for table in tables:
         row_count = len(table.objective_names)
         values = jnp.asarray(table.values)
@@ -1231,6 +1232,7 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
                     "split this objective family into separate cotangent tables."
                 )
             payload_bars_for_pullback.extend(table.payload_bars)
+            row_blocks.append(("payload", row_count))
         else:
             table_state_bar = _zero_state_bar_batch(row_count)
             if table.vmec_state_bars is not None:
@@ -1240,6 +1242,7 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
                     table.vmec_state_bars,
                 )
             extra_state_bar_batches.append(table_state_bar)
+            row_blocks.append(("state", row_count))
 
     if not payload_bars_for_pullback and not extra_state_bar_batches:
         return jnp.zeros((0, len(shared_payload.vmec_specs)), dtype=jnp.float64)
@@ -1252,8 +1255,12 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
             *extra_state_bar_batches,
         )
     )
+    payload_matrix = None
     if payload_bars_for_pullback:
-        return geometry_payload_pullback_from_param_vector_raw_block_transpose(
+        # Keep payload rows on the benchmark-good compact tangent-contraction
+        # path. Passing VMEC-state geometry rows as extra_state_bars disables
+        # that compact path and can force a full NTX support VJP.
+        payload_matrix = geometry_payload_pullback_from_param_vector_raw_block_transpose(
             geometry_context,
             shared_payload.vmec_parameter_values,
             tuple(spec.as_tuple() for spec in shared_payload.vmec_specs),
@@ -1267,16 +1274,49 @@ def fused_geometry_parameter_matrix_from_cotangent_tables(
             max_iter=max_iter,
             solver_device=solver_device,
             raw_block_solve=shared_payload.raw_block_solve,
-            extra_state_bars=extra_state_bar_batch,
-            extra_state_bars_factory=extra_state_bars_factory,
         )
-    if shared_payload.raw_block_solve is None:
+    if extra_state_bars_factory is not None:
+        if shared_payload.raw_block_solve is None:
+            raise ValueError("Deferred VMEC-state cotangent rows require an existing raw-block solve.")
+        deferred_state_bars = extra_state_bars_factory(shared_payload.raw_block_solve)
+        extra_state_bar_batch = (
+            deferred_state_bars
+            if extra_state_bar_batch is None
+            else jax.tree_util.tree_map(
+                lambda left, right: jnp.concatenate([left, right], axis=0),
+                extra_state_bar_batch,
+                deferred_state_bars,
+            )
+        )
+        row_blocks.append(("state", int(jax.tree_util.tree_leaves(deferred_state_bars)[0].shape[0])))
+    state_matrix = None
+    if extra_state_bar_batch is not None:
+        if shared_payload.raw_block_solve is None:
+            raise ValueError("Direct VMEC-state cotangent rows require an existing raw-block solve.")
+        state_matrix = geometry_raw_block_transpose_from_state_bars(
+            shared_payload.raw_block_solve,
+            extra_state_bar_batch,
+            probe_chunk_size=1,
+        )
+    if payload_matrix is None and state_matrix is None:
         raise ValueError("Direct VMEC-state cotangent rows require an existing raw-block solve.")
-    return geometry_raw_block_transpose_from_state_bars(
-        shared_payload.raw_block_solve,
-        extra_state_bar_batch,
-        probe_chunk_size=1,
-    )
+    if payload_matrix is None:
+        return state_matrix
+    if state_matrix is None:
+        return payload_matrix
+
+    payload_row0 = 0
+    state_row0 = 0
+    ordered_blocks = []
+    for kind, row_count in row_blocks:
+        row_count = int(row_count)
+        if kind == "payload":
+            ordered_blocks.append(payload_matrix[payload_row0 : payload_row0 + row_count])
+            payload_row0 += row_count
+        else:
+            ordered_blocks.append(state_matrix[state_row0 : state_row0 + row_count])
+            state_row0 += row_count
+    return jnp.concatenate(ordered_blocks, axis=0)
 
 
 def objective_table_result_from_cotangent_table(
