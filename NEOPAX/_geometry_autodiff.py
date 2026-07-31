@@ -4436,7 +4436,7 @@ def _build_ntx_center_prepared_from_vmec_state(
             ],
             axis=0,
         )
-        static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
+        static_ntx_psia = jnp.abs(static_phi[-1])
         center_surfaces = surfaces_fn(
             state=state,
             static=context.static,
@@ -4524,7 +4524,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         ],
         axis=0,
     )
-    static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
+    static_ntx_psia = jnp.abs(static_phi[-1])
     rho_center_sample = np.linspace(0.0, 1.0, int(rho_center.shape[0]), dtype=float)
     if int(rho_face.shape[0]) > 1:
         rho_face_sample = np.concatenate(

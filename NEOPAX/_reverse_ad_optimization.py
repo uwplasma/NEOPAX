@@ -2118,6 +2118,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
 
     parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
+    shared_raw_block_solve = None
     t_start = time.perf_counter()
 
     if "transport" in grouped_terms:
@@ -2143,7 +2144,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 ],
                 axis=0,
             )
-            transport_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+            shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
                 geometry_context,
                 vmec_parameter_values,
                 tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
@@ -2168,7 +2169,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
-                raw_block_solve=transport_raw_block_solve,
+                raw_block_solve=shared_raw_block_solve,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
@@ -2213,6 +2214,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             step_size=geometry_step_size,
             final_vmec_pullback_mode="raw_block_transpose",
             solver_device=geometry_solver_device,
+            raw_block_solve=shared_raw_block_solve,
         )
 
     result = assemble_least_squares_result(

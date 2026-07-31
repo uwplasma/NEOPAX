@@ -87,6 +87,11 @@ def iteration_diagnostics(evaluation):
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
     }
+    residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+    residual_lookup = {
+        label: float(residuals[i])
+        for i, label in enumerate(evaluation.result.residual_labels)
+    }
 
     def value(*labels):
         for label in labels:
@@ -94,6 +99,14 @@ def iteration_diagnostics(evaluation):
                 return values[label]
         return np.nan
 
+    def residual(*labels):
+        for label in labels:
+            if label in residual_lookup:
+                return residual_lookup[label]
+        return np.nan
+
+    er_residual = residual("transport:softmax_Er", "softmax_Er")
+    er_cost = 0.5 * er_residual * er_residual
     return (
         f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
@@ -101,7 +114,9 @@ def iteration_diagnostics(evaluation):
         f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
         f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
-        f"softmax_Er={value('transport:softmax_Er', 'softmax_Er'):.8e}"
+        f"softmax_Er={value('transport:softmax_Er', 'softmax_Er'):.8e} "
+        f"Er_residual={er_residual:.8e} "
+        f"Er_cost={er_cost:.8e}"
     )
 
 

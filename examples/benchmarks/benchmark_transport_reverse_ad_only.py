@@ -63,7 +63,7 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
-    evaluate_geometry_initial_er_root_only_least_squares_fused,
+    evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     geometry as geometry_objectives,
     geometry_active_initial_er_root_only_reverse_table,
     LeastSquaresEvaluation,
@@ -3531,7 +3531,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
                 LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
                 LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
             )
-            evaluation = evaluate_geometry_initial_er_root_only_least_squares_fused(
+            evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 config,
                 parameter_set=parameter_set,
                 parameter_values=parameter_values,
