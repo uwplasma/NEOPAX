@@ -51,6 +51,7 @@ from ._reverse_ad_transport import (
     TransportReverseReportBuilder,
     TransportReverseReportRunner,
     TransportReverseTableResultBuilder,
+    bootstrap_current_softmax_abs_scaled,
     normalize_transport_objective_names,
     realtime_geometry_transport_reverse_table_from_payload_cotangents,
     realtime_geometry_transport_reverse_table_request,
@@ -206,6 +207,7 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
+    "bootstrap_current_softmax_abs_scaled",
 )
 GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
     "aspect_ratio": "vmec_aspect_ratio",
@@ -622,6 +624,8 @@ def _initial_er_root_only_objective_values(
             return _initial_er_root_only_volume_average(er * er, geometry)
         if name == "Er_volume_average":
             return _initial_er_root_only_volume_average(er, geometry)
+        if name == "bootstrap_current_softmax_abs_scaled":
+            return bootstrap_current_softmax_abs_scaled(state, runtime)
         raise ValueError(f"Unsupported initial-Er root-only objective {name!r}.")
 
     return jnp.stack([_one(name) for name in names])
