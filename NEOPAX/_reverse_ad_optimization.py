@@ -25,7 +25,7 @@ from ._reverse_ad_parameters import (
     VmecBoundaryParameterSpec,
     parameter_labels,
 )
-from ._transport_flux_models import _add_float_delta_tree, _float_delta_tree_like
+from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, _add_float_delta_tree, _float_delta_tree_like
 from ._geometry_autodiff import (
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     geometry_full_ad_objective_table_pullback_from_param_vector,
@@ -607,13 +607,16 @@ def _bootstrap_current_softmax_abs_value_and_flux_bar(
         raise ValueError("bootstrap current objective requires Upar or Upar_neo fluxes.")
     dtype = jnp.asarray(state.pressure).dtype
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=dtype)
+    current_weights = jnp.sign(charge_qp)
     upar_arr = jnp.asarray(upar, dtype=dtype)
     scale = jnp.asarray(elementary_charge * 1.0e-5, dtype=dtype)
+    upar_physical_scale = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=dtype)
+    upar_physical = upar_physical_scale * upar_arr
     if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
-        jboot = jnp.sum(upar_arr * charge_qp[:, None], axis=0) * scale
+        jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0) * scale
         species_axis_first = True
     else:
-        jboot = jnp.sum(upar_arr * charge_qp[None, :], axis=1) * scale
+        jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1) * scale
         species_axis_first = False
 
     smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=dtype) ** 2)
@@ -622,9 +625,9 @@ def _bootstrap_current_softmax_abs_value_and_flux_bar(
     smooth_abs_bar = jax.nn.softmax(beta_arr * smooth_abs)
     jboot_bar = smooth_abs_bar * jboot / jnp.maximum(smooth_abs, jnp.asarray(1.0e-30, dtype=dtype))
     if species_axis_first:
-        upar_bar = charge_qp[:, None] * (scale * jboot_bar)[None, :]
+        upar_bar = current_weights[:, None] * (upar_physical_scale * scale * jboot_bar)[None, :]
     else:
-        upar_bar = (scale * jboot_bar)[:, None] * charge_qp[None, :]
+        upar_bar = (upar_physical_scale * scale * jboot_bar)[:, None] * current_weights[None, :]
 
     gamma_ref = fluxes.get("Gamma_neo", fluxes.get("Gamma", None))
     q_ref = fluxes.get("Q_neo", fluxes.get("Q", None))

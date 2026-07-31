@@ -20,7 +20,7 @@ from NEOPAX._constants import elementary_charge  # noqa: E402
 from NEOPAX._neoclassical import get_Neoclassical_Fluxes_With_Momentum_Correction  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._profiles import AnalyticalProfileModel  # noqa: E402
-from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
+from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
@@ -269,11 +269,13 @@ def _bootstrap_current_softmax_abs_scaled(
             jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
         )
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
+    current_weights = jnp.sign(charge_qp)
     upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)
+    upar_physical = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
     if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
-        jboot = jnp.sum(upar_arr * charge_qp[:, None], axis=0)
+        jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0)
     else:
-        jboot = jnp.sum(upar_arr * charge_qp[None, :], axis=1)
+        jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1)
     jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
     smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
     beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
