@@ -3613,9 +3613,7 @@ def _boozer_rmnc00_from_state_at_rho(
     )
     if "rmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
     if mode00 is None:
         raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
     rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
