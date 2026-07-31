@@ -27,7 +27,6 @@ from ._geometry_autodiff import (
     GeometryRawBlockSolve,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
 )
-from ._neoclassical import get_Neoclassical_Fluxes_With_Momentum_Correction
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
@@ -287,6 +286,7 @@ TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 )
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",
@@ -513,29 +513,24 @@ def bootstrap_current_softmax_abs_scaled(
     beta: float = 128.0,
     eps: float = 1.0e-12,
 ) -> jax.Array:
-    """Smooth max(abs(Jboot)) in the historical ``Jboot * 1e-5`` scaling.
+    """Direct momentum-corrected smooth max(abs(Jboot)).
 
     A value of 0.1 corresponds to 10 kA/m^2 in physical current density.
     """
 
     flux_model = getattr(getattr(runtime, "models", None), "flux", None)
-    if flux_model is not None:
-        fluxes = flux_model(final_state)
-        upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
-    else:
-        upar = None
-    if upar is None:
-        if runtime.database is None:
-            return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
-        _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
-            runtime.species,
-            runtime.energy_grid,
-            runtime.geometry,
-            runtime.database,
-            jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
-            jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
-            jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    if not callable(corrected_fluxes_fn):
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled requires a realtime NTX model with "
+            "evaluate_momentum_corrected_fluxes; refusing to use the static database "
+            "or uncorrected lagged Upar path."
         )
+    corrected_fluxes = corrected_fluxes_fn(final_state)
+    upar = corrected_fluxes.get("Upar_neo", corrected_fluxes.get("Upar", None))
+    if upar is None:
+        raise ValueError("momentum-corrected realtime NTX fluxes did not return Upar.")
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
     upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)
     if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):

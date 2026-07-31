@@ -64,6 +64,7 @@ OBJECTIVE_LABELS = [
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 ]
 
 
@@ -245,11 +246,17 @@ def _bootstrap_current_softmax_abs_scaled(
     eps: float = 1.0e-12,
 ) -> jax.Array:
     flux_model = getattr(getattr(runtime, "models", None), "flux", None)
-    if flux_model is not None:
-        fluxes = flux_model(final_state)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    if callable(corrected_fluxes_fn):
+        fluxes = corrected_fluxes_fn(final_state)
         upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
     else:
         upar = None
+    if flux_model is not None:
+        if upar is None:
+            fluxes = flux_model(final_state)
+            upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
     if upar is None:
         if runtime.database is None:
             return jnp.asarray(0.0, dtype=final_state.pressure.dtype)

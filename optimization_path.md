@@ -812,3 +812,95 @@ Interpretation:
 - Transport/root rows include both profile columns and the VMEC harmonic column, as expected.
 - This does not by itself validate the full Radau time-evolution shared path; that remains covered by
   the separate full-transport shared payload smoke.
+
+### Corrected Current QI Reference
+
+The older shared-payload table above predates the current Boozer/J-invariant QI
+formulation. The corrected standalone frozen-linearized QI reference for the
+same high-resolution VMEC input is:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Observed:
+
+```text
+baseline value       = 3.2109136309506803e-03
+frozen_linearized_fd = 8.9996041589633161e-02
+forward_jvp          = 8.9989229074526111e-02
+rel_err_linfd_vs_jvp = 7.570367e-05
+```
+
+This agrees with the current shared-payload geometry row:
+
+```text
+geometry:boozer_qi_objective value          = 3.2109136309506734e-03
+d geometry:boozer_qi_objective / d RBC:1:0 = 8.9989229070800647e-02
+```
+
+Saved derivative references:
+
+| Quantity | d/dRBC:1:0 |
+| --- | ---: |
+| `boozer_qi_objective` frozen-linearized FD | `8.9996041589633161e-02` |
+| `boozer_qi_objective` forward JVP / AD target | `8.9989229074526111e-02` |
+| `boozer_qi_objective` shared-payload reverse row | `8.9989229070800647e-02` |
+
+Conclusion: for the current QI implementation, the saved FD reference is
+`8.9996041589633161e-02`; the implicit/JVP AD target is
+`8.9989229074526111e-02`, with frozen-linearized FD agreement at about
+`7.6e-05` relative error.
+
+### Corrected Current maxJ Reference
+
+The corrected standalone frozen-linearized maxJ reference for the same
+high-resolution VMEC input is:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_maxj_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+Observed:
+
+```text
+baseline value       = 1.3389843913753766e-01
+frozen_linearized_fd = -1.1591364898936340e+00
+forward_jvp          = -1.1593167988198267e+00
+rel_err_linfd_vs_jvp = 1.555303e-04
+```
+
+This agrees with the current shared-payload geometry row:
+
+```text
+geometry:boozer_maxj_objective value          = 1.3389843913753852e-01
+d geometry:boozer_maxj_objective / d RBC:1:0 = -1.1593167987379616e+00
+```
+
+Saved derivative references:
+
+| Quantity | d/dRBC:1:0 |
+| --- | ---: |
+| `boozer_maxj_objective` frozen-linearized FD | `-1.1591364898936340e+00` |
+| `boozer_maxj_objective` forward JVP / AD target | `-1.1593167988198267e+00` |
+| `boozer_maxj_objective` shared-payload reverse row | `-1.1593167987379616e+00` |
+
+Conclusion: for the current maxJ implementation, the saved FD reference is
+`-1.1591364898936340e+00`; the implicit/JVP AD target is
+`-1.1593167988198267e+00`, with frozen-linearized FD agreement at about
+`1.6e-04` relative error. The shared-payload reverse row matches the JVP target
+to about `7e-11` relative error.
