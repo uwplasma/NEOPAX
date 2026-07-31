@@ -17,6 +17,7 @@ from typing import Any, Literal
 import jax
 import jax.numpy as jnp
 
+from ._constants import elementary_charge
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
     ProfileParameterSpec,
@@ -209,6 +210,7 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "Er_volume_average",
     "bootstrap_current_softmax_abs_scaled",
 )
+_BOOTSTRAP_CURRENT_OBJECTIVE = "bootstrap_current_softmax_abs_scaled"
 GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
     "aspect_ratio": "vmec_aspect_ratio",
     "vmec_aspect_ratio": "vmec_aspect_ratio",
@@ -581,6 +583,142 @@ def _initial_er_root_only_volume_average(profile, geometry):
     return integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=profile_arr.dtype))
 
 
+def _bootstrap_current_softmax_abs_value_and_flux_bar(
+    *,
+    state,
+    runtime,
+    fluxes: Mapping[str, Any],
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+):
+    """Return smooth max(abs(Jboot)) and a sparse flux cotangent.
+
+    This is the compact counterpart to ``bootstrap_current_softmax_abs_scaled``:
+    it starts from already-evaluated lagged-response fluxes and creates only the
+    ``Upar_neo`` cotangent needed by the NTX compact pullbacks.
+    """
+
+    upar = fluxes.get("Upar_neo", fluxes.get("Upar", None))
+    if upar is None:
+        raise ValueError("bootstrap current objective requires Upar or Upar_neo fluxes.")
+    dtype = jnp.asarray(state.pressure).dtype
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=dtype)
+    upar_arr = jnp.asarray(upar, dtype=dtype)
+    scale = jnp.asarray(elementary_charge * 1.0e-5, dtype=dtype)
+    if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+        jboot = jnp.sum(upar_arr * charge_qp[:, None], axis=0) * scale
+        species_axis_first = True
+    else:
+        jboot = jnp.sum(upar_arr * charge_qp[None, :], axis=1) * scale
+        species_axis_first = False
+
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=dtype)
+    value = jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
+    smooth_abs_bar = jax.nn.softmax(beta_arr * smooth_abs)
+    jboot_bar = smooth_abs_bar * jboot / jnp.maximum(smooth_abs, jnp.asarray(1.0e-30, dtype=dtype))
+    if species_axis_first:
+        upar_bar = charge_qp[:, None] * (scale * jboot_bar)[None, :]
+    else:
+        upar_bar = (scale * jboot_bar)[:, None] * charge_qp[None, :]
+
+    gamma_ref = fluxes.get("Gamma_neo", fluxes.get("Gamma", None))
+    q_ref = fluxes.get("Q_neo", fluxes.get("Q", None))
+    flux_bar = {
+        "Gamma": jnp.zeros_like(jnp.asarray(gamma_ref, dtype=dtype)) if gamma_ref is not None else 0,
+        "Q": jnp.zeros_like(jnp.asarray(q_ref, dtype=dtype)) if q_ref is not None else 0,
+        "Upar": jnp.zeros_like(upar_arr),
+        "Gamma_neo": jnp.zeros_like(jnp.asarray(gamma_ref, dtype=dtype)) if gamma_ref is not None else 0,
+        "Q_neo": jnp.zeros_like(jnp.asarray(q_ref, dtype=dtype)) if q_ref is not None else 0,
+        "Upar_neo": upar_bar,
+    }
+    return value, flux_bar
+
+
+def _compact_bootstrap_current_root_objective_cotangent(
+    *,
+    rooted_state,
+    runtime_for_geometry,
+    baseline_geometry,
+    baseline_ntx_support,
+    geometry_delta0,
+):
+    """Compact cotangent row for bootstrap current at the selected initial Er root."""
+
+    flux_model = getattr(getattr(runtime_for_geometry, "models", None), "flux", None)
+    if flux_model is None:
+        value = bootstrap_current_softmax_abs_scaled(rooted_state, runtime_for_geometry)
+        zero_state_bar = jax.tree_util.tree_map(jnp.zeros_like, rooted_state)
+        zero_geometry_bar = _float_delta_tree_like(baseline_geometry)
+        zero_support_bar = _float_delta_tree_like(baseline_ntx_support)
+        return value, zero_state_bar, zero_geometry_bar, zero_support_bar
+
+    lagged_response = flux_model.build_lagged_response(rooted_state)
+    fluxes = flux_model.evaluate_with_lagged_response(rooted_state, lagged_response)
+    value, flux_bar = _bootstrap_current_softmax_abs_value_and_flux_bar(
+        state=rooted_state,
+        runtime=runtime_for_geometry,
+        fluxes=fluxes,
+    )
+
+    state_bar = flux_model.pullback_evaluate_with_lagged_response_state(
+        rooted_state,
+        lagged_response,
+        flux_bar,
+    )
+    lagged_response_bar = flux_model.pullback_evaluate_with_lagged_response(
+        rooted_state,
+        lagged_response,
+        flux_bar,
+    )
+    state_bar_from_response = flux_model.pullback_build_lagged_response(
+        rooted_state,
+        lagged_response_bar,
+    )
+    state_bar = _add_trees(state_bar, state_bar_from_response)
+
+    support_bar = flux_model.pullback_evaluate_with_lagged_response_support_payload(
+        rooted_state,
+        lagged_response,
+        flux_bar,
+        baseline_ntx_support,
+    )
+    support_bar_from_response = flux_model.pullback_build_lagged_response_support_payload(
+        rooted_state,
+        lagged_response_bar,
+        baseline_ntx_support,
+    )
+    support_bar = _add_trees(support_bar, support_bar_from_response)
+
+    def _value_from_geometry_delta(geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        geometry_flux_model = runtime_with_geometry.models.flux
+        geometry_fluxes = geometry_flux_model.evaluate_with_lagged_response(
+            rooted_state,
+            lagged_response,
+        )
+        geometry_value, _ = _bootstrap_current_softmax_abs_value_and_flux_bar(
+            state=rooted_state,
+            runtime=runtime_with_geometry,
+            fluxes=geometry_fluxes,
+        )
+        return geometry_value
+
+    _, geometry_pullback = jax.vjp(_value_from_geometry_delta, geometry_delta0)
+    (geometry_bar,) = geometry_pullback(jnp.asarray(1.0, dtype=jnp.asarray(value).dtype))
+    return value, state_bar, geometry_bar, support_bar
+
+
+def _row_from_batched_tree(tree, row_index: int):
+    return jax.tree_util.tree_map(lambda leaf: leaf[row_index], tree)
+
+
+def _stack_tree_rows(rows: Sequence[Any]):
+    return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *rows)
+
+
 def _initial_er_root_only_objective_values(
     state,
     runtime,
@@ -624,8 +762,6 @@ def _initial_er_root_only_objective_values(
             return _initial_er_root_only_volume_average(er * er, geometry)
         if name == "Er_volume_average":
             return _initial_er_root_only_volume_average(er, geometry)
-        if name == "bootstrap_current_softmax_abs_scaled":
-            return bootstrap_current_softmax_abs_scaled(state, runtime)
         raise ValueError(f"Unsupported initial-Er root-only objective {name!r}.")
 
     return jnp.stack([_one(name) for name in names])
@@ -879,6 +1015,8 @@ def initial_er_root_only_objective_cotangent_table(
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
 
+    generic_objectives = tuple(name for name in requested_objectives if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
+
     def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
         geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
         runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
@@ -886,19 +1024,62 @@ def initial_er_root_only_objective_cotangent_table(
         return _initial_er_root_only_objective_values(
             state_value,
             runtime_with_geometry,
-            requested_objectives,
+            generic_objectives,
         )
 
-    objective_values, objective_pullback = jax.vjp(
-        _values_from_rooted_state_and_geometry,
-        rooted_state,
-        geometry_delta0,
-    )
     objective_count = len(requested_objectives)
-    objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
-    rooted_state_bars, direct_geometry_bars = jax.vmap(lambda cotangent: objective_pullback(cotangent))(
-        objective_basis
-    )
+    generic_values = None
+    generic_rooted_state_bars = None
+    generic_direct_geometry_bars = None
+    generic_value_lookup = {name: i for i, name in enumerate(generic_objectives)}
+    if generic_objectives:
+        generic_values, objective_pullback = jax.vjp(
+            _values_from_rooted_state_and_geometry,
+            rooted_state,
+            geometry_delta0,
+        )
+        generic_basis = jnp.eye(len(generic_objectives), dtype=jnp.asarray(generic_values).dtype)
+        generic_rooted_state_bars, generic_direct_geometry_bars = jax.vmap(
+            lambda cotangent: objective_pullback(cotangent)
+        )(generic_basis)
+
+    bootstrap_row = None
+    if _BOOTSTRAP_CURRENT_OBJECTIVE in requested_objectives:
+        bootstrap_row = _compact_bootstrap_current_root_objective_cotangent(
+            rooted_state=rooted_state,
+            runtime_for_geometry=runtime_for_geometry,
+            baseline_geometry=baseline_geometry,
+            baseline_ntx_support=baseline_ntx_support,
+            geometry_delta0=geometry_delta0,
+        )
+
+    objective_value_rows = []
+    rooted_state_bar_rows = []
+    direct_geometry_bar_rows = []
+    direct_ntx_support_bar_rows = []
+    zero_ntx_support_bar = _float_delta_tree_like(baseline_ntx_support)
+    for name in requested_objectives:
+        if name == _BOOTSTRAP_CURRENT_OBJECTIVE:
+            if bootstrap_row is None:
+                raise AssertionError("bootstrap cotangent row was not built.")
+            value, rooted_state_bar, direct_geometry_bar, direct_support_bar = bootstrap_row
+            objective_value_rows.append(value)
+            rooted_state_bar_rows.append(rooted_state_bar)
+            direct_geometry_bar_rows.append(direct_geometry_bar)
+            direct_ntx_support_bar_rows.append(direct_support_bar)
+            continue
+        if generic_values is None or generic_rooted_state_bars is None or generic_direct_geometry_bars is None:
+            raise AssertionError("generic root objective rows were not built.")
+        generic_i = generic_value_lookup[name]
+        objective_value_rows.append(generic_values[generic_i])
+        rooted_state_bar_rows.append(_row_from_batched_tree(generic_rooted_state_bars, generic_i))
+        direct_geometry_bar_rows.append(_row_from_batched_tree(generic_direct_geometry_bars, generic_i))
+        direct_ntx_support_bar_rows.append(zero_ntx_support_bar)
+
+    objective_values = jnp.stack(objective_value_rows)
+    rooted_state_bars = _stack_tree_rows(rooted_state_bar_rows)
+    direct_geometry_bars = _stack_tree_rows(direct_geometry_bar_rows)
+    direct_ntx_support_bars = _stack_tree_rows(direct_ntx_support_bar_rows)
 
     dres_der = initial_er_charge_flux_residual_er_derivative(
         pre_root_state,
@@ -977,7 +1158,11 @@ def initial_er_root_only_objective_cotangent_table(
     support_bars = []
     for objective_index in range(objective_count):
         geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
-        ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
+        ntx_bar = jax.tree_util.tree_map(
+            lambda residual_leaf, direct_leaf: residual_leaf[objective_index] + direct_leaf[objective_index],
+            ntx_bars,
+            direct_ntx_support_bars,
+        )
         support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
 
     return ObjectiveCotangentTable(
@@ -1251,6 +1436,8 @@ def geometry_active_initial_er_root_only_reverse_table(
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
         rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
 
+        generic_objectives = tuple(name for name in requested_objectives if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
+
         def _values_from_rooted_state_and_geometry(state_value, geometry_delta):
             geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
             runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
@@ -1258,19 +1445,62 @@ def geometry_active_initial_er_root_only_reverse_table(
             return _initial_er_root_only_objective_values(
                 state_value,
                 runtime_with_geometry,
-                requested_objectives,
+                generic_objectives,
             )
 
-        objective_values, objective_pullback = jax.vjp(
-            _values_from_rooted_state_and_geometry,
-            rooted_state,
-            geometry_delta0,
-        )
         objective_count = len(requested_objectives)
-        objective_basis = jnp.eye(objective_count, dtype=jnp.asarray(objective_values).dtype)
-        rooted_state_bars, direct_geometry_bars = jax.vmap(
-            lambda cotangent: objective_pullback(cotangent)
-        )(objective_basis)
+        generic_values = None
+        generic_rooted_state_bars = None
+        generic_direct_geometry_bars = None
+        generic_value_lookup = {name: i for i, name in enumerate(generic_objectives)}
+        if generic_objectives:
+            generic_values, objective_pullback = jax.vjp(
+                _values_from_rooted_state_and_geometry,
+                rooted_state,
+                geometry_delta0,
+            )
+            generic_basis = jnp.eye(len(generic_objectives), dtype=jnp.asarray(generic_values).dtype)
+            generic_rooted_state_bars, generic_direct_geometry_bars = jax.vmap(
+                lambda cotangent: objective_pullback(cotangent)
+            )(generic_basis)
+
+        bootstrap_row = None
+        if _BOOTSTRAP_CURRENT_OBJECTIVE in requested_objectives:
+            bootstrap_row = _compact_bootstrap_current_root_objective_cotangent(
+                rooted_state=rooted_state,
+                runtime_for_geometry=runtime_for_geometry,
+                baseline_geometry=baseline_geometry,
+                baseline_ntx_support=baseline_ntx_support,
+                geometry_delta0=geometry_delta0,
+            )
+
+        objective_value_rows = []
+        rooted_state_bar_rows = []
+        direct_geometry_bar_rows = []
+        direct_ntx_support_bar_rows = []
+        zero_ntx_support_bar = _float_delta_tree_like(baseline_ntx_support)
+        for name in requested_objectives:
+            if name == _BOOTSTRAP_CURRENT_OBJECTIVE:
+                if bootstrap_row is None:
+                    raise AssertionError("bootstrap cotangent row was not built.")
+                value, rooted_state_bar, direct_geometry_bar, direct_support_bar = bootstrap_row
+                objective_value_rows.append(value)
+                rooted_state_bar_rows.append(rooted_state_bar)
+                direct_geometry_bar_rows.append(direct_geometry_bar)
+                direct_ntx_support_bar_rows.append(direct_support_bar)
+                continue
+            if generic_values is None or generic_rooted_state_bars is None or generic_direct_geometry_bars is None:
+                raise AssertionError("generic root objective rows were not built.")
+            generic_i = generic_value_lookup[name]
+            objective_value_rows.append(generic_values[generic_i])
+            rooted_state_bar_rows.append(_row_from_batched_tree(generic_rooted_state_bars, generic_i))
+            direct_geometry_bar_rows.append(_row_from_batched_tree(generic_direct_geometry_bars, generic_i))
+            direct_ntx_support_bar_rows.append(zero_ntx_support_bar)
+
+        objective_values = jnp.stack(objective_value_rows)
+        rooted_state_bars = _stack_tree_rows(rooted_state_bar_rows)
+        direct_geometry_bars = _stack_tree_rows(direct_geometry_bar_rows)
+        direct_ntx_support_bars = _stack_tree_rows(direct_ntx_support_bar_rows)
 
         dres_der = initial_er_charge_flux_residual_er_derivative(
             pre_root_state,
@@ -1351,7 +1581,11 @@ def geometry_active_initial_er_root_only_reverse_table(
         support_bars = []
         for objective_index in range(objective_count):
             geometry_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], geometry_bars)
-            ntx_bar = jax.tree_util.tree_map(lambda leaf: leaf[objective_index], ntx_bars)
+            ntx_bar = jax.tree_util.tree_map(
+                lambda residual_leaf, direct_leaf: residual_leaf[objective_index] + direct_leaf[objective_index],
+                ntx_bars,
+                direct_ntx_support_bars,
+            )
             support_bars.append({"geometry": geometry_bar, "ntx_support": ntx_bar})
         return objective_values, profile_gradient_matrix_for_payload, tuple(support_bars), objective_count
 
