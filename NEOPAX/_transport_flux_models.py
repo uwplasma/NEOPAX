@@ -6036,6 +6036,413 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "Upar2_neo": jnp.swapaxes(upar2, 0, 1),
         }
 
+    def _momentum_corrected_upar_one_radius(self, state, radius_index, *, support=None):
+        """Local corrected-Upar evaluator used by compact bootstrap pullbacks."""
+
+        density = safe_density(state.density)
+        temperature = state.temperature
+        n_species = int(temperature.shape[0])
+        n_right = _as_species_constraint(
+            None if self.bc_density is None else getattr(self.bc_density, "right_value", None),
+            n_species,
+        )
+        if n_right is None:
+            n_right = density[:, -1]
+        n_right_grad = _as_species_constraint(
+            None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None),
+            n_species,
+        )
+        if n_right_grad is None:
+            n_right_grad = jnp.zeros_like(n_right)
+        t_right = _as_species_constraint(
+            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None),
+            n_species,
+        )
+        if t_right is None:
+            t_right = temperature[:, -1]
+        t_right_grad = _as_species_constraint(
+            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None),
+            n_species,
+        )
+        if t_right_grad is None:
+            t_right_grad = jnp.zeros_like(t_right)
+
+        dndr = jax.vmap(
+            lambda density_a, right_value, right_grad: get_gradient_density(
+                density_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=right_value,
+                right_face_grad_constraint=right_grad,
+            )
+        )(density, n_right, n_right_grad)
+        dTdr = jax.vmap(
+            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
+                temperature_a,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=right_value,
+                right_face_grad_constraint=right_grad,
+            )
+        )(temperature, t_right, t_right_grad)
+        A1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge,
+                density_a,
+                temperature_a,
+                dndr_a,
+                dTdr_a,
+                state.Er,
+            )
+        )(self.species.charge, density, temperature, dndr, dTdr)
+        A2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr)
+        A3 = get_Thermodynamical_Forces_A3(state.Er)
+
+        support_value = self._static_support() if support is None else support
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        prepared = jax.tree_util.tree_map(
+            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+            support_value.center_prepared,
+        )
+        drds_value = jax.lax.dynamic_index_in_dim(
+            support_value.center_channels.drds,
+            radius_index,
+            axis=0,
+            keepdims=False,
+        )
+        er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+        lij_radius, eij_radius, nu_av_radius = jax.vmap(
+            lambda species_index: self._solve_momentum_matrices_prepared_local(
+                prepared,
+                drds_value=drds_value,
+                species_index=species_index,
+                er_value=er_value,
+                temperature_local=temperature_local,
+                density_local=density_local,
+                vthermal_local=vthermal_local,
+                collisionality_kind=collisionality_kind,
+                derivative_mode_override="direct",
+            )
+        )(species_indices)
+
+        def _rhs_one(species_index, lij_species):
+            return jnp.stack(
+                [
+                    -(
+                        lij_species[2, 0] * A1[species_index, radius_index]
+                        + lij_species[2, 1] * A2[species_index, radius_index]
+                        + lij_species[2, 2] * A3[radius_index]
+                    ),
+                    -(
+                        (2.5 * lij_species[2, 0] - lij_species[3, 0]) * A1[species_index, radius_index]
+                        + (2.5 * lij_species[2, 1] - lij_species[3, 1]) * A2[species_index, radius_index]
+                        + (2.5 * lij_species[2, 2] - lij_species[3, 2]) * A3[radius_index]
+                    ),
+                    -(
+                        (4.375 * lij_species[2, 0] - 3.5 * lij_species[3, 0] + 0.5 * lij_species[4, 0])
+                        * A1[species_index, radius_index]
+                        + (4.375 * lij_species[2, 1] - 3.5 * lij_species[3, 1] + 0.5 * lij_species[4, 1])
+                        * A2[species_index, radius_index]
+                        + (4.375 * lij_species[2, 2] - 3.5 * lij_species[3, 2] + 0.5 * lij_species[4, 2])
+                        * A3[radius_index]
+                    ),
+                ]
+            )
+
+        cm_ab, cn_ab, tau = jax.vmap(
+            jax.vmap(
+                get_Collision_Operator_terms,
+                in_axes=(None, None, 0, None, None, None, None),
+            ),
+            in_axes=(None, 0, None, None, None, None, None),
+        )(
+            self.species,
+            species_indices,
+            species_indices,
+            radius_index,
+            temperature,
+            density,
+            v_thermal,
+        )
+        rhs = jax.vmap(_rhs_one, in_axes=(0, 0))(species_indices, lij_radius)
+        matrix_rows = jax.vmap(
+            get_Matrix,
+            in_axes=(None, None, 0, None, 0, 0, None, None, None, None),
+        )(
+            self.energy_grid,
+            self.geometry,
+            species_indices,
+            radius_index,
+            lij_radius,
+            eij_radius,
+            cm_ab,
+            cn_ab,
+            tau,
+            v_thermal,
+        )
+        operator = lineax.MatrixLinearOperator(
+            jnp.reshape(matrix_rows, (matrix_rows.shape[0] * matrix_rows.shape[1], matrix_rows.shape[2]))
+        )
+        solution = lineax.linear_solve(operator, jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1]))
+        correction = jnp.reshape(solution.value, (n_species, 3))
+        _gamma, _q, upar, _qpar, _upar2 = jax.vmap(
+            get_corrected_fluxes,
+            in_axes=(
+                None,
+                None,
+                0,
+                None,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )(
+            self.energy_grid,
+            self.geometry,
+            species_indices,
+            radius_index,
+            lij_radius,
+            eij_radius,
+            nu_av_radius,
+            cm_ab,
+            cn_ab,
+            tau,
+            correction,
+            v_thermal,
+            density,
+            temperature,
+            A1,
+            A2,
+            A3,
+            self.species.charge,
+            dndr,
+            dTdr,
+        )
+        return upar
+
+    def pullback_momentum_corrected_upar_state_by_radius(self, state, upar_bar):
+        """Compact state pullback for sparse corrected-Upar cotangents."""
+
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_count = int(upar_bar.shape[-1])
+        radius_indices = jnp.arange(radius_count, dtype=jnp.int32)
+
+        def _zero_like_leaf(leaf):
+            arr = jnp.asarray(leaf)
+            if jnp.issubdtype(arr.dtype, jnp.inexact):
+                return jnp.zeros_like(arr)
+            return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+        def _add_trees(left, right):
+            return jax.tree_util.tree_map(lambda a, b: a + b, left, right)
+
+        state_bar0 = jax.tree_util.tree_map(_zero_like_leaf, state)
+
+        def _accumulate(carry, radius_index):
+            _, pullback = jax.vjp(
+                lambda state_value: self._momentum_corrected_upar_one_radius(
+                    state_value,
+                    radius_index,
+                ),
+                state,
+            )
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            (state_bar,) = pullback(local_bar)
+            return _add_trees(carry, state_bar), None
+
+        state_bar, _ = jax.lax.scan(_accumulate, state_bar0, radius_indices)
+        return state_bar
+
+    def pullback_momentum_corrected_upar_support_by_radius(self, state, upar_bar, support):
+        """Compact support-payload pullback for sparse corrected-Upar cotangents."""
+
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_count = int(upar_bar.shape[-1])
+        radius_indices = jnp.arange(radius_count, dtype=jnp.int32)
+
+        def _batched_zero_tree_leaves(tree):
+            return tuple(
+                jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+                if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                else jnp.zeros_like(jnp.asarray(leaf))
+                for leaf in jax.tree_util.tree_leaves(tree)
+            )
+
+        center_channels_bar = _float_delta_tree_like(support.center_channels)
+        center_prepared_bar_leaves = _batched_zero_tree_leaves(support.center_prepared)
+        face_channels_bar_leaves = _batched_zero_tree_leaves(support.face_channels)
+        face_prepared_bar_leaves = _batched_zero_tree_leaves(support.face_prepared)
+
+        def _split_flat_vector(flat, sizes, shapes, treedef):
+            leaves = []
+            offset = 0
+            for size, shape in zip(sizes, shapes, strict=True):
+                leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+                offset += size
+            return treedef.unflatten(leaves), flat[offset]
+
+        def _accumulate(carry, radius_index):
+            channels_carry, prepared_leaf_carry = carry
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.center_channels.drds,
+                radius_index,
+                axis=0,
+                keepdims=False,
+            )
+            prepared_delta0 = _float_delta_tree_like(prepared)
+            prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+            prepared_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0)
+            prepared_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0)
+            flat_delta0 = jnp.concatenate(
+                [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
+                + [jnp.ravel(jnp.zeros_like(drds_value))]
+            )
+
+            def _upar_from_local_support_flat(flat_delta):
+                prepared_delta, drds_delta = _split_flat_vector(
+                    flat_delta,
+                    prepared_delta_sizes,
+                    prepared_delta_shapes,
+                    prepared_delta_treedef,
+                )
+                support_value = dataclasses.replace(
+                    support,
+                    center_prepared=jax.tree_util.tree_map(
+                        lambda full, local_delta: full.at[radius_index].add(local_delta),
+                        support.center_prepared,
+                        prepared_delta,
+                    ),
+                    center_channels=dataclasses.replace(
+                        support.center_channels,
+                        drds=support.center_channels.drds.at[radius_index].add(drds_delta),
+                    ),
+                )
+                return self.with_support_payload(support_value)._momentum_corrected_upar_one_radius(
+                    state,
+                    radius_index,
+                    support=support_value,
+                )
+
+            _, pullback = jax.vjp(_upar_from_local_support_flat, flat_delta0)
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            (flat_bar,) = pullback(local_bar)
+            prepared_flat_size = int(sum(prepared_delta_sizes))
+            drds_bar = flat_bar[prepared_flat_size]
+
+            updated_prepared_leaves = []
+            offset = 0
+            for carry_leaf, size, shape in zip(
+                prepared_leaf_carry,
+                prepared_delta_sizes,
+                prepared_delta_shapes,
+                strict=True,
+            ):
+                local_prepared_bar = jnp.reshape(flat_bar[offset : offset + size], shape)
+                updated_prepared_leaves.append(carry_leaf.at[radius_index].add(local_prepared_bar))
+                offset += size
+
+            return (
+                dataclasses.replace(
+                    channels_carry,
+                    drds=channels_carry.drds.at[radius_index].add(drds_bar),
+                ),
+                tuple(updated_prepared_leaves),
+            ), None
+
+        (center_channels_bar, center_prepared_bar_leaves), _ = jax.lax.scan(
+            _accumulate,
+            (center_channels_bar, center_prepared_bar_leaves),
+            radius_indices,
+        )
+        return (
+            tuple(jax.tree_util.tree_leaves(center_channels_bar))
+            + face_channels_bar_leaves
+            + tuple(center_prepared_bar_leaves)
+            + face_prepared_bar_leaves
+        )
+
+    def pullback_momentum_corrected_upar_geometry_by_radius(self, state, upar_bar, geometry, support):
+        """Compact NEOPAX-geometry pullback for sparse corrected-Upar cotangents."""
+
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_count = int(upar_bar.shape[-1])
+        radius_indices = jnp.arange(radius_count, dtype=jnp.int32)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_delta_leaves0, geometry_delta_treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        geometry_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in geometry_delta_leaves0)
+        geometry_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in geometry_delta_leaves0)
+        flat_delta0 = jnp.concatenate([jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_delta_leaves0])
+
+        def _split_flat_geometry(flat):
+            leaves = []
+            offset = 0
+            for size, shape in zip(geometry_delta_sizes, geometry_delta_shapes, strict=True):
+                leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+                offset += size
+            return geometry_delta_treedef.unflatten(leaves)
+
+        def _zero_flat_like():
+            return jnp.zeros_like(flat_delta0)
+
+        def _accumulate(flat_carry, radius_index):
+            def _upar_from_geometry_flat(flat_delta):
+                geometry_delta = _split_flat_geometry(flat_delta)
+                geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+                model = dataclasses.replace(self, geometry=geometry_value, support=support)
+                return model._momentum_corrected_upar_one_radius(
+                    state,
+                    radius_index,
+                    support=support,
+                )
+
+            _, pullback = jax.vjp(_upar_from_geometry_flat, flat_delta0)
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            (flat_bar,) = pullback(local_bar)
+            return flat_carry + flat_bar, None
+
+        geometry_flat_bar, _ = jax.lax.scan(_accumulate, _zero_flat_like(), radius_indices)
+        return _split_flat_geometry(geometry_flat_bar)
+
     def build_lagged_response(self, state, **kwargs):
         del kwargs
         if lagged_timing_enabled():

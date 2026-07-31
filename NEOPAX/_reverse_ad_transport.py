@@ -286,7 +286,6 @@ TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
-    "bootstrap_current_softmax_abs_scaled",
 )
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",

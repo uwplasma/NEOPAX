@@ -208,11 +208,11 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
-    "bootstrap_current_softmax_abs_scaled",
 )
 _BOOTSTRAP_CURRENT_OBJECTIVE = "bootstrap_current_softmax_abs_scaled"
 INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES: tuple[str, ...] = (
     *INITIAL_ER_ROOT_ONLY_OBJECTIVES,
+    _BOOTSTRAP_CURRENT_OBJECTIVE,
 )
 GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
     "aspect_ratio": "vmec_aspect_ratio",
@@ -670,54 +670,32 @@ def _compact_bootstrap_current_root_objective_cotangent(
     flux_model = getattr(getattr(runtime_for_geometry, "models", None), "flux", None)
     neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
     corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
+    support_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_support_by_radius", None)
+    geometry_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_geometry_by_radius", None)
     if not callable(corrected_fluxes_fn):
         raise NotImplementedError(
             "bootstrap_current_softmax_abs_scaled requires realtime NTX "
             "evaluate_momentum_corrected_fluxes for compact root AD."
         )
-
-    def _value_from_state(state_value):
-        fluxes = corrected_fluxes_fn(state_value)
-        return _bootstrap_current_softmax_abs_value_from_fluxes(
-            state=state_value,
-            runtime=runtime_for_geometry,
-            fluxes=fluxes,
+    if not callable(state_pullback_fn) or not callable(support_pullback_fn) or not callable(geometry_pullback_fn):
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
+            "state, geometry, and support pullbacks on the realtime NTX model."
         )
 
-    value, state_pullback = jax.vjp(_value_from_state, rooted_state)
-    (state_bar,) = state_pullback(
-        jnp.asarray(1.0, dtype=jnp.asarray(value).dtype)
+    corrected_fluxes = corrected_fluxes_fn(rooted_state)
+    value, flux_bar = _bootstrap_current_softmax_abs_value_and_flux_bar(
+        state=rooted_state,
+        runtime=runtime_for_geometry,
+        fluxes=corrected_fluxes,
     )
-
-    def _value_from_support(support_value):
-        runtime_with_support = runtime_with_ntx_support_payload(runtime_for_geometry, support_value)
-        support_flux_model = runtime_with_support.models.flux
-        support_neoclassical_model = getattr(support_flux_model, "neoclassical_model", support_flux_model)
-        fluxes = support_neoclassical_model.evaluate_momentum_corrected_fluxes(rooted_state)
-        return _bootstrap_current_softmax_abs_value_from_fluxes(
-            state=rooted_state,
-            runtime=runtime_with_support,
-            fluxes=fluxes,
-        )
-
-    _, support_pullback = jax.vjp(_value_from_support, baseline_ntx_support)
-    (support_bar,) = support_pullback(jnp.asarray(1.0, dtype=jnp.asarray(value).dtype))
-
-    def _value_from_geometry_delta(geometry_delta):
-        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
-        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
-        geometry_flux_model = runtime_with_geometry.models.flux
-        geometry_neoclassical_model = getattr(geometry_flux_model, "neoclassical_model", geometry_flux_model)
-        geometry_fluxes = geometry_neoclassical_model.evaluate_momentum_corrected_fluxes(rooted_state)
-        return _bootstrap_current_softmax_abs_value_from_fluxes(
-            state=rooted_state,
-            runtime=runtime_with_geometry,
-            fluxes=geometry_fluxes,
-        )
-
-    _, geometry_pullback = jax.vjp(_value_from_geometry_delta, geometry_delta0)
-    (geometry_bar,) = geometry_pullback(jnp.asarray(1.0, dtype=jnp.asarray(value).dtype))
+    upar_bar = flux_bar["Upar_neo"]
+    state_bar = state_pullback_fn(rooted_state, upar_bar)
+    geometry_bar = geometry_pullback_fn(rooted_state, upar_bar, baseline_geometry, baseline_ntx_support)
+    support_bar_leaves = support_pullback_fn(rooted_state, upar_bar, baseline_ntx_support)
+    _, support_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
+    support_bar = support_treedef.unflatten(tuple(support_bar_leaves))
     return value, state_bar, geometry_bar, support_bar
 
 
@@ -784,6 +762,12 @@ def initial_er_root_only_reverse_table(
 ) -> ObjectiveTableResult:
     """Evaluate Er-root-only objective values and Jacobian with no time evolution."""
 
+    if _BOOTSTRAP_CURRENT_OBJECTIVE in request.objective_names:
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled must use the geometry-active compact "
+            "initial-Er root table; the generic root-only table would trace the full "
+            "momentum-corrected NTX evaluator."
+        )
     parameter_values = jnp.asarray(request.parameter_values)
 
     def _values_from_parameter_vector(values):

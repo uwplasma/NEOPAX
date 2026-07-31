@@ -64,7 +64,6 @@ OBJECTIVE_LABELS = [
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
-    "bootstrap_current_softmax_abs_scaled",
 ]
 
 
@@ -289,7 +288,6 @@ def _objective_vector(final_state, runtime) -> jax.Array:
     te_vol = _electron_temperature_volume_average(final_state, runtime)
     p_tot_vol = _total_pressure_volume_average(final_state, runtime)
     alpha_vol = _alpha_power_volume_average(final_state, runtime)
-    bootstrap_current = _bootstrap_current_softmax_abs_scaled(final_state, runtime)
     return jnp.stack(
         [
             _softmax_objective(er),
@@ -299,7 +297,6 @@ def _objective_vector(final_state, runtime) -> jax.Array:
             te_vol,
             p_tot_vol,
             alpha_vol,
-            bootstrap_current,
         ]
     )
 

@@ -67,6 +67,7 @@ from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     geometry as geometry_objectives,
     geometry_active_initial_er_root_only_reverse_table,
     LeastSquaresEvaluation,
+    INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES,
     INITIAL_ER_ROOT_ONLY_OBJECTIVES,
     residuals_and_jacobian_reverse_ad,
     LeastSquaresTerm,
@@ -3421,20 +3422,30 @@ def _run_initial_er_root_only_optimization_api_smoke(
             "an ambipolar Er initialization mode in the TOML and "
             "--initial-Er-root-ad jax_selected_root."
         )
-    objective_names = (
-        INITIAL_ER_ROOT_ONLY_OBJECTIVES
-        if str(args.objective) == "all"
-        else (str(args.objective),)
-    )
-    unsupported = tuple(name for name in objective_names if name not in INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    include_geometry_dofs = str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    if str(args.objective) == "all":
+        objective_names = (
+            (*INITIAL_ER_ROOT_ONLY_OBJECTIVES, "bootstrap_current_softmax_abs_scaled")
+            if include_geometry_dofs
+            else INITIAL_ER_ROOT_ONLY_OBJECTIVES
+        )
+    else:
+        objective_names = (str(args.objective),)
+    unsupported = tuple(name for name in objective_names if name not in INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
     if unsupported:
-        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
         raise SystemExit(
             "[autodiff-gate] initial-Er root-only smoke supports only Er objectives; "
             f"unsupported={unsupported!r}, choices are: {allowed}."
         )
-    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
-    include_geometry_dofs = str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    if "bootstrap_current_softmax_abs_scaled" in objective_names and not include_geometry_dofs:
+        raise SystemExit(
+            "[autodiff-gate] bootstrap_current_softmax_abs_scaled currently requires the "
+            "geometry-active compact root-only path. Use "
+            "--reverse-parameter-mode profiles_plus_realtime_geometry and "
+            "--reverse-geometry-parameter ..."
+        )
     geometry_param_specs = (
         _geometry_param_specs_from_args(args, geometry_context)
         if include_geometry_dofs
@@ -4273,7 +4284,7 @@ def main() -> None:
         "--objective",
         type=str,
         default="softmax_Er",
-        choices=tuple(OBJECTIVE_LABELS) + ("all",),
+        choices=tuple(dict.fromkeys(tuple(OBJECTIVE_LABELS) + tuple(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES) + ("all",))),
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
             "objective-by-parameter reverse derivative matrix for every metric."
