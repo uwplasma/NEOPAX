@@ -297,15 +297,28 @@ def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
         )
         print(f"wrote {csv_path}")
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        contour = ax.contourf(phi, theta, b_grid, levels=40, cmap="viridis")
-        fig.colorbar(contour, ax=ax, label="|B|")
-        ax.set_xlabel("phi")
-        ax.set_ylabel("theta")
-        ax.set_title(f"Boozer |B| contour, {surface_label.replace('_', ' ')} ({label})")
+        finite_b = b_grid[np.isfinite(b_grid)]
+        if finite_b.size:
+            levels = np.linspace(float(finite_b.min()), float(finite_b.max()), 28)
+        else:
+            levels = 28
+        fig, ax = plt.subplots(figsize=(6.4, 4.8))
+        contour = ax.contour(phi, theta, b_grid, levels=levels, cmap="viridis", linewidths=1.0)
+        colorbar = fig.colorbar(contour, ax=ax, pad=0.05)
+        colorbar.set_label(r"$|B|$ [T]", fontsize=11)
+        colorbar.ax.tick_params(labelsize=9)
+        ax.set_xlabel(r"toroidal angle $\phi$", fontsize=11)
+        ax.set_ylabel(r"poloidal angle $\theta$", fontsize=11)
+        ax.set_yticks([0.0, 0.5 * np.pi, np.pi, 1.5 * np.pi, 2.0 * np.pi])
+        ax.set_yticklabels(["0", r"$\pi/2$", r"$\pi$", r"$3\pi/2$", r"$2\pi$"])
+        ax.set_xlim(float(phi.min()), float(phi.max()))
+        ax.set_ylim(float(theta.min()), float(theta.max()))
+        title_surface = "magnetic axis" if surface_label == "axis" else surface_label.replace("_", " ")
+        ax.set_title(rf"$|B|$ on {title_surface} (one field period)", fontsize=12)
+        ax.tick_params(axis="both", labelsize=9)
         fig.tight_layout()
         png_path = out_dir / f"B_boozer_contour_{surface_label}_{label}.png"
-        fig.savefig(png_path, dpi=180, bbox_inches="tight")
+        fig.savefig(png_path, dpi=320, bbox_inches="tight")
         plt.close(fig)
         print(f"wrote {png_path}")
 
