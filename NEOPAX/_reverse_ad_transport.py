@@ -23,6 +23,7 @@ import numpy as np
 from ._constants import elementary_charge
 from ._geometry_autodiff import (
     boundary_param_entries,
+    build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_geometry_autodiff_context,
     GeometryRawBlockSolve,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
@@ -2331,6 +2332,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     progress_label: str | None = None,
+    raw_block_solve: GeometryRawBlockSolve | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -2341,7 +2343,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
 
     if not isinstance(table_context, RealtimeGeometryTransportReverseTableContext):
         raise TypeError("table_context must be a RealtimeGeometryTransportReverseTableContext.")
-    profile_values = jnp.asarray(
+    baseline_profile_values = jnp.asarray(
         table_context.baseline_values[: len(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)]
     )
 
@@ -2364,10 +2366,36 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         active_accepted_step_limit = opts.get("accepted_step_limit", accepted_step_limit)
         active_reverse_segment_length = opts.get("reverse_segment_length", reverse_segment_length)
         active_initial_er_root_ad = str(opts.get("initial_er_root_ad", initial_er_root_ad))
+        active_raw_block_solve = opts.get("raw_block_solve", raw_block_solve)
+        active_profile_values = jnp.asarray(
+            opts.get("profile_values", baseline_profile_values),
+            dtype=baseline_profile_values.dtype,
+        )
+        active_runtime = table_context.baseline_runtime
+        active_support_payload = None
+        use_runtime_payload = bool(opts.get("use_runtime_payload", active_raw_block_solve is None))
+        if active_raw_block_solve is not None and not use_runtime_payload:
+            active_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                geometry_context,
+                active_raw_block_solve.state,
+                n_r=int(opts.get("n_r", n_r)),
+                n_theta=int(opts.get("n_theta", n_theta)),
+                n_zeta=int(opts.get("n_zeta", n_zeta)),
+                n_xi=int(opts.get("n_xi", n_xi)),
+                surface_backend=str(opts.get("surface_backend", surface_backend)),
+            )
+            active_runtime = runtime_with_geometry_payload(
+                active_runtime,
+                active_support_payload["geometry"],
+            )
+            active_runtime = runtime_with_ntx_support_payload(
+                active_runtime,
+                active_support_payload["ntx_support"],
+            )
         active_reverse_setup = prepare_reverse_static_setup(
-            profile_values,
+            active_profile_values,
             config=table_context.config,
-            runtime=table_context.baseline_runtime,
+            runtime=active_runtime,
             baseline_state=table_context.baseline_state,
             profile_cfg=table_context.profile_cfg,
             initial_er_root_ad=active_initial_er_root_ad,
@@ -2394,16 +2422,27 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 opts.get("reverse_stage_adjoint_iter_tol", reverse_stage_adjoint_iter_tol)
             ),
         )
-        ntx_support_payload = find_ntx_support_payload(table_context.baseline_runtime)
+        ntx_support_payload = (
+            active_support_payload["ntx_support"]
+            if active_support_payload is not None
+            else find_ntx_support_payload(active_runtime)
+        )
         support_payload = (
-            {"geometry": table_context.baseline_runtime.geometry, "ntx_support": ntx_support_payload}
+            {
+                "geometry": (
+                    active_support_payload["geometry"]
+                    if active_support_payload is not None
+                    else active_runtime.geometry
+                ),
+                "ntx_support": ntx_support_payload,
+            }
             if combined_geometry_payload
             else ntx_support_payload
         )
         support_result = realtime_geometry_support_cotangents_from_parameter_vector(
-            profile_values=profile_values,
+            profile_values=active_profile_values,
             config=table_context.config,
-            baseline_runtime=table_context.baseline_runtime,
+            baseline_runtime=active_runtime,
             baseline_state=table_context.baseline_state,
             profile_cfg=table_context.profile_cfg,
             reverse_setup=active_reverse_setup,
@@ -2455,6 +2494,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             solver_device=str(opts.get("solver_device", solver_device)),
             progress_label=progress_label,
             return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
+            raw_block_solve=active_raw_block_solve,
         )
         return assembly.table_result
 

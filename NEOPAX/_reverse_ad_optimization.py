@@ -2414,6 +2414,155 @@ def evaluate_transport_realtime_geometry_least_squares(
     )
 
 
+def evaluate_geometry_transport_realtime_geometry_least_squares(
+    config: Mapping[str, object],
+    *,
+    request: RealtimeGeometryTransportReverseTableRequest,
+    terms: Sequence[LeastSquaresTerm | tuple[ObjectiveRef | str, float, float]],
+    geometry_context,
+    parameter_values=None,
+    table_result_builder: TransportReverseTableResultBuilder | None = None,
+    run_grouped_report=None,
+    objective_labels: Sequence[str] | None = None,
+    options: Mapping[str, object] | None = None,
+    quiet_default: bool = True,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_final_vmec_pullback_mode: str = "raw_block_transpose",
+    geometry_solver_device: str | None = "default",
+    share_raw_block_solve: bool = True,
+) -> LeastSquaresEvaluation:
+    """Evaluate mixed geometry + realtime-transport least-squares terms.
+
+    This is the full time-evolution analogue of the mixed initial-Er-root
+    optimizer wiring: transport rows come from the realtime transport reverse
+    table, geometry rows come from the validated full-geometry reverse table,
+    and callers that use the direct internal transport table builder can pass a
+    shared raw-block VMEC solve through both branches.
+    """
+
+    normalized_terms = normalize_least_squares_terms(terms)
+    grouped_terms = group_least_squares_terms_by_family(normalized_terms)
+    unsupported_families = tuple(
+        family for family in grouped_terms if family not in {"geometry", "transport"}
+    )
+    if unsupported_families:
+        raise NotImplementedError(
+            "evaluate_geometry_transport_realtime_geometry_least_squares supports only "
+            f"geometry and transport terms; got families {unsupported_families!r}."
+        )
+
+    requested_transport_objectives = _unique_objective_names(grouped_terms.get("transport", ()))
+    if requested_transport_objectives and requested_transport_objectives != request.objective_names:
+        raise ValueError(
+            "Realtime-geometry transport request objectives must match the transport "
+            "least-squares terms in first-use order: "
+            f"request={request.objective_names!r}, terms={requested_transport_objectives!r}."
+        )
+
+    opts = {} if options is None else dict(options)
+    parameter_values_arr = (
+        jnp.zeros((len(request.parameter_set.specs),), dtype=jnp.float64)
+        if parameter_values is None
+        else jnp.asarray(parameter_values, dtype=jnp.float64)
+    )
+    if tuple(parameter_values_arr.shape) != (len(request.parameter_set.specs),):
+        raise ValueError(
+            "parameter_values must match the realtime-geometry parameter set; "
+            f"got {tuple(parameter_values_arr.shape)}, expected ({len(request.parameter_set.specs)},)."
+        )
+    baseline_profile_values = jnp.asarray(
+        request.context.baseline_values[: len(PROFILE_PARAMETER_ORDER)],
+        dtype=parameter_values_arr.dtype,
+    )
+    opts.setdefault(
+        "profile_values",
+        _active_profile_values_from_parameter_vector(
+            request.parameter_set,
+            parameter_values_arr,
+            baseline_profile_values,
+        ),
+    )
+
+    shared_raw_block_solve = None
+    if (
+        bool(share_raw_block_solve)
+        and request.parameter_set.vmec_boundary_specs
+        and ("geometry" in grouped_terms or table_result_builder is not None)
+    ):
+        vmec_parameter_values = vmec_parameter_values_from_parameter_vector(
+            request.parameter_set,
+            parameter_values_arr,
+        )
+        shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+            geometry_context,
+            vmec_parameter_values,
+            tuple(spec.as_tuple() for spec in request.parameter_set.vmec_boundary_specs),
+            max_iter=geometry_max_iter,
+            solver_device=geometry_solver_device,
+        )
+        opts.setdefault("raw_block_solve", shared_raw_block_solve)
+        opts.setdefault("geometry_raw_block_solve", shared_raw_block_solve)
+        try:
+            use_runtime_payload = bool(
+                jnp.allclose(
+                    vmec_parameter_values,
+                    jnp.zeros_like(vmec_parameter_values),
+                ).item()
+            )
+        except Exception:
+            use_runtime_payload = False
+        opts.setdefault("use_runtime_payload", use_runtime_payload)
+
+    backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
+    t_start = time.perf_counter()
+
+    if "transport" in grouped_terms:
+        table_result = transport_realtime_geometry_reverse_table(
+            request=request,
+            table_result_builder=table_result_builder,
+            run_grouped_report=run_grouped_report,
+            objective_labels=objective_labels,
+            options=opts,
+            quiet_default=quiet_default,
+        )
+        backend_results["transport"] = transport_reverse_table_result_to_objective_table_result(
+            table_result,
+            requested_transport_objectives,
+            request.parameter_set,
+        )
+
+    if "geometry" in grouped_terms:
+        backend_results["geometry"] = geometry_full_ad_reverse_table(
+            context=geometry_context,
+            parameter_set=request.parameter_set,
+            objective_names=_unique_objective_names(grouped_terms["geometry"]),
+            parameter_values=parameter_values_arr,
+            lane=geometry_lane,
+            max_iter=geometry_max_iter,
+            step_size=geometry_step_size,
+            final_vmec_pullback_mode=geometry_final_vmec_pullback_mode,
+            solver_device=geometry_solver_device,
+            raw_block_solve=shared_raw_block_solve,
+        )
+
+    result = assemble_least_squares_result(
+        normalized_terms,
+        parameter_set=request.parameter_set,
+        backend_results=backend_results,
+    )
+    residuals = jax.block_until_ready(result.residuals)
+    jacobian = jax.block_until_ready(result.jacobian)
+    elapsed_s = time.perf_counter() - t_start
+    return LeastSquaresEvaluation(
+        result=result,
+        residuals=residuals,
+        jacobian=jacobian,
+        elapsed_s=float(elapsed_s),
+    )
+
+
 def build_transport_realtime_geometry_least_squares_runner(
     config: Mapping[str, object],
     *,

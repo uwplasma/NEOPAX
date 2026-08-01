@@ -56,6 +56,7 @@ SOLVER_DEVICE = "default"
 
 MAKE_WOUT_PLOTS = True
 MAKE_J_POLAR_PLOTS = True
+MAKE_B_AXIS_PLOTS = True
 
 
 # --------------------------- objective functions ---------------------------
@@ -197,6 +198,40 @@ def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.
             print(f"wrote {path}")
 
 
+def plot_b_on_axis(wout, out_dir, label, *, nphi=256):
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.plotting import surface_modB
+    except Exception as exc:
+        print(f"skipping B-axis plot: {exc}")
+        return
+
+    phi = np.linspace(0.0, 2.0 * np.pi / int(wout.nfp), int(nphi))
+    theta = np.asarray([0.0], dtype=float)
+    b_axis = np.asarray(surface_modB(wout, s_index=0, theta=theta, phi=phi), dtype=float).reshape(-1)
+    csv_path = out_dir / f"B_axis_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack([phi, b_axis]),
+        delimiter=",",
+        header="phi,B_axis",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(phi, b_axis, linewidth=1.6)
+    ax.set_xlabel("phi")
+    ax.set_ylabel("|B| on axis")
+    ax.set_title(f"|B| on magnetic axis ({label})")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    png_path = out_dir / f"B_axis_{label}.png"
+    fig.savefig(png_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
 def write_geometry_artifacts(input_obj, label):
     artifact_dir = OUT_DIR / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +245,8 @@ def write_geometry_artifacts(input_obj, label):
     if MAKE_WOUT_PLOTS:
         for _, path in vj.plot_wout(wout_path, artifact_dir).items():
             print(f"wrote {path}")
+    if MAKE_B_AXIS_PLOTS:
+        plot_b_on_axis(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
         plot_j_polar_contours(eq, artifact_dir)
 

@@ -19,9 +19,13 @@ import jax.numpy as jnp
 import numpy as np
 
 import NEOPAX
+from NEOPAX._geometry_autodiff import build_geometry_autodiff_context
 from NEOPAX._orchestrator import build_runtime_context
 from NEOPAX._reverse_ad_optimization import (
     build_transport_realtime_geometry_least_squares_runner,
+    evaluate_geometry_transport_realtime_geometry_least_squares,
+    geometry as geometry_objectives,
+    LeastSquaresTerm,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_parameters import (
@@ -31,8 +35,10 @@ from NEOPAX._reverse_ad_parameters import (
 )
 from NEOPAX._reverse_ad_transport import (
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+    internal_realtime_geometry_transport_reverse_table_result_builder,
     realtime_geometry_transport_reverse_grouped_inputs,
     realtime_geometry_transport_reverse_table_context,
+    realtime_geometry_transport_reverse_table_request,
     realtime_geometry_transport_reverse_support_segment_executor,
     run_internal_realtime_geometry_support_segment_probe,
 )
@@ -175,10 +181,27 @@ def main() -> int:
     profile_values = _profile_values(profile_cfg, jnp.asarray(baseline_state.pressure).dtype)
     geometry_deltas = _baseline_geometry_delta_vector(config.get("geometry", {}), geometry_specs)
     baseline_values = jnp.concatenate([profile_values, geometry_deltas.astype(profile_values.dtype)])
+    geom_cfg = config.get("geometry", {})
+    vmec_input = geom_cfg.get("vmec_input_file")
+    if vmec_input is None:
+        raise ValueError("geometry.vmec_input_file is required for mixed geometry/transport smoke.")
+    geometry_context = build_geometry_autodiff_context(
+        vmec_input,
+        param_family=str(geometry_specs[0][0]),
+        param_m=int(geometry_specs[0][1]),
+        param_n=int(geometry_specs[0][2]),
+        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
+        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+    )
     include_profiles = args.optimization_api_profile_dofs == "include"
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profiles,
         vmec_boundary=tuple(VmecBoundaryParameterSpec(*spec) for spec in geometry_specs),
+    )
+    parameter_values = (
+        baseline_values
+        if include_profiles
+        else jnp.asarray(geometry_deltas, dtype=baseline_values.dtype)
     )
     setattr(args, "realtime_geometry_gradient_path", "reverse_payload")
     setattr(args, "skip_realtime_geometry_support_bar_diagnostics", True)
@@ -236,32 +259,94 @@ def main() -> int:
     table_context = grouped_inputs.table_context
     run_grouped_report = grouped_inputs.run_grouped_report
     objective_names = _objective_names(args.objective)
-    runner = build_transport_realtime_geometry_least_squares_runner(
-        config,
-        objective_names=objective_names,
-        parameter_set=parameter_set,
-        table_context=table_context,
-        run_grouped_report=run_grouped_report,
-        objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
-        options={
-            "quiet": False,
-            "accepted_step_limit": int(args.accepted_step_limit),
-            "reverse_segment_length": int(args.reverse_segment_length),
-            "initial_er_root_ad": str(args.initial_Er_root_ad),
-            "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
-            "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
-            "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
-            "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
-            "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
-            "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
-            "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
-        },
-    )
+    terms = transport_least_squares_terms(objective_names)
+    if str(args.objective).strip().lower() == "all":
+        terms = tuple(terms) + (
+            LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
+            LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
+            LeastSquaresTerm(geometry_objectives.vmec_aspect_ratio),
+            LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
+            LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
+            LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+        )
+    common_options = {
+        "quiet": False,
+        "accepted_step_limit": int(args.accepted_step_limit),
+        "reverse_segment_length": int(args.reverse_segment_length),
+        "initial_er_root_ad": str(args.initial_Er_root_ad),
+        "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+        "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
+        "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
+        "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
+        "reverse_stage_adjoint_memory_mode": str(args.reverse_stage_adjoint_memory_mode),
+        "reverse_stage_adjoint_iter_maxiter": int(args.reverse_stage_adjoint_iter_maxiter),
+        "reverse_stage_adjoint_iter_tol": float(args.reverse_stage_adjoint_iter_tol),
+    }
     print(
         "[autodiff-gate] progress: running internal realtime-geometry optimization smoke",
         flush=True,
     )
-    evaluation = runner(transport_least_squares_terms(objective_names))
+    if str(args.objective).strip().lower() == "all":
+        neoclassical_cfg = config.get("neoclassical", {})
+        table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
+            table_context=table_context,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=geometry_deltas,
+            combined_geometry_payload=True,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(
+                neoclassical_cfg.get(
+                    "ntx_exact_surface_backend",
+                    neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                )
+            ),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            accepted_step_limit=int(args.accepted_step_limit),
+            reverse_segment_length=int(args.reverse_segment_length),
+            initial_er_root_ad=str(args.initial_Er_root_ad),
+            reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
+            reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+            reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
+            reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+            reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
+            reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
+            reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
+            progress_label="[autodiff-gate] optimization shared payload:",
+        )
+        request = realtime_geometry_transport_reverse_table_request(
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            context=table_context,
+            options=common_options,
+        )
+        evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+            config,
+            request=request,
+            terms=terms,
+            geometry_context=geometry_context,
+            parameter_values=parameter_values,
+            table_result_builder=table_result_builder,
+            objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            options=common_options,
+            quiet_default=False,
+            geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+            geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+        )
+    else:
+        runner = build_transport_realtime_geometry_least_squares_runner(
+            config,
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            table_context=table_context,
+            run_grouped_report=run_grouped_report,
+            objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            options=common_options,
+        )
+        evaluation = runner(terms)
     residuals_np = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
     jacobian_np = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
     result = evaluation.result

@@ -142,6 +142,39 @@ diagnostic.
 
 ## Existing Full-Transport FD Values
 
+### 2-Step Shared-Payload AD
+
+This is the current full-transport shared-payload AD smoke with `2` accepted
+steps. A matching full realtime-geometry 2-step FD table for `d/dRBC:1:0` was
+not found in the saved local docs/outputs; the saved 2-step references I found
+are profile-only `softmax_Er` forward-AD checks, so they should not be used as
+the FD reference for this table.
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0474480434757560e+01` | `-4.4010821718627282e+00` | `3.6893021316932324e+00` | `-9.7245517683807015e-02` | `2.2784341729715321e+00` | `-5.1317447005281466e+01` |
+| `transport:smooth_root_proxy` | `1.9565517403925628e-10` | `0.0000000000000000e+00` | `-4.2240800049036898e-10` | `-1.0873396947539999e-13` | `1.7568065363844018e-08` | `4.1615832435909986e-09` |
+| `transport:Er2_volume_average` | `2.5789275767390154e+02` | `-1.1130507692496927e+00` | `3.3314765761704457e+01` | `3.9716409094558180e+00` | `-1.6627182341155759e+01` | `-1.8107833510078140e+02` |
+| `transport:Er_volume_average` | `-3.5463367280578586e+00` | `-2.0727795330781582e+00` | `9.2860232007956911e-01` | `-1.0172552313027816e-01` | `-8.2119695491996003e-01` | `-2.0555620539844501e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4471445508615828e+00` | `4.7658840766284793e-04` | `3.4852955165267474e-01` | `9.8558205532291165e-06` | `1.4942008613521125e+00` | `-1.3670544339803796e-02` |
+| `transport:total_pressure_volume_average` | `3.3551072628692104e+01` | `7.9013769812319090e+00` | `1.8280094754912617e+00` | `2.3976273858151381e-01` | `7.5981644339917755e+00` | `-7.7574037477612573e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7786228569831921e-01` | `2.7421038425018640e-01` | `8.1604646824932223e-02` | `2.3155465380623520e-03` | `2.7875538302773323e-01` | `-1.7350581859371954e-03` |
+
+Matching FD command to generate the missing 2-step geometry reference:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+### 16-Step FD Table
+
 These are not root-only ambipolarity FD values, but they are the saved
 16-step realtime-geometry FD references for the full transport run with
 `--initial-Er-root-ad jax_selected_root`.
@@ -159,3 +192,61 @@ These are not root-only ambipolarity FD values, but they are the saved
 This full-transport table should not be used as the FD reference for the
 root-only ambipolarity smoke, because the root-only path does not include the
 Radau time evolution.
+
+### 16-Step Shared-Payload Smoke Update
+
+Current run:
+
+- `mode = transport_reverse_ad_only_full_transport_shared_payload_smoke`
+- `accepted_step_limit = 16`
+- `elapsed_s = 3531.475`
+- output JSON: `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke.json`
+
+Full shared-payload AD table:
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0694998241267641e+01` | `-5.0838282415568408e+00` | `4.1306249928548100e+00` | `-1.1591644624461980e-01` | `4.2417414653234697e+00` | `-6.2626550836918256e+01` |
+| `transport:smooth_root_proxy` | `1.9868729727533445e-02` | `-5.8593750000000000e-03` | `-7.7788585014637937e-05` | `-1.3650089969452495e-07` | `2.3783611385449557e-03` | `-3.7595015565651822e-04` |
+| `transport:Er2_volume_average` | `2.4372053202139412e+02` | `-6.8729867376835294e+00` | `3.6065316917000459e+01` | `3.7772605808640574e+00` | `-9.9007831215974562e+00` | `-2.7118433140008011e+02` |
+| `transport:Er_volume_average` | `-3.4309746025765144e+00` | `-2.3765676300577470e+00` | `1.0952038126424903e+00` | `-1.0966510378096389e-01` | `-3.1844641881012514e-01` | `-2.3646073978935458e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4597967687544342e+00` | `3.2044199169065646e-03` | `3.5042845972161463e-01` | `-1.7862537077364612e-04` | `1.5035680183819486e+00` | `-2.2448497735886055e-02` |
+| `transport:total_pressure_volume_average` | `3.3559238356010034e+01` | `7.9065460031525578e+00` | `1.8293618203570214e+00` | `2.3978045308837445e-01` | `7.6008795466190691e+00` | `-7.7520439508832056e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7709114832136932e-01` | `2.7390173486511626e-01` | `8.1435927075356962e-02` | `2.3105926577552259e-03` | `2.7792303880127184e-01` | `1.2073916329946855e-03` |
+
+Comparison against saved 16-step FD `d/dRBC:1:0`:
+
+| Objective | 16-step FD `d/dRBC:1:0` | Shared-payload AD `d/dRBC:1:0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-6.2627250000000000e+01` | `-6.2626550836918256e+01` | `6.991631e-04` | `1.116388e-05` |
+| `transport:smooth_root_proxy` | `-5.5764050000000004e-04` | `-3.7595015565651822e-04` | `1.816903e-04` | `3.258199e-01` |
+| `transport:Er2_volume_average` | `-2.7123439999999999e+02` | `-2.7118433140008011e+02` | `5.006860e-02` | `1.845953e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073978935458e+01` | `2.043979e-03` | `8.644799e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497735886055e-02` | `1.522641e-07` | `6.782774e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521010000000001e-02` | `-7.7520439508832056e-02` | `5.704912e-07` | `7.359181e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073920000000001e-03` | `1.2073916329946855e-03` | `3.670053e-10` | `3.039653e-07` |
+
+Profile-column comparison:
+
+- The full profile-column table for this run is saved in
+  `optimization_ad_vs_fd.md` under `16-Step Full-Transport Shared-Payload
+  Smoke`.
+- Existing saved 16-step profile references are profile-only references, not a
+  matching `profiles_plus_realtime_geometry` frozen-FD table.
+- Pressure/temperature/alpha profile derivatives agree tightly with those
+  references; Er/root-sensitive profile derivatives differ because the current
+  run includes realtime geometry/root coupling.
+
+Bootstrap FD update:
+
+- The 16-step full-transport FD run with `jax_selected_root` now includes
+  `bootstrap_current_softmax_abs_scaled`.
+- The full saved table is in `optimization_ad_vs_fd.md` under
+  `16-Step Full-Transport FD With Bootstrap`.
+- New FD-only rows awaiting matching full-reverse AD rows:
+
+| Objective | FD `d/dRBC:1:0` |
+| --- | ---: |
+| `transport:Er_transition_left` | `-2.0130240000000000e+01` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7311170000000000e+00` |

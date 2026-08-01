@@ -180,6 +180,67 @@ Configuration:
 - Initial-Er root AD: `jax_selected_root`
 - Geometry FD lane: frozen-linearized
 
+## Full Transport: 2-Step Shared-Payload AD
+
+Configuration:
+
+- Config: `examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml`
+- Path: full realtime geometry transport with `2` accepted Radau steps
+- Initial-Er root AD: `jax_selected_root`
+- Reverse segment length: `1`
+- Mode: `--full-transport-shared-payload-smoke`
+- Output: `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke.json`
+- Elapsed time: `1267.576 s`
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0474480434757560e+01` | `-4.4010821718627282e+00` | `3.6893021316932324e+00` | `-9.7245517683807015e-02` | `2.2784341729715321e+00` | `-5.1317447005281466e+01` |
+| `transport:smooth_root_proxy` | `1.9565517403925628e-10` | `0.0000000000000000e+00` | `-4.2240800049036898e-10` | `-1.0873396947539999e-13` | `1.7568065363844018e-08` | `4.1615832435909986e-09` |
+| `transport:Er2_volume_average` | `2.5789275767390154e+02` | `-1.1130507692496927e+00` | `3.3314765761704457e+01` | `3.9716409094558180e+00` | `-1.6627182341155759e+01` | `-1.8107833510078140e+02` |
+| `transport:Er_volume_average` | `-3.5463367280578586e+00` | `-2.0727795330781582e+00` | `9.2860232007956911e-01` | `-1.0172552313027816e-01` | `-8.2119695491996003e-01` | `-2.0555620539844501e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4471445508615828e+00` | `4.7658840766284793e-04` | `3.4852955165267474e-01` | `9.8558205532291165e-06` | `1.4942008613521125e+00` | `-1.3670544339803796e-02` |
+| `transport:total_pressure_volume_average` | `3.3551072628692104e+01` | `7.9013769812319090e+00` | `1.8280094754912617e+00` | `2.3976273858151381e-01` | `7.5981644339917755e+00` | `-7.7574037477612573e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7786228569831921e-01` | `2.7421038425018640e-01` | `8.1604646824932223e-02` | `2.3155465380623520e-03` | `2.7875538302773323e-01` | `-1.7350581859371954e-03` |
+
+Saved 2-step FD lookup:
+
+- I do not currently find a saved full realtime-geometry 2-step FD table for `d/dRBC:1:0` and all objectives in the local docs/outputs.
+- The saved 2-step references I found are profile-only/`softmax_Er` forward AD checks, e.g. `dsoftmax_Er/dn0 = -3.578618e-01`, `dsoftmax_Er/dT0 = 3.010300e-01`, `dsoftmax_Er/ddensity_shape_power = -7.886158e-03`, `dsoftmax_Er/dtemperature_shape_power = 1.779141e-01`. Those are not the matching realtime-geometry `RBC:1:0` FD reference for this table.
+- The matching FD command to generate the missing 2-step geometry reference is:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
 FD command:
 
 ```bash
@@ -233,3 +294,161 @@ Conclusion:
 - `smooth_root_proxy` has small absolute error but large relative error because
   the derivative itself is very small and sensitive to the smooth sign/root
   proxy construction.
+
+### 16-Step Full-Transport Shared-Payload Smoke
+
+Current shared-payload smoke run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
+
+Run metadata:
+
+- `mode = transport_reverse_ad_only_full_transport_shared_payload_smoke`
+- `residual_count = 7`
+- `parameter_count = 5`
+- `elapsed_s = 3531.475`
+- output JSON: `outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke.json`
+- This same 7-row reverse table was re-attached later as the current
+  16-step full-transport shared-payload reverse result. It predates/omits
+  `Er_transition_left`, `Er_transition_right`, and
+  `bootstrap_current_softmax_abs_scaled` in the full-transport reverse table.
+
+Full AD table:
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0694998241267641e+01` | `-5.0838282415568408e+00` | `4.1306249928548100e+00` | `-1.1591644624461980e-01` | `4.2417414653234697e+00` | `-6.2626550836918256e+01` |
+| `transport:smooth_root_proxy` | `1.9868729727533445e-02` | `-5.8593750000000000e-03` | `-7.7788585014637937e-05` | `-1.3650089969452495e-07` | `2.3783611385449557e-03` | `-3.7595015565651822e-04` |
+| `transport:Er2_volume_average` | `2.4372053202139412e+02` | `-6.8729867376835294e+00` | `3.6065316917000459e+01` | `3.7772605808640574e+00` | `-9.9007831215974562e+00` | `-2.7118433140008011e+02` |
+| `transport:Er_volume_average` | `-3.4309746025765144e+00` | `-2.3765676300577470e+00` | `1.0952038126424903e+00` | `-1.0966510378096389e-01` | `-3.1844641881012514e-01` | `-2.3646073978935458e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4597967687544342e+00` | `3.2044199169065646e-03` | `3.5042845972161463e-01` | `-1.7862537077364612e-04` | `1.5035680183819486e+00` | `-2.2448497735886055e-02` |
+| `transport:total_pressure_volume_average` | `3.3559238356010034e+01` | `7.9065460031525578e+00` | `1.8293618203570214e+00` | `2.3978045308837445e-01` | `7.6008795466190691e+00` | `-7.7520439508832056e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7709114832136932e-01` | `2.7390173486511626e-01` | `8.1435927075356962e-02` | `2.3105926577552259e-03` | `2.7792303880127184e-01` | `1.2073916329946855e-03` |
+
+Comparison against saved 16-step FD `d/dRBC:1:0`:
+
+| Objective | 16-step FD `d/dRBC:1:0` | Shared-payload AD `d/dRBC:1:0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-6.2627250000000000e+01` | `-6.2626550836918256e+01` | `6.991631e-04` | `1.116388e-05` |
+| `transport:smooth_root_proxy` | `-5.5764050000000004e-04` | `-3.7595015565651822e-04` | `1.816903e-04` | `3.258199e-01` |
+| `transport:Er2_volume_average` | `-2.7123439999999999e+02` | `-2.7118433140008011e+02` | `5.006860e-02` | `1.845953e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073978935458e+01` | `2.043979e-03` | `8.644799e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497735886055e-02` | `1.522641e-07` | `6.782774e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521010000000001e-02` | `-7.7520439508832056e-02` | `5.704912e-07` | `7.359181e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073920000000001e-03` | `1.2073916329946855e-03` | `3.670053e-10` | `3.039653e-07` |
+
+Comparison against existing saved 16-step profile references:
+
+- These saved profile references are profile-only 16-step references from
+  `ad_forward_lane.md`, not a matching `profiles_plus_realtime_geometry`
+  frozen-FD table for this exact shared-payload run.
+- The pressure/temperature/alpha rows remain very close.
+- The Er/root-sensitive rows are not expected to match these profile-only
+  references exactly because this shared-payload run includes realtime geometry
+  and `jax_selected_root` coupling.
+
+| Objective | Parameter | Shared-payload AD | Saved profile reference | Abs diff | Rel diff |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `n0` | `-5.0838282415568408e+00` | `-3.7637150000000000e+00` | `1.320113e+00` | `3.507472e-01` |
+| `transport:softmax_Er` | `T0` | `4.1306249928548100e+00` | `3.0572340000000000e+00` | `1.073391e+00` | `3.510988e-01` |
+| `transport:softmax_Er` | `density_shape_power` | `-1.1591644624461980e-01` | `-8.5283690000000000e-02` | `3.063276e-02` | `3.591867e-01` |
+| `transport:softmax_Er` | `temperature_shape_power` | `4.2417414653234697e+00` | `3.2202820000000001e+00` | `1.021459e+00` | `3.171956e-01` |
+| `transport:smooth_root_proxy` | `n0` | `-5.8593750000000000e-03` | `4.2146960000000000e-04` | `6.280845e-03` | `1.490225e+01` |
+| `transport:smooth_root_proxy` | `T0` | `-7.7788585014637937e-05` | `-1.7306870000000001e-04` | `9.528011e-05` | `5.505335e-01` |
+| `transport:smooth_root_proxy` | `density_shape_power` | `-1.3650089969452495e-07` | `-3.6866190000000000e-06` | `3.550118e-06` | `9.629879e-01` |
+| `transport:smooth_root_proxy` | `temperature_shape_power` | `2.3783611385449557e-03` | `1.6721560000000000e-02` | `1.434320e-02` | `8.577518e-01` |
+| `transport:Er2_volume_average` | `n0` | `-6.8729867376835294e+00` | `-4.3770650000000000e+00` | `2.495922e+00` | `5.701815e-01` |
+| `transport:Er2_volume_average` | `T0` | `3.6065316917000459e+01` | `2.4631770000000000e+01` | `1.143355e+01` | `4.641791e-01` |
+| `transport:Er2_volume_average` | `density_shape_power` | `3.7772605808640574e+00` | `1.3390750000000000e+00` | `2.438186e+00` | `1.820799e+00` |
+| `transport:Er2_volume_average` | `temperature_shape_power` | `-9.9007831215974562e+00` | `-3.2042000000000002e+01` | `2.214122e+01` | `6.910062e-01` |
+| `transport:Er_volume_average` | `n0` | `-2.3765676300577470e+00` | `-1.7386590000000000e+00` | `6.379086e-01` | `3.668970e-01` |
+| `transport:Er_volume_average` | `T0` | `1.0952038126424903e+00` | `8.2147700000000001e-01` | `2.737268e-01` | `3.332125e-01` |
+| `transport:Er_volume_average` | `density_shape_power` | `-1.0966510378096389e-01` | `-4.3872050000000003e-02` | `6.579305e-02` | `1.499659e+00` |
+| `transport:Er_volume_average` | `temperature_shape_power` | `-3.1844641881012514e-01` | `-4.1779350000000000e-01` | `9.934708e-02` | `2.377899e-01` |
+| `transport:electron_temperature_volume_average_keV` | `n0` | `3.2044199169065646e-03` | `3.1878530000000000e-03` | `1.656692e-05` | `5.196895e-03` |
+| `transport:electron_temperature_volume_average_keV` | `T0` | `3.5042845972161463e-01` | `3.5041640000000002e-01` | `1.205972e-05` | `3.441542e-05` |
+| `transport:electron_temperature_volume_average_keV` | `density_shape_power` | `-1.7862537077364612e-04` | `-1.8212640000000001e-04` | `3.501029e-06` | `1.922307e-02` |
+| `transport:electron_temperature_volume_average_keV` | `temperature_shape_power` | `1.5035680183819486e+00` | `1.5035620000000001e+00` | `6.018382e-06` | `4.002747e-06` |
+| `transport:total_pressure_volume_average` | `n0` | `7.9065460031525578e+00` | `7.9065220000000000e+00` | `2.400315e-05` | `3.035867e-06` |
+| `transport:total_pressure_volume_average` | `T0` | `1.8293618203570214e+00` | `1.8293340000000000e+00` | `2.782036e-05` | `1.520792e-05` |
+| `transport:total_pressure_volume_average` | `density_shape_power` | `2.3978045308837445e-01` | `2.3977710000000000e-01` | `3.353088e-06` | `1.398419e-05` |
+| `transport:total_pressure_volume_average` | `temperature_shape_power` | `7.6008795466190691e+00` | `7.6009360000000000e+00` | `5.645338e-05` | `7.427161e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `n0` | `2.7390173486511626e-01` | `2.7390430000000000e-01` | `2.565135e-06` | `9.365080e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `T0` | `8.1435927075356962e-02` | `8.1428780000000006e-02` | `7.147075e-06` | `8.776964e-05` |
+| `transport:alpha_power_volume_average_mw_m3` | `density_shape_power` | `2.3105926577552259e-03` | `2.3111570000000000e-03` | `5.643422e-07` | `2.441817e-04` |
+| `transport:alpha_power_volume_average_mw_m3` | `temperature_shape_power` | `2.7792303880127184e-01` | `2.7792670000000003e-01` | `3.661199e-06` | `1.317325e-05` |
+
+Historical profile FD values found locally:
+
+- `auto_diff.md` contains older profile AD-vs-FD snippets for `n0` and `T0`.
+- Those values are from a different historical setup and should not be used as
+  the matching FD reference for the current shared-payload run.
+
+### 16-Step Full-Transport FD With Bootstrap
+
+Current FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+FD values:
+
+| Objective | Value | Full FD `d/dRBC:1:0` | Fixed-final-state explicit geometry FD | Baseline-geometry final-state FD |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0694998194713662e+01` | `-6.2627320000000000e+01` | `0.0000000000000000e+00` | `-6.2627320000000000e+01` |
+| `transport:smooth_root_proxy` | `1.9869328464046845e-02` | `-5.5764290000000000e-04` | `0.0000000000000000e+00` | `-5.5764290000000000e-04` |
+| `transport:Er_transition_left` | `1.7686989067626193e+01` | `-2.0130240000000000e+01` | `0.0000000000000000e+00` | `-2.0130240000000000e+01` |
+| `transport:Er_transition_right` | `1.8352979233941966e+01` | `-2.2349450000000000e+01` | `0.0000000000000000e+00` | `-2.2349450000000000e+01` |
+| `transport:Er2_volume_average` | `2.4370331301244494e+02` | `-2.7123420000000000e+02` | `3.5418810000000000e-01` | `-2.7158840000000000e+02` |
+| `transport:Er_volume_average` | `-3.4306058803160564e+00` | `-2.3644030000000000e+01` | `-5.3707040000000000e-02` | `-2.3590320000000000e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4597967427865761e+00` | `-2.2448650000000000e-02` | `-1.2869300000000000e-02` | `-9.5793540000000000e-03` |
+| `transport:total_pressure_volume_average` | `3.3559238343437478e+01` | `-7.7521020000000000e-02` | `-7.7538330000000000e-02` | `1.7328650000000000e-05` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7709114846781473e-01` | `1.2073930000000000e-03` | `-1.9243270000000000e-03` | `3.1317200000000000e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `7.2206620331981608e-01` | `-1.7311170000000000e+00` | `-1.6664920000000000e+00` | `-6.4625960000000000e-02` |
+
+Comparison against the saved 16-step shared-payload reverse AD rows:
+
+| Objective | Full FD `d/dRBC:1:0` | Shared-payload AD `d/dRBC:1:0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-6.2627319999999997e+01` | `-6.2626550836918256e+01` | `7.691631e-04` | `1.228159e-05` |
+| `transport:smooth_root_proxy` | `-5.5764289999999999e-04` | `-3.7595015565651822e-04` | `1.816927e-04` | `3.258228e-01` |
+| `transport:Er2_volume_average` | `-2.7123419999999999e+02` | `-2.7118433140008011e+02` | `4.986860e-02` | `1.838581e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073978935458e+01` | `2.043979e-03` | `8.644799e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497735886055e-02` | `1.522641e-07` | `6.782774e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521019999999996e-02` | `-7.7520439508832056e-02` | `5.804912e-07` | `7.488178e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073916329946855e-03` | `1.367005e-09` | `1.132196e-06` |
+
+Rows present in this FD run but not in the saved 16-step shared-payload reverse
+AD table:
+
+| Objective | FD `d/dRBC:1:0` |
+| --- | ---: |
+| `transport:Er_transition_left` | `-2.0130240000000000e+01` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7311170000000000e+00` |

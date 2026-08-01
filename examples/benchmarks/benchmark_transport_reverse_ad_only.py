@@ -63,6 +63,7 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    evaluate_geometry_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     geometry as geometry_objectives,
     geometry_active_initial_er_root_only_reverse_table,
@@ -74,9 +75,12 @@ from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
+    TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     grouped_transport_reverse_report_builder,
     grouped_transport_reverse_table_result_builder,
+    internal_realtime_geometry_transport_reverse_table_result_builder,
     prepare_realtime_geometry_support_segment_core_setup,
+    realtime_geometry_transport_reverse_table_request,
     RealtimeGeometrySupportReverseDependencies,
     realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector,
     realtime_geometry_support_cotangents_from_parameter_vector,
@@ -3324,12 +3328,26 @@ def _run_realtime_geometry_optimization_api_smoke(
             for family, m, n in geometry_param_specs
         ),
     )
+    objective_labels = (
+        TRANSPORT_REVERSE_OBJECTIVE_LABELS
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else tuple(OBJECTIVE_LABELS)
+    )
     objective_names = (
-        OBJECTIVE_LABELS
+        objective_labels
         if str(args.objective) == "all"
         else (str(args.objective),)
     )
     terms = transport_least_squares_terms(objective_names)
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        terms = tuple(terms) + (
+            LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
+            LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
+            LeastSquaresTerm(geometry_objectives.vmec_aspect_ratio),
+            LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
+            LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
+            LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+        )
     table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
         args=args,
         config=config,
@@ -3339,20 +3357,85 @@ def _run_realtime_geometry_optimization_api_smoke(
         profile_cfg=profile_cfg,
         neoclassical_cfg=neoclassical_cfg,
     )
-    runner = build_transport_realtime_geometry_least_squares_runner(
-        config,
-        objective_names=objective_names,
-        parameter_set=parameter_set,
-        table_context=table_context,
-        run_grouped_report=run_grouped_report,
-        objective_labels=OBJECTIVE_LABELS,
-        options={"quiet": True},
-    )
     print(
         "[autodiff-gate] progress: running realtime geometry optimization API smoke",
         flush=True,
     )
-    evaluation = runner(terms)
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        geom_cfg = config.get("geometry", {})
+        neoclassical_cfg = config.get("neoclassical", {})
+        geometry_values0 = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg,
+            geometry_param_specs,
+        )
+        profile_values0 = jnp.asarray(
+            [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        parameter_values = jnp.asarray(
+            (
+                list(np.asarray(profile_values0, dtype=float))
+                if include_profile_dofs
+                else []
+            )
+            + list(np.asarray(geometry_values0, dtype=float)),
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
+            table_context=table_context,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=geometry_values0,
+            combined_geometry_payload=True,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(
+                neoclassical_cfg.get(
+                    "ntx_exact_surface_backend",
+                    neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                )
+            ),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            accepted_step_limit=args.accepted_step_limit,
+            reverse_segment_length=args.reverse_segment_length,
+            initial_er_root_ad=str(args.initial_er_root_ad),
+            reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
+            reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+            reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+            progress_label="[autodiff-gate] full-transport shared payload:",
+        )
+        request = realtime_geometry_transport_reverse_table_request(
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            context=table_context,
+            options={"quiet": True},
+        )
+        evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+            config,
+            request=request,
+            terms=terms,
+            geometry_context=geometry_context,
+            parameter_values=parameter_values,
+            table_result_builder=table_result_builder,
+            objective_labels=objective_labels,
+            options={"quiet": True},
+            quiet_default=True,
+            geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+            geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+        )
+    else:
+        runner = build_transport_realtime_geometry_least_squares_runner(
+            config,
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            table_context=table_context,
+            run_grouped_report=run_grouped_report,
+            objective_labels=objective_labels,
+            options={"quiet": True},
+        )
+        evaluation = runner(terms)
     result = evaluation.result
     residuals = evaluation.residuals
     jacobian = evaluation.jacobian
