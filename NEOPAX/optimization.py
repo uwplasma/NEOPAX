@@ -6,7 +6,7 @@ import dataclasses
 import copy
 import time
 from collections.abc import Sequence
-from typing import Callable
+from typing import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +19,7 @@ from ._geometry_autodiff import (
     build_geometry_autodiff_context,
     geometry_raw_block_solve_from_param_vector,
 )
+from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
 from ._reverse_ad_initial_er import (
     initial_er_selected_root_profile,
@@ -47,12 +48,13 @@ from ._reverse_ad_parameters import (
     vmex_boundary_parameterization,
 )
 from ._reverse_ad_transport import initial_state_for_parameter_vector
+from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from .api import prepare_config
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GeometryObjectiveTransform:
-    """Script-defined scalar geometry objective backed by one AD-table row."""
+    """Script-defined scalar objective backed by one AD-table row."""
 
     base: ObjectiveRef
     value_fn: Callable[[object], object]
@@ -198,6 +200,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     geometry_max_iter: int | None = None
     geometry_step_size: float | None = None
     geometry_solver_device: str | None = "default"
+    root_options: Mapping[str, object] | None = None
 
     @property
     def parameter_count(self) -> int:
@@ -291,6 +294,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_max_iter=self.geometry_max_iter,
             geometry_step_size=self.geometry_step_size,
             geometry_solver_device=self.geometry_solver_device,
+            root_options=self.root_options,
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -333,8 +337,8 @@ class GeometryInitialErRootLeastSquaresProblem:
         entries = boundary_param_entries(self.context, self.geometry_parameterization.vmec_tuples)
         return _input_with_boundary_deltas(self.context, geometry_values, entries)
 
-    def initial_er_profile_from_scaled_parameters(self, scaled_parameter_values=None):
-        """Return rho, selected initial ambipolar Er, and finite mask for optimizer variables."""
+    def _initial_er_root_state_runtime_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, rooted initial state, runtime, and finite mask for optimizer variables."""
 
         scaled_values = self.x0 if scaled_parameter_values is None else jnp.asarray(
             scaled_parameter_values,
@@ -379,7 +383,54 @@ class GeometryInitialErRootLeastSquaresProblem:
             runtime=runtime_for_geometry,
         )
         rho_grid = jnp.asarray(runtime_for_geometry.geometry.rho_grid, dtype=jnp.asarray(er_profile).dtype)
-        return rho_grid, er_profile, finite_mask
+        rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+        return rho_grid, rooted_state, runtime_for_geometry, finite_mask
+
+    def initial_er_profile_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, selected initial ambipolar Er, and finite mask for optimizer variables."""
+
+        rho_grid, rooted_state, _runtime_for_geometry, finite_mask = (
+            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
+        )
+        return rho_grid, rooted_state.Er, finite_mask
+
+    def bootstrap_current_profile_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, momentum-corrected bootstrap current profile, and finite mask.
+
+        The returned current uses the same scaled units as the optimization
+        objective: one unit corresponds to ``1e5 A/m^2``.
+        """
+
+        rho_grid, rooted_state, runtime_for_geometry, finite_mask = (
+            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
+        )
+        flux_model = runtime_for_geometry.models.flux
+        neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+        corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+        if corrected_fluxes_fn is None:
+            raise ValueError("Bootstrap-current profile requires evaluate_momentum_corrected_fluxes.")
+        fluxes = corrected_fluxes_fn(rooted_state)
+
+        def flux_value(name: str):
+            if hasattr(fluxes, "get"):
+                return fluxes.get(name, None)
+            return getattr(fluxes, name, None)
+
+        upar = flux_value("Upar_neo")
+        if upar is None:
+            upar = flux_value("Upar")
+        if upar is None:
+            raise ValueError("Momentum-corrected fluxes did not provide Upar_neo or Upar.")
+        upar_arr = jnp.asarray(upar, dtype=jnp.asarray(rooted_state.pressure).dtype)
+        charge_qp = jnp.asarray(runtime_for_geometry.species.charge_qp, dtype=upar_arr.dtype)
+        current_weights = jnp.sign(charge_qp)
+        upar_physical = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
+        scale = jnp.asarray(elementary_charge * 1.0e-5, dtype=upar_arr.dtype)
+        if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+            jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0) * scale
+        else:
+            jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1) * scale
+        return rho_grid, jboot, finite_mask
 
 
 def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
@@ -421,6 +472,25 @@ def transformed_geometry_objective(
     )
 
 
+def transformed_transport_objective(
+    base: str | ObjectiveRef,
+    value_fn: Callable[[object], object],
+    derivative_fn: Callable[[object], object] | None = None,
+    *,
+    label: str,
+) -> GeometryObjectiveTransform:
+    """Build a scalar transformed transport objective from one table row."""
+
+    if derivative_fn is None:
+        derivative_fn = jax.grad(lambda x: jnp.asarray(value_fn(x), dtype=jnp.float64))
+    return GeometryObjectiveTransform(
+        base=transport_objective(base),
+        value_fn=value_fn,
+        derivative_fn=derivative_fn,
+        label=str(label),
+    )
+
+
 def _normalize_geometry_least_squares_terms(
     terms: Sequence[
         GeometryLeastSquaresTerm
@@ -450,6 +520,11 @@ def _normalize_geometry_least_squares_terms(
             )
         objective, target, weight = term
         if isinstance(objective, GeometryObjectiveTransform):
+            if objective.base.family != "geometry":
+                raise ValueError(
+                    "geometry_least_squares_problem supports only transformed "
+                    f"geometry objectives; got {objective.base.family!r}."
+                )
             normalized.append(
                 GeometryLeastSquaresTerm(
                     objective=objective.base,
@@ -779,6 +854,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     geometry_step_size: float | None = None,
     geometry_solver_device: str | None = "default",
     device: str | None = "default",
+    root_options: Mapping[str, object] | None = None,
 ) -> GeometryInitialErRootLeastSquaresProblem:
     """Build an optimizer problem for geometry terms plus initial-Er root terms.
 
@@ -869,6 +945,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_max_iter=geometry_max_iter,
         geometry_step_size=geometry_step_size,
         geometry_solver_device=geometry_solver_device,
+        root_options=None if root_options is None else dict(root_options),
     )
 
 
@@ -956,6 +1033,7 @@ __all__ = [
     "geometry_least_squares_problem",
     "least_squares",
     "transformed_geometry_objective",
+    "transformed_transport_objective",
     "transport",
     "transport_objective",
 ]

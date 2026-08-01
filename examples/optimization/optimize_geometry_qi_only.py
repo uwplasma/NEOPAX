@@ -57,6 +57,8 @@ SOLVER_DEVICE = "default"
 MAKE_WOUT_PLOTS = True
 MAKE_J_POLAR_PLOTS = True
 MAKE_B_AXIS_PLOTS = True
+MAKE_BOOZER_B_CONTOUR_PLOTS = True
+MAKE_INITIAL_PLOTS = False
 
 
 # --------------------------- objective functions ---------------------------
@@ -176,24 +178,26 @@ def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.
         for idx in sample_idx:
             values = data[:, :, idx]
             values_periodic = np.concatenate([values, values[:, :1]], axis=1)
-            fig = plt.figure(figsize=(12, 5))
-            ax_polar = fig.add_subplot(1, 2, 1, projection="polar")
-            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=32, cmap="viridis")
-            ax_polar.set_title(f"{name.upper()} polar contour at lambda={lambda_grid[idx]:.2f}")
-            ax_polar.set_ylim(float(surfaces.min()), float(surfaces.max()))
-            fig.colorbar(contour, ax=ax_polar, pad=0.12, label=name.upper())
-
-            ax_lines = fig.add_subplot(1, 2, 2)
-            for isurf, surface in enumerate(surfaces):
-                ax_lines.plot(alpha, data[isurf, :, idx], label=f"s={surface:.2f}")
-            ax_lines.set_title(f"{name.upper()} vs alpha across surfaces")
-            ax_lines.set_xlabel("alpha")
-            ax_lines.set_ylabel(name.upper())
-            ax_lines.grid(True, alpha=0.3)
-            ax_lines.legend(loc="best", ncol=2, fontsize=8)
-            fig.tight_layout()
+            display_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            title_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            fig = plt.figure(figsize=(5.4, 5.8))
+            ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
+            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=40, cmap="plasma")
+            ax_polar.set_title(f"Second adiabatic invariant, {title_name}", fontsize=15, pad=20)
+            ax_polar.set_ylim(0.0, float(surfaces.max()))
+            ax_polar.set_thetagrids(np.arange(0, 360, 45), fontsize=8)
+            radial_ticks = np.linspace(0.2, float(surfaces.max()), 5)
+            ax_polar.set_rticks(radial_ticks)
+            ax_polar.set_yticklabels([f"{tick:.1f}" for tick in radial_ticks], fontsize=8)
+            ax_polar.set_rlabel_position(45)
+            ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
+            colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
+            colorbar.set_label(display_name, fontsize=11)
+            colorbar.ax.tick_params(labelsize=8)
+            fig.text(0.5, 0.035, rf"$\lambda$ = {lambda_grid[idx]:.2f}", ha="center", va="center", fontsize=15)
+            fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
             path = out_dir / f"{name}_polar_lambda_{idx:02d}.png"
-            fig.savefig(path, dpi=180, bbox_inches="tight")
+            fig.savefig(path, dpi=320, bbox_inches="tight")
             plt.close(fig)
             print(f"wrote {path}")
 
@@ -232,6 +236,80 @@ def plot_b_on_axis(wout, out_dir, label, *, nphi=256):
     print(f"wrote {png_path}")
 
 
+def plot_b_on_first_flux_surface(wout, out_dir, label, *, nphi=256):
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.plotting import surface_modB
+    except Exception as exc:
+        print(f"skipping first-flux-surface B plot: {exc}")
+        return
+
+    phi = np.linspace(0.0, 2.0 * np.pi / int(wout.nfp), int(nphi))
+    theta = np.asarray([0.0], dtype=float)
+    ns = int(getattr(wout, "ns", 2))
+    s_index = 1 if ns > 1 else 0
+    b_surface = np.asarray(surface_modB(wout, s_index=s_index, theta=theta, phi=phi), dtype=float).reshape(-1)
+    csv_path = out_dir / f"B_first_flux_surface_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack([phi, b_surface]),
+        delimiter=",",
+        header="phi,B_first_flux_surface_theta0",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(phi, b_surface, linewidth=1.6)
+    ax.set_xlabel("phi")
+    ax.set_ylabel("|B| at first flux surface, theta=0")
+    ax.set_title(f"|B| on first flux surface ({label})")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    png_path = out_dir / f"B_first_flux_surface_{label}.png"
+    fig.savefig(png_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.plotting import surface_modB
+    except Exception as exc:
+        print(f"skipping Boozer |B| contour plots: {exc}")
+        return
+
+    theta = np.linspace(0.0, 2.0 * np.pi, int(ntheta))
+    phi = np.linspace(0.0, 2.0 * np.pi / int(wout.nfp), int(nphi))
+    ns = int(getattr(wout, "ns", 2))
+    surfaces = (("axis", 0), ("first_flux_surface", 1 if ns > 1 else 0))
+    for surface_label, s_index in surfaces:
+        b_grid = np.asarray(surface_modB(wout, s_index=s_index, theta=theta, phi=phi), dtype=float)
+        csv_path = out_dir / f"B_boozer_contour_{surface_label}_{label}.csv"
+        theta_grid, phi_grid = np.meshgrid(theta, phi, indexing="ij")
+        np.savetxt(
+            csv_path,
+            np.column_stack([theta_grid.reshape(-1), phi_grid.reshape(-1), b_grid.reshape(-1)]),
+            delimiter=",",
+            header="theta,phi,B",
+            comments="",
+        )
+        print(f"wrote {csv_path}")
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        contour = ax.contourf(phi, theta, b_grid, levels=40, cmap="viridis")
+        fig.colorbar(contour, ax=ax, label="|B|")
+        ax.set_xlabel("phi")
+        ax.set_ylabel("theta")
+        ax.set_title(f"Boozer |B| contour, {surface_label.replace('_', ' ')} ({label})")
+        fig.tight_layout()
+        png_path = out_dir / f"B_boozer_contour_{surface_label}_{label}.png"
+        fig.savefig(png_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {png_path}")
+
+
 def write_geometry_artifacts(input_obj, label):
     artifact_dir = OUT_DIR / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -247,6 +325,9 @@ def write_geometry_artifacts(input_obj, label):
             print(f"wrote {path}")
     if MAKE_B_AXIS_PLOTS:
         plot_b_on_axis(eq.wout, artifact_dir, label)
+        plot_b_on_first_flux_surface(eq.wout, artifact_dir, label)
+    if MAKE_BOOZER_B_CONTOUR_PLOTS:
+        plot_boozer_b_contours(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
         plot_j_polar_contours(eq, artifact_dir)
 
@@ -259,7 +340,8 @@ def write_outputs(optimized_input, initial_input):
     optimized_input.to_indata(optimized_input_path)
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
-    write_geometry_artifacts(initial_input, "initial")
+    if MAKE_INITIAL_PLOTS:
+        write_geometry_artifacts(initial_input, "initial")
     write_geometry_artifacts(optimized_input, "optimized")
 
 

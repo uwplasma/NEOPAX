@@ -419,6 +419,17 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
 
 FD values:
 
+Bootstrap-current note:
+
+- The `bootstrap_current_softmax_abs_scaled` row in this saved FD table was
+  produced before the FD helper was corrected to require realtime NTX
+  `evaluate_momentum_corrected_fluxes`.
+- Keep the old bootstrap numbers below only as a historical stale reference.
+  They are not a valid comparator for the corrected-momentum bootstrap objective
+  used by the internal/shared AD path.
+- Rerun the FD command after the correction before validating the full-transport
+  bootstrap row.
+
 | Objective | Value | Full FD `d/dRBC:1:0` | Fixed-final-state explicit geometry FD | Baseline-geometry final-state FD |
 | --- | ---: | ---: | ---: | ---: |
 | `transport:softmax_Er` | `2.0694998194713662e+01` | `-6.2627320000000000e+01` | `0.0000000000000000e+00` | `-6.2627320000000000e+01` |
@@ -452,3 +463,93 @@ AD table:
 | `transport:Er_transition_left` | `-2.0130240000000000e+01` |
 | `transport:Er_transition_right` | `-2.2349450000000000e+01` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `-1.7311170000000000e+00` |
+
+## Full Transport: Mixed Shared-Payload AD Update
+
+This is the current mixed optimization-facing smoke after wiring the full
+transport path to print both transport and geometry objectives through the
+shared-payload machinery.
+
+### 2-Step Mixed Shared-Payload AD
+
+- Command: `benchmark_transport_reverse_ad_only.py ... --accepted-step-limit 2 --reverse-segment-length 1 --full-transport-shared-payload-smoke`
+- Residual count: `16`
+- Parameter count: `5`
+- Elapsed time: `1848.789 s`
+- Status: completed without OOM after compact full-transport bootstrap objective rule.
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0474480434757560e+01` | `-4.4010821718627282e+00` | `3.6893021316932324e+00` | `-9.7245517683807015e-02` | `2.2784341729715321e+00` | `-5.1317447005281480e+01` |
+| `transport:smooth_root_proxy` | `1.9565517403925628e-10` | `0.0000000000000000e+00` | `-4.2240800049036898e-10` | `-1.0873396947539999e-13` | `1.7568065363844018e-08` | `4.1615832435574225e-09` |
+| `transport:Er_transition_left` | `1.7657165985271565e+01` | `-1.4241855329757844e+00` | `1.8196098174192941e+00` | `-1.2412582416126678e-02` | `-7.2603261187208350e+00` | `-2.0089861173590997e+01` |
+| `transport:Er_transition_right` | `1.8321478503969928e+01` | `-1.6488669584139266e+00` | `1.9854658787281658e+00` | `-1.7786057135425234e-02` | `-6.3370794754853419e+00` | `-2.2291200089653881e+01` |
+| `transport:Er2_volume_average` | `2.5789275767390154e+02` | `-1.1130507692496678e+00` | `3.3314765761704457e+01` | `3.9716409094558180e+00` | `-1.6627182341155731e+01` | `-1.8107833510078163e+02` |
+| `transport:Er_volume_average` | `-3.5463367280578586e+00` | `-2.0727795330781582e+00` | `9.2860232007956911e-01` | `-1.0172552313027822e-01` | `-8.2119695491996003e-01` | `-2.0555620539844504e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4471445508615828e+00` | `4.7658840766284793e-04` | `3.4852955165267474e-01` | `9.8558205532291165e-06` | `1.4942008613521125e+00` | `-1.3670544339803787e-02` |
+| `transport:total_pressure_volume_average` | `3.3551072628692104e+01` | `7.9013769812319090e+00` | `1.8280094754912617e+00` | `2.3976273858151381e-01` | `7.5981644339917755e+00` | `-7.7574037477612962e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7786228569831921e-01` | `2.7421038425018640e-01` | `8.160464682493223e-02` | `2.3155465380623520e-03` | `2.7875538302773323e-01` | `-1.7350581859371954e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3568564560406851e+00` | `-2.2735836563506640e-03` | `2.1636345559494713e-01` | `-1.2305256192806667e-02` | `1.4402456009787310e+00` | `-1.7122866213720369e+00` |
+| `geometry:boozer_qi_objective` | `3.2109136309506734e-03` | `0.0` | `0.0` | `0.0` | `0.0` | `8.9989229071147925e-02` |
+| `geometry:boozer_maxj_objective` | `1.3389843913753852e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `-1.1593167987082040e+00` |
+| `geometry:vmec_aspect_ratio` | `1.0015330918957178e+01` | `0.0` | `0.0` | `0.0` | `0.0` | `-5.4006784187006147e+00` |
+| `geometry:vmec_iota_mean` | `-5.9365259966101458e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `2.4405140609263865e-01` |
+| `geometry:vmec_magnetic_well` | `-2.7476128749679612e-02` | `0.0` | `0.0` | `0.0` | `0.0` | `-1.1090116065531674e-02` |
+| `geometry:vmec_mirror_ratio` | `2.1153803467163693e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `-5.9359094714046601e-01` |
+
+### 16-Step Mixed Shared-Payload AD
+
+- Command: `benchmark_transport_reverse_ad_only.py ... --accepted-step-limit 16 --reverse-segment-length 4 --full-transport-shared-payload-smoke`
+- Residual count: `16`
+- Parameter count: `5`
+- Elapsed time: `3541.502 s`
+- Status: completed without OOM after compact full-transport bootstrap objective rule.
+
+| Objective | Value | `d/dn0` | `d/dT0` | `d/ddensity_shape_power` | `d/dtemperature_shape_power` | `d/dRBC:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `2.0694998241267641e+01` | `-5.0838282426765602e+00` | `4.1306249932125239e+00` | `-1.1591644638113782e-01` | `4.2417414639205937e+00` | `-6.2626550858639305e+01` |
+| `transport:smooth_root_proxy` | `1.9868729727533445e-02` | `-5.8593750000000000e-03` | `-7.8661443694676321e-05` | `-4.6968973155259164e-10` | `2.3759369109219077e-03` | `-3.6780535157069163e-04` |
+| `transport:Er_transition_left` | `1.7686989084389136e+01` | `-1.4080049846156255e+00` | `1.8189473816018960e+00` | `-1.2527738844939166e-02` | `-7.2434886819567694e+00` | `-2.0130902762944103e+01` |
+| `transport:Er_transition_right` | `1.8352979259460643e+01` | `-1.6310887137958741e+00` | `1.9845372872751819e+00` | `-1.7923132068669315e-02` | `-6.3196368732760977e+00` | `-2.2349701278432580e+01` |
+| `transport:Er2_volume_average` | `2.4372053202139412e+02` | `-6.8729867601779873e+00` | `3.6065316928902384e+01` | `3.7772605802803998e+00` | `-9.9007834256044234e+00` | `-2.7118433131494726e+02` |
+| `transport:Er_volume_average` | `-3.4309746025765144e+00` | `-2.3765427446710738e+00` | `1.0951895590455043e+00` | `-1.0966513920041543e-01` | `-3.1848898508307144e-01` | `-2.3645736589729140e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.4597967687544342e+00` | `3.2044206846031376e-03` | `3.5042845937983902e-01` | `-1.7862516380266411e-04` | `1.5035679924726344e+00` | `-2.2448477914450340e-02` |
+| `transport:total_pressure_volume_average` | `3.3559238356010034e+01` | `7.9065460031560715e+00` | `1.8293618202564703e+00` | `2.3978045310409096e-01` | `7.6008795464596064e+00` | `-7.7520438710911577e-02` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.7709114832136932e-01` | `2.7390173501999121e-01` | `8.1435926777295040e-02` | `2.3105926842456898e-03` | `2.7792304292856762e-01` | `1.2073914238870094e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3615202803949229e+00` | `-4.0512909481635884e-03` | `2.1820601193258365e-01` | `-1.2505757233407980e-02` | `1.4495166463763556e+00` | `-1.7920897096814259e+00` |
+| `geometry:boozer_qi_objective` | `3.2109136309506734e-03` | `0.0` | `0.0` | `0.0` | `0.0` | `8.9989229071780308e-02` |
+| `geometry:boozer_maxj_objective` | `1.3389843913753852e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `-1.1593167987256550e+00` |
+| `geometry:vmec_aspect_ratio` | `1.0015330918957178e+01` | `0.0` | `0.0` | `0.0` | `0.0` | `-5.4006784187006147e+00` |
+| `geometry:vmec_iota_mean` | `-5.9365259966101458e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `2.4405140609263865e-01` |
+| `geometry:vmec_magnetic_well` | `-2.7476128749679612e-02` | `0.0` | `0.0` | `0.0` | `0.0` | `-1.1090116065531674e-02` |
+| `geometry:vmec_mirror_ratio` | `2.1153803467163693e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `-5.9359094714046601e-01` |
+
+Comparison against saved 16-step full-transport FD `d/dRBC:1:0`:
+
+| Objective | FD `d/dRBC:1:0` | Mixed shared AD `d/dRBC:1:0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-6.2627320000000000e+01` | `-6.2626550858639305e+01` | `7.691414e-04` | `1.228124e-05` |
+| `transport:smooth_root_proxy` | `-5.5764290000000003e-04` | `-3.6780535157069163e-04` | `1.898375e-04` | `3.403266e-01` |
+| `transport:Er_transition_left` | `-2.0130240000000001e+01` | `-2.0130902762944103e+01` | `6.627629e-04` | `3.292373e-05` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `2.512784e-04` | `1.124317e-05` |
+| `transport:Er2_volume_average` | `-2.7123420000000002e+02` | `-2.7118433131494726e+02` | `4.986869e-02` | `1.838583e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3645736589729140e+01` | `1.706590e-03` | `7.218262e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `1.720855e-07` | `7.665731e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `5.812891e-07` | `7.498470e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.576113e-09` | `1.305385e-06` |
+| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` | `-1.7920897096814259e+00` | pending corrected FD rerun | pending corrected FD rerun |
+
+Notes:
+
+- The mixed shared-payload run now exercises the optimization-facing full
+  transport and geometry rows in one table.
+- The compact full-transport bootstrap rule avoids the previous OOM.
+- Non-bootstrap full-transport rows remain close to the saved FD references.
+- The old full-transport bootstrap FD row used a stale objective helper that
+  could use lagged/uncorrected or fallback `Upar`. The FD helper has now been
+  corrected to require realtime NTX momentum-corrected `Upar`; the bootstrap
+  comparison is pending a corrected FD rerun.
+- This caveat is specific to the full time-evolution bootstrap row. The
+  initial-Er root-only/ambipolarity bootstrap geometry derivative was already
+  validated against FD: `d/dRBC:1:0` AD `-1.7061866715282692e+00` vs FD
+  `-1.7058819999999999e+00`, relative difference `1.786006e-04`.

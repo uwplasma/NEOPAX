@@ -17,7 +17,6 @@ if str(ROOT) not in sys.path:
 
 import NEOPAX  # noqa: E402
 from NEOPAX._constants import elementary_charge  # noqa: E402
-from NEOPAX._neoclassical import get_Neoclassical_Fluxes_With_Momentum_Correction  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._profiles import AnalyticalProfileModel  # noqa: E402
 from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
@@ -247,27 +246,16 @@ def _bootstrap_current_softmax_abs_scaled(
     flux_model = getattr(getattr(runtime, "models", None), "flux", None)
     neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
     corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
-    if callable(corrected_fluxes_fn):
-        fluxes = corrected_fluxes_fn(final_state)
-        upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
-    else:
-        upar = None
-    if flux_model is not None:
-        if upar is None:
-            fluxes = flux_model(final_state)
-            upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
-    if upar is None:
-        if runtime.database is None:
-            return jnp.asarray(0.0, dtype=final_state.pressure.dtype)
-        _gamma, _q, upar, _qpar, _upar2 = get_Neoclassical_Fluxes_With_Momentum_Correction(
-            runtime.species,
-            runtime.energy_grid,
-            runtime.geometry,
-            runtime.database,
-            jnp.asarray(final_state.Er, dtype=final_state.pressure.dtype),
-            jnp.asarray(final_state.temperature, dtype=final_state.pressure.dtype),
-            jnp.asarray(final_state.density, dtype=final_state.pressure.dtype),
+    if not callable(corrected_fluxes_fn):
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled requires realtime NTX "
+            "evaluate_momentum_corrected_fluxes; refusing to use lagged, "
+            "uncorrected, or database fallback Upar in the FD objective."
         )
+    fluxes = corrected_fluxes_fn(final_state)
+    upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
+    if upar is None:
+        raise ValueError("momentum-corrected realtime NTX fluxes did not return Upar.")
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
     current_weights = jnp.sign(charge_qp)
     upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)

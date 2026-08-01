@@ -972,6 +972,7 @@ def initial_er_root_only_objective_cotangent_table(
     profile_values,
     pre_root_state_from_profile_values: Callable[[object], object],
     support_payload_override=None,
+    options: Mapping[str, object] | None = None,
 ) -> ObjectiveCotangentTable:
     """Return initial-Er root objective values plus profile/payload cotangents.
 
@@ -1024,6 +1025,7 @@ def initial_er_root_only_objective_cotangent_table(
             state_value,
             runtime_with_geometry,
             generic_objectives,
+            options=options,
         )
 
     objective_count = len(requested_objectives)
@@ -1390,6 +1392,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     progress_label: str | None = None,
     raw_block_solve=None,
     support_payload_override=None,
+    options: Mapping[str, object] | None = None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -1485,6 +1488,7 @@ def geometry_active_initial_er_root_only_reverse_table(
                 state_value,
                 runtime_with_geometry,
                 generic_objectives,
+                options=options,
             )
 
         objective_count = len(requested_objectives)
@@ -1831,7 +1835,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
 ) -> LeastSquaresEvaluation:
     """Evaluate geometry + initial-Er root terms with one fused VMEC pullback."""
 
-    del root_options  # Objective/root tuning can be threaded here once needed.
+    root_runner_options = {} if root_options is None else dict(root_options)
     normalized_terms = normalize_least_squares_terms(terms)
     grouped_terms = group_least_squares_terms_by_family(normalized_terms)
     unsupported_families = tuple(
@@ -1869,6 +1873,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 runtime=runtime,
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                options=root_runner_options,
             )
             cotangent_tables_by_family["transport"] = transport_table
         else:
@@ -1930,6 +1935,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_fused(
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
                 support_payload_override=current_support_payload,
+                options=root_runner_options,
             )
             (
                 transport_values,
@@ -2101,6 +2107,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_max_iter: int | None = None,
     geometry_step_size: float | None = None,
     geometry_solver_device: str | None = "default",
+    root_options: Mapping[str, object] | None = None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2118,6 +2125,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     parameter_values_arr = jnp.asarray(parameter_values, dtype=jnp.float64)
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     shared_raw_block_solve = None
+    root_runner_options = {} if root_options is None else dict(root_options)
     t_start = time.perf_counter()
 
     if "transport" in grouped_terms:
@@ -2169,6 +2177,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 solver_device=geometry_solver_device,
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
                 raw_block_solve=shared_raw_block_solve,
+                options=root_runner_options,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
@@ -2192,6 +2201,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 runtime=runtime,
                 profile_values=active_profile_values,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                options=root_runner_options,
             )
             backend_results["transport"] = objective_table_result_from_cotangent_table(
                 transport_table,

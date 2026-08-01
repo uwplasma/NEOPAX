@@ -241,12 +241,57 @@ Bootstrap FD update:
 
 - The 16-step full-transport FD run with `jax_selected_root` now includes
   `bootstrap_current_softmax_abs_scaled`.
-- The full saved table is in `optimization_ad_vs_fd.md` under
-  `16-Step Full-Transport FD With Bootstrap`.
-- New FD-only rows awaiting matching full-reverse AD rows:
+- The saved bootstrap row was later found to use the old full-FD objective
+  helper, which could evaluate lagged/uncorrected or fallback `Upar` instead of
+  realtime NTX momentum-corrected `Upar`.
+- The FD helper has now been corrected to require realtime NTX
+  `evaluate_momentum_corrected_fluxes`; rerun the FD command before treating the
+  bootstrap FD row as a valid comparator.
+- New FD-only rows from the stale table:
 
 | Objective | FD `d/dRBC:1:0` |
 | --- | ---: |
 | `transport:Er_transition_left` | `-2.0130240000000000e+01` |
 | `transport:Er_transition_right` | `-2.2349450000000000e+01` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7311170000000000e+00` |
+| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` |
+
+## Mixed Full-Transport Shared-Payload Update
+
+Current mixed shared-payload smoke now completes for both `2` and `16`
+accepted-step tests with `16` residual rows:
+
+- 10 transport rows:
+  `softmax_Er`, `smooth_root_proxy`, `Er_transition_left`,
+  `Er_transition_right`, `Er2_volume_average`, `Er_volume_average`,
+  `electron_temperature_volume_average_keV`, `total_pressure_volume_average`,
+  `alpha_power_volume_average_mw_m3`, `bootstrap_current_softmax_abs_scaled`.
+- 6 geometry rows:
+  `boozer_qi_objective`, `boozer_maxj_objective`, `vmec_aspect_ratio`,
+  `vmec_iota_mean`, `vmec_magnetic_well`, `vmec_mirror_ratio`.
+
+Saved 16-step mixed shared-payload `d/dRBC:1:0` comparison:
+
+| Objective | Saved FD `d/dRBC:1:0` | Mixed shared AD `d/dRBC:1:0` | Rel diff |
+| --- | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-6.2627320000000000e+01` | `-6.2626550858639305e+01` | `1.228124e-05` |
+| `transport:Er_transition_left` | `-2.0130240000000001e+01` | `-2.0130902762944103e+01` | `3.292373e-05` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `1.124317e-05` |
+| `transport:Er2_volume_average` | `-2.7123420000000002e+02` | `-2.7118433131494726e+02` | `1.838583e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3645736589729140e+01` | `7.218262e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `7.665731e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `7.498470e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.305385e-06` |
+| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` | `-1.7920897096814259e+00` | pending corrected FD rerun |
+
+Status:
+
+- The full-transport bootstrap compact rule removes the previous OOM.
+- The non-bootstrap full-transport rows are consistent with saved FD.
+- The full-transport bootstrap row is still a follow-up item because the saved
+  FD bootstrap reference was produced with the stale objective helper. It needs
+  a corrected FD rerun before comparison.
+- The initial-Er root-only/ambipolarity bootstrap geometry derivative was fine:
+  AD `-1.7061866715282692e+00` vs FD `-1.7058819999999999e+00`, relative
+  difference `1.786006e-04`.
+- Full detailed 2-step/16-step mixed tables are saved in
+  `optimization_ad_vs_fd.md`.
