@@ -426,7 +426,13 @@ def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
 
         finite_b = b_grid[np.isfinite(b_grid)]
         if finite_b.size:
-            levels = np.linspace(float(finite_b.min()), float(finite_b.max()), 28)
+            b_min = float(finite_b.min())
+            b_max = float(finite_b.max())
+            if not b_max > b_min:
+                pad = max(abs(b_min), 1.0) * 1.0e-8
+                b_min -= pad
+                b_max += pad
+            levels = np.linspace(b_min, b_max, 28)
         else:
             levels = 28
         fig, ax = plt.subplots(figsize=(6.4, 4.8))
