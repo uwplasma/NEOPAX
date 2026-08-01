@@ -1383,7 +1383,7 @@ class ComposedEquationSystem:
             density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
             temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
             er_equation=next((eq for eq in equations if getattr(eq, "name", None) == "Er"), None),
-            shared_flux_model=flux_model if len(equations) > 1 else None,
+            shared_flux_model=flux_model if len(equations) >= 1 else None,
         )
 
     def _prepare_working_state(self, state):
