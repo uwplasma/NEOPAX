@@ -3578,6 +3578,7 @@ def _boozer_rmnc00_from_state_at_rho(
     *,
     boozer_surface_sampling=None,
     booz_constants_grids=None,
+    booz_mode00: int | None = None,
 ):
     """Return Boozer R(m=0,n=0) on requested rho values.
 
@@ -3613,7 +3614,10 @@ def _boozer_rmnc00_from_state_at_rho(
     )
     if "rmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    if booz_mode00 is None:
+        mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    else:
+        mode00 = int(booz_mode00)
     if mode00 is None:
         raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
     rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
@@ -4488,6 +4492,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
     progress_label: str | None = None,
     r00_boozer_surface_sampling=None,
     r00_booz_constants_grids=None,
+    r00_booz_mode00: int | None = None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -4558,6 +4563,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         r00_support_rho_np,
         boozer_surface_sampling=r00_boozer_surface_sampling,
         booz_constants_grids=r00_booz_constants_grids,
+        booz_mode00=r00_booz_mode00,
     )
     r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
     r00_center = r00_interp(rho_center)
@@ -4890,6 +4896,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             progress_label=progress_label,
             r00_boozer_surface_sampling=r00_boozer_surface_sampling,
             r00_booz_constants_grids=geometry_booz_constants_grids,
+            r00_booz_mode00=geometry_booz_mode00,
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
