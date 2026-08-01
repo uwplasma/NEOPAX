@@ -181,13 +181,16 @@ These are not root-only ambipolarity FD values, but they are the saved
 
 | Objective | 16-step FD `d/dRBC:1:0` | 16-step reverse AD `d/dRBC:1:0` | `abs diff` | `rel diff` |
 | --- | ---: | ---: | ---: | ---: |
-| `transport:softmax_Er` | `-6.2627250000000000e+01` | `-6.2626550584360913e+01` | `6.994156e-04` | `1.116791e-05` |
-| `transport:smooth_root_proxy` | `-5.5764050000000004e-04` | `-3.7595015613984747e-04` | `1.816903e-04` | `3.258198e-01` |
-| `transport:Er2_volume_average` | `-2.7123439999999999e+02` | `-2.7118432937475063e+02` | `5.007063e-02` | `1.846028e-04` |
-| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073953442198e+01` | `2.043953e-03` | `8.644691e-05` |
-| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497948865054e-02` | `1.520511e-07` | `6.773286e-06` |
-| `transport:total_pressure_volume_average` | `-7.7521010000000001e-02` | `-7.7520440608481067e-02` | `5.693915e-07` | `7.344996e-06` |
-| `transport:alpha_power_volume_average_mw_m3` | `1.2073920000000001e-03` | `1.2073916077413038e-03` | `3.922587e-10` | `3.248810e-07` |
+| `transport:softmax_Er` | `-6.2627320000000000e+01` | `-6.2626550858639305e+01` | `7.691414e-04` | `1.228124e-05` |
+| `transport:smooth_root_proxy` | `-5.5764290000000003e-04` | `-3.6780535157069163e-04` | `1.898375e-04` | `3.404285e-01` |
+| `transport:Er_transition_left` | `-2.0130240000000001e+01` | `-2.0130902762944103e+01` | `6.627629e-04` | `3.292375e-05` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `2.512784e-04` | `1.124316e-05` |
+| `transport:Er2_volume_average` | `-2.7123420000000002e+02` | `-2.7118433131494726e+02` | `4.986869e-02` | `1.838584e-04` |
+| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3645736589729140e+01` | `1.706590e-03` | `7.217846e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `1.720855e-07` | `7.665742e-06` |
+| `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `5.812891e-07` | `7.498471e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.576113e-09` | `1.305385e-06` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `3.177097e-04` | `1.773159e-04` |
 
 This full-transport table should not be used as the FD reference for the
 root-only ambipolarity smoke, because the root-only path does not include the
@@ -208,11 +211,14 @@ Full shared-payload AD table:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `transport:softmax_Er` | `2.0694998241267641e+01` | `-5.0838282415568408e+00` | `4.1306249928548100e+00` | `-1.1591644624461980e-01` | `4.2417414653234697e+00` | `-6.2626550836918256e+01` |
 | `transport:smooth_root_proxy` | `1.9868729727533445e-02` | `-5.8593750000000000e-03` | `-7.7788585014637937e-05` | `-1.3650089969452495e-07` | `2.3783611385449557e-03` | `-3.7595015565651822e-04` |
+| `transport:Er_transition_left` | `1.7686989084389136e+01` | `-1.4080049846156255e+00` | `1.8189473816018960e+00` | `-1.2527738844939166e-02` | `-7.2434886819567694e+00` | `-2.0130902762944103e+01` |
+| `transport:Er_transition_right` | `1.8352979259460643e+01` | `-1.6310887137958741e+00` | `1.9845372872751819e+00` | `-1.7923132068669315e-02` | `-6.3196368732760977e+00` | `-2.2349701278432580e+01` |
 | `transport:Er2_volume_average` | `2.4372053202139412e+02` | `-6.8729867376835294e+00` | `3.6065316917000459e+01` | `3.7772605808640574e+00` | `-9.9007831215974562e+00` | `-2.7118433140008011e+02` |
 | `transport:Er_volume_average` | `-3.4309746025765144e+00` | `-2.3765676300577470e+00` | `1.0952038126424903e+00` | `-1.0966510378096389e-01` | `-3.1844641881012514e-01` | `-2.3646073978935458e+01` |
 | `transport:electron_temperature_volume_average_keV` | `6.4597967687544342e+00` | `3.2044199169065646e-03` | `3.5042845972161463e-01` | `-1.7862537077364612e-04` | `1.5035680183819486e+00` | `-2.2448497735886055e-02` |
 | `transport:total_pressure_volume_average` | `3.3559238356010034e+01` | `7.9065460031525578e+00` | `1.8293618203570214e+00` | `2.3978045308837445e-01` | `7.6008795466190691e+00` | `-7.7520439508832056e-02` |
 | `transport:alpha_power_volume_average_mw_m3` | `5.7709114832136932e-01` | `2.7390173486511626e-01` | `8.1435927075356962e-02` | `2.3105926577552259e-03` | `2.7792303880127184e-01` | `1.2073916329946855e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3615202803949229e+00` | `-4.0512909481635884e-03` | `2.1820601193258365e-01` | `-1.2505757233407980e-02` | `1.4495166463763556e+00` | `-1.7920897096814259e+00` |
 
 Comparison against saved 16-step FD `d/dRBC:1:0`:
 
@@ -220,11 +226,14 @@ Comparison against saved 16-step FD `d/dRBC:1:0`:
 | --- | ---: | ---: | ---: | ---: |
 | `transport:softmax_Er` | `-6.2627250000000000e+01` | `-6.2626550836918256e+01` | `6.991631e-04` | `1.116388e-05` |
 | `transport:smooth_root_proxy` | `-5.5764050000000004e-04` | `-3.7595015565651822e-04` | `1.816903e-04` | `3.258199e-01` |
+| `transport:Er_transition_left` | `-2.0130240000000001e+01` | `-2.0130902762944103e+01` | `6.627629e-04` | `3.292375e-05` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `2.512784e-04` | `1.124316e-05` |
 | `transport:Er2_volume_average` | `-2.7123439999999999e+02` | `-2.7118433140008011e+02` | `5.006860e-02` | `1.845953e-04` |
 | `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073978935458e+01` | `2.043979e-03` | `8.644799e-05` |
 | `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497735886055e-02` | `1.522641e-07` | `6.782774e-06` |
 | `transport:total_pressure_volume_average` | `-7.7521010000000001e-02` | `-7.7520439508832056e-02` | `5.704912e-07` | `7.359181e-06` |
 | `transport:alpha_power_volume_average_mw_m3` | `1.2073920000000001e-03` | `1.2073916329946855e-03` | `3.670053e-10` | `3.039653e-07` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `3.177097e-04` | `1.773159e-04` |
 
 Profile-column comparison:
 
@@ -239,21 +248,12 @@ Profile-column comparison:
 
 Bootstrap FD update:
 
-- The 16-step full-transport FD run with `jax_selected_root` now includes
-  `bootstrap_current_softmax_abs_scaled`.
-- The saved bootstrap row was later found to use the old full-FD objective
-  helper, which could evaluate lagged/uncorrected or fallback `Upar` instead of
-  realtime NTX momentum-corrected `Upar`.
-- The FD helper has now been corrected to require realtime NTX
-  `evaluate_momentum_corrected_fluxes`; rerun the FD command before treating the
-  bootstrap FD row as a valid comparator.
-- New FD-only rows from the stale table:
-
-| Objective | FD `d/dRBC:1:0` |
-| --- | ---: |
-| `transport:Er_transition_left` | `-2.0130240000000000e+01` |
-| `transport:Er_transition_right` | `-2.2349450000000000e+01` |
-| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` |
+- The 16-step full-transport FD run with `jax_selected_root` now includes the
+  corrected realtime NTX momentum-corrected bootstrap row.
+- Bootstrap AD vs FD is validated at relative difference `1.773159e-04`.
+- The bootstrap FD split is also internally consistent:
+  explicit geometry `-1.656870e+00` plus final-state `-1.349065e-01` matches
+  full FD `-1.791772e+00` within FD precision.
 
 ## Mixed Full-Transport Shared-Payload Update
 
@@ -281,15 +281,12 @@ Saved 16-step mixed shared-payload `d/dRBC:1:0` comparison:
 | `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `7.665731e-06` |
 | `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `7.498470e-06` |
 | `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.305385e-06` |
-| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` | `-1.7920897096814259e+00` | pending corrected FD rerun |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `1.773159e-04` |
 
 Status:
 
 - The full-transport bootstrap compact rule removes the previous OOM.
-- The non-bootstrap full-transport rows are consistent with saved FD.
-- The full-transport bootstrap row is still a follow-up item because the saved
-  FD bootstrap reference was produced with the stale objective helper. It needs
-  a corrected FD rerun before comparison.
+- The full-transport rows, including bootstrap, are consistent with saved FD.
 - The initial-Er root-only/ambipolarity bootstrap geometry derivative was fine:
   AD `-1.7061866715282692e+00` vs FD `-1.7058819999999999e+00`, relative
   difference `1.786006e-04`.

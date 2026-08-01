@@ -421,14 +421,12 @@ FD values:
 
 Bootstrap-current note:
 
-- The `bootstrap_current_softmax_abs_scaled` row in this saved FD table was
-  produced before the FD helper was corrected to require realtime NTX
-  `evaluate_momentum_corrected_fluxes`.
-- Keep the old bootstrap numbers below only as a historical stale reference.
-  They are not a valid comparator for the corrected-momentum bootstrap objective
-  used by the internal/shared AD path.
-- Rerun the FD command after the correction before validating the full-transport
-  bootstrap row.
+- The bootstrap row below is the corrected full-transport FD reference using
+  realtime NTX momentum-corrected `Upar`.
+- For bootstrap, the full FD splits cleanly into explicit geometry plus
+  baseline-geometry final-state pieces:
+  `-1.656870e+00 + -1.349065e-01 = -1.7917765e+00`, matching the full FD
+  `-1.791772e+00` within FD precision.
 
 | Objective | Value | Full FD `d/dRBC:1:0` | Fixed-final-state explicit geometry FD | Baseline-geometry final-state FD |
 | --- | ---: | ---: | ---: | ---: |
@@ -441,7 +439,7 @@ Bootstrap-current note:
 | `transport:electron_temperature_volume_average_keV` | `6.4597967427865761e+00` | `-2.2448650000000000e-02` | `-1.2869300000000000e-02` | `-9.5793540000000000e-03` |
 | `transport:total_pressure_volume_average` | `3.3559238343437478e+01` | `-7.7521020000000000e-02` | `-7.7538330000000000e-02` | `1.7328650000000000e-05` |
 | `transport:alpha_power_volume_average_mw_m3` | `5.7709114846781473e-01` | `1.2073930000000000e-03` | `-1.9243270000000000e-03` | `3.1317200000000000e-03` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `7.2206620331981608e-01` | `-1.7311170000000000e+00` | `-1.6664920000000000e+00` | `-6.4625960000000000e-02` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.3615203117088308e+00` | `-1.7917720000000000e+00` | `-1.6568700000000000e+00` | `-1.3490650000000000e-01` |
 
 Comparison against the saved 16-step shared-payload reverse AD rows:
 
@@ -449,20 +447,17 @@ Comparison against the saved 16-step shared-payload reverse AD rows:
 | --- | ---: | ---: | ---: | ---: |
 | `transport:softmax_Er` | `-6.2627319999999997e+01` | `-6.2626550836918256e+01` | `7.691631e-04` | `1.228159e-05` |
 | `transport:smooth_root_proxy` | `-5.5764289999999999e-04` | `-3.7595015565651822e-04` | `1.816927e-04` | `3.258228e-01` |
+| `transport:Er_transition_left` | `-2.0130240000000000e+01` | `-2.0130902762944103e+01` | `6.627629e-04` | `3.292375e-05` |
+| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `2.512784e-04` | `1.124316e-05` |
 | `transport:Er2_volume_average` | `-2.7123419999999999e+02` | `-2.7118433140008011e+02` | `4.986860e-02` | `1.838581e-04` |
 | `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3646073978935458e+01` | `2.043979e-03` | `8.644799e-05` |
 | `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448497735886055e-02` | `1.522641e-07` | `6.782774e-06` |
 | `transport:total_pressure_volume_average` | `-7.7521019999999996e-02` | `-7.7520439508832056e-02` | `5.804912e-07` | `7.488178e-06` |
 | `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073916329946855e-03` | `1.367005e-09` | `1.132196e-06` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `3.177097e-04` | `1.773159e-04` |
 
-Rows present in this FD run but not in the saved 16-step shared-payload reverse
-AD table:
-
-| Objective | FD `d/dRBC:1:0` |
-| --- | ---: |
-| `transport:Er_transition_left` | `-2.0130240000000000e+01` |
-| `transport:Er_transition_right` | `-2.2349450000000000e+01` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7311170000000000e+00` |
+The transition and bootstrap rows are included in the current mixed
+shared-payload AD table below.
 
 ## Full Transport: Mixed Shared-Payload AD Update
 
@@ -537,19 +532,15 @@ Comparison against saved 16-step full-transport FD `d/dRBC:1:0`:
 | `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `1.720855e-07` | `7.665731e-06` |
 | `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `5.812891e-07` | `7.498470e-06` |
 | `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.576113e-09` | `1.305385e-06` |
-| `transport:bootstrap_current_softmax_abs_scaled` | stale: `-1.7311170000000000e+00` | `-1.7920897096814259e+00` | pending corrected FD rerun | pending corrected FD rerun |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `3.177097e-04` | `1.773159e-04` |
 
 Notes:
 
 - The mixed shared-payload run now exercises the optimization-facing full
   transport and geometry rows in one table.
 - The compact full-transport bootstrap rule avoids the previous OOM.
-- Non-bootstrap full-transport rows remain close to the saved FD references.
-- The old full-transport bootstrap FD row used a stale objective helper that
-  could use lagged/uncorrected or fallback `Upar`. The FD helper has now been
-  corrected to require realtime NTX momentum-corrected `Upar`; the bootstrap
-  comparison is pending a corrected FD rerun.
-- This caveat is specific to the full time-evolution bootstrap row. The
-  initial-Er root-only/ambipolarity bootstrap geometry derivative was already
+- Full-transport rows, including the corrected bootstrap row, are consistent
+  with the saved FD references.
+- The initial-Er root-only/ambipolarity bootstrap geometry derivative was also
   validated against FD: `d/dRBC:1:0` AD `-1.7061866715282692e+00` vs FD
   `-1.7058819999999999e+00`, relative difference `1.786006e-04`.

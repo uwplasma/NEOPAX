@@ -187,6 +187,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     runtime: object
     baseline_state: object
     baseline_profile_values: object
+    profile_scales: object
     parameter_set: object
     geometry_parameterization: VmexBoundaryParameterization | None
     profile_specs: tuple[ProfileParameterSpec, ...]
@@ -214,9 +215,13 @@ class GeometryInitialErRootLeastSquaresProblem:
     def x0(self):
         values = []
         profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_scale_lookup = {
+            name: self.profile_scales[i]
+            for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+        }
         for spec in self.parameter_set.specs:
             if isinstance(spec, ProfileParameterSpec):
-                values.append(self.baseline_profile_values[profile_lookup[spec.name]])
+                values.append(self.baseline_profile_values[profile_lookup[spec.name]] / profile_scale_lookup[spec.name])
             else:
                 values.append(jnp.asarray(0.0, dtype=jnp.float64))
         return jnp.asarray(values, dtype=jnp.float64)
@@ -234,9 +239,13 @@ class GeometryInitialErRootLeastSquaresProblem:
                 )
             }
         scales = []
+        profile_scale_lookup = {
+            name: self.profile_scales[i]
+            for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+        }
         for spec in self.parameter_set.specs:
             if isinstance(spec, ProfileParameterSpec):
-                scales.append(1.0)
+                scales.append(profile_scale_lookup[spec.name])
             else:
                 scales.append(float(geometry_scales.get(spec, 1.0)))
         return jnp.asarray(scales, dtype=jnp.float64)
@@ -252,7 +261,7 @@ class GeometryInitialErRootLeastSquaresProblem:
         scale = self.x_scale
         for i, spec in enumerate(self.parameter_set.specs):
             if isinstance(spec, ProfileParameterSpec):
-                physical_values.append(scaled_values[i])
+                physical_values.append(scaled_values[i] * scale[i])
             else:
                 physical_values.append(scaled_values[i] * scale[i])
         return jnp.asarray(physical_values, dtype=jnp.float64)
@@ -393,6 +402,14 @@ class GeometryInitialErRootLeastSquaresProblem:
             self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
         )
         return rho_grid, rooted_state.Er, finite_mask
+
+    def initial_root_profiles_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, density, temperature, selected Er, and finite root mask."""
+
+        rho_grid, rooted_state, _runtime_for_geometry, finite_mask = (
+            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
+        )
+        return rho_grid, rooted_state.density, rooted_state.temperature, rooted_state.Er, finite_mask
 
     def bootstrap_current_profile_from_scaled_parameters(self, scaled_parameter_values=None):
         """Return rho, momentum-corrected bootstrap current profile, and finite mask.
@@ -825,6 +842,16 @@ def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
     return jnp.asarray(values, dtype=dtype)
 
 
+def _profile_scales_from_values(values, mode: str):
+    mode_eff = str(mode).strip().lower()
+    values_arr = jnp.asarray(values, dtype=jnp.float64)
+    if mode_eff in ("identity", "none", "unit"):
+        return jnp.ones_like(values_arr)
+    if mode_eff in ("nominal", "baseline"):
+        return jnp.maximum(jnp.abs(values_arr), jnp.asarray(1.0e-12, dtype=values_arr.dtype))
+    raise ValueError("profile_scale_mode must be 'identity' or 'nominal'.")
+
+
 def geometry_initial_er_root_only_least_squares_problem(
     config,
     terms: Sequence[
@@ -838,6 +865,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     parameters: str | Sequence[str] | None = None,
     include_profiles: bool = False,
     profile_parameters: str | Sequence[str] | None = "n0,T0,density_shape_power,temperature_shape_power",
+    profile_scale_mode: str = "identity",
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
@@ -888,14 +916,18 @@ def geometry_initial_er_root_only_least_squares_problem(
             scale_mode="unit",
         )
     else:
-        if max_mode is None:
+        if max_mode is None and not include_profiles:
             raise ValueError("Either max_mode or explicit geometry parameters must be provided.")
-        geometry_parameterization = vmex_boundary_parameterization(
-            context,
-            max_mode=int(max_mode),
-            families=families,
-            scale_mode=scale_mode,
-            ess_alpha=float(ess_alpha),
+        geometry_parameterization = (
+            None
+            if max_mode is None
+            else vmex_boundary_parameterization(
+                context,
+                max_mode=int(max_mode),
+                families=families,
+                scale_mode=scale_mode,
+                ess_alpha=float(ess_alpha),
+            )
         )
     profile_specs = (
         parse_profile_parameter_specs(profile_parameters)
@@ -905,7 +937,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=bool(profile_specs),
         profiles=tuple(spec.name for spec in profile_specs) if profile_specs else None,
-        vmec_boundary=geometry_parameterization.specs,
+        vmec_boundary=() if geometry_parameterization is None else geometry_parameterization.specs,
     )
     runtime, baseline_state = build_runtime_context(config_eff)
     if baseline_state is None:
@@ -914,6 +946,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         config_eff,
         jnp.asarray(baseline_state.pressure).dtype,
     )
+    profile_scales = _profile_scales_from_values(baseline_profile_values, profile_scale_mode)
     if geometry_max_iter is None:
         geometry_max_iter = geom_cfg.get("vmec_max_iter")
     if geometry_solver_device is None:
@@ -925,6 +958,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         runtime=runtime,
         baseline_state=baseline_state,
         baseline_profile_values=baseline_profile_values,
+        profile_scales=profile_scales,
         parameter_set=parameter_set,
         geometry_parameterization=geometry_parameterization,
         profile_specs=profile_specs,
