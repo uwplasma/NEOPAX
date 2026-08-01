@@ -98,7 +98,10 @@ def _power_exchange_impl(state, species, pair_active_mask, use_ntssfusion_lnL):
             ),
         ),
     )
-    lnL_simple = 32.2 + 1.15 * jnp.log10(TA**2 / nA)
+    # 32.2 is the NRL constant for T in eV and n in m^-3, but TA/nA arrive in the transport state's
+    # keV and 1e20 m^-3. Converting it gives 16.1, the same constant the NTSSfusion branches above
+    # already use for this regime (1.15 * log10(x) is approximately 0.5 * log(x)).
+    lnL_simple = 16.1 + 1.15 * jnp.log10(TA**2 / nA)
     lnL_ntss = jnp.where(
         same_sign,
         jnp.where(a_is_electron & b_is_electron, lnL_ee, lnL_ii),
