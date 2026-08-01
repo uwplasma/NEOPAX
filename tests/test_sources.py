@@ -11,6 +11,7 @@ from NEOPAX._source_models import (
     get_source,
     register_source,
 )
+from NEOPAX._sources import bremsstrahlung_radiation_generalized
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState
 
@@ -204,3 +205,20 @@ def test_neopax_simple_coulomb_log_uses_transport_state_units():
     ntss = PowerExchangeSource(mode="all", coulomb_log_mode="ntssfusion")(state, species)
     ratio = simple["power_exchange"] / ntss["power_exchange"]
     assert jnp.all(jnp.abs(ratio - 1.0) < 1.0e-3)
+
+
+def test_bremsstrahlung_relativistic_correction_reads_temperature_as_kev():
+    # The correction is a function of Te/(m_e c^2), so stating it in keV here is independent of the
+    # units the implementation happens to work in. Reading the keV state as eV would shrink the
+    # ratio by 1e3 and leave the correction indistinguishable from 1.
+    state = make_two_temperature_state()
+    species = make_dummy_species()
+    plain, Zeff = bremsstrahlung_radiation_generalized(state, species=species)
+    corrected, _ = bremsstrahlung_radiation_generalized(
+        state, species=species, use_relativistic_correction=True
+    )
+    Te_keV = state.temperature[0]
+    electron_rest_mass_keV = 511.0
+    ratio = Te_keV / electron_rest_mass_keV
+    expected = (1.0 + 2.0 * ratio) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + ratio)))
+    assert jnp.allclose(corrected / plain, expected, rtol=1e-10)

@@ -205,7 +205,7 @@ def bremsstrahlung_radiation_generalized(
     # source, while upgrading Zeff to the full multispecies expression.
     PBrems = jnp.asarray(brems_coefficient, dtype=ne.dtype) * Zeff * ne**2 * jnp.sqrt(Te)
     Tm = 511.0 * 1e3  # eV
-    Te_eV = Te  # assume Te in eV
+    Te_eV = Te * 1.0e3  # state temperature in keV
     corr = (1.0 + 2.0 * Te_eV / Tm) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + Te_eV / Tm)))
     PBrems = jax.lax.cond(
         jnp.asarray(use_relativistic_correction),
