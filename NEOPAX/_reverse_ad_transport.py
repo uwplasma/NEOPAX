@@ -549,6 +549,45 @@ def bootstrap_current_softmax_abs_scaled(
     return jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
 
 
+def bootstrap_current_softmax_abs_value_and_upar_bar(
+    final_state,
+    runtime,
+    fluxes: Mapping[str, Any],
+    *,
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+) -> tuple[jax.Array, jax.Array]:
+    """Return smooth max(abs(Jboot)) and the compact corrected-Upar cotangent."""
+
+    upar = fluxes.get("Upar_neo", fluxes.get("Upar", None))
+    if upar is None:
+        raise ValueError("bootstrap current objective requires Upar or Upar_neo fluxes.")
+    dtype = jnp.asarray(final_state.pressure).dtype
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=dtype)
+    current_weights = jnp.sign(charge_qp)
+    upar_arr = jnp.asarray(upar, dtype=dtype)
+    scale = jnp.asarray(elementary_charge * 1.0e-5, dtype=dtype)
+    upar_physical_scale = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=dtype)
+    upar_physical = upar_physical_scale * upar_arr
+    if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+        jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0) * scale
+        species_axis_first = True
+    else:
+        jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1) * scale
+        species_axis_first = False
+
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=dtype)
+    value = jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
+    smooth_abs_bar = jax.nn.softmax(beta_arr * smooth_abs)
+    jboot_bar = smooth_abs_bar * jboot / jnp.maximum(smooth_abs, jnp.asarray(1.0e-30, dtype=dtype))
+    if species_axis_first:
+        upar_bar = current_weights[:, None] * (upar_physical_scale * scale * jboot_bar)[None, :]
+    else:
+        upar_bar = (upar_physical_scale * scale * jboot_bar)[:, None] * current_weights[None, :]
+    return value, upar_bar
+
+
 def objective_scalar_by_index(final_state, runtime, objective_index: int):
     objective_name = TRANSPORT_REVERSE_OBJECTIVE_LABELS[int(objective_index)]
     er = jnp.asarray(final_state.Er)
@@ -1230,6 +1269,86 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
     zero_payload_bar = _radau_zero_support_delta_tree_like(support_payload)
     for objective_i in range(objective_count):
+        objective_name = objective_labels[objective_i]
+        if objective_name == "bootstrap_current_softmax_abs_scaled":
+            final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                final_y_for_objective
+            )
+            flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+            neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+            corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+            state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
+            support_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_support_by_radius",
+                None,
+            )
+            geometry_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_geometry_by_radius",
+                None,
+            )
+            if not callable(corrected_fluxes_fn):
+                raise NotImplementedError(
+                    "bootstrap_current_softmax_abs_scaled requires realtime NTX "
+                    "evaluate_momentum_corrected_fluxes for compact full-transport AD."
+                )
+            if not callable(state_pullback_fn) or not callable(support_pullback_fn):
+                raise NotImplementedError(
+                    "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
+                    "state and support pullbacks on the realtime NTX model."
+                )
+            corrected_fluxes = corrected_fluxes_fn(final_state_for_bootstrap)
+            objective_value, upar_bar = bootstrap_current_softmax_abs_value_and_upar_bar(
+                final_state_for_bootstrap,
+                runtime,
+                corrected_fluxes,
+            )
+            final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
+            _, unpack_pullback = jax.vjp(
+                reverse_setup.prepared_rollout.physics_context.unpack_flat,
+                final_y_for_objective,
+            )
+            final_y_bar_rows.append(unpack_pullback(final_state_bar)[0])
+            objective_values_rows.append(objective_value)
+            if combined_geometry_payload:
+                if not callable(geometry_pullback_fn):
+                    raise NotImplementedError(
+                        "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
+                        "geometry pullback for combined realtime geometry payloads."
+                    )
+                geometry = support_payload["geometry"]
+                ntx_support = support_payload["ntx_support"]
+                geometry_objective_bar = geometry_pullback_fn(
+                    final_state_for_bootstrap,
+                    upar_bar,
+                    geometry,
+                    ntx_support,
+                )
+                support_bar_leaves = support_pullback_fn(
+                    final_state_for_bootstrap,
+                    upar_bar,
+                    ntx_support,
+                )
+                _, ntx_treedef = jax.tree_util.tree_flatten(ntx_support)
+                objective_payload_bar_rows.append(
+                    {
+                        "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
+                        "ntx_support": ntx_treedef.unflatten(tuple(support_bar_leaves)),
+                    }
+                )
+            else:
+                support_bar_leaves = support_pullback_fn(
+                    final_state_for_bootstrap,
+                    upar_bar,
+                    support_payload,
+                )
+                _, support_treedef = jax.tree_util.tree_flatten(support_payload)
+                objective_payload_bar_rows.append(
+                    support_treedef.unflatten(tuple(support_bar_leaves))
+                )
+            continue
+
         def _objective_from_final_y(final_y_value, objective_index=objective_i):
             final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
             return dependencies.objective_scalar_by_index(final_state, runtime, objective_index)
