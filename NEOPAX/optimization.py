@@ -34,6 +34,7 @@ from ._reverse_ad_optimization import (
     LeastSquaresTerm,
     ObjectiveTableResult,
     ObjectiveRef,
+    evaluate_geometry_transport_realtime_geometry_least_squares,
     evaluate_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     geometry,
@@ -54,6 +55,7 @@ from ._reverse_ad_parameters import (
 )
 from ._reverse_ad_transport import (
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+    internal_realtime_geometry_transport_reverse_table_result_builder,
     initial_state_for_parameter_vector,
     realtime_geometry_transport_reverse_grouped_inputs,
     realtime_geometry_transport_reverse_support_segment_executor,
@@ -588,6 +590,110 @@ class ProfileFullTransportLeastSquaresProblem:
             raise RuntimeError("Full transport run did not expose a final state.")
         rho_grid = jnp.asarray(self.runtime.geometry.rho_grid, dtype=jnp.asarray(final_state.Er).dtype)
         return rho_grid, final_state
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryFullTransportLeastSquaresProblem:
+    """Geometry-only QI + full-transport least-squares problem."""
+
+    config: dict
+    context: object
+    runtime: object
+    baseline_state: object
+    parameterization: VmexBoundaryParameterization
+    parameter_set: object
+    terms: tuple[GeometryLeastSquaresTerm | LeastSquaresTerm, ...]
+    table_context: object
+    table_result_builder: object
+    options: Mapping[str, object]
+    geometry_lane: str = "ad"
+    geometry_max_iter: int | None = None
+    geometry_step_size: float | None = None
+    geometry_solver_device: str | None = "default"
+
+    @property
+    def parameter_count(self) -> int:
+        return len(self.parameter_set.specs)
+
+    @property
+    def parameter_labels(self) -> tuple[str, ...]:
+        return self.parameter_set.labels
+
+    @property
+    def x0(self):
+        return jnp.zeros((self.parameter_count,), dtype=jnp.float64)
+
+    @property
+    def x_scale(self):
+        return self.parameterization.x_scale
+
+    def _scaled_to_physical(self, scaled_parameter_values):
+        scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
+        if tuple(scaled_values.shape) != (self.parameter_count,):
+            raise ValueError(
+                "scaled_parameter_values must have shape "
+                f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
+            )
+        return self.parameterization.scaled_to_physical_delta(scaled_values)
+
+    def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
+        physical_values = self._scaled_to_physical(
+            self.x0 if scaled_parameter_values is None else scaled_parameter_values
+        )
+        base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
+        transport_objectives = tuple(
+            dict.fromkeys(term.objective.name for term in base_terms if term.objective.family == "transport")
+        )
+        options = dict(self.options)
+        request = realtime_geometry_transport_reverse_table_request(
+            objective_names=transport_objectives,
+            parameter_set=self.parameter_set,
+            context=self.table_context,
+            options=options,
+        )
+        base_evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+            self.config,
+            request=request,
+            terms=base_terms,
+            geometry_context=self.context,
+            parameter_values=physical_values,
+            table_result_builder=self.table_result_builder,
+            objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            options=options,
+            quiet_default=True,
+            geometry_lane=self.geometry_lane,
+            geometry_max_iter=self.geometry_max_iter,
+            geometry_step_size=self.geometry_step_size,
+            geometry_final_vmec_pullback_mode="raw_block_transpose",
+            geometry_solver_device=self.geometry_solver_device,
+            share_raw_block_solve=True,
+        )
+        result = _assemble_mixed_initial_er_root_result(
+            self.terms,
+            base_evaluation=base_evaluation,
+        )
+        residuals = jax.block_until_ready(result.residuals)
+        jacobian = jax.block_until_ready(result.jacobian)
+        evaluation = LeastSquaresEvaluation(
+            result=result,
+            residuals=residuals,
+            jacobian=jacobian,
+            elapsed_s=float(base_evaluation.elapsed_s),
+        )
+        return scale_least_squares_evaluation_columns(evaluation, self.x_scale)
+
+    def residuals(self, scaled_parameter_values=None) -> np.ndarray:
+        return np.asarray(jax.device_get(self.evaluate(scaled_parameter_values).residuals), dtype=float)
+
+    def jacobian(self, scaled_parameter_values=None) -> np.ndarray:
+        return np.asarray(jax.device_get(self.evaluate(scaled_parameter_values).jacobian), dtype=float)
+
+    def input_from_scaled_parameters(self, scaled_parameter_values=None):
+        physical_values = self._scaled_to_physical(
+            self.x0 if scaled_parameter_values is None else scaled_parameter_values
+        )
+        entries = boundary_param_entries(self.context, self.parameterization.vmec_tuples)
+        return _input_with_boundary_deltas(self.context, physical_values, entries)
 
 
 def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
@@ -1284,6 +1390,194 @@ def full_transport_profile_least_squares_problem(
     )
 
 
+def geometry_full_transport_least_squares_problem(
+    config,
+    terms: Sequence[
+        GeometryLeastSquaresTerm
+        | LeastSquaresTerm
+        | tuple[ObjectiveRef | GeometryObjectiveTransform | str, float, float]
+    ],
+    *,
+    vmec_input=None,
+    max_mode: int | None = None,
+    parameters: str | Sequence[str] | None = None,
+    families: str | Sequence[str] | None = "RBC,ZBS",
+    scale_mode: str = "ess",
+    ess_alpha: float = 1.0,
+    mboz: int = 18,
+    nboz: int = 18,
+    surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
+    n_r: int | None = None,
+    n_theta: int | None = None,
+    n_zeta: int | None = None,
+    n_xi: int | None = None,
+    surface_backend: str | None = None,
+    geometry_lane: str = "ad",
+    geometry_max_iter: int | None = None,
+    geometry_step_size: float | None = None,
+    geometry_solver_device: str | None = "default",
+    device: str | None = "default",
+    accepted_step_limit: int | None = None,
+    reverse_segment_length: int | None = 4,
+    initial_er_root_ad: str = "jax_selected_root",
+    radau_jacobian_reuse_mode: str = "legacy",
+    reverse_stage_adjoint_solve_mode: str = "bicgstab",
+    reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
+    reverse_stage_cotangent_mode: str = "full",
+    reverse_step_bwd_mode: str = "reduced_cotangent",
+    reverse_stage_adjoint_memory_mode: str = "default",
+    reverse_stage_adjoint_iter_maxiter: int = 40,
+    reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+) -> GeometryFullTransportLeastSquaresProblem:
+    """Build a geometry-only optimizer problem for full Radau transport objectives."""
+
+    config_eff = _prepare_full_transport_config(config, device=device)
+    config_eff.setdefault("transport_solver", {})["radau_jacobian_reuse_mode"] = str(
+        radau_jacobian_reuse_mode
+    )
+    if vmec_input is not None:
+        config_eff.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
+    geom_cfg = config_eff.get("geometry", {})
+    neoclassical_cfg = config_eff.get("neoclassical", {})
+    vmec_input_eff = geom_cfg.get("vmec_input_file")
+    if vmec_input_eff is None:
+        raise ValueError("geometry.vmec_input_file is required.")
+    context = build_geometry_autodiff_context(
+        vmec_input_eff,
+        param_family="RBC",
+        param_m=1,
+        param_n=0,
+        mboz=int(mboz),
+        nboz=int(nboz),
+        surface_s=tuple(float(s) for s in surfaces),
+    )
+    if parameters is not None:
+        specs = parse_vmec_boundary_parameter_specs(
+            ",".join(parameters) if not isinstance(parameters, str) else parameters
+        )
+        parameterization = VmexBoundaryParameterization(
+            specs=specs,
+            scales=tuple(1.0 for _ in specs),
+            scale_mode="unit",
+        )
+    else:
+        if max_mode is None:
+            raise ValueError("Either max_mode or explicit geometry parameters must be provided.")
+        parameterization = vmex_boundary_parameterization(
+            context,
+            max_mode=int(max_mode),
+            families=families,
+            scale_mode=scale_mode,
+            ess_alpha=float(ess_alpha),
+        )
+    parameter_set = reverse_ad_optimization_parameter_set(
+        include_profiles=False,
+        vmec_boundary=parameterization.specs,
+    )
+    runtime, baseline_state = build_runtime_context(config_eff)
+    if baseline_state is None:
+        raise RuntimeError("transport runtime did not return an initial state.")
+    baseline_profile_values = _profile_values_from_config(
+        config_eff,
+        jnp.asarray(baseline_state.pressure).dtype,
+    )
+    baseline_values = jnp.concatenate(
+        [
+            baseline_profile_values,
+            jnp.zeros((len(parameterization.specs),), dtype=baseline_profile_values.dtype),
+        ],
+        axis=0,
+    )
+    profile_cfg = copy.deepcopy(config_eff.get("profiles", {}))
+    profile_cfg.setdefault("model", "standard_analytical")
+    neoclassical_cfg = dict(neoclassical_cfg)
+    table_context = realtime_geometry_transport_reverse_table_context(
+        config=config_eff,
+        baseline_values=baseline_values,
+        baseline_runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        neoclassical_cfg=neoclassical_cfg,
+    )
+    n_r_eff = int(n_r if n_r is not None else geom_cfg.get("n_radial", 51))
+    n_theta_eff = int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25))
+    n_zeta_eff = int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25))
+    n_xi_eff = int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64))
+    surface_backend_eff = str(
+        surface_backend
+        if surface_backend is not None
+        else neoclassical_cfg.get(
+            "ntx_exact_surface_backend",
+            neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+        )
+    )
+    if geometry_max_iter is None:
+        geometry_max_iter = geom_cfg.get("vmec_max_iter")
+    if geometry_solver_device is None:
+        geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
+    options = {
+        "quiet": True,
+        "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
+        "reverse_segment_length": None if reverse_segment_length is None else int(reverse_segment_length),
+        "initial_er_root_ad": str(initial_er_root_ad),
+        "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
+        "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
+        "reverse_stage_cotangent_mode": str(reverse_stage_cotangent_mode),
+        "reverse_step_bwd_mode": str(reverse_step_bwd_mode),
+        "reverse_stage_adjoint_memory_mode": str(reverse_stage_adjoint_memory_mode),
+        "reverse_stage_adjoint_iter_maxiter": int(reverse_stage_adjoint_iter_maxiter),
+        "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
+        "n_r": n_r_eff,
+        "n_theta": n_theta_eff,
+        "n_zeta": n_zeta_eff,
+        "n_xi": n_xi_eff,
+        "surface_backend": surface_backend_eff,
+        "max_iter": geometry_max_iter,
+        "solver_device": geometry_solver_device,
+    }
+    table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
+        table_context=table_context,
+        geometry_context=context,
+        baseline_geometry_deltas=jnp.zeros((len(parameterization.specs),), dtype=jnp.float64),
+        combined_geometry_payload=True,
+        n_r=n_r_eff,
+        n_theta=n_theta_eff,
+        n_zeta=n_zeta_eff,
+        n_xi=n_xi_eff,
+        surface_backend=surface_backend_eff,
+        max_iter=geometry_max_iter,
+        solver_device=str(geometry_solver_device),
+        accepted_step_limit=accepted_step_limit,
+        reverse_segment_length=reverse_segment_length,
+        initial_er_root_ad=str(initial_er_root_ad),
+        reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
+        reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+        reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
+        reverse_step_bwd_mode=str(reverse_step_bwd_mode),
+        reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
+        reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
+        reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+        progress_label="[optimization] full transport geometry payload pullback:",
+    )
+    normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    return GeometryFullTransportLeastSquaresProblem(
+        config=config_eff,
+        context=context,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        parameterization=parameterization,
+        parameter_set=parameter_set,
+        terms=normalized_terms,
+        table_context=table_context,
+        table_result_builder=table_result_builder,
+        options=options,
+        geometry_lane=geometry_lane,
+        geometry_max_iter=geometry_max_iter,
+        geometry_step_size=geometry_step_size,
+        geometry_solver_device=geometry_solver_device,
+    )
+
+
 def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
     """Run SciPy least_squares on a NEOPAX geometry least-squares problem."""
 
@@ -1361,9 +1655,11 @@ __all__ = [
     "GeometryLeastSquaresTerm",
     "GeometryObjectiveTransform",
     "GeometryInitialErRootLeastSquaresProblem",
+    "GeometryFullTransportLeastSquaresProblem",
     "GeometryLeastSquaresProblem",
     "ProfileFullTransportLeastSquaresProblem",
     "full_transport_profile_least_squares_problem",
+    "geometry_full_transport_least_squares_problem",
     "geometry",
     "geometry_objective",
     "geometry_initial_er_root_only_least_squares_problem",
