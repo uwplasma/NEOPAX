@@ -7770,6 +7770,61 @@ def _flux_profile_debug_summary(name, arr):
     return " ".join(pieces)
 
 
+def _normalize_flux_profile_location(location):
+    normalized = str(location).strip().lower()
+    aliases = {
+        "cell": "cell_centered",
+        "cells": "cell_centered",
+        "center": "cell_centered",
+        "centers": "cell_centered",
+        "cell_centered": "cell_centered",
+        "cell-centred": "cell_centered",
+        "cell_centred": "cell_centered",
+        "face": "face_centered",
+        "faces": "face_centered",
+        "face_centered": "face_centered",
+        "face-centred": "face_centered",
+        "face_centred": "face_centered",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported fluxes_r_file profile_location '{location}'. "
+            "Expected one of: cell_centered, face_centered."
+        )
+    return aliases[normalized]
+
+
+def _require_interpolatable_flux_grid(file_r, target_r, target_name):
+    file_r = jnp.asarray(file_r, dtype=jnp.float64)
+    target_r = jnp.asarray(target_r, dtype=jnp.float64)
+    if file_r.size < 2:
+        raise ValueError(
+            f"fluxes_r_file radial grid holds {file_r.size} entries; interpolation needs at "
+            "least 2. The finiteness and ordering checks below are vacuous on a shorter grid."
+        )
+    if not bool(jnp.all(jnp.isfinite(file_r))):
+        raise ValueError(
+            "fluxes_r_file radial grid holds non-finite entries, which interpolate to NaN at "
+            "every radius."
+        )
+    if not bool(jnp.all(jnp.diff(file_r) > 0.0)):
+        raise ValueError(
+            "fluxes_r_file radial grid must be strictly increasing. interpax takes its first "
+            "and last entries as the interpolation bounds, so a descending grid interpolates "
+            "to NaN everywhere and an unordered one silently reads from the wrong interval."
+        )
+    # Bounds come from the end points rather than min/max, matching how interpax reads them.
+    file_lo, file_hi = float(file_r[0]), float(file_r[-1])
+    target_lo, target_hi = float(jnp.min(target_r)), float(jnp.max(target_r))
+    # interpax returns NaN strictly outside the knots, so the check admits no tolerance.
+    if not (file_lo <= target_lo and target_hi <= file_hi):
+        raise ValueError(
+            f"fluxes_r_file radial grid [{file_lo:.6e}, {file_hi:.6e}] does not cover "
+            f"{target_name} [{target_lo:.6e}, {target_hi:.6e}]. Radii outside the file grid "
+            "interpolate to NaN and would reach the transport solve unreported."
+        )
+
+
 def build_fluxes_r_file_transport_model(
     species,
     geometry,
@@ -7814,6 +7869,10 @@ def build_fluxes_r_file_transport_model(
     )
     location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    if _normalize_flux_profile_location(location) == "cell_centered":
+        _require_interpolatable_flux_grid(r_data, geometry.r_grid, "geometry.r_grid")
+    else:
+        _require_interpolatable_flux_grid(r_data, geometry.r_grid_half, "geometry.r_grid_half")
     gamma_perturb_data = None
     q_perturb_data = None
     perturb_delta_data = None
@@ -7894,27 +7953,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
     def _normalize_profile_location(self):
-        location = str(self.profile_location).strip().lower()
-        aliases = {
-            "cell": "cell_centered",
-            "cells": "cell_centered",
-            "center": "cell_centered",
-            "centers": "cell_centered",
-            "cell_centered": "cell_centered",
-            "cell-centred": "cell_centered",
-            "cell_centred": "cell_centered",
-            "face": "face_centered",
-            "faces": "face_centered",
-            "face_centered": "face_centered",
-            "face-centred": "face_centered",
-            "face_centred": "face_centered",
-        }
-        if location not in aliases:
-            raise ValueError(
-                f"Unsupported fluxes_r_file profile_location '{self.profile_location}'. "
-                "Expected one of: cell_centered, face_centered."
-            )
-        return aliases[location]
+        return _normalize_flux_profile_location(self.profile_location)
 
     def _data_on_cell_grid(self, data):
         location = self._normalize_profile_location()

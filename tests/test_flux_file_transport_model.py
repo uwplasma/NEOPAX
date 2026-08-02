@@ -222,6 +222,109 @@ def test_fluxes_r_file_invalid_profile_location_raises():
         model._normalize_profile_location()
 
 
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_cell_grid(tmp_path):
+    path = tmp_path / "narrow_cell_fluxes.h5"
+    _write_flux_file(path, r=[0.3, 0.7], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_face_grid(tmp_path):
+    path = tmp_path / "narrow_face_fluxes.h5"
+    _write_flux_file(path, r=[0.0, 0.5, 0.9], gamma=jnp.ones((2, 3)), q=jnp.ones((2, 3)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid_half"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="face_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_too_short_to_interpolate(tmp_path):
+    path = tmp_path / "single_point_fluxes.h5"
+    _write_flux_file(path, r=[0.5], gamma=jnp.ones((2, 1)), q=jnp.ones((2, 1)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"at least 2"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_descending_file_grid(tmp_path):
+    path = tmp_path / "descending_fluxes.h5"
+    _write_flux_file(path, r=[0.75, 0.25], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"strictly increasing"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_with_non_finite_radii(tmp_path):
+    path = tmp_path / "nonfinite_fluxes.h5"
+    _write_flux_file(path, r=[0.25, jnp.nan], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"non-finite"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_accepts_a_file_whose_endpoints_touch_the_grid(tmp_path):
+    path = tmp_path / "touching_fluxes.h5"
+    gamma = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    _write_flux_file(path, r=[0.25, 0.5, 0.75], gamma=gamma, q=gamma)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            grid_location="cell_centered",
+        )
+
+    assert jnp.all(jnp.isfinite(model(state=None)["Gamma"]))
+
+
+def test_interpolating_off_the_file_grid_yields_nan(tmp_path):
+    # Direct construction bypasses the factory guard, so this pins the NaN that guard prevents.
+    # Adding equivalent validation to the class would replace this test with a rejection test.
+    del tmp_path
+    model = FluxesRFileTransportModel(
+        species=DummySpecies(),
+        geometry=DummyGeometry(),
+        r_data=jnp.array([0.3, 0.7]),
+        gamma_data=jnp.ones((2, 2)),
+        q_data=jnp.ones((2, 2)),
+        upar_data=None,
+        profile_location="cell_centered",
+    )
+
+    assert jnp.all(jnp.isnan(model(state=None)["Gamma"]))
+
+
 def test_analytical_turbulent_transport_model_with_transport_coeffs_updates_coefficients():
     model = AnalyticalTurbulentTransportModel(
         species="species",
