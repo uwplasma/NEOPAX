@@ -1,5 +1,7 @@
 import argparse
 
+import pytest
+
 import NEOPAX.cli as cli
 
 
@@ -95,3 +97,28 @@ def test_cli_main_loads_config_applies_overrides_and_runs(monkeypatch, tmp_path)
     assert observed["loaded_path"] == str(config_path.resolve())
     assert observed["mode"] == "fluxes"
     assert observed["n_radial"] == 41
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_rc"),
+    [
+        # Failure flag alone, with the other two fields healthy.
+        ({"failed": True, "n_steps": 12, "done": True, "fail_code": 3}, 1),
+        # Zero accepted steps alone, the silent case reported in #5.
+        ({"failed": False, "n_steps": 0, "done": True}, 1),
+        # Stopped before t_final alone.
+        ({"failed": False, "n_steps": 12, "done": False}, 1),
+        # Completed solve.
+        ({"failed": False, "n_steps": 12, "done": True}, 0),
+        # Non-transport mode, which carries no solver verdict to act on.
+        ({"rho": [0.0, 1.0], "fluxes": {}}, 0),
+    ],
+)
+def test_cli_main_exit_code_follows_the_solver_verdict(monkeypatch, tmp_path, result, expected_rc):
+    config_path = tmp_path / "case.toml"
+    config_path.write_text("[general]\nmode='transport'\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "load_config", lambda path: {"general": {"mode": "transport"}})
+    monkeypatch.setattr(cli, "run_config", lambda config: result)
+
+    assert cli.main([str(config_path)]) == expected_rc

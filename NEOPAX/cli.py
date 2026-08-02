@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -123,6 +124,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failed_solve_reason(result) -> str | None:
+    """Describe why a run result counts as a failed solve.
+
+    Parameters
+    ----------
+    result : Any
+        Whatever ``run_config`` returned. Only the transport backends produce the solver summary
+        mapping inspected here, so any other shape yields ``None``.
+
+    Returns
+    -------
+    str | None
+        A short reason when the solve failed, and ``None`` when it succeeded or when the result
+        carries no solver verdict to judge.
+    """
+    if not isinstance(result, dict):
+        return None
+    failed = result.get("failed")
+    done = result.get("done")
+    n_steps = result.get("n_steps")
+    if failed is None and done is None and n_steps is None:
+        return None
+    if failed is not None and bool(failed):
+        fail_code = result.get("fail_code")
+        return f"solver reported failed=True with fail_code={'na' if fail_code is None else int(fail_code)}"
+    if n_steps is not None and int(n_steps) == 0:
+        return "solver accepted zero steps, so the output holds the initial state"
+    if done is not None and not bool(done):
+        return "solver stopped before reaching t_final"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -136,7 +169,11 @@ def main(argv: list[str] | None = None) -> int:
         config = apply_cli_overrides(config, args)
     except ValueError as exc:
         parser.error(str(exc))
-    run_config(config)
+    result = run_config(config)
+    reason = _failed_solve_reason(result)
+    if reason is not None:
+        print(f"[NEOPAX] solve failed: {reason}", file=sys.stderr)
+        return 1
     return 0
 
 
