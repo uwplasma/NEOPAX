@@ -31,16 +31,16 @@ OUT_DIR = ROOT / "outputs" / "profiles_max_er_transition_bootstrap_initial_root_
 PROFILE_PARAMETERS = "n0,T0,density_shape_power,temperature_shape_power"
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_PHYSICAL_LOWER = {
-    "n0": 0.05,
-    "T0": 0.05,
-    "density_shape_power": 0.25,
-    "temperature_shape_power": 0.25,
+    "n0": 2.0,
+    "T0": 7.0,
+    "density_shape_power": 0.1,
+    "temperature_shape_power": 0.1,
 }
 PROFILE_PHYSICAL_UPPER = {
-    "n0": 20.0,
-    "T0": 60.0,
-    "density_shape_power": 40.0,
-    "temperature_shape_power": 20.0,
+    "n0": 10.0,
+    "T0": 25.0,
+    "density_shape_power": 12.0,
+    "temperature_shape_power": 12.0,
 }
 
 MAX_ER_TARGET = 25.0
@@ -50,9 +50,9 @@ ER_TRANSITION_LEFT_TARGET = 26.0
 ER_TRANSITION_RIGHT_TARGET = -10.0
 BOOTSTRAP_LIMIT_SCALED = 0.1  # 10 kA/m^2 in the scaled bootstrap-current objective.
 
-MAX_ER_WEIGHT = 0.6
-ER_TRANSITION_LEFT_WEIGHT = 1.0
-ER_TRANSITION_RIGHT_WEIGHT = 1.0
+MAX_ER_WEIGHT = 1.0
+ER_TRANSITION_LEFT_WEIGHT = 100.0
+ER_TRANSITION_RIGHT_WEIGHT = 100.0
 BOOTSTRAP_WEIGHT = 1.0
 
 NFEV = 40
@@ -79,9 +79,9 @@ bootstrap_penalty = opt.transformed_transport_objective(
 
 terms = [
     (opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT),
-    (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
-    (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
-    (bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
+    #(opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
+    #(opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
+    #(bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
 ]
 
 
