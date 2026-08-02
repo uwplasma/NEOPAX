@@ -6372,7 +6372,7 @@ def _radau_prepare_lagged_response(
             if build_lagged_response is None:
                 return None
             candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
-            return build_lagged_response(candidate_state)
+            return build_lagged_response(candidate_state, previous_response=carry_in.lagged_response_cache)
 
         lagged_response = jax.lax.cond(
             carry_in.lagged_response_valid,
@@ -13839,7 +13839,7 @@ def _theta_prepare_lagged_response(
     def _rebuild_cached(_):
         if build_lagged_response is None:
             return None
-        return build_lagged_response(candidate_state)
+        return build_lagged_response(candidate_state, previous_response=reuse_state.lagged_response_cache)
 
     lagged_response = jax.lax.cond(
         can_reuse,

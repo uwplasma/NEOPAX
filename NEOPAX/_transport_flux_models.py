@@ -675,11 +675,19 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             "Upar_classical": classical.get("Upar", 0),
         }
 
-    def build_lagged_response(self, state, **kwargs):
+    def build_lagged_response(self, state, previous_response=None, **kwargs):
+        if not isinstance(previous_response, CombinedTransportLaggedResponse):
+            previous_response = CombinedTransportLaggedResponse(None, None, None)
         return CombinedTransportLaggedResponse(
-            neoclassical_response=self.neoclassical_model.build_lagged_response(state, **kwargs),
-            turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
-            classical_response=self.classical_model.build_lagged_response(state, **kwargs),
+            neoclassical_response=self.neoclassical_model.build_lagged_response(
+                state, previous_response=previous_response.neoclassical_response, **kwargs
+            ),
+            turbulent_response=self.turbulent_model.build_lagged_response(
+                state, previous_response=previous_response.turbulent_response, **kwargs
+            ),
+            classical_response=self.classical_model.build_lagged_response(
+                state, previous_response=previous_response.classical_response, **kwargs
+            ),
         )
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
@@ -8011,7 +8019,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         upar = self._data_on_face_grid(self.upar_data)
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
-    def build_lagged_response(self, state, **kwargs):
+    def build_lagged_response(self, state, previous_response=None, **kwargs):
         del kwargs
         if str(self.lagged_response_mode).strip().lower() != "fd":
             return JVPTransportFluxResponse(reference_state=state, reference_flux=self(state))
@@ -8027,6 +8035,10 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
             )
         self._require_matching_fd_grid()
+        # Re-anchoring moves the extrapolation origin while the file-derived slopes stay fixed,
+        # so an existing response is returned unchanged rather than rebuilt against `state`.
+        if isinstance(previous_response, SpectraXTurbulenceFDLaggedResponse):
+            return previous_response
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),
