@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 
 import h5py
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -321,3 +322,149 @@ def test_calculate_fluxes_from_config_uses_flux_output_flags():
 
 def test_fluxes_r_file_entropy_alias_is_registered():
     assert get_entropy_model("fluxes_r_file") is get_entropy_model("ntx_database")
+
+
+class DummyFDGeometry:
+    """Two-cell geometry carrying the fields the FD basis and the temperature equation both read."""
+
+    def __init__(self):
+        self.r_grid_half = jnp.array([0.0, 0.5, 1.0])
+        self.r_grid = jnp.array([0.25, 0.75])
+        self.dr = 0.5
+        self.a_b = 1.0
+        self.Vprime = jnp.ones(2)
+        self.Vprime_half = jnp.ones(3)
+
+
+def _fd_model(**overrides):
+    """Two-species, two-radius FD model with one temperature-gradient perturbation on species 0."""
+    kwargs = dict(
+        species=DummySpecies(),
+        geometry=DummyFDGeometry(),
+        r_data=jnp.array([0.25, 0.75]),
+        gamma_data=jnp.array([[1.0, 2.0], [3.0, 4.0]]),
+        q_data=jnp.array([[10.0, 20.0], [30.0, 40.0]]),
+        upar_data=jnp.zeros((2, 2)),
+        profile_location="cell_centered",
+        lagged_response_mode="fd",
+        gamma_perturb_data=jnp.array([[[1.5, 2.5], [3.0, 4.0]]]),
+        q_perturb_data=jnp.array([[[14.0, 26.0], [30.0, 40.0]]]),
+        perturb_delta_data=jnp.array([[0.5, 0.5]]),
+        perturb_present_data=jnp.array([[True, True]]),
+        perturb_kind_codes=jnp.array([1]),
+        perturb_species_indices=jnp.array([0]),
+    )
+    kwargs.update(overrides)
+    return FluxesRFileTransportModel(**kwargs)
+
+
+def _fd_states():
+    """Peaked anchor state plus a flatter one, both keeping every flux positive."""
+    density = jnp.array([[1.0, 1.0], [1.0, 1.0]])
+    anchor = TransportState(
+        density=density,
+        pressure=jnp.array([[4.0, 2.0], [4.0, 2.0]]),
+        Er=jnp.array([0.0, 0.0]),
+    )
+    relaxed = TransportState(
+        density=density,
+        pressure=jnp.array([[3.6, 2.2], [4.0, 2.0]]),
+        Er=jnp.array([0.0, 0.0]),
+    )
+    return anchor, relaxed
+
+
+def test_fd_face_fluxes_follow_the_lagged_center_fluxes():
+    model = _fd_model()
+    anchor, relaxed = _fd_states()
+
+    response = model.build_lagged_response(anchor)
+    center_fluxes = model.evaluate_with_lagged_response(relaxed, response)
+    face_fluxes = model.evaluate_face_fluxes(relaxed, None, center_fluxes=center_fluxes)
+
+    assert jnp.allclose(face_fluxes["Q"], jax.vmap(faces_from_cell_centered)(center_fluxes["Q"]))
+    assert jnp.allclose(face_fluxes["Gamma"], jax.vmap(faces_from_cell_centered)(center_fluxes["Gamma"]))
+    assert not jnp.allclose(face_fluxes["Q"], model.evaluate_face_fluxes(relaxed, None)["Q"])
+
+
+def test_combined_flux_model_routes_center_fluxes_to_each_submodel():
+    from NEOPAX._transport_flux_models import TransportFluxModelBase
+
+    recorded = {}
+
+    class RecordingFluxModel(TransportFluxModelBase):
+        def __init__(self, label, scale):
+            self.label = label
+            self.scale = scale
+
+        def __call__(self, state, geometry=None, params=None) -> dict:
+            del state, geometry, params
+            centers = self.scale * jnp.ones((2, 2))
+            return {"Gamma": centers, "Q": 10.0 * centers, "Upar": jnp.zeros((2, 2))}
+
+        def evaluate_face_fluxes(self, state, face_state, **kwargs):
+            del state, face_state
+            recorded[self.label] = kwargs.get("center_fluxes")
+            faces = self.scale * jnp.ones((2, 3))
+            return {"Gamma": faces, "Q": 10.0 * faces, "Upar": jnp.zeros((2, 3))}
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=RecordingFluxModel("neo", 1.0),
+        turbulent_model=RecordingFluxModel("turb", 2.0),
+        classical_model=RecordingFluxModel("classical", 3.0),
+    )
+
+    model.evaluate_face_fluxes(None, None, center_fluxes=model(state=None))
+
+    for label, scale in (("neo", 1.0), ("turb", 2.0), ("classical", 3.0)):
+        assert jnp.allclose(recorded[label]["Gamma"], scale * jnp.ones((2, 2)))
+        assert jnp.allclose(recorded[label]["Q"], 10.0 * scale * jnp.ones((2, 2)))
+
+
+def test_temperature_equation_heat_flux_follows_the_lagged_response():
+    from NEOPAX._transport_equations import build_temperature_equation
+
+    geometry = DummyFDGeometry()
+    model = _fd_model(geometry=geometry)
+    anchor, relaxed = _fd_states()
+    # Convection and the work term are off so the heat flux is the only route into the RHS.
+    equation = build_temperature_equation(
+        geometry,
+        model,
+        None,
+        DummySpecies(),
+        None,
+        charge_qp=jnp.array([1.0, -1.0]),
+        include_neo_convection=False,
+        include_turbulent_convection=False,
+        include_classical_convection=False,
+        include_work_term=False,
+        heat_flux_reconstruction="closure_face_flux",
+    )
+
+    response = model.build_lagged_response(anchor)
+    at_anchor = equation(anchor, fluxes=model.evaluate_with_lagged_response(anchor, response))
+    at_relaxed = equation(relaxed, fluxes=model.evaluate_with_lagged_response(relaxed, response))
+
+    # The RHS carries the state-unit conversions, so the comparison has to be relative.
+    relative_change = jnp.abs(at_relaxed[0] - at_anchor[0]) / jnp.abs(at_anchor[0])
+    assert bool(jnp.all(relative_change > 1.0e-3))
+
+
+def test_non_fd_face_fluxes_still_come_from_the_file():
+    model = _fd_model(lagged_response_mode="none")
+    _, relaxed = _fd_states()
+
+    center_fluxes = {key: 100.0 * value for key, value in model(relaxed).items()}
+    face_fluxes = model.evaluate_face_fluxes(relaxed, None, center_fluxes=center_fluxes)
+
+    assert jnp.allclose(face_fluxes["Q"], model.evaluate_face_fluxes(relaxed, None)["Q"])
+
+
+def test_fd_face_fluxes_fall_back_to_the_file_without_center_fluxes():
+    model = _fd_model()
+    _, relaxed = _fd_states()
+
+    face_fluxes = model.evaluate_face_fluxes(relaxed, None)
+
+    assert jnp.allclose(face_fluxes["Q"], jax.vmap(faces_from_cell_centered)(model(relaxed)["Q"]))

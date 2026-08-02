@@ -647,9 +647,21 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
-        neo = self.neoclassical_model.evaluate_face_fluxes(state, face_state, **kwargs)
-        turb = self.turbulent_model.evaluate_face_fluxes(state, face_state, **kwargs)
-        classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
+        center_fluxes = kwargs.get("center_fluxes")
+
+        def submodel_kwargs(suffix):
+            # Each sub-model sees its own contribution, since the combined center fluxes sum all three.
+            component_keys = {name: f"{name}_{suffix}" for name in ("Gamma", "Q", "Upar")}
+            if center_fluxes is None or any(key not in center_fluxes for key in component_keys.values()):
+                return {**kwargs, "center_fluxes": None}
+            return {
+                **kwargs,
+                "center_fluxes": {name: center_fluxes[key] for name, key in component_keys.items()},
+            }
+
+        neo = self.neoclassical_model.evaluate_face_fluxes(state, face_state, **submodel_kwargs("neo"))
+        turb = self.turbulent_model.evaluate_face_fluxes(state, face_state, **submodel_kwargs("turb"))
+        classical = self.classical_model.evaluate_face_fluxes(state, face_state, **submodel_kwargs("classical"))
         if neo is None or turb is None or classical is None:
             return None
         gamma_turb = (
@@ -8005,6 +8017,14 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        center_fluxes = kwargs.get("center_fluxes")
+        if str(self.lagged_response_mode).strip().lower() == "fd" and center_fluxes is not None:
+            # The FD response is defined on the cell grid alone, so the faces are reconstructed from
+            # the responding center fluxes instead of being re-read from the file.
+            return {
+                key: jax.vmap(faces_from_cell_centered)(center_fluxes[key])
+                for key in ("Gamma", "Q", "Upar")
+            }
         del state, face_state, kwargs
         gamma = self._data_on_face_grid(self.gamma_data)
         q = self.q_scale * self._data_on_face_grid(self.q_data)
