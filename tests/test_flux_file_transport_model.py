@@ -321,3 +321,248 @@ def test_calculate_fluxes_from_config_uses_flux_output_flags():
 
 def test_fluxes_r_file_entropy_alias_is_registered():
     assert get_entropy_model("fluxes_r_file") is get_entropy_model("ntx_database")
+
+
+class DummyFDGeometry:
+    def __init__(self):
+        self.r_grid_half = jnp.array([0.0, 0.5, 1.0])
+        self.r_grid = jnp.array([0.25, 0.75])
+        self.dr = 0.5
+        self.a_b = 1.0
+
+
+def _fd_model(**overrides):
+    """Two-species, two-radius FD model with one temperature perturbation on species 0."""
+    kwargs = dict(
+        species=DummySpecies(),
+        geometry=DummyFDGeometry(),
+        r_data=jnp.array([0.25, 0.75]),
+        gamma_data=jnp.array([[1.0, 2.0], [3.0, 4.0]]),
+        q_data=jnp.array([[10.0, 20.0], [30.0, 40.0]]),
+        upar_data=jnp.zeros((2, 2)),
+        profile_location="cell_centered",
+        lagged_response_mode="fd",
+        gamma_perturb_data=jnp.array([[[1.5, 2.5], [3.0, 4.0]]]),
+        q_perturb_data=jnp.array([[[14.0, 26.0], [30.0, 40.0]]]),
+        perturb_delta_data=jnp.array([[0.5, 0.5]]),
+        perturb_present_data=jnp.array([[True, True]]),
+        perturb_kind_codes=jnp.array([1]),
+        perturb_species_indices=jnp.array([0]),
+    )
+    kwargs.update(overrides)
+    return FluxesRFileTransportModel(**kwargs)
+
+
+def _fd_states():
+    """Peaked reference state plus two successively flatter ones, all fluxes staying positive."""
+    density = jnp.array([[1.0, 1.0], [1.0, 1.0]])
+    state0 = TransportState(
+        density=density,
+        pressure=jnp.array([[4.0, 2.0], [4.0, 2.0]]),
+        Er=jnp.array([0.0, 0.0]),
+    )
+    state1 = TransportState(
+        density=density,
+        pressure=jnp.array([[3.8, 2.1], [4.0, 2.0]]),
+        Er=jnp.array([0.0, 0.0]),
+    )
+    state2 = TransportState(
+        density=density,
+        pressure=jnp.array([[3.6, 2.2], [4.0, 2.0]]),
+        Er=jnp.array([0.0, 0.0]),
+    )
+    return state0, state1, state2
+
+
+def test_fd_lagged_response_rebuild_keeps_the_original_anchor():
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+
+    response0 = model.build_lagged_response(state0)
+    expected = model.evaluate_with_lagged_response(state1, response0)
+
+    response1 = model.build_lagged_response(state1, previous_response=response0)
+    rebuilt = model.evaluate_with_lagged_response(state1, response1)
+
+    assert jnp.allclose(rebuilt["Q"], expected["Q"])
+    assert jnp.allclose(rebuilt["Gamma"], expected["Gamma"])
+
+
+def test_fd_lagged_response_rebuild_does_not_snap_back_to_the_file_flux():
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+
+    response0 = model.build_lagged_response(state0)
+    response1 = model.build_lagged_response(state1, previous_response=response0)
+    rebuilt = model.evaluate_with_lagged_response(state1, response1)
+
+    file_flux = model(state=None)
+    assert bool(jnp.all(rebuilt["Q"][0] < file_flux["Q"][0]))
+
+
+def test_fd_lagged_response_is_the_same_function_before_and_after_a_rebuild():
+    model = _fd_model()
+    state0, state1, state2 = _fd_states()
+
+    response0 = model.build_lagged_response(state0)
+    response1 = model.build_lagged_response(state1, previous_response=response0)
+
+    through_original = model.evaluate_with_lagged_response(state2, response0)
+    through_rebuilt = model.evaluate_with_lagged_response(state2, response1)
+
+    assert jnp.allclose(through_rebuilt["Q"], through_original["Q"], rtol=0.0, atol=0.0)
+    assert jnp.allclose(through_rebuilt["Gamma"], through_original["Gamma"], rtol=0.0, atol=0.0)
+
+
+def test_fd_lagged_response_without_a_previous_response_anchors_at_the_given_state():
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+
+    response = model.build_lagged_response(state1)
+    at_anchor = model.evaluate_with_lagged_response(state1, response)
+
+    file_flux = model(state=None)
+    assert jnp.allclose(at_anchor["Q"], file_flux["Q"])
+    assert not jnp.allclose(
+        model.build_lagged_response(state0).reference_basis,
+        response.reference_basis,
+    )
+
+
+def test_combined_flux_model_routes_the_previous_response_to_each_submodel():
+    from NEOPAX._transport_flux_models import TransportFluxModelBase
+
+    class ZeroFluxModel(TransportFluxModelBase):
+        def __call__(self, state, geometry=None, params=None) -> dict:
+            del geometry, params
+            zeros = jnp.zeros_like(state.density)
+            return {"Gamma": zeros, "Q": zeros, "Upar": zeros}
+
+    fd_model = _fd_model()
+    combined = CombinedTransportFluxModel(
+        neoclassical_model=ZeroFluxModel(),
+        turbulent_model=fd_model,
+        classical_model=ZeroFluxModel(),
+    )
+    state0, state1, _ = _fd_states()
+
+    response0 = combined.build_lagged_response(state0)
+    response1 = combined.build_lagged_response(state1, previous_response=response0)
+
+    expected = fd_model.evaluate_with_lagged_response(state1, response0.turbulent_response)
+    rebuilt = fd_model.evaluate_with_lagged_response(state1, response1.turbulent_response)
+
+    assert jnp.allclose(rebuilt["Q"], expected["Q"])
+
+
+def test_equation_system_forwards_the_previous_response_to_the_flux_model():
+    from NEOPAX._transport_equations import ComposedEquationSystem
+
+    fd_model = _fd_model()
+    system = ComposedEquationSystem(equations=(), shared_flux_model=fd_model)
+    state0, state1, _ = _fd_states()
+
+    response0 = system.build_lagged_response(state0)
+    response1 = system.build_lagged_response(state1, previous_response=response0)
+
+    expected = fd_model.evaluate_with_lagged_response(state1, response0.flux_response)
+    rebuilt = fd_model.evaluate_with_lagged_response(state1, response1.flux_response)
+
+    assert not jnp.allclose(expected["Q"], fd_model(state=None)["Q"])
+    assert jnp.allclose(rebuilt["Q"], expected["Q"])
+
+
+def test_non_fd_lagged_response_still_rebuilds_at_the_current_state():
+    model = _fd_model(lagged_response_mode="none")
+    state0, state1, _ = _fd_states()
+
+    response0 = model.build_lagged_response(state0)
+    response1 = model.build_lagged_response(state1, previous_response=response0)
+
+    assert jnp.allclose(response1.reference_state.pressure, state1.pressure)
+
+
+def _response_tangent(response, value):
+    """Tangent tree matching a lagged response, with float0 on its integer and boolean leaves."""
+    import jax
+
+    def leaf(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.full(arr.shape, value, dtype=arr.dtype)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    return jax.tree_util.tree_map(leaf, response)
+
+
+def test_fd_lagged_response_jvp_matches_the_primal_identity():
+    import jax
+
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+
+    def build(state, previous):
+        return model.build_lagged_response(state, previous_response=previous)
+
+    dstate = jax.tree_util.tree_map(jnp.ones_like, state1)
+    dprevious = _response_tangent(response0, 1.0)
+
+    primal, tangent = jax.jvp(build, (state1, response0), (dstate, dprevious))
+
+    assert jnp.allclose(primal.reference_basis, response0.reference_basis)
+    assert jnp.allclose(tangent.reference_basis, dprevious.reference_basis)
+    assert jnp.allclose(tangent.reference_flux["Q"], dprevious.reference_flux["Q"])
+
+
+def test_non_fd_lagged_response_jvp_still_tracks_the_state():
+    import jax
+
+    model = _fd_model(lagged_response_mode="none")
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+
+    def build(state, previous):
+        return model.build_lagged_response(state, previous_response=previous)
+
+    dstate = jax.tree_util.tree_map(jnp.ones_like, state1)
+    dprevious = _response_tangent(response0, 0.0)
+
+    _, tangent = jax.jvp(build, (state1, response0), (dstate, dprevious))
+
+    assert jnp.allclose(tangent.reference_state.pressure, dstate.pressure)
+
+
+def test_radau_prepare_lagged_response_rebuild_matches_reuse_for_fd():
+    from jax.flatten_util import ravel_pytree
+
+    from NEOPAX._transport_solvers import _radau_prepare_lagged_response
+
+    class KernelContext:
+        use_transport_lagged_response = True
+
+    class Carry:
+        def __init__(self, y, valid, cache):
+            self.y = y
+            self.lagged_response_valid = valid
+            self.lagged_response_cache = cache
+            self.lagged_reference_y = y
+
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+    flat_y1, unravel = ravel_pytree(state1)
+
+    fluxes = {}
+    for label, valid in (("reuse", True), ("rebuild", False)):
+        response, _, _ = _radau_prepare_lagged_response(
+            KernelContext(),
+            Carry(flat_y1, jnp.asarray(valid), response0),
+            unravel,
+            None,
+            model.build_lagged_response,
+        )
+        fluxes[label] = model.evaluate_with_lagged_response(state1, response)["Q"]
+
+    assert jnp.array_equal(fluxes["reuse"], fluxes["rebuild"])
+    assert bool(jnp.all(fluxes["rebuild"][0] < model(state=None)["Q"][0]))

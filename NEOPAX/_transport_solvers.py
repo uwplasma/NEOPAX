@@ -3284,16 +3284,27 @@ def _radau_accepted_step_attempt_tangent_from_primal(
             if physics_context.build_lagged_response is None:
                 return None
 
-            def _build_from_flat(flat_y):
+            def _build_from_flat(flat_y, previous_response):
                 candidate_state = physics_context.unpack_flat(
                     _project_flat_state_if_needed(flat_y, physics_context.project_flat)
                 )
-                return physics_context.build_lagged_response(candidate_state)
+                return physics_context.build_lagged_response(
+                    candidate_state,
+                    previous_response=previous_response,
+                )
 
+            # `previous_response` is a differentiation argument so that this tangent tracks whatever
+            # the model does with it, including returning it unchanged instead of rebuilding.
             _, dlagged_response_out = jax.jvp(
                 _build_from_flat,
-                (carry_in.y,),
-                (tangent_inputs.dy,),
+                (carry_in.y, carry_in.lagged_response_cache),
+                (
+                    tangent_inputs.dy,
+                    _radau_align_tangent_tree_to_primal(
+                        tangent_inputs.dlagged_response_cache,
+                        carry_in.lagged_response_cache,
+                    ),
+                ),
             )
             return dlagged_response_out
 
@@ -6372,7 +6383,7 @@ def _radau_prepare_lagged_response(
             if build_lagged_response is None:
                 return None
             candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
-            return build_lagged_response(candidate_state)
+            return build_lagged_response(candidate_state, previous_response=carry_in.lagged_response_cache)
 
         lagged_response = jax.lax.cond(
             carry_in.lagged_response_valid,
@@ -13839,7 +13850,7 @@ def _theta_prepare_lagged_response(
     def _rebuild_cached(_):
         if build_lagged_response is None:
             return None
-        return build_lagged_response(candidate_state)
+        return build_lagged_response(candidate_state, previous_response=reuse_state.lagged_response_cache)
 
     lagged_response = jax.lax.cond(
         can_reuse,
