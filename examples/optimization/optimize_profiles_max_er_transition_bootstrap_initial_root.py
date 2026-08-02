@@ -300,6 +300,109 @@ def write_profile_artifacts(problem, x, label):
     )
 
 
+def profile_artifact_arrays(problem, x):
+    rho, density, temperature, er, finite_mask = problem.initial_root_profiles_from_scaled_parameters(x)
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    rho_boot, jboot, finite_boot = problem.bootstrap_current_profile_from_scaled_parameters(x)
+    rho_boot_np = np.asarray(jax.device_get(rho_boot), dtype=float)
+    if not np.allclose(rho_np, rho_boot_np):
+        raise RuntimeError("Bootstrap-current rho grid did not match initial-root rho grid.")
+    return {
+        "rho": rho_np,
+        "density": np.asarray(jax.device_get(density), dtype=float),
+        "temperature": np.asarray(jax.device_get(temperature), dtype=float),
+        "er": np.asarray(jax.device_get(er), dtype=float),
+        "finite_er": np.asarray(jax.device_get(finite_mask), dtype=bool),
+        "jboot": np.asarray(jax.device_get(jboot), dtype=float),
+        "finite_bootstrap": np.asarray(jax.device_get(finite_boot), dtype=bool),
+    }
+
+
+def save_initial_final_profile_overlay(initial, optimized, out_dir):
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping initial/final overlay plots: {exc}")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rho = initial["rho"]
+    if not np.allclose(rho, optimized["rho"]):
+        raise RuntimeError("Initial and optimized rho grids did not match.")
+
+    def _style_axes(ax):
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+            spine.set_color("0.35")
+        ax.margins(x=0.04, y=0.08)
+
+    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    ax.plot(rho, initial["er"], color="red", linestyle="--", linewidth=3.0, label="initial")
+    ax.plot(rho, optimized["er"], color="red", linestyle="-", linewidth=3.2, label="optimized")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$E_r[\mathrm{kV}/\mathrm{m}]$", fontsize=20)
+    _style_axes(ax)
+    ax.legend(loc="best", fontsize=15, frameon=True)
+    fig.tight_layout()
+    png_path = out_dir / "initial_final_er_profile.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+    for name, ylabel in (
+        ("density", r"$n[10^{20}m^{-3}]$"),
+        ("temperature", r"$T[keV]$"),
+    ):
+        initial_data = initial[name]
+        optimized_data = optimized[name]
+        initial_plot = initial_data if initial_data.ndim == 2 else initial_data[None, :]
+        optimized_plot = optimized_data if optimized_data.ndim == 2 else optimized_data[None, :]
+        fig, ax = plt.subplots(figsize=(6.4, 6.4))
+        for i in range(initial_plot.shape[0]):
+            color = f"C{i}"
+            ax.plot(rho, initial_plot[i], color=color, linestyle="--", linewidth=2.6, label=f"species {i} initial")
+            ax.plot(rho, optimized_plot[i], color=color, linestyle="-", linewidth=2.8, label=f"species {i} optimized")
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel(ylabel, fontsize=20)
+        _style_axes(ax)
+        ax.legend(loc="best", fontsize=12, frameon=True)
+        fig.tight_layout()
+        png_path = out_dir / f"initial_final_{name}_profile.png"
+        fig.savefig(png_path, dpi=320, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {png_path}")
+
+    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    ax.plot(
+        rho,
+        100.0 * initial["jboot"],
+        color="tab:blue",
+        linestyle="--",
+        linewidth=2.8,
+        label="initial",
+    )
+    ax.plot(
+        rho,
+        100.0 * optimized["jboot"],
+        color="tab:blue",
+        linestyle="-",
+        linewidth=3.0,
+        label="optimized",
+    )
+    ax.axhline(10.0, color="black", linewidth=2.6, label=r"$10 kA m^{-2}$")
+    ax.axhline(-10.0, color="black", linewidth=2.6, label=r"$-10 kA m^{-2}$")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{BOOTSTRAP}[kA m^{-2}]$", fontsize=20)
+    _style_axes(ax)
+    ax.legend(loc="best", fontsize=15, frameon=True)
+    fig.tight_layout()
+    png_path = out_dir / "initial_final_bootstrap_current_profile.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
 # --------------------------- solve -----------------------------------------
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -365,6 +468,11 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
     write_profile_artifacts(problem, x_opt, "optimized")
+    save_initial_final_profile_overlay(
+        profile_artifact_arrays(problem, x0),
+        profile_artifact_arrays(problem, x_opt),
+        OUT_DIR,
+    )
     return 0
 
 
