@@ -92,6 +92,8 @@ def iteration_diagnostics(evaluation):
         for label, value in evaluation.result.objective_values.items()
     }
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+    jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+    gradient = jacobian.T @ residuals if jacobian.ndim == 2 else np.asarray([])
     residual_lookup = {
         label: float(residuals[i])
         for i, label in enumerate(evaluation.result.residual_labels)
@@ -122,7 +124,8 @@ def iteration_diagnostics(evaluation):
         f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"Er_right_residual={residual('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"bootstrap_penalty={bootstrap_penalty_value:.8e} "
-        f"bootstrap_residual={bootstrap_residual:.8e}"
+        f"bootstrap_residual={bootstrap_residual:.8e} "
+        f"grad={gradient.tolist()}"
     )
 
 
@@ -136,6 +139,8 @@ def report(tag, problem, x):
     print(f"  physical_profiles={dict(zip(problem.parameter_labels, physical.tolist(), strict=True))}")
     print(f"  residual_norm={float(np.linalg.norm(residuals)):.6e}")
     print(f"  jacobian_shape={jacobian.shape}")
+    print(f"  jacobian={jacobian.tolist()}")
+    print(f"  gradient={(jacobian.T @ residuals).tolist()}")
     return evaluation
 
 
@@ -298,9 +303,10 @@ def write_profile_artifacts(problem, x, label):
 # --------------------------- solve -----------------------------------------
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
     problem = opt.geometry_initial_er_root_only_least_squares_problem(
         TRANSPORT_CONFIG,
-        tuple(term for term in terms if float(term[2]) != 0.0),
+        active_terms,
         vmec_input=SEED_INPUT,
         max_mode=None,
         include_profiles=True,
@@ -313,6 +319,20 @@ def main() -> int:
     x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
     print(f"[setup] parameter_count={problem.parameter_count} parameters={list(problem.parameter_labels)}")
     print(f"[setup] nominal_profile_scales={np.asarray(jax.device_get(problem.x_scale), dtype=float).tolist()}")
+    print(
+        "[setup] active_terms="
+        + json.dumps(
+            [
+                {
+                    "objective": getattr(term[0], "label", getattr(term[0], "name", str(term[0]))),
+                    "target": float(term[1]),
+                    "weight": float(term[2]),
+                }
+                for term in active_terms
+            ]
+        ),
+        flush=True,
+    )
     report("initial", problem, x0)
     write_profile_artifacts(problem, x0, "initial")
     bounds = scaled_profile_bounds(problem)
