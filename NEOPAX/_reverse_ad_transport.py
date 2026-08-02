@@ -1261,6 +1261,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
 
     final_y_for_objective = segmented_final_carry.y
+    if reverse_setup.stop_after_accepted_steps is None:
+        final_time = jnp.asarray(segmented_final_carry.t)
+        target_time = jnp.asarray(getattr(reverse_setup.solver, "t1", final_time), dtype=final_time.dtype)
+        final_time_ready, target_time_ready = jax.block_until_ready((final_time, target_time))
+        if float(final_time_ready) < float(target_time_ready) - 1.0e-12:
+            raise RuntimeError(
+                "full transport reverse trial did not reach solver final time "
+                f"(final_time={float(final_time_ready):.16e}, target_time={float(target_time_ready):.16e}); "
+                "treating trial as failed for optimization."
+            )
 
     objective_count = int(len(objective_labels))
     objective_values_rows = []
