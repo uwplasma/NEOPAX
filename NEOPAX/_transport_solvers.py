@@ -11645,9 +11645,9 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
     segment_start_carries = None
     segmented_final_carry = None
     segmented_replay_arrays = None
-    if reverse_segment_length is not None and int(reverse_segment_length) > 0 and stop_after_accepted_steps is not None:
+    if reverse_segment_length is not None and int(reverse_segment_length) > 0:
         segment_length = int(reverse_segment_length)
-        accepted_limit = int(stop_after_accepted_steps)
+        accepted_limit = int(stop_after_accepted_steps) if stop_after_accepted_steps is not None else int(max_total_steps)
         segment_count = (accepted_limit + segment_length - 1) // segment_length
         padded_count = segment_count * segment_length
         accepted_active_mask = jnp.logical_and(active_mask, accepted_mask)

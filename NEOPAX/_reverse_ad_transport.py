@@ -278,6 +278,7 @@ class RealtimeGeometryReverseStaticSetup:
     stop_after_accepted_steps: int | None
     max_total_steps: int
     reverse_segment_length: int | None
+    require_final_time: bool = False
 
 
 TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
@@ -888,7 +889,7 @@ def prepare_reverse_static_setup(
     profile_cfg: Mapping[str, Any],
     initial_er_root_ad: str = "off",
     accepted_step_limit_override: int | None = None,
-    reverse_segment_length: int | None = None,
+    reverse_segment_length: int | str | None = None,
     reverse_direct_stage_adjoint: bool = False,
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
@@ -939,26 +940,57 @@ def prepare_reverse_static_setup(
         if accepted_step_limit_override is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
+    requested_full_final_time = stop_after_accepted_steps is None
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
-    if stop_after_accepted_steps is not None:
+    reverse_segment_auto_quarter = (
+        isinstance(reverse_segment_length, str)
+        and str(reverse_segment_length).strip().lower()
+        in {"auto", "auto_quarter", "quarter", "accepted_quarter"}
+    )
+    reverse_segment_length_eff = None
+    if reverse_segment_length is not None and not reverse_segment_auto_quarter:
+        reverse_segment_length_eff = int(reverse_segment_length)
+    needs_schedule_probe = (
+        stop_after_accepted_steps is not None
+        or reverse_segment_auto_quarter
+        or (requested_full_final_time and reverse_segment_length_eff is not None)
+    )
+    if needs_schedule_probe:
+        probe_max_total_steps = max_total_steps
+        if stop_after_accepted_steps is not None:
+            probe_max_total_steps = min(
+                max_total_steps,
+                max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+            )
         max_total_steps = min(
             max_total_steps,
             max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
-        )
+        ) if stop_after_accepted_steps is not None else max_total_steps
         schedule_probe = _radau_adaptive_schedule_rollout(
             execution_context,
             prepared_rollout_static.initial_carry,
-            max_total_steps=max_total_steps,
+            max_total_steps=probe_max_total_steps,
             stop_after_accepted_steps=stop_after_accepted_steps,
         )
         actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
         max_total_steps = min(
-            max_total_steps,
-            max(actual_attempt_count + 2, int(stop_after_accepted_steps)),
+            probe_max_total_steps,
+            max(
+                actual_attempt_count + 2,
+                int(stop_after_accepted_steps) if stop_after_accepted_steps is not None else 1,
+            ),
         )
-        accepted_limit = int(stop_after_accepted_steps)
         active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
         accepted_mask_np = np.asarray(jax.device_get(schedule_probe.trace.accepted_mask), dtype=bool)
+        accepted_count_np = int(np.sum(np.logical_and(active_mask_np, accepted_mask_np)))
+        if reverse_segment_auto_quarter:
+            reverse_segment_length_eff = max(1, (accepted_count_np + 3) // 4)
+        if requested_full_final_time and reverse_segment_length_eff is not None:
+            stop_after_accepted_steps = max(1, accepted_count_np)
+        if stop_after_accepted_steps is None:
+            accepted_limit = int(max_total_steps)
+        else:
+            accepted_limit = int(stop_after_accepted_steps)
         next_lagged_valid_np = np.asarray(
             jax.device_get(schedule_probe.trace.next_lagged_response_valid),
             dtype=bool,
@@ -985,7 +1017,8 @@ def prepare_reverse_static_setup(
         execution_context=execution_context,
         stop_after_accepted_steps=stop_after_accepted_steps,
         max_total_steps=max_total_steps,
-        reverse_segment_length=reverse_segment_length,
+        reverse_segment_length=reverse_segment_length_eff,
+        require_final_time=bool(requested_full_final_time and reverse_segment_length_eff is not None),
     )
 
 
@@ -1261,7 +1294,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
 
     final_y_for_objective = segmented_final_carry.y
-    if reverse_setup.stop_after_accepted_steps is None:
+    if bool(getattr(reverse_setup, "require_final_time", False)):
         final_time = jnp.asarray(segmented_final_carry.t)
         target_time = jnp.asarray(getattr(reverse_setup.solver, "t1", final_time), dtype=final_time.dtype)
         final_time_ready, target_time_ready = jax.block_until_ready((final_time, target_time))
@@ -2532,7 +2565,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 None if active_accepted_step_limit is None else int(active_accepted_step_limit)
             ),
             reverse_segment_length=(
-                None if active_reverse_segment_length is None else int(active_reverse_segment_length)
+                None
+                if active_reverse_segment_length is None
+                else active_reverse_segment_length
+                if isinstance(active_reverse_segment_length, str)
+                else int(active_reverse_segment_length)
             ),
             reverse_direct_stage_adjoint=True,
             reverse_stage_adjoint_solve_mode=str(

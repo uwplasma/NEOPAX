@@ -1259,7 +1259,7 @@ def full_transport_profile_least_squares_problem(
     profile_scale_mode: str = "nominal",
     device: str | None = "default",
     accepted_step_limit: int | None = 16,
-    reverse_segment_length: int | None = 4,
+    reverse_segment_length: int | str | None = 4,
     initial_er_root_ad: str = "jax_selected_root",
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
@@ -1364,7 +1364,13 @@ def full_transport_profile_least_squares_problem(
     options = {
         "quiet": True,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
-        "reverse_segment_length": None if reverse_segment_length is None else int(reverse_segment_length),
+        "reverse_segment_length": (
+            None
+            if reverse_segment_length is None
+            else reverse_segment_length
+            if isinstance(reverse_segment_length, str)
+            else int(reverse_segment_length)
+        ),
         "initial_er_root_ad": str(initial_er_root_ad),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
@@ -1418,7 +1424,7 @@ def geometry_full_transport_least_squares_problem(
     geometry_solver_device: str | None = "default",
     device: str | None = "default",
     accepted_step_limit: int | None = None,
-    reverse_segment_length: int | None = 4,
+    reverse_segment_length: int | str | None = 4,
     initial_er_root_ad: str = "jax_selected_root",
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
@@ -1518,7 +1524,13 @@ def geometry_full_transport_least_squares_problem(
     options = {
         "quiet": True,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
-        "reverse_segment_length": None if reverse_segment_length is None else int(reverse_segment_length),
+        "reverse_segment_length": (
+            None
+            if reverse_segment_length is None
+            else reverse_segment_length
+            if isinstance(reverse_segment_length, str)
+            else int(reverse_segment_length)
+        ),
         "initial_er_root_ad": str(initial_er_root_ad),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),

@@ -34,7 +34,7 @@ TRANSPORT_CONFIG = (
 OUT_DIR = ROOT / "outputs" / "geometry_qi_max_er_transition_bootstrap_alpha_full_transport_optimization"
 
 SURFACES = np.asarray(
-    [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 51 / 51],
+    [1 / 51, 10 / 51, 20 / 51, 30 / 51, 40 / 51, 51 / 51],
     dtype=float,
 )
 QI_MBOZ = 18
@@ -47,7 +47,7 @@ ESS_ALPHA = 1.2
 
 # None means the full transport solve uses t_final from the TOML.
 FULL_TRANSPORT_ACCEPTED_STEP_LIMIT = None
-REVERSE_SEGMENT_LENGTH = 4
+REVERSE_SEGMENT_LENGTH = "auto_quarter"
 
 ASPECT_TARGET = 10.0
 IOTA_TARGET = -0.61
@@ -61,7 +61,7 @@ ALPHA_REFERENCE_VOLUME_M3 = 331.0187969899648
 ALPHA_POWER_TARGET_MW_M3 = ALPHA_POWER_TARGET_MW / ALPHA_REFERENCE_VOLUME_M3
 
 QI_WEIGHT = 1.0
-MAXJ_WEIGHT = 0.00005
+MAXJ_WEIGHT = 0.0001
 ASPECT_WEIGHT = 1.0
 IOTA_WEIGHT = 1.0
 MIRROR_WEIGHT = 100.0
@@ -71,14 +71,14 @@ ER_TRANSITION_RIGHT_WEIGHT = 1.0
 BOOTSTRAP_WEIGHT = 1.0
 ALPHA_POWER_WEIGHT = 1.0
 
-NFEV = 20
+NFEV = 6
 FTOL = 1.0e-6
 XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
 
 MAKE_WOUT_PLOTS = True
-MAKE_INITIAL_PLOTS = False
+MAKE_INITIAL_PLOTS = True
 MAKE_TRANSPORT_REPORTS = True
 
 
@@ -111,10 +111,10 @@ terms = [
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
-    (opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT),
-    (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
-    (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
-    (bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
+    #(opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT),
+    #(opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
+    #(opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
+    #(bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
     (opt.transport.alpha_power_volume_average_mw_m3, ALPHA_POWER_TARGET_MW_M3, ALPHA_POWER_WEIGHT),
 ]
 
