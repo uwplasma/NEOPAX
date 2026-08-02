@@ -272,7 +272,7 @@ def save_density_temperature_profiles(rho_np, density_np, temperature_np, out_di
         print(f"wrote {png_path}")
 
 
-def write_final_profiles(problem, x):
+def write_profile_artifacts(problem, x, label):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rho, density, temperature, er, finite_mask = problem.initial_root_profiles_from_scaled_parameters(x)
     rho_np = np.asarray(jax.device_get(rho), dtype=float)
@@ -284,14 +284,14 @@ def write_final_profiles(problem, x):
     rho_boot_np = np.asarray(jax.device_get(rho_boot), dtype=float)
     if not np.allclose(rho_np, rho_boot_np):
         raise RuntimeError("Bootstrap-current rho grid did not match initial-root rho grid.")
-    save_er_profile(rho_np, er_np, finite_np, OUT_DIR, "optimized")
-    save_density_temperature_profiles(rho_np, density_np, temperature_np, OUT_DIR, "optimized")
+    save_er_profile(rho_np, er_np, finite_np, OUT_DIR, label)
+    save_density_temperature_profiles(rho_np, density_np, temperature_np, OUT_DIR, label)
     save_bootstrap_current_profile(
         rho_np,
         np.asarray(jax.device_get(jboot), dtype=float),
         np.asarray(jax.device_get(finite_boot), dtype=bool),
         OUT_DIR,
-        "optimized",
+        label,
     )
 
 
@@ -314,6 +314,7 @@ def main() -> int:
     print(f"[setup] parameter_count={problem.parameter_count} parameters={list(problem.parameter_labels)}")
     print(f"[setup] nominal_profile_scales={np.asarray(jax.device_get(problem.x_scale), dtype=float).tolist()}")
     report("initial", problem, x0)
+    write_profile_artifacts(problem, x0, "initial")
     bounds = scaled_profile_bounds(problem)
     result = opt.least_squares(
         problem,
@@ -343,7 +344,7 @@ def main() -> int:
     summary_path = OUT_DIR / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
-    write_final_profiles(problem, x_opt)
+    write_profile_artifacts(problem, x_opt, "optimized")
     return 0
 
 

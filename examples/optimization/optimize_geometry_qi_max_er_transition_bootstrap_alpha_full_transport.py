@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ import vmex as vj  # noqa: E402
 from vmex import optimize as vmex_opt  # noqa: E402
 
 from NEOPAX import optimization as opt  # noqa: E402
+from NEOPAX._orchestrator import load_config, run_config  # noqa: E402
 
 
 # --------------------------- parameters ------------------------------------
@@ -27,7 +29,7 @@ TRANSPORT_CONFIG = (
     ROOT
     / "examples"
     / "benchmarks"
-    / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml"
+    / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark_QI_optimization.toml"
 )
 OUT_DIR = ROOT / "outputs" / "geometry_qi_max_er_transition_bootstrap_alpha_full_transport_optimization"
 
@@ -54,7 +56,9 @@ MAX_ER_TARGET = 25.0
 ER_TRANSITION_LEFT_TARGET = 26.0
 ER_TRANSITION_RIGHT_TARGET = -10.0
 BOOTSTRAP_LIMIT_SCALED = 0.1
-ALPHA_POWER_MIN_MW_M3 = 0.6
+ALPHA_POWER_TARGET_MW = 300.0
+ALPHA_REFERENCE_VOLUME_M3 = 331.0187969899648
+ALPHA_POWER_TARGET_MW_M3 = ALPHA_POWER_TARGET_MW / ALPHA_REFERENCE_VOLUME_M3
 
 QI_WEIGHT = 1.0
 MAXJ_WEIGHT = 0.00005
@@ -75,6 +79,7 @@ SOLVER_DEVICE = "default"
 
 MAKE_WOUT_PLOTS = True
 MAKE_INITIAL_PLOTS = False
+MAKE_TRANSPORT_REPORTS = True
 
 
 def max_mode_schedule_values():
@@ -100,12 +105,6 @@ bootstrap_penalty = opt.transformed_transport_objective(
     label="bootstrap_current_penalty",
 )
 
-alpha_power_shortfall = opt.transformed_transport_objective(
-    opt.transport.alpha_power_volume_average_mw_m3,
-    lambda alpha_power: positive_part(ALPHA_POWER_MIN_MW_M3 - alpha_power),
-    label="alpha_power_shortfall",
-)
-
 terms = [
     (opt.geometry.boozer_qi_objective, 0.0, QI_WEIGHT),
     (opt.geometry.boozer_maxj_objective, 0.0, MAXJ_WEIGHT),
@@ -116,7 +115,7 @@ terms = [
     (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
     (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
     (bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
-    (alpha_power_shortfall, 0.0, ALPHA_POWER_WEIGHT),
+    (opt.transport.alpha_power_volume_average_mw_m3, ALPHA_POWER_TARGET_MW_M3, ALPHA_POWER_WEIGHT),
 ]
 
 
@@ -146,6 +145,11 @@ def iteration_diagnostics(evaluation):
 
     er_residual = residual("transport:softmax_Er", "softmax_Er")
     er_cost = 0.5 * er_residual * er_residual
+    alpha_power_mw_m3 = value(
+        "transport:alpha_power_volume_average_mw_m3",
+        "alpha_power_volume_average_mw_m3",
+    )
+    alpha_power_mw = alpha_power_mw_m3 * ALPHA_REFERENCE_VOLUME_M3
     return (
         f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
@@ -162,8 +166,9 @@ def iteration_diagnostics(evaluation):
         f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"Er_right_residual={residual('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"bootstrap_penalty={value('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
-        f"alpha_power={value('transport:alpha_power_volume_average_mw_m3', 'alpha_power_volume_average_mw_m3'):.8e} "
-        f"alpha_shortfall={value('alpha_power_shortfall', 'transport:alpha_power_shortfall'):.8e}"
+        f"alpha_power_mw_m3={alpha_power_mw_m3:.8e} "
+        f"P_alpha_MW={alpha_power_mw:.8e} "
+        f"P_alpha_residual_MW={(alpha_power_mw - ALPHA_POWER_TARGET_MW):.8e}"
     )
 
 
@@ -199,6 +204,27 @@ def write_geometry_artifacts(input_obj, label):
     return artifact_dir
 
 
+def write_transport_report(input_obj, label):
+    """Run the forward transport solver and save its usual plot/HDF5 outputs."""
+
+    if not MAKE_TRANSPORT_REPORTS:
+        return None
+    artifact_dir = OUT_DIR / label / "transport"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    input_path = artifact_dir / f"input.QI_neopax_geometry_full_transport_{label}"
+    input_obj.to_indata(input_path)
+    config = copy.deepcopy(load_config(TRANSPORT_CONFIG))
+    config.setdefault("geometry", {})["vmec_input_file"] = str(input_path)
+    transport_output = config.setdefault("transport_output", {})
+    transport_output["transport_plot"] = True
+    transport_output["transport_write_hdf5"] = True
+    transport_output["transport_output_dir"] = str(artifact_dir)
+    print(f"[transport-report] running {label} forward transport output", flush=True)
+    result = run_config(config)
+    print(f"[transport-report] wrote usual transport outputs in {artifact_dir}", flush=True)
+    return result
+
+
 def write_outputs(optimized_input, initial_input):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed_copy = OUT_DIR / SEED_INPUT.name
@@ -209,7 +235,37 @@ def write_outputs(optimized_input, initial_input):
     print(f"wrote {optimized_input_path}")
     if MAKE_INITIAL_PLOTS:
         write_geometry_artifacts(initial_input, "initial")
+    write_transport_report(initial_input, "initial")
     write_geometry_artifacts(optimized_input, "optimized")
+    write_transport_report(optimized_input, "optimized")
+
+
+class GeometryInputSavingProblem:
+    """Save the VMEC input corresponding to every successful optimizer evaluation."""
+
+    def __init__(self, problem, artifact_dir):
+        self.problem = problem
+        self.artifact_dir = Path(artifact_dir)
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._seen = {}
+
+    def __getattr__(self, name):
+        return getattr(self.problem, name)
+
+    def evaluate(self, scaled_parameter_values=None):
+        evaluation = self.problem.evaluate(scaled_parameter_values)
+        x = self.problem.x0 if scaled_parameter_values is None else jnp.asarray(
+            scaled_parameter_values,
+            dtype=jnp.float64,
+        )
+        key = tuple(np.asarray(jax.device_get(x), dtype=float).tolist())
+        if key not in self._seen:
+            index = len(self._seen)
+            self._seen[key] = index
+            input_path = self.artifact_dir / f"input.QI_neopax_geometry_full_transport_eval_{index:04d}"
+            self.problem.input_from_scaled_parameters(x).to_indata(input_path)
+            print(f"wrote {input_path}", flush=True)
+        return evaluation
 
 
 # --------------------------- continuation ladder ----------------------------
@@ -247,6 +303,10 @@ def main() -> int:
             reverse_stage_adjoint_solve_mode="bicgstab",
             reverse_rhs_transpose_mode="explicit_ntx_interpolated",
             reverse_step_bwd_mode="reduced_cotangent",
+        )
+        problem = GeometryInputSavingProblem(
+            problem,
+            OUT_DIR / f"geometry_inputs_m{max_mode}",
         )
         if x is None or len(x) != problem.parameter_count:
             x = np.asarray(jax.device_get(problem.x0), dtype=float)
