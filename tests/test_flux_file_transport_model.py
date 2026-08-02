@@ -480,3 +480,89 @@ def test_non_fd_lagged_response_still_rebuilds_at_the_current_state():
     response1 = model.build_lagged_response(state1, previous_response=response0)
 
     assert jnp.allclose(response1.reference_state.pressure, state1.pressure)
+
+
+def _response_tangent(response, value):
+    """Tangent tree matching a lagged response, with float0 on its integer and boolean leaves."""
+    import jax
+
+    def leaf(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.full(arr.shape, value, dtype=arr.dtype)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    return jax.tree_util.tree_map(leaf, response)
+
+
+def test_fd_lagged_response_jvp_matches_the_primal_identity():
+    import jax
+
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+
+    def build(state, previous):
+        return model.build_lagged_response(state, previous_response=previous)
+
+    dstate = jax.tree_util.tree_map(jnp.ones_like, state1)
+    dprevious = _response_tangent(response0, 1.0)
+
+    primal, tangent = jax.jvp(build, (state1, response0), (dstate, dprevious))
+
+    assert jnp.allclose(primal.reference_basis, response0.reference_basis)
+    assert jnp.allclose(tangent.reference_basis, dprevious.reference_basis)
+    assert jnp.allclose(tangent.reference_flux["Q"], dprevious.reference_flux["Q"])
+
+
+def test_non_fd_lagged_response_jvp_still_tracks_the_state():
+    import jax
+
+    model = _fd_model(lagged_response_mode="none")
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+
+    def build(state, previous):
+        return model.build_lagged_response(state, previous_response=previous)
+
+    dstate = jax.tree_util.tree_map(jnp.ones_like, state1)
+    dprevious = _response_tangent(response0, 0.0)
+
+    _, tangent = jax.jvp(build, (state1, response0), (dstate, dprevious))
+
+    assert jnp.allclose(tangent.reference_state.pressure, dstate.pressure)
+
+
+def test_radau_prepare_lagged_response_rebuild_matches_reuse_for_fd():
+    from jax.flatten_util import ravel_pytree
+
+    from NEOPAX._transport_solvers import _radau_prepare_lagged_response
+
+    class KernelContext:
+        use_transport_lagged_response = True
+
+    class Carry:
+        def __init__(self, y, valid, cache):
+            self.y = y
+            self.lagged_response_valid = valid
+            self.lagged_response_cache = cache
+            self.lagged_reference_y = y
+
+    model = _fd_model()
+    state0, state1, _ = _fd_states()
+    response0 = model.build_lagged_response(state0)
+    flat_y1, unravel = ravel_pytree(state1)
+
+    fluxes = {}
+    for label, valid in (("reuse", True), ("rebuild", False)):
+        response, _, _ = _radau_prepare_lagged_response(
+            KernelContext(),
+            Carry(flat_y1, jnp.asarray(valid), response0),
+            unravel,
+            None,
+            model.build_lagged_response,
+        )
+        fluxes[label] = model.evaluate_with_lagged_response(state1, response)["Q"]
+
+    assert jnp.array_equal(fluxes["reuse"], fluxes["rebuild"])
+    assert bool(jnp.all(fluxes["rebuild"][0] < model(state=None)["Q"][0]))

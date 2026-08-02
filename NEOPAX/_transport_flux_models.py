@@ -8034,11 +8034,11 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
             )
-        self._require_matching_fd_grid()
         # Re-anchoring moves the extrapolation origin while the file-derived slopes stay fixed,
         # so an existing response is returned unchanged rather than rebuilt against `state`.
         if isinstance(previous_response, SpectraXTurbulenceFDLaggedResponse):
             return previous_response
+        self._require_matching_fd_grid()
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),
