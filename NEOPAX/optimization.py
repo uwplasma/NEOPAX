@@ -1079,9 +1079,17 @@ def _prepare_initial_er_root_config(config_path, *, device: str | None, vmec_inp
 
 def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
     profiles = config.get("profiles", {})
+    defaults = {
+        "n0": 4.21,
+        "T0": 17.8,
+        "density_shape_power": 2.0,
+        "temperature_shape_power": 2.0,
+        "density_shape_alpha": 1.0,
+        "temperature_shape_alpha": 1.0,
+    }
     values = []
     for name in PROFILE_PARAMETER_ORDER:
-        raw = profiles[name]
+        raw = profiles.get(name, defaults[name])
         if isinstance(raw, (list, tuple)):
             raw = raw[0]
         values.append(float(raw))

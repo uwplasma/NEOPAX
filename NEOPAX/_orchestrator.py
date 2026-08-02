@@ -1736,7 +1736,7 @@ def plot_fluxes(
         return None
 
     def _plot_flux_group(quantity_keys, ylabel, title, out_name):
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         plotted = False
         plotted_reference = False
         for key in quantity_keys:
@@ -1746,7 +1746,7 @@ def plot_fluxes(
             arr = jnp.asarray(arr)
             if arr.ndim == 2:
                 for i in range(arr.shape[0]):
-                    ax.plot(rho, arr[i], label=f"{key}[{i}]")
+                    ax.plot(rho, arr[i], linewidth=3.0, label=f"{key}[{i}]")
                     if overlay_reference and ntss_reference:
                         ref_values = _reference_flux_profile(key, i)
                         if ref_values is not None:
@@ -1754,25 +1754,26 @@ def plot_fluxes(
                                 rho,
                                 ref_values,
                                 color="black",
-                                linewidth=2.2,
+                                linewidth=3.0,
                                 alpha=0.9,
                                 label=f"{reference_label} {key}[{_species_label(i)}]",
                             )
                             plotted_reference = True
             else:
-                ax.plot(rho, arr, label=key)
+                ax.plot(rho, arr, linewidth=3.0, label=key)
             plotted = True
         if not plotted:
             plt.close(fig)
             return None
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel(ylabel, fontsize=20)
         ax.set_title(title)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
+        ax.grid(False)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=320, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -1804,17 +1805,18 @@ def plot_sources(rho, sources, output_dir):
         arr = jnp.asarray(arr)
         if arr.ndim != 2:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         for i in range(arr.shape[0]):
-            ax.plot(rho, arr[i], label=f"{prefix}[{i}]")
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
+            ax.plot(rho, arr[i], linewidth=3.0, label=f"{prefix}[{i}]")
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel(ylabel, fontsize=20)
         ax.set_title(title)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
+        ax.grid(False)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=320, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2263,10 +2265,50 @@ def plot_transport_solution(
             return str(species_names[species_idx])
         return f"species[{species_idx}]"
 
+    _TRANSPORT_FIGSIZE = (6.8, 5.6)
+    _TRANSPORT_DPI = 320
+    _TRANSPORT_LINEWIDTH = 3.0
+    _TRANSPORT_REFERENCE_LINEWIDTH = 3.0
+
+    def _transport_ylabel(label):
+        replacements = {
+            "Density": r"$n$ [$10^{20} m^{-3}$]",
+            "Temperature": r"$T$ [$keV$]",
+            "Er": r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]",
+            "Total Power Source [MW/m^3]": r"Total Power Source [$MW/m^3$]",
+            "Alpha Particle Source [1e20 m^-3 s^-1]": r"Alpha Particle Source [$10^{20} m^{-3} s^{-1}$]",
+            "Total Heat Flux [MW]": r"Total Heat Flux [$MW$]",
+            "Neo Heat Flux [MW]": r"Neo Heat Flux [$MW$]",
+            "Turbulent Heat Flux [MW]": r"Turbulent Heat Flux [$MW$]",
+            "Ion Neo Heat Flux [MW]": r"Ion Neo Heat Flux [$MW$]",
+            "Ion Turbulent Heat Flux [MW]": r"Ion Turbulent Heat Flux [$MW$]",
+            "Neo Energy Flux Approx. [MW]": r"Neo Energy Flux Approx. [$MW$]",
+            "Turbulent Energy Flux Approx. [MW]": r"Turbulent Energy Flux Approx. [$MW$]",
+            "Alpha Power [MW/m^3]": r"Alpha Power [$MW/m^3$]",
+            "Bremsstrahlung Power [MW/m^3]": r"Bremsstrahlung Power [$MW/m^3$]",
+            "Power Exchange [MW/m^3]": r"Power Exchange [$MW/m^3$]",
+            "Heat Diffusivity chi_t [m^2/s]": r"Heat Diffusivity $\chi_t$ [$m^2/s$]",
+            "Particle Diffusivity chi_n [m^2/s]": r"Particle Diffusivity $\chi_n$ [$m^2/s$]",
+        }
+        return replacements.get(label, label)
+
+    def _style_transport_axes(ax, *, xlabel=r"$\rho$", ylabel=None, title=None):
+        ax.set_xlabel(xlabel, fontsize=20)
+        if ylabel is not None:
+            ax.set_ylabel(_transport_ylabel(ylabel), fontsize=20)
+        if title is not None:
+            ax.set_title(title)
+        ax.grid(False)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+            spine.set_color("0.35")
+        ax.margins(x=0.04, y=0.08)
+
     def _plot_species_time_series(series, ylabel, out_name):
         if not series:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
         if not color_cycle:
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
@@ -2284,7 +2326,7 @@ def plot_transport_solution(
             color = color_cycle[time_idx % len(color_cycle)]
             for species_idx in range(values.shape[0]):
                 linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
-                ax.plot(rho, values[species_idx], color=color, linestyle=linestyle, linewidth=1.8)
+                ax.plot(rho, values[species_idx], color=color, linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH)
         reference_kind = None
         flux_reference_key = None
         out_name_lower = out_name.lower()
@@ -2317,7 +2359,7 @@ def plot_transport_solution(
                             ref_values,
                             color=ref_spec["color"],
                             linestyle=linestyle,
-                            linewidth=2.2,
+                            linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                             alpha=0.9,
                         )
                         used = True
@@ -2340,7 +2382,7 @@ def plot_transport_solution(
                             ref_values,
                             color=ref_spec["color"],
                             linestyle=linestyle,
-                            linewidth=2.2,
+                            linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                             alpha=0.9,
                         )
                         used = True
@@ -2351,13 +2393,13 @@ def plot_transport_solution(
         for time_idx, (time_label, _) in enumerate(series):
             color = color_cycle[time_idx % len(color_cycle)]
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=2.0, label=label))
+            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=_TRANSPORT_LINEWIDTH, label=label))
 
         species_handles = []
         for species_idx in range(species_count):
             linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
             species_handles.append(
-                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
+                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH, label=_species_label(species_idx))
             )
         for ref_spec in reference_labels_present:
             species_handles.append(
@@ -2366,14 +2408,12 @@ def plot_transport_solution(
                     [0],
                     color=ref_spec["color"],
                     linestyle=ref_spec["linestyle"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     label=ref_spec["label"],
                 )
             )
 
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel)
 
         legend_times = ax.legend(handles=time_handles, title="Time", loc="upper left")
         ax.add_artist(legend_times)
@@ -2381,7 +2421,7 @@ def plot_transport_solution(
 
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2394,11 +2434,11 @@ def plot_transport_solution(
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
         species_count = int(jnp.asarray(series[0][1]).shape[0])
         for species_idx in range(species_count):
-            fig, ax = plt.subplots(figsize=(9, 4))
+            fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
             for time_idx, (time_label, values) in enumerate(series):
                 color = color_cycle[time_idx % len(color_cycle)]
                 label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-                ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
+                ax.plot(rho, values[species_idx], color=color, linewidth=_TRANSPORT_LINEWIDTH, label=label)
             reference_kind = "density" if "density" in out_stem.lower() else "temperature" if "temperature" in out_stem.lower() else None
             species_name = _species_label(species_idx)
             for ref_spec in reference_profile_sets:
@@ -2436,18 +2476,15 @@ def plot_transport_solution(
                         rho,
                         ref_values,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_label,
                     )
-            ax.set_xlabel("rho")
-            ax.set_ylabel(ylabel)
-            ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
-            ax.grid(True, alpha=0.3)
+            _style_transport_axes(ax, ylabel=ylabel, title=f"{_transport_ylabel(ylabel)}: {_species_label(species_idx)}")
             ax.legend(title="Time")
             fig.tight_layout()
             out_png = output_dir / f"{out_stem}_{_species_label(species_idx)}.png"
-            fig.savefig(out_png, dpi=170)
+            fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
             plt.close(fig)
             written[_species_label(species_idx)] = out_png
         return written
@@ -2455,10 +2492,10 @@ def plot_transport_solution(
     def _plot_scalar_time_series(series, ylabel, out_name, title=None, reference_key=None, reference_label="NTSS reference"):
         if not series:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         for time_idx, (time_label, values) in enumerate(series):
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-            ax.plot(rho, values, linewidth=1.8, label=label)
+            ax.plot(rho, values, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         if reference_key is not None:
             for ref_spec in reference_profile_sets:
                 ref_values = ref_spec["data"].get("scalar", {}).get(reference_key)
@@ -2467,19 +2504,15 @@ def plot_transport_solution(
                         rho,
                         ref_values,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_spec["label"] if reference_label == "NTSS reference" else f"{ref_spec['label']} {reference_label}",
                     )
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
         ax.legend(title="Time")
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2499,13 +2532,13 @@ def plot_transport_solution(
     ):
         if not series_left and not series_right:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         for time_idx, (time_label, values) in enumerate(series_left):
             label = f"{left_label} t={time_label:.3g}" if time_label is not None else left_label
-            ax.plot(rho, values, linewidth=1.8, label=label)
+            ax.plot(rho, values, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         for time_idx, (time_label, values) in enumerate(series_right):
             label = f"{right_label} t={time_label:.3g}" if time_label is not None else right_label
-            ax.plot(rho, values, linewidth=1.8, linestyle="--", label=label)
+            ax.plot(rho, values, linewidth=_TRANSPORT_LINEWIDTH, linestyle="--", label=label)
         for ref_spec in reference_profile_sets:
             if reference_left_values is not None:
                 ref_values = reference_left_values
@@ -2520,7 +2553,7 @@ def plot_transport_solution(
                     rho,
                     ref_values,
                     color=ref_spec["color"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     linestyle=ref_spec["linestyle"],
                     label=f"{ref_spec['label']} {left_label}",
                 )
@@ -2535,36 +2568,28 @@ def plot_transport_solution(
                     rho,
                     ref_values,
                     color=ref_spec["color"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     linestyle=ref_spec["linestyle"],
                     alpha=0.75,
                     label=f"{ref_spec['label']} {right_label}",
                 )
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
         ax.legend(title="Series")
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
     def _plot_geometry_profile(x, values, xlabel, ylabel, out_name, title=None):
         if x is None or values is None:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(jnp.asarray(x), jnp.asarray(values), linewidth=2.0)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        ax.plot(jnp.asarray(x), jnp.asarray(values), linewidth=_TRANSPORT_LINEWIDTH)
+        _style_transport_axes(ax, xlabel=xlabel, ylabel=ylabel, title=title)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2925,12 +2950,12 @@ def plot_transport_solution(
             flux_plot_paths[f"{key}_{species_name}"] = path
 
     if er_series:
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         for time_label, er in er_series:
             label = "Er"
             if time_label is not None:
                 label += f" t={time_label:.3g}"
-            ax.plot(rho, er, label=label)
+            ax.plot(rho, er, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         if overlay_reference_er and rho is not None:
             try:
                 plotted_reference = False
@@ -2942,7 +2967,7 @@ def plot_transport_solution(
                         rho,
                         er_ref,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_spec["label"],
                     )
@@ -2951,12 +2976,10 @@ def plot_transport_solution(
                     print("[NEOPAX] transport Er overlay requested, but no usable reference Er profiles were loaded.")
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
-        ax.set_xlabel("rho")
-        ax.set_ylabel("Er")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel="Er")
+        ax.legend(loc="lower left", fontsize=15, frameon=True)
         fig.tight_layout()
-        fig.savefig(output_dir / "transport_Er.png", dpi=170)
+        fig.savefig(output_dir / "transport_Er.png", dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
 
     return {
@@ -3088,15 +3111,16 @@ def write_transport_ambipolarity_residual_comparison(state, runtime, transport_e
         f.create_dataset("ambipolar_charge_flux_local", data=jnp.asarray(local_charge_flux))
 
     if rho is not None:
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(rho, transport_charge_flux, label="transport charge flux")
-        ax.plot(rho, local_charge_flux, label="ambipolar local charge flux", linestyle="--")
-        ax.set_xlabel("rho")
-        ax.set_ylabel("charge-weighted flux")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
+        ax.plot(rho, transport_charge_flux, linewidth=3.0, label="transport charge flux")
+        ax.plot(rho, local_charge_flux, linewidth=3.0, label="ambipolar local charge flux", linestyle="--")
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel("charge-weighted flux", fontsize=20)
+        ax.grid(False)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
         fig.tight_layout()
-        fig.savefig(output_dir / "transport_ambipolarity_residual_compare.png", dpi=170)
+        fig.savefig(output_dir / "transport_ambipolarity_residual_compare.png", dpi=320, bbox_inches="tight")
         plt.close(fig)
 
     return out_h5
@@ -3137,7 +3161,7 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
         resolved_radii = [0, n_radial - 1]
 
     out_h5 = output_dir / "transport_ambipolarity_residual_scan.h5"
-    fig, axes = plt.subplots(len(resolved_radii), 1, figsize=(9, 4 * len(resolved_radii)), sharex=True)
+    fig, axes = plt.subplots(len(resolved_radii), 1, figsize=(6.8, 5.6 * len(resolved_radii)), sharex=True)
     if len(resolved_radii) == 1:
         axes = [axes]
 
@@ -3177,16 +3201,17 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
             label_suffix = f"i={i}"
             if rho is not None:
                 label_suffix += f", rho={float(rho[i]):.3g}"
-            ax.plot(er_scan, transport_scan, label=f"transport ({label_suffix})")
-            ax.plot(er_scan, ambipolar_scan, "--", label=f"ambipolar ({label_suffix})")
+            ax.plot(er_scan, transport_scan, linewidth=3.0, label=f"transport ({label_suffix})")
+            ax.plot(er_scan, ambipolar_scan, "--", linewidth=3.0, label=f"ambipolar ({label_suffix})")
             ax.axhline(0.0, color="k", linewidth=0.8, alpha=0.5)
-            ax.set_ylabel("charge-weighted flux")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            ax.set_ylabel("charge-weighted flux", fontsize=20)
+            ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+            ax.legend(fontsize=14, frameon=True)
+            ax.grid(False)
 
-    axes[-1].set_xlabel("Er")
+    axes[-1].set_xlabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     fig.tight_layout()
-    fig.savefig(output_dir / "transport_ambipolarity_residual_scan.png", dpi=170)
+    fig.savefig(output_dir / "transport_ambipolarity_residual_scan.png", dpi=320, bbox_inches="tight")
     plt.close(fig)
     return out_h5
 

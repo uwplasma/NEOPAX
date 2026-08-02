@@ -28,19 +28,26 @@ TRANSPORT_CONFIG = (
 )
 OUT_DIR = ROOT / "outputs" / "profiles_max_er_transition_bootstrap_initial_root_optimization"
 
-PROFILE_PARAMETERS = "n0,T0,density_shape_power,temperature_shape_power"
+PROFILE_PARAMETERS = (
+    "n0,T0,density_shape_power,temperature_shape_power,"
+    "density_shape_alpha,temperature_shape_alpha"
+)
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_PHYSICAL_LOWER = {
     "n0": 2.0,
     "T0": 7.0,
     "density_shape_power": 0.1,
     "temperature_shape_power": 0.1,
+    "density_shape_alpha": 0.1,
+    "temperature_shape_alpha": 0.1,
 }
 PROFILE_PHYSICAL_UPPER = {
     "n0": 10.0,
     "T0": 25.0,
     "density_shape_power": 12.0,
     "temperature_shape_power": 12.0,
+    "density_shape_alpha": 12.0,
+    "temperature_shape_alpha": 12.0,
 }
 
 MAX_ER_TARGET = 25.0
@@ -185,13 +192,14 @@ def save_er_profile(rho_np, er_np, finite_np, out_dir, label):
             jump_index = int(np.argmax(np.abs(np.diff(finite_er))))
             marker_rho = float(0.5 * (finite_rho[jump_index] + finite_rho[jump_index + 1]))
 
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho_np, er_np, color="red", linewidth=3.2, solid_capstyle="round")
     if marker_rho is not None:
         ax.axvline(marker_rho, color="black", linewidth=1.8, ymin=0.25, ymax=0.93)
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$E_r[\mathrm{kV}/\mathrm{m}]$", fontsize=20)
+    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    ax.grid(False)
     for spine in ax.spines.values():
         spine.set_linewidth(1.0)
         spine.set_color("0.35")
@@ -219,13 +227,14 @@ def save_bootstrap_current_profile(rho_np, jboot_np, finite_np, out_dir, label):
         print(f"skipping bootstrap-current profile plot: {exc}")
         return
     jboot_ka_m2 = 100.0 * jboot_np
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho_np, jboot_ka_m2, color="tab:blue", linewidth=3.0, label="bootstrap current")
     ax.axhline(10.0, color="black", linewidth=2.6, label=r"$10 kA m^{-2}$")
     ax.axhline(-10.0, color="black", linewidth=2.6, label=r"$-10 kA m^{-2}$")
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$J^{BOOTSTRAP}[kA m^{-2}]$")
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$kA m^{-2}$]", fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    ax.grid(False)
     for spine in ax.spines.values():
         spine.set_linewidth(1.0)
         spine.set_color("0.35")
@@ -242,8 +251,8 @@ def save_density_temperature_profiles(rho_np, density_np, temperature_np, out_di
     density_plot = density_np if density_np.ndim == 2 else density_np[None, :]
     temperature_plot = temperature_np if temperature_np.ndim == 2 else temperature_np[None, :]
     for name, data, ylabel in (
-        ("density", density_plot, r"$n[10^{20}m^{-3}]$"),
-        ("temperature", temperature_plot, r"$T[keV]$"),
+        ("density", density_plot, r"$n$ [$10^{20}m^{-3}$]"),
+        ("temperature", temperature_plot, r"$T$ [$keV$]"),
     ):
         csv_path = out_dir / f"{name}_profile_{label}.csv"
         np.savetxt(
@@ -259,12 +268,13 @@ def save_density_temperature_profiles(rho_np, density_np, temperature_np, out_di
         except Exception as exc:
             print(f"skipping {name} profile plot: {exc}")
             continue
-        fig, ax = plt.subplots(figsize=(6.4, 6.4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         for i in range(data.shape[0]):
-            ax.plot(rho_np, data[i], linewidth=2.8, label=f"species {i}")
+            ax.plot(rho_np, data[i], linewidth=3.0, label=f"species {i}")
         ax.set_xlabel(r"$\rho$", fontsize=20)
         ax.set_ylabel(ylabel, fontsize=20)
         ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.grid(False)
         for spine in ax.spines.values():
             spine.set_linewidth(1.0)
             spine.set_color("0.35")
@@ -332,18 +342,19 @@ def save_initial_final_profile_overlay(initial, optimized, out_dir):
 
     def _style_axes(ax):
         ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.grid(False)
         for spine in ax.spines.values():
             spine.set_linewidth(1.0)
             spine.set_color("0.35")
         ax.margins(x=0.04, y=0.08)
 
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho, initial["er"], color="red", linestyle="--", linewidth=3.0, label="initial")
     ax.plot(rho, optimized["er"], color="red", linestyle="-", linewidth=3.2, label="optimized")
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$E_r[\mathrm{kV}/\mathrm{m}]$", fontsize=20)
+    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     _style_axes(ax)
-    ax.legend(loc="best", fontsize=15, frameon=True)
+    ax.legend(loc="lower left", fontsize=15, frameon=True)
     fig.tight_layout()
     png_path = out_dir / "initial_final_er_profile.png"
     fig.savefig(png_path, dpi=320, bbox_inches="tight")
@@ -351,18 +362,18 @@ def save_initial_final_profile_overlay(initial, optimized, out_dir):
     print(f"wrote {png_path}")
 
     for name, ylabel in (
-        ("density", r"$n[10^{20}m^{-3}]$"),
-        ("temperature", r"$T[keV]$"),
+        ("density", r"$n$ [$10^{20}m^{-3}$]"),
+        ("temperature", r"$T$ [$keV$]"),
     ):
         initial_data = initial[name]
         optimized_data = optimized[name]
         initial_plot = initial_data if initial_data.ndim == 2 else initial_data[None, :]
         optimized_plot = optimized_data if optimized_data.ndim == 2 else optimized_data[None, :]
-        fig, ax = plt.subplots(figsize=(6.4, 6.4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         for i in range(initial_plot.shape[0]):
             color = f"C{i}"
-            ax.plot(rho, initial_plot[i], color=color, linestyle="--", linewidth=2.6, label=f"species {i} initial")
-            ax.plot(rho, optimized_plot[i], color=color, linestyle="-", linewidth=2.8, label=f"species {i} optimized")
+            ax.plot(rho, initial_plot[i], color=color, linestyle="--", linewidth=2.8, label=f"species {i} initial")
+            ax.plot(rho, optimized_plot[i], color=color, linestyle="-", linewidth=3.0, label=f"species {i} optimized")
         ax.set_xlabel(r"$\rho$", fontsize=20)
         ax.set_ylabel(ylabel, fontsize=20)
         _style_axes(ax)
@@ -373,7 +384,7 @@ def save_initial_final_profile_overlay(initial, optimized, out_dir):
         plt.close(fig)
         print(f"wrote {png_path}")
 
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(
         rho,
         100.0 * initial["jboot"],
@@ -393,7 +404,7 @@ def save_initial_final_profile_overlay(initial, optimized, out_dir):
     ax.axhline(10.0, color="black", linewidth=2.6, label=r"$10 kA m^{-2}$")
     ax.axhline(-10.0, color="black", linewidth=2.6, label=r"$-10 kA m^{-2}$")
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$J^{BOOTSTRAP}[kA m^{-2}]$", fontsize=20)
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$kA m^{-2}$]", fontsize=20)
     _style_axes(ax)
     ax.legend(loc="best", fontsize=15, frameon=True)
     fig.tight_layout()

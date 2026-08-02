@@ -232,13 +232,14 @@ def save_er_profile(problem, x, out_dir, label):
             jump_index = int(np.argmax(np.abs(np.diff(finite_er))))
             marker_rho = float(0.5 * (finite_rho[jump_index] + finite_rho[jump_index + 1]))
 
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho_np, er_np, color="red", linewidth=3.2, solid_capstyle="round")
     if marker_rho is not None:
         ax.axvline(marker_rho, color="black", linewidth=1.8, ymin=0.25, ymax=0.93)
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$E_r[\mathrm{kV}/\mathrm{m}]$", fontsize=20)
+    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    ax.grid(False)
     for spine in ax.spines.values():
         spine.set_linewidth(1.0)
         spine.set_color("0.35")
@@ -270,13 +271,14 @@ def save_bootstrap_current_profile(problem, x, out_dir, label):
         print(f"skipping bootstrap-current profile plot: {exc}")
         return
     jboot_ka_m2 = 100.0 * jboot_np
-    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho_np, jboot_ka_m2, color="tab:blue", linewidth=3.0, label="bootstrap current")
     ax.axhline(10.0, color="black", linewidth=2.6, label=r"$10 kA m^{-2}$")
     ax.axhline(-10.0, color="black", linewidth=2.6, label=r"$-10 kA m^{-2}$")
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$J^{BOOTSTRAP}[kA m^{-2}]$")
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$kA m^{-2}$]", fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    ax.grid(False)
     for spine in ax.spines.values():
         spine.set_linewidth(1.0)
         spine.set_color("0.35")

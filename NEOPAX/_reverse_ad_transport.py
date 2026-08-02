@@ -42,6 +42,7 @@ from ._reverse_ad_initial_er import (
     runtime_with_ntx_support_payload,
 )
 from ._reverse_ad_parameters import (
+    PROFILE_PARAMETER_ORDER,
     ReverseADParameterSet,
     discover_vmec_boundary_parameter_specs,
     normalize_vmec_boundary_families,
@@ -356,7 +357,9 @@ def parameterized_profile_set(
         c_density=None if cfg.get("c_density") is None else tuple(cfg.get("c_density")),
         c_temperature=None if cfg.get("c_temperature") is None else tuple(cfg.get("c_temperature")),
         density_shape_power=cfg.get("density_shape_power", 2.0),
+        density_shape_alpha=cfg.get("density_shape_alpha", 1.0),
         temperature_shape_power=cfg.get("temperature_shape_power", 2.0),
+        temperature_shape_alpha=cfg.get("temperature_shape_alpha", 1.0),
         n_scale=cfg.get("n_scale", 1.0),
         T_scale=cfg.get("T_scale", 1.0),
         er0_scale=cfg.get("er0_scale", 100.0),
@@ -376,7 +379,12 @@ def initial_state_for_parameter_vector(
     initial_er_root_ad: str = "off",
 ):
     cfg = dict(profile_cfg)
-    for name, value in zip(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER, parameter_values):
+    values_arr = jnp.asarray(parameter_values)
+    if int(values_arr.shape[0]) == len(PROFILE_PARAMETER_ORDER):
+        parameter_order = PROFILE_PARAMETER_ORDER
+    else:
+        parameter_order = TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER
+    for name, value in zip(parameter_order, values_arr):
         cfg[name] = value
     profile_set = parameterized_profile_set(
         cfg,
