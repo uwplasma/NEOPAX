@@ -1434,6 +1434,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    max_reverse_accepted_steps: int | None = None,
 ) -> GeometryFullTransportLeastSquaresProblem:
     """Build a geometry-only optimizer problem for full Radau transport objectives."""
 
@@ -1539,6 +1540,9 @@ def geometry_full_transport_least_squares_problem(
         "reverse_stage_adjoint_memory_mode": str(reverse_stage_adjoint_memory_mode),
         "reverse_stage_adjoint_iter_maxiter": int(reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
+        "max_reverse_accepted_steps": (
+            None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
+        ),
         "n_r": n_r_eff,
         "n_theta": n_theta_eff,
         "n_zeta": n_zeta_eff,
@@ -1569,6 +1573,9 @@ def geometry_full_transport_least_squares_problem(
         reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
         reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+        max_reverse_accepted_steps=(
+            None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
+        ),
         progress_label="[optimization] full transport geometry payload pullback:",
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
@@ -1596,7 +1603,9 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
     from scipy.optimize import least_squares as scipy_least_squares
 
     iteration_reporter = kwargs.pop("iteration_reporter", None)
+    initial_evaluation = kwargs.pop("initial_evaluation", None)
     cache: dict[tuple[float, ...], LeastSquaresEvaluation] = {}
+    failed_cache: dict[tuple[float, ...], tuple[np.ndarray, np.ndarray, str]] = {}
     verbose = int(kwargs.get("verbose", 0) or 0)
     state: dict[str, object] = {"nres": None, "npar": problem.parameter_count, "eval_count": 0}
 
@@ -1605,6 +1614,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
 
     def _evaluate(x):
         key = _key(x)
+        if key in failed_cache:
+            raise RuntimeError(f"cached failed least-squares trial: {failed_cache[key][2]}")
         evaluation = cache.get(key)
         if evaluation is None:
             evaluation = problem.evaluate(jnp.asarray(x, dtype=jnp.float64))
@@ -1613,19 +1624,35 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         return evaluation
 
     def _fun(x):
+        key = _key(x)
+        failed = failed_cache.get(key)
+        if failed is not None:
+            residuals, _jacobian, reason = failed
+            state["eval_count"] = int(state["eval_count"]) + 1
+            if verbose:
+                print(
+                    f"[NEOPAX least_squares] eval={int(state['eval_count'])} "
+                    f"cached failed trial -> penalty residual: {reason}",
+                    flush=True,
+                )
+            return residuals
         try:
             residuals = np.asarray(jax.device_get(_evaluate(x).residuals), dtype=float)
         except Exception as exc:
             if state["nres"] is None:
                 raise
             state["eval_count"] = int(state["eval_count"]) + 1
+            residuals = np.full((int(state["nres"]),), 1.0e6, dtype=float)
+            jacobian = np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
+            failed_cache[key] = (residuals, jacobian, str(exc))
+            cache.clear()
             if verbose:
                 print(
                     f"[NEOPAX least_squares] eval={int(state['eval_count'])} "
                     f"trial solve failed -> penalty residual: {exc}",
                     flush=True,
                 )
-            return np.full((int(state["nres"]),), 1.0e6, dtype=float)
+            return residuals
         residuals = np.where(np.isfinite(residuals), residuals, 1.0e6)
         state["nres"] = int(residuals.size)
         state["eval_count"] = int(state["eval_count"]) + 1
@@ -1644,20 +1671,58 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         return residuals
 
     def _jac(x):
+        key = _key(x)
+        failed = failed_cache.get(key)
+        if failed is not None:
+            _residuals, jacobian, reason = failed
+            if verbose:
+                print(
+                    f"[NEOPAX least_squares] cached failed trial -> zero jacobian: {reason}",
+                    flush=True,
+                )
+            return jacobian
         try:
             jacobian = np.asarray(jax.device_get(_evaluate(x).jacobian), dtype=float)
         except Exception as exc:
             if state["nres"] is None:
                 raise
+            jacobian = np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
+            residuals = np.full((int(state["nres"]),), 1.0e6, dtype=float)
+            failed_cache[key] = (residuals, jacobian, str(exc))
+            cache.clear()
             if verbose:
                 print(
                     f"[NEOPAX least_squares] trial jacobian failed -> zero jacobian: {exc}",
                     flush=True,
                 )
-            return np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
+            return jacobian
         return np.where(np.isfinite(jacobian), jacobian, 0.0)
 
     x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
+    if initial_evaluation is not None:
+        initial_residuals = np.asarray(jax.device_get(initial_evaluation.residuals), dtype=float)
+        initial_jacobian = np.asarray(jax.device_get(initial_evaluation.jacobian), dtype=float)
+        if initial_residuals.ndim != 1:
+            raise ValueError(
+                "initial_evaluation residuals must be one-dimensional; "
+                f"got shape={initial_residuals.shape}."
+            )
+        if initial_jacobian.ndim != 2:
+            raise ValueError(
+                "initial_evaluation jacobian must be two-dimensional; "
+                f"got shape={initial_jacobian.shape}."
+            )
+        if int(initial_jacobian.shape[0]) != int(initial_residuals.shape[0]):
+            raise ValueError(
+                "initial_evaluation jacobian row count must match residual count; "
+                f"residuals.shape={initial_residuals.shape}, jacobian.shape={initial_jacobian.shape}."
+            )
+        if int(initial_jacobian.shape[1]) != int(problem.parameter_count):
+            raise ValueError(
+                "initial_evaluation jacobian column count must match problem parameter count; "
+                f"jacobian.shape={initial_jacobian.shape}, parameter_count={problem.parameter_count}."
+            )
+        cache[_key(x0)] = initial_evaluation
     x_scale = np.asarray(jax.device_get(problem.x_scale), dtype=float)
     kwargs.setdefault("x_scale", x_scale)
     return scipy_least_squares(_fun, x0, jac=_jac, **kwargs)

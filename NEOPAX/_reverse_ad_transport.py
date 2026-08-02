@@ -898,6 +898,7 @@ def prepare_reverse_static_setup(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    max_reverse_accepted_steps: int | None = None,
 ) -> RealtimeGeometryReverseStaticSetup:
     state0_static = initial_state_for_parameter_vector(
         parameter_values,
@@ -954,39 +955,63 @@ def prepare_reverse_static_setup(
         stop_after_accepted_steps is not None
         or reverse_segment_auto_quarter
         or (requested_full_final_time and reverse_segment_length_eff is not None)
+        or (requested_full_final_time and max_reverse_accepted_steps is not None)
     )
     if needs_schedule_probe:
         probe_max_total_steps = max_total_steps
-        if stop_after_accepted_steps is not None:
+        probe_stop_after_accepted_steps = stop_after_accepted_steps
+        if requested_full_final_time and max_reverse_accepted_steps is not None:
+            probe_stop_after_accepted_steps = int(max_reverse_accepted_steps)
+        if probe_stop_after_accepted_steps is not None:
             probe_max_total_steps = min(
                 max_total_steps,
-                max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
+                max(
+                    int(probe_stop_after_accepted_steps) * 16,
+                    int(probe_stop_after_accepted_steps) + 16,
+                ),
             )
         max_total_steps = min(
             max_total_steps,
-            max(int(stop_after_accepted_steps) * 16, int(stop_after_accepted_steps) + 16),
-        ) if stop_after_accepted_steps is not None else max_total_steps
+            max(
+                int(probe_stop_after_accepted_steps) * 16,
+                int(probe_stop_after_accepted_steps) + 16,
+            ),
+        ) if probe_stop_after_accepted_steps is not None else max_total_steps
         schedule_probe = _radau_adaptive_schedule_rollout(
             execution_context,
             prepared_rollout_static.initial_carry,
             max_total_steps=probe_max_total_steps,
-            stop_after_accepted_steps=stop_after_accepted_steps,
+            stop_after_accepted_steps=probe_stop_after_accepted_steps,
         )
         actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
-        max_total_steps = min(
-            probe_max_total_steps,
-            max(
-                actual_attempt_count + 2,
-                int(stop_after_accepted_steps) if stop_after_accepted_steps is not None else 1,
-            ),
-        )
         active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
         accepted_mask_np = np.asarray(jax.device_get(schedule_probe.trace.accepted_mask), dtype=bool)
         accepted_count_np = int(np.sum(np.logical_and(active_mask_np, accepted_mask_np)))
+        if requested_full_final_time and max_reverse_accepted_steps is not None:
+            final_time = float(np.asarray(jax.device_get(schedule_probe.final_carry.t)))
+            target_time = float(getattr(solver, "t1", final_time))
+            if final_time < target_time - 1.0e-12 and accepted_count_np >= int(max_reverse_accepted_steps):
+                raise RuntimeError(
+                    "full transport reverse trial exceeded optimization accepted-step guard "
+                    f"(accepted_steps={accepted_count_np}, max_reverse_accepted_steps="
+                    f"{int(max_reverse_accepted_steps)}, final_time={final_time:.16e}, "
+                    f"target_time={target_time:.16e}); treating trial as failed for optimization."
+                )
         if reverse_segment_auto_quarter:
             reverse_segment_length_eff = max(1, (accepted_count_np + 3) // 4)
         if requested_full_final_time and reverse_segment_length_eff is not None:
             stop_after_accepted_steps = max(1, accepted_count_np)
+        replay_accepted_limit = (
+            int(stop_after_accepted_steps)
+            if stop_after_accepted_steps is not None
+            else int(probe_stop_after_accepted_steps)
+            if probe_stop_after_accepted_steps is not None
+            else 1
+        )
+        max_total_steps = min(
+            probe_max_total_steps,
+            max(actual_attempt_count + 2, replay_accepted_limit),
+        )
         if stop_after_accepted_steps is None:
             accepted_limit = int(max_total_steps)
         else:
@@ -2493,6 +2518,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    max_reverse_accepted_steps: int | None = None,
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
 ) -> TransportReverseTableResultBuilder:
@@ -2527,6 +2553,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         opts = {} if options is None else dict(options)
         active_accepted_step_limit = opts.get("accepted_step_limit", accepted_step_limit)
         active_reverse_segment_length = opts.get("reverse_segment_length", reverse_segment_length)
+        active_max_reverse_accepted_steps = opts.get(
+            "max_reverse_accepted_steps",
+            max_reverse_accepted_steps,
+        )
         active_initial_er_root_ad = str(opts.get("initial_er_root_ad", initial_er_root_ad))
         active_raw_block_solve = opts.get("raw_block_solve", raw_block_solve)
         active_profile_values = jnp.asarray(
@@ -2586,6 +2616,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_stage_adjoint_iter_tol=float(
                 opts.get("reverse_stage_adjoint_iter_tol", reverse_stage_adjoint_iter_tol)
+            ),
+            max_reverse_accepted_steps=(
+                None
+                if active_max_reverse_accepted_steps is None
+                else int(active_max_reverse_accepted_steps)
             ),
         )
         ntx_support_payload = (

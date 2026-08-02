@@ -48,6 +48,7 @@ ESS_ALPHA = 1.2
 # None means the full transport solve uses t_final from the TOML.
 FULL_TRANSPORT_ACCEPTED_STEP_LIMIT = None
 REVERSE_SEGMENT_LENGTH = "auto_quarter"
+MAX_REVERSE_ACCEPTED_STEPS = 200
 
 ASPECT_TARGET = 10.0
 IOTA_TARGET = -0.61
@@ -298,6 +299,7 @@ def main() -> int:
             device=SOLVER_DEVICE,
             accepted_step_limit=FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
             reverse_segment_length=REVERSE_SEGMENT_LENGTH,
+            max_reverse_accepted_steps=MAX_REVERSE_ACCEPTED_STEPS,
             initial_er_root_ad="jax_selected_root",
             radau_jacobian_reuse_mode="legacy",
             reverse_stage_adjoint_solve_mode="bicgstab",
@@ -318,12 +320,13 @@ def main() -> int:
         print(
             "[setup] full_transport "
             f"accepted_step_limit={FULL_TRANSPORT_ACCEPTED_STEP_LIMIT} "
-            f"reverse_segment_length={REVERSE_SEGMENT_LENGTH}",
+            f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
+            f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS}",
             flush=True,
         )
         if initial_input is None:
             initial_input = problem.input_from_scaled_parameters(x)
-        report("initial", problem, x)
+        initial_evaluation = report("initial", problem, x)
         last_result = opt.least_squares(
             problem,
             max_nfev=NFEV,
@@ -331,6 +334,7 @@ def main() -> int:
             xtol=XTOL,
             verbose=1,
             iteration_reporter=iteration_diagnostics,
+            initial_evaluation=initial_evaluation,
         )
         x = np.asarray(last_result.x, dtype=float)
         report(f"QI + full-transport stage {max_mode}", problem, x)
@@ -351,6 +355,7 @@ def main() -> int:
         "max_mode_schedule": list(max_mode_schedule),
         "accepted_step_limit": FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
         "reverse_segment_length": REVERSE_SEGMENT_LENGTH,
+        "max_reverse_accepted_steps": MAX_REVERSE_ACCEPTED_STEPS,
         "parameter_labels": list(last_problem.parameter_labels),
         "x": np.asarray(last_result.x, dtype=float).tolist(),
         "cost": float(last_result.cost),
