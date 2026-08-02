@@ -1,8 +1,10 @@
 import argparse
 
+import jax.numpy as jnp
 import pytest
 
 import NEOPAX.cli as cli
+from NEOPAX._transport_solvers import build_time_solver
 
 
 def test_apply_cli_overrides_maps_common_runtime_flags():
@@ -104,12 +106,14 @@ def test_cli_main_loads_config_applies_overrides_and_runs(monkeypatch, tmp_path)
     [
         # Failure flag alone, with the other two fields healthy.
         ({"failed": True, "n_steps": 12, "done": True, "fail_code": 3}, 1),
-        # Zero accepted steps alone, the silent case reported in #5.
-        ({"failed": False, "n_steps": 0, "done": True}, 1),
-        # Stopped before t_final alone.
+        # Zero accepted steps short of t_final, the silent case reported in #5.
+        ({"failed": False, "n_steps": 0, "done": False}, 1),
+        # Stopped before t_final after making progress.
         ({"failed": False, "n_steps": 12, "done": False}, 1),
         # Completed solve.
         ({"failed": False, "n_steps": 12, "done": True}, 0),
+        # Zero-duration solve, where t0 == t_final leaves nothing to step.
+        ({"failed": False, "n_steps": 0, "done": True}, 0),
         # Non-transport mode, which carries no solver verdict to act on.
         ({"rho": [0.0, 1.0], "fluxes": {}}, 0),
     ],
@@ -122,3 +126,26 @@ def test_cli_main_exit_code_follows_the_solver_verdict(monkeypatch, tmp_path, re
     monkeypatch.setattr(cli, "run_config", lambda config: result)
 
     assert cli.main([str(config_path)]) == expected_rc
+
+
+# max_steps of 4 cannot cover t_final, so diffrax returns an unsuccessful solution rather than raising.
+@pytest.mark.parametrize(("max_steps", "reason_expected"), [(4, True), (4096, False)])
+def test_failed_solve_reason_reads_the_diffrax_solution_result(max_steps, reason_expected):
+    pytest.importorskip("diffrax")
+
+    solver = build_time_solver(
+        {
+            "t0": 0.0,
+            "t_final": 1.0,
+            "dt": 1.0e-3,
+            "transport_solver_backend": "diffrax_kvaerno5",
+            "max_steps": max_steps,
+            "save_n": 2,
+            "rtol": 1.0e-6,
+            "atol": 1.0e-8,
+        }
+    )
+    solution = solver.solve(jnp.array([1.0]), lambda t, y: -2.0 * y)
+
+    assert not isinstance(solution, dict)
+    assert (cli._failed_solve_reason(solution) is not None) is reason_expected
