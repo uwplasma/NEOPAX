@@ -2755,9 +2755,16 @@ def plot_transport_solution(
                     he_source_series.append((time_label, he_arr))
 
             pressure_components = sources.get("pressure_components", {})
-            power_exchange_component = pressure_components.get("power_exchange")
-            if power_exchange_component is not None:
-                power_exchange_arr = jnp.asarray(power_exchange_component)
+            power_exchange_components = [
+                pressure_components.get("power_exchange"),
+                pressure_components.get("power_exchange_temperature_equilibration"),
+                pressure_components.get("power_exchange_t3d"),
+            ]
+            power_exchange_arrays = [
+                jnp.asarray(component) for component in power_exchange_components if component is not None
+            ]
+            if power_exchange_arrays:
+                power_exchange_arr = sum(power_exchange_arrays[1:], power_exchange_arrays[0])
                 power_exchange_series.append(
                     (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(power_exchange_arr, axis=0))
                 )

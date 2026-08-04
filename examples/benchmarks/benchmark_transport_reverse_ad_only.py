@@ -17,6 +17,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_NTX_EXACT_DERIVATIVE_MODE = "direct"
+DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE = "compact_vjp"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY = "inline"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA = "ntx_helper"
+
 from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
@@ -591,8 +596,8 @@ def _check_compact_ntx_derivative_pullback_available() -> None:
         from ntx._solver_prepared import solve_prepared_coefficient_vector_derivative_vjp  # noqa: F401
     except ImportError as exc:
         raise SystemExit(
-            "[autodiff-gate] --ntx-exact-derivative-field-pullback-mode compact_vjp "
-            "requires the matching NTX patch/export: "
+            "[autodiff-gate] the default compact NTX field pullback requires "
+            "the matching NTX patch/export: "
             "solve_prepared_coefficient_vector_derivative_vjp. Sync/apply the NTX "
             "changes before running this mode."
         ) from exc
@@ -4579,10 +4584,10 @@ def main() -> None:
         help="Optional accepted-step prefix to stop the adaptive rollout.",
     )
     parser.set_defaults(
-        ntx_exact_derivative_mode="direct",
-        ntx_exact_derivative_field_pullback_mode="compact_vjp",
-        ntx_exact_derivative_pullback_boundary="inline",
-        ntx_exact_derivative_pullback_algebra="ntx_helper",
+        ntx_exact_derivative_mode=DEFAULT_NTX_EXACT_DERIVATIVE_MODE,
+        ntx_exact_derivative_field_pullback_mode=DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE,
+        ntx_exact_derivative_pullback_boundary=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY,
+        ntx_exact_derivative_pullback_algebra=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
         reverse_ntx_prepared_solve_boundary="default",
     )
     parser.add_argument(

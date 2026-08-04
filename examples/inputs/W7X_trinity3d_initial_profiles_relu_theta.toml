@@ -92,12 +92,11 @@ toggle_temperature = [false, true]
 toggle_Er = false
 
 [sources]
-temperature = ["power_exchange_t3d"]
+temperature = ["power_exchange_temperature_equilibration"]
 density = []
 
-[sources.parameters.power_exchange_t3d]
+[sources.parameters.power_exchange_temperature_equilibration]
 mode = "all"
-t_ref = 0.037
 
 [transport_solver]
 density_floor = 1.0e-3

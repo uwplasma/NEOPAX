@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_NTX_EXACT_DERIVATIVE_MODE = "direct"
+DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE = "compact_vjp"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY = "inline"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA = "ntx_helper"
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -134,10 +139,10 @@ def parse_args():
     parser.add_argument("--initial-Er-root-ad", default="jax_selected_root")
     parser.add_argument("--optimization-api-profile-dofs", choices=("include", "exclude"), default="include")
     parser.set_defaults(
-        ntx_exact_derivative_mode="direct",
-        ntx_exact_derivative_field_pullback_mode="compact_vjp",
-        ntx_exact_derivative_pullback_boundary="inline",
-        ntx_exact_derivative_pullback_algebra="ntx_helper",
+        ntx_exact_derivative_mode=DEFAULT_NTX_EXACT_DERIVATIVE_MODE,
+        ntx_exact_derivative_field_pullback_mode=DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE,
+        ntx_exact_derivative_pullback_boundary=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY,
+        ntx_exact_derivative_pullback_algebra=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
     )
     parser.add_argument("--radau-jacobian-reuse-mode", default="legacy")
     parser.add_argument("--reverse-stage-adjoint-solve-mode", default="bicgstab")
