@@ -182,37 +182,11 @@ def main() -> None:
         default=None,
         help="Optional accepted-step prefix to stop the adaptive rollout.",
     )
-    parser.add_argument(
-        "--ntx-exact-derivative-mode",
-        default="direct",
-        choices=("direct", "custom_vjp"),
-        help="NTX exact-runtime derivative mode.",
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-field-pullback-mode",
-        default=None,
-        choices=("generic_jvp", "compact_vjp"),
-        help="Optional NTX derivative-field pullback mode, forwarded for parity with reverse benchmarks.",
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-boundary",
-        default=None,
-        choices=("inline", "per_energy_jit"),
-        help="Optional NTX compact-pullback boundary mode, forwarded for parity with reverse benchmarks.",
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-algebra",
-        default=None,
-        choices=(
-            "ntx_helper",
-            "scalar_contract",
-            "scalar_contract_lowdot",
-            "scalar_contract_lowdot_sequential",
-            "scalar_contract_lowdot_ntx",
-            "scalar_contract_lowdot_recompute",
-            "scalar_contract_matrix_free",
-        ),
-        help="Optional NTX compact-pullback algebra mode, forwarded for parity with reverse benchmarks.",
+    parser.set_defaults(
+        ntx_exact_derivative_mode="direct",
+        ntx_exact_derivative_field_pullback_mode="compact_vjp",
+        ntx_exact_derivative_pullback_boundary="inline",
+        ntx_exact_derivative_pullback_algebra="ntx_helper",
     )
     parser.add_argument(
         "--radau-jacobian-reuse-mode",

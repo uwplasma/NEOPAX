@@ -11099,7 +11099,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-derivative-mode-compare-check",
         action="store_true",
-        help="Dedicated opt-in mode: run the same realized-trace checkpoint frozen-FD benchmark twice, once with NTX direct AD and once with NTX custom_vjp, and compare timings and custom-AD derivatives.",
+        help="Retired; the supported NTX derivative lane is direct + compact_vjp + ntx_helper.",
     )
     parser.add_argument(
         "--adaptive-vs-frozen-custom-ad-check",
@@ -11119,7 +11119,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_vjp"),
+        choices=("direct",),
         help="NTX exact-runtime derivative mode used by the benchmark when a single-mode run is requested.",
     )
     parser.add_argument(
@@ -11392,16 +11392,9 @@ def main() -> None:
             checkpoint_index=args.realized_trace_checkpoint_index,
         )
     elif args.ntx_derivative_mode_compare_check:
-        report = build_ntx_derivative_mode_compare_report(
-            config_path=args.config,
-            parameter_name=args.parameter,
-            rel_fd_step=args.fd_rel_step,
-            abs_fd_step=args.fd_abs_step,
-            device=args.device,
-            checkpoint_index=args.realized_trace_checkpoint_index,
-            replay_mode=args.realized_schedule_frozen_replay_mode,
-            include_direct_ad=not args.skip_direct_ad_in_frozen_check,
-            compute_five_point=False,
+        raise SystemExit(
+            "[autodiff-gate] --ntx-derivative-mode-compare-check was retired. "
+            "The supported NTX derivative lane is direct + compact_vjp + ntx_helper."
         )
     elif args.adaptive_vs_frozen_custom_ad_check:
         report = build_adaptive_vs_frozen_custom_ad_report(

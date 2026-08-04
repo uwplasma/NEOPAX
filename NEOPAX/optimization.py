@@ -1071,7 +1071,7 @@ def _prepare_initial_er_root_config(config_path, *, device: str | None, vmec_inp
     solver_cfg["debug_disable_jit"] = False
     solver_cfg["debug_walltime_attempts"] = False
     config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = "direct"
-    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "generic_jvp"
+    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "compact_vjp"
     if vmec_input is not None:
         config.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
     return config
@@ -1251,7 +1251,7 @@ def _prepare_full_transport_config(config_path, *, device: str | None) -> dict:
     solver_cfg["debug_disable_jit"] = False
     solver_cfg["debug_walltime_attempts"] = False
     config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = "direct"
-    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "generic_jvp"
+    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "compact_vjp"
     return config
 
 

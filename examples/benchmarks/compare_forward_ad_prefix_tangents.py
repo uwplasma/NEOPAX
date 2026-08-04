@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_vjp"),
+        choices=("direct",),
     )
     parser.add_argument("--radau-jacobian-reuse-mode", type=str, default="legacy")
     parser.add_argument("--fd-rel-step", type=float, default=3.0e-8)

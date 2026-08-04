@@ -144,6 +144,216 @@ def power_exchange(state, species, pair_active_mask, coulomb_log_mode="neopax_si
         )
     return _power_exchange_impl(state, species, pair_active_mask, jnp.asarray(use_ntssfusion_lnL))
 
+
+@jit
+def _power_exchange_temperature_equilibration_impl(state, species, pair_active_mask):
+    # A pairwise temperature-equilibration model in the same general spirit as
+    # T3D, but kept in the native NEOPAX conservative pair-exchange form.
+    n_species = state.temperature.shape[0]
+    idx_i, idx_j = jnp.triu_indices(n_species, k=1)
+    nA = state.density[idx_i]
+    nB = state.density[idx_j]
+    TA = state.temperature[idx_i]
+    TB = state.temperature[idx_j]
+    mA = species.mass_mp[idx_i]
+    mB = species.mass_mp[idx_j]
+    qA = species.charge_qp[idx_i]
+    qB = species.charge_qp[idx_j]
+
+    nA_cgs = jnp.maximum(nA * 1.0e14, 1.0e-30)
+    nB_cgs = jnp.maximum(nB * 1.0e14, 1.0e-30)
+    TA_eV = jnp.maximum(TA * 1.0e3, 1.0e-30)
+    TB_eV = jnp.maximum(TB * 1.0e3, 1.0e-30)
+    qA_abs = jnp.maximum(jnp.abs(qA), 1.0e-30)
+    qB_abs = jnp.maximum(jnp.abs(qB), 1.0e-30)
+
+    a_is_electron = qA < 0.0
+    b_is_electron = qB < 0.0
+    both_electrons = a_is_electron & b_is_electron
+    electron_ion = a_is_electron ^ b_is_electron
+
+    lnL_ee = (
+        23.5
+        - jnp.log(jnp.sqrt(nA_cgs) / jnp.power(TA_eV, 1.25))
+        - jnp.sqrt(1.0e-5 + jnp.square(jnp.log(TA_eV) - 2.0) / 16.0)
+    )
+    lnL_ei = jnp.where(
+        a_is_electron,
+        24.0 - jnp.log(jnp.sqrt(nA_cgs) / TA_eV),
+        24.0 - jnp.log(jnp.sqrt(nB_cgs) / TB_eV),
+    )
+    lnL_ii = 23.0 - jnp.log(
+        (qA_abs * qB_abs)
+        * (mA + mB)
+        / jnp.maximum(mA * TB_eV + mB * TA_eV, 1.0e-30)
+        * jnp.sqrt(
+            nA_cgs * qA_abs**2 / TA_eV
+            + nB_cgs * qB_abs**2 / TB_eV
+        )
+    )
+    lnL = jnp.where(both_electrons, lnL_ee, jnp.where(electron_ion, lnL_ei, lnL_ii))
+
+    pair_prefactor = (
+        (4.0 * 2.85e2 / jnp.sqrt(jnp.pi))
+        * jnp.sqrt(mA[:, None] * mB[:, None])
+        * jnp.square((qA * qB)[:, None])
+    )
+    Pab = (
+        pair_prefactor
+        * nA
+        * nB
+        * lnL
+        * (TB - TA)
+        / jnp.power(mA[:, None] * TB + mB[:, None] * TA, 1.5)
+    )
+    pair_mask = jnp.asarray(pair_active_mask, dtype=Pab.dtype)[:, None]
+    Pab = Pab * pair_mask
+
+    out = jnp.zeros((n_species,) + Pab.shape[1:], dtype=Pab.dtype)
+    out = out.at[idx_i].add(Pab)
+    out = out.at[idx_j].add(-Pab)
+    return out
+
+
+def power_exchange_temperature_equilibration(state, species, pair_active_mask):
+    return _power_exchange_temperature_equilibration_impl(state, species, pair_active_mask)
+
+
+@jit
+def _t3d_loglambda_pair(nA, TA, mA, qA, nB, TB, mB, qB):
+    nA_cgs = jnp.maximum(nA * 1.0e14, 1.0e-30)
+    nB_cgs = jnp.maximum(nB * 1.0e14, 1.0e-30)
+    TA_eV = jnp.maximum(TA * 1.0e3, 1.0e-30)
+    TB_eV = jnp.maximum(TB * 1.0e3, 1.0e-30)
+    qA_abs = jnp.maximum(jnp.abs(qA), 1.0e-30)
+    qB_abs = jnp.maximum(jnp.abs(qB), 1.0e-30)
+
+    a_is_electron = qA < 0.0
+    b_is_electron = qB < 0.0
+    both_electrons = jnp.logical_and(a_is_electron, b_is_electron)
+    a_electron_b_ion = jnp.logical_and(a_is_electron, jnp.logical_not(b_is_electron))
+    b_electron_a_ion = jnp.logical_and(b_is_electron, jnp.logical_not(a_is_electron))
+
+    lnL_ee = (
+        23.5
+        - jnp.log(jnp.sqrt(nA_cgs) / jnp.power(TA_eV, 1.25))
+        - jnp.sqrt(1.0e-5 + jnp.square(jnp.log(TA_eV) - 2.0) / 16.0)
+    )
+    lnL_ei = 24.0 - jnp.log(jnp.sqrt(nA_cgs) / TA_eV)
+    lnL_ie = 24.0 - jnp.log(jnp.sqrt(nB_cgs) / TB_eV)
+    lnL_ii = 23.0 - jnp.log(
+        (qA_abs * qB_abs)
+        * (mA + mB)
+        / jnp.maximum(mA * TB_eV + mB * TA_eV, 1.0e-30)
+        * jnp.sqrt(
+            nA_cgs * qA_abs**2 / TA_eV
+            + nB_cgs * qB_abs**2 / TB_eV
+        )
+    )
+    return jnp.where(
+        both_electrons,
+        lnL_ee,
+        jnp.where(a_electron_b_ion, lnL_ei, jnp.where(b_electron_a_ion, lnL_ie, lnL_ii)),
+    )
+
+
+@jit
+def _power_exchange_t3d_exact_impl(state, species, active_matrix, t_ref):
+    density = state.density
+    temperature = state.temperature
+    pressure = state.pressure
+    q = species.charge_qp
+    m = species.mass_mp
+    dtype = pressure.dtype
+
+    n_s = density[:, None, :]
+    n_u = density[None, :, :]
+    T_s = temperature[:, None, :]
+    T_u = temperature[None, :, :]
+    p_s = pressure[:, None, :]
+    p_u = pressure[None, :, :]
+    q_s = q[:, None]
+    q_u = q[None, :]
+    m_s = m[:, None]
+    m_u = m[None, :]
+
+    n_s_cgs = jnp.maximum(n_s * 1.0e14, 1.0e-30)
+    n_u_cgs = jnp.maximum(n_u * 1.0e14, 1.0e-30)
+    T_s_eV = jnp.maximum(T_s * 1.0e3, 1.0e-30)
+    T_u_eV = jnp.maximum(T_u * 1.0e3, 1.0e-30)
+    q_s_abs = jnp.maximum(jnp.abs(q_s), 1.0e-30)
+    q_u_abs = jnp.maximum(jnp.abs(q_u), 1.0e-30)
+    m_s_3d = m_s[:, :, None]
+    m_u_3d = m_u[:, :, None]
+    q_s_abs_3d = q_s_abs[:, :, None]
+    q_u_abs_3d = q_u_abs[:, :, None]
+
+    s_is_electron = q_s < 0.0
+    u_is_electron = q_u < 0.0
+    both_electrons = jnp.logical_and(s_is_electron, u_is_electron)
+    s_electron_u_ion = jnp.logical_and(s_is_electron, jnp.logical_not(u_is_electron))
+    u_electron_s_ion = jnp.logical_and(u_is_electron, jnp.logical_not(s_is_electron))
+
+    log_lambda_ee = (
+        23.5
+        - jnp.log(jnp.sqrt(n_s_cgs) / jnp.power(T_s_eV, 1.25))
+        - jnp.sqrt(1.0e-5 + jnp.square(jnp.log(T_s_eV) - 2.0) / 16.0)
+    )
+    log_lambda_ei = 24.0 - jnp.log(jnp.sqrt(n_s_cgs) / T_s_eV)
+    log_lambda_ie = 24.0 - jnp.log(jnp.sqrt(n_u_cgs) / T_u_eV)
+    log_lambda_ii = 23.0 - jnp.log(
+        (q_s_abs_3d * q_u_abs_3d)
+        * (m_s_3d + m_u_3d)
+        / jnp.maximum(m_s_3d * T_u_eV + m_u_3d * T_s_eV, 1.0e-30)
+        * jnp.sqrt(
+            n_s_cgs * q_s_abs_3d**2 / T_s_eV
+            + n_u_cgs * q_u_abs_3d**2 / T_u_eV
+        )
+    )
+    log_lambda = jnp.where(
+        both_electrons[:, :, None],
+        log_lambda_ee,
+        jnp.where(
+            s_electron_u_ion[:, :, None],
+            log_lambda_ei,
+            jnp.where(u_electron_s_ion[:, :, None], log_lambda_ie, log_lambda_ii),
+        ),
+    )
+
+    nu_su = (
+        2.85e2
+        * jnp.square(q_s * q_u)[:, :, None]
+        / jnp.sqrt(jnp.maximum(m_s, 1.0e-30))[:, :, None]
+        * log_lambda
+        * n_u
+        / jnp.power(jnp.maximum(T_s, 1.0e-30), 1.5)
+    )
+    nu_equil = (
+        jnp.asarray(t_ref, dtype=dtype)
+        * (8.0 / (3.0 * jnp.sqrt(jnp.pi)))
+        * nu_su
+        * jnp.sqrt(jnp.maximum(m_u / jnp.maximum(m_s, 1.0e-30), 1.0e-30))[:, :, None]
+        * jnp.power(
+            jnp.maximum(m_u / jnp.maximum(m_s, 1.0e-30), 1.0e-30)[:, :, None]
+            + T_u / jnp.maximum(T_s, 1.0e-30),
+            -1.5,
+        )
+    )
+    equil_factor = (
+        n_s
+        * p_u
+        / jnp.maximum(n_u * p_s, 1.0e-30)
+        - 1.0
+    )
+    coll_eq_pairs = p_s * nu_equil * equil_factor
+    coll_eq_pairs = coll_eq_pairs * jnp.asarray(active_matrix, dtype=dtype)[:, :, None]
+    coll_eq = jnp.sum(coll_eq_pairs, axis=1)
+    return 1.5 * coll_eq
+
+
+def power_exchange_t3d_exact(state, species, active_matrix, t_ref):
+    return _power_exchange_t3d_exact_impl(state, species, active_matrix, t_ref)
+
 @jit
 def bremsstrahlung_radiation_generalized(
     state,

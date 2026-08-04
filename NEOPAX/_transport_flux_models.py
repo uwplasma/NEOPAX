@@ -58,7 +58,7 @@ from ._model_api import (
     validate_transport_flux_builder,
 )
 from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
-from ._constants import elementary_charge
+from ._constants import elementary_charge, proton_mass
 from ._spectrax_quasilinear_runtime import (
     SpectraXQuasilinearRuntimeDiagnostics,
     evaluate_spectrax_quasilinear_proxy,
@@ -1153,71 +1153,8 @@ def _install_vmec_jax_api_compat_for_ntx() -> None:
 
 
 def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):
-    if derivative_mode == "custom_jvp":
-        solver = getattr(ntx, "solve_prepared_coefficient_vector_jvp", None)
-        if solver is not None:
-            return solver
-        try:
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_jvp
-
-            return solve_prepared_coefficient_vector_jvp
-        except ImportError as exc:
-            raise AttributeError(
-                "ntx_exact_derivative_mode='custom_jvp' requires NTX to provide "
-                "solve_prepared_coefficient_vector_jvp."
-            ) from exc
-    if derivative_mode == "custom_vjp":
-        solver = getattr(ntx, "solve_prepared_coefficient_vector_vjp", None)
-        if solver is not None:
-            return solver
-        try:
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_vjp
-
-            return solve_prepared_coefficient_vector_vjp
-        except ImportError as exc:
-            raise AttributeError(
-                "ntx_exact_derivative_mode='custom_vjp' requires NTX to provide "
-                "solve_prepared_coefficient_vector_vjp."
-            ) from exc
-    if derivative_mode == "recompute_vjp":
-        solver = getattr(ntx, "solve_prepared_coefficient_vector_recompute_vjp", None)
-        if solver is not None:
-            return solver
-        try:
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_recompute_vjp
-
-            return solve_prepared_coefficient_vector_recompute_vjp
-        except ImportError as exc:
-            raise AttributeError(
-                "ntx_exact_derivative_mode='recompute_vjp' requires NTX to provide "
-                "solve_prepared_coefficient_vector_recompute_vjp."
-            ) from exc
-    if derivative_mode == "iterative_vjp":
-        solver = getattr(ntx, "solve_prepared_coefficient_vector_iterative_vjp", None)
-        if solver is not None:
-            return solver
-        try:
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_iterative_vjp
-
-            return solve_prepared_coefficient_vector_iterative_vjp
-        except ImportError as exc:
-            raise AttributeError(
-                "ntx_exact_derivative_mode='iterative_vjp' requires NTX to provide "
-                "solve_prepared_coefficient_vector_iterative_vjp."
-            ) from exc
-    if derivative_mode == "iterative_jvp":
-        solver = getattr(ntx, "solve_prepared_coefficient_vector_iterative_jvp", None)
-        if solver is not None:
-            return solver
-        try:
-            from ntx._solver_prepared import solve_prepared_coefficient_vector_iterative_jvp
-
-            return solve_prepared_coefficient_vector_iterative_jvp
-        except ImportError as exc:
-            raise AttributeError(
-                "ntx_exact_derivative_mode='iterative_jvp' requires NTX to provide "
-                "solve_prepared_coefficient_vector_iterative_jvp."
-            ) from exc
+    if derivative_mode != "direct":
+        raise ValueError("ntx_exact_derivative_mode must be 'direct'.")
     return ntx.solve_prepared_coefficient_vector
 
 
@@ -1773,7 +1710,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     response_anchor_count: int | None = None
     use_remat: bool = False
     derivative_mode: str = "direct"
-    derivative_field_pullback_mode: str = "generic_jvp"
+    derivative_field_pullback_mode: str = "compact_vjp"
     derivative_pullback_boundary: str = "inline"
     derivative_pullback_algebra: str = "ntx_helper"
     er_v_floor: float | None = None
@@ -1917,77 +1854,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     @staticmethod
     def _normalize_derivative_mode(derivative_mode: str | None) -> str:
         mode = "direct" if derivative_mode in (None, "") else str(derivative_mode).strip().lower()
-        aliases = {
-            "plain": "direct",
-            "jax": "direct",
-            "custom": "custom_vjp",
-            "custom-vjp": "custom_vjp",
-            "customvjp": "custom_vjp",
-            "custom-jvp": "custom_jvp",
-            "customjvp": "custom_jvp",
-            "implicit-jvp": "custom_jvp",
-            "implicit_jvp": "custom_jvp",
-            "iterative": "iterative_vjp",
-            "iterative-vjp": "iterative_vjp",
-            "bicgstab": "iterative_vjp",
-            "matrix-free": "iterative_vjp",
-            "matrix_free": "iterative_vjp",
-            "iterative-jvp": "iterative_jvp",
-            "matrix-free-jvp": "iterative_jvp",
-            "matrix_free_jvp": "iterative_jvp",
-        }
+        aliases = {"plain": "direct", "jax": "direct", "default": "direct"}
         mode = aliases.get(mode, mode)
-        if mode not in {
-            "direct",
-            "custom_jvp",
-            "custom_vjp",
-            "recompute_vjp",
-            "iterative_vjp",
-            "iterative_jvp",
-        }:
-            raise ValueError(
-                "ntx_exact_derivative_mode must be one of: direct, custom_jvp, "
-                "custom_vjp, recompute_vjp, iterative_vjp, iterative_jvp"
-            )
+        if mode != "direct":
+            raise ValueError("ntx_exact_derivative_mode must be 'direct'.")
         return mode
 
     @staticmethod
     def _normalize_derivative_field_pullback_mode(mode: str | None) -> str:
-        normalized = "generic_jvp" if mode in (None, "") else str(mode).strip().lower()
+        normalized = "compact_vjp" if mode in (None, "") else str(mode).strip().lower()
         aliases = {
-            "default": "generic_jvp",
-            "generic": "generic_jvp",
-            "jvp": "generic_jvp",
+            "default": "compact_vjp",
             "compact": "compact_vjp",
             "compact-vjp": "compact_vjp",
-            "custom_vjp": "compact_vjp",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized not in {"generic_jvp", "compact_vjp"}:
-            raise ValueError(
-                "ntx_exact_derivative_field_pullback_mode must be one of: "
-                "generic_jvp, compact_vjp"
-            )
+        if normalized != "compact_vjp":
+            raise ValueError("ntx_exact_derivative_field_pullback_mode must be 'compact_vjp'.")
         return normalized
 
     @staticmethod
     def _normalize_derivative_pullback_boundary(mode: str | None) -> str:
         normalized = "inline" if mode in (None, "") else str(mode).strip().lower()
-        aliases = {
-            "default": "inline",
-            "none": "inline",
-            "off": "inline",
-            "per-energy": "per_energy_jit",
-            "per_energy": "per_energy_jit",
-            "energy_jit": "per_energy_jit",
-            "case_jit": "per_energy_jit",
-        }
+        aliases = {"default": "inline", "none": "inline", "off": "inline"}
         normalized = aliases.get(normalized, normalized)
-        if normalized not in {"inline", "per_energy_jit"}:
-            raise ValueError(
-                "ntx_exact_derivative_pullback_boundary must be one of: "
-                "inline, per_energy_jit"
-            )
+        if normalized != "inline":
+            raise ValueError("ntx_exact_derivative_pullback_boundary must be 'inline'.")
         return normalized
 
     @staticmethod
@@ -1998,41 +1890,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "ntx": "ntx_helper",
             "compact": "ntx_helper",
             "compact_vjp": "ntx_helper",
-            "scalar": "scalar_contract",
-            "scalar-contract": "scalar_contract",
-            "contract": "scalar_contract",
-            "lowdot": "scalar_contract_lowdot",
-            "scalar-lowdot": "scalar_contract_lowdot",
-            "scalar_contract_no_f_dot": "scalar_contract_lowdot",
-            "lowdot_sequential": "scalar_contract_lowdot_sequential",
-            "scalar-lowdot-sequential": "scalar_contract_lowdot_sequential",
-            "scalar_contract_lowdot_while": "scalar_contract_lowdot_sequential",
-            "lowdot_ntx": "scalar_contract_lowdot_ntx",
-            "scalar-lowdot-ntx": "scalar_contract_lowdot_ntx",
-            "scalar_contract_lowdot_helper": "scalar_contract_lowdot_ntx",
-            "lowdot_recompute": "scalar_contract_lowdot_recompute",
-            "scalar-lowdot-recompute": "scalar_contract_lowdot_recompute",
-            "scalar_contract_lowdot_replay": "scalar_contract_lowdot_recompute",
-            "matrix_free": "scalar_contract_matrix_free",
-            "matrix-free": "scalar_contract_matrix_free",
-            "krylov": "scalar_contract_matrix_free",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized not in {
-            "ntx_helper",
-            "scalar_contract",
-            "scalar_contract_lowdot",
-            "scalar_contract_lowdot_sequential",
-            "scalar_contract_lowdot_ntx",
-            "scalar_contract_lowdot_recompute",
-            "scalar_contract_matrix_free",
-        }:
-            raise ValueError(
-                "ntx_exact_derivative_pullback_algebra must be one of: "
-                "ntx_helper, scalar_contract, scalar_contract_lowdot, "
-                "scalar_contract_lowdot_sequential, scalar_contract_lowdot_ntx, "
-                "scalar_contract_lowdot_recompute, scalar_contract_matrix_free"
-            )
+        if normalized != "ntx_helper":
+            raise ValueError("ntx_exact_derivative_pullback_algebra must be 'ntx_helper'.")
         return normalized
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
@@ -8178,7 +8039,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_response_anchor_count=None,
     ntx_exact_use_remat=False,
     ntx_exact_derivative_mode="direct",
-    ntx_exact_derivative_field_pullback_mode="generic_jvp",
+    ntx_exact_derivative_field_pullback_mode="compact_vjp",
     ntx_exact_derivative_pullback_boundary="inline",
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
@@ -9079,6 +8940,190 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
+    species: Any
+    field: Any
+    density_critical_gradient: Any = 1.0
+    temperature_critical_gradient: Any = 1.0
+    density_relu_slope: Any = 1.0
+    temperature_relu_slope: Any = 1.0
+    relu_power: Any = 1.0
+
+    def with_transport_coeffs(
+        self,
+        *,
+        chi_t=None,
+        chi_n=None,
+        pressure_source_model=None,
+        total_power_mw=None,
+        density_critical_gradient=None,
+        temperature_critical_gradient=None,
+        density_relu_slope=None,
+        temperature_relu_slope=None,
+        relu_power=None,
+    ) -> "ReLUAnalyticalTurbulentTransportModel":
+        del chi_t, chi_n, pressure_source_model, total_power_mw
+        return dataclasses.replace(
+            self,
+            density_critical_gradient=(
+                self.density_critical_gradient
+                if density_critical_gradient is None
+                else density_critical_gradient
+            ),
+            temperature_critical_gradient=(
+                self.temperature_critical_gradient
+                if temperature_critical_gradient is None
+                else temperature_critical_gradient
+            ),
+            density_relu_slope=self.density_relu_slope if density_relu_slope is None else density_relu_slope,
+            temperature_relu_slope=(
+                self.temperature_relu_slope
+                if temperature_relu_slope is None
+                else temperature_relu_slope
+            ),
+            relu_power=self.relu_power if relu_power is None else relu_power,
+        )
+
+    def _relu_fluxes(self, state, face_state, *, bc_density=None, bc_temperature=None):
+        dtype = state.density.dtype
+        n_species = int(state.density.shape[0])
+
+        def _species_column(value):
+            arr = jnp.asarray(value, dtype=dtype)
+            if arr.ndim == 0:
+                arr = jnp.full((n_species,), arr, dtype=dtype)
+            if arr.shape[0] < n_species:
+                arr = jnp.pad(arr, (0, n_species - arr.shape[0]), mode="edge")
+            return arr[:n_species, None]
+
+        density_face = jnp.maximum(
+            jnp.asarray(face_state.density, dtype=dtype),
+            jnp.asarray(1.0e-30, dtype=dtype),
+        )
+        temperature_face = jnp.maximum(
+            jnp.asarray(face_state.temperature, dtype=dtype),
+            jnp.asarray(1.0e-30, dtype=dtype),
+        )
+        # T3D's ReLU model thresholds are specified for normalized gradients
+        # -d ln(profile) / d rho, not physical minor-radius gradients.
+        gradient_faces = getattr(self.field, "rho_grid_half", self.field.r_grid_half)
+        dndr_faces = _face_profile_gradient(
+            jnp.asarray(state.density, dtype=dtype),
+            gradient_faces,
+            bc_model=bc_density,
+        )
+        dTdr_faces = _face_profile_gradient(
+            jnp.asarray(state.temperature, dtype=dtype),
+            gradient_faces,
+            bc_model=bc_temperature,
+        )
+        kn = -dndr_faces / density_face
+        kT = -dTdr_faces / temperature_face
+        crit_n = _species_column(self.density_critical_gradient)
+        crit_T = _species_column(self.temperature_critical_gradient)
+        slope_n = _species_column(self.density_relu_slope)
+        slope_T = _species_column(self.temperature_relu_slope)
+        power = jnp.asarray(self.relu_power, dtype=dtype)
+
+        def _signed_power(value):
+            return jnp.sign(value) * jnp.power(jnp.abs(value), power)
+
+        gamma = jnp.sign(kn - crit_n) * jnp.power(jnp.abs(slope_n * (kn - crit_n)), power)
+        relu_base = kT - crit_T * jnp.sign(kT)
+        q = jnp.where(
+            jnp.abs(kT) < crit_T,
+            jnp.asarray(1.0e-16, dtype=dtype),
+            slope_T * _signed_power(relu_base),
+        )
+        return gamma, q
+
+    def _to_neopax_physical_fluxes(self, state, face_state, gamma_raw, q_raw):
+        """Convert T3D-like normalized ReLU fluxes to NEOPAX physical units.
+
+        The ReLU algebra returns T3D-style gyroBohm-normalized particle and heat
+        flux amplitudes. NEOPAX's transport equations expect particle flux in
+        m^-2 s^-1 and heat flux in eV m^-2 s^-1.
+        """
+
+        dtype = state.density.dtype
+        names = tuple(getattr(self.species, "names", ()))
+        if "e" in names:
+            electron_idx = int(names.index("e"))
+            ref_candidates = [idx for idx in range(int(self.species.number_species)) if idx != electron_idx]
+            ref_idx = int(ref_candidates[0]) if ref_candidates else 0
+        else:
+            ref_idx = 0
+
+        ref_density = jnp.maximum(
+            jnp.asarray(face_state.density[ref_idx], dtype=dtype),
+            jnp.asarray(1.0e-30, dtype=dtype),
+        )
+        ref_temperature = jnp.maximum(
+            jnp.asarray(face_state.temperature[ref_idx], dtype=dtype),
+            jnp.asarray(1.0e-30, dtype=dtype),
+        )
+        ref_pressure = ref_density * ref_temperature
+
+        a_minor = jnp.asarray(getattr(self.field, "a_b", 1.0), dtype=dtype)
+        psia = jnp.asarray(getattr(self.field, "Psia_value", 1.0), dtype=dtype)
+        b_ref = jnp.maximum(
+            jnp.abs(psia) / (jnp.pi * jnp.maximum(a_minor**2, jnp.asarray(1.0e-30, dtype=dtype))),
+            jnp.asarray(1.0e-30, dtype=dtype),
+        )
+
+        m_ref_mp = jnp.asarray(self.species.mass_mp[ref_idx], dtype=dtype)
+        reference_thermal_speed = jnp.sqrt(jnp.asarray(1.0e3, dtype=dtype) * elementary_charge / proton_mass)
+        reference_gyroradius = jnp.sqrt(jnp.asarray(1.0e3, dtype=dtype) * elementary_charge * proton_mass) / elementary_charge
+        vt_ref = reference_thermal_speed / jnp.sqrt(jnp.maximum(m_ref_mp, jnp.asarray(1.0e-30, dtype=dtype)))
+        rho_ref = reference_gyroradius * jnp.sqrt(jnp.maximum(m_ref_mp, jnp.asarray(1.0e-30, dtype=dtype)))
+        t_ref = (a_minor / vt_ref) * jnp.square(a_minor / jnp.maximum(rho_ref, jnp.asarray(1.0e-30, dtype=dtype)))
+
+        particle_source_ref = jnp.asarray(1.0e20, dtype=dtype) / t_ref
+        pressure_power_ref_eV = jnp.asarray(1.0e23, dtype=dtype) / t_ref
+
+        particle_factor = jnp.power(ref_pressure, 1.5) / jnp.sqrt(ref_density)
+        heat_factor = jnp.power(ref_pressure, 2.5) / jnp.power(ref_density, 1.5)
+        geometry_factor = a_minor / jnp.square(b_ref)
+
+        gamma = gamma_raw * particle_factor[None, :] * particle_source_ref * geometry_factor
+        q = q_raw * heat_factor[None, :] * pressure_power_ref_eV * geometry_factor
+        return gamma, q
+
+    def __call__(self, state) -> dict:
+        face_state = build_face_transport_state(state, self.field)
+        face_fluxes = self.evaluate_face_fluxes(state, face_state)
+        return {
+            "Gamma": jax.vmap(cell_centered_from_faces)(face_fluxes["Gamma"]),
+            "Q": jax.vmap(cell_centered_from_faces)(face_fluxes["Q"]),
+            "Upar": jnp.zeros_like(state.density),
+        }
+
+    def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        gamma_raw, q_raw = self._relu_fluxes(
+            state,
+            face_state,
+            bc_density=kwargs.get("bc_density"),
+            bc_temperature=kwargs.get("bc_temperature"),
+        )
+        gamma, q = self._to_neopax_physical_fluxes(state, face_state, gamma_raw, q_raw)
+        return {
+            "Gamma": gamma,
+            "Q": q,
+            "Upar": jnp.zeros_like(gamma),
+        }
+
+    def build_local_particle_flux_evaluator(self, state):
+        fluxes = self(state)
+        gamma_turb = fluxes["Gamma"]
+
+        def evaluator(radius_index, er_value):
+            del er_value
+            return gamma_turb[:, radius_index]
+
+        return evaluator
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class SpectraXQuasilinearRuntimeTransportModel(TransportFluxModelBase):
     species: Any
     geometry: Any
@@ -9256,6 +9301,35 @@ register_transport_flux_model(
         pressure_source_model=pressure_source_model,
         total_power_mw=total_power_mw,
     ),
+)
+
+register_transport_flux_model(
+    "turbulent_relu_analytical",
+    lambda species,
+    grid,
+    field,
+    chi_t,
+    chi_n,
+    pressure_source_model=None,
+    total_power_mw=None,
+    density_critical_gradient=1.0,
+    temperature_critical_gradient=1.0,
+    density_relu_slope=1.0,
+    temperature_relu_slope=1.0,
+    relu_power=1.0: ReLUAnalyticalTurbulentTransportModel(
+        species=species,
+        field=field,
+        density_critical_gradient=density_critical_gradient,
+        temperature_critical_gradient=temperature_critical_gradient,
+        density_relu_slope=density_relu_slope,
+        temperature_relu_slope=temperature_relu_slope,
+        relu_power=relu_power,
+    ),
+)
+
+register_transport_flux_model(
+    "turbulent_power_relu_analytical",
+    get_transport_flux_model("turbulent_relu_analytical"),
 )
 
 register_transport_flux_model(

@@ -183,6 +183,16 @@ over radii:
 
 .. code-block:: toml
 
+    [turbulence]
+    flux_model = "turbulent_relu_analytical"
+    # T3D-style ReLU parameters. Critical gradients and slopes apply to
+    # normalized gradients -d ln(profile) / d rho, not physical 1/m gradients.
+    density_relu_flux = {critical_gradient = [100.0, 100.0], slope = [0.0, 0.0]}
+    pressure_relu_flux = {critical_gradient = [100.0, 0.1], slope = [0.0, 1.2]}
+    power = 1.0
+
+.. code-block:: toml
+
     [classical]
     flux_model = "none"
 
@@ -404,11 +414,18 @@ Example:
 .. code-block:: toml
 
     [sources]
-    temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+    temperature = ["power_exchange", "power_exchange_temperature_equilibration", "power_exchange_t3d", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
 
     [sources.parameters.power_exchange]
     mode = "all"
     coulomb_log_mode = "ntssfusion"
+
+    [sources.parameters.power_exchange_temperature_equilibration]
+    mode = "all"
+
+    [sources.parameters.power_exchange_t3d]
+    mode = "all"
+    t_ref = 0.037
 
     [sources.parameters.bremsstrahlung_radiation]
     coefficient_mode = "ntssfusion"

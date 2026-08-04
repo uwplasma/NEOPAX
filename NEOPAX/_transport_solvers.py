@@ -14680,6 +14680,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             lagged_response = attempt_context.lagged_response
             lagged_response_reused = attempt_context.lagged_response_reused
             reuse_state = attempt_context.reuse_state
+            freeze_attempt_linearization = reuse_state.freeze_attempt_linearization
             t_new = attempt_context.t_new
             guess0, linear_ok0 = _make_linearized_guess(attempt_context)
             f_ref_new = flat_rhs(t_new, flat_y)

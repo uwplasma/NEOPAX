@@ -133,10 +133,12 @@ def parse_args():
     parser.add_argument("--reverse-segment-length", type=int, default=1)
     parser.add_argument("--initial-Er-root-ad", default="jax_selected_root")
     parser.add_argument("--optimization-api-profile-dofs", choices=("include", "exclude"), default="include")
-    parser.add_argument("--ntx-exact-derivative-mode", default="direct")
-    parser.add_argument("--ntx-exact-derivative-field-pullback-mode", default="generic_jvp")
-    parser.add_argument("--ntx-exact-derivative-pullback-boundary", default=None)
-    parser.add_argument("--ntx-exact-derivative-pullback-algebra", default=None)
+    parser.set_defaults(
+        ntx_exact_derivative_mode="direct",
+        ntx_exact_derivative_field_pullback_mode="compact_vjp",
+        ntx_exact_derivative_pullback_boundary="inline",
+        ntx_exact_derivative_pullback_algebra="ntx_helper",
+    )
     parser.add_argument("--radau-jacobian-reuse-mode", default="legacy")
     parser.add_argument("--reverse-stage-adjoint-solve-mode", default="bicgstab")
     parser.add_argument("--reverse-rhs-transpose-mode", default="explicit_ntx_interpolated")

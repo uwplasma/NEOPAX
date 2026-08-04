@@ -140,24 +140,26 @@ def plot_j_polar_contours(out, out_dir: Path, *, p_lambda: float, lambda_samples
         for idx in sample_idx:
             values = data[:, :, idx]
             values_periodic = np.concatenate([values, values[:, :1]], axis=1)
-            fig = plt.figure(figsize=(12, 5))
-            ax_polar = fig.add_subplot(1, 2, 1, projection="polar")
-            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=32, cmap="viridis")
-            ax_polar.set_title(f"{name.upper()} polar contour at lambda={lambda_grid[idx]:.2f}")
-            ax_polar.set_ylim(float(surfaces.min()), float(surfaces.max()))
-            fig.colorbar(contour, ax=ax_polar, pad=0.12, label=name.upper())
-
-            ax_lines = fig.add_subplot(1, 2, 2)
-            for isurf, surface in enumerate(surfaces):
-                ax_lines.plot(alpha, data[isurf, :, idx], label=f"s={surface:.2f}")
-            ax_lines.set_title(f"{name.upper()} vs alpha across surfaces")
-            ax_lines.set_xlabel("alpha")
-            ax_lines.set_ylabel(name.upper())
-            ax_lines.grid(True, alpha=0.3)
-            ax_lines.legend(loc="best", ncol=2, fontsize=8)
-            fig.tight_layout()
+            display_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            title_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            fig = plt.figure(figsize=(5.4, 5.8))
+            ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
+            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=40, cmap="plasma")
+            ax_polar.set_title(f"Second adiabatic invariant, {title_name}", fontsize=15, pad=20)
+            ax_polar.set_ylim(0.0, float(surfaces.max()))
+            ax_polar.set_thetagrids(np.arange(0, 360, 45), fontsize=8)
+            radial_ticks = np.linspace(0.2, float(surfaces.max()), 5)
+            ax_polar.set_rticks(radial_ticks)
+            ax_polar.set_yticklabels([f"{tick:.1f}" for tick in radial_ticks], fontsize=8)
+            ax_polar.set_rlabel_position(45)
+            ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
+            colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
+            colorbar.set_label(display_name, fontsize=11)
+            colorbar.ax.tick_params(labelsize=8)
+            fig.text(0.5, 0.035, rf"$\lambda$ = {lambda_grid[idx]:.2f}", ha="center", va="center", fontsize=15)
+            fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
             path = out_dir / f"{name}_polar_lambda_{idx:02d}.png"
-            fig.savefig(path, dpi=180, bbox_inches="tight")
+            fig.savefig(path, dpi=320, bbox_inches="tight")
             plt.close(fig)
             written.append(path)
             print(f"wrote {path}")

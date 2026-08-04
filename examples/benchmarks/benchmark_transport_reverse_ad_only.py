@@ -4578,84 +4578,12 @@ def main() -> None:
         default=None,
         help="Optional accepted-step prefix to stop the adaptive rollout.",
     )
-    parser.add_argument(
-        "--ntx-exact-derivative-mode",
-        default="direct",
-        choices=(
-            "direct",
-            "custom_jvp",
-            "custom_vjp",
-            "recompute_vjp",
-            "iterative_vjp",
-            "iterative_jvp",
-        ),
-        help="NTX exact-runtime derivative mode.",
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-field-pullback-mode",
-        default="compact_vjp",
-        choices=("generic_jvp", "compact_vjp"),
-        help=(
-            "Reverse-only NTX derivative-field pullback mode. 'compact_vjp' uses "
-            "the NTX compact second-order coefficient-solve VJP helper and is the "
-            "intended reverse-lane path. 'generic_jvp' keeps the older fallback "
-            "that can compile through NTX factorization JVPs."
-        ),
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-boundary",
-        default="inline",
-        choices=("inline", "per_energy_jit"),
-        help=(
-            "Reverse-only boundary mode for the compact NTX derivative-field "
-            "pullback. 'inline' keeps the current monolithic reverse kernel. "
-            "'per_energy_jit' wraps each per-energy derivative pullback in its "
-            "own JIT call boundary to test XLA graph partitioning."
-        ),
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-algebra",
-        default="ntx_helper",
-        choices=(
-            "ntx_helper",
-            "scalar_contract",
-            "scalar_contract_lowdot",
-            "scalar_contract_lowdot_sequential",
-            "scalar_contract_lowdot_ntx",
-            "scalar_contract_lowdot_recompute",
-            "scalar_contract_matrix_free",
-        ),
-        help=(
-            "Reverse-only algebra mode for compact NTX derivative-field "
-            "pullbacks. 'ntx_helper' uses NTX's current compact helper. "
-            "'scalar_contract' uses a NEOPAX-local scalar-contraction path "
-            "that avoids Python-unrolled mode loops where possible. "
-            "'scalar_contract_lowdot' additionally avoids full tangent-mode "
-            "stacks for the field-bar contraction. "
-            "'scalar_contract_lowdot_sequential' keeps that exact algebra but "
-            "assembles the energy-scan bars with a sequential JAX loop to test "
-            "whether factorization temporaries stop being live across the full "
-            "energy axis. "
-            "'scalar_contract_lowdot_ntx' moves the fused lowdot algebra into "
-            "NTX while keeping NEOPAX's transport-moment cotangent mapping. "
-            "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
-            "before field-dot contractions to test peak-memory reduction. "
-            "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
-            "using Krylov solves on the NTX block operator."
-        ),
-    )
-    parser.add_argument(
-        "--reverse-ntx-prepared-solve-boundary",
-        default="default",
-        choices=("default", "custom_vjp", "recompute_vjp"),
-        help=(
-            "Reverse-only diagnostic boundary for the NTX prepared coefficient solve. "
-            "'default' preserves --ntx-exact-derivative-mode. 'custom_vjp' forces "
-            "the response solve through NTX's custom-VJP boundary without changing "
-            "the forward-AD lane. 'recompute_vjp' uses an exact custom-VJP boundary "
-            "that rebuilds the NTX factorization in backward instead of saving it "
-            "in the forward residual."
-        ),
+    parser.set_defaults(
+        ntx_exact_derivative_mode="direct",
+        ntx_exact_derivative_field_pullback_mode="compact_vjp",
+        ntx_exact_derivative_pullback_boundary="inline",
+        ntx_exact_derivative_pullback_algebra="ntx_helper",
+        reverse_ntx_prepared_solve_boundary="default",
     )
     parser.add_argument(
         "--ntx-radial-batch-size",
@@ -4966,18 +4894,6 @@ def main() -> None:
     if str(args.ntx_exact_derivative_field_pullback_mode) == "compact_vjp":
         _check_compact_ntx_derivative_pullback_available()
     effective_ntx_exact_derivative_mode = str(args.ntx_exact_derivative_mode)
-    if str(args.reverse_ntx_prepared_solve_boundary) in {"custom_vjp", "recompute_vjp"}:
-        if str(args.ntx_exact_derivative_mode) not in {
-            "direct",
-            "custom_vjp",
-            "recompute_vjp",
-        }:
-            raise SystemExit(
-                "[autodiff-gate] --reverse-ntx-prepared-solve-boundary custom_vjp "
-                "or recompute_vjp is only compatible with --ntx-exact-derivative-mode "
-                "direct, custom_vjp, or recompute_vjp."
-            )
-        effective_ntx_exact_derivative_mode = str(args.reverse_ntx_prepared_solve_boundary)
 
     config = _prepare_benchmark_config(
         Path(args.config),

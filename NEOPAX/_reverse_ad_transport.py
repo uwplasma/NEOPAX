@@ -2161,7 +2161,7 @@ def run_internal_realtime_geometry_support_segment_probe(
         reverse_stage_cotangent_mode_effective=core_setup.support_probe_cotangent_mode,
         ntx_exact_derivative_mode=str(getattr(args, "ntx_exact_derivative_mode", "direct")),
         ntx_exact_derivative_field_pullback_mode=str(
-            getattr(args, "ntx_exact_derivative_field_pullback_mode", "generic_jvp")
+            getattr(args, "ntx_exact_derivative_field_pullback_mode", "compact_vjp")
         ),
         ntx_exact_surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         realtime_geometry_gradient_path=str(getattr(args, "realtime_geometry_gradient_path", "reverse_payload")),

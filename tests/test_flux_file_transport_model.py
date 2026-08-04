@@ -12,6 +12,7 @@ from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     FluxesRFileTransportModel,
     PowerAnalyticalTurbulentTransportModel,
+    ReLUAnalyticalTurbulentTransportModel,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
 )
@@ -259,6 +260,46 @@ def test_power_analytical_turbulent_transport_model_with_transport_coeffs_update
     assert jnp.allclose(updated.chi_n, jnp.array([7.0, 8.0]))
     assert updated.pressure_source_model == "source_b"
     assert updated.total_power_mw == 9.0
+
+
+def test_relu_analytical_turbulent_transport_model_thresholds_fluxes():
+    species = type(
+        "Species",
+        (),
+        {
+            "species_idx": {"e": 0},
+            "species_indices": jnp.array([0, 1]),
+        },
+    )()
+    field = DummyGeometry()
+    state = TransportState(
+        density=jnp.array([[2.0, 1.0], [2.0, 1.0]]),
+        pressure=jnp.array([[20.0, 4.0], [20.0, 4.0]]),
+        Er=jnp.zeros((2, 2)),
+    )
+
+    off_model = ReLUAnalyticalTurbulentTransportModel(
+        species=species,
+        field=field,
+        density_critical_gradient=jnp.array([1.0e30, 1.0e30]),
+        temperature_critical_gradient=jnp.array([1.0e30, 1.0e30]),
+        density_relu_slope=jnp.array([0.0, 0.0]),
+        temperature_relu_slope=jnp.array([0.0, 0.0]),
+    )
+    on_model = off_model.with_transport_coeffs(
+        density_critical_gradient=0.0,
+        temperature_critical_gradient=0.0,
+        density_relu_slope=1.0,
+        temperature_relu_slope=1.0,
+    )
+
+    off_fluxes = off_model(state)
+    on_fluxes = on_model(state)
+
+    assert jnp.allclose(off_fluxes["Gamma"], 0.0)
+    assert jnp.allclose(off_fluxes["Q"], 0.0)
+    assert jnp.any(jnp.abs(on_fluxes["Gamma"]) > 0.0)
+    assert jnp.any(jnp.abs(on_fluxes["Q"]) > 0.0)
 
 
 def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():

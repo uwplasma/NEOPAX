@@ -49,6 +49,9 @@ except ImportError:
     import toml
 
 
+PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
+
+
 @dataclasses.dataclass(frozen=True)
 class Models:
     flux: object = None
@@ -590,7 +593,25 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             dtype=float,
         )
         turbulence_model = turbulence_factory(species, energy_grid, chi_t, chi_n, geometry)
-    elif turbulence_name in {"turbulent_power_analytical", "ntss_power_over_n"}:
+    elif turbulence_name in {
+        "turbulent_power_analytical",
+        "ntss_power_over_n",
+        "turbulent_relu_analytical",
+        "turbulent_power_relu_analytical",
+    }:
+        def _species_vector(value, default):
+            if value is None:
+                value = default
+            if isinstance(value, dict):
+                out = [value.get(name, value.get(str(name), default)) for name in species.names]
+                return jnp.asarray(out, dtype=float)
+            arr = jnp.asarray(value, dtype=float)
+            if arr.ndim == 0:
+                return jnp.full((species.number_species,), arr, dtype=float)
+            if arr.shape[0] < species.number_species:
+                arr = jnp.pad(arr, (0, species.number_species - arr.shape[0]), mode="edge")
+            return arr[: species.number_species]
+
         chi_t = jnp.asarray(
             turbulence_cfg.get(
                 "chi_temperature",
@@ -614,12 +635,26 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             chi_t = jnp.full((species.number_species,), ion_value, dtype=float).at[electron_idx].set(electron_value)
         total_power_mw = turbulence_cfg.get("total_power_mw", turbulence_cfg.get("power_mw"))
         pressure_source_model = None if source_models is None else source_models.get("temperature")
-        if total_power_mw is None and pressure_source_model is None:
+        if (
+            turbulence_name
+            in {
+                "turbulent_power_analytical",
+                "ntss_power_over_n",
+            }
+            and total_power_mw is None
+            and pressure_source_model is None
+        ):
             raise ValueError(
                 f"[turbulence] flux_model='{turbulence_name}' requires a power source. "
                 "Provide 'total_power_mw' (or 'power_mw') in [turbulence], or configure "
                 "temperature sources so NEOPAX can build the scalar power automatically."
             )
+        density_relu_cfg = turbulence_cfg.get("density_relu_flux", {})
+        pressure_relu_cfg = turbulence_cfg.get("pressure_relu_flux", {})
+        if not isinstance(density_relu_cfg, dict):
+            density_relu_cfg = {}
+        if not isinstance(pressure_relu_cfg, dict):
+            pressure_relu_cfg = {}
         turbulence_model = turbulence_factory(
             species,
             energy_grid,
@@ -628,6 +663,59 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             chi_n,
             pressure_source_model,
             total_power_mw,
+            **(
+                {
+                    "density_critical_gradient": _species_vector(
+                        turbulence_cfg.get(
+                            "density_critical_gradient",
+                            turbulence_cfg.get(
+                                "n_critical_gradient",
+                                turbulence_cfg.get(
+                                    "critical_gradient_density",
+                                    density_relu_cfg.get("critical_gradient"),
+                                ),
+                            ),
+                        ),
+                        turbulence_cfg.get("critical_gradient", 1.0),
+                    ),
+                    "temperature_critical_gradient": _species_vector(
+                        turbulence_cfg.get(
+                            "temperature_critical_gradient",
+                            turbulence_cfg.get(
+                                "pressure_critical_gradient",
+                                turbulence_cfg.get(
+                                    "critical_gradient_temperature",
+                                    pressure_relu_cfg.get("critical_gradient"),
+                                ),
+                            ),
+                        ),
+                        turbulence_cfg.get("critical_gradient", 1.0),
+                    ),
+                    "density_relu_slope": _species_vector(
+                        turbulence_cfg.get(
+                            "density_relu_slope",
+                            turbulence_cfg.get(
+                                "n_relu_slope",
+                                turbulence_cfg.get("slope_density", density_relu_cfg.get("slope")),
+                            ),
+                        ),
+                        turbulence_cfg.get("slope", 1.0),
+                    ),
+                    "temperature_relu_slope": _species_vector(
+                        turbulence_cfg.get(
+                            "temperature_relu_slope",
+                            turbulence_cfg.get(
+                                "pressure_relu_slope",
+                                turbulence_cfg.get("slope_temperature", pressure_relu_cfg.get("slope")),
+                            ),
+                        ),
+                        turbulence_cfg.get("slope", 1.0),
+                    ),
+                    "relu_power": float(turbulence_cfg.get("relu_power", turbulence_cfg.get("power", 1.0))),
+                }
+                if turbulence_name in {"turbulent_relu_analytical", "turbulent_power_relu_analytical"}
+                else {}
+            ),
         )
     elif turbulence_name in {"spectrax_quasilinear_runtime", "spectrax_quasilinear_runtime_lagged"}:
         turbulence_model = turbulence_factory(
@@ -2606,6 +2694,7 @@ def plot_transport_solution(
     alpha_power_series = []
     pbrems_series = []
     power_exchange_series = []
+    power_exchange_species_series = []
     total_heat_flux_series = []
     neo_heat_flux_series = []
     turb_heat_flux_series = []
@@ -2671,6 +2760,9 @@ def plot_transport_solution(
                 power_exchange_arr = jnp.asarray(power_exchange_component)
                 power_exchange_series.append(
                     (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(power_exchange_arr, axis=0))
+                )
+                power_exchange_species_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * power_exchange_arr)
                 )
             alpha_component = pressure_components.get("alpha_power")
             if alpha_component is not None:
@@ -2901,6 +2993,16 @@ def plot_transport_solution(
         "transport_pressure_source_power_exchange.png",
         title="Power Exchange vs rho",
     )
+    power_exchange_species_png = _plot_species_time_series(
+        power_exchange_species_series,
+        "Power Exchange [MW/m^3]",
+        "transport_pressure_source_power_exchange_species.png",
+    )
+    power_exchange_species_pngs = _plot_individual_species_series(
+        power_exchange_species_series,
+        "Power Exchange [MW/m^3]",
+        "transport_pressure_source_power_exchange",
+    )
 
     vprime_png = _plot_geometry_profile(
         getattr(geometry, "r_grid", None) if geometry is not None else None,
@@ -2996,6 +3098,8 @@ def plot_transport_solution(
         "alpha_power": alpha_power_png,
         "bremsstrahlung_power": pbrems_png,
         "power_exchange": power_exchange_png,
+        "power_exchange_species": power_exchange_species_png,
+        "power_exchange_species_individual": power_exchange_species_pngs,
         **flux_plot_paths,
     }
 
@@ -3017,6 +3121,13 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
     with h5py.File(out_h5, "w") as f:
         if rho is not None:
             f.create_dataset("rho", data=jnp.asarray(rho))
+        if geometry is not None:
+            r_grid = getattr(geometry, "r_grid", None)
+            vprime = getattr(geometry, "Vprime", None)
+            if r_grid is not None:
+                f.create_dataset("r_grid", data=jnp.asarray(r_grid))
+            if vprime is not None:
+                f.create_dataset("Vprime", data=jnp.asarray(vprime))
         if ts is not None:
             f.create_dataset("ts", data=jnp.asarray(ts))
         if dts is not None:
@@ -3056,6 +3167,45 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
                     )
                 )(jnp.asarray(density), jnp.asarray(pressure), jnp.asarray(er))
                 f.create_dataset("P_total_mw", data=jnp.asarray(power_total))
+                alpha_profiles = []
+                alpha_volume_averages = []
+                for dens, pres, er_prof in zip(jnp.asarray(density), jnp.asarray(pressure), jnp.asarray(er)):
+                    snapshot_state = TransportState(
+                        density=jnp.asarray(dens),
+                        pressure=jnp.asarray(pres),
+                        Er=jnp.asarray(er_prof),
+                    )
+                    sources, _, _, _ = calculate_sources_from_config(
+                        snapshot_state,
+                        {},
+                        {"species": species},
+                        source_models=source_models,
+                    )
+                    alpha_component = sources.get("pressure_components", {}).get("alpha_power")
+                    if alpha_component is None and isinstance(sources.get("pressure_raw"), dict):
+                        alpha_component = sources["pressure_raw"].get("AlphaPower")
+                    if alpha_component is None:
+                        continue
+                    alpha_arr = PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.asarray(alpha_component)
+                    alpha_profile = jnp.sum(alpha_arr, axis=0) if alpha_arr.ndim == 2 else alpha_arr
+                    alpha_profiles.append(alpha_profile)
+                    if getattr(geometry, "Vprime", None) is not None and getattr(geometry, "r_grid", None) is not None:
+                        volume = jnp.trapezoid(jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+                        integral = jnp.trapezoid(alpha_profile * jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+                    else:
+                        rho_arr = jnp.asarray(rho, dtype=alpha_profile.dtype)
+                        weights = jnp.maximum(rho_arr, jnp.asarray(0.0, dtype=alpha_profile.dtype))
+                        volume = jnp.trapezoid(weights, x=rho_arr)
+                        integral = jnp.trapezoid(alpha_profile * weights, x=rho_arr)
+                    alpha_volume_averages.append(
+                        integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=integral.dtype))
+                    )
+                if alpha_profiles:
+                    f.create_dataset("alpha_power_mw_m3", data=jnp.stack(alpha_profiles))
+                    f.create_dataset(
+                        "alpha_power_volume_average_mw_m3",
+                        data=jnp.asarray(alpha_volume_averages),
+                    )
     return out_h5
 
 
