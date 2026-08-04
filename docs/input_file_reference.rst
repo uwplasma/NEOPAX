@@ -414,7 +414,7 @@ Example:
 .. code-block:: toml
 
     [sources]
-    temperature = ["power_exchange", "power_exchange_temperature_equilibration", "power_exchange_t3d", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+    temperature = ["power_exchange", "power_exchange_temperature_equilibration", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
 
     [sources.parameters.power_exchange]
     mode = "all"
@@ -423,9 +423,6 @@ Example:
     [sources.parameters.power_exchange_temperature_equilibration]
     mode = "all"
 
-    [sources.parameters.power_exchange_t3d]
-    mode = "all"
-    t_ref = 0.037
 
     [sources.parameters.bremsstrahlung_radiation]
     coefficient_mode = "ntssfusion"

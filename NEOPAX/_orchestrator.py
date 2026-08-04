@@ -2758,7 +2758,6 @@ def plot_transport_solution(
             power_exchange_components = [
                 pressure_components.get("power_exchange"),
                 pressure_components.get("power_exchange_temperature_equilibration"),
-                pressure_components.get("power_exchange_t3d"),
             ]
             power_exchange_arrays = [
                 jnp.asarray(component) for component in power_exchange_components if component is not None

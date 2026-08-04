@@ -8,7 +8,6 @@ from NEOPAX._source_models import (
     FusionPowerFractionElectronsSource,
     PowerExchangeSource,
     TemperatureEquilibrationPowerExchangeSource,
-    T3DExactPowerExchangeSource,
     SourceModelBase,
     get_source,
     register_source,
@@ -211,14 +210,6 @@ def test_power_exchange_temperature_equilibration_is_pairwise_conservative():
     src = TemperatureEquilibrationPowerExchangeSource(mode="all")
     result = src(state, species)["power_exchange_temperature_equilibration"]
     assert jnp.allclose(jnp.sum(result, axis=0), jnp.zeros(result.shape[-1]), rtol=1e-10, atol=1e-10)
-
-
-def test_power_exchange_t3d_exact():
-    state = make_dummy_state()
-    species = make_dummy_species()
-    src = T3DExactPowerExchangeSource(mode="all", t_ref=0.037)
-    result = src(state, species)
-    assert result["power_exchange_t3d"].shape == state.temperature.shape
 
 
 def test_bremsstrahlung_radiation():

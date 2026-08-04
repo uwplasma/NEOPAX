@@ -243,7 +243,6 @@ The currently registered source models include:
 - ``dt_reaction``
 - ``power_exchange``
 - ``power_exchange_temperature_equilibration``
-- ``power_exchange_t3d``
 - ``bremsstrahlung_radiation``
 - ``analytic``
 - ``example_state``

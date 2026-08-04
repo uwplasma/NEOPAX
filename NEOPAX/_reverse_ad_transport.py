@@ -2548,10 +2548,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         lookup = {name: i for i, name in enumerate(labels)}
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
 
-    def _profile_column_indices(parameter_set: ReverseADParameterSet) -> tuple[int, ...]:
-        lookup = {name: i for i, name in enumerate(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)}
-        return tuple(lookup[spec.name] for spec in parameter_set.profile_specs)
-
     def _builder(
         objective_names: tuple[str, ...],
         parameter_set: ReverseADParameterSet,
@@ -2666,7 +2662,14 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)
-        profile_cols = _profile_column_indices(parameter_set)
+        if int(all_profile_gradient_matrix.shape[1]) == len(PROFILE_PARAMETER_ORDER):
+            all_profile_parameter_labels = PROFILE_PARAMETER_ORDER
+        else:
+            all_profile_parameter_labels = TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER
+        profile_lookup = {
+            name: i for i, name in enumerate(all_profile_parameter_labels)
+        }
+        profile_cols = tuple(profile_lookup[spec.name] for spec in parameter_set.profile_specs)
         selected_objective_values = all_objective_values[jnp.asarray(rows, dtype=jnp.int32)]
         selected_profile_matrix = all_profile_gradient_matrix[
             jnp.asarray(rows, dtype=jnp.int32),

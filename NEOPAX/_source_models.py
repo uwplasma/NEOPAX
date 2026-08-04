@@ -21,7 +21,6 @@ from ._sources import (
     dt_reaction,
     power_exchange,
     power_exchange_temperature_equilibration,
-    power_exchange_t3d_exact,
     bremsstrahlung_radiation,
 )
 from ._model_api import (
@@ -69,7 +68,6 @@ def _ensure_default_source_models_registered() -> None:
     register_source_model("dt_reaction", DTReactionSource)
     register_source_model("power_exchange", PowerExchangeSource)
     register_source_model("power_exchange_temperature_equilibration", TemperatureEquilibrationPowerExchangeSource)
-    register_source_model("power_exchange_t3d", T3DExactPowerExchangeSource)
     register_source_model("bremsstrahlung_radiation", BremsstrahlungRadiationSource)
     register_source_model("analytic", AnalyticSource)
     register_source_model("example_state", ExampleStateDrivenSource)
@@ -267,41 +265,6 @@ class TemperatureEquilibrationPowerExchangeSource(SourceModelBase):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
-class T3DExactPowerExchangeSource(SourceModelBase):
-    species: Any = dataclasses.field(repr=False, default=None)
-    mode: str = "all"
-    temperature_active_mask: Any = dataclasses.field(repr=False, default=None)
-    t_ref: float = 1.0
-
-    def __call__(self, state, species=None):
-        active_species = self.species if self.species is not None else species
-        n_species = state.temperature.shape[0]
-        mode = str(self.mode).strip().lower()
-        if mode in {"all", "full", "multispecies"}:
-            active_matrix = jnp.ones((n_species, n_species), dtype=bool)
-        elif mode in {"exclude_frozen", "active_temperature_only", "active_only", "evolving_only", "ntss_like"}:
-            if self.temperature_active_mask is None:
-                active_matrix = jnp.ones((n_species, n_species), dtype=bool)
-            else:
-                active_mask = jnp.asarray(self.temperature_active_mask, dtype=bool)
-                active_matrix = active_mask[:, None] & active_mask[None, :]
-        else:
-            raise ValueError(
-                f"Unknown power_exchange_t3d mode '{self.mode}'. "
-                "Use 'all' or 'exclude_frozen' "
-                "(aliases: 'active_temperature_only', 'active_only', 'evolving_only', 'ntss_like')."
-            )
-        return {
-            "power_exchange_t3d": power_exchange_t3d_exact(
-                state,
-                species=active_species,
-                active_matrix=active_matrix,
-                t_ref=self.t_ref,
-            )
-        }
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, eq=False)
 class BremsstrahlungRadiationSource(SourceModelBase):
     species: Any = dataclasses.field(repr=False, default=None)
     delta_zeff: float = 0.0
@@ -350,7 +313,7 @@ def _builder_kwargs_for(
         out = dict(params_cfg.get(source_name, {})) if isinstance(params_cfg.get(source_name, {}), dict) else {}
     if species is not None and "species" not in out:
         out["species"] = species
-    if source_name in {"power_exchange", "power_exchange_temperature_equilibration", "power_exchange_t3d"} and "temperature_active_mask" not in out and species is not None:
+    if source_name in {"power_exchange", "power_exchange_temperature_equilibration"} and "temperature_active_mask" not in out and species is not None:
         eq_cfg = (cfg or {}).get("equations", {}) if isinstance(cfg, dict) else {}
         raw_mask = eq_cfg.get("toggle_temperature", [True] * getattr(species, "number_species", 0))
         active_mask = jnp.asarray(raw_mask, dtype=bool)
@@ -413,7 +376,7 @@ def assemble_density_source_components(source_value: Any, state: Any, species: A
                 if t_idx is not None:
                     out["fusion_sink_T"] = -_species_component(template, t_idx, he_profile)
             continue
-        if key in {"DTreactionRate", "AlphaPower", "PBrems", "Zeff", "fusion_power_fraction_electrons", "power_exchange", "power_exchange_temperature_equilibration", "power_exchange_t3d"}:
+        if key in {"DTreactionRate", "AlphaPower", "PBrems", "Zeff", "fusion_power_fraction_electrons", "power_exchange", "power_exchange_temperature_equilibration"}:
             continue
         out[key] = _broadcast_profile(value, template)
     return out
@@ -438,9 +401,6 @@ def assemble_pressure_source_components(source_value: Any, state: Any, species: 
             continue
         if key == "power_exchange_temperature_equilibration":
             out["power_exchange_temperature_equilibration"] = _broadcast_profile(value, template)
-            continue
-        if key == "power_exchange_t3d":
-            out["power_exchange_t3d"] = _broadcast_profile(value, template)
             continue
         if key == "PBrems":
             if electron_idx is not None:

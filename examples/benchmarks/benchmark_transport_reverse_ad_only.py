@@ -58,6 +58,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     runtime_with_ntx_support_payload as _core_runtime_with_ntx_support_payload,
 )
 from NEOPAX._reverse_ad_parameters import (  # noqa: E402
+    PROFILE_PARAMETER_ORDER,
     VmecBoundaryParameterSpec,
     discover_vmec_boundary_parameter_specs,
     normalize_vmec_boundary_families,
@@ -131,7 +132,22 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 
 PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
+_PROFILE_PARAMETER_DEFAULTS = {
+    "n0": 4.21,
+    "T0": 17.8,
+    "density_shape_power": 2.0,
+    "temperature_shape_power": 2.0,
+    "density_shape_alpha": 1.0,
+    "temperature_shape_alpha": 1.0,
+}
 _REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+
+
+def _profile_cfg_scalar_value(profile_cfg: dict[str, Any], name: str) -> float:
+    raw = profile_cfg.get(name, _PROFILE_PARAMETER_DEFAULTS[name])
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0]
+    return float(raw)
 
 
 def _initial_er_root_ad_mode(value: str | None) -> str:
@@ -680,7 +696,8 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
     if str(geometry_parameter).strip().lower() == "all":
         family, m, n = ("RBC", 0, 0)
     else:
-        family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
+        first_geometry_parameter = str(geometry_parameter).split(",", 1)[0].strip()
+        family, m, n = _parse_reverse_geometry_parameter(first_geometry_parameter)
     geom_cfg = config.get("geometry", {})
     backend = str(geom_cfg.get("backend", "")).strip().lower()
     if backend not in _REALTIME_GEOMETRY_BACKENDS:
@@ -713,11 +730,25 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
 def _reverse_geometry_parameter_order(geometry_parameter: str) -> tuple[str, ...]:
     if str(geometry_parameter).strip().lower() == "all":
         return (*PARAMETER_ORDER, "vmec:all")
-    return (*PARAMETER_ORDER, _format_reverse_geometry_parameter(geometry_parameter))
+    return (
+        *PARAMETER_ORDER,
+        *(
+            _format_reverse_geometry_parameter(raw_parameter.strip())
+            for raw_parameter in str(geometry_parameter).split(",")
+            if raw_parameter.strip()
+        ),
+    )
 
 
 def _geometry_param_specs_from_parameter_name(geometry_parameter: str) -> tuple[tuple[str, int, int], ...]:
-    return (_parse_reverse_geometry_parameter(geometry_parameter),)
+    specs = tuple(
+        _parse_reverse_geometry_parameter(raw_parameter.strip())
+        for raw_parameter in str(geometry_parameter).split(",")
+        if raw_parameter.strip()
+    )
+    if not specs:
+        raise ValueError("At least one reverse geometry parameter must be provided.")
+    return specs
 
 
 def _all_geometry_param_specs_from_context(
@@ -3326,8 +3357,14 @@ def _run_realtime_geometry_optimization_api_smoke(
 
     geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
     include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    profile_parameter_order = (
+        PROFILE_PARAMETER_ORDER
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else PARAMETER_ORDER
+    )
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profile_dofs,
+        profiles=profile_parameter_order if include_profile_dofs else None,
         vmec_boundary=tuple(
             VmecBoundaryParameterSpec(family, m, n)
             for family, m, n in geometry_param_specs
@@ -3353,10 +3390,32 @@ def _run_realtime_geometry_optimization_api_smoke(
             LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
             LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
         )
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        geom_cfg_for_context = config.get("geometry", {})
+        context_geometry_values0 = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg_for_context,
+            geometry_param_specs,
+        )
+        context_profile_values0 = jnp.asarray(
+            [
+                _profile_cfg_scalar_value(profile_cfg, name)
+                for name in PROFILE_PARAMETER_ORDER
+            ],
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        context_baseline_values = jnp.concatenate(
+            [
+                context_profile_values0,
+                jnp.asarray(context_geometry_values0, dtype=context_profile_values0.dtype),
+            ],
+            axis=0,
+        )
+    else:
+        context_baseline_values = baseline_values
     table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
         args=args,
         config=config,
-        baseline_values=baseline_values,
+        baseline_values=context_baseline_values,
         baseline_runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
@@ -3374,7 +3433,10 @@ def _run_realtime_geometry_optimization_api_smoke(
             geometry_param_specs,
         )
         profile_values0 = jnp.asarray(
-            [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+            [
+                _profile_cfg_scalar_value(profile_cfg, spec.name)
+                for spec in parameter_set.profile_specs
+            ],
             dtype=jnp.asarray(baseline_state.pressure).dtype,
         )
         parameter_values = jnp.asarray(
@@ -3549,6 +3611,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
     )
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profile_dofs,
+        profiles=PARAMETER_ORDER if include_profile_dofs else None,
         vmec_boundary=tuple(
             VmecBoundaryParameterSpec(family, m, n)
             for family, m, n in geometry_param_specs
@@ -3561,7 +3624,10 @@ def _run_initial_er_root_only_optimization_api_smoke(
         )
     geom_cfg = config.get("geometry", {})
     profile_values0 = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+        [
+            _profile_cfg_scalar_value(profile_cfg, spec.name)
+            for spec in parameter_set.profile_specs
+        ],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
     geometry_values0 = (
@@ -4408,7 +4474,7 @@ def main() -> None:
         help=(
             "Differentiated parameter set. 'profiles' preserves the current "
             "profile-only reverse lane. 'profiles_plus_realtime_geometry' adds "
-            "one realtime VMEC boundary parameter to the four profile parameters."
+            "selected realtime VMEC boundary parameters to the active profile parameters."
         ),
     )
     parser.add_argument(
@@ -4418,6 +4484,7 @@ def main() -> None:
         help=(
             "Realtime VMEC geometry parameter used when --reverse-parameter-mode "
             "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0. "
+            "Use comma-separated values for multiple harmonics, e.g. RBC:1:0,ZBS:1:0. "
             "Use 'all' to pull back to all selected VMEC boundary harmonics."
         ),
     )
