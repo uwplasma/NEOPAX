@@ -37,6 +37,8 @@ def _select_radial_grid(geometry: Any, radial_size: int):
         r_grid_half = jnp.asarray(r_grid_half)
         if int(r_grid_half.shape[0]) == radial_size:
             return r_grid_half
+        if int(r_grid_half.shape[0]) == radial_size + 1:
+            return 0.5 * (r_grid_half[:-1] + r_grid_half[1:])
     return jnp.linspace(float(r_grid[0]), float(r_grid[-1]), radial_size)
 
 

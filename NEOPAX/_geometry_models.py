@@ -42,13 +42,13 @@ class VmecBoozer(GeometryModelBase):
     a_b: float
     Psia_value: float
     rho_grid: Float[Array, "n_r"]
-    rho_grid_half: Float[Array, "n_r"]
+    rho_grid_half: Float[Array, "n_face"]
     r_grid: Float[Array, "n_r"]
-    r_grid_half: Float[Array, "n_r"]   
+    r_grid_half: Float[Array, "n_face"]
     full_grid_indices : Int[Array, "n_r"]   
     dr: float         
     Vprime: Float[Array, "n_r"]
-    Vprime_half: Float[Array, "n_r"]
+    Vprime_half: Float[Array, "n_face"]
     overVprime: Float[Array, "n_r"]
     epsilon_t: Float[Array, "n_r"]
     B0: Float[Array, "n_r"]
@@ -110,15 +110,11 @@ class VmecBoozer(GeometryModelBase):
 
         self.R0 = rmnc_b[-1,0]
         self.a_b = np.sqrt(volume_p/(2*jnp.pi**2*self.R0))
-        self.rho_grid = jnp.linspace(0., rho_edge, self.n_r)
-        self.rho_grid_half = jnp.concatenate([
-            jnp.array([0.]),
-            0.5 * (self.rho_grid[:-1] + self.rho_grid[1:]),
-            jnp.array([rho_edge])
-        ])
+        self.rho_grid_half = jnp.linspace(0.0, rho_edge, self.n_r + 1)
+        self.rho_grid = 0.5 * (self.rho_grid_half[:-1] + self.rho_grid_half[1:])
         self.r_grid = self.rho_grid * self.a_b
         self.r_grid_half = self.rho_grid_half * self.a_b
-        self.dr = self.r_grid[1] - self.r_grid[0]
+        self.dr = self.r_grid_half[1] - self.r_grid_half[0]
 
         # Interpolators for equilibrium quantities
         for l in range(len(xm_b)):
@@ -136,7 +132,6 @@ class VmecBoozer(GeometryModelBase):
         self.Vprime = dVdr(self.rho_grid) * 2.0 * self.rho_grid / self.a_b * volume_scale
         self.Vprime_half = dVdr(self.rho_grid_half) * 2.0 * self.rho_grid_half / self.a_b * volume_scale
         self.overVprime = 1./self.Vprime
-        self.overVprime = self.overVprime.at[0].set(0.0)
 
         iota_interp = interpax.Interpolator1D(rho_full[:], iotaf[:], extrap=True)
         self.iota = iota_interp(self.rho_grid)
@@ -147,7 +142,6 @@ class VmecBoozer(GeometryModelBase):
         # B00 is tabulated against rho, while B0prime is used as dB0/dr.
         self.B0prime = jax.vmap(jax.grad(lambda rho : B00(rho)), in_axes=0)(self.rho_grid) / self.a_b
         self.curvature = jnp.absolute(self.B_10)/self.epsilon_t
-        self.curvature = self.curvature.at[0].set(0.0)
         self.enlogation = jnp.square(self.epsilon_t/self.B_10)
 
         G = interpax.Interpolator1D(rho_half[1:], bvco[1:], extrap=True)

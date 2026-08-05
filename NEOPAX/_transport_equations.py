@@ -126,22 +126,14 @@ def project_fixed_temperature_species(
 
 
 def apply_er_dirichlet_boundary_state(state, er_bc_model):
-    """Clamp Er state values at configured Dirichlet boundaries."""
-    if er_bc_model is None or getattr(state, "Er", None) is None:
-        return state
+    """Legacy helper kept for compatibility.
 
-    er = state.Er
-    left_type = str(getattr(er_bc_model, "left_type", "")).strip().lower()
-    if left_type == "dirichlet" and getattr(er_bc_model, "left_value", None) is not None:
-        left_value = jnp.asarray(getattr(er_bc_model, "left_value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[0].set(left_value)
-
-    right_type = str(getattr(er_bc_model, "right_type", "")).strip().lower()
-    if right_type == "dirichlet" and getattr(er_bc_model, "right_value", None) is not None:
-        right_value = jnp.asarray(getattr(er_bc_model, "right_value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[-1].set(right_value)
-
-    return dataclasses.replace(state, Er=er)
+    In the cell-centered FV layout, Dirichlet values belong on faces and should
+    influence the solution through face constraints/flux closure, not by
+    overwriting the first or last cell-centered Er state directly.
+    """
+    del er_bc_model
+    return state
 
 
 def _expand_density_rhs_to_full_shape(density_rhs, template_density, species):
@@ -241,20 +233,8 @@ class DensityEquation(EquationBase):
         return self._mode_requests_face_fluxes(self.particle_flux_reconstruction)
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs):
-        bc = self.density_bc_model
-        if bc is None:
-            return density_rhs
-
-        out = density_rhs
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            out = out.at[:, 0].set(jnp.zeros_like(out[:, 0]))
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet":
-            out = out.at[:, -1].set(jnp.zeros_like(out[:, -1]))
-
-        return out
+        del state
+        return density_rhs
 
     def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
@@ -436,35 +416,8 @@ class TemperatureEquation(EquationBase):
         return self._mode_requests_face_fluxes(self.convection_reconstruction)
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
-        bc = self.temperature_bc_model
-        if bc is None:
-            return pressure_rhs
-
-        out = pressure_rhs
-
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            left_value = getattr(bc, "left_value", None)
-            if left_value is None:
-                t_left = state.temperature[:, 0]
-            else:
-                t_left = jnp.asarray(left_value, dtype=pressure_rhs.dtype)
-                if t_left.ndim == 0:
-                    t_left = jnp.broadcast_to(t_left, (pressure_rhs.shape[0],))
-            out = out.at[:, 0].set(t_left * density_rhs[:, 0])
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet":
-            right_value = getattr(bc, "right_value", None)
-            if right_value is None:
-                t_right = state.temperature[:, -1]
-            else:
-                t_right = jnp.asarray(right_value, dtype=pressure_rhs.dtype)
-                if t_right.ndim == 0:
-                    t_right = jnp.broadcast_to(t_right, (pressure_rhs.shape[0],))
-            out = out.at[:, -1].set(t_right * density_rhs[:, -1])
-
-        return out
+        del state, density_rhs
+        return pressure_rhs
 
     def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
@@ -668,22 +621,61 @@ def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
                     prof,
                     field.r_grid_half,
                     left_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
-                    right_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    right_face_constraint=(
+                        1.5 * prof[-1] - 0.5 * prof[-2]
+                        if prof.shape[0] >= 2
+                        else prof[-1]
+                    ),
                 ).face_value(reconstruction=reconstruction)
             )(profile)
     return faces_builder
 
 
-def _build_species_ghost_builder(bc_model):
+def _build_species_ghost_builder(field, bc_model):
     if bc_model is not None and hasattr(bc_model, "apply_ghost_all"):
         def ghost_builder(profile):
             return bc_model.apply_ghost_all(profile)
     elif bc_model is not None and hasattr(bc_model, "apply_ghost"):
         def ghost_builder(profile):
             return jax.vmap(lambda prof: bc_model.apply_ghost(prof))(profile)
+    elif bc_model is not None and hasattr(bc_model, "right_type"):
+        def ghost_builder(profile):
+            left_value, left_grad = left_constraints_from_bc_model(
+                bc_model,
+                profile[:, 0],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
+            right_value, right_grad = right_constraints_from_bc_model(
+                bc_model,
+                profile[:, -1],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
+            dx_left = field.r_grid_half[1] - field.r_grid_half[0]
+            dx_right = field.r_grid_half[-1] - field.r_grid_half[-2]
+
+            if left_value is None:
+                left_face = profile[:, 0] - 0.5 * dx_left * jnp.asarray(left_grad)
+            else:
+                left_face = jnp.asarray(left_value)
+            if right_value is None:
+                right_face = profile[:, -1] + 0.5 * dx_right * jnp.asarray(right_grad)
+            else:
+                right_face = jnp.asarray(right_value)
+
+            left_ghost = 2.0 * left_face - profile[:, 0]
+            right_ghost = 2.0 * right_face - profile[:, -1]
+            return jnp.concatenate([left_ghost[:, None], profile, right_ghost[:, None]], axis=1)
     else:
         def ghost_builder(profile):
-            return jnp.concatenate([profile[:, :1], profile, profile[:, -1:]], axis=1)
+            left_ghost = profile[:, :1]
+            if profile.shape[1] >= 2:
+                right_face = 1.5 * profile[:, -1] - 0.5 * profile[:, -2]
+            else:
+                right_face = profile[:, -1]
+            right_ghost = 2.0 * right_face[:, None] - profile[:, -1:]
+            return jnp.concatenate([left_ghost, profile, right_ghost], axis=1)
     return ghost_builder
 
 
@@ -735,7 +727,7 @@ def build_temperature_equation(
             bc_er=bc_er,
             center_fluxes=center_fluxes,
         )
-    temperature_ghost_builder = _build_species_ghost_builder(bc_temperature)
+    temperature_ghost_builder = _build_species_ghost_builder(field, bc_temperature)
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
     return TemperatureEquation(
@@ -867,20 +859,8 @@ class ElectricFieldEquation(EquationBase):
         return SourceEr
 
     def enforce_dirichlet_boundary_rhs(self, state, er_rhs):
-        bc = self.er_bc_model
-        if bc is None:
-            return er_rhs.at[0].set(0.0)
-
-        out = er_rhs
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            out = out.at[0].set(jnp.asarray(0.0, dtype=out.dtype))
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet" and self.boundary_mode != "floating_ambipolar_edge":
-            out = out.at[-1].set(jnp.asarray(0.0, dtype=out.dtype))
-
-        return out
+        del state
+        return er_rhs
 
     def ap_linear_split(self, state):
         """
@@ -981,7 +961,11 @@ def build_electric_field_equation(
                     G,
                     field.r_grid_half,
                     left_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
-                    right_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
+                    right_face_constraint=(
+                        1.5 * G[-1] - 0.5 * G[-2]
+                        if G.shape[0] >= 2
+                        else G[-1]
+                    ),
                 ).face_value(reconstruction=reconstruction)
             )(Gamma)
     # Pre-build the diffusive Er face-flux builder for BC handling.
@@ -1026,7 +1010,11 @@ def build_electric_field_equation(
                 er_profile,
                 field.r_grid_half,
                 left_face_grad_constraint=jnp.asarray(0.0, dtype=er_profile.dtype),
-                right_face_constraint=er_profile[-1],
+                right_face_constraint=(
+                    1.5 * er_profile[-1] - 0.5 * er_profile[-2]
+                    if er_profile.shape[0] >= 2
+                    else er_profile[-1]
+                ),
             )
             return -er_cell_var.face_grad()
     return ElectricFieldEquation(

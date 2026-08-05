@@ -388,7 +388,13 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
 
 
 def apply_cell_centered_boundary_state(profile, bc_model, face_centers):
-    """Project cell-centered profiles so boundary cells satisfy the configured BCs."""
+    """Project cell-centered profiles to a BC-consistent endpoint guess.
+
+    This helper is for preprocessing and legacy compatibility paths.  The
+    transport FV operator should prefer face constraints directly through
+    ``CellVariable`` rather than mutating the terminal cell to act like the
+    boundary.
+    """
     if bc_model is None:
         return jnp.asarray(profile)
 
@@ -440,3 +446,8 @@ def apply_cell_centered_boundary_state(profile, bc_model, face_centers):
         out = out.at[:, -1].set(right_cell)
 
     return out[0] if squeeze else out
+
+
+def preprocess_cell_centered_boundary_guess(profile, bc_model, face_centers):
+    """Compatibility wrapper for boundary-state preprocessing outside the FV solve."""
+    return apply_cell_centered_boundary_state(profile, bc_model, face_centers)

@@ -352,9 +352,20 @@ def _unflatten_flux_dict(flat_flux: jax.Array, reference_flux: dict) -> dict:
     return out
 
 
+def _extrapolated_right_face_value(state_arr: jax.Array) -> jax.Array:
+    arr = jnp.asarray(state_arr)
+    if arr.ndim == 1:
+        if arr.shape[0] >= 2:
+            return 1.5 * arr[-1] - 0.5 * arr[-2]
+        return arr[-1]
+    if arr.shape[-1] >= 2:
+        return 1.5 * arr[:, -1] - 0.5 * arr[:, -2]
+    return arr[:, -1]
+
+
 def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
     n_species = state_arr.shape[0]
-    default_value = state_arr[:, -1]
+    default_value = _extrapolated_right_face_value(state_arr)
     default_grad = jnp.zeros_like(default_value)
     if bc_model is None:
         return default_value, default_grad
@@ -390,6 +401,10 @@ def _extract_face_constraints(
     state_arr: jax.Array,
     face_centers: jax.Array,
 ) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None, jax.Array | None]:
+    if bc_model is None:
+        default_right = _extrapolated_right_face_value(state_arr)
+        return None, jnp.zeros_like(state_arr[:, 0]), default_right, None
+
     default_left = state_arr[:, 0]
     default_right = state_arr[:, -1]
     left_value, left_grad = left_constraints_from_bc_model(
@@ -518,7 +533,7 @@ def _ntss_like_face_profile(profile, face_centers, bc_model=None, density_floor=
     if left_value is None:
         left_value = profile_2d[:, 0]
     if right_value is None:
-        right_value = profile_2d[:, -1]
+        right_value = _extrapolated_right_face_value(profile_2d)
     cell_centers = 0.5 * (face_centers[1:] + face_centers[:-1])
     inner = 0.5 * (profile_2d[:, :-1] + profile_2d[:, 1:])
     faces = jnp.concatenate([left_value[..., None], inner, right_value[..., None]], axis=-1)
@@ -5629,19 +5644,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def __call__(self, state) -> dict:
         density = safe_density(state.density)
         temperature = state.temperature
-        n_species = int(temperature.shape[0])
-        n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-        if n_right is None:
-            n_right = density[:, -1]
-        n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-        if n_right_grad is None:
-            n_right_grad = jnp.zeros_like(n_right)
-        t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-        if t_right is None:
-            t_right = temperature[:, -1]
-        t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-        if t_right_grad is None:
-            t_right_grad = jnp.zeros_like(t_right)
+        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
         lij = self._lij_center(state.Er, temperature, density)
         gamma, q, upar = self._assemble_center_fluxes(
@@ -5667,31 +5671,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         density = safe_density(state.density)
         temperature = state.temperature
-        n_species = int(temperature.shape[0])
-        n_right = _as_species_constraint(
-            None if self.bc_density is None else getattr(self.bc_density, "right_value", None),
-            n_species,
-        )
-        if n_right is None:
-            n_right = density[:, -1]
-        n_right_grad = _as_species_constraint(
-            None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None),
-            n_species,
-        )
-        if n_right_grad is None:
-            n_right_grad = jnp.zeros_like(n_right)
-        t_right = _as_species_constraint(
-            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None),
-            n_species,
-        )
-        if t_right is None:
-            t_right = temperature[:, -1]
-        t_right_grad = _as_species_constraint(
-            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None),
-            n_species,
-        )
-        if t_right_grad is None:
-            t_right_grad = jnp.zeros_like(t_right)
+        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
         dndr = jax.vmap(
             lambda density_a, right_value, right_grad: get_gradient_density(
@@ -5902,31 +5883,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         density = safe_density(state.density)
         temperature = state.temperature
-        n_species = int(temperature.shape[0])
-        n_right = _as_species_constraint(
-            None if self.bc_density is None else getattr(self.bc_density, "right_value", None),
-            n_species,
-        )
-        if n_right is None:
-            n_right = density[:, -1]
-        n_right_grad = _as_species_constraint(
-            None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None),
-            n_species,
-        )
-        if n_right_grad is None:
-            n_right_grad = jnp.zeros_like(n_right)
-        t_right = _as_species_constraint(
-            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None),
-            n_species,
-        )
-        if t_right is None:
-            t_right = temperature[:, -1]
-        t_right_grad = _as_species_constraint(
-            None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None),
-            n_species,
-        )
-        if t_right_grad is None:
-            t_right_grad = jnp.zeros_like(t_right)
+        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
         dndr = jax.vmap(
             lambda density_a, right_value, right_grad: get_gradient_density(
@@ -7136,19 +7094,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         del kwargs
         density = safe_density(state.density)
         temperature = state.temperature
-        n_species = int(temperature.shape[0])
-        n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-        if n_right is None:
-            n_right = density[:, -1]
-        n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-        if n_right_grad is None:
-            n_right_grad = jnp.zeros_like(n_right)
-        t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-        if t_right is None:
-            t_right = temperature[:, -1]
-        t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-        if t_right_grad is None:
-            t_right_grad = jnp.zeros_like(t_right)
+        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7288,18 +7235,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density = safe_density(state.density)
             temperature = state.temperature
             n_species = int(temperature.shape[0])
-            n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-            if n_right is None:
-                n_right = density[:, -1]
-            n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-            if n_right_grad is None:
-                n_right_grad = jnp.zeros_like(n_right)
-            t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-            if t_right is None:
-                t_right = temperature[:, -1]
-            t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-            if t_right_grad is None:
-                t_right_grad = jnp.zeros_like(t_right)
+            n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+            t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7525,19 +7462,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if isinstance(center_response, NTXInterpolatedMomentResponse):
             density = safe_density(state.density)
             temperature = state.temperature
-            n_species = int(temperature.shape[0])
-            n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-            if n_right is None:
-                n_right = density[:, -1]
-            n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-            if n_right_grad is None:
-                n_right_grad = jnp.zeros_like(n_right)
-            t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-            if t_right is None:
-                t_right = temperature[:, -1]
-            t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-            if t_right_grad is None:
-                t_right_grad = jnp.zeros_like(t_right)
+            n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
+            t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7685,12 +7611,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             er_bar_direct = -jnp.sum(a1_bar * species_charge / (elementary_charge * temperature), axis=0)
 
             def _density_gradient_map(density_value):
-                local_n_right = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_value", None), n_species)
-                if local_n_right is None:
-                    local_n_right = density_value[:, -1]
-                local_n_right_grad = _as_species_constraint(None if self.bc_density is None else getattr(self.bc_density, "right_gradient", None), n_species)
-                if local_n_right_grad is None:
-                    local_n_right_grad = jnp.zeros_like(local_n_right)
+                local_n_right, local_n_right_grad = _extract_right_constraints(self.bc_density, density_value)
                 return jax.vmap(
                     lambda density_a, right_value, right_grad: get_gradient_density(
                         density_a,
@@ -7703,12 +7624,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )(density_value, local_n_right, local_n_right_grad)
 
             def _temperature_gradient_map(temperature_value):
-                local_t_right = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_value", None), n_species)
-                if local_t_right is None:
-                    local_t_right = temperature_value[:, -1]
-                local_t_right_grad = _as_species_constraint(None if self.bc_temperature is None else getattr(self.bc_temperature, "right_gradient", None), n_species)
-                if local_t_right_grad is None:
-                    local_t_right_grad = jnp.zeros_like(local_t_right)
+                local_t_right, local_t_right_grad = _extract_right_constraints(self.bc_temperature, temperature_value)
                 return jax.vmap(
                     lambda temperature_a, right_value, right_grad: get_gradient_temperature(
                         temperature_a,
@@ -8601,7 +8517,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 self.geometry.r_grid,
                 self.geometry.r_grid_half,
                 self.geometry.dr,
-                right_face_constraint=density_a[-1],
             )
         )(density)
         dTdr_all = jax.vmap(
@@ -8610,7 +8525,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 self.geometry.r_grid,
                 self.geometry.r_grid_half,
                 self.geometry.dr,
-                right_face_constraint=temperature_a[-1],
             )
         )(temperature)
         # Stage 4 currently writes SPECTRAX perturbations in the default
@@ -9062,7 +8976,6 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
             jnp.asarray(face_state.temperature[ref_idx], dtype=dtype),
             jnp.asarray(1.0e-30, dtype=dtype),
         )
-        ref_pressure = ref_density * ref_temperature
 
         a_minor = jnp.asarray(getattr(self.field, "a_b", 1.0), dtype=dtype)
         psia = jnp.asarray(getattr(self.field, "Psia_value", 1.0), dtype=dtype)
@@ -9070,6 +8983,7 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
             jnp.abs(psia) / (jnp.pi * jnp.maximum(a_minor**2, jnp.asarray(1.0e-30, dtype=dtype))),
             jnp.asarray(1.0e-30, dtype=dtype),
         )
+        ref_pressure = ref_density * ref_temperature
 
         m_ref_mp = jnp.asarray(self.species.mass_mp[ref_idx], dtype=dtype)
         reference_thermal_speed = jnp.sqrt(jnp.asarray(1.0e3, dtype=dtype) * elementary_charge / proton_mass)
@@ -9080,13 +8994,22 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
 
         particle_source_ref = jnp.asarray(1.0e20, dtype=dtype) / t_ref
         pressure_power_ref_eV = jnp.asarray(1.0e23, dtype=dtype) / t_ref
-
         particle_factor = jnp.power(ref_pressure, 1.5) / jnp.sqrt(ref_density)
         heat_factor = jnp.power(ref_pressure, 2.5) / jnp.power(ref_density, 1.5)
         geometry_factor = a_minor / jnp.square(b_ref)
 
-        gamma = gamma_raw * particle_factor[None, :] * particle_source_ref * geometry_factor
-        q = q_raw * heat_factor[None, :] * pressure_power_ref_eV * geometry_factor
+        gamma = (
+            gamma_raw
+            * particle_factor[None, :]
+            * particle_source_ref
+            * geometry_factor
+        )
+        q = (
+            q_raw
+            * heat_factor[None, :]
+            * pressure_power_ref_eV
+            * geometry_factor
+        )
         return gamma, q
 
     def __call__(self, state) -> dict:

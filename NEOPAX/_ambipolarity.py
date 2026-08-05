@@ -1235,7 +1235,7 @@ def _ambipolarity_local_charge_flux_setup(state, params, flux_model):
     charge_qp = jnp.asarray(params["species"].charge_qp)
 
     geometry = getattr(flux_model, "geometry", None)
-    r_grid = getattr(geometry, "r_grid", None)
+    r_grid = getattr(geometry, "r_grid_half", None)
     skip_axis_root = False
     if r_grid is not None:
         try:
@@ -1435,7 +1435,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
 
     charge_qp = jnp.asarray(params["species"].charge_qp)
     geometry = getattr(flux_model, "geometry", None)
-    r_grid = getattr(geometry, "r_grid", None)
+    r_grid = getattr(geometry, "r_grid_half", None)
     skip_axis_root = False
     if r_grid is not None:
         try:

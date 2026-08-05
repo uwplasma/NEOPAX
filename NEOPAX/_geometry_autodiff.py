@@ -3625,18 +3625,7 @@ def _boozer_rmnc00_from_state_at_rho(
 
 
 def _neopax_geometry_requested_sample_rho(context: GeometryAutodiffContext, *, n_r: int):
-    rho_grid = np.linspace(0.0, 1.0, int(n_r), dtype=float)
-    if int(n_r) > 1:
-        rho_grid_half = np.concatenate(
-            [
-                np.asarray([0.0], dtype=float),
-                0.5 * (rho_grid[:-1] + rho_grid[1:]),
-                np.asarray([1.0], dtype=float),
-            ],
-            axis=0,
-        )
-    else:
-        rho_grid_half = np.asarray([0.0, 1.0], dtype=float)
+    rho_grid_half = np.linspace(0.0, 1.0, int(n_r) + 1, dtype=float)
     s_full = np.asarray(jax.device_get(context.static.s), dtype=float)
     rho_half = np.sqrt(np.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))
     edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
@@ -3681,17 +3670,8 @@ def _build_neopax_geometry_from_state(
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
-    rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
-    if int(n_r) > 1:
-        rho_grid_half = jnp.concatenate(
-            [
-                jnp.array([0.0], dtype=rho_grid.dtype),
-                0.5 * (rho_grid[:-1] + rho_grid[1:]),
-                jnp.array([1.0], dtype=rho_grid.dtype),
-            ]
-        )
-    else:
-        rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
+    rho_grid_half = jnp.linspace(0.0, 1.0, int(n_r) + 1)
+    rho_grid = 0.5 * (rho_grid_half[:-1] + rho_grid_half[1:])
     try:
         forces_module = _import_vmec_module("vmec_forces")
         residue_module = _import_vmec_module("vmec_residue")
@@ -3842,13 +3822,13 @@ def _build_neopax_geometry_from_state(
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
-    dr = r_grid[1] - r_grid[0] if int(n_r) > 1 else jnp.asarray(0.0, dtype=r_grid.dtype)
+    dr = r_grid_half[1] - r_grid_half[0] if int(n_r) > 0 else jnp.asarray(0.0, dtype=r_grid_half.dtype)
 
     dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
     volume_scale = (2.0 * jnp.pi) ** 2
     vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
     vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
-    over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
+    over_vprime = _safe_reciprocal(vprime)
 
     iota_samples = jnp.asarray(out["iota_b"])
     i_value_samples = jnp.asarray(out["buco_b"])
@@ -3871,15 +3851,15 @@ def _build_neopax_geometry_from_state(
 
     b_00 = b0_interp(rho_grid)
     b0 = b_00
-    b_10 = _safe_divide(b10_interp(rho_grid), b_00).at[0].set(0.0)
+    b_10 = _safe_divide(b10_interp(rho_grid), b_00)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
     # Match frozen VmecBoozer: epsilon_t uses the Boozer R00 profile, not the
     # edge major radius used to define a_b.
     epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
-    curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
-    enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
+    curvature = _safe_divide(jnp.abs(b_10), epsilon_t)
+    enlogation = jnp.square(_safe_divide(epsilon_t, b_10))
     # b0_interp is tabulated against rho; B0prime follows the frozen geometry
     # convention of dB0/dr, so convert dB00/drho by drho/dr = 1 / a_b.
     b0prime = jax.vmap(jax.grad(lambda rho: b0_interp(rho)))(rho_grid) / a_b
