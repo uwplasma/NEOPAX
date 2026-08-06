@@ -138,6 +138,16 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
 
 ## Current Open Items
 
+- New 8-parameter full-transport shared-payload reverse-AD snapshot is saved
+  in `shared_payload_8param_benchmark_snapshot.md`. This run uses
+  `density_shape_alpha`, `temperature_shape_alpha`, `RBC:1:0`, and `ZBS:1:0`,
+  so it should be validated against newly rerun FD references instead of the
+  older 5-parameter table.
+- New current QI frozen-linearized FD for `RBC:1:0` is saved in the 8-parameter
+  snapshot: FD `5.9397387449796542e+00`, forward JVP
+  `5.9392891189187216e+00`, optimization-internal reverse
+  `5.9392891187135319e+00`, shared-payload reverse
+  `5.9392927523725234e+00`.
 - Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
 - Add full-transport FD references for selected profile parameters if needed; current exact 16-step table is geometry `RBC:1:0`.
 - Keep bootstrap-current objective in the root/full benchmark tables, but be careful not to reintroduce generic full flux VJPs that caused OOM.

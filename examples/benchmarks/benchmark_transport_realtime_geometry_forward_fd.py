@@ -38,6 +38,7 @@ from benchmark_transport_reverse_ad_only import (  # noqa: E402
     _geometry_param_specs_from_parameter_name,
     _initial_state_for_parameter_vector,
     _initial_er_root_ad_mode,
+    _profile_cfg_scalar_value,
     _runtime_with_ntx_support_payload,
 )
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
@@ -627,7 +628,10 @@ def main() -> None:
             frozen_linearized_bundle,
             step_scale=0.0,
         )
-    profile_values = jnp.asarray([float(profile_cfg[name]) for name in PARAMETER_ORDER], dtype=jnp.float64)
+    profile_values = jnp.asarray(
+        [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
+        dtype=jnp.float64,
+    )
     baseline_profile_state = _profile_state_from_values(
         profile_values,
         config=config,
@@ -647,7 +651,7 @@ def main() -> None:
         if parameter_is_profile:
             parameter_kind = "profile"
             param_index = PARAMETER_ORDER.index(parameter_name)
-            baseline_value = float(profile_cfg[parameter_name])
+            baseline_value = _profile_cfg_scalar_value(profile_cfg, parameter_name)
             h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
             minus_runtime = baseline_runtime
             plus_runtime = baseline_runtime
@@ -871,7 +875,7 @@ def main() -> None:
         local_rhs_geometry_fd = None
         local_rhs_geometry_payload_fd = None
         param_index = PARAMETER_ORDER.index(parameter_name)
-        baseline_value = float(profile_cfg[parameter_name])
+        baseline_value = _profile_cfg_scalar_value(profile_cfg, parameter_name)
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
         print("[autodiff-gate] progress: running profile fd_minus replay", flush=True)
         minus_objectives, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(

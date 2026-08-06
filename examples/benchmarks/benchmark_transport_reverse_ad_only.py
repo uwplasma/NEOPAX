@@ -4196,7 +4196,7 @@ def _run_realtime_geometry_reverse_mode(
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
     geom_cfg = config.get("geometry", {})
     baseline_values = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER]
+        [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER]
         + [float(geom_cfg.get("vmec_param_delta", 0.0))],
         dtype=jnp.float64,
     )
@@ -5117,7 +5117,7 @@ def main() -> None:
         )
         return
     baseline_values = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+        [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)
