@@ -12,7 +12,7 @@ mode = "transport"
 
 [geometry]
 backend = "vmec_jax_booz_xform_jax"
-vmec_input_file = "./examples/inputs/input.w7x_from_wout_reconstructed"
+vmec_input_file = "./examples/inputs/input copy.w7x_from_wout_lowres"
 vmec_lane = "forward"
 vmec_param_family = "RBC"
 vmec_param_m = 1

@@ -6156,10 +6156,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     prepared_delta_shapes,
                     prepared_delta_treedef,
                 )
+
+                def _add_local_prepared_delta(full, local_delta):
+                    full_arr = jnp.asarray(full)
+                    if not jnp.issubdtype(full_arr.dtype, jnp.inexact):
+                        return full
+                    return full_arr.at[radius_index].add(jnp.asarray(local_delta, dtype=full_arr.dtype))
+
                 support_value = dataclasses.replace(
                     support,
                     center_prepared=jax.tree_util.tree_map(
-                        lambda full, local_delta: full.at[radius_index].add(local_delta),
+                        _add_local_prepared_delta,
                         support.center_prepared,
                         prepared_delta,
                     ),
