@@ -3110,8 +3110,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     support_reuse_count = 0
     support_rebuild_count = 0
+    print(
+        f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
+        f"segments={segment_count} segment_length="
+        f"{int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[1])} "
+        f"objectives={objective_count} cotangent_mode={cotangent_mode}",
+        flush=True,
+    )
     phase_start = time.perf_counter()
     for segment_index in range(segment_count - 1, -1, -1):
+        segment_phase_start = time.perf_counter()
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         reduced_bars, segment_support_bar_leaves = (
@@ -3124,6 +3132,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 support_payload,
             )
         )
+        reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
+            (reduced_bars, segment_support_bar_leaves)
+        )
         support_bar_leaves = tuple(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, segment_support_bar_leaves)
@@ -3133,12 +3144,24 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             for accumulated, increment in zip(step_support_bar_leaves_accum, segment_support_bar_leaves)
         )
         segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
-        support_reuse_count += int(np.count_nonzero(segment_lagged_valid))
-        support_rebuild_count += int(segment_lagged_valid.size - np.count_nonzero(segment_lagged_valid))
+        segment_support_reuse_count = int(np.count_nonzero(segment_lagged_valid))
+        segment_support_rebuild_count = int(segment_lagged_valid.size - segment_support_reuse_count)
+        support_reuse_count += segment_support_reuse_count
+        support_rebuild_count += segment_support_rebuild_count
+        print(
+            f"{progress_prefix} progress: support reverse segment "
+            f"{segment_index + 1}/{segment_count} ready "
+            f"elapsed_s={time.perf_counter() - segment_phase_start:.3f} "
+            f"active_steps={int(segment_lagged_valid.size)} "
+            f"support_reuse={segment_support_reuse_count} "
+            f"support_rebuild={segment_support_rebuild_count}",
+            flush=True,
+        )
     reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        f"elapsed_s={time.perf_counter() - phase_start:.3f} "
+        f"support_reuse={support_reuse_count} support_rebuild={support_rebuild_count}",
         flush=True,
     )
 
