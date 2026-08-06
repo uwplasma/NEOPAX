@@ -5710,7 +5710,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
-        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        n_species = int(self.species.number_species)
+        species_indices = jnp.arange(n_species, dtype=jnp.int32)
         radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
         def _momentum_matrices_per_radius(radius_index):

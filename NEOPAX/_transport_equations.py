@@ -787,6 +787,10 @@ class ElectricFieldEquation(EquationBase):
         ambipolar_flux_center = 0.5 * (Gamma_faces[:, :-1] + Gamma_faces[:, 1:])
         return jnp.sum(self.charge_qp[:, None] * ambipolar_flux_center, axis=0)
 
+    def _charge_flux_faces_from_gamma(self, Gamma):
+        Gamma_faces = self.gamma_faces_builder(Gamma)
+        return jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+
     def _er_diffusion(self, Er):
         # When DEr == 0 we want a true pure-ambipolar RHS, not 0 * NaN.
         if float(self.DEr) == 0.0:
@@ -820,6 +824,35 @@ class ElectricFieldEquation(EquationBase):
         ambi_term = charge_flux * elementary_charge * 1.0e-3 / plasma_permitivity
         return charge_flux, ambi_term
 
+    def _outer_face_ambi_term(self, state, Gamma, plasma_permitivity):
+        charge_flux_faces = self._charge_flux_faces_from_gamma(Gamma)
+        charge_flux_edge = charge_flux_faces[-1]
+        mode = str(self.permitivity_mode).strip().lower()
+        if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
+            density_indices = self.ntss_density_indices
+            if density_indices is None:
+                ni_mid = jnp.asarray(1.0, dtype=charge_flux_edge.dtype)
+            else:
+                ni_mid = jnp.sum(state.density[density_indices, state.density.shape[1] // 2])
+            ni_mid = jnp.maximum(ni_mid, jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype))
+            coeffG = (
+                jnp.asarray(95780.0, dtype=charge_flux_edge.dtype)
+                * jnp.asarray(self.ntss_B0_mid, dtype=charge_flux_edge.dtype) ** 2
+                / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux_edge.dtype))
+            )
+            return coeffG * (charge_flux_edge * jnp.asarray(1.0e-20, dtype=charge_flux_edge.dtype))
+
+        plasma_permitivity_edge = (
+            1.5 * plasma_permitivity[-1] - 0.5 * plasma_permitivity[-2]
+            if plasma_permitivity.shape[0] >= 2
+            else plasma_permitivity[-1]
+        )
+        plasma_permitivity_edge = jnp.maximum(
+            plasma_permitivity_edge,
+            jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype),
+        )
+        return charge_flux_edge * elementary_charge * 1.0e-3 / plasma_permitivity_edge
+
     def debug_components(self, state, fluxes=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
@@ -831,11 +864,13 @@ class ElectricFieldEquation(EquationBase):
         )
         Gamma = fluxes["Gamma"]
         charge_flux, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
+        ambi_term_edge = self._outer_face_ambi_term(state, Gamma, plasma_permitivity)
         er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
         return {
             "charge_flux": charge_flux,
             "plasma_permitivity": plasma_permitivity,
             "ambi_term": ambi_term,
+            "ambi_term_edge": ambi_term_edge,
             "er_diffusive_flux": er_diffusive_flux,
             "er_diffusion": er_diffusion,
         }
@@ -854,7 +889,7 @@ class ElectricFieldEquation(EquationBase):
         _, Er_diffusion = self._er_diffusion(Er)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
         if self.boundary_mode == "floating_ambipolar_edge":
-            SourceEr = SourceEr.at[-1].set(-self.Er_relax * ambi_term[-1])
+            SourceEr = SourceEr.at[-1].set(-self.Er_relax * self._outer_face_ambi_term(state, Gamma, plasma_permitivity))
         SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
 

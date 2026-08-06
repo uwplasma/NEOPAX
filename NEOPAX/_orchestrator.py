@@ -42,6 +42,7 @@ from ._transport_flux_models import (
     compute_total_power_mw,
     get_transport_flux_model,
 )
+from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
 
 try:
     import tomli as toml
@@ -278,25 +279,10 @@ def _build_state(config: dict, geometry, species: Species):
 
 
 def _apply_configured_er_dirichlet_boundaries(config: dict, state: TransportState | None):
-    if state is None:
-        return state
-
-    er_cfg = config.get("boundary", {}).get("Er", {})
-    if not isinstance(er_cfg, dict):
-        return state
-
-    er = state.Er
-    left_cfg = er_cfg.get("left", {})
-    if isinstance(left_cfg, dict) and str(left_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in left_cfg:
-        left_value = jnp.asarray(left_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[0].set(left_value)
-
-    right_cfg = er_cfg.get("right", {})
-    if isinstance(right_cfg, dict) and str(right_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in right_cfg:
-        right_value = jnp.asarray(right_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[-1].set(right_value)
-
-    return dataclasses.replace(state, Er=er)
+    del config
+    # Face-based FV transport keeps BCs in the face closures. State
+    # initialization should not collapse cell centers onto boundary values.
+    return state
 
 
 def _resolve_er_right_boundary_mode(config: dict, solver_cfg: dict) -> str:
@@ -328,44 +314,11 @@ def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
 
 
 def _apply_boundary_corrected_state_for_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
-    if state is None or runtime.geometry is None:
-        return state
-
-    from ._boundary_conditions import build_boundary_condition_model, preprocess_cell_centered_boundary_guess
-
-    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
-    dr = getattr(runtime.geometry, "dr", 1.0)
-    face_centers = runtime.geometry.r_grid_half
-
-    density = state.density
-    pressure = state.pressure
-
-    density_bc_cfg = boundary_cfg.get("density")
-    if density_bc_cfg is not None:
-        density_bc = build_boundary_condition_model(
-            density_bc_cfg,
-            dr,
-            species_names=runtime.species.names,
-        )
-        density = preprocess_cell_centered_boundary_guess(density, density_bc, face_centers)
-
-    temperature = pressure / safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6))
-    temperature_bc_cfg = boundary_cfg.get("temperature")
-    if temperature_bc_cfg is not None:
-        temperature_bc = build_boundary_condition_model(
-            temperature_bc_cfg,
-            dr,
-            species_names=runtime.species.names,
-        )
-        temperature = preprocess_cell_centered_boundary_guess(temperature, temperature_bc, face_centers)
-
-    temperature = safe_temperature(temperature, runtime.solver_parameters.get("temperature_floor"))
-    corrected = dataclasses.replace(
-        state,
-        density=density,
-        pressure=safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6)) * temperature,
-    )
-    return _apply_configured_er_dirichlet_boundaries(config, corrected)
+    del config, runtime
+    # Keep initialization states cell-centered; do not project endpoints onto
+    # boundary values or gradients. Ambipolar/root solvers should see the same
+    # center state that the FV transport solver evolves.
+    return state
 
 
 def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
@@ -1404,6 +1357,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)
     do_hdf5 = transport_cfg.get("transport_write_hdf5", False)
+    do_print_summary = bool(transport_cfg.get("transport_print_summary", False))
     do_residual_compare = transport_cfg.get("transport_compare_ambipolarity_residual", False)
     do_residual_scan = transport_cfg.get("transport_scan_ambipolarity_residual", False)
     output_dir = transport_cfg.get("transport_output_dir", None)
@@ -1456,6 +1410,38 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 species=runtime.species,
                 source_models=runtime.models.source,
             )
+        if do_print_summary:
+            if isinstance(result, dict):
+                def _scalar_value(key, default=None):
+                    import jax as _jax
+
+                    value = result.get(key, default)
+                    if value is None:
+                        return default
+                    return _jax.device_get(value)
+
+                n_steps = _scalar_value("n_steps", None)
+                done = _scalar_value("done", None)
+                failed = _scalar_value("failed", None)
+                fail_code = _scalar_value("fail_code", None)
+                final_time = _scalar_value("final_time", None)
+                print(
+                    "[NEOPAX] transport summary:",
+                    f"output_dir={output_dir}",
+                    f"n_steps={int(n_steps) if n_steps is not None else 'na'}",
+                    f"final_time={float(final_time):.6e}" if final_time is not None else "final_time=na",
+                    f"done={bool(done) if done is not None else 'na'}",
+                    f"failed={bool(failed) if failed is not None else 'na'}",
+                    f"fail_code={int(fail_code) if fail_code is not None else 'na'}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[NEOPAX] transport summary:",
+                    f"output_dir={output_dir}",
+                    "solver_result_type=non_dict",
+                    flush=True,
+                )
         if do_residual_compare:
             write_transport_ambipolarity_residual_comparison(
                 state=state,
@@ -1889,24 +1875,72 @@ def _append_outer_face_point_for_species_plot(values, rho, geometry=None, bc_mod
     ):
         return _radial_axis_for_array(values, rho, geometry), values
 
+    left_value = None
     right_value = None
-    if bc_model is not None and str(getattr(bc_model, "right_type", "dirichlet")).strip().lower() == "dirichlet":
-        bc_right = getattr(bc_model, "right_value", None)
-        if bc_right is not None:
-            bc_right = jnp.asarray(bc_right)
-            if bc_right.ndim == 0:
-                right_value = bc_right.reshape(1)
-            elif species_index is not None and bc_right.shape[0] > 0:
-                idx = min(int(species_index), int(bc_right.shape[0]) - 1)
-                right_value = jnp.asarray(bc_right[idx]).reshape(1)
+    if bc_model is not None:
+        if species_index is not None:
+            def _pick_species_bc(value):
+                if value is None:
+                    return None
+                arr = jnp.asarray(value)
+                if arr.ndim == 0:
+                    return arr
+                idx = min(int(species_index), int(arr.shape[0]) - 1)
+                return arr[idx]
+
+            bc_model = dataclasses.replace(
+                bc_model,
+                left_value=_pick_species_bc(getattr(bc_model, "left_value", None)),
+                right_value=_pick_species_bc(getattr(bc_model, "right_value", None)),
+                left_gradient=_pick_species_bc(getattr(bc_model, "left_gradient", None)),
+                right_gradient=_pick_species_bc(getattr(bc_model, "right_gradient", None)),
+                left_decay_length=_pick_species_bc(getattr(bc_model, "left_decay_length", None)),
+                right_decay_length=_pick_species_bc(getattr(bc_model, "right_decay_length", None)),
+            )
+        face_centers = None
+        if geometry is not None and hasattr(geometry, "r_grid_half"):
+            face_centers = getattr(geometry, "r_grid_half")
+        elif rho_face is not None:
+            face_centers = rho_face
+        lv, _ = left_constraints_from_bc_model(
+            bc_model,
+            values[0],
+            profile=values,
+            face_centers=face_centers,
+        )
+        rv, _ = right_constraints_from_bc_model(
+            bc_model,
+            values[-1],
+            profile=values,
+            face_centers=face_centers,
+        )
+        if lv is not None:
+            left_value = jnp.asarray(lv).reshape(1)
+        if rv is not None:
+            right_value = jnp.asarray(rv).reshape(1)
+    if left_value is None:
+        left_value = values[:1].astype(values.dtype)
     if right_value is None:
         if values.shape[0] >= 2:
             right_value = (1.5 * values[-1:] - 0.5 * values[-2:-1]).astype(values.dtype)
         else:
             right_value = values[-1:]
-    rho_plot = jnp.concatenate([rho_center, rho_face[-1:]], axis=0)
-    values_plot = jnp.concatenate([values, right_value.astype(values.dtype)], axis=0)
+    rho_plot = jnp.concatenate([rho_face[:1], rho_center, rho_face[-1:]], axis=0)
+    values_plot = jnp.concatenate([left_value.astype(values.dtype), values, right_value.astype(values.dtype)], axis=0)
     return rho_plot, values_plot
+
+
+def _boundary_model_for_plot_name(name, boundary_models):
+    if boundary_models is None:
+        return None
+    name_lower = str(name).lower()
+    if "density" in name_lower:
+        return boundary_models.get("density")
+    if "temperature" in name_lower:
+        return boundary_models.get("temperature")
+    if name_lower.startswith("er") or "electric_field" in name_lower:
+        return boundary_models.get("Er")
+    return None
 
 
 def plot_fluxes(
@@ -2266,8 +2300,6 @@ def plot_transport_solution(
     temperature_series = _select_time_slices(getattr(ys, "temperature", None), kind="species")
     er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
     species_names = list(getattr(species, "names", ())) if species is not None else []
-    bc_temperature = None if boundary_models is None else boundary_models.get("temperature")
-
     def _resolve_reference_path(path_value):
         if path_value is None:
             return None
@@ -2552,6 +2584,7 @@ def plot_transport_solution(
             return None
         species_count = int(first_values.shape[0])
         linestyle_cycle = ["-", "--", ":", "-."]
+        bc_plot_model = _boundary_model_for_plot_name(out_name, boundary_models)
 
         for time_idx, (time_label, values) in enumerate(series):
             values = jnp.asarray(values)
@@ -2564,7 +2597,7 @@ def plot_transport_solution(
                     values[species_idx],
                     rho,
                     geometry,
-                    bc_model=bc_temperature if "temperature" in out_name.lower() else None,
+                    bc_model=bc_plot_model,
                     species_index=species_idx,
                 )
                 ax.plot(rho_plot, values_plot, color=color, linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH)
@@ -2595,7 +2628,7 @@ def plot_transport_solution(
                     ref_values = reference_profiles.get(species_name)
                     if ref_values is not None:
                         linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
-                        rho_plot, ref_plot = _append_outer_face_point_for_species_plot(ref_values, rho, geometry)
+                        rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                         ax.plot(
                             rho_plot,
                             ref_plot,
@@ -2676,6 +2709,7 @@ def plot_transport_solution(
         if not color_cycle:
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
         species_count = int(jnp.asarray(series[0][1]).shape[0])
+        bc_plot_model = _boundary_model_for_plot_name(out_stem, boundary_models)
         for species_idx in range(species_count):
             fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
             for time_idx, (time_label, values) in enumerate(series):
@@ -2685,7 +2719,7 @@ def plot_transport_solution(
                     values[species_idx],
                     rho,
                     geometry,
-                    bc_model=bc_temperature if "temperature" in out_stem.lower() else None,
+                    bc_model=bc_plot_model,
                     species_index=species_idx,
                 )
                 ax.plot(rho_plot, values_plot, color=color, linewidth=_TRANSPORT_LINEWIDTH, label=label)
@@ -2744,9 +2778,15 @@ def plot_transport_solution(
         if not series:
             return None
         fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        bc_plot_model = _boundary_model_for_plot_name(out_name, boundary_models)
         for time_idx, (time_label, values) in enumerate(series):
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-            rho_plot, values_plot = _append_outer_face_point_for_plot(values, rho, geometry)
+            rho_plot, values_plot = _append_outer_face_point_for_species_plot(
+                values,
+                rho,
+                geometry,
+                bc_model=bc_plot_model,
+            )
             ax.plot(rho_plot, values_plot, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         if reference_key is not None:
             for ref_spec in reference_profile_sets:

@@ -22,6 +22,71 @@ DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE = "compact_vjp"
 DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY = "inline"
 DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA = "ntx_helper"
 
+
+def _apply_transport_solver_backend_override(config: dict, backend_override: str | None) -> None:
+    """Switch the benchmark TOML between solver backends without editing the file."""
+    if backend_override in (None, "", "config"):
+        return
+    backend = str(backend_override).strip().lower()
+    solver_cfg = config.setdefault("transport_solver", {})
+    solver_cfg["transport_solver_backend"] = backend
+    solver_cfg["integrator"] = backend
+    if backend in {"theta", "theta_newton"}:
+        solver_cfg.setdefault("theta_implicit", 1.0)
+        solver_cfg.setdefault("theta_predictor_mode", "linearized")
+        solver_cfg.setdefault(
+            "theta_rhs_mode",
+            solver_cfg.get("radau_rhs_mode", solver_cfg.get("rhs_mode", "lagged_response")),
+        )
+        if backend == "theta_newton":
+            solver_cfg.setdefault("theta_controller_mode", "current")
+            solver_cfg.setdefault("theta_jacobian_reuse_mode", "refresh_each_iteration")
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_mode",
+                solver_cfg.get("lagged_response_reuse_mode", "retry_only"),
+            )
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_rtol",
+                solver_cfg.get("lagged_response_reuse_rtol", 5.0e-2),
+            )
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_atol",
+                solver_cfg.get("lagged_response_reuse_atol", 1.0e-8),
+            )
+
+
+def _run_transport_solver_forward_smoke(*, args, solver, solve_vector_field, runtime, baseline_state) -> None:
+    phase_start = time.perf_counter()
+    print(
+        "[autodiff-gate] progress: running transport solver forward smoke "
+        f"solver={type(solver).__name__}",
+        flush=True,
+    )
+    result = solver.solve(baseline_state, solve_vector_field, runtime.species)
+    final_state = result["final_state"]
+    objective_values = _objective_vector(final_state, runtime)
+    jax.block_until_ready(objective_values)
+    objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+    print(
+        "[autodiff-gate] mode=transport_solver_forward_smoke "
+        f"solver={type(solver).__name__} objective=all "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
+    print("[autodiff-gate] forward-smoke objective values:", flush=True)
+    for label, value in zip(OBJECTIVE_LABELS, objective_values_np, strict=False):
+        print(f"  - {label}: value={value:.16e}", flush=True)
+    if "n_steps" in result:
+        print(
+            "[autodiff-gate] forward-smoke solver summary: "
+            f"n_steps={int(np.asarray(jax.device_get(result['n_steps'])))} "
+            f"done={bool(np.asarray(jax.device_get(result.get('done', False))))} "
+            f"failed={bool(np.asarray(jax.device_get(result.get('failed', False))))} "
+            f"fail_code={int(np.asarray(jax.device_get(result.get('fail_code', 0))))}",
+            flush=True,
+        )
+
+
 from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
@@ -4182,6 +4247,15 @@ def _run_realtime_geometry_reverse_mode(
         f"local_devices={[str(device) for device in jax.local_devices()]}",
         flush=True,
     )
+    if bool(getattr(args, "transport_solver_forward_smoke", False)):
+        _run_transport_solver_forward_smoke(
+            args=args,
+            solver=static_solver,
+            solve_vector_field=baseline_components["solve_vector_field"],
+            runtime=baseline_runtime,
+            baseline_state=baseline_profile_state,
+        )
+        return
     if bool(args.optimization_api_smoke) or bool(args.full_transport_shared_payload_smoke):
         if str(args.realtime_geometry_gradient_path) != "reverse_payload":
             raise SystemExit(
@@ -4603,6 +4677,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--transport-solver-forward-smoke",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry setup, run only the production transport "
+            "solver forward from the benchmark initial state and print objective values. "
+            "This is useful for theta/theta_newton backend checks before running reverse."
+        ),
+    )
+    parser.add_argument(
         "--optimization-api-profile-dofs",
         choices=("include", "exclude"),
         default="include",
@@ -4644,6 +4727,17 @@ def main() -> None:
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
+    parser.add_argument(
+        "--transport-solver-backend-override",
+        choices=("config", "radau", "theta", "theta_newton"),
+        default="config",
+        help=(
+            "Override transport_solver_backend/integrator in memory for this benchmark run. "
+            "Use theta_newton to test the theta/TORAX-style production solve against the "
+            "same benchmark TOML without editing the validated Radau config. Normal reverse "
+            "uses reverse_stage_cotangent_mode='full' and dispatches by the configured solver."
+        ),
+    )
     parser.add_argument(
         "--accepted-step-limit",
         type=int,
@@ -4769,6 +4863,10 @@ def main() -> None:
             "scan_rebuild_local_moment_pullback",
             "scan_rebuild_anchor_pullback",
             "zero_step_bwd",
+            "theta_state_only",
+            "theta_zero_lagged",
+            "theta_compact_support_probe",
+            "theta_implicit_transpose_probe",
             "force_reuse_bwd",
             "force_rebuild_bwd",
             "dynamic_call_bwd",
@@ -4791,7 +4889,15 @@ def main() -> None:
             "'scan_rebuild_anchor_pullback' additionally scans over rebuild anchors and "
             "accumulates state bars directly; "
             "'zero_step_bwd' bypasses the accepted-step "
-            "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
+            "backward body inside segmented replay; for theta solvers, 'full' dispatches "
+            "to the one-step theta implicit residual transpose; theta-only diagnostics "
+            "'theta_state_only' and 'theta_zero_lagged' replay the theta realized schedule "
+            "through state/carry cotangents but intentionally return zero support-payload bars; "
+            "'theta_compact_support_probe' additionally threads support as a VJP primal and "
+            "uses compact lagged-RHS support pullbacks for diagnosis; "
+            "'theta_implicit_transpose_probe' uses a one-step theta residual transpose "
+            "and compact RHS/rebuild support pullbacks; "
+            "'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Most non-full "
             "diagnostic modes intentionally change gradients unless the forced branch matches the "
             "realized primal branch for every accepted step; 'scan_rebuild_local_moment_pullback' "
@@ -4976,6 +5082,9 @@ def main() -> None:
         ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
+        config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})
     if args.ntx_radial_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_radial_batch_size"] = int(args.ntx_radial_batch_size)

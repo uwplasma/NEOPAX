@@ -1,8 +1,9 @@
 # Focused transport debug case:
-# - density frozen
+# - density frozen except He
 # - pressure evolved for e, D, T
 # - Er evolved
-# - startup prints thermal and Er term breakdowns
+# - same physics setup as Solve_Transport_equations_wHe_radau.toml
+# - theta/Newton time stepping
 
 [general]
 mode = "transport"
@@ -15,16 +16,8 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_database"
 entropy_model = "ntx_database"
-neoclassical_file = "./examples/inputs/Dij_NEOPAX_FULL_S_NEW_Er_Opt.h5"
-interpolation_mode = "preprocessed_3d"
-
-
-
-
-
-
-
-
+neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
+interpolation_mode = "preprocessed_3d_radial_ntss1d"
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -43,11 +36,10 @@ er_ambipolar_reference_er_label = "reference Er"
 er_ambipolar_plot = true
 er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux"
 
-
 [turbulence]
 flux_model = "turbulent_power_analytical"
-chi_density = [6.5e-05, 6.5e-05, 6.5e-05,6.5e-05]
-chi_temperature = [0.0065, 0.0065, 0.0065,0.0065]
+chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 6.5e-05]
+chi_temperature = [0.0065, 0.0065, 0.0065, 0.0065]
 
 [classical]
 flux_model = "none"
@@ -57,9 +49,9 @@ n_x = 4
 
 [species]
 n_species = 4
-names = ["e", "D", "T","He"]
-mass_mp = [0.000544617, 2.0, 3.0,4.0]
-charge_qp = [-1.0, 1.0, 1.0,2.0]
+names = ["e", "D", "T", "He"]
+mass_mp = [0.000544617, 2.0, 3.0, 4.0]
+charge_qp = [-1.0, 1.0, 1.0, 2.0]
 
 [profiles]
 model = "standard_analytical"
@@ -67,46 +59,52 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.4, 0.4,0.1]
+c_density = [1.0, 0.5, 0.5, 0.0]
 c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
 n_scale = [0.65, 0.65, 0.65, 0.0]
-T_scale =  0.7
+T_scale = 0.7
 er_initialization_mode = "ambipolar_min_entropy"
 er0_scale = 100.0
 er0_peak_rho = 0.8
 
 [boundary.density.left]
 type = "neumann"
+
 [boundary.density.left.gradient]
 default = 0.0
+
 [boundary.density.right]
 type = "dirichlet"
+
 [boundary.density.right.value]
 e = 0.39
 D = 0.195
 T = 0.195
 He = 0.0
 
-
 [boundary.temperature.left]
 type = "neumann"
+
 [boundary.temperature.left.gradient]
 default = 0.0
+
 [boundary.temperature.right]
 type = "robin"
+
 [boundary.temperature.right.value]
 default = 1.0
+
 [boundary.temperature.right.decay_length]
 default = 0.05
 
 [boundary.Er.left]
 type = "dirichlet"
 value = 0.0
+
 [boundary.Er.right]
 type = "floating_ambipolar_edge"
-
 
 [equations]
 toggle_density = [false, false, false, true]
@@ -116,10 +114,14 @@ toggle_Er = true
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
 density = ["dt_reaction"]
+
 [sources.parameters.power_exchange]
 mode = "exclude_frozen"
+coulomb_log_mode = "ntssfusion"
 
-
+[sources.parameters.bremsstrahlung_radiation]
+coefficient_mode = "neopax"
+delta_zeff = 0.0
 
 [transport_solver]
 density_floor = 1.0e-3
@@ -127,25 +129,32 @@ temperature_floor = 1.0e-3
 transport_solver_backend = "theta_newton"
 integrator = "theta_newton"
 theta_implicit = 1.0
+theta_rhs_mode = "lagged_response"
 theta_predictor_mode = "linearized"
+theta_controller_mode = "current"
+theta_jacobian_reuse_mode = "refresh_each_iteration"
+theta_lagged_response_reuse_mode = "retry_only"
+theta_lagged_response_reuse_rtol = 5.0e-2
+theta_lagged_response_reuse_atol = 1.0e-8
 use_predictor_corrector = true
 n_corrector_steps = 2
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
 theta_delta_reduction_factor = 0.5
 theta_tau_min = 0.01
+theta_target_nonlinear_iterations = 4
 t0 = 0.0
 t_final = 20.0
 dt = 5.0e-5
-min_step = 1.0e-8
 max_step = 1.0
+min_step = 1.0e-14
 safety_factor = 0.9
 min_step_factor = 0.5
 max_step_factor = 1.5
-theta_target_nonlinear_iterations = 4
 max_steps = 20000
 throw = false
-debug_stage_markers = true
+debug_stage_markers = false
+debug_walltime_attempts = false
 debug_disable_jit = false
 save_n = 10
 
@@ -160,13 +169,18 @@ Er_source_mode = "ambipolar_local"
 work_source_mode = "local"
 Er_relax = 0.1
 DEr = 2.0
+Er_permittivity_mode = "ntss_like_midpoint"
 
 [transport_output]
+transport_print_summary = true
 transport_plot = true
-transport_write_hdf5 = false
+transport_write_hdf5 = true
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
-transport_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
-transport_output_dir = "./outputs/transport_wHe_theta"
+transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
+transport_initial_reference_label = "Initial NTSS"
+transport_final_reference_label = "Final NTSS"
+transport_output_dir = "./docs/benchmark/figures/transport_solver_theta_wHe"
 transport_plot_n_times = -1

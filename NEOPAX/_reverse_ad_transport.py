@@ -12,6 +12,7 @@ import copy
 import contextlib
 import dataclasses
 import io
+import inspect
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -56,20 +57,41 @@ from ._transport_flux_models import (
     _sanitize_float_delta_bar_tree,
 )
 from ._transport_solvers import (
+    RADAUSolver,
+    NewtonThetaMethodSolver,
+    ThetaMethodSolver,
     _RadauAcceptedStepReducedCotangent,
+    _ThetaStepState,
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
+    _flat_rhs_factory,
+    _flat_rhs_build_support_pullback_factory,
+    _flat_rhs_lagged_response_pullback_factory,
+    _flat_rhs_lagged_response_support_pullback_factory,
+    _flat_rhs_state_pullback_factory,
+    _flat_rhs_with_lagged_response_factory,
+    _lagged_response_hooks,
     _make_radau_initial_step_state,
     _make_solver_state_transform,
     _radau_adaptive_schedule_rollout,
+    _theta_basic_accepted_step_attempt,
+    _theta_basic_adaptive_schedule_rollout,
+    _theta_basic_step_from_attempt_fn,
+    _theta_initial_reuse_state,
+    _theta_make_attempt_context,
+    _theta_newton_accepted_step_attempt,
+    _theta_newton_adaptive_schedule_rollout,
+    _theta_newton_step_from_attempt_fn,
+    _theta_prepare_lagged_response,
     _project_flat_state_if_needed,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
     _radau_eval_rhs,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
+    _radau_sanitize_support_delta_bar_tree,
     _radau_zero_support_delta_tree_like,
 )
 
@@ -270,7 +292,7 @@ class RealtimeGeometrySupportReverseDependencies:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class RealtimeGeometryReverseStaticSetup:
-    """Static Radau reverse setup shared by benchmarks and optimization callers."""
+    """Static solver reverse setup shared by benchmarks and optimization callers."""
 
     solver: object
     solve_vector_field: object
@@ -280,6 +302,90 @@ class RealtimeGeometryReverseStaticSetup:
     max_total_steps: int
     reverse_segment_length: int | None
     require_final_time: bool = False
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReverseCarry:
+    t: Any
+    y: Any
+    lagged_response_cache: Any
+    lagged_response_valid: Any
+    lagged_reference_y: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaAcceptedStepReducedCotangent:
+    y: Any
+    lagged_response_cache: Any
+    lagged_reference_y: Any
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReversePhysicsContext:
+    unpack_flat: Any
+    pack_flat: Any = None
+    project_flat: Any = None
+    flat_rhs: Any = None
+    flat_rhs_with_lagged_response: Any = None
+    pullback_build_lagged_response: Any = None
+    flat_rhs_lagged_response_pullback: Any = None
+    flat_rhs_state_pullback: Any = None
+    flat_rhs_build_support_pullback: Any = None
+    flat_rhs_lagged_response_support_pullback: Any = None
+    reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaPreparedReverseRollout:
+    solver: Any
+    state: Any
+    vector_field: Any
+    species: Any
+    temperature_active_mask: Any
+    fixed_temperature_profile: Any
+    density_floor: Any
+    temperature_floor: Any
+    initial_carry: _ThetaReverseCarry
+    physics_context: _ThetaReversePhysicsContext
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReverseExecutionContext:
+    solver: Any
+    prepared_rollout: _ThetaPreparedReverseRollout
+    physics_context: _ThetaReversePhysicsContext
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReverseScheduleTrace:
+    accepted_mask: Any
+    active_mask: Any
+    t_start: Any
+    y_start: Any
+    lagged_response_cache_start: Any
+    lagged_response_valid_start: Any
+    err_norms: Any
+    attempted_dts: Any
+    next_dts: Any
+    step_ts: Any
+    next_recent_reject_count: Any
+    next_regrowth_cooldown: Any
+    next_easy_growth_streak: Any
+    next_lagged_response_valid: Any
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ThetaReverseScheduleRolloutResult:
+    final_step_state: Any
+    final_carry: _ThetaReverseCarry
+    trace: _ThetaReverseScheduleTrace
+    attempt_count: Any
+    accepted_count: Any
+    completed: Any
+    failed: Any
+    fail_code: Any
 
 
 TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
@@ -632,6 +738,1497 @@ def lagged_response_pullback_from_owner(solve_vector_field):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _require_reverse_solver_radau(solver, capability: str) -> None:
+    if isinstance(solver, RADAUSolver):
+        return
+    solver_name = type(solver).__name__
+    raise ValueError(
+        f"{capability} currently requires RADAUSolver because the reverse path "
+        "uses Radau-private accepted-step rollout/VJP/segment rules; "
+        f"got {solver_name}. Add the theta implementation behind this solver-neutral "
+        "dispatch layer before enabling theta for this reverse capability."
+    )
+
+
+def _require_reverse_execution_context_radau(execution_context, capability: str) -> None:
+    kernel_context = getattr(execution_context, "kernel_context", None)
+    if hasattr(kernel_context, "radau_transform"):
+        return
+    context_name = type(execution_context).__name__
+    raise ValueError(
+        f"{capability} currently requires a Radau reverse execution context because "
+        "the reverse path uses Radau-private accepted-step rollout/VJP/segment rules; "
+        f"got {context_name}. Add the theta implementation behind this solver-neutral "
+        "dispatch layer before enabling theta for this reverse capability."
+    )
+
+
+def _is_theta_reverse_solver(solver) -> bool:
+    return isinstance(solver, (ThetaMethodSolver, NewtonThetaMethodSolver))
+
+
+def _build_prepared_theta_reverse_rollout(*, solver, state, vector_field, species):
+    temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+    density_floor, temperature_floor = _extract_state_regularization(vector_field)
+    flat_state0, unpack_flat, _unpack_packed, pack_flat, project_flat = _make_solver_state_transform(
+        state,
+        species,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
+    )
+    args = (species,)
+    kwargs = {}
+    flat_rhs = _flat_rhs_factory(
+        unpack_flat,
+        vector_field,
+        args,
+        kwargs,
+        project_flat=project_flat,
+    )
+    flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+        unravel=unpack_flat,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
+    flat_rhs_lagged_response_pullback = _flat_rhs_lagged_response_pullback_factory(
+        unpack_flat,
+        vector_field,
+        args,
+        kwargs,
+        project_flat=project_flat,
+    )
+    flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
+        unpack_flat,
+        pack_flat,
+        vector_field,
+        args,
+        kwargs,
+        project_flat=project_flat,
+    )
+    pullback_build_lagged_response = lagged_response_pullback_from_owner(vector_field)
+    flat_rhs_build_support_pullback = _flat_rhs_build_support_pullback_factory(
+        unpack_flat,
+        vector_field,
+        args,
+        kwargs,
+        project_flat=project_flat,
+    )
+    flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
+        unpack_flat,
+        vector_field,
+        args,
+        kwargs,
+        project_flat=project_flat,
+    )
+    dtype = jnp.asarray(flat_state0).dtype
+    initial_carry = _ThetaReverseCarry(
+        t=jnp.asarray(getattr(solver, "t0", 0.0), dtype=dtype),
+        y=flat_state0,
+        lagged_response_cache=None,
+        lagged_response_valid=jnp.asarray(False),
+        lagged_reference_y=flat_state0,
+    )
+    return _ThetaPreparedReverseRollout(
+        solver=solver,
+        state=state,
+        vector_field=vector_field,
+        species=species,
+        temperature_active_mask=temperature_active_mask,
+        fixed_temperature_profile=fixed_temperature_profile,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
+        initial_carry=initial_carry,
+        physics_context=_ThetaReversePhysicsContext(
+            unpack_flat=unpack_flat,
+            pack_flat=pack_flat,
+            project_flat=project_flat,
+            flat_rhs=flat_rhs,
+            flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+            pullback_build_lagged_response=pullback_build_lagged_response,
+            flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
+            flat_rhs_state_pullback=flat_rhs_state_pullback,
+            flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
+            flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+        ),
+    )
+
+
+def _build_theta_reverse_execution_context(*, solver, prepared_rollout):
+    return _ThetaReverseExecutionContext(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+        physics_context=prepared_rollout.physics_context,
+    )
+
+
+def _theta_solver_with_reverse_probe_limits(solver, *, max_total_steps, stop_after_accepted_steps):
+    replacements = {}
+    if max_total_steps is not None:
+        replacements["max_steps"] = int(max(1, max_total_steps))
+    if stop_after_accepted_steps is not None:
+        replacements["stop_after_accepted_steps"] = int(max(1, stop_after_accepted_steps))
+    if not replacements:
+        return solver
+    init_params = inspect.signature(type(solver).__init__).parameters
+    accepted_kinds = {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    solver_kwargs = {
+        name: getattr(solver, name)
+        for name, param in init_params.items()
+        if name != "self"
+        and hasattr(solver, name)
+        and param.kind in accepted_kinds
+    }
+    solver_kwargs.update(replacements)
+    return type(solver)(**solver_kwargs)
+
+
+def _theta_reverse_adaptive_schedule_rollout(
+    execution_context,
+    initial_carry,
+    *,
+    max_total_steps,
+    stop_after_accepted_steps,
+):
+    """Run theta's forward schedule probe and expose Radau-like metadata.
+
+    Theta and Newton-theta use the shared theta attempt helpers directly so
+    reverse setup can see real accepted/rejected schedule rows.  The remaining
+    theta reverse work is the realized-schedule VJP/segmented cotangent pass.
+    """
+
+    prepared = execution_context.prepared_rollout
+    solver = _theta_solver_with_reverse_probe_limits(
+        execution_context.solver,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    initial_state = prepared.physics_context.unpack_flat(initial_carry.y)
+    if isinstance(solver, ThetaMethodSolver):
+        rollout = _theta_basic_adaptive_schedule_rollout(
+            solver,
+            initial_state,
+            prepared.vector_field,
+            prepared.species,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        final_carry = _ThetaReverseCarry(
+            t=rollout.final_step_state.t,
+            y=rollout.final_step_state.y,
+            lagged_response_cache=rollout.final_step_state.reuse_state.lagged_response_cache,
+            lagged_response_valid=rollout.final_step_state.reuse_state.lagged_response_valid,
+            lagged_reference_y=rollout.final_step_state.reuse_state.lagged_reference_y,
+        )
+        trace = _ThetaReverseScheduleTrace(
+            accepted_mask=rollout.trace.accepted_mask,
+            active_mask=rollout.trace.active_mask,
+            t_start=rollout.trace.t_start,
+            y_start=rollout.trace.y_start,
+            lagged_response_cache_start=rollout.trace.lagged_response_cache_start,
+            lagged_response_valid_start=rollout.trace.lagged_response_valid_start,
+            err_norms=rollout.trace.err_norms,
+            attempted_dts=rollout.trace.attempted_dts,
+            next_dts=rollout.trace.next_dts,
+            step_ts=rollout.trace.step_ts,
+            next_recent_reject_count=rollout.trace.next_recent_reject_count,
+            next_regrowth_cooldown=rollout.trace.next_regrowth_cooldown,
+            next_easy_growth_streak=rollout.trace.next_easy_growth_streak,
+            next_lagged_response_valid=rollout.trace.next_lagged_response_valid,
+        )
+        return _ThetaReverseScheduleRolloutResult(
+            final_step_state=rollout.final_step_state,
+            final_carry=final_carry,
+            trace=trace,
+            attempt_count=rollout.attempt_count,
+            accepted_count=rollout.accepted_count,
+            completed=rollout.completed,
+            failed=rollout.failed,
+            fail_code=rollout.fail_code,
+        )
+    if isinstance(solver, NewtonThetaMethodSolver):
+        rollout = _theta_newton_adaptive_schedule_rollout(
+            solver,
+            initial_state,
+            prepared.vector_field,
+            prepared.species,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+        final_carry = _ThetaReverseCarry(
+            t=rollout.final_step_state.t,
+            y=rollout.final_step_state.y,
+            lagged_response_cache=rollout.final_step_state.reuse_state.lagged_response_cache,
+            lagged_response_valid=rollout.final_step_state.reuse_state.lagged_response_valid,
+            lagged_reference_y=rollout.final_step_state.reuse_state.lagged_reference_y,
+        )
+        trace = _ThetaReverseScheduleTrace(
+            accepted_mask=rollout.trace.accepted_mask,
+            active_mask=rollout.trace.active_mask,
+            t_start=rollout.trace.t_start,
+            y_start=rollout.trace.y_start,
+            lagged_response_cache_start=rollout.trace.lagged_response_cache_start,
+            lagged_response_valid_start=rollout.trace.lagged_response_valid_start,
+            err_norms=rollout.trace.err_norms,
+            attempted_dts=rollout.trace.attempted_dts,
+            next_dts=rollout.trace.next_dts,
+            step_ts=rollout.trace.step_ts,
+            next_recent_reject_count=rollout.trace.next_recent_reject_count,
+            next_regrowth_cooldown=rollout.trace.next_regrowth_cooldown,
+            next_easy_growth_streak=rollout.trace.next_easy_growth_streak,
+            next_lagged_response_valid=rollout.trace.next_lagged_response_valid,
+        )
+        return _ThetaReverseScheduleRolloutResult(
+            final_step_state=rollout.final_step_state,
+            final_carry=final_carry,
+            trace=trace,
+            attempt_count=rollout.attempt_count,
+            accepted_count=rollout.accepted_count,
+            completed=rollout.completed,
+            failed=rollout.failed,
+            fail_code=rollout.fail_code,
+        )
+
+    result = solver.solve(prepared.state, prepared.vector_field, prepared.species)
+    final_flat, *_ = _make_solver_state_transform(
+        result["final_state"],
+        prepared.species,
+        temperature_active_mask=prepared.temperature_active_mask,
+        fixed_temperature_profile=prepared.fixed_temperature_profile,
+        density_floor=prepared.density_floor,
+        temperature_floor=prepared.temperature_floor,
+    )
+    accepted_count = jnp.asarray(result.get("n_steps", 0), dtype=jnp.int32)
+    attempt_count_value = int(np.asarray(jax.device_get(accepted_count)))
+    dtype = jnp.asarray(initial_carry.y).dtype
+    active_mask = jnp.ones((attempt_count_value,), dtype=bool)
+    accepted_mask = jnp.ones((attempt_count_value,), dtype=bool)
+    zero_float_trace = jnp.zeros((attempt_count_value,), dtype=dtype)
+    zero_int_trace = jnp.zeros((attempt_count_value,), dtype=jnp.int32)
+    lagged_valid = result.get("final_reuse_lagged_response_valid", False)
+    if lagged_valid is None:
+        lagged_valid = False
+    lagged_valid_trace = jnp.full((attempt_count_value,), lagged_valid, dtype=bool)
+    final_carry = _ThetaReverseCarry(
+        t=result["final_time"],
+        y=final_flat,
+        lagged_response_cache=None,
+        lagged_response_valid=jnp.asarray(lagged_valid, dtype=bool),
+        lagged_reference_y=final_flat,
+    )
+    trace = _ThetaReverseScheduleTrace(
+        accepted_mask=accepted_mask,
+        active_mask=active_mask,
+        t_start=zero_float_trace,
+        y_start=jnp.broadcast_to(final_flat[None, ...], (attempt_count_value,) + jnp.shape(final_flat)),
+        lagged_response_cache_start=None,
+        lagged_response_valid_start=lagged_valid_trace,
+        err_norms=zero_float_trace,
+        attempted_dts=zero_float_trace,
+        next_dts=zero_float_trace,
+        step_ts=zero_float_trace,
+        next_recent_reject_count=zero_int_trace,
+        next_regrowth_cooldown=zero_int_trace,
+        next_easy_growth_streak=zero_int_trace,
+        next_lagged_response_valid=lagged_valid_trace,
+    )
+    return _ThetaReverseScheduleRolloutResult(
+        final_step_state=None,
+        final_carry=final_carry,
+        trace=trace,
+        attempt_count=accepted_count,
+        accepted_count=accepted_count,
+        completed=result["done"],
+        failed=result["failed"],
+        fail_code=result["fail_code"],
+    )
+
+
+def _build_prepared_reverse_accepted_rollout(*, solver, state, vector_field, species):
+    # Solver-neutral seam: theta support should be added here, not in callers.
+    if _is_theta_reverse_solver(solver):
+        return _build_prepared_theta_reverse_rollout(
+            solver=solver,
+            state=state,
+            vector_field=vector_field,
+            species=species,
+        )
+    _require_reverse_solver_radau(solver, "prepared reverse accepted rollout")
+    return _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state,
+        vector_field=vector_field,
+        species=species,
+    )
+
+
+def _build_prepared_reverse_execution_context(*, solver, prepared_rollout):
+    if _is_theta_reverse_solver(solver):
+        return _build_theta_reverse_execution_context(
+            solver=solver,
+            prepared_rollout=prepared_rollout,
+        )
+    _require_reverse_solver_radau(solver, "prepared reverse execution context")
+    return _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+
+
+def _reverse_adaptive_schedule_rollout(
+    execution_context,
+    initial_carry,
+    *,
+    max_total_steps,
+    stop_after_accepted_steps,
+):
+    if isinstance(execution_context, _ThetaReverseExecutionContext):
+        return _theta_reverse_adaptive_schedule_rollout(
+            execution_context,
+            initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+        )
+    _require_reverse_execution_context_radau(execution_context, "reverse adaptive schedule rollout")
+    return _radau_adaptive_schedule_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+
+
+def _theta_adaptive_final_y_realized_schedule_vjp_fwd(
+    execution_context,
+    max_total_steps,
+    stop_after_accepted_steps,
+    reverse_segment_length,
+    initial_carry,
+):
+    rollout = _theta_reverse_adaptive_schedule_rollout(
+        execution_context,
+        initial_carry,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    segment_start_carries = None
+    segmented_final_carry = None
+    segmented_replay_arrays = None
+    if reverse_segment_length is not None and int(reverse_segment_length) > 0:
+        segment_length = int(reverse_segment_length)
+        accepted_limit = int(stop_after_accepted_steps) if stop_after_accepted_steps is not None else int(max_total_steps)
+        segment_count = (accepted_limit + segment_length - 1) // segment_length
+        padded_count = segment_count * segment_length
+        accepted_active_mask = jnp.logical_and(active_mask, accepted_mask)
+        accepted_count = jnp.minimum(
+            jnp.sum(accepted_active_mask.astype(jnp.int32)),
+            jnp.asarray(accepted_limit, dtype=jnp.int32),
+        )
+        accepted_positions = jnp.nonzero(
+            accepted_active_mask,
+            size=accepted_limit,
+            fill_value=0,
+        )[0]
+
+        def _compact_and_pad(values):
+            compact = jnp.take(values, accepted_positions, axis=0)
+            pad_count = padded_count - accepted_limit
+            if pad_count == 0:
+                return compact
+            pad_values = jnp.repeat(compact[-1:], pad_count, axis=0)
+            return jnp.concatenate([compact, pad_values], axis=0)
+
+        def _compact_and_pad_tree(tree):
+            if tree is None:
+                return None
+            return jax.tree_util.tree_map(_compact_and_pad, tree)
+
+        replay_active_mask = jnp.concatenate(
+            [
+                jnp.arange(accepted_limit, dtype=jnp.int32) < accepted_count,
+                jnp.zeros((padded_count - accepted_limit,), dtype=jnp.bool_),
+            ],
+            axis=0,
+        )
+        replay_attempted_dts = _compact_and_pad(attempted_dts)
+        replay_next_dts = _compact_and_pad(next_dts)
+        replay_next_recent_reject_count = _compact_and_pad(next_recent_reject_count)
+        replay_next_regrowth_cooldown = _compact_and_pad(next_regrowth_cooldown)
+        replay_next_easy_growth_streak = _compact_and_pad(next_easy_growth_streak)
+        replay_next_lagged_response_valid = _compact_and_pad(next_lagged_response_valid)
+        segmented_replay_arrays = (
+            replay_active_mask.reshape((segment_count, segment_length)),
+            replay_attempted_dts.reshape((segment_count, segment_length)),
+            replay_next_dts.reshape((segment_count, segment_length)),
+            replay_next_recent_reject_count.reshape((segment_count, segment_length)),
+            replay_next_regrowth_cooldown.reshape((segment_count, segment_length)),
+            replay_next_easy_growth_streak.reshape((segment_count, segment_length)),
+            replay_next_lagged_response_valid.reshape((segment_count, segment_length)),
+        )
+        compact_start_carries = _ThetaReverseCarry(
+            t=_compact_and_pad(jax.lax.stop_gradient(rollout.trace.t_start)),
+            y=_compact_and_pad(jax.lax.stop_gradient(rollout.trace.y_start)),
+            lagged_response_cache=_compact_and_pad_tree(
+                jax.lax.stop_gradient(rollout.trace.lagged_response_cache_start)
+            ),
+            lagged_response_valid=_compact_and_pad(
+                jax.lax.stop_gradient(rollout.trace.lagged_response_valid_start)
+            ),
+            lagged_reference_y=_compact_and_pad(jax.lax.stop_gradient(rollout.trace.y_start)),
+        )
+        segment_start_carries = _ThetaReverseCarry(
+            t=compact_start_carries.t.reshape((segment_count, segment_length) + compact_start_carries.t.shape[1:])[:, 0],
+            y=compact_start_carries.y.reshape((segment_count, segment_length) + compact_start_carries.y.shape[1:])[:, 0],
+            lagged_response_cache=(
+                None
+                if compact_start_carries.lagged_response_cache is None
+                else jax.tree_util.tree_map(
+                    lambda value: value.reshape((segment_count, segment_length) + value.shape[1:])[:, 0],
+                    compact_start_carries.lagged_response_cache,
+                )
+            ),
+            lagged_response_valid=compact_start_carries.lagged_response_valid.reshape(
+                (segment_count, segment_length) + compact_start_carries.lagged_response_valid.shape[1:]
+            )[:, 0],
+            lagged_reference_y=compact_start_carries.lagged_reference_y.reshape(
+                (segment_count, segment_length) + compact_start_carries.lagged_reference_y.shape[1:]
+            )[:, 0],
+        )
+        segmented_final_carry = rollout.final_carry
+    residuals = (
+        initial_carry,
+        active_mask,
+        accepted_mask,
+        attempted_dts,
+        next_dts,
+        next_recent_reject_count,
+        next_regrowth_cooldown,
+        next_easy_growth_streak,
+        next_lagged_response_valid,
+        segment_start_carries,
+        segmented_final_carry,
+        segmented_replay_arrays,
+    )
+    return rollout.final_carry.y, residuals
+
+
+def _reverse_adaptive_final_y_realized_schedule_vjp_fwd(
+    execution_context,
+    max_total_steps,
+    stop_after_accepted_steps,
+    reverse_segment_length,
+    initial_carry,
+):
+    if isinstance(execution_context, _ThetaReverseExecutionContext):
+        return _theta_adaptive_final_y_realized_schedule_vjp_fwd(
+            execution_context,
+            max_total_steps,
+            stop_after_accepted_steps,
+            reverse_segment_length,
+            initial_carry,
+        )
+    _require_reverse_execution_context_radau(execution_context, "reverse realized-schedule VJP forward")
+    return _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+        execution_context,
+        max_total_steps,
+        stop_after_accepted_steps,
+        reverse_segment_length,
+        initial_carry,
+    )
+
+
+def _reverse_zero_support_delta_tree_like(solver, support_payload):
+    if _is_theta_reverse_solver(solver):
+        return _radau_zero_support_delta_tree_like(support_payload)
+    _require_reverse_solver_radau(solver, "reverse support-payload zero cotangent")
+    return _radau_zero_support_delta_tree_like(support_payload)
+
+
+def _reverse_align_tangent_tree_to_primal(execution_context, tangent_tree, primal_tree):
+    if isinstance(execution_context, _ThetaReverseExecutionContext):
+        return _radau_align_tangent_tree_to_primal(tangent_tree, primal_tree)
+    _require_reverse_execution_context_radau(execution_context, "reverse tangent-tree alignment")
+    return _radau_align_tangent_tree_to_primal(tangent_tree, primal_tree)
+
+
+def _theta_lagged_rhs_support_pullback(
+    physics_context,
+    *,
+    t_value,
+    y_value,
+    lagged_response,
+    rhs_bar,
+    support_payload,
+):
+    if (
+        lagged_response is None
+        or support_payload is None
+        or physics_context.flat_rhs_lagged_response_support_pullback is None
+    ):
+        return _radau_zero_support_delta_tree_like(support_payload)
+    return _radau_sanitize_support_delta_bar_tree(
+        support_payload,
+        physics_context.flat_rhs_lagged_response_support_pullback(
+            t_value,
+            y_value,
+            lagged_response,
+            rhs_bar,
+            support_payload,
+        ),
+    )
+
+
+def _theta_support_cotangent_for_vjp(primal, bar):
+    def _sanitize_leaf(primal_leaf, bar_leaf):
+        arr = jnp.asarray(primal_leaf)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return jnp.asarray(bar_leaf, dtype=arr.dtype)
+        return jnp.zeros(arr.shape, dtype=jax.dtypes.float0)
+
+    return jax.tree_util.tree_map(_sanitize_leaf, primal, bar)
+
+
+def _theta_segment_reduced_cotangent_bwd_batched_with_support_call(
+    execution_context,
+    cotangent_mode,
+    reduced_bars,
+    segment_start_carry,
+    segment_arrays,
+    support_payload,
+):
+    requested_mode = str(cotangent_mode).strip().lower()
+    # Theta has a one-state implicit residual, so the normal "full" reverse lane
+    # dispatches to the theta residual-transpose implementation directly.  The
+    # theta_* names are kept only as diagnostics/aliases for isolating pieces.
+    mode = "theta_implicit_transpose_probe" if requested_mode == "full" else requested_mode
+    zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+    objective_count = jnp.asarray(reduced_bars.y).shape[0]
+    zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support_payload)))
+    zero_support_bar_leaves = tuple(
+        jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
+        for leaf in zero_support_leaves
+    )
+    if zero_step_bwd:
+        zero_reduced_bars = _ThetaAcceptedStepReducedCotangent(
+            y=jnp.zeros(
+                (objective_count,) + jnp.shape(segment_start_carry.y),
+                dtype=jnp.asarray(segment_start_carry.y).dtype,
+            ),
+            lagged_response_cache=_reverse_align_tangent_tree_to_primal(
+                execution_context,
+                None,
+                reduced_bars.lagged_response_cache,
+            ),
+            lagged_reference_y=jnp.zeros_like(reduced_bars.lagged_reference_y),
+        )
+        return zero_reduced_bars, zero_support_bar_leaves
+    state_only_modes = {
+        "state_only",
+        "final_state",
+        "theta_state_only",
+        "theta_zero_lagged",
+        "theta_compact_support_probe",
+        "theta_implicit_transpose_probe",
+    }
+    if mode in state_only_modes:
+        solver = execution_context.solver
+        prepared = execution_context.prepared_rollout
+        physics_context = prepared.physics_context
+        unpack_flat = physics_context.unpack_flat
+        vector_field = prepared.vector_field
+        species = prepared.species
+        dtype = jnp.asarray(segment_start_carry.y).dtype
+        state_dim = jnp.asarray(segment_start_carry.y).shape[0]
+        project_flat = physics_context.project_flat
+        flat_rhs = physics_context.flat_rhs
+        flat_rhs_with_lagged_response = physics_context.flat_rhs_with_lagged_response
+        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        rhs_mode = str(getattr(solver, "rhs_mode", "black_box")).strip().lower()
+        use_lagged_linear_response = rhs_mode == "lagged_linear_state"
+        use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+        predictor_mode = getattr(solver, "predictor_mode", "linearized")
+        theta = jnp.asarray(solver.theta_implicit, dtype=dtype)
+        identity_n = jnp.eye(state_dim, dtype=dtype)
+        one = jnp.asarray(1.0, dtype=dtype)
+        t_final = jnp.asarray(solver.t1, dtype=dtype)
+
+        def _make_theta_replay_step_fn(
+            flat_rhs_replay,
+            flat_rhs_with_lagged_response_replay,
+            build_lagged_response_replay=build_lagged_response,
+        ):
+            if isinstance(solver, ThetaMethodSolver):
+                n_linearized_solves = 1 + (solver.n_corrector_steps if solver.use_predictor_corrector else 0)
+
+                def _attempt_fn(attempt_context):
+                    return _theta_basic_accepted_step_attempt(
+                        attempt_context,
+                        predictor_mode=predictor_mode,
+                        n_linearized_solves=n_linearized_solves,
+                        theta=theta,
+                        one=one,
+                        identity_n=identity_n,
+                        flat_rhs=flat_rhs_replay,
+                        flat_rhs_with_lagged_response=flat_rhs_with_lagged_response_replay,
+                        use_lagged_linear_response=use_lagged_linear_response,
+                        project_flat=project_flat,
+                        dtype=dtype,
+                        tol=jnp.asarray(solver.tol, dtype=dtype),
+                    )
+
+                def _step_fn(step_state):
+                    return _theta_basic_step_from_attempt_fn(
+                        step_state,
+                        attempt_fn=_attempt_fn,
+                        t_final=t_final,
+                        flat_rhs=flat_rhs_replay,
+                        build_lagged_response=build_lagged_response_replay,
+                        unpack_flat=unpack_flat,
+                        project_flat=project_flat,
+                        use_transport_lagged_response=use_transport_lagged_response,
+                        dtype=dtype,
+                    )
+
+                return _step_fn
+
+            n_linearized_solves = 1 + (solver.n_corrector_steps if solver.use_predictor_corrector else 0)
+            lagged_response_reuse_mode = str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower()
+            lagged_response_reuse_rtol = jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype)
+            lagged_response_reuse_atol = jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype)
+            delta_reduction_factor = jnp.asarray(solver.delta_reduction_factor, dtype=dtype)
+            tau_min = jnp.asarray(solver.tau_min, dtype=dtype)
+            jacobian_reuse_rtol = jnp.asarray(getattr(solver, "jacobian_reuse_rtol", 0.1), dtype=dtype)
+            max_jacobian_age = jnp.asarray(getattr(solver, "max_jacobian_age", 8), dtype=jnp.int32)
+            freeze_attempt_linearization = str(
+                getattr(solver, "jacobian_reuse_mode", "refresh_each_iteration")
+            ).strip().lower() == "freeze_attempt"
+
+            def _attempt_fn(attempt_context):
+                return _theta_newton_accepted_step_attempt(
+                    attempt_context,
+                    predictor_mode=predictor_mode,
+                    n_linearized_solves=n_linearized_solves,
+                    theta=theta,
+                    one=one,
+                    identity_n=identity_n,
+                    flat_rhs=flat_rhs_replay,
+                    flat_rhs_with_lagged_response=flat_rhs_with_lagged_response_replay,
+                    use_lagged_linear_response=use_lagged_linear_response,
+                    use_transport_lagged_response=use_transport_lagged_response,
+                    lagged_response_reuse_mode=lagged_response_reuse_mode,
+                    jacobian_reuse_rtol=jacobian_reuse_rtol,
+                    max_jacobian_age=max_jacobian_age,
+                    delta_reduction_factor=delta_reduction_factor,
+                    tau_min=tau_min,
+                    project_flat=project_flat,
+                    dtype=dtype,
+                    tol=jnp.asarray(solver.tol, dtype=dtype),
+                    maxiter=jnp.asarray(solver.maxiter, dtype=jnp.int32),
+                )
+
+            def _step_fn(step_state):
+                return _theta_newton_step_from_attempt_fn(
+                    step_state,
+                    attempt_fn=_attempt_fn,
+                    t_final=t_final,
+                    flat_rhs=flat_rhs_replay,
+                    build_lagged_response=build_lagged_response_replay,
+                    unpack_flat=unpack_flat,
+                    project_flat=project_flat,
+                    use_transport_lagged_response=use_transport_lagged_response,
+                    lagged_response_reuse_mode=lagged_response_reuse_mode,
+                    lagged_response_reuse_rtol=lagged_response_reuse_rtol,
+                    lagged_response_reuse_atol=lagged_response_reuse_atol,
+                    dt_min=jnp.asarray(solver.min_step, dtype=dtype),
+                    dt_max=jnp.asarray(solver.max_step, dtype=dtype),
+                    safety_factor=jnp.asarray(solver.safety_factor, dtype=dtype),
+                    min_step_factor=jnp.asarray(solver.min_step_factor, dtype=dtype),
+                    max_step_factor=jnp.asarray(solver.max_step_factor, dtype=dtype),
+                    controller_mode=str(getattr(solver, "controller_mode", "current")).strip().lower(),
+                    delta_reduction_factor=delta_reduction_factor,
+                    freeze_attempt_linearization=freeze_attempt_linearization,
+                    dtype=dtype,
+                )
+
+            return _step_fn
+
+        _step_fn = _make_theta_replay_step_fn(flat_rhs, flat_rhs_with_lagged_response)
+
+        (
+            active_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ) = segment_arrays
+
+        if mode == "theta_implicit_transpose_probe":
+            if not use_transport_lagged_response:
+                raise NotImplementedError(
+                    "theta_implicit_transpose_probe currently targets lagged transport-response theta runs."
+                )
+
+            def _initial_theta_step_state_from_carry(carry_value):
+                reuse_state = dataclasses.replace(
+                    _theta_initial_reuse_state(state_dim, dtype),
+                    lagged_response_cache=carry_value.lagged_response_cache,
+                    lagged_response_available=jnp.asarray(carry_value.lagged_response_cache is not None),
+                    lagged_response_valid=carry_value.lagged_response_valid,
+                    lagged_reference_y=carry_value.lagged_reference_y,
+                )
+                return _ThetaStepState(
+                    t=carry_value.t,
+                    y=carry_value.y,
+                    dt=attempted_dts[0],
+                    status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+                    prev_error=jnp.asarray(1.0, dtype=dtype),
+                    prev_dt=jnp.asarray(0.0, dtype=dtype),
+                    recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                    regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                    easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                    prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+                    prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+                    reuse_state=reuse_state,
+                )
+
+            def _collect_start_states(carry, slot_values):
+                active, dt_value, next_dt_value, recent_reject, cooldown, streak, lagged_valid = slot_values
+                carry = dataclasses.replace(carry, dt=dt_value)
+
+                def _run(_):
+                    next_state, _info = _step_fn(carry)
+                    next_reuse = dataclasses.replace(
+                        next_state.reuse_state,
+                        lagged_response_valid=lagged_valid,
+                    )
+                    return dataclasses.replace(
+                        next_state,
+                        dt=next_dt_value,
+                        recent_reject_count=recent_reject,
+                        regrowth_cooldown=cooldown,
+                        easy_growth_streak=streak,
+                        reuse_state=next_reuse,
+                    )
+
+                return jax.lax.cond(active, _run, lambda _: carry, operand=None), carry
+
+            _segment_final_state, step_start_states = jax.lax.scan(
+                _collect_start_states,
+                _initial_theta_step_state_from_carry(segment_start_carry),
+                segment_arrays,
+            )
+
+            def _rhs_state_pullback(t_value, y_value, lagged_response_value, rhs_bar):
+                if lagged_response_value is not None and physics_context.flat_rhs_state_pullback is not None:
+                    return physics_context.flat_rhs_state_pullback(
+                        t_value,
+                        y_value,
+                        lagged_response_value,
+                        rhs_bar,
+                    )
+
+                def _rhs_from_y(y_inner):
+                    return _radau_eval_rhs(
+                        t_value,
+                        y_inner,
+                        lagged_response_value,
+                        flat_rhs,
+                        flat_rhs_with_lagged_response,
+                    )
+
+                _, rhs_pullback = jax.vjp(_rhs_from_y, y_value)
+                (y_bar,) = rhs_pullback(rhs_bar)
+                return y_bar
+
+            def _rhs_lagged_pullback(t_value, y_value, lagged_response_value, rhs_bar):
+                if lagged_response_value is None:
+                    return None
+                if physics_context.flat_rhs_lagged_response_pullback is not None:
+                    return physics_context.flat_rhs_lagged_response_pullback(
+                        t_value,
+                        y_value,
+                        lagged_response_value,
+                        rhs_bar,
+                    )
+
+                def _rhs_from_lagged(lagged_inner):
+                    return flat_rhs_with_lagged_response(t_value, y_value, lagged_inner)
+
+                _, lagged_pullback = jax.vjp(_rhs_from_lagged, lagged_response_value)
+                (lagged_bar,) = lagged_pullback(rhs_bar)
+                return lagged_bar
+
+            def _batched_zero_like_tree(tree):
+                if tree is None:
+                    return None
+                return jax.tree_util.tree_map(
+                    lambda leaf: jnp.zeros(
+                        (objective_count,) + jnp.asarray(leaf).shape,
+                        dtype=jnp.asarray(leaf).dtype,
+                    ),
+                    tree,
+                )
+
+            def _single_step_bwd(carry, slot_xs):
+                slot_bars, support_bar_leaves = carry
+                step_state, slot_values = slot_xs
+                (
+                    active,
+                    dt_value,
+                    _next_dt_value,
+                    _recent_reject,
+                    _cooldown,
+                    _streak,
+                    _lagged_valid,
+                ) = slot_values
+
+                def _zero_step(_):
+                    return slot_bars, support_bar_leaves
+
+                def _do_step(_):
+                    carry_for_step = dataclasses.replace(step_state, dt=dt_value)
+                    next_state, _info = _step_fn(carry_for_step)
+                    h_value = jnp.asarray(dt_value, dtype=dtype)
+                    t_old = carry_for_step.t
+                    t_new = t_old + h_value
+                    y_old = carry_for_step.y
+                    y_new = next_state.y
+
+                    if isinstance(solver, ThetaMethodSolver):
+                        attempt_context = _theta_make_attempt_context(
+                            carry_for_step,
+                            t_final=t_final,
+                            flat_rhs=flat_rhs,
+                            build_lagged_response=build_lagged_response,
+                            unpack_flat=unpack_flat,
+                            project_flat=project_flat,
+                            use_transport_lagged_response=use_transport_lagged_response,
+                        )
+                        lagged_response = attempt_context.lagged_response
+                        lagged_response_reused = jnp.asarray(False)
+                        lagged_reference_y = attempt_context.lagged_reference_y
+                    else:
+                        lagged_response, lagged_reference_y, lagged_response_reused = _theta_prepare_lagged_response(
+                            carry_for_step,
+                            use_transport_lagged_response=use_transport_lagged_response,
+                            lagged_response_reuse_mode=lagged_response_reuse_mode,
+                            lagged_response_reuse_rtol=lagged_response_reuse_rtol,
+                            lagged_response_reuse_atol=lagged_response_reuse_atol,
+                            unpack_flat=unpack_flat,
+                            project_flat=project_flat,
+                            build_lagged_response=build_lagged_response,
+                        )
+
+                    def _rhs_new(y_value):
+                        return _radau_eval_rhs(
+                            t_new,
+                            y_value,
+                            lagged_response,
+                            flat_rhs,
+                            flat_rhs_with_lagged_response,
+                        )
+
+                    jac_new = jax.jacfwd(_rhs_new)(y_new)
+                    system_t = (jnp.eye(state_dim, dtype=dtype) - h_value * theta * jac_new).T
+                    lambda_rows = jax.vmap(
+                        lambda rhs: jnp.linalg.solve(system_t, jnp.asarray(rhs, dtype=dtype))
+                    )(slot_bars.y)
+
+                    f_old_coeff = h_value * (one - theta)
+                    f_new_coeff = h_value * theta
+                    old_rhs_bars = f_old_coeff * lambda_rows
+                    new_rhs_bars = f_new_coeff * lambda_rows
+
+                    old_rhs_y_bars = jax.vmap(
+                        lambda rhs_bar: _rhs_state_pullback(t_old, y_old, None, rhs_bar)
+                    )(old_rhs_bars)
+                    y_old_bars = lambda_rows + old_rhs_y_bars
+
+                    lagged_rhs_bars = jax.vmap(
+                        lambda rhs_bar: _rhs_lagged_pullback(t_new, y_new, lagged_response, rhs_bar)
+                    )(new_rhs_bars)
+                    support_rhs_bars = jax.vmap(
+                        lambda rhs_bar: _theta_lagged_rhs_support_pullback(
+                            physics_context,
+                            t_value=t_new,
+                            y_value=y_new,
+                            lagged_response=lagged_response,
+                            rhs_bar=rhs_bar,
+                            support_payload=support_payload,
+                        )
+                    )(new_rhs_bars)
+                    support_bar_leaves_next = tuple(
+                        accumulated + increment
+                        for accumulated, increment in zip(
+                            support_bar_leaves,
+                            jax.tree_util.tree_leaves(support_rhs_bars),
+                            strict=True,
+                        )
+                    )
+
+                    total_lagged_bars = _radau_align_tangent_tree_to_primal(
+                        slot_bars.lagged_response_cache,
+                        lagged_response,
+                    )
+                    total_lagged_bars = jax.tree_util.tree_map(
+                        lambda lhs, rhs: lhs + rhs,
+                        total_lagged_bars,
+                        lagged_rhs_bars,
+                    )
+                    reference_bars = jnp.asarray(slot_bars.lagged_reference_y, dtype=dtype)
+
+                    def _reuse_lagged(_):
+                        return (
+                            y_old_bars,
+                            _radau_align_tangent_tree_to_primal(
+                                total_lagged_bars,
+                                carry_for_step.reuse_state.lagged_response_cache,
+                            ),
+                            reference_bars,
+                            support_bar_leaves_next,
+                        )
+
+                    def _rebuild_lagged(_):
+                        if physics_context.pullback_build_lagged_response is not None:
+                            projected_y = _project_flat_state_if_needed(y_old, project_flat)
+                            rebuild_state = unpack_flat(projected_y)
+                            rebuild_state_bars = jax.vmap(
+                                lambda lagged_bar: physics_context.pullback_build_lagged_response(
+                                    rebuild_state,
+                                    lagged_bar,
+                                )
+                            )(total_lagged_bars)
+                            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+                            if project_flat is not None:
+                                _, project_pullback = jax.vjp(project_flat, y_old)
+                                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
+                        else:
+                            def _build_from_flat(flat_inner):
+                                projected_inner = _project_flat_state_if_needed(flat_inner, project_flat)
+                                return build_lagged_response(unpack_flat(projected_inner))
+
+                            _, build_pullback = jax.vjp(_build_from_flat, y_old)
+                            rebuild_flat_bars = jax.vmap(lambda lagged_bar: build_pullback(lagged_bar)[0])(
+                                total_lagged_bars
+                            )
+                        y_old_bars_rebuild = y_old_bars + rebuild_flat_bars + reference_bars
+                        if physics_context.flat_rhs_build_support_pullback is not None:
+                            rebuild_support_bars = jax.vmap(
+                                lambda lagged_bar: _radau_sanitize_support_delta_bar_tree(
+                                    support_payload,
+                                    physics_context.flat_rhs_build_support_pullback(
+                                        y_old,
+                                        lagged_bar,
+                                        support_payload,
+                                    ),
+                                )
+                            )(total_lagged_bars)
+                            support_bar_leaves_rebuild = tuple(
+                                accumulated + increment
+                                for accumulated, increment in zip(
+                                    support_bar_leaves_next,
+                                    jax.tree_util.tree_leaves(rebuild_support_bars),
+                                    strict=True,
+                                )
+                            )
+                        else:
+                            support_bar_leaves_rebuild = support_bar_leaves_next
+                        return (
+                            y_old_bars_rebuild,
+                            _batched_zero_like_tree(carry_for_step.reuse_state.lagged_response_cache),
+                            jnp.zeros_like(reference_bars),
+                            support_bar_leaves_rebuild,
+                        )
+
+                    y_prev, lagged_prev, reference_prev, support_bar_leaves_out = jax.lax.cond(
+                        lagged_response_reused,
+                        _reuse_lagged,
+                        _rebuild_lagged,
+                        operand=None,
+                    )
+                    return (
+                        _ThetaAcceptedStepReducedCotangent(
+                            y=y_prev,
+                            lagged_response_cache=lagged_prev,
+                            lagged_reference_y=reference_prev,
+                        ),
+                        support_bar_leaves_out,
+                    )
+
+                return jax.lax.cond(active, _do_step, _zero_step, operand=None)
+
+            start_bars, support_bar_leaves = jax.lax.scan(
+                _single_step_bwd,
+                (reduced_bars, zero_support_bar_leaves),
+                (step_start_states, segment_arrays),
+                reverse=True,
+            )[0]
+            return start_bars, support_bar_leaves
+
+        @jax.custom_vjp
+        def _compact_lagged_rhs_with_support(t_value, y_value, lagged_response_value, support_value):
+            return flat_rhs_with_lagged_response(t_value, y_value, lagged_response_value)
+
+        def _compact_lagged_rhs_with_support_fwd(t_value, y_value, lagged_response_value, support_value):
+            rhs_value = flat_rhs_with_lagged_response(t_value, y_value, lagged_response_value)
+            return rhs_value, (t_value, y_value, lagged_response_value, support_value)
+
+        def _compact_lagged_rhs_with_support_bwd(residual, rhs_bar):
+            t_value, y_value, lagged_response_value, support_value = residual
+            rhs_bar = jnp.asarray(rhs_bar, dtype=jnp.asarray(y_value).dtype)
+            if physics_context.flat_rhs_state_pullback is not None:
+                y_bar = physics_context.flat_rhs_state_pullback(
+                    t_value,
+                    y_value,
+                    lagged_response_value,
+                    rhs_bar,
+                )
+            else:
+                def _rhs_from_y(y_inner):
+                    return flat_rhs_with_lagged_response(
+                        t_value,
+                        y_inner,
+                        lagged_response_value,
+                    )
+
+                _, y_pullback = jax.vjp(_rhs_from_y, y_value)
+                (y_bar,) = y_pullback(rhs_bar)
+            if physics_context.flat_rhs_lagged_response_pullback is not None:
+                lagged_bar = physics_context.flat_rhs_lagged_response_pullback(
+                    t_value,
+                    y_value,
+                    lagged_response_value,
+                    rhs_bar,
+                )
+            else:
+                def _rhs_from_lagged(lagged_inner):
+                    return flat_rhs_with_lagged_response(
+                        t_value,
+                        y_value,
+                        lagged_inner,
+                    )
+
+                _, lagged_pullback = jax.vjp(_rhs_from_lagged, lagged_response_value)
+                (lagged_bar,) = lagged_pullback(rhs_bar)
+            support_bar = _theta_lagged_rhs_support_pullback(
+                physics_context,
+                t_value=t_value,
+                y_value=y_value,
+                lagged_response=lagged_response_value,
+                rhs_bar=rhs_bar,
+                support_payload=support_value,
+            )
+            support_bar = _theta_support_cotangent_for_vjp(support_value, support_bar)
+            return (
+                jnp.zeros_like(t_value),
+                y_bar,
+                lagged_bar,
+                support_bar,
+            )
+
+        _compact_lagged_rhs_with_support.defvjp(
+            _compact_lagged_rhs_with_support_fwd,
+            _compact_lagged_rhs_with_support_bwd,
+        )
+
+        def _build_lagged_response_from_flat(flat_y_value):
+            if build_lagged_response is None:
+                return None
+            projected_y = _project_flat_state_if_needed(flat_y_value, project_flat)
+            return build_lagged_response(unpack_flat(projected_y))
+
+        @jax.custom_vjp
+        def _compact_build_lagged_response_with_support(flat_y_value, support_value):
+            return _build_lagged_response_from_flat(flat_y_value)
+
+        def _compact_build_lagged_response_with_support_fwd(flat_y_value, support_value):
+            lagged_value = _build_lagged_response_from_flat(flat_y_value)
+            return lagged_value, (flat_y_value, support_value, lagged_value)
+
+        def _compact_build_lagged_response_with_support_bwd(residual, lagged_bar):
+            flat_y_value, support_value, lagged_value = residual
+            if lagged_value is None:
+                return (
+                    jnp.zeros_like(flat_y_value),
+                    _theta_support_cotangent_for_vjp(
+                        support_value,
+                        _radau_zero_support_delta_tree_like(support_value),
+                    ),
+                )
+            projected_y = _project_flat_state_if_needed(flat_y_value, project_flat)
+            state_value = unpack_flat(projected_y)
+            if physics_context.pullback_build_lagged_response is not None:
+                state_bar = physics_context.pullback_build_lagged_response(
+                    state_value,
+                    lagged_bar,
+                )
+                flat_y_bar = physics_context.pack_flat(state_bar)
+                if project_flat is not None:
+                    _, project_pullback = jax.vjp(project_flat, flat_y_value)
+                    (flat_y_bar,) = project_pullback(flat_y_bar)
+            else:
+                def _build_from_flat(flat_inner):
+                    projected_inner = _project_flat_state_if_needed(flat_inner, project_flat)
+                    return build_lagged_response(unpack_flat(projected_inner))
+
+                _, build_pullback = jax.vjp(_build_from_flat, flat_y_value)
+                (flat_y_bar,) = build_pullback(lagged_bar)
+            if physics_context.flat_rhs_build_support_pullback is not None:
+                support_bar = physics_context.flat_rhs_build_support_pullback(
+                    flat_y_value,
+                    lagged_bar,
+                    support_value,
+                )
+            else:
+                support_bar = _radau_zero_support_delta_tree_like(support_value)
+            support_bar = _theta_support_cotangent_for_vjp(support_value, support_bar)
+            return flat_y_bar, support_bar
+
+        _compact_build_lagged_response_with_support.defvjp(
+            _compact_build_lagged_response_with_support_fwd,
+            _compact_build_lagged_response_with_support_bwd,
+        )
+
+        def _make_final_reduced_from_start(step_fn_for_replay):
+            def _final_reduced_from_start(
+                start_y,
+                start_lagged_cache,
+                start_lagged_reference_y,
+            ):
+                reuse_state = dataclasses.replace(
+                    _theta_initial_reuse_state(state_dim, dtype),
+                    lagged_response_cache=start_lagged_cache,
+                    lagged_response_available=jnp.asarray(start_lagged_cache is not None),
+                    lagged_response_valid=segment_start_carry.lagged_response_valid,
+                    lagged_reference_y=start_lagged_reference_y,
+                )
+                step_state0 = _ThetaStepState(
+                    t=segment_start_carry.t,
+                    y=start_y,
+                    dt=attempted_dts[0],
+                    status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+                    prev_error=jnp.asarray(1.0, dtype=dtype),
+                    prev_dt=jnp.asarray(0.0, dtype=dtype),
+                    recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                    regrowth_cooldown=jnp.asarray(0, dtype=jnp.int32),
+                    easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+                    prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+                    prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+                    reuse_state=reuse_state,
+                )
+
+                def _slot(carry, slot_values):
+                    active, dt_value, next_dt_value, recent_reject, cooldown, streak, lagged_valid = slot_values
+                    carry = dataclasses.replace(carry, dt=dt_value)
+
+                    def _run(_):
+                        next_state, _info = step_fn_for_replay(carry)
+                        next_reuse = dataclasses.replace(
+                            next_state.reuse_state,
+                            lagged_response_valid=lagged_valid,
+                        )
+                        return dataclasses.replace(
+                            next_state,
+                            dt=next_dt_value,
+                            recent_reject_count=recent_reject,
+                            regrowth_cooldown=cooldown,
+                            easy_growth_streak=streak,
+                            reuse_state=next_reuse,
+                        )
+
+                    return jax.lax.cond(active, _run, lambda _: carry, operand=None), None
+
+                final_state, _ = jax.lax.scan(
+                    _slot,
+                    step_state0,
+                    (
+                        active_mask,
+                        attempted_dts,
+                        next_dts,
+                        next_recent_reject_count,
+                        next_regrowth_cooldown,
+                        next_easy_growth_streak,
+                        next_lagged_response_valid,
+                    ),
+                )
+                return _ThetaAcceptedStepReducedCotangent(
+                    y=final_state.y,
+                    lagged_response_cache=final_state.reuse_state.lagged_response_cache,
+                    lagged_reference_y=final_state.reuse_state.lagged_reference_y,
+                )
+
+            return _final_reduced_from_start
+
+        _final_reduced_from_start = _make_final_reduced_from_start(_step_fn)
+
+        def _take_batched_tree_axis0(tree, index):
+            if tree is None:
+                return None
+            return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+        def _zero_tree_like(tree):
+            if tree is None:
+                return None
+            return jax.tree_util.tree_map(jnp.zeros_like, tree)
+
+        def _single_reduced_pullback(objective_index):
+            reduced_lagged_bar_i = _take_batched_tree_axis0(
+                reduced_bars.lagged_response_cache,
+                objective_index,
+            )
+            if mode == "theta_zero_lagged":
+                reduced_lagged_bar_i = _zero_tree_like(reduced_lagged_bar_i)
+            reduced_bar_i = _ThetaAcceptedStepReducedCotangent(
+                y=reduced_bars.y[objective_index],
+                lagged_response_cache=reduced_lagged_bar_i,
+                lagged_reference_y=reduced_bars.lagged_reference_y[objective_index],
+            )
+
+            if segment_start_carry.lagged_response_cache is None:
+                def _final_reduced_from_start_no_cache(start_y, start_lagged_reference_y):
+                    return _final_reduced_from_start(
+                        start_y,
+                        None,
+                        start_lagged_reference_y,
+                    )
+
+                _, pullback = jax.vjp(
+                    _final_reduced_from_start_no_cache,
+                    segment_start_carry.y,
+                    segment_start_carry.lagged_reference_y,
+                )
+                start_y_bar_i, start_reference_bar_i = pullback(reduced_bar_i)
+                start_cache_bar_i = None
+            else:
+                _, pullback = jax.vjp(
+                    _final_reduced_from_start,
+                    segment_start_carry.y,
+                    segment_start_carry.lagged_response_cache,
+                    segment_start_carry.lagged_reference_y,
+                )
+                start_y_bar_i, start_cache_bar_i, start_reference_bar_i = pullback(reduced_bar_i)
+            return _ThetaAcceptedStepReducedCotangent(
+                y=start_y_bar_i,
+                lagged_response_cache=start_cache_bar_i,
+                lagged_reference_y=start_reference_bar_i,
+            )
+
+        objective_indices = jnp.arange(objective_count, dtype=jnp.int32)
+        if mode == "theta_compact_support_probe":
+            def _single_support_pullback(objective_index):
+                reduced_bar_i = _ThetaAcceptedStepReducedCotangent(
+                    y=reduced_bars.y[objective_index],
+                    lagged_response_cache=_take_batched_tree_axis0(
+                        reduced_bars.lagged_response_cache,
+                        objective_index,
+                    ),
+                    lagged_reference_y=reduced_bars.lagged_reference_y[objective_index],
+                )
+
+                def _make_support_step_fn(support_value):
+                    def _flat_rhs_with_lagged_response_support(t_value, y_value, lagged_response_value):
+                        return _compact_lagged_rhs_with_support(
+                            t_value,
+                            y_value,
+                            lagged_response_value,
+                            support_value,
+                        )
+
+                    def _build_lagged_response_support(state_value):
+                        return _compact_build_lagged_response_with_support(
+                            physics_context.pack_flat(state_value),
+                            support_value,
+                        )
+
+                    return _make_theta_replay_step_fn(
+                        flat_rhs,
+                        _flat_rhs_with_lagged_response_support,
+                        build_lagged_response_replay=_build_lagged_response_support,
+                    )
+
+                if segment_start_carry.lagged_response_cache is None:
+                    def _final_reduced_from_start_no_cache_support(
+                        start_y,
+                        start_lagged_reference_y,
+                        support_value,
+                    ):
+                        support_final_reduced_from_start = _make_final_reduced_from_start(
+                            _make_support_step_fn(support_value)
+                        )
+                        return support_final_reduced_from_start(
+                            start_y,
+                            None,
+                            start_lagged_reference_y,
+                        )
+
+                    _, pullback = jax.vjp(
+                        _final_reduced_from_start_no_cache_support,
+                        segment_start_carry.y,
+                        segment_start_carry.lagged_reference_y,
+                        support_payload,
+                    )
+                    start_y_bar_i, start_reference_bar_i, support_bar_i = pullback(reduced_bar_i)
+                    start_cache_bar_i = None
+                else:
+                    def _final_reduced_from_start_support(
+                        start_y,
+                        start_lagged_cache,
+                        start_lagged_reference_y,
+                        support_value,
+                    ):
+                        support_final_reduced_from_start = _make_final_reduced_from_start(
+                            _make_support_step_fn(support_value)
+                        )
+                        return support_final_reduced_from_start(
+                            start_y,
+                            start_lagged_cache,
+                            start_lagged_reference_y,
+                        )
+
+                    _, pullback = jax.vjp(
+                        _final_reduced_from_start_support,
+                        segment_start_carry.y,
+                        segment_start_carry.lagged_response_cache,
+                        segment_start_carry.lagged_reference_y,
+                        support_payload,
+                    )
+                    start_y_bar_i, start_cache_bar_i, start_reference_bar_i, support_bar_i = pullback(reduced_bar_i)
+                return (
+                    _ThetaAcceptedStepReducedCotangent(
+                        y=start_y_bar_i,
+                        lagged_response_cache=start_cache_bar_i,
+                        lagged_reference_y=start_reference_bar_i,
+                    ),
+                    _radau_sanitize_support_delta_bar_tree(support_payload, support_bar_i),
+                )
+
+            start_bars, support_bars = jax.vmap(_single_support_pullback)(objective_indices)
+            return start_bars, tuple(jax.tree_util.tree_leaves(support_bars))
+
+        start_bars = jax.vmap(_single_reduced_pullback)(objective_indices)
+        return start_bars, zero_support_bar_leaves
+
+    raise NotImplementedError(
+        "theta full-transport reverse has real schedule/segment forward artifacts, "
+        "but this cotangent diagnostic mode is not implemented for theta. "
+        "Use reverse_stage_cotangent_mode='full' for the solver-selected theta "
+        "implicit-transpose lane, or one of zero_step_bwd/theta_state_only/"
+        "theta_compact_support_probe/theta_implicit_transpose_probe for diagnostics."
+    )
+
+
+def _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
+    execution_context,
+    cotangent_mode,
+    reduced_bars,
+    segment_start_carry,
+    segment_arrays,
+    support_payload,
+):
+    if isinstance(execution_context, _ThetaReverseExecutionContext):
+        return _theta_segment_reduced_cotangent_bwd_batched_with_support_call(
+            execution_context,
+            cotangent_mode,
+            reduced_bars,
+            segment_start_carry,
+            segment_arrays,
+            support_payload,
+        )
+    _require_reverse_execution_context_radau(
+        execution_context,
+        "reverse segmented support-payload cotangent sweep",
+    )
+    return _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
+        execution_context,
+        cotangent_mode,
+        reduced_bars,
+        segment_start_carry,
+        segment_arrays,
+        support_payload,
+    )
+
+
+def _reverse_reduced_cotangent(
+    execution_context,
+    *,
+    y,
+    lagged_response_cache,
+    lagged_reference_y,
+):
+    if isinstance(execution_context, _ThetaReverseExecutionContext):
+        return _ThetaAcceptedStepReducedCotangent(
+            y=y,
+            lagged_response_cache=lagged_response_cache,
+            lagged_reference_y=lagged_reference_y,
+        )
+    _require_reverse_execution_context_radau(execution_context, "reverse reduced cotangent")
+    return _RadauAcceptedStepReducedCotangent(
+        y=y,
+        lagged_response_cache=lagged_response_cache,
+        lagged_reference_y=lagged_reference_y,
+    )
+
+
+def _theta_initial_carry_from_state_with_static_setup(
+    *,
+    solver,
+    state,
+    solve_vector_field,
+    species,
+    prepared_rollout_static,
+):
+    temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
+    density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
+
+    def _flat_state_from_state(state_value):
+        flat_state, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        return flat_state, unpack_flat, project_flat
+
+    flat_state0, unpack_flat, project_flat = _flat_state_from_state(state)
+    dtype = jnp.asarray(flat_state0).dtype
+    build_lagged_response, _ = _lagged_response_hooks(solve_vector_field)
+    rhs_mode = str(getattr(solver, "rhs_mode", "black_box")).strip().lower()
+    use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
+    if use_transport_lagged_response and build_lagged_response is not None:
+        lagged_reference_y = _project_flat_state_if_needed(flat_state0, project_flat)
+        lagged_response_cache = build_lagged_response(unpack_flat(lagged_reference_y))
+        lagged_response_valid = jnp.asarray(True)
+    else:
+        lagged_reference_y = flat_state0
+        lagged_response_cache = None
+        lagged_response_valid = jnp.asarray(False)
+    return _ThetaReverseCarry(
+        t=jnp.asarray(getattr(solver, "t0", 0.0), dtype=dtype),
+        y=flat_state0,
+        lagged_response_cache=lagged_response_cache,
+        lagged_response_valid=lagged_response_valid,
+        lagged_reference_y=lagged_reference_y,
+    )
+
+
 def reverse_initial_carry_from_state_with_static_setup(
     *,
     solver,
@@ -642,7 +2239,16 @@ def reverse_initial_carry_from_state_with_static_setup(
 ):
     """Build the initial carry with the validated reverse-local lagged pullback."""
 
-    del solver
+    if _is_theta_reverse_solver(solver):
+        return _theta_initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state,
+            solve_vector_field=solve_vector_field,
+            species=species,
+            prepared_rollout_static=prepared_rollout_static,
+        )
+
+    _require_reverse_solver_radau(solver, "reverse initial carry")
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
     density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
     kernel_context = prepared_rollout_static.kernel_context
@@ -919,13 +2525,13 @@ def prepare_reverse_static_setup(
     prepared_components_static = prepare_transport_solver_components(dict(config), runtime, state0_static)
     solver = prepared_components_static["solver"]
     solve_vector_field_static = prepared_components_static["solve_vector_field"]
-    prepared_rollout_static = _build_prepared_radau_accepted_rollout(
+    prepared_rollout_static = _build_prepared_reverse_accepted_rollout(
         solver=solver,
         state=state0_static,
         vector_field=solve_vector_field_static,
         species=runtime.species,
     )
-    execution_context = _build_prepared_radau_execution_context(
+    execution_context = _build_prepared_reverse_execution_context(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
@@ -985,7 +2591,7 @@ def prepare_reverse_static_setup(
                 int(probe_stop_after_accepted_steps) + 16,
             ),
         ) if probe_stop_after_accepted_steps is not None else max_total_steps
-        schedule_probe = _radau_adaptive_schedule_rollout(
+        schedule_probe = _reverse_adaptive_schedule_rollout(
             execution_context,
             prepared_rollout_static.initial_carry,
             max_total_steps=probe_max_total_steps,
@@ -1226,7 +2832,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         return jax.tree_util.tree_map(lambda value: value[index], tree)
 
     def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
-        zero_tree = _radau_align_tangent_tree_to_primal(None, primal_tree)
+        zero_tree = _reverse_align_tangent_tree_to_primal(
+            reverse_setup.execution_context,
+            None,
+            primal_tree,
+        )
         return jax.tree_util.tree_map(
             lambda leaf: jnp.broadcast_to(
                 jnp.asarray(leaf)[None, ...],
@@ -1285,7 +2895,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
 
     phase_start = time.perf_counter()
-    final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+    final_y, residuals = _reverse_adaptive_final_y_realized_schedule_vjp_fwd(
         reverse_setup.execution_context,
         reverse_setup.max_total_steps,
         reverse_setup.stop_after_accepted_steps,
@@ -1343,7 +2953,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     final_y_bar_rows = []
     objective_payload_bar_rows = []
     combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
-    zero_payload_bar = _radau_zero_support_delta_tree_like(support_payload)
+    zero_payload_bar = _reverse_zero_support_delta_tree_like(reverse_setup.solver, support_payload)
     for objective_i in range(objective_count):
         objective_name = objective_labels[objective_i]
         if objective_name == "bootstrap_current_softmax_abs_scaled":
@@ -1468,7 +3078,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
 
-    reduced_bars = _RadauAcceptedStepReducedCotangent(
+    reduced_bars = _reverse_reduced_cotangent(
+        reverse_setup.execution_context,
         y=final_y_bars,
         lagged_response_cache=_batched_zero_tangent_tree_like(
             segmented_final_carry.lagged_response_cache,
@@ -1504,7 +3115,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         reduced_bars, segment_support_bar_leaves = (
-            _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
+            _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
                 reverse_setup.execution_context,
                 cotangent_mode,
                 reduced_bars,
