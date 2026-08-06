@@ -125,6 +125,122 @@ Status:
   standalone raw-block/JVP value and within the expected frozen-linearized FD
   level compared with FD.
 
+### `boozer_qi_objective`, `ZBS:1:0`
+
+Current effective geometry benchmark result:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter ZBS:1:0 \
+  --objective boozer_qi_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+| Quantity | Value |
+| --- | ---: |
+| Baseline objective value | `2.1192029964274489e-01` |
+| Frozen-linearized FD `d/dZBS:1:0` | `-1.2367491295362752e-01` |
+| Forward JVP `d/dZBS:1:0` | `-1.2365550023172692e-01` |
+| Optimization-internal raw-block reverse `d/dZBS:1:0` | `-1.2365550092181365e-01` |
+| Shared-payload reverse row `d/dZBS:1:0` | `-1.2365499862085017e-01` |
+
+| Comparison | Abs diff | Rel diff |
+| --- | ---: | ---: |
+| Shared-payload reverse vs frozen-linearized FD | `1.9914332777357102e-05` | `1.6102160334508642e-04` |
+| Shared-payload reverse vs forward JVP | `5.0161087675193450e-07` | `4.0565189240424390e-06` |
+| Shared-payload reverse vs optimization-internal raw-block reverse | `5.0230096348968800e-07` | `4.0620996214902625e-06` |
+| Optimization-internal raw-block reverse vs forward JVP | `6.9008673775350360e-10` | `5.5807201172636930e-09` |
+
+Status:
+
+- The FD value is now saved for the current QI objective with `ZBS:1:0`.
+- The standalone optimization-internal raw-block reverse matches the forward
+  JVP target to `5.6e-09` relative.
+- The full shared-payload reverse row is within `4.1e-06` relative of the
+  forward JVP/internal raw-block value and within the expected
+  frozen-linearized FD level compared with FD.
+
+### `boozer_maxj_objective`, `RBC:1:0`
+
+Current effective geometry benchmark result:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_maxj_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+| Quantity | Value |
+| --- | ---: |
+| Baseline objective value | `4.4387332574093733e+02` |
+| Frozen-linearized FD `d/dRBC:1:0` | `-3.8425374640355458e+03` |
+| Forward JVP `d/dRBC:1:0` | `-3.8431351880877260e+03` |
+| Optimization-internal raw-block reverse `d/dRBC:1:0` | `-3.8431351877333364e+03` |
+| Shared-payload reverse row `d/dRBC:1:0` | `-3.8431400490597589e+03` |
+
+| Comparison | Abs diff | Rel diff |
+| --- | ---: | ---: |
+| Shared-payload reverse vs frozen-linearized FD | `6.0258502421311280e-01` | `1.5681955735058996e-04` |
+| Shared-payload reverse vs forward JVP | `4.8609720329295670e-03` | `1.2648454438961066e-06` |
+| Shared-payload reverse vs optimization-internal raw-block reverse | `4.8613264225423340e-03` | `1.2649376576860733e-06` |
+| Optimization-internal raw-block reverse vs forward JVP | `3.5438961276668124e-07` | `9.2213673322019940e-11` |
+
+Status:
+
+- The FD value is now updated for the current maxJ objective.
+- The standalone optimization-internal raw-block reverse matches the forward
+  JVP target to `9.2e-11` relative.
+- The full shared-payload reverse row is within `1.3e-06` relative of the
+  standalone raw-block/JVP value and within the expected frozen-linearized FD
+  level compared with FD.
+
+### `boozer_maxj_objective`, `ZBS:1:0`
+
+Current effective geometry benchmark result:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter ZBS:1:0 \
+  --objective boozer_maxj_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+| Quantity | Value |
+| --- | ---: |
+| Baseline objective value | `4.4387332574093733e+02` |
+| Frozen-linearized FD `d/dZBS:1:0` | `-1.9205101180950553e+03` |
+| Forward JVP `d/dZBS:1:0` | `-1.9205082810004324e+03` |
+| Optimization-internal raw-block reverse `d/dZBS:1:0` | `-1.9205082803893893e+03` |
+| Shared-payload reverse row `d/dZBS:1:0` | `-1.9205081921396923e+03` |
+
+| Comparison | Abs diff | Rel diff |
+| --- | ---: | ---: |
+| Shared-payload reverse vs frozen-linearized FD | `1.9259553630490700e-03` | `1.0028353117761315e-06` |
+| Shared-payload reverse vs forward JVP | `8.8860740106611050e-05` | `4.6269386591929540e-08` |
+| Shared-payload reverse vs optimization-internal raw-block reverse | `8.8249697000719610e-05` | `4.5951219217251536e-08` |
+| Optimization-internal raw-block reverse vs forward JVP | `6.1104310589144010e-07` | `3.1816738929817846e-10` |
+
+Status:
+
+- The FD value is now saved for the current maxJ objective with `ZBS:1:0`.
+- The standalone optimization-internal raw-block reverse matches the forward
+  JVP target to `3.2e-10` relative.
+- The full shared-payload reverse row is within `4.7e-08` relative of the
+  forward JVP value and `1.1e-06` relative of frozen-linearized FD.
+
 ## Geometry Frozen-FD Commands To Rerun
 
 Use the same VMEC input from the transport TOML:

@@ -608,11 +608,6 @@ def main() -> None:
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
     parameter_is_profile = parameter_name in PARAMETER_ORDER
     root_only_fd = bool(args.initial_er_root_only_fd)
-    if parameter_is_profile and initial_er_root_ad != "off" and not root_only_fd:
-        raise SystemExit(
-            "[autodiff-gate] --initial-Er-root-ad is currently wired only for "
-            "realtime-geometry FD parameters in this script."
-        )
     frozen_linearized_bundle = None
     if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
         baseline_runtime, baseline_state = build_runtime_context(config)
@@ -878,28 +873,32 @@ def main() -> None:
         baseline_value = _profile_cfg_scalar_value(profile_cfg, parameter_name)
         h = _fd_step(baseline_value, rel_step=args.fd_rel_step, abs_step=args.fd_abs_step)
         print("[autodiff-gate] progress: running profile fd_minus replay", flush=True)
-        minus_objectives, minus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-            jnp.asarray(baseline_value - h, dtype=jnp.float64),
+        minus_profile_values = profile_values.at[param_index].set(
+            jnp.asarray(baseline_value - h, dtype=profile_values.dtype)
+        )
+        minus_objectives, minus_replay = _objectives_on_realtime_geometry_frozen_trace(
             config=config,
             runtime=baseline_runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
+            profile_values=minus_profile_values,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
-            use_ad_lane=False,
+            initial_er_root_ad=initial_er_root_ad,
         )
         print("[autodiff-gate] progress: running profile fd_plus replay", flush=True)
-        plus_objectives, plus_replay = _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace(
-            jnp.asarray(baseline_value + h, dtype=jnp.float64),
+        plus_profile_values = profile_values.at[param_index].set(
+            jnp.asarray(baseline_value + h, dtype=profile_values.dtype)
+        )
+        plus_objectives, plus_replay = _objectives_on_realtime_geometry_frozen_trace(
             config=config,
             runtime=baseline_runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
+            profile_values=plus_profile_values,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
-            use_ad_lane=False,
+            initial_er_root_ad=initial_er_root_ad,
         )
         del param_index
     else:

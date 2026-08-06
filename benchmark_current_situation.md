@@ -148,6 +148,21 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   `5.9392891189187216e+00`, optimization-internal reverse
   `5.9392891187135319e+00`, shared-payload reverse
   `5.9392927523725234e+00`.
+- New current QI frozen-linearized FD for `ZBS:1:0` is saved in the
+  8-parameter snapshot: FD `-1.2367491295362752e-01`, forward JVP
+  `-1.2365550023172692e-01`, optimization-internal reverse
+  `-1.2365550092181365e-01`, shared-payload reverse
+  `-1.2365499862085017e-01`.
+- New current maxJ frozen-linearized FD for `RBC:1:0` is saved in the
+  8-parameter snapshot: FD `-3.8425374640355458e+03`, forward JVP
+  `-3.8431351880877260e+03`, optimization-internal reverse
+  `-3.8431351877333364e+03`, shared-payload reverse
+  `-3.8431400490597589e+03`.
+- New current maxJ frozen-linearized FD for `ZBS:1:0` is saved in the
+  8-parameter snapshot: FD `-1.9205101180950553e+03`, forward JVP
+  `-1.9205082810004324e+03`, optimization-internal reverse
+  `-1.9205082803893893e+03`, shared-payload reverse
+  `-1.9205081921396923e+03`.
 - Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
 - Add full-transport FD references for selected profile parameters if needed; current exact 16-step table is geometry `RBC:1:0`.
 - Keep bootstrap-current objective in the root/full benchmark tables, but be careful not to reintroduce generic full flux VJPs that caused OOM.
