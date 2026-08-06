@@ -3536,6 +3536,11 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
             reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+            max_reverse_accepted_steps=(
+                None
+                if args.max_reverse_accepted_steps is None
+                else int(args.max_reverse_accepted_steps)
+            ),
             progress_label="[autodiff-gate] full-transport shared payload:",
         )
         request = realtime_geometry_transport_reverse_table_request(
@@ -4674,6 +4679,17 @@ def main() -> None:
             "the full transport internal realtime-geometry table path and write a "
             "shared-path JSON report for offline comparison against saved reference "
             "benchmark output. This does not run the reference path in the same process."
+        ),
+    )
+    parser.add_argument(
+        "--max-reverse-accepted-steps",
+        type=int,
+        default=None,
+        help=(
+            "When reverse AD is run to the solver t_final rather than an explicit "
+            "--accepted-step-limit, use this as a schedule-discovery guard. The "
+            "reverse path still requires reaching t_final; exceeding this guard is "
+            "reported as a failed trial instead of compiling a max_steps-sized trace."
         ),
     )
     parser.add_argument(
