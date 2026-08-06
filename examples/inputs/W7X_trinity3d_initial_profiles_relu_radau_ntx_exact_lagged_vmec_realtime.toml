@@ -1,0 +1,161 @@
+# Transport-style NEOPAX input using the Trinity3D-like W7-X ReLU setup,
+# but replacing the zero-neoclassical model with the exact-runtime NTX
+# lagged-response realtime VMEC path used by the reverse-AD shared-payload
+# benchmark.
+#
+# This keeps the small two-species/n_radial=9/rho_edge=0.7 ReLU case
+# characteristics, while matching the realtime VMEC -> exact NTX settings as
+# closely as practical for this lightweight comparison case.
+
+[general]
+mode = "transport"
+
+[geometry]
+backend = "vmec_jax_booz_xform_jax"
+vmec_input_file = "./examples/inputs/input.w7x_from_wout_reconstructed"
+vmec_lane = "forward"
+vmec_param_family = "RBC"
+vmec_param_m = 1
+vmec_param_n = 0
+vmec_param_delta = 0.0
+n_radial = 9
+rho_edge = 0.7
+
+[neoclassical]
+flux_model = "ntx_exact_lij_runtime"
+entropy_model = "ntx_exact_lij_runtime"
+ntx_exact_n_theta = 5
+ntx_exact_n_zeta = 21
+ntx_exact_n_xi = 33
+ntx_exact_surface_backend = "vmec"
+ntx_exact_face_response_mode = "interpolate_center_response"
+ntx_exact_response_anchor_count = 48
+
+[turbulence]
+flux_model = "turbulent_relu_analytical"
+density_relu_flux = {critical_gradient = [100.0, 100.0], slope = [0.0, 0.0]}
+pressure_relu_flux = {critical_gradient = [100.0, 0.1], slope = [0.0, 1.2]}
+power = 1.0
+
+[classical]
+flux_model = "none"
+
+[energy_grid]
+n_x = 4
+
+[species]
+n_species = 2
+names = ["e", "ion"]
+mass_mp = [0.000544617, 1.0]
+charge_qp = [-1.0, 1.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = [0.35, 0.35]
+n_edge = [0.29, 0.29]
+T0 = [6.7, 1.0]
+T_edge = [0.8, 0.8]
+density_shape_power = [2.0, 2.0]
+density_shape_alpha = [1.0, 1.0]
+temperature_shape_power = [2.0, 2.0]
+temperature_shape_alpha = [2.0, 1.0]
+er_initialization_mode = "analytical"
+er0_scale = 0.0
+er0_peak_rho = 0.8
+
+[boundary.density.left]
+type = "neumann"
+
+[boundary.density.left.gradient]
+default = 0.0
+
+[boundary.density.right]
+type = "dirichlet"
+
+[boundary.density.right.value]
+e = 0.29
+ion = 0.29
+
+[boundary.temperature.left]
+type = "neumann"
+
+[boundary.temperature.left.gradient]
+default = 0.0
+
+[boundary.temperature.right]
+type = "dirichlet"
+
+[boundary.temperature.right.value]
+e = 0.8
+ion = 0.8
+
+[boundary.Er.left]
+type = "dirichlet"
+value = 0.0
+
+[boundary.Er.right]
+type = "dirichlet"
+value = 0.0
+
+[equations]
+toggle_density = [false, false]
+toggle_temperature = [false, true]
+toggle_Er = false
+
+[sources]
+temperature = ["power_exchange_temperature_equilibration"]
+density = []
+
+[sources.parameters.power_exchange_temperature_equilibration]
+mode = "all"
+
+[transport_solver]
+density_floor = 1.0e-3
+temperature_floor = 1.0e-3
+transport_solver_backend = "radau"
+integrator = "radau"
+radau_rhs_mode = "lagged_response"
+radau_num_stages = 7
+nonlinear_solver_tol = 1.0e-7
+nonlinear_solver_maxiter = 20
+radau_newton_tol_mode = "hairer"
+radau_newton_fnewt_mode = "hairer"
+radau_error_estimator = "embedded2_ntss_transport_scale"
+radau_controller_mode = "hairer_lean_transport_discounted"
+radau_predictor_mode = "collocation_transport_weighted"
+lagged_response_reuse_mode = "global_state_drift"
+lagged_response_reuse_rtol = 1.0e-2
+lagged_response_reuse_atol = 1.0e-8
+t0 = 0.0
+t_final = 0.4
+dt = 0.00374056
+rtol = 1.0e-6
+atol = 1.0e-8
+max_step = 1.0
+min_step = 1.0e-14
+max_steps = 20000
+throw = false
+debug_stage_markers = true
+debug_walltime_attempts = true
+debug_disable_jit = false
+save_n = 20
+temperature_include_work_term = true
+temperature_include_neo_convection = true
+temperature_include_turbulent_convection = false
+temperature_include_classical_convection = false
+temperature_convection_reconstruction = "closure_face_flux"
+temperature_heat_flux_reconstruction = "closure_face_flux"
+Er_source_mode = "ambipolar_local"
+work_source_mode = "local"
+Er_relax = 0.1
+DEr = 2.0
+Er_permittivity_mode = "ntss_like_midpoint"
+
+[transport_output]
+transport_plot = true
+transport_write_hdf5 = true
+transport_compare_ambipolarity_residual = false
+transport_scan_ambipolarity_residual = false
+transport_overlay_reference_er = false
+transport_output_dir = "./outputs/w7x_trinity3d_relu_radau_ntx_exact_lagged_vmec_realtime"
+transport_plot_n_times = 20

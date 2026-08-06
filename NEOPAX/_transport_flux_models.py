@@ -5923,7 +5923,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         support_value = self._static_support() if support is None else support
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
-        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        n_species = int(self.species.number_species)
+        species_indices = jnp.arange(n_species, dtype=jnp.int32)
 
         prepared = jax.tree_util.tree_map(
             lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
