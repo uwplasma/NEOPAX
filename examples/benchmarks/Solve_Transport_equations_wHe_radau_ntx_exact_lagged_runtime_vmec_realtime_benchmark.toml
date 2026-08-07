@@ -129,6 +129,7 @@ delta_zeff = 0.0
 
 [transport_solver]
 density_floor = 1.0e-3
+temperature_floor = 1.0e-3
 transport_solver_backend = "radau"
 integrator = "radau"
 radau_rhs_mode = "lagged_response"
@@ -144,7 +145,7 @@ lagged_response_reuse_mode = "global_state_drift"
 lagged_response_reuse_rtol = 1.0e-2
 lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
-t_final = 0.01
+t_final = 0.2
 dt = 1.0e-8
 rtol = 1.0e-6
 atol = 1.0e-8
@@ -154,6 +155,7 @@ max_steps = 20000
 throw = false
 debug_stage_markers = true
 debug_walltime_attempts = true
+debug_nonfinite_rhs_components = true
 debug_disable_jit = false
 save_n = 10
 

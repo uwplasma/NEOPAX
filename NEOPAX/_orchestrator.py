@@ -878,6 +878,7 @@ def prepare_transport_solver_components(
         source_models=runtime.models.source,
         solver_cfg=solver_cfg,
         boundary_models=bc,
+        debug_nonfinite_rhs_components=bool(solver_cfg.get("debug_nonfinite_rhs_components", False)),
     )
     solver = build_time_solver(solver_cfg)
     return {

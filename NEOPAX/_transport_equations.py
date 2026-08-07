@@ -1385,6 +1385,7 @@ class ComposedEquationSystem:
     source_models: object | None = None
     solver_cfg: object | None = None
     boundary_models: object | None = None
+    debug_nonfinite_rhs_components: bool = False
 
     @staticmethod
     def _split_realtime_geometry_payload(payload):
@@ -1549,6 +1550,54 @@ class ComposedEquationSystem:
     @staticmethod
     def _shared_fluxes_add(lhs, rhs):
         return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+    def _debug_nonfinite_rhs_components(
+        self,
+        working_state,
+        shared_fluxes,
+        density_rhs,
+        pressure_rhs,
+        Er_rhs,
+    ):
+        if not self.debug_nonfinite_rhs_components:
+            return
+
+        rhs_finite = jnp.logical_and(
+            jnp.all(jnp.isfinite(density_rhs)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(pressure_rhs)),
+                jnp.all(jnp.isfinite(Er_rhs)),
+            ),
+        )
+
+        def _print_array_stats(label, value):
+            value = jnp.asarray(value)
+            jax.debug.print(
+                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}}",
+                finite=jnp.all(jnp.isfinite(value)),
+                min=jnp.nanmin(value),
+                max=jnp.nanmax(value),
+            )
+
+        def _print(_):
+            _print_array_stats("state.density", working_state.density)
+            _print_array_stats("state.temperature", working_state.temperature)
+            _print_array_stats("state.pressure", working_state.pressure)
+            _print_array_stats("state.Er", working_state.Er)
+            _print_array_stats("rhs.density", density_rhs)
+            _print_array_stats("rhs.pressure", pressure_rhs)
+            _print_array_stats("rhs.Er", Er_rhs)
+            if isinstance(shared_fluxes, dict):
+                for key in sorted(shared_fluxes):
+                    value = shared_fluxes.get(key)
+                    if value is not None:
+                        _print_array_stats(f"flux.{key}", value)
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        def _skip(_):
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(jnp.logical_not(rhs_finite), _print, _skip, operand=None)
 
     def _prepare_working_state_pullback(self, state, working_state_bar):
         prepared_qn = None
@@ -1760,6 +1809,14 @@ class ComposedEquationSystem:
 
         if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
             Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
+
+        self._debug_nonfinite_rhs_components(
+            working_state,
+            shared_fluxes,
+            density_rhs,
+            pressure_rhs,
+            Er_rhs,
+        )
 
         return TransportState(
             density=density_rhs,
