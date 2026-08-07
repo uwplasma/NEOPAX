@@ -81,6 +81,72 @@ def _ntx_local_pullback_finite_debug_enabled() -> bool:
     return raw not in {"", "0", "false", "no", "off"}
 
 
+def _debug_first_bad_flat(value):
+    value = jnp.asarray(value)
+    flat_bad = jnp.ravel(jnp.logical_not(jnp.isfinite(value)))
+    return jnp.argmax(flat_bad)
+
+
+def _debug_array_stats(label, value):
+    value = jnp.asarray(value)
+    jax.debug.print(
+        "[ntx-nonfinite] {label}: finite={finite} min={min:.6e} max={max:.6e} max_abs={max_abs:.6e} first_bad_flat={first_bad}",
+        label=label,
+        finite=jnp.all(jnp.isfinite(value)),
+        min=jnp.nanmin(value),
+        max=jnp.nanmax(value),
+        max_abs=jnp.nanmax(jnp.abs(value)),
+        first_bad=_debug_first_bad_flat(value),
+    )
+
+
+def _debug_arrays_if_any_nonfinite(prefix, labelled_arrays):
+    """Print detailed NTX diagnostics only if at least one array is nonfinite."""
+
+    arrays = tuple((label, value) for label, value in labelled_arrays if value is not None)
+    if not arrays:
+        return
+    trigger = jnp.asarray(False)
+    for _, value in arrays:
+        trigger = jnp.logical_or(trigger, jnp.logical_not(jnp.all(jnp.isfinite(jnp.asarray(value)))))
+
+    def _print(_):
+        jax.debug.print("[ntx-nonfinite] {prefix}: begin", prefix=prefix)
+        for label, value in arrays:
+            _debug_array_stats(f"{prefix}.{label}", value)
+        jax.debug.print("[ntx-nonfinite] {prefix}: end", prefix=prefix)
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    def _skip(_):
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    jax.lax.cond(trigger, _print, _skip, operand=None)
+
+
+def _debug_lagged_response_if_nonfinite(prefix, response):
+    if isinstance(response, NTXInterpolatedMomentResponse):
+        _debug_arrays_if_any_nonfinite(
+            prefix,
+            (
+                ("reference_er", response.reference_er),
+                ("reference_log_nu_star", response.reference_log_nu_star),
+                ("reference_transport_moments", response.reference_transport_moments),
+                ("dtransport_moments_d_er", response.dtransport_moments_d_er),
+                ("dtransport_moments_d_log_nu_star", response.dtransport_moments_d_log_nu_star),
+            ),
+        )
+        return
+    if isinstance(response, NTXPreparedCoefficientResponse):
+        _debug_arrays_if_any_nonfinite(
+            prefix,
+            (
+                ("reference_transport_moments", response.reference_transport_moments),
+                ("reference_nu_hat", response.reference_nu_hat),
+                ("reference_epsi_hat", response.reference_epsi_hat),
+            ),
+        )
+
+
 def compute_total_power_mw(state, species, pressure_source_model, geometry, fallback_mw=3.0):
     fallback = jnp.asarray(fallback_mw, dtype=state.density.dtype)
     if pressure_source_model is None or geometry is None:
@@ -1152,9 +1218,10 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
     collisionality_model: str = "default"
     bc_density: Any = None
     bc_temperature: Any = None
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
 
     def __call__(self, state) -> dict:
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes(
             self.species,
             self.energy_grid,
@@ -1176,7 +1243,7 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         energy_grid = self.energy_grid
         geometry = self.geometry
         database = self.database
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
             self.bc_density,
@@ -1209,8 +1276,8 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
-        density = safe_density(state.density)
-        face_density = safe_density(face_state.density)
+        density = safe_density(state.density, self.density_floor)
+        face_density = safe_density(face_state.density, self.density_floor)
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
         particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
@@ -1968,6 +2035,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     collisionality_model: str = "default"
     bc_density: Any = None
     bc_temperature: Any = None
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
+    temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
     support: NTXExactLijRuntimeSupport | None = None
 
     def _rho_center_face(self):
@@ -5911,7 +5980,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return jax.vmap(faces_from_cell_centered)(flux)
 
     def __call__(self, state) -> dict:
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
         t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
@@ -5941,7 +6010,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         momentum-correction solve before constructing ``Upar``.
         """
 
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
         t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
@@ -6154,7 +6223,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def _momentum_corrected_upar_one_radius(self, state, radius_index, *, support=None):
         """Local corrected-Upar evaluator used by compact bootstrap pullbacks."""
 
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
         t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
@@ -6636,7 +6705,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         del kwargs
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("ntx.build_lagged_response"), ordered=True)
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         support = self._static_support()
         v_thermal = get_v_thermal(self.species.mass, temperature)
@@ -6645,8 +6714,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.geometry,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
         )
-        face_density = safe_density(face_state.density)
+        face_density = safe_density(face_state.density, self.density_floor)
         face_temperature = face_state.temperature
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
         face_response = self._build_axis_lagged_response(
@@ -6658,6 +6729,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density=face_density,
             v_thermal=face_v_thermal,
         )
+        _debug_arrays_if_any_nonfinite(
+            "ntx.build_lagged_response.face_state",
+            (
+                ("density_center", density),
+                ("temperature_center", temperature),
+                ("Er_center", state.Er),
+                ("density_face", face_density),
+                ("temperature_face", face_temperature),
+                ("Er_face", face_state.Er),
+                ("v_thermal_face", face_v_thermal),
+            ),
+        )
+        _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.face_response", face_response)
         center_response = None
         if self._resolved_center_response_mode() == "center_local_response":
             center_response = self._build_axis_lagged_response(
@@ -6669,6 +6753,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 density=density,
                 v_thermal=v_thermal,
             )
+            _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.center_response", center_response)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
         return NTXExactLijLaggedResponse(
@@ -6720,8 +6805,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 self.geometry,
                 bc_density=self.bc_density,
                 bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
             )
-            face_density = safe_density(face_state.density)
+            face_density = safe_density(face_state.density, self.density_floor)
             face_temperature = face_state.temperature
             return self._build_axis_lagged_response(
                 channels=self._static_support().face_channels,
@@ -7182,8 +7269,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 self.geometry,
                 bc_density=self.bc_density,
                 bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
             )
-            face_density = safe_density(face_state.density)
+            face_density = safe_density(face_state.density, self.density_floor)
             face_temperature = face_state.temperature
             face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7469,7 +7558,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         center_channels_bar = _float_delta_tree_like(support.center_channels)
         center_prepared_bar = _float_delta_tree_like(support.center_prepared)
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         v_thermal = get_v_thermal(self.species.mass, temperature)
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7725,7 +7814,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
         t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
@@ -7786,7 +7875,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     + response.dtransport_moments_d_er * delta_er[None, :, None]
                     + response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
                 )
-                return self._batched_lij_from_transport_moments(transport_moments, v_thermal_axis)
+                lij_axis = self._batched_lij_from_transport_moments(transport_moments, v_thermal_axis)
+                _debug_arrays_if_any_nonfinite(
+                    "ntx.evaluate_lagged.interpolated_axis",
+                    (
+                        ("Er_axis", Er_axis),
+                        ("temperature_axis", temperature_axis),
+                        ("density_axis", density_axis),
+                        ("v_thermal_axis", v_thermal_axis),
+                        ("current_log_nu_star", current_log_nu_star),
+                        ("reference_log_nu_star", response.reference_log_nu_star),
+                        ("delta_er", delta_er),
+                        ("delta_log_nu_star", delta_log_nu_star),
+                        ("reference_transport_moments", response.reference_transport_moments),
+                        ("dtransport_moments_d_er", response.dtransport_moments_d_er),
+                        ("dtransport_moments_d_log_nu_star", response.dtransport_moments_d_log_nu_star),
+                        ("transport_moments", transport_moments),
+                        ("lij_axis", lij_axis),
+                    ),
+                )
+                return lij_axis
 
             radius_indices_axis = jnp.arange(Er_axis.shape[0], dtype=jnp.int32)
 
@@ -7837,7 +7945,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             transport_moments = response.reference_transport_moments + transport_moment_tangent_by_radius
             transport_moments = jnp.swapaxes(transport_moments, 0, 1)
-            return self._batched_lij_from_transport_moments(transport_moments, v_thermal_axis)
+            lij_axis = self._batched_lij_from_transport_moments(transport_moments, v_thermal_axis)
+            _debug_arrays_if_any_nonfinite(
+                "ntx.evaluate_lagged.direct_axis",
+                (
+                    ("Er_axis", Er_axis),
+                    ("temperature_axis", temperature_axis),
+                    ("density_axis", density_axis),
+                    ("v_thermal_axis", v_thermal_axis),
+                    ("reference_transport_moments", response.reference_transport_moments),
+                    ("transport_moment_tangent_by_radius", transport_moment_tangent_by_radius),
+                    ("transport_moments", transport_moments),
+                    ("lij_axis", lij_axis),
+                ),
+            )
+            return lij_axis
 
         def _assemble_face_fluxes_from_lij(face_state, face_density, lij_faces):
             dndr_faces = _face_profile_gradient(
@@ -7875,6 +7997,30 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 + lij_faces[:, :, 2, 1] * a2
                 + lij_faces[:, :, 2, 2] * a3[None, :]
             )
+            _debug_arrays_if_any_nonfinite(
+                "ntx.evaluate_lagged.face_flux_assembly",
+                (
+                    ("state_density_center", density),
+                    ("state_temperature_center", temperature),
+                    ("face_density", face_density),
+                    ("face_temperature", face_state.temperature),
+                    ("face_Er", face_state.Er),
+                    ("dndr_faces", dndr_faces),
+                    ("dTdr_faces", dTdr_faces),
+                    ("A1", a1),
+                    ("A2", a2),
+                    ("A3", a3),
+                    ("density_phys", density_phys),
+                    ("temperature_phys", temperature_phys),
+                    ("lij_faces", lij_faces),
+                    ("Gamma_faces", gamma_faces),
+                    ("Q_faces", q_faces),
+                    ("Upar_faces", upar_faces),
+                    ("Gamma_center_from_faces", jax.vmap(cell_centered_from_faces)(gamma_faces)),
+                    ("Q_center_from_faces", jax.vmap(cell_centered_from_faces)(q_faces)),
+                    ("Upar_center_from_faces", jax.vmap(cell_centered_from_faces)(upar_faces)),
+                ),
+            )
             return gamma_faces, q_faces, upar_faces
 
         face_state = build_face_transport_state(
@@ -7882,11 +8028,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.geometry,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
         )
-        face_density = safe_density(face_state.density)
+        face_density = safe_density(face_state.density, self.density_floor)
         face_temperature = face_state.temperature
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+        _debug_arrays_if_any_nonfinite(
+            "ntx.evaluate_lagged.input_state",
+            (
+                ("density_center", density),
+                ("temperature_center", temperature),
+                ("Er_center", state.Er),
+                ("density_face", face_density),
+                ("temperature_face", face_temperature),
+                ("Er_face", face_state.Er),
+                ("v_thermal_face", face_v_thermal),
+            ),
+        )
         face_response = lagged_response.face_response
+        _debug_lagged_response_if_nonfinite("ntx.evaluate_lagged.face_response", face_response)
         if face_response is None:
             face_fluxes = self.evaluate_face_fluxes(state, face_state, face_response_mode="face_local_response")
         else:
@@ -7902,8 +8063,35 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             gamma_faces, q_faces, upar_faces = _assemble_face_fluxes_from_lij(face_state, face_density, lij_faces)
             face_fluxes = {"Gamma": gamma_faces, "Q": q_faces, "Upar": upar_faces}
+        _debug_arrays_if_any_nonfinite(
+            "ntx.evaluate_lagged.face_flux_output",
+            (
+                ("Gamma_faces", face_fluxes.get("Gamma")),
+                ("Q_faces", face_fluxes.get("Q")),
+                ("Upar_faces", face_fluxes.get("Upar")),
+                (
+                    "Gamma_center_from_faces",
+                    None
+                    if face_fluxes.get("Gamma", None) is None
+                    else jax.vmap(cell_centered_from_faces)(face_fluxes["Gamma"]),
+                ),
+                (
+                    "Q_center_from_faces",
+                    None
+                    if face_fluxes.get("Q", None) is None
+                    else jax.vmap(cell_centered_from_faces)(face_fluxes["Q"]),
+                ),
+                (
+                    "Upar_center_from_faces",
+                    None
+                    if face_fluxes.get("Upar", None) is None
+                    else jax.vmap(cell_centered_from_faces)(face_fluxes["Upar"]),
+                ),
+            ),
+        )
 
         center_response = lagged_response.center_response
+        _debug_lagged_response_if_nonfinite("ntx.evaluate_lagged.center_response", center_response)
         if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
             return {
                 "Gamma_faces": face_fluxes["Gamma"],
@@ -8044,7 +8232,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return NTXExactLijLaggedResponse(face_response=face_response_bar_acc)
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
-            density = safe_density(state.density)
+            density = safe_density(state.density, self.density_floor)
             temperature = state.temperature
             n_species = int(temperature.shape[0])
             n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
@@ -8329,7 +8517,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return state_bar_acc
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
-            density = safe_density(state.density)
+            density = safe_density(state.density, self.density_floor)
             temperature = state.temperature
             n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
             t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
@@ -8633,9 +8821,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             er_bar = er_bar + er_log_bar_by_radius
             temperature_bar = temperature_bar + jnp.swapaxes(temperature_log_bar_by_radius, 0, 1)
             density_bar_direct = density_bar_direct + jnp.swapaxes(density_log_bar_by_radius, 0, 1)
-            density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), DEFAULT_TRANSPORT_DENSITY_FLOOR)
+            density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), self.density_floor)
             density_active = jnp.asarray(state.density) > density_floor_arr
-            density_safe = safe_density(state.density)
+            density_safe = safe_density(state.density, self.density_floor)
             pressure_bar = temperature_bar / density_safe
             density_bar = density_bar_direct - temperature_bar * state.pressure / (density_safe * density_safe)
             density_bar = density_bar * density_active.astype(density_bar.dtype)
@@ -8674,7 +8862,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def build_local_particle_flux_evaluator(self, state):
-        density = safe_density(state.density)
+        density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         support = self._static_support()
         center_prepared = support.center_prepared
@@ -8769,8 +8957,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "Upar": self._cell_centered_flux_to_faces_centered(center_fluxes["Upar"]),
             }
 
-        density = safe_density(state.density)
-        face_density = safe_density(face_state.density)
+        density = safe_density(state.density, self.density_floor)
+        face_density = safe_density(face_state.density, self.density_floor)
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
         particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
@@ -8853,6 +9041,8 @@ def build_ntx_exact_lij_runtime_transport_model(
     collisionality_model="default",
     bc_density=None,
     bc_temperature=None,
+    density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
     **kwargs,
 ):
     del kwargs
@@ -8916,6 +9106,8 @@ def build_ntx_exact_lij_runtime_transport_model(
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
         support=ntx_exact_lij_support,
     )
     if preload_support:

@@ -2133,6 +2133,36 @@ def _apply_radau_lean_timestep_controller(
         fail_code_next = jnp.where(fail_now, code, jnp.asarray(0, dtype=jnp.int32))
         status_next = status_next.at[0].set(fail_now.astype(jnp.int32))
         status_next = status_next.at[1].set(fail_code_next)
+        reject_nonfinite = jnp.logical_or(
+            nonfinite_stage_state,
+            jnp.logical_or(nonfinite_stage_residual, newton_nonfinite),
+        )
+        jax.lax.cond(
+            reject_nonfinite,
+            lambda _: jax.debug.print(
+                "[radau-solver] nonfinite reject: t={t:.6e} trial_dt={trial_dt:.6e} reduced_dt={reduced_dt:.6e} "
+                "nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} "
+                "newton_nonfinite={newton_nonfinite} lagged_valid_before={lagged_valid_before} cache_valid_before={cache_valid_before}",
+                t=step_state.t,
+                trial_dt=trial_dt,
+                reduced_dt=reduced_dt,
+                nonfinite_stage_state=nonfinite_stage_state,
+                nonfinite_stage_residual=nonfinite_stage_residual,
+                newton_nonfinite=newton_nonfinite,
+                lagged_valid_before=step_state.lagged_response_valid,
+                cache_valid_before=cache_valid_out,
+            ),
+            lambda _: None,
+            operand=None,
+        )
+        lagged_response_valid_reject = jnp.logical_and(
+            step_state.lagged_response_valid,
+            jnp.logical_not(reject_nonfinite),
+        )
+        cache_valid_reject = jnp.logical_and(
+            cache_valid_out,
+            jnp.logical_not(reject_nonfinite),
+        )
         return _RadauStepState(
             t=step_state.t,
             y=step_state.y,
@@ -2149,10 +2179,10 @@ def _apply_radau_lean_timestep_controller(
             ),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
             lagged_response_cache=step_state.lagged_response_cache,
-            lagged_response_valid=step_state.lagged_response_valid,
+            lagged_response_valid=lagged_response_valid_reject,
             lagged_reference_y=step_state.lagged_reference_y,
             jacobian=jacobian_out,
-            cache_valid=cache_valid_out,
+            cache_valid=cache_valid_reject,
             cache_dt=cache_dt_out,
             cache_age=cache_age_out,
             real_lu=real_lu_out,

@@ -1572,11 +1572,25 @@ class ComposedEquationSystem:
 
         def _print_array_stats(label, value):
             value = jnp.asarray(value)
+            finite_mask = jnp.isfinite(value)
+            flat_bad = jnp.ravel(jnp.logical_not(finite_mask))
+            first_bad = jnp.argmax(flat_bad)
             jax.debug.print(
-                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}}",
-                finite=jnp.all(jnp.isfinite(value)),
+                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}} first_bad_flat={{first_bad}}",
+                finite=jnp.all(finite_mask),
                 min=jnp.nanmin(value),
                 max=jnp.nanmax(value),
+                first_bad=first_bad,
+            )
+
+        def _print_center_from_faces_stats(fluxes, key):
+            center_key = key
+            face_key = f"{key}_faces"
+            if _flux_has_key(fluxes, center_key) or not _flux_has_key(fluxes, face_key):
+                return
+            _print_array_stats(
+                f"flux.{key}_center_from_faces",
+                jax.vmap(cell_centered_from_faces)(fluxes[face_key]),
             )
 
         def _print(_):
@@ -1592,6 +1606,8 @@ class ComposedEquationSystem:
                     value = shared_fluxes.get(key)
                     if value is not None:
                         _print_array_stats(f"flux.{key}", value)
+                for key in ("Gamma", "Q", "Upar", "Gamma_neo", "Q_neo", "Upar_neo"):
+                    _print_center_from_faces_stats(shared_fluxes, key)
             return jnp.asarray(0, dtype=jnp.int32)
 
         def _skip(_):
