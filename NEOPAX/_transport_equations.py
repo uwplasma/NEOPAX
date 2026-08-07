@@ -230,7 +230,7 @@ class DensityEquation(EquationBase):
         return mode in {"closure_face_flux", "model_face_flux", "face_closure"}
 
     def _use_model_face_particle_fluxes(self):
-        return self._mode_requests_face_fluxes(self.particle_flux_reconstruction)
+        return True
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs):
         del state
@@ -410,10 +410,10 @@ class TemperatureEquation(EquationBase):
         return mode in {"closure_face_flux", "model_face_flux", "face_closure"}
 
     def _use_model_face_heat_fluxes(self):
-        return self._mode_requests_face_fluxes(self.heat_flux_reconstruction)
+        return True
 
     def _use_model_face_particle_fluxes(self):
-        return self._mode_requests_face_fluxes(self.convection_reconstruction)
+        return True
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
         del state, density_rhs
@@ -1118,14 +1118,14 @@ def build_equation_system(
     temperature_source_model = source_models.get("temperature")
     Er_relax = solver_cfg.get("Er_relax", 1.0)
     DEr = solver_cfg.get("DEr", 1.0)
-    Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
+    Er_source_mode = "ambipolar_local"
     Er_permitivity_mode = solver_cfg.get(
         "Er_permittivity_mode",
         solver_cfg.get("Er_permitivity_mode", "neopax_local"),
     )
     Er_boundary_mode = _resolve_er_boundary_mode(config, solver_cfg)
-    density_flux_reconstruction = solver_cfg.get("density_flux_reconstruction", "closure_face_flux")
-    density_particle_face_closure_mode = solver_cfg.get("density_particle_face_closure_mode", "reconstructed")
+    density_flux_reconstruction = "closure_face_flux"
+    density_particle_face_closure_mode = "reconstructed"
     include_neo_convection = solver_cfg.get("temperature_include_neo_convection", True)
     include_turbulent_convection = solver_cfg.get("temperature_include_turbulent_convection", True)
     include_classical_convection = solver_cfg.get("temperature_include_classical_convection", True)
@@ -1133,8 +1133,8 @@ def build_equation_system(
         "temperature_include_work_term",
         solver_cfg.get("temperature_include_work_source_term", True),
     )
-    convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
-    heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
+    convection_reconstruction = "closure_face_flux"
+    heat_flux_reconstruction = "closure_face_flux"
     density_floor = solver_cfg.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
     temperature_floor = solver_cfg.get("temperature_floor", DEFAULT_TRANSPORT_TEMPERATURE_FLOOR)
 

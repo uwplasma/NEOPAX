@@ -22,7 +22,7 @@ ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 21
 ntx_exact_n_xi = 33
 ntx_exact_surface_backend = "vmec"
-ntx_exact_face_response_mode = "interpolate_center_response"
+ntx_exact_center_response_mode = "interpolate_from_faces"
 ntx_exact_response_anchor_count = 0
 
 [ambipolarity]
@@ -155,9 +155,6 @@ temperature_include_work_term = true
 temperature_include_neo_convection = true
 temperature_include_turbulent_convection = false
 temperature_include_classical_convection = false
-temperature_convection_reconstruction = "closure_face_flux"
-temperature_heat_flux_reconstruction = "closure_face_flux"
-Er_source_mode = "ambipolar_local"
 work_source_mode = "local"
 Er_relax = 0.1
 DEr = 2.0

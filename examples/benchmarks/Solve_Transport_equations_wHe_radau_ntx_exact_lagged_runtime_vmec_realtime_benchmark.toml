@@ -1,7 +1,6 @@
-# Full no-He Radau transport run using exact-runtime NTX with lagged-response RHS.
-# Mirrors the usual Solve_Transport_equations_noHe_radau.toml time horizon
-# and solver settings, while switching the neoclassical model to the
-# exact-runtime NTX lagged-response path.
+# Full w-He Radau transport run using exact-runtime NTX with lagged-response RHS.
+# Same four-species physics/source setup as the standard wHe Radau case, but
+# NTX coefficients are evaluated at runtime from the static VMEC/Boozer geometry.
 
 [general]
 mode = "transport"
@@ -21,7 +20,6 @@ ntx_exact_surface_backend = "vmec"
 ntx_exact_center_response_mode = "interpolate_from_faces"
 ntx_exact_response_anchor_count = 48
 
-
 [ambipolarity]
 er_ambipolar_method = "two_stage"
 er_ambipolar_scan_min = -50.0
@@ -39,13 +37,13 @@ er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
 er_ambipolar_reference_er_label = "reference Er"
 er_ambipolar_plot = true
-er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_exact_lagged"
+er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_exact_lagged_vmec_realtime_wHe"
 er_initialization_preprocess_boundary_state = false
 
 [turbulence]
 flux_model = "turbulent_power_analytical"
-chi_density = [6.5e-05, 6.5e-05, 6.5e-05]
-chi_temperature = [0.0065, 0.0065, 0.0065]
+chi_density = [6.5e-05, 6.5e-05, 6.5e-05, 6.5e-05]
+chi_temperature = [0.0065, 0.0065, 0.0065, 0.0065]
 
 [classical]
 flux_model = "none"
@@ -54,10 +52,10 @@ flux_model = "none"
 n_x = 4
 
 [species]
-n_species = 3
-names = ["e", "D", "T"]
-mass_mp = [0.000544617, 2.0, 3.0]
-charge_qp = [-1.0, 1.0, 1.0]
+n_species = 4
+names = ["e", "D", "T", "He"]
+mass_mp = [0.000544617, 2.0, 3.0, 4.0]
+charge_qp = [-1.0, 1.0, 1.0, 2.0]
 
 [profiles]
 model = "standard_analytical"
@@ -65,11 +63,11 @@ n0 = 4.21
 n_edge = 0.6
 T0 = 17.8
 T_edge = 0.7
-c_density = [1.0, 0.5, 0.5]
-c_temperature = [1.0, 1.0, 1.0]
+c_density = [1.0, 0.5, 0.5, 0.0]
+c_temperature = [1.0, 1.0, 1.0, 1.0]
 density_shape_power = 10.0
 temperature_shape_power = 2.0
-n_scale = [0.65, 0.65, 0.65]
+n_scale = [0.65, 0.65, 0.65, 0.0]
 T_scale = 0.7
 er_initialization_mode = "ambipolar_min_entropy"
 er0_scale = 100.0
@@ -88,6 +86,7 @@ type = "dirichlet"
 e = 0.39
 D = 0.195
 T = 0.195
+He = 0.0
 
 [boundary.temperature.left]
 type = "neumann"
@@ -112,19 +111,20 @@ value = 0.0
 type = "floating_ambipolar_edge"
 
 [equations]
-toggle_density = [false, false, false]
-toggle_temperature = [true, true, true]
+toggle_density = [false, false, false, true]
+toggle_temperature = [true, true, true, false]
 toggle_Er = true
 
 [sources]
 temperature = ["power_exchange", "dt_reaction", "fusion_power_fraction_electrons", "bremsstrahlung_radiation"]
+density = ["dt_reaction"]
 
 [sources.parameters.power_exchange]
-mode = "all"
+mode = "exclude_frozen"
 coulomb_log_mode = "ntssfusion"
 
 [sources.parameters.bremsstrahlung_radiation]
-coefficient_mode = "ntssfusion"
+coefficient_mode = "neopax"
 delta_zeff = 0.0
 
 [transport_solver]
@@ -145,7 +145,7 @@ lagged_response_reuse_rtol = 1.0e-2
 lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
 t_final = 20.0
-dt = 1.0e-5
+dt = 1.0e-8
 rtol = 1.0e-6
 atol = 1.0e-8
 max_step = 1.0
@@ -173,9 +173,9 @@ transport_write_hdf5 = true
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
-transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_flux_scaled_noHe.h5"
-transport_initial_reference_label = "Initial ref"
-transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_noHe.h5"
-transport_final_reference_label = "Final ref"
-transport_output_dir = "./outputs/transport_solver_radau_noHe_ntx_exact_lagged"
+transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+transport_initial_reference_label = "Initial NTSS"
+transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
+transport_final_reference_label = "Final NTSS"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime"
 transport_plot_n_times = -1

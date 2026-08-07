@@ -51,7 +51,7 @@ def _build_config(
             neo["ntx_exact_response_anchor_count"] = int(anchor_count)
         else:
             neo.pop("ntx_exact_response_anchor_count", None)
-        neo["ntx_exact_face_response_mode"] = "interpolate_center_response"
+        neo["ntx_exact_center_response_mode"] = "interpolate_from_faces"
     out = config.setdefault("transport_output", {})
     out["transport_plot"] = False
     out["transport_write_hdf5"] = False

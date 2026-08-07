@@ -55,7 +55,7 @@ DEFAULT_ER_INIT_MODE = "keep"
 DEFAULT_NTX_EXACT_N_THETA = 5
 DEFAULT_NTX_EXACT_N_ZETA = 21
 DEFAULT_NTX_EXACT_N_XI = 32
-DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE = "interpolate_center_response"
+DEFAULT_NTX_EXACT_CENTER_RESPONSE_MODE = "interpolate_from_faces"
 DEFAULT_NTX_EXACT_RADIAL_BATCH_SIZE = None
 DEFAULT_NTX_EXACT_RADIAL_BATCH_MODE = "simple"
 DEFAULT_NTX_EXACT_SCAN_BATCH_SIZE = None
@@ -110,7 +110,7 @@ def _build_config(
     n_theta: int | None,
     n_zeta: int | None,
     n_xi: int | None,
-    ntx_face_response_mode: str,
+    ntx_center_response_mode: str,
     ntx_radial_batch_size: int | None,
     ntx_radial_batch_mode: str,
     ntx_scan_batch_size: int | None,
@@ -161,7 +161,7 @@ def _build_config(
             neoclassical["ntx_exact_response_anchor_count"] = int(ntx_response_anchor_count)
         if ntx_use_remat:
             neoclassical["ntx_exact_use_remat"] = True
-        neoclassical["ntx_exact_face_response_mode"] = str(ntx_face_response_mode)
+        neoclassical["ntx_exact_center_response_mode"] = str(ntx_center_response_mode)
 
     ambipolarity = config.setdefault("ambipolarity", {})
     ambipolarity["er_ambipolar_plot"] = False
@@ -973,12 +973,12 @@ def main():
         help="Override ntx_exact_n_xi when benchmarking ntx_exact_lij_runtime.",
     )
     parser.add_argument(
-        "--ntx-face-response-mode",
-        default=DEFAULT_NTX_EXACT_FACE_RESPONSE_MODE,
-        choices=["face_local_response", "interpolate_center_response"],
+        "--ntx-center-response-mode",
+        default=DEFAULT_NTX_EXACT_CENTER_RESPONSE_MODE,
+        choices=["interpolate_from_faces", "direct_center"],
         help=(
-            "Exact-runtime NTX face response mode to use for lagged_response benchmarks. "
-            "Black-box mode continues to use the normal live face-local path."
+            "Exact-runtime NTX center response mode for Er/local terms. "
+            "Density/temperature flux divergences always use face fluxes."
         ),
     )
     parser.add_argument(
@@ -1126,7 +1126,7 @@ def main():
     print(f"[benchmark] device={args.device}")
     print(f"[benchmark] requested_flux_model={args.flux_model}")
     print(f"[benchmark] er_init_mode={args.er_init_mode}")
-    print(f"[benchmark] ntx_face_response_mode={args.ntx_face_response_mode}")
+    print(f"[benchmark] ntx_center_response_mode={args.ntx_center_response_mode}")
     print(f"[benchmark] ntx_radial_batch_size={args.ntx_radial_batch_size}")
     print(f"[benchmark] ntx_radial_batch_mode={args.ntx_radial_batch_mode}")
     print(f"[benchmark] ntx_scan_batch_size={args.ntx_scan_batch_size}")
@@ -1155,7 +1155,7 @@ def main():
                 n_theta=args.ntx_n_theta,
                 n_zeta=args.ntx_n_zeta,
                 n_xi=args.ntx_n_xi,
-                ntx_face_response_mode=args.ntx_face_response_mode,
+                ntx_center_response_mode=args.ntx_center_response_mode,
                 ntx_radial_batch_size=args.ntx_radial_batch_size,
                 ntx_radial_batch_mode=args.ntx_radial_batch_mode,
                 ntx_scan_batch_size=args.ntx_scan_batch_size,
@@ -1185,8 +1185,8 @@ def main():
                     )
                 if active_flux_model == "ntx_exact_lij_runtime":
                     print(
-                        "[benchmark] ntx exact runtime face response mode:",
-                        config["neoclassical"].get("ntx_exact_face_response_mode", "face_local_response"),
+                        "[benchmark] ntx exact runtime center response mode:",
+                        config["neoclassical"].get("ntx_exact_center_response_mode", "interpolate_from_faces"),
                     )
                     anchor_count = config["neoclassical"].get("ntx_exact_response_anchor_count", 0)
                     if int(anchor_count) > 0:

@@ -298,7 +298,8 @@ def _interpolated_response_field_bar_tuple(
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXExactLijLaggedResponse:
-        center_response: Any
+        center_response: Any = None
+        face_response: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -666,6 +667,31 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
+        center_fluxes = kwargs.get("center_fluxes")
+        if (
+            isinstance(center_fluxes, dict)
+            and "Gamma_faces" in center_fluxes
+            and "Q_faces" in center_fluxes
+            and "Upar_faces" in center_fluxes
+        ):
+            zero_gamma_faces = self._zero_like_flux(center_fluxes.get("Gamma_faces", None), 0)
+            zero_q_faces = self._zero_like_flux(center_fluxes.get("Q_faces", None), 0)
+            zero_upar_faces = self._zero_like_flux(center_fluxes.get("Upar_faces", None), 0)
+            return {
+                "Gamma": center_fluxes["Gamma_faces"],
+                "Q": center_fluxes["Q_faces"],
+                "Upar": center_fluxes["Upar_faces"],
+                "Gamma_neo": center_fluxes.get("Gamma_neo_faces", center_fluxes["Gamma_faces"]),
+                "Q_neo": center_fluxes.get("Q_neo_faces", center_fluxes["Q_faces"]),
+                "Upar_neo": center_fluxes.get("Upar_neo_faces", center_fluxes["Upar_faces"]),
+                "Gamma_turb": center_fluxes.get("Gamma_turb_faces", zero_gamma_faces),
+                "Q_turb": center_fluxes.get("Q_turb_faces", zero_q_faces),
+                "Upar_turb": center_fluxes.get("Upar_turb_faces", zero_upar_faces),
+                "Gamma_classical": center_fluxes.get("Gamma_classical_faces", zero_gamma_faces),
+                "Q_classical": center_fluxes.get("Q_classical_faces", zero_q_faces),
+                "Upar_classical": center_fluxes.get("Upar_classical_faces", zero_upar_faces),
+            }
+
         neo = self.neoclassical_model.evaluate_face_fluxes(state, face_state, **kwargs)
         turb = self.turbulent_model.evaluate_face_fluxes(state, face_state, **kwargs)
         classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
@@ -679,7 +705,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 self._zero_like_flux(neo.get("Gamma", None), self._zero_like_flux(classical.get("Gamma", None), 0)),
             )
         )
-        return {
+        out = {
             "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
             "Upar": neo.get("Upar", 0) + turb.get("Upar", 0) + classical.get("Upar", 0),
@@ -800,7 +826,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 self._zero_like_flux(neo.get("Gamma", None), self._zero_like_flux(classical.get("Gamma", None), 0)),
             )
         )
-        return {
+        out = {
             "Gamma": neo.get("Gamma", 0) + gamma_turb + classical.get("Gamma", 0),
             "Q": neo.get("Q", 0) + turb.get("Q", 0) + classical.get("Q", 0),
             "Upar": neo.get("Upar", 0) + turb.get("Upar", 0) + classical.get("Upar", 0),
@@ -814,6 +840,35 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             "Q_classical": classical.get("Q", 0),
             "Upar_classical": classical.get("Upar", 0),
         }
+        if "Gamma_faces" in neo and "Q_faces" in neo and "Upar_faces" in neo:
+            gamma_turb_faces = (
+                turb.get("Gamma_faces", 0)
+                if self.include_turbulent_particle_flux
+                else self._zero_like_flux(
+                    turb.get("Gamma_faces", None),
+                    self._zero_like_flux(
+                        neo.get("Gamma_faces", None),
+                        self._zero_like_flux(classical.get("Gamma_faces", None), 0),
+                    ),
+                )
+            )
+            out.update(
+                {
+                    "Gamma_faces": neo.get("Gamma_faces", 0) + gamma_turb_faces + classical.get("Gamma_faces", 0),
+                    "Q_faces": neo.get("Q_faces", 0) + turb.get("Q_faces", 0) + classical.get("Q_faces", 0),
+                    "Upar_faces": neo.get("Upar_faces", 0) + turb.get("Upar_faces", 0) + classical.get("Upar_faces", 0),
+                    "Gamma_neo_faces": neo.get("Gamma_faces", 0),
+                    "Q_neo_faces": neo.get("Q_faces", 0),
+                    "Upar_neo_faces": neo.get("Upar_faces", 0),
+                    "Gamma_turb_faces": gamma_turb_faces,
+                    "Q_turb_faces": turb.get("Q_faces", 0),
+                    "Upar_turb_faces": turb.get("Upar_faces", 0),
+                    "Gamma_classical_faces": classical.get("Gamma_faces", 0),
+                    "Q_classical_faces": classical.get("Q_faces", 0),
+                    "Upar_classical_faces": classical.get("Upar_faces", 0),
+                }
+            )
+        return out
 
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
         def _submodel_pullback(model, subresponse, subflux_bar):
@@ -836,12 +891,18 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         gamma_total_bar = flux_bar.get("Gamma", 0)
         q_total_bar = flux_bar.get("Q", 0)
         upar_total_bar = flux_bar.get("Upar", 0)
+        gamma_faces_total_bar = flux_bar.get("Gamma_faces", 0)
+        q_faces_total_bar = flux_bar.get("Q_faces", 0)
+        upar_faces_total_bar = flux_bar.get("Upar_faces", 0)
 
         zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
         neo_flux_bar = {
             "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
             "Q": q_total_bar + flux_bar.get("Q_neo", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+            "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_neo_faces", 0),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_neo_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_neo_faces", 0),
         }
         turb_flux_bar = {
             "Gamma": (
@@ -851,11 +912,21 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             ),
             "Q": q_total_bar + flux_bar.get("Q_turb", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+            "Gamma_faces": (
+                gamma_faces_total_bar + flux_bar.get("Gamma_turb_faces", 0)
+                if self.include_turbulent_particle_flux
+                else flux_bar.get("Gamma_turb_faces", 0)
+            ),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_turb_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_turb_faces", 0),
         }
         classical_flux_bar = {
             "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
             "Q": q_total_bar + flux_bar.get("Q_classical", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+            "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_classical_faces", 0),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_classical_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_classical_faces", 0),
         }
 
         return CombinedTransportLaggedResponse(
@@ -887,12 +958,18 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         gamma_total_bar = flux_bar.get("Gamma", 0)
         q_total_bar = flux_bar.get("Q", 0)
         upar_total_bar = flux_bar.get("Upar", 0)
+        gamma_faces_total_bar = flux_bar.get("Gamma_faces", 0)
+        q_faces_total_bar = flux_bar.get("Q_faces", 0)
+        upar_faces_total_bar = flux_bar.get("Upar_faces", 0)
 
         zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
         neo_flux_bar = {
             "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
             "Q": q_total_bar + flux_bar.get("Q_neo", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+            "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_neo_faces", 0),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_neo_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_neo_faces", 0),
         }
         pullback_fn = getattr(
             self.neoclassical_model,
@@ -948,12 +1025,18 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         gamma_total_bar = flux_bar.get("Gamma", 0)
         q_total_bar = flux_bar.get("Q", 0)
         upar_total_bar = flux_bar.get("Upar", 0)
+        gamma_faces_total_bar = flux_bar.get("Gamma_faces", 0)
+        q_faces_total_bar = flux_bar.get("Q_faces", 0)
+        upar_faces_total_bar = flux_bar.get("Upar_faces", 0)
 
         zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
         neo_flux_bar = {
             "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
             "Q": q_total_bar + flux_bar.get("Q_neo", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+            "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_neo_faces", 0),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_neo_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_neo_faces", 0),
         }
         turb_flux_bar = {
             "Gamma": (
@@ -963,11 +1046,21 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             ),
             "Q": q_total_bar + flux_bar.get("Q_turb", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+            "Gamma_faces": (
+                gamma_faces_total_bar + flux_bar.get("Gamma_turb_faces", 0)
+                if self.include_turbulent_particle_flux
+                else flux_bar.get("Gamma_turb_faces", 0)
+            ),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_turb_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_turb_faces", 0),
         }
         classical_flux_bar = {
             "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
             "Q": q_total_bar + flux_bar.get("Q_classical", 0),
             "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+            "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_classical_faces", 0),
+            "Q_faces": q_faces_total_bar + flux_bar.get("Q_classical_faces", 0),
+            "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_classical_faces", 0),
         }
 
         neo_state_bar = _submodel_state_pullback(
@@ -1411,6 +1504,22 @@ def _support_with_center_delta(support, center_channels_delta, center_prepared_d
     )
 
 
+def _support_with_all_delta(
+    support,
+    center_channels_delta,
+    face_channels_delta,
+    center_prepared_delta,
+    face_prepared_delta,
+):
+    return dataclasses.replace(
+        support,
+        center_channels=_add_float_delta_tree(support.center_channels, center_channels_delta),
+        face_channels=_add_float_delta_tree(support.face_channels, face_channels_delta),
+        center_prepared=_add_float_delta_tree(support.center_prepared, center_prepared_delta),
+        face_prepared=_add_float_delta_tree(support.face_prepared, face_prepared_delta),
+    )
+
+
 def _support_bar_from_channel_bars(support, center_bar, face_bar):
     return dataclasses.replace(
         _float_delta_tree_like(support),
@@ -1424,6 +1533,22 @@ def _support_bar_from_center_bars(support, center_channels_bar, center_prepared_
         _float_delta_tree_like(support),
         center_channels=_sanitize_float_delta_bar_tree(support.center_channels, center_channels_bar),
         center_prepared=_sanitize_float_delta_bar_tree(support.center_prepared, center_prepared_bar),
+    )
+
+
+def _support_bar_from_all_bars(
+    support,
+    center_channels_bar,
+    face_channels_bar,
+    center_prepared_bar,
+    face_prepared_bar,
+):
+    return dataclasses.replace(
+        _float_delta_tree_like(support),
+        center_channels=_sanitize_float_delta_bar_tree(support.center_channels, center_channels_bar),
+        face_channels=_sanitize_float_delta_bar_tree(support.face_channels, face_channels_bar),
+        center_prepared=_sanitize_float_delta_bar_tree(support.center_prepared, center_prepared_bar),
+        face_prepared=_sanitize_float_delta_bar_tree(support.face_prepared, face_prepared_bar),
     )
 
 
@@ -1479,6 +1604,40 @@ def build_ntx_runtime_surfaces(vmec_file, boozer_file, rho_values, *, surface_ba
     rho_arr = _as_float_array(rho_values, name="rho_values")
     _, loader = _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend=surface_backend)
     return tuple(loader(float(rho_value)) for rho_value in rho_arr)
+
+
+def _positive_transport_rho_values_from_rho(rho_values):
+    rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
+    positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
+    if positive.size == 0:
+        return tuple(float(rho_value) for rho_value in rho_np)
+    first_transport_rho = float(np.min(positive))
+    return tuple(float(rho_value if rho_value > 0.0 else first_transport_rho) for rho_value in rho_np)
+
+
+def _normalize_ntx_exact_center_response_mode(mode):
+    key = str(mode).strip().lower()
+    if key in {
+        "direct",
+        "direct_center",
+        "center_local_response",
+        "center_local",
+        "center_response",
+        "face_local_response",
+    }:
+        return "direct_center"
+    if key in {
+        "interpolate_from_faces",
+        "interpolate_face_response",
+        "interpolate_center_response",
+        "interpolate_center_fluxes",
+        "center_interpolation",
+    }:
+        return "interpolate_from_faces"
+    raise ValueError(
+        "ntx_exact_center_response_mode must be one of "
+        "'direct_center' or 'interpolate_from_faces'."
+    )
 
 
 @functools.partial(
@@ -1670,7 +1829,9 @@ def build_ntx_exact_lij_runtime_support(
     n_theta=25,
     n_zeta=25,
     n_xi=64,
+    face_response_mode="face_local_response",
 ) -> NTXExactLijRuntimeSupport:
+    del face_response_mode  # Kept only for temporary config/API compatibility.
     ntx = _import_ntx()
     grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
     center_channels = build_ntx_runtime_scan_channels(vmec_file, boozer_file, rho_center)
@@ -1678,13 +1839,13 @@ def build_ntx_exact_lij_runtime_support(
     center_surfaces = build_ntx_runtime_surfaces(
         vmec_file,
         boozer_file,
-        center_channels.rho,
+        _positive_transport_rho_values_from_rho(center_channels.rho),
         surface_backend=surface_backend,
     )
     face_surfaces = build_ntx_runtime_surfaces(
         vmec_file,
         boozer_file,
-        face_channels.rho,
+        _positive_transport_rho_values_from_rho(face_channels.rho),
         surface_backend=surface_backend,
     )
 
@@ -1695,8 +1856,8 @@ def build_ntx_exact_lij_runtime_support(
         return jnp.stack([jnp.asarray(value) for value in values], axis=0)
 
     center_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in center_surfaces)
-    face_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in face_surfaces)
     center_prepared = jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
+    face_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in face_surfaces)
     face_prepared = jax.tree_util.tree_map(_stack_optional, *face_prepared_tuple)
     return NTXExactLijRuntimeSupport(
         center_channels=center_channels,
@@ -1718,7 +1879,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     n_zeta: int = 25
     n_xi: int = 64
     surface_backend: str = "vmec"
-    face_response_mode: str = "face_local_response"
+    center_response_mode: str = "interpolate_from_faces"
     radial_batch_size: int | None = None
     radial_batch_mode: str = "simple"
     scan_batch_size: int | None = None
@@ -1784,8 +1945,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             support=None,
         )
 
+    def with_center_response_mode(self, center_response_mode: str) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(
+            self,
+            center_response_mode=_normalize_ntx_exact_center_response_mode(center_response_mode),
+        )
+
     def with_face_response_mode(self, face_response_mode: str) -> "NTXExactLijRuntimeTransportModel":
-        return dataclasses.replace(self, face_response_mode=str(face_response_mode))
+        return self.with_center_response_mode(_normalize_ntx_exact_center_response_mode(face_response_mode))
 
     def with_radial_batch_size(self, radial_batch_size: int | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if radial_batch_size in (None, 0) else int(radial_batch_size)
@@ -5552,6 +5719,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
         support = self._static_support()
+        if support.face_prepared is None:
+            raise ValueError(
+                "NTX face fluxes require face_prepared support. "
+                "Build exact-runtime support with face surfaces enabled."
+            )
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal_faces = get_v_thermal(self.species.mass, temperature_faces)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
@@ -5580,8 +5752,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(species_indices)
 
-        lij_by_radius = self._map_radius_axis(_per_radius, radius_indices)
-        lij_by_radius = self._regularize_axis_radius0(lij_by_radius, self.geometry.r_grid_half)
+        lij_by_radius = self._map_radius_axis_regularized_at_axis0(
+            _per_radius,
+            radius_indices,
+            self.geometry.r_grid_half,
+        )
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
     def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
@@ -5641,7 +5816,43 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return faces_from_cell_centered(flux)
         return jax.vmap(faces_from_cell_centered)(flux)
 
+    def _center_response_interpolates_from_faces(self):
+        return self.center_response_mode == "interpolate_from_faces"
+
+    def _face_fluxes_to_center_fluxes(self, face_fluxes):
+        return {
+            key: (
+                cell_centered_from_faces(value)
+                if jnp.asarray(value).ndim == 1
+                else jax.vmap(cell_centered_from_faces)(value)
+            )
+            for key, value in face_fluxes.items()
+        }
+
+    def _center_fluxes_with_face_fluxes(self, face_fluxes):
+        center_fluxes = self._face_fluxes_to_center_fluxes(face_fluxes)
+        return {
+            **center_fluxes,
+            "Gamma_faces": face_fluxes["Gamma"],
+            "Q_faces": face_fluxes["Q"],
+            "Upar_faces": face_fluxes["Upar"],
+            "Gamma_neo_faces": face_fluxes["Gamma"],
+            "Q_neo_faces": face_fluxes["Q"],
+            "Upar_neo_faces": face_fluxes["Upar"],
+        }
+
     def __call__(self, state) -> dict:
+        if self._center_response_interpolates_from_faces():
+            face_state = build_face_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+            )
+            return self._center_fluxes_with_face_fluxes(
+                self.evaluate_face_fluxes(state, face_state)
+            )
+
         density = safe_density(state.density)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
@@ -6281,6 +6492,153 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        if self._center_response_interpolates_from_faces():
+            face_state = build_face_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+            )
+            face_density = safe_density(face_state.density)
+            face_temperature = face_state.temperature
+            face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+            n_face = int(face_state.Er.shape[0])
+            face_radius_indices = jnp.arange(n_face, dtype=jnp.int32)
+            face_anchor_indices = self._response_anchor_indices(n_face)
+
+            if int(face_anchor_indices.shape[0]) < n_face:
+                target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
+
+                def _per_face_anchor(radius_index):
+                    prepared = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        support.face_prepared,
+                    )
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        support.face_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        face_temperature,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(
+                        face_density,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        face_v_thermal,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    return jax.vmap(
+                        lambda species_index: self._build_interpolated_moment_response_local(
+                            prepared,
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )
+                    )(species_indices)
+
+                anchor_response = self._map_radius_axis_regularized_at_axis0(
+                    _per_face_anchor,
+                    face_anchor_indices,
+                    jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[face_anchor_indices],
+                )
+                if lagged_timing_enabled():
+                    jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
+                return NTXExactLijLaggedResponse(
+                    face_response=NTXInterpolatedMomentResponse(
+                        reference_er=face_state.Er,
+                        reference_log_nu_star=jnp.swapaxes(
+                            self._interpolate_anchor_values(
+                                face_anchor_indices,
+                                anchor_response[0],
+                                target_rho,
+                            ),
+                            0,
+                            1,
+                        ),
+                        reference_transport_moments=jnp.swapaxes(
+                            self._interpolate_anchor_values(
+                                face_anchor_indices,
+                                anchor_response[1],
+                                target_rho,
+                            ),
+                            0,
+                            1,
+                        ),
+                        dtransport_moments_d_er=jnp.swapaxes(
+                            self._interpolate_anchor_values(
+                                face_anchor_indices,
+                                anchor_response[2],
+                                target_rho,
+                            ),
+                            0,
+                            1,
+                        ),
+                        dtransport_moments_d_log_nu_star=jnp.swapaxes(
+                            self._interpolate_anchor_values(
+                                face_anchor_indices,
+                                anchor_response[3],
+                                target_rho,
+                            ),
+                            0,
+                            1,
+                        ),
+                    )
+                )
+
+            def _per_face_radius(radius_index):
+                prepared = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                    support.face_prepared,
+                )
+                drds_value = jax.lax.dynamic_index_in_dim(
+                    support.face_channels.drds,
+                    radius_index,
+                    axis=0,
+                    keepdims=False,
+                )
+                er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+                temperature_local = jax.lax.dynamic_index_in_dim(face_temperature, radius_index, axis=1, keepdims=False)
+                density_local = jax.lax.dynamic_index_in_dim(face_density, radius_index, axis=1, keepdims=False)
+                vthermal_local = jax.lax.dynamic_index_in_dim(face_v_thermal, radius_index, axis=1, keepdims=False)
+                return jax.vmap(
+                    lambda species_index: self._build_coefficient_response_local(
+                        prepared,
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            response_by_face = self._map_radius_axis_regularized_at_axis0(
+                _per_face_radius,
+                face_radius_indices,
+                self.geometry.r_grid_half,
+            )
+            if lagged_timing_enabled():
+                jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
+            return NTXExactLijLaggedResponse(face_response=response_by_face)
+
         n_radius = int(state.Er.shape[0])
         radius_indices = jnp.arange(n_radius, dtype=jnp.int32)
         anchor_indices = self._response_anchor_indices(n_radius)
@@ -6387,6 +6745,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
         reverse_stage_cotangent_mode = str(kwargs.pop("reverse_stage_cotangent_mode", "full")).strip().lower()
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            if lagged_response_bar is None or lagged_response_bar.face_response is None:
+                return jax.tree_util.tree_map(jnp.zeros_like, state)
+            _, pullback = jax.vjp(
+                lambda state_value: self.build_lagged_response(state_value),
+                state,
+            )
+            (state_bar,) = pullback(lagged_response_bar)
+            return state_bar
+
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if center_response_bar is None:
             return jax.tree_util.tree_map(jnp.zeros_like, state)
@@ -6835,6 +7203,42 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            if lagged_response_bar is None or lagged_response_bar.face_response is None:
+                return _float_delta_tree_like(support)
+            center_channels_delta0 = _float_delta_tree_like(support.center_channels)
+            face_channels_delta0 = _float_delta_tree_like(support.face_channels)
+            center_prepared_delta0 = _float_delta_tree_like(support.center_prepared)
+            face_prepared_delta0 = _float_delta_tree_like(support.face_prepared)
+            _, support_delta_pullback = jax.vjp(
+                lambda center_delta, face_delta, center_prepared_delta, face_prepared_delta: self.with_support_payload(
+                    _support_with_all_delta(
+                        support,
+                        center_delta,
+                        face_delta,
+                        center_prepared_delta,
+                        face_prepared_delta,
+                    )
+                ).build_lagged_response(state),
+                center_channels_delta0,
+                face_channels_delta0,
+                center_prepared_delta0,
+                face_prepared_delta0,
+            )
+            (
+                center_channels_bar,
+                face_channels_bar,
+                center_prepared_bar,
+                face_prepared_bar,
+            ) = support_delta_pullback(lagged_response_bar)
+            return _support_bar_from_all_bars(
+                support,
+                center_channels_bar,
+                face_channels_bar,
+                center_prepared_bar,
+                face_prepared_bar,
+            )
+
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if center_response_bar is None:
             return _support_bar_from_center_bars(
@@ -7101,6 +7505,206 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            face_state = build_face_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+            )
+            face_response = lagged_response.face_response
+            if face_response is None:
+                raise ValueError("interpolate_from_faces lagged NTX evaluation requires face_response.")
+            density = safe_density(state.density)
+            face_density = safe_density(face_state.density)
+            face_temperature = face_state.temperature
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            radius_indices = jnp.arange(face_state.Er.shape[0], dtype=jnp.int32)
+
+            if isinstance(face_response, NTXInterpolatedMomentResponse):
+                def _current_log_nu_star_per_face(radius_index):
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        support.face_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        face_temperature,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(
+                        face_density,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        face_v_thermal,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    return jax.vmap(
+                        lambda species_index: self._log_nu_star_from_nu_hat(
+                            self._local_scan_inputs(
+                                drds_value=drds_value,
+                                species_index=species_index,
+                                er_value=er_value,
+                                temperature_local=temperature_local,
+                                density_local=density_local,
+                                vthermal_local=vthermal_local,
+                                collisionality_kind=collisionality_kind,
+                            )[0]
+                        )
+                    )(species_indices)
+
+                current_log_nu_star = jnp.swapaxes(
+                    self._map_radius_axis_regularized_at_axis0(
+                        _current_log_nu_star_per_face,
+                        radius_indices,
+                        self.geometry.r_grid_half,
+                        unbatched=True,
+                    ),
+                    0,
+                    1,
+                )
+                delta_er = face_state.Er - face_response.reference_er
+                delta_log_nu_star = current_log_nu_star - face_response.reference_log_nu_star
+                transport_moments = (
+                    face_response.reference_transport_moments
+                    + face_response.dtransport_moments_d_er * delta_er[None, :, None]
+                    + face_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+                )
+                lij_faces = self._batched_lij_from_transport_moments(transport_moments, face_v_thermal)
+            else:
+                def _transport_moment_tangent_per_face(radius_index):
+                    prepared = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        support.face_prepared,
+                    )
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        support.face_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        face_temperature,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(face_density, radius_index, axis=1, keepdims=False)
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        face_v_thermal,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    ref_nu_radius = jax.lax.dynamic_index_in_dim(
+                        face_response.reference_nu_hat,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    ref_epsi_radius = jax.lax.dynamic_index_in_dim(
+                        face_response.reference_epsi_hat,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    return jax.vmap(
+                        lambda species_index, ref_nu_species, ref_epsi_species: jax.jvp(
+                            lambda nu_hat_a, epsi_hat_a: self._transport_moments_from_inputs(
+                                prepared,
+                                nu_hat_a,
+                                epsi_hat_a,
+                                drds_value=drds_value,
+                                derivative_mode_override="direct",
+                            ),
+                            (ref_nu_species, ref_epsi_species),
+                            tuple(
+                                current_value - reference_value
+                                for current_value, reference_value in zip(
+                                    self._local_scan_inputs(
+                                        drds_value=drds_value,
+                                        species_index=species_index,
+                                        er_value=er_value,
+                                        temperature_local=temperature_local,
+                                        density_local=density_local,
+                                        vthermal_local=vthermal_local,
+                                        collisionality_kind=collisionality_kind,
+                                    )[:2],
+                                    (ref_nu_species, ref_epsi_species),
+                                )
+                            ),
+                        )[1]
+                    )(species_indices, ref_nu_radius, ref_epsi_radius)
+
+                transport_moment_tangent_by_face = self._map_radius_axis_regularized_at_axis0(
+                    _transport_moment_tangent_per_face,
+                    radius_indices,
+                    self.geometry.r_grid_half,
+                )
+                transport_moments = (
+                    face_response.reference_transport_moments
+                    + transport_moment_tangent_by_face
+                )
+                transport_moments = jnp.swapaxes(transport_moments, 0, 1)
+                lij_faces = self._batched_lij_from_transport_moments(transport_moments, face_v_thermal)
+
+            dndr_faces = _face_profile_gradient(
+                density,
+                self.geometry.r_grid_half,
+                bc_model=self.bc_density,
+            )
+            dTdr_faces = _face_profile_gradient(
+                state.temperature,
+                self.geometry.r_grid_half,
+                bc_model=self.bc_temperature,
+            )
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                    charge,
+                    density_a,
+                    temperature_a,
+                    dndr_a,
+                    dTdr_a,
+                    face_state.Er,
+                ),
+                in_axes=(0, 0, 0, 0, 0),
+            )(self.species.charge, face_density, face_temperature, dndr_faces, dTdr_faces)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(face_temperature, dTdr_faces)
+            a3 = get_Thermodynamical_Forces_A3(face_state.Er)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * face_density
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * face_temperature
+            gamma = -density_phys * (
+                lij_faces[:, :, 0, 0] * a1
+                + lij_faces[:, :, 0, 1] * a2
+                + lij_faces[:, :, 0, 2] * a3[None, :]
+            )
+            q = -temperature_phys * density_phys * (
+                lij_faces[:, :, 1, 0] * a1
+                + lij_faces[:, :, 1, 1] * a2
+                + lij_faces[:, :, 1, 2] * a3[None, :]
+            )
+            upar = -density_phys * (
+                lij_faces[:, :, 2, 0] * a1
+                + lij_faces[:, :, 2, 1] * a2
+                + lij_faces[:, :, 2, 2] * a3[None, :]
+            )
+            return self._center_fluxes_with_face_fluxes(
+                {"Gamma": gamma, "Q": q, "Upar": upar}
+            )
+
         density = safe_density(state.density)
         temperature = state.temperature
         n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
@@ -7238,6 +7842,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            _, response_pullback = jax.vjp(
+                lambda response_value: self.evaluate_with_lagged_response(
+                    state,
+                    response_value,
+                ),
+                lagged_response,
+            )
+            (response_bar,) = response_pullback(flux_bar)
+            return response_bar
+
         center_response = lagged_response.center_response
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
@@ -7452,6 +8067,40 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         **kwargs,
     ):
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            center_delta0 = _float_delta_tree_like(support.center_channels)
+            face_delta0 = _float_delta_tree_like(support.face_channels)
+            center_prepared_delta0 = _float_delta_tree_like(support.center_prepared)
+            face_prepared_delta0 = _float_delta_tree_like(support.face_prepared)
+            _, support_delta_pullback = jax.vjp(
+                lambda center_delta, face_delta, center_prepared_delta, face_prepared_delta: self.with_support_payload(
+                    _support_with_all_delta(
+                        support,
+                        center_delta,
+                        face_delta,
+                        center_prepared_delta,
+                        face_prepared_delta,
+                    )
+                ).evaluate_with_lagged_response(state, lagged_response),
+                center_delta0,
+                face_delta0,
+                center_prepared_delta0,
+                face_prepared_delta0,
+            )
+            (
+                center_channels_bar,
+                face_channels_bar,
+                center_prepared_bar,
+                face_prepared_bar,
+            ) = support_delta_pullback(flux_bar)
+            return _support_bar_from_all_bars(
+                support,
+                center_channels_bar,
+                face_channels_bar,
+                center_prepared_bar,
+                face_prepared_bar,
+            )
+
         center_delta0 = _float_delta_tree_like(support.center_channels)
         face_delta0 = _float_delta_tree_like(support.face_channels)
         _, channel_delta_pullback = jax.vjp(
@@ -7466,6 +8115,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
         del kwargs
+        if self._center_response_interpolates_from_faces():
+            _, state_pullback = jax.vjp(
+                lambda state_value: self.evaluate_with_lagged_response(
+                    state_value,
+                    lagged_response,
+                ),
+                state,
+            )
+            (state_bar,) = state_pullback(flux_bar)
+            return state_bar
+
         center_response = lagged_response.center_response
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
@@ -7879,15 +8539,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
-        face_response_mode = str(kwargs.get("face_response_mode", self.face_response_mode)).strip().lower()
-        center_fluxes = kwargs.get("center_fluxes")
-        if face_response_mode in {"interpolate_center_response", "interpolate_center_fluxes", "center_interpolation"}:
-            if center_fluxes is None:
-                center_fluxes = self(state)
+        center_fluxes = kwargs.pop("center_fluxes", None)
+        if (
+            isinstance(center_fluxes, dict)
+            and "Gamma_faces" in center_fluxes
+            and "Q_faces" in center_fluxes
+            and "Upar_faces" in center_fluxes
+        ):
             return {
-                "Gamma": self._cell_centered_flux_to_faces_centered(center_fluxes["Gamma"]),
-                "Q": self._cell_centered_flux_to_faces_centered(center_fluxes["Q"]),
-                "Upar": self._cell_centered_flux_to_faces_centered(center_fluxes["Upar"]),
+                "Gamma": center_fluxes["Gamma_faces"],
+                "Q": center_fluxes["Q_faces"],
+                "Upar": center_fluxes["Upar_faces"],
             }
 
         density = safe_density(state.density)
@@ -7957,7 +8619,8 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_n_zeta=25,
     ntx_exact_n_xi=64,
     ntx_exact_surface_backend="vmec",
-    ntx_exact_face_response_mode="face_local_response",
+    ntx_exact_face_response_mode="interpolate_center_response",
+    ntx_exact_center_response_mode=None,
     ntx_exact_radial_batch_size=None,
     ntx_exact_radial_batch_mode="simple",
     ntx_exact_scan_batch_size=None,
@@ -7976,6 +8639,11 @@ def build_ntx_exact_lij_runtime_transport_model(
     **kwargs,
 ):
     del kwargs
+    center_response_mode = _normalize_ntx_exact_center_response_mode(
+        ntx_exact_face_response_mode
+        if ntx_exact_center_response_mode is None
+        else ntx_exact_center_response_mode
+    )
     model = NTXExactLijRuntimeTransportModel(
         species=species,
         energy_grid=energy_grid,
@@ -7986,7 +8654,7 @@ def build_ntx_exact_lij_runtime_transport_model(
         n_zeta=int(ntx_exact_n_zeta),
         n_xi=int(ntx_exact_n_xi),
         surface_backend=str(ntx_exact_surface_backend),
-        face_response_mode=str(ntx_exact_face_response_mode),
+        center_response_mode=center_response_mode,
         radial_batch_size=(
             None
             if ntx_exact_radial_batch_size in (None, "", 0, "0")

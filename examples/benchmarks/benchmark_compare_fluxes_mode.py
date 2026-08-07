@@ -2,8 +2,8 @@
 
 One run can compare:
 - database baseline
-- exact-runtime with interpolate_center_response
-- exact-runtime with face_local_response
+- exact-runtime with interpolate_from_faces center response
+- exact-runtime with direct_center response
 - multiple exact-runtime resolutions
 """
 
@@ -28,7 +28,7 @@ import NEOPAX
 
 DEFAULT_DATABASE_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_database_benchmark.toml")
 DEFAULT_EXACT_CONFIG = Path("examples/benchmarks/Calculate_Fluxes_noHe_ntx_exact_lij_runtime_benchmark.toml")
-DEFAULT_FACE_MODES = ["interpolate_center_response", "face_local_response"]
+DEFAULT_CENTER_MODES = ["interpolate_from_faces", "direct_center"]
 DEFAULT_RESOLUTIONS = ["5,21,32"]
 
 
@@ -45,7 +45,7 @@ def _run_config(
     device: str,
     er_init_mode: str,
     flux_model: str | None = None,
-    face_mode: str | None = None,
+    center_mode: str | None = None,
     resolution: tuple[int, int, int] | None = None,
     exact_er_v_floor: float | None = None,
     output_dir: Path | None = None,
@@ -57,8 +57,8 @@ def _run_config(
     neoclassical = config.setdefault("neoclassical", {})
     if flux_model is not None:
         neoclassical["flux_model"] = str(flux_model)
-    if face_mode is not None:
-        neoclassical["ntx_exact_face_response_mode"] = str(face_mode)
+    if center_mode is not None:
+        neoclassical["ntx_exact_center_response_mode"] = str(center_mode)
     if resolution is not None:
         n_theta, n_zeta, n_xi = resolution
         neoclassical["ntx_exact_n_theta"] = int(n_theta)
@@ -153,11 +153,11 @@ def main():
         help="Override profiles.er_initialization_mode for all native fluxes-mode runs.",
     )
     parser.add_argument(
-        "--face-modes",
+        "--center-modes",
         nargs="+",
-        default=DEFAULT_FACE_MODES,
-        choices=["interpolate_center_response", "face_local_response"],
-        help="Exact-runtime face response modes to compare in the same run.",
+        default=DEFAULT_CENTER_MODES,
+        choices=["interpolate_from_faces", "direct_center"],
+        help="Exact-runtime center response modes to compare in the same run.",
     )
     parser.add_argument(
         "--resolutions",
@@ -181,7 +181,7 @@ def main():
     print(f"[flux-compare] database_config={db_cfg}")
     print(f"[flux-compare] exact_config={ex_cfg}")
     print(f"[flux-compare] er_init_mode={args.er_init_mode}")
-    print(f"[flux-compare] face_modes={args.face_modes}")
+    print(f"[flux-compare] center_modes={args.center_modes}")
     print(f"[flux-compare] resolutions={resolutions}")
     print(f"[flux-compare] exact_er_v_floor={args.exact_er_v_floor}")
 
@@ -208,17 +208,17 @@ def main():
         }
     ]
 
-    for face_mode in args.face_modes:
+    for center_mode in args.center_modes:
         for resolution in resolutions:
             n_theta, n_zeta, n_xi = resolution
-            label = f"exact:{face_mode}:({n_theta},{n_zeta},{n_xi})"
-            slug = f"{face_mode}_{n_theta}_{n_zeta}_{n_xi}"
+            label = f"exact:{center_mode}:({n_theta},{n_zeta},{n_xi})"
+            slug = f"{center_mode}_{n_theta}_{n_zeta}_{n_xi}"
             rho_ex, fluxes_ex, dt_ex, out_ex = _run_config(
                 ex_cfg,
                 device=args.device,
                 er_init_mode=args.er_init_mode,
                 flux_model="ntx_exact_lij_runtime",
-                face_mode=face_mode,
+                center_mode=center_mode,
                 resolution=resolution,
                 exact_er_v_floor=args.exact_er_v_floor,
                 output_dir=compare_output_dir / f"native_{slug}",
