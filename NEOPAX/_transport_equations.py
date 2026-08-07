@@ -3,7 +3,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 from jax import jit
-from ._fem import conservative_update, faces_from_cell_centered
+from ._fem import cell_centered_from_faces, conservative_update, faces_from_cell_centered
 from ._cell_variable import make_profile_cell_variable
 from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
 from ._constants import elementary_charge
@@ -207,6 +207,41 @@ class TransportLaggedResponse:
     flux_response: object = dataclasses.field(repr=False, default=None)
 
 
+def _flux_has_key(fluxes, key):
+    return isinstance(fluxes, dict) and key in fluxes and fluxes.get(key, None) is not None
+
+
+def _get_face_flux(fluxes, key):
+    face_key = f"{key}_faces"
+    if _flux_has_key(fluxes, face_key):
+        return fluxes[face_key]
+    if _flux_has_key(fluxes, key):
+        return fluxes[key]
+    return None
+
+
+def _get_center_flux(fluxes, key):
+    if _flux_has_key(fluxes, key):
+        return fluxes[key]
+    face_value = _get_face_flux(fluxes, key)
+    if face_value is None:
+        return None
+    return jax.vmap(cell_centered_from_faces)(face_value)
+
+
+def _with_center_fluxes_from_faces(fluxes, keys=("Gamma", "Q", "Upar")):
+    """Return a center-view of face-primary fluxes without changing lagged storage."""
+    if not isinstance(fluxes, dict):
+        return fluxes
+    out = dict(fluxes)
+    for key in keys:
+        if not _flux_has_key(out, key):
+            center_value = _get_center_flux(out, key)
+            if center_value is not None:
+                out[key] = center_value
+    return out
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class DensityEquation(EquationBase):
@@ -241,11 +276,24 @@ class DensityEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
+        face_fluxes = (
+            fluxes
+            if (need_face_fluxes and _flux_has_key(fluxes, "Gamma_faces"))
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        gamma_center = _get_center_flux(fluxes, "Gamma")
+        Gamma = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_center
+            if gamma_center is not None
+            else None
+        )
         Gamma_faces_raw = (
-            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
-            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * _get_face_flux(face_fluxes, "Gamma")
+            if (face_fluxes is not None and _get_face_flux(face_fluxes, "Gamma") is not None and use_face_gamma)
             else self.flux_faces_builder(Gamma, self.particle_flux_reconstruction)
         )
         gamma_divergence_raw = jax.vmap(
@@ -279,11 +327,26 @@ class DensityEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
+        face_fluxes = (
+            fluxes
+            if (need_face_fluxes and _flux_has_key(fluxes, "Gamma_faces"))
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        gamma_center = _get_center_flux(fluxes, "Gamma")
+        Gamma = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_center
+            if gamma_center is not None
+            else None
+        )
         Gamma_faces = (
-            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
-            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * (
+                _get_face_flux(face_fluxes, "Gamma")
+            )
+            if (face_fluxes is not None and use_face_gamma)
             else self.flux_faces_builder(Gamma, self.particle_flux_reconstruction)
         )
         gamma_divergence = jax.vmap(
@@ -425,11 +488,25 @@ class TemperatureEquation(EquationBase):
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        face_fluxes = (
+            fluxes
+            if (
+                need_face_fluxes
+                and (_flux_has_key(fluxes, "Q_faces") or _flux_has_key(fluxes, "Gamma_faces"))
+            )
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        q_center = _get_center_flux(fluxes, "Q")
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
-            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            HEAT_FLUX_PHYSICAL_TO_STATE * (
+                _get_face_flux(face_fluxes, "Q")
+            )
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
@@ -439,7 +516,12 @@ class TemperatureEquation(EquationBase):
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
+            gamma_face_key = f"{gamma_key}_faces"
+            gamma_comp = (
+                _get_face_flux(face_fluxes, gamma_key)
+                if (face_fluxes is not None and use_face_gamma)
+                else _get_center_flux(fluxes, gamma_key)
+            )
             if gamma_comp is None:
                 gamma_faces = jnp.zeros_like(Q_faces)
             elif face_fluxes is not None and use_face_gamma:
@@ -490,7 +572,7 @@ class TemperatureEquation(EquationBase):
         work_rhs = (
             self.charge_qp[:, None]
             * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * fluxes["Gamma"]
+            * _get_center_flux(fluxes, "Gamma")
             * state.Er[None, :]
             if self.include_work_term
             else jnp.zeros_like(state.pressure)
@@ -521,11 +603,23 @@ class TemperatureEquation(EquationBase):
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        face_fluxes = (
+            fluxes
+            if (
+                need_face_fluxes
+                and (_flux_has_key(fluxes, "Q_faces") or _flux_has_key(fluxes, "Gamma_faces"))
+            )
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        q_center = _get_center_flux(fluxes, "Q")
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
-            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            HEAT_FLUX_PHYSICAL_TO_STATE * _get_face_flux(face_fluxes, "Q")
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
@@ -535,7 +629,11 @@ class TemperatureEquation(EquationBase):
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
+            gamma_comp = (
+                _get_face_flux(face_fluxes, gamma_key)
+                if (face_fluxes is not None and use_face_gamma)
+                else _get_center_flux(fluxes, gamma_key)
+            )
             if gamma_comp is None:
                 gamma_faces = jnp.zeros_like(Q_faces)
             elif face_fluxes is not None and use_face_gamma:
@@ -566,7 +664,7 @@ class TemperatureEquation(EquationBase):
         work_rhs = (
             self.charge_qp[:, None]
             * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * fluxes["Gamma"]
+            * _get_center_flux(fluxes, "Gamma")
             * state.Er[None, :]
             if self.include_work_term
             else jnp.zeros_like(state.pressure)
@@ -862,7 +960,7 @@ class ElectricFieldEquation(EquationBase):
             self.species_mass,
             self.permitivity_prefactor,
         )
-        Gamma = fluxes["Gamma"]
+        Gamma = _get_center_flux(fluxes, "Gamma")
         charge_flux, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
         ambi_term_edge = self._outer_face_ambi_term(state, Gamma, plasma_permitivity)
         er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
@@ -884,7 +982,7 @@ class ElectricFieldEquation(EquationBase):
             self.species_mass,
             self.permitivity_prefactor,
         )
-        Gamma = fluxes["Gamma"]
+        Gamma = _get_center_flux(fluxes, "Gamma")
         _, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
         _, Er_diffusion = self._er_diffusion(Er)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)

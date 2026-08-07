@@ -218,6 +218,81 @@ python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
   --adjoint-maxiter 300
 ```
 
+## Previous Timing Reference: 8 Accepted Steps
+
+Saved from the pasted terminal run on 2026-08-07. This is the full-transport
+shared-payload smoke benchmark with 8 accepted Radau steps, 2-step reverse
+segments, profile parameters plus `RBC:1:0` and `ZBS:1:0`.
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --objective all \
+  --accepted-step-limit 8 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 2 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
+
+| Phase | Elapsed [s] |
+| --- | ---: |
+| Realtime geometry runtime build | `221.206` |
+| Realtime geometry solver components | `31.127` |
+| Support reverse profile-state VJP | `32.441` |
+| Support reverse initial-carry VJP | `21.591` |
+| Support reverse realized-schedule VJP forward | `170.647` |
+| Support reverse segmented cotangent sweep | `623.629` |
+| Initial-Er root boundary compact pullback | `50.171` |
+| Geometry objective VMEC implicit/raw-block aux | `0.009` |
+| Geometry objective Boozer input tables | `0.511` |
+| Geometry objective Boozer VJP | `1.981` |
+| Geometry objective VMEC cotangents | `8.063` |
+| Geometry objective Boozer light cotangents | `0.576` |
+| Geometry objective aspect proxy cotangents | `0.059` |
+| Geometry objective J-QI/maxJ Boozer cotangents | `7.780` |
+| Geometry objective Boozer cotangents to state | `6.727` |
+| Geometry objective final VMEC parameter pullback | `14.088` |
+| Total reported mode elapsed | `1895.859` |
+
+Segmented cotangent sweep details:
+
+| Segment | Active steps | Support reuse | Support rebuild | Elapsed [s] |
+| --- | ---: | ---: | ---: | ---: |
+| 4/4 | `2` | `0` | `2` | `402.010` |
+| 3/4 | `2` | `1` | `1` | `110.310` |
+| 2/4 | `2` | `0` | `2` | `110.496` |
+| 1/4 | `2` | `2` | `0` | `0.810` |
+| Total | `8` | `3` | `5` | `623.629` |
+
+Payload diagnostics:
+
+| Diagnostic | Value |
+| --- | ---: |
+| `residual_count` | `16` |
+| `parameter_count` | `8` |
+| `geometry_active_float_leaves` | `9` |
+| `ntx_support_active_float_leaves` | `19` |
+| `ntx_surface_backend` | `vmec` |
+| `ntx_surface_branch` | `vmec_traceable` |
+| `compact_payload_tangent_contract` | `True` |
+| `raw_block_param_bar_l2` | `5.148705e+02` |
+| `raw_block_param_bar_all_finite` | `True` |
+| `raw_block_param_bar_first_nonfinite` | `None` |
+
+Output JSON:
+
+```text
+outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke.json
+```
+
 | Quantity | Value |
 | --- | ---: |
 | Baseline objective value | `4.4387332574093733e+02` |

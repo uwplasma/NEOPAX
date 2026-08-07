@@ -402,7 +402,13 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                 f"min={float(jnp.min(finite_roots)):.6e}",
                 f"max={float(jnp.max(finite_roots)):.6e}",
             )
-        if runtime.models.flux is not None and runtime.geometry is not None:
+        run_scan_diagnostic = bool(
+            amb_cfg.get(
+                "er_initialization_debug_scan_diagnostic",
+                runtime.solver_parameters.get("er_initialization_debug_scan_diagnostic", False),
+            )
+        )
+        if run_scan_diagnostic and runtime.models.flux is not None and runtime.geometry is not None:
             try:
                 local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
                 if local_particle_flux is not None:
@@ -440,16 +446,17 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                             sign_change_count,
                         )
 
-                    gamma_debug = jax.vmap(gamma_scan_for_radius)(sample_radii)
-                    for radius_idx, vals in zip(sample_radii.tolist(), gamma_debug):
-                        g_left, g_right, g_best, er_best, n_changes = vals
+                    gamma_left, gamma_right, gamma_best, er_best, n_changes = jax.vmap(gamma_scan_for_radius)(
+                        sample_radii
+                    )
+                    for k, radius_idx in enumerate(sample_radii.tolist()):
                         print(
                             f"[NEOPAX] ambipolar scan diagnostic[r={int(radius_idx)}]:",
-                            f"gamma_at_scan_min={float(g_left):.6e}",
-                            f"gamma_at_scan_max={float(g_right):.6e}",
-                            f"minabs_gamma={float(g_best):.6e}",
-                            f"minabs_gamma_Er={float(er_best):.6e}",
-                            f"coarse_sign_changes={int(n_changes)}",
+                            f"gamma_at_scan_min={float(gamma_left[k]):.6e}",
+                            f"gamma_at_scan_max={float(gamma_right[k]):.6e}",
+                            f"minabs_gamma={float(gamma_best[k]):.6e}",
+                            f"minabs_gamma_Er={float(er_best[k]):.6e}",
+                            f"coarse_sign_changes={int(n_changes[k])}",
                         )
             except Exception as exc:
                 print(f"[NEOPAX] ambipolar scan diagnostic unavailable: {exc}")
@@ -901,6 +908,14 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             "theta_rhs_mode" if backend_name in {"theta", "theta_newton"} else "radau_rhs_mode",
             solver_cfg.get("rhs_mode", "black_box"),
         ) if backend_name in {"theta", "theta_newton", "radau"} else "default"
+        rhs_mode_key = str(rhs_mode).strip().lower()
+        use_lagged_initial_rhs_debug = rhs_mode_key in {"lagged_response", "lagged_transport_response"}
+        run_initial_rhs_components = bool(
+            solver_cfg.get(
+                "debug_initial_rhs_components",
+                not use_lagged_initial_rhs_debug,
+            )
+        )
         print(
             "[NEOPAX] transport setup complete:",
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
@@ -988,11 +1003,20 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     "[NEOPAX] temperature heat_flux_reconstruction:",
                     getattr(temperature_equation, "heat_flux_reconstruction"),
                 )
-        rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
         try:
             working_state_debug, _ = equation_system._prepare_working_state(state)
         except Exception:
             working_state_debug = state
+        if use_lagged_initial_rhs_debug:
+            lagged_response_debug = equation_system.build_lagged_response(state)
+            rhs0 = equation_system.evaluate_with_lagged_response(
+                jnp.asarray(0.0),
+                state,
+                runtime.species,
+                lagged_response_debug,
+            )
+        else:
+            rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
         density_rhs0 = getattr(rhs0, "density", None)
         if density_rhs0 is not None:
             density_rhs0_arr = jnp.asarray(density_rhs0)
@@ -1004,7 +1028,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"min={float(jnp.min(arr)):.6e}",
                     f"max={float(jnp.max(arr)):.6e}",
                 )
-            if density_equation is not None:
+            if density_equation is not None and run_initial_rhs_components:
                 components = density_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
@@ -1160,7 +1184,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"min={float(jnp.min(arr)):.6e}",
                     f"max={float(jnp.max(arr)):.6e}",
                 )
-            if temperature_equation is not None:
+            if temperature_equation is not None and run_initial_rhs_components:
                 components = temperature_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
@@ -1253,7 +1277,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 f"min={float(jnp.min(er_rhs0)):.6e}",
                 f"max={float(jnp.max(er_rhs0)):.6e}",
             )
-            if er_equation is not None:
+            if er_equation is not None and run_initial_rhs_components:
                 components = er_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
