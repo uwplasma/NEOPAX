@@ -81,6 +81,13 @@ def _ntx_local_pullback_finite_debug_enabled() -> bool:
     return raw not in {"", "0", "false", "no", "off"}
 
 
+def _ntx_nonfinite_debug_enabled() -> bool:
+    raw = str(os.environ.get("NEOPAX_NTX_NONFINITE_DEBUG", "")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return _ntx_local_pullback_finite_debug_enabled()
+
+
 def _debug_first_bad_flat(value):
     value = jnp.asarray(value)
     flat_bad = jnp.ravel(jnp.logical_not(jnp.isfinite(value)))
@@ -102,6 +109,9 @@ def _debug_array_stats(label, value):
 
 def _debug_arrays_if_any_nonfinite(prefix, labelled_arrays):
     """Print detailed NTX diagnostics only if at least one array is nonfinite."""
+
+    if not _ntx_nonfinite_debug_enabled():
+        return
 
     arrays = tuple((label, value) for label, value in labelled_arrays if value is not None)
     if not arrays:
