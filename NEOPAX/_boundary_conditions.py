@@ -300,7 +300,11 @@ def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_
                 if right_decay is None
                 else _as_like_template(right_decay, default_arr)
             )
-            rv = (4.0 * u_im1 - u_im2) / (3.0 + 2.0 * dx / (decay + 1e-12))
+            # FV cell-centered stencil for dU/dr = -U_face / decay at the
+            # right boundary face.  The NTSS 4,-1 formula assumes node values
+            # one and two full spacings inside the boundary; here the nearest
+            # cells are half a spacing and three halves inside the face.
+            rv = (9.0 * u_im1 - u_im2) / (8.0 + 3.0 * dx / (decay + 1e-12))
             rg = -rv / (decay + 1e-12)
             return rv, rg
 
@@ -362,7 +366,10 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
                 if left_decay is None
                 else _as_like_template(left_decay, default_arr)
             )
-            lv = (4.0 * u_ip1 - u_ip2) / (3.0 - 2.0 * dx / (decay + 1e-12))
+            # FV cell-centered stencil for dU/dr = +U_face / decay at the
+            # left boundary face, matching the cell-to-face geometry used by
+            # CellVariable rather than NTSS boundary-node indexing.
+            lv = (9.0 * u_ip1 - u_ip2) / (8.0 + 3.0 * dx / (decay + 1e-12))
             lg = lv / (decay + 1e-12)
             return lv, lg
 
