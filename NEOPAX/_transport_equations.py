@@ -1216,7 +1216,7 @@ def build_equation_system(
     temperature_source_model = source_models.get("temperature")
     Er_relax = solver_cfg.get("Er_relax", 1.0)
     DEr = solver_cfg.get("DEr", 1.0)
-    Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
+    Er_source_mode = solver_cfg.get("Er_source_mode", "ambipolar_local")
     Er_permitivity_mode = solver_cfg.get(
         "Er_permittivity_mode",
         solver_cfg.get("Er_permitivity_mode", "neopax_local"),
