@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ._fem import cell_centered_from_faces
 from ._transport_flux_models import build_transport_flux_model
 from ._entropy_models import get_entropy_model
 
@@ -60,6 +61,50 @@ def _map_er_scan_axis(fn, values, *, batch_mode: str = "vmap", batch_size: int |
         lambda full_arr, tail_arr: jnp.concatenate([full_arr, tail_arr], axis=0),
         flat_outputs,
         tail_outputs,
+    )
+
+
+def _normalize_ambipolar_flux_mode(amb_cfg=None, params=None) -> str:
+    amb_cfg = {} if amb_cfg is None else amb_cfg
+    solver_parameters = {} if params is None else params.get("solver_parameters", {})
+    mode = amb_cfg.get(
+        "er_ambipolar_flux_mode",
+        amb_cfg.get(
+            "er_initialization_flux_mode",
+            solver_parameters.get("Er_source_mode", "ambipolar_local"),
+        ),
+    )
+    normalized = str(mode).strip().lower()
+    aliases = {
+        "local": "ambipolar_local",
+        "center": "ambipolar_local",
+        "centered": "ambipolar_local",
+        "ambipolar_center": "ambipolar_local",
+        "ambipolar_centered": "ambipolar_local",
+        "transport": "transport_centered",
+        "transport_based": "transport_centered",
+        "transport_center": "transport_centered",
+        "transport_centered": "transport_centered",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"ambipolar_local", "transport_centered"}:
+        raise ValueError(
+            "[ambipolarity].er_ambipolar_flux_mode must be one of "
+            "'ambipolar_local' or 'transport_centered'."
+        )
+    return normalized
+
+
+def _center_gamma_from_transport_fluxes(fluxes):
+    for key in ("Gamma_total", "Gamma"):
+        if isinstance(fluxes, dict) and key in fluxes and fluxes[key] is not None:
+            return fluxes[key]
+    for key in ("Gamma_total_faces", "Gamma_faces"):
+        if isinstance(fluxes, dict) and key in fluxes and fluxes[key] is not None:
+            return jax.vmap(cell_centered_from_faces)(fluxes[key])
+    raise ValueError(
+        "Flux model did not return center or face particle fluxes "
+        "('Gamma_total', 'Gamma', 'Gamma_total_faces', or 'Gamma_faces')."
     )
 
 
@@ -445,7 +490,12 @@ def initialize_ambipolar_best_roots_fast(state, config, params, flux_model, amb_
     n_radial = Er.shape[0] if hasattr(Er, "shape") and len(Er.shape) == 1 else 1
 
     charge_qp = jnp.asarray(params["species"].charge_qp)
-    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+    flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
+    local_particle_flux = (
+        flux_model.build_local_particle_flux_evaluator(state)
+        if flux_mode == "ambipolar_local"
+        else None
+    )
 
     def _evaluate_gamma_and_entropy(i, er):
         if local_particle_flux is not None:
@@ -457,12 +507,7 @@ def initialize_ambipolar_best_roots_fast(state, config, params, flux_model, amb_
             else:
                 er_vec = jnp.asarray([er_value], dtype=Er.dtype)
             fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
-            gamma = fluxes.get("Gamma_total", None)
-            if gamma is None:
-                gamma = fluxes.get("Gamma", None)
-            if gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            gamma = gamma[:, i]
+            gamma = _center_gamma_from_transport_fluxes(fluxes)[:, i]
         return (
             jnp.sum(charge_qp * gamma),
             jnp.sum(jnp.abs(gamma)),
@@ -629,7 +674,7 @@ def find_ambipolar_root_tracked_local(
     return root, found
 
 
-def _build_initializer_evaluators(state, params, flux_model):
+def _build_initializer_evaluators(state, params, flux_model, amb_cfg=None):
     import dataclasses
 
     Er = getattr(state, "Er", None)
@@ -638,7 +683,12 @@ def _build_initializer_evaluators(state, params, flux_model):
     n_radial = Er.shape[0] if hasattr(Er, "shape") and len(Er.shape) == 1 else 1
 
     charge_qp = jnp.asarray(params["species"].charge_qp)
-    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+    flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
+    local_particle_flux = (
+        flux_model.build_local_particle_flux_evaluator(state)
+        if flux_mode == "ambipolar_local"
+        else None
+    )
 
     def _evaluate_gamma_and_entropy(i, er):
         if local_particle_flux is not None:
@@ -650,10 +700,7 @@ def _build_initializer_evaluators(state, params, flux_model):
             else:
                 er_vec = jnp.asarray([er_value], dtype=Er.dtype)
             fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
-            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
-            if gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            gamma = gamma[:, i]
+            gamma = _center_gamma_from_transport_fluxes(fluxes)[:, i]
         return (
             jnp.sum(charge_qp * gamma),
             jnp.sum(jnp.abs(gamma)),
@@ -685,7 +732,7 @@ def initialize_ambipolar_best_roots_tracked(state, config, params, flux_model, a
     - fallback to global two-stage only when local tracking fails
     """
     n_radial, gamma_func_factory, entropy_func_factory = _build_initializer_evaluators(
-        state, params, flux_model
+        state, params, flux_model, amb_cfg
     )
 
     global_range = (
@@ -767,7 +814,7 @@ def initialize_ambipolar_best_roots_hybrid(state, config, params, flux_model, am
     it at every radius.
     """
     n_radial, gamma_func_factory, entropy_func_factory = _build_initializer_evaluators(
-        state, params, flux_model
+        state, params, flux_model, amb_cfg
     )
 
     global_range = (
@@ -873,7 +920,7 @@ def initialize_ambipolar_best_roots_multibranch(state, config, params, flux_mode
     - periodically or on failure, fall back to full two_stage
     """
     n_radial, gamma_func_factory, entropy_func_factory = _build_initializer_evaluators(
-        state, params, flux_model
+        state, params, flux_model, amb_cfg
     )
 
     global_range = (
@@ -1224,7 +1271,7 @@ def register_ambipolarity_model(name: str, func):
     AMBIPOLARITY_MODEL_REGISTRY[str(name).strip().lower()] = func
 
 
-def _ambipolarity_local_charge_flux_setup(state, params, flux_model):
+def _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg=None):
     """Return common local ambipolar residual closures for JAX radial root solves."""
     import dataclasses
 
@@ -1243,7 +1290,12 @@ def _ambipolarity_local_charge_flux_setup(state, params, flux_model):
         except Exception:
             skip_axis_root = False
 
-    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+    flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
+    local_particle_flux = (
+        flux_model.build_local_particle_flux_evaluator(state)
+        if flux_mode == "ambipolar_local"
+        else None
+    )
 
     def _evaluate_gamma_and_entropy(i, er):
         if local_particle_flux is not None:
@@ -1255,10 +1307,7 @@ def _ambipolarity_local_charge_flux_setup(state, params, flux_model):
             else:
                 er_vec = jnp.asarray([er_value], dtype=Er.dtype)
             fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
-            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
-            if gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            gamma = gamma[:, i]
+            gamma = _center_gamma_from_transport_fluxes(fluxes)[:, i]
         return (
             jnp.sum(charge_qp * gamma),
             jnp.sum(jnp.abs(gamma)),
@@ -1316,7 +1365,7 @@ def solve_ambipolarity_roots_radial_jax(state, config, params, model_name, flux_
         _local_particle_flux,
         gamma_func_factory,
         entropy_func_factory,
-    ) = _ambipolarity_local_charge_flux_setup(state, params, flux_model)
+    ) = _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg)
     del _local_particle_flux
 
     root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(str(model_name).strip().lower())
@@ -1443,12 +1492,18 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
         except Exception:
             skip_axis_root = False
     t_flux_build = __import__("time").perf_counter() if debug_stage_markers else None
-    local_particle_flux = flux_model.build_local_particle_flux_evaluator(state)
+    flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
+    local_particle_flux = (
+        flux_model.build_local_particle_flux_evaluator(state)
+        if flux_mode == "ambipolar_local"
+        else None
+    )
     if debug_stage_markers and model_name == "two_stage":
         dt_flux_build = __import__("time").perf_counter() - t_flux_build
         print(
             "[NEOPAX] ambipolar two_stage setup: "
             f"local_flux_builder_elapsed_s={dt_flux_build:.3f} "
+            f"flux_mode={flux_mode} "
             f"uses_local_evaluator={local_particle_flux is not None}"
         )
 
@@ -1462,10 +1517,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
             else:
                 er_vec = jnp.asarray([er_value], dtype=Er.dtype)
             fluxes = flux_model(dataclasses.replace(state, Er=er_vec))
-            gamma = fluxes.get("Gamma_total") or fluxes.get("Gamma")
-            if gamma is None:
-                raise ValueError("Flux model did not return 'Gamma' or 'Gamma_total'.")
-            gamma = gamma[:, i]
+            gamma = _center_gamma_from_transport_fluxes(fluxes)[:, i]
         return (
             jnp.sum(charge_qp * gamma),
             jnp.sum(jnp.abs(gamma)),

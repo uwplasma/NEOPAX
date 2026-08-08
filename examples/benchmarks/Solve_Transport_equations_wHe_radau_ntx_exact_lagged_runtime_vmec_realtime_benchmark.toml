@@ -22,6 +22,7 @@ ntx_exact_response_anchor_count = 48
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
+er_ambipolar_flux_mode = "ambipolar_local"
 er_ambipolar_scan_min = -50.0
 er_ambipolar_scan_max = 50.0
 er_ambipolar_n_coarse = 80
@@ -128,8 +129,8 @@ coefficient_mode = "neopax"
 delta_zeff = 0.0
 
 [transport_solver]
-density_floor = 1.0e-3
-temperature_floor = 1.0e-3
+density_floor = 1.0e-6
+temperature_floor = 1.0e-6
 transport_solver_backend = "radau"
 integrator = "radau"
 radau_rhs_mode = "lagged_response"
