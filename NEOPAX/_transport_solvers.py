@@ -2138,7 +2138,7 @@ def _apply_radau_lean_timestep_controller(
             jnp.logical_or(nonfinite_stage_residual, newton_nonfinite),
         )
         jax.lax.cond(
-            reject_nonfinite,
+            jnp.logical_and(reject_nonfinite, kernel_context.debug_newton_trace),
             lambda _: jax.debug.print(
                 "[radau-solver] nonfinite reject: t={t:.6e} trial_dt={trial_dt:.6e} reduced_dt={reduced_dt:.6e} "
                 "nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} "

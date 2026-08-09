@@ -108,20 +108,23 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --full-transport-shared-payload-smoke
 ```
 
-The 16-step shared-payload AD result has been compared against the corrected 16-step FD for `RBC:1:0`.
+The 16-step `RBC:1:0` FD reference was refreshed on 2026-08-09 after the
+finite-volume/lagged-response cleanup. The previous shared-payload AD
+comparison is now historical until the reverse benchmark is rerun against this
+same baseline.
 
-| Objective | AD d/d`RBC:1:0` | FD d/d`RBC:1:0` | Abs Diff | Rel Diff | Status |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `softmax_Er` | `-6.2626550858639305e+01` | `-6.262732e+01` | `7.691414e-04` | `1.228124e-05` | good |
-| `smooth_root_proxy` | `-3.6780535157069163e-04` | `-5.576429e-04` | `1.898375e-04` | `3.404285e-01` | small derivative |
-| `Er_transition_left` | `-2.0130902762944103e+01` | `-2.013024e+01` | `6.627629e-04` | `3.292375e-05` | good |
-| `Er_transition_right` | `-2.2349701278432580e+01` | `-2.234945e+01` | `2.512784e-04` | `1.124316e-05` | good |
-| `Er2_volume_average` | `-2.7118433131494726e+02` | `-2.712342e+02` | `4.986869e-02` | `1.838584e-04` | good |
-| `Er_volume_average` | `-2.3645736589729140e+01` | `-2.364403e+01` | `1.706590e-03` | `7.217846e-05` | good |
-| `electron_temperature_volume_average_keV` | `-2.2448477914450340e-02` | `-2.244865e-02` | `1.720855e-07` | `7.665742e-06` | good |
-| `total_pressure_volume_average` | `-7.7520438710911577e-02` | `-7.752102e-02` | `5.812891e-07` | `7.498471e-06` | good |
-| `alpha_power_volume_average_mw_m3` | `1.2073914238870094e-03` | `1.207393e-03` | `1.576113e-09` | `1.305385e-06` | good |
-| `bootstrap_current_softmax_abs_scaled` | `-1.7920897096814259e+00` | `-1.791772e+00` | `3.177097e-04` | `1.773159e-04` | good |
+| Objective | Current FD d/d`RBC:1:0` | Explicit-geometry FD | Final-state FD |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | `-7.859465e+01` | `0.000000e+00` | `-7.859465e+01` |
+| `smooth_root_proxy` | `0.000000e+00` | `0.000000e+00` | `0.000000e+00` |
+| `Er_transition_left` | `-2.031218e+01` | `0.000000e+00` | `-2.031218e+01` |
+| `Er_transition_right` | `-2.249804e+01` | `0.000000e+00` | `-2.249804e+01` |
+| `Er2_volume_average` | `5.442326e+03` | `3.485674e-01` | `5.441977e+03` |
+| `Er_volume_average` | `1.365614e+02` | `-5.066563e-02` | `1.366120e+02` |
+| `electron_temperature_volume_average_keV` | `-2.397626e-02` | `-1.226367e-02` | `-1.171259e-02` |
+| `total_pressure_volume_average` | `-7.694414e-02` | `-7.382077e-02` | `-3.123393e-03` |
+| `alpha_power_volume_average_mw_m3` | `1.960857e-01` | `-1.870960e-03` | `1.979567e-01` |
+| `bootstrap_current_softmax_abs_scaled` | `-1.767152e+00` | `-1.674224e+00` | `-9.293104e-02` |
 
 16-step FD command:
 
@@ -199,7 +202,7 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   `-1.9205082803893893e+03`, shared-payload reverse
   `-1.9205081921396923e+03`.
 - Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
-- Add full-transport FD references for selected profile parameters if needed; current exact 16-step table is geometry `RBC:1:0`.
+- Add/rerun the matching current shared-payload reverse AD rows for the refreshed 16-step geometry `RBC:1:0` FD table.
 - A 16-step FD run for `density_shape_alpha` originally produced all-zero
   gradients, but that run was invalid. The benchmark-local
   `_parameterized_profile_set` in

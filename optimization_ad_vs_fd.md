@@ -421,27 +421,28 @@ FD values:
 
 Bootstrap-current note:
 
-- The bootstrap row below is the corrected full-transport FD reference using
-  realtime NTX momentum-corrected `Upar`.
-- For bootstrap, the full FD splits cleanly into explicit geometry plus
-  baseline-geometry final-state pieces:
-  `-1.656870e+00 + -1.349065e-01 = -1.7917765e+00`, matching the full FD
-  `-1.791772e+00` within FD precision.
+- The `RBC:1:0` row below was refreshed from the 2026-08-09 16-step
+  frozen-linearized FD run after the finite-volume/lagged-response cleanup.
+- The solver rejected two early nonfinite Newton trials near
+  `t=1.012932e-04`, then completed the baseline and replayed FD traces.
 
 | Objective | Value | Full FD `d/dRBC:1:0` | Fixed-final-state explicit geometry FD | Baseline-geometry final-state FD |
 | --- | ---: | ---: | ---: | ---: |
-| `transport:softmax_Er` | `2.0694998194713662e+01` | `-6.2627320000000000e+01` | `0.0000000000000000e+00` | `-6.2627320000000000e+01` |
-| `transport:smooth_root_proxy` | `1.9869328464046845e-02` | `-5.5764290000000000e-04` | `0.0000000000000000e+00` | `-5.5764290000000000e-04` |
-| `transport:Er_transition_left` | `1.7686989067626193e+01` | `-2.0130240000000000e+01` | `0.0000000000000000e+00` | `-2.0130240000000000e+01` |
-| `transport:Er_transition_right` | `1.8352979233941966e+01` | `-2.2349450000000000e+01` | `0.0000000000000000e+00` | `-2.2349450000000000e+01` |
-| `transport:Er2_volume_average` | `2.4370331301244494e+02` | `-2.7123420000000000e+02` | `3.5418810000000000e-01` | `-2.7158840000000000e+02` |
-| `transport:Er_volume_average` | `-3.4306058803160564e+00` | `-2.3644030000000000e+01` | `-5.3707040000000000e-02` | `-2.3590320000000000e+01` |
-| `transport:electron_temperature_volume_average_keV` | `6.4597967427865761e+00` | `-2.2448650000000000e-02` | `-1.2869300000000000e-02` | `-9.5793540000000000e-03` |
-| `transport:total_pressure_volume_average` | `3.3559238343437478e+01` | `-7.7521020000000000e-02` | `-7.7538330000000000e-02` | `1.7328650000000000e-05` |
-| `transport:alpha_power_volume_average_mw_m3` | `5.7709114846781473e-01` | `1.2073930000000000e-03` | `-1.9243270000000000e-03` | `3.1317200000000000e-03` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `1.3615203117088308e+00` | `-1.7917720000000000e+00` | `-1.6568700000000000e+00` | `-1.3490650000000000e-01` |
+| `transport:softmax_Er` | `2.0493049813391263e+01` | `-7.8594650000000000e+01` | `0.0000000000000000e+00` | `-7.8594650000000000e+01` |
+| `transport:smooth_root_proxy` | `9.8039215686309116e-03` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764966344089e+01` | `-2.0312180000000000e+01` | `0.0000000000000000e+00` | `-2.0312180000000000e+01` |
+| `transport:Er_transition_right` | `1.8376267791735049e+01` | `-2.2498040000000001e+01` | `0.0000000000000000e+00` | `-2.2498040000000001e+01` |
+| `transport:Er2_volume_average` | `2.3720890299502904e+02` | `5.4423260000000002e+03` | `3.4856740000000000e-01` | `5.4419770000000003e+03` |
+| `transport:Er_volume_average` | `-3.4526122553412755e+00` | `1.3656140000000000e+02` | `-5.0665630000000000e-02` | `1.3661200000000000e+02` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646442870649961e+00` | `-2.3976260000000000e-02` | `-1.2263670000000000e-02` | `-1.1712590000000000e-02` |
+| `transport:total_pressure_volume_average` | `3.4213473064475188e+01` | `-7.6944140000000004e-02` | `-7.3820770000000001e-02` | `-3.1233930000000001e-03` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935809218241009e-01` | `1.9608570000000000e-01` | `-1.8709600000000000e-03` | `1.9795670000000000e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485504661986399e+00` | `-1.7671520000000001e+00` | `-1.6742240000000000e+00` | `-9.2931040000000002e-02` |
 
 Comparison against the saved 16-step shared-payload reverse AD rows:
+
+This comparison is historical. Rerun the shared-payload reverse benchmark after
+the current FD refresh before using this table as the active pass/fail check.
 
 | Objective | Full FD `d/dRBC:1:0` | Shared-payload AD `d/dRBC:1:0` | Abs diff | Rel diff |
 | --- | ---: | ---: | ---: | ---: |
@@ -779,7 +780,11 @@ shared-payload machinery.
 | `geometry:vmec_magnetic_well` | `-2.7476128749679612e-02` | `0.0` | `0.0` | `0.0` | `0.0` | `-1.1090116065531674e-02` |
 | `geometry:vmec_mirror_ratio` | `2.1153803467163693e-01` | `0.0` | `0.0` | `0.0` | `0.0` | `-5.9359094714046601e-01` |
 
-Comparison against saved 16-step full-transport FD `d/dRBC:1:0`:
+Historical comparison against saved 16-step full-transport FD `d/dRBC:1:0`:
+
+This table predates the refreshed 2026-08-09 `RBC:1:0` FD reference above.
+Keep it as a record of the earlier match, but rerun reverse AD before using it
+as the active comparison.
 
 | Objective | FD `d/dRBC:1:0` | Mixed shared AD `d/dRBC:1:0` | Abs diff | Rel diff |
 | --- | ---: | ---: | ---: | ---: |
@@ -799,8 +804,8 @@ Notes:
 - The mixed shared-payload run now exercises the optimization-facing full
   transport and geometry rows in one table.
 - The compact full-transport bootstrap rule avoids the previous OOM.
-- Full-transport rows, including the corrected bootstrap row, are consistent
-  with the saved FD references.
+- Full-transport rows, including the corrected bootstrap row, were consistent
+  with the older saved FD references shown in the historical table above.
 - The initial-Er root-only/ambipolarity bootstrap geometry derivative was also
   validated against FD: `d/dRBC:1:0` AD `-1.7061866715282692e+00` vs FD
   `-1.7058819999999999e+00`, relative difference `1.786006e-04`.

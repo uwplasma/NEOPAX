@@ -179,18 +179,23 @@ These are not root-only ambipolarity FD values, but they are the saved
 16-step realtime-geometry FD references for the full transport run with
 `--initial-Er-root-ad jax_selected_root`.
 
-| Objective | 16-step FD `d/dRBC:1:0` | 16-step reverse AD `d/dRBC:1:0` | `abs diff` | `rel diff` |
+Current `RBC:1:0` reference was refreshed from the 2026-08-09 run after the
+finite-volume/lagged-response cleanup. The run had two early nonfinite Newton
+trial rejections near `t=1.012932e-04`, both rejected by the solver, and then
+completed the 16 accepted-step FD replay.
+
+| Objective | Value | 16-step FD `d/dRBC:1:0` | Fixed-final-state explicit geometry FD | Baseline-geometry final-state FD |
 | --- | ---: | ---: | ---: | ---: |
-| `transport:softmax_Er` | `-6.2627320000000000e+01` | `-6.2626550858639305e+01` | `7.691414e-04` | `1.228124e-05` |
-| `transport:smooth_root_proxy` | `-5.5764290000000003e-04` | `-3.6780535157069163e-04` | `1.898375e-04` | `3.404285e-01` |
-| `transport:Er_transition_left` | `-2.0130240000000001e+01` | `-2.0130902762944103e+01` | `6.627629e-04` | `3.292375e-05` |
-| `transport:Er_transition_right` | `-2.2349450000000000e+01` | `-2.2349701278432580e+01` | `2.512784e-04` | `1.124316e-05` |
-| `transport:Er2_volume_average` | `-2.7123420000000002e+02` | `-2.7118433131494726e+02` | `4.986869e-02` | `1.838584e-04` |
-| `transport:Er_volume_average` | `-2.3644030000000001e+01` | `-2.3645736589729140e+01` | `1.706590e-03` | `7.217846e-05` |
-| `transport:electron_temperature_volume_average_keV` | `-2.2448650000000001e-02` | `-2.2448477914450340e-02` | `1.720855e-07` | `7.665742e-06` |
-| `transport:total_pressure_volume_average` | `-7.7521020000000002e-02` | `-7.7520438710911577e-02` | `5.812891e-07` | `7.498471e-06` |
-| `transport:alpha_power_volume_average_mw_m3` | `1.2073930000000000e-03` | `1.2073914238870094e-03` | `1.576113e-09` | `1.305385e-06` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `-1.7917720000000000e+00` | `-1.7920897096814259e+00` | `3.177097e-04` | `1.773159e-04` |
+| `transport:softmax_Er` | `2.0493049813391263e+01` | `-7.8594650000000000e+01` | `0.0000000000000000e+00` | `-7.8594650000000000e+01` |
+| `transport:smooth_root_proxy` | `9.8039215686309116e-03` | `0.0000000000000000e+00` | `0.0000000000000000e+00` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764966344089e+01` | `-2.0312180000000000e+01` | `0.0000000000000000e+00` | `-2.0312180000000000e+01` |
+| `transport:Er_transition_right` | `1.8376267791735049e+01` | `-2.2498040000000001e+01` | `0.0000000000000000e+00` | `-2.2498040000000001e+01` |
+| `transport:Er2_volume_average` | `2.3720890299502904e+02` | `5.4423260000000002e+03` | `3.4856740000000000e-01` | `5.4419770000000003e+03` |
+| `transport:Er_volume_average` | `-3.4526122553412755e+00` | `1.3656140000000000e+02` | `-5.0665630000000000e-02` | `1.3661200000000000e+02` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646442870649961e+00` | `-2.3976260000000000e-02` | `-1.2263670000000000e-02` | `-1.1712590000000000e-02` |
+| `transport:total_pressure_volume_average` | `3.4213473064475188e+01` | `-7.6944140000000004e-02` | `-7.3820770000000001e-02` | `-3.1233930000000001e-03` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935809218241009e-01` | `1.9608570000000000e-01` | `-1.8709600000000000e-03` | `1.9795670000000000e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485504661986399e+00` | `-1.7671520000000001e+00` | `-1.6742240000000000e+00` | `-9.2931040000000002e-02` |
 
 This full-transport table should not be used as the FD reference for the
 root-only ambipolarity smoke, because the root-only path does not include the
@@ -512,7 +517,11 @@ Full shared-payload AD table:
 | `transport:alpha_power_volume_average_mw_m3` | `5.7709114832136932e-01` | `2.7390173486511626e-01` | `8.1435927075356962e-02` | `2.3105926577552259e-03` | `2.7792303880127184e-01` | `1.2073916329946855e-03` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `1.3615202803949229e+00` | `-4.0512909481635884e-03` | `2.1820601193258365e-01` | `-1.2505757233407980e-02` | `1.4495166463763556e+00` | `-1.7920897096814259e+00` |
 
-Comparison against saved 16-step FD `d/dRBC:1:0`:
+Comparison against the previously saved 16-step FD `d/dRBC:1:0`:
+
+This comparison is historical. The current `RBC:1:0` FD reference above changed
+after the finite-volume/lagged-response cleanup, so rerun the shared-payload
+reverse benchmark before treating the comparison below as current.
 
 | Objective | 16-step FD `d/dRBC:1:0` | Shared-payload AD `d/dRBC:1:0` | Abs diff | Rel diff |
 | --- | ---: | ---: | ---: | ---: |
@@ -561,7 +570,11 @@ accepted-step tests with `16` residual rows:
   `boozer_qi_objective`, `boozer_maxj_objective`, `vmec_aspect_ratio`,
   `vmec_iota_mean`, `vmec_magnetic_well`, `vmec_mirror_ratio`.
 
-Saved 16-step mixed shared-payload `d/dRBC:1:0` comparison:
+Historical saved 16-step mixed shared-payload `d/dRBC:1:0` comparison:
+
+This table predates the refreshed 2026-08-09 `RBC:1:0` FD reference above.
+Keep it as a record of the earlier match, but rerun reverse AD before using it
+as the active comparison.
 
 | Objective | Saved FD `d/dRBC:1:0` | Mixed shared AD `d/dRBC:1:0` | Rel diff |
 | --- | ---: | ---: | ---: |
@@ -578,7 +591,8 @@ Saved 16-step mixed shared-payload `d/dRBC:1:0` comparison:
 Status:
 
 - The full-transport bootstrap compact rule removes the previous OOM.
-- The full-transport rows, including bootstrap, are consistent with saved FD.
+- The full-transport rows, including bootstrap, were consistent with the older
+  saved FD reference shown in the historical table above.
 - The initial-Er root-only/ambipolarity bootstrap geometry derivative was fine:
   AD `-1.7061866715282692e+00` vs FD `-1.7058819999999999e+00`, relative
   difference `1.786006e-04`.

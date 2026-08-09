@@ -1985,6 +1985,13 @@ def _support_with_face_delta(support, face_channels_delta, face_prepared_delta):
     )
 
 
+def _support_with_face_channel_delta(support, face_channels_delta):
+    return dataclasses.replace(
+        support,
+        face_channels=_add_float_delta_tree(support.face_channels, face_channels_delta),
+    )
+
+
 def _support_bar_from_channel_bars(support, center_bar, face_bar):
     return dataclasses.replace(
         _float_delta_tree_like(support),
@@ -8703,6 +8710,30 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             lagged_response.center_response is None
             or self._resolved_center_response_mode() == "interpolate_from_faces"
         ):
+            if isinstance(lagged_response.face_response, NTXInterpolatedMomentResponse):
+                face_channels_delta0 = _float_delta_tree_like(support.face_channels)
+                face_output, face_support_pullback = jax.vjp(
+                    lambda face_channels_delta: self.with_support_payload(
+                        _support_with_face_channel_delta(
+                            support,
+                            face_channels_delta,
+                        )
+                    ).evaluate_with_lagged_response(state, lagged_response),
+                    face_channels_delta0,
+                )
+                face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
+                face_flux_bar = _complete_flux_bar_like(
+                    face_output,
+                    face_flux_bar,
+                    context="NTXExactLijRuntimeTransportModel.support_payload.face_interpolated",
+                )
+                (face_channels_bar,) = face_support_pullback(face_flux_bar)
+                return _support_bar_from_face_bars(
+                    support,
+                    face_channels_bar,
+                    _float_delta_tree_like(support.face_prepared),
+                )
+
             face_channels_delta0 = _float_delta_tree_like(support.face_channels)
             face_prepared_delta0 = _float_delta_tree_like(support.face_prepared)
             face_output, face_support_pullback = jax.vjp(
