@@ -200,5 +200,51 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   `-1.9205081921396923e+03`.
 - Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
 - Add full-transport FD references for selected profile parameters if needed; current exact 16-step table is geometry `RBC:1:0`.
+- A 16-step FD run for `density_shape_alpha` produced all-zero gradients, but
+  that run is invalid. The benchmark-local `_parameterized_profile_set` in
+  `examples/benchmarks/benchmark_transport_forward_fd_lane.py` accepted the
+  alpha parameter name but did not pass `density_shape_alpha` or
+  `temperature_shape_alpha` into `AnalyticalProfileModel`, so the perturbed
+  alpha values were discarded before state construction. This wiring is now
+  fixed; rerun both alpha-exponent FD commands before saving alpha references.
+- After fast-forwarding `en/clear_flux` to `8d9abc4`, the next 16-step
+  shared-payload reverse run reached segmented cotangent sweep start and then
+  failed in the turbulent submodel fallback VJP: the submodel forward output
+  had both center and face keys (`Gamma`, `Gamma_faces`, `Q`, `Q_faces`,
+  `Upar`, `Upar_faces`), while the combined flux bar only contained the active
+  center keys. The generic fallback state VJP now completes missing output keys
+  with shaped zero cotangents before calling the pullback. This is reverse
+  cotangent bookkeeping only; it does not change the forward flux values.
+- Step-2 reverse audit also found the same missing-key risk in the combined
+  lagged-response pullback, the combined support-payload fallback pullback, and
+  the NTX exact-runtime custom response/state/support pullbacks. These paths
+  now complete cotangent dictionaries against the actual forward output PyTree
+  before calling generic VJPs. The combined state pullback now also propagates
+  face-bar keys to submodels instead of center bars only.
+- Step-3 center/face audit: equation VJPs own the transpose from face outputs
+  to center uses when the shared flux tree exposes only face keys. NTX
+  interpolate-from-faces support/state pullbacks already folded any explicit
+  center bars back into face bars; the lagged-response pullback now uses the
+  same condition, so interpolated-center bars cannot be dropped in that path.
+  The combined model still only routes bars to submodels; it does not perform
+  the center-to-face transpose itself, avoiding double counting.
+- Step-4 compact-rule audit: the benchmark shared-payload reverse path uses the
+  NTX compact helper `solve_prepared_coefficient_vector_derivative_vjp`; it is
+  not using the old exposed derivative-mode flags. The compact
+  `build_lagged_response` state transpose now uses the configured
+  `density_floor`, matching the forward lagged-response builder for both
+  coefficient and interpolated center-response branches. Current benchmark
+  TOMLs explicitly set `ntx_exact_center_response_mode = "interpolate_from_faces"`;
+  the legacy face-response alias `interpolate_center_response` still maps to a
+  center-local response if the center-response option is omitted, so avoid that
+  alias in benchmark TOMLs.
+- Step-5 diagnostics: generic flux-model fallback VJPs now print
+  `[reverse-flux-bar-tree]` only when the supplied flux cotangent dictionary
+  does not match the actual forward output keys, including missing keys, extra
+  keys, scalar/float0 bars, and key shapes. Before the full shared-payload
+  segmented reverse sweep, objective support-payload bars are checked against
+  the zero payload tree; leaf-count or shape mismatches now report the objective
+  name and leaf index before the expensive sweep starts. Scalar/float0 zero
+  bars are normalized to shaped zeros.
 - Keep bootstrap-current objective in the root/full benchmark tables, but be careful not to reintroduce generic full flux VJPs that caused OOM.
 - Continue optimization-fusion work only through internals, preserving benchmark AD behavior.

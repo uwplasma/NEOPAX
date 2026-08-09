@@ -1110,7 +1110,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             pullback_fn = getattr(model, "pullback_evaluate_with_lagged_response", None)
             if callable(pullback_fn):
                 return pullback_fn(state, subresponse, subflux_bar, **kwargs)
-            _, pb = jax.vjp(
+            flux_output, pb = jax.vjp(
                 lambda response_value: model.evaluate_with_lagged_response(
                     state,
                     response_value,
@@ -1118,7 +1118,13 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 ),
                 subresponse,
             )
-            (subresponse_bar,) = pb(subflux_bar)
+            (subresponse_bar,) = pb(
+                _complete_flux_bar_like(
+                    flux_output,
+                    subflux_bar,
+                    context=f"CombinedTransportFluxModel.response.{type(model).__name__}",
+                )
+            )
             return subresponse_bar
 
         gamma_total_bar = flux_bar.get("Gamma", 0)
@@ -1255,7 +1261,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 ),
             )
         support_delta0 = _float_delta_tree_like(support)
-        _, support_delta_pullback = jax.vjp(
+        flux_output, support_delta_pullback = jax.vjp(
             lambda support_delta: self.neoclassical_model.with_support_payload(
                 _add_float_delta_tree(support, support_delta)
             ).evaluate_with_lagged_response(
@@ -1265,7 +1271,13 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             ),
             support_delta0,
         )
-        (support_bar,) = support_delta_pullback(neo_flux_bar)
+        (support_bar,) = support_delta_pullback(
+            _complete_flux_bar_like(
+                flux_output,
+                neo_flux_bar,
+                context="CombinedTransportFluxModel.support_payload.neoclassical",
+            )
+        )
         return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
@@ -1278,7 +1290,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             pullback_fn = getattr(model, "pullback_evaluate_with_lagged_response_state", None)
             if callable(pullback_fn):
                 return pullback_fn(state, subresponse, subflux_bar, **kwargs)
-            _, pb = jax.vjp(
+            flux_output, pb = jax.vjp(
                 lambda state_value: model.evaluate_with_lagged_response(
                     state_value,
                     subresponse,
@@ -1286,33 +1298,79 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 ),
                 state,
             )
-            (state_bar,) = pb(subflux_bar)
+            (state_bar,) = pb(
+                _complete_flux_bar_like(
+                    flux_output,
+                    subflux_bar,
+                    context=f"CombinedTransportFluxModel.state.{type(model).__name__}",
+                )
+            )
             return state_bar
 
         gamma_total_bar = flux_bar.get("Gamma", 0)
         q_total_bar = flux_bar.get("Q", 0)
         upar_total_bar = flux_bar.get("Upar", 0)
+        gamma_faces_total_bar = flux_bar.get("Gamma_faces", 0)
+        q_faces_total_bar = flux_bar.get("Q_faces", 0)
+        upar_faces_total_bar = flux_bar.get("Upar_faces", 0)
 
         zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
-        neo_flux_bar = {
-            "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
-            "Q": q_total_bar + flux_bar.get("Q_neo", 0),
-            "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
-        }
-        turb_flux_bar = {
-            "Gamma": (
-                gamma_total_bar + flux_bar.get("Gamma_turb", zero_gamma)
-                if self.include_turbulent_particle_flux
-                else flux_bar.get("Gamma_turb", zero_gamma)
-            ),
-            "Q": q_total_bar + flux_bar.get("Q_turb", 0),
-            "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
-        }
-        classical_flux_bar = {
-            "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
-            "Q": q_total_bar + flux_bar.get("Q_classical", 0),
-            "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
-        }
+        zero_gamma_faces = self._zero_like_flux(flux_bar.get("Gamma_faces", None), 0)
+        neo_flux_bar = {}
+        turb_flux_bar = {}
+        classical_flux_bar = {}
+        if any(key in flux_bar for key in ("Gamma", "Q", "Upar", "Gamma_neo", "Q_neo", "Upar_neo")):
+            neo_flux_bar.update(
+                {
+                    "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
+                    "Q": q_total_bar + flux_bar.get("Q_neo", 0),
+                    "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+                }
+            )
+            turb_flux_bar.update(
+                {
+                    "Gamma": (
+                        gamma_total_bar + flux_bar.get("Gamma_turb", zero_gamma)
+                        if self.include_turbulent_particle_flux
+                        else flux_bar.get("Gamma_turb", zero_gamma)
+                    ),
+                    "Q": q_total_bar + flux_bar.get("Q_turb", 0),
+                    "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+                }
+            )
+            classical_flux_bar.update(
+                {
+                    "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
+                    "Q": q_total_bar + flux_bar.get("Q_classical", 0),
+                    "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+                }
+            )
+        if any(key in flux_bar for key in ("Gamma_faces", "Q_faces", "Upar_faces", "Gamma_neo_faces", "Q_neo_faces", "Upar_neo_faces")):
+            neo_flux_bar.update(
+                {
+                    "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_neo_faces", zero_gamma_faces),
+                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_neo_faces", 0),
+                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_neo_faces", 0),
+                }
+            )
+            turb_flux_bar.update(
+                {
+                    "Gamma_faces": (
+                        gamma_faces_total_bar + flux_bar.get("Gamma_turb_faces", zero_gamma_faces)
+                        if self.include_turbulent_particle_flux
+                        else flux_bar.get("Gamma_turb_faces", zero_gamma_faces)
+                    ),
+                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_turb_faces", 0),
+                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_turb_faces", 0),
+                }
+            )
+            classical_flux_bar.update(
+                {
+                    "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_classical_faces", zero_gamma_faces),
+                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_classical_faces", 0),
+                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_classical_faces", 0),
+                }
+            )
 
         neo_state_bar = _submodel_state_pullback(
             self.neoclassical_model,
@@ -1841,6 +1899,59 @@ def _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar):
         "Q_faces": _face_bar_from_center_key("Q", "Q_faces"),
         "Upar_faces": _face_bar_from_center_key("Upar", "Upar_faces"),
     }
+
+
+def _debug_flux_bar_tree_mismatch(context, flux_output, flux_bar):
+    if not isinstance(flux_output, dict) or not isinstance(flux_bar, dict):
+        return
+    output_keys = tuple(flux_output.keys())
+    bar_keys = tuple(flux_bar.keys())
+    missing_keys = tuple(key for key in output_keys if key not in flux_bar)
+    extra_keys = tuple(key for key in bar_keys if key not in flux_output)
+    scalar_or_float0_keys = []
+    for key in output_keys:
+        value = flux_bar.get(key, None)
+        if value is None:
+            continue
+        arr = jnp.asarray(value)
+        if arr.shape == () or arr.dtype == jax.dtypes.float0:
+            scalar_or_float0_keys.append(key)
+    if missing_keys or extra_keys or scalar_or_float0_keys:
+        output_shapes = {
+            key: tuple(jnp.asarray(value).shape)
+            for key, value in flux_output.items()
+        }
+        bar_shapes = {
+            key: tuple(jnp.asarray(value).shape)
+            for key, value in flux_bar.items()
+            if value is not None
+        }
+        print(
+            "[reverse-flux-bar-tree] "
+            f"context={context} output_keys={output_keys} bar_keys={bar_keys} "
+            f"missing_output_bars={missing_keys} extra_bars={extra_keys} "
+            f"scalar_or_float0_bars={tuple(scalar_or_float0_keys)} "
+            f"output_shapes={output_shapes} bar_shapes={bar_shapes}",
+            flush=True,
+        )
+
+
+def _complete_flux_bar_like(flux_output, flux_bar, *, context=None):
+    if not isinstance(flux_output, dict) or not isinstance(flux_bar, dict):
+        return flux_bar
+    if context is not None:
+        _debug_flux_bar_tree_mismatch(context, flux_output, flux_bar)
+
+    def _bar_or_zeros(key, template):
+        value = flux_bar.get(key, None)
+        if value is None:
+            return jnp.zeros_like(template)
+        arr = jnp.asarray(value)
+        if arr.shape == () or arr.dtype == jax.dtypes.float0:
+            return jnp.zeros_like(template)
+        return jnp.asarray(value, dtype=jnp.asarray(template).dtype)
+
+    return {key: _bar_or_zeros(key, value) for key, value in flux_output.items()}
 
 
 def _support_with_channel_delta(support, center_delta, face_delta):
@@ -6964,7 +7075,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return state_bar_acc
 
         def _build_coefficient_center_response_from_primitives(density_value, pressure_value, er_value):
-            density_safe = safe_density(density_value)
+            density_safe = safe_density(density_value, self.density_floor)
             temperature_value = pressure_value / density_safe
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7022,7 +7133,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
 
         def _build_interpolated_center_response_from_primitives(density_value, pressure_value, er_value):
-            density_safe = safe_density(density_value)
+            density_safe = safe_density(density_value, self.density_floor)
             temperature_value = pressure_value / density_safe
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7231,7 +7342,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         axis=1,
                         keepdims=False,
                     )
-                    density_safe_local = safe_density(density_local0)
+                    density_safe_local = safe_density(density_local0, self.density_floor)
                     temperature_local0 = pressure_local0 / density_safe_local
                     er_local0 = jax.lax.dynamic_index_in_dim(
                         er0,
@@ -7283,7 +7394,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                     density_floor_local = _broadcast_species_floor(
                         density_local0,
-                        DEFAULT_TRANSPORT_DENSITY_FLOOR,
+                        self.density_floor,
                     )
                     density_local_bar = jnp.where(
                         density_local0 > density_floor_local,
@@ -8332,7 +8443,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             for key in ("Gamma_faces", "Q_faces", "Upar_faces")
         )
         face_response_bar_acc = None
-        if face_response is not None and has_face_bar:
+        if face_response is not None and (
+            has_face_bar
+            or center_response is None
+            or self._resolved_center_response_mode() == "interpolate_from_faces"
+        ):
             face_output, pullback = jax.vjp(
                 lambda response_value: self.evaluate_with_lagged_response(
                     state,
@@ -8347,6 +8462,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
                 if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces"
                 else flux_bar
+            )
+            face_flux_bar = _complete_flux_bar_like(
+                face_output,
+                face_flux_bar,
+                context="NTXExactLijRuntimeTransportModel.response.face",
             )
             (face_response_bar_acc,) = pullback(face_flux_bar)
             if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
@@ -8417,6 +8537,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 evaluated.temperature_grad_center,
                 lij,
             )
+            center_flux_bar = _complete_flux_bar_like(
+                {"Gamma": gamma, "Q": q, "Upar": upar},
+                flux_bar,
+                context="NTXExactLijRuntimeTransportModel.response.center_interpolated",
+            )
             gamma_bar, q_bar, upar_bar = jax.linear_transpose(
                 lambda gamma_value, q_value, upar_value: self._regularize_center_fluxes_axis0(
                     gamma_value,
@@ -8426,7 +8551,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 gamma,
                 q,
                 upar,
-            )((flux_bar["Gamma"], flux_bar["Q"], flux_bar["Upar"]))
+            )((center_flux_bar["Gamma"], center_flux_bar["Q"], center_flux_bar["Upar"]))
 
             dndr_all = evaluated.density_grad_center
             dTdr_all = evaluated.temperature_grad_center
@@ -8513,7 +8638,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     ),
                 )
 
-            _, pb = jax.vjp(
+            output, pb = jax.vjp(
                 _reduced_response,
                 center_response.reference_transport_moments,
                 center_response.reference_nu_hat,
@@ -8523,7 +8648,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 reference_transport_moments_bar,
                 reference_nu_hat_bar,
                 reference_epsi_hat_bar,
-            ) = pb(flux_bar)
+            ) = pb(
+                _complete_flux_bar_like(
+                    output,
+                    flux_bar,
+                    context="NTXExactLijRuntimeTransportModel.response.center_prepared",
+                )
+            )
             return NTXExactLijLaggedResponse(
                 face_response=face_response_bar_acc,
                 center_response=NTXPreparedCoefficientResponse(
@@ -8533,14 +8664,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )
 
-        _, pb = jax.vjp(
+        output, pb = jax.vjp(
             lambda response_value: self.evaluate_with_lagged_response(
                 state,
                 NTXExactLijLaggedResponse(center_response=response_value),
             ),
             center_response,
         )
-        (center_response_bar,) = pb(flux_bar)
+        (center_response_bar,) = pb(
+            _complete_flux_bar_like(
+                output,
+                flux_bar,
+                context="NTXExactLijRuntimeTransportModel.response.center_generic",
+            )
+        )
         return NTXExactLijLaggedResponse(
             face_response=face_response_bar_acc,
             center_response=center_response_bar,
@@ -8568,7 +8705,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _face_flux_bar_with_interpolated_center_bars(output, flux_bar)
             if lagged_response.center_response is None
             or self._resolved_center_response_mode() == "interpolate_from_faces"
-            else flux_bar
+            else _complete_flux_bar_like(
+                output,
+                flux_bar,
+                context="NTXExactLijRuntimeTransportModel.support_payload.center_local",
+            )
         )
         center_bar, face_bar = channel_delta_pullback(flux_bar_for_output)
         return _support_bar_from_channel_bars(support, center_bar, face_bar)
@@ -8602,23 +8743,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             if use_all_flux_bars_for_face:
                 face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
             else:
-                face_flux_bar = {
-                    "Gamma_faces": (
-                        flux_bar["Gamma_faces"]
-                        if flux_bar.get("Gamma_faces", None) is not None
-                        else jnp.zeros_like(face_output["Gamma_faces"])
-                    ),
-                    "Q_faces": (
-                        flux_bar["Q_faces"]
-                        if flux_bar.get("Q_faces", None) is not None
-                        else jnp.zeros_like(face_output["Q_faces"])
-                    ),
-                    "Upar_faces": (
-                        flux_bar["Upar_faces"]
-                        if flux_bar.get("Upar_faces", None) is not None
-                        else jnp.zeros_like(face_output["Upar_faces"])
-                    ),
-                }
+                face_flux_bar = _complete_flux_bar_like(
+                    face_output,
+                    {
+                        "Gamma_faces": flux_bar.get("Gamma_faces", None),
+                        "Q_faces": flux_bar.get("Q_faces", None),
+                        "Upar_faces": flux_bar.get("Upar_faces", None),
+                    },
+                    context="NTXExactLijRuntimeTransportModel.state.face",
+                )
             (face_state_bar,) = face_state_pullback(face_flux_bar)
             state_bar_acc = dataclasses.replace(
                 state_bar_acc,
@@ -8928,18 +9061,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ),
             state,
         )
-        center_flux_bar = {
-            "Gamma": flux_bar["Gamma"],
-            "Q": flux_bar["Q"],
-            "Upar": flux_bar["Upar"],
-        }
-        if "Gamma_faces" in center_output:
-            center_flux_bar = {
-                **center_flux_bar,
-                "Gamma_faces": jnp.zeros_like(center_output["Gamma_faces"]),
-                "Q_faces": jnp.zeros_like(center_output["Q_faces"]),
-                "Upar_faces": jnp.zeros_like(center_output["Upar_faces"]),
-            }
+        center_flux_bar = _complete_flux_bar_like(
+            center_output,
+            {
+                "Gamma": flux_bar.get("Gamma", None),
+                "Q": flux_bar.get("Q", None),
+                "Upar": flux_bar.get("Upar", None),
+            },
+            context="NTXExactLijRuntimeTransportModel.state.center_generic",
+        )
         (state_bar,) = pb(center_flux_bar)
         return dataclasses.replace(
             state_bar_acc,

@@ -3095,6 +3095,44 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         jax.tree_util.tree_leaves(payload_bar)
         for payload_bar in objective_payload_bar_rows
     )
+    expected_support_leaf_count = len(_zero_support_leaves)
+    normalized_objective_payload_bar_leaves = []
+    for objective_i, leaves in enumerate(objective_payload_bar_leaves):
+        objective_name = objective_labels[objective_i]
+        if len(leaves) != expected_support_leaf_count:
+            print(
+                "[autodiff-gate] support-payload-bar-structure mismatch "
+                f"objective={objective_name} leaf_count={len(leaves)} "
+                f"expected_leaf_count={expected_support_leaf_count}",
+                flush=True,
+            )
+            raise ValueError(
+                "Objective support-payload bar leaf-count mismatch for "
+                f"{objective_name}: got {len(leaves)}, expected {expected_support_leaf_count}."
+            )
+        normalized_leaves = []
+        for leaf_i, (expected_leaf, leaf) in enumerate(zip(_zero_support_leaves, leaves, strict=True)):
+            expected_arr = jnp.asarray(expected_leaf)
+            leaf_arr = jnp.asarray(leaf)
+            if leaf_arr.dtype == jax.dtypes.float0 or leaf_arr.shape == ():
+                normalized_leaves.append(jnp.zeros_like(expected_arr))
+                continue
+            if leaf_arr.shape != expected_arr.shape:
+                print(
+                    "[autodiff-gate] support-payload-bar-structure mismatch "
+                    f"objective={objective_name} leaf={leaf_i} "
+                    f"shape={leaf_arr.shape} expected_shape={expected_arr.shape} "
+                    f"dtype={leaf_arr.dtype} expected_dtype={expected_arr.dtype}",
+                    flush=True,
+                )
+                raise ValueError(
+                    "Objective support-payload bar leaf-shape mismatch for "
+                    f"{objective_name} leaf {leaf_i}: got {leaf_arr.shape}, "
+                    f"expected {expected_arr.shape}."
+                )
+            normalized_leaves.append(jnp.asarray(leaf_arr, dtype=expected_arr.dtype))
+        normalized_objective_payload_bar_leaves.append(tuple(normalized_leaves))
+    objective_payload_bar_leaves = tuple(normalized_objective_payload_bar_leaves)
     support_bar_leaves = tuple(
         jnp.stack(
             [
