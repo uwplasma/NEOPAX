@@ -152,6 +152,17 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   finite-volume equations, BCs, or NTX evaluation path. It should be retested
   with the same 16-step shared-payload reverse command before comparing
   profile-column AD against the fresh FD rows.
+- The next 16-step shared-payload reverse rerun got past the `float0` failure
+  and then failed at NTX lagged-response state pullback with a cotangent tree
+  mismatch: the face-only VJP produced `Gamma_faces`, `Q_faces`, `Upar_faces`,
+  but the assembled equation bar also contained center keys `Gamma`, `Q`,
+  `Upar`. For `ntx_center_response = interpolate_from_faces`, those center
+  bars mathematically belong to the face fluxes through
+  `cell_centered_from_faces`. A second narrow reverse-bookkeeping patch now
+  transposes `cell_centered_from_faces` and adds center bars onto the matching
+  face bars before calling face-response/state/support VJPs. This preserves
+  the face-primary forward math and does not evaluate a separate center NTX
+  response.
 - New 8-parameter full-transport shared-payload reverse-AD snapshot is saved
   in `shared_payload_8param_benchmark_snapshot.md`. This run uses
   `density_shape_alpha`, `temperature_shape_alpha`, `RBC:1:0`, and `ZBS:1:0`,

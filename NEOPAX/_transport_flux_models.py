@@ -1805,6 +1805,29 @@ def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
     return jax.tree_util.tree_map(_sanitize_leaf, primal_tree, bar_tree)
 
 
+def _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar):
+    def _face_bar_from_center_key(center_key, face_key):
+        face_bar = (
+            flux_bar[face_key]
+            if flux_bar.get(face_key, None) is not None
+            else jnp.zeros_like(face_output[face_key])
+        )
+        center_bar = flux_bar.get(center_key, None)
+        if center_bar is None:
+            return face_bar
+        (center_to_face_bar,) = jax.linear_transpose(
+            lambda faces_value: jax.vmap(cell_centered_from_faces)(faces_value),
+            face_output[face_key],
+        )(center_bar)
+        return face_bar + center_to_face_bar
+
+    return {
+        "Gamma_faces": _face_bar_from_center_key("Gamma", "Gamma_faces"),
+        "Q_faces": _face_bar_from_center_key("Q", "Q_faces"),
+        "Upar_faces": _face_bar_from_center_key("Upar", "Upar_faces"),
+    }
+
+
 def _support_with_channel_delta(support, center_delta, face_delta):
     return dataclasses.replace(
         support,
@@ -8295,7 +8318,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         face_response_bar_acc = None
         if face_response is not None and has_face_bar:
-            _, pullback = jax.vjp(
+            face_output, pullback = jax.vjp(
                 lambda response_value: self.evaluate_with_lagged_response(
                     state,
                     NTXExactLijLaggedResponse(
@@ -8305,7 +8328,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 ),
                 face_response,
             )
-            (face_response_bar_acc,) = pullback(flux_bar)
+            face_flux_bar = (
+                _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
+                if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces"
+                else flux_bar
+            )
+            (face_response_bar_acc,) = pullback(face_flux_bar)
             if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
                 return NTXExactLijLaggedResponse(face_response=face_response_bar_acc)
 
@@ -8514,14 +8542,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         del kwargs
         center_delta0 = _float_delta_tree_like(support.center_channels)
         face_delta0 = _float_delta_tree_like(support.face_channels)
-        _, channel_delta_pullback = jax.vjp(
+        output, channel_delta_pullback = jax.vjp(
             lambda center_delta, face_delta: self.with_support_payload(
                 _support_with_channel_delta(support, center_delta, face_delta)
             ).evaluate_with_lagged_response(state, lagged_response),
             center_delta0,
             face_delta0,
         )
-        center_bar, face_bar = channel_delta_pullback(flux_bar)
+        flux_bar_for_output = (
+            _face_flux_bar_with_interpolated_center_bars(output, flux_bar)
+            if lagged_response.center_response is None
+            or self._resolved_center_response_mode() == "interpolate_from_faces"
+            else flux_bar
+        )
+        center_bar, face_bar = channel_delta_pullback(flux_bar_for_output)
         return _support_bar_from_channel_bars(support, center_bar, face_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
@@ -8551,7 +8585,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 state,
             )
             if use_all_flux_bars_for_face:
-                face_flux_bar = flux_bar
+                face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
             else:
                 face_flux_bar = {
                     "Gamma_faces": (

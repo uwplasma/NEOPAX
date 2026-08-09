@@ -247,6 +247,54 @@ Current status:
   rerun the shared-payload reverse benchmark before treating the profile-column
   AD-vs-FD comparison as current.
 
+### 16-Step Full-Transport Profile FD: `T0`
+
+Saved from the current run after the finite-volume boundary/evaluated-state
+updates:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter T0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+Run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter: `T0`
+- Parameter kind: `profile`
+- Baseline value: `1.780000e+01`
+- FD step: `5.340000e-06`
+- Replay mode: `accepted`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/T0_forward_fd_summary.json`
+- Baseline had the same two rejected nonfinite Newton trial attempts near
+  `t=1.012932e-04`, then completed the accepted-step FD replay.
+
+| Objective | Value | 16-step FD `d/dT0` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040599404146e+01` | `5.5482120000000000e+00` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764197009018e+01` | `1.8372730000000000e+00` |
+| `transport:Er_transition_right` | `1.8376266968588908e+01` | `2.0114280000000000e+00` |
+| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `-3.6161840000000000e+02` |
+| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `-1.0112300000000000e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `3.5611900000000000e-01` |
+| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `1.8650270000000000e+00` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `6.9380040000000000e-02` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `2.3095590000000000e-01` |
+
+Current status:
+
+- These are fresh full-transport 16-step FD values for the profile parameter
+  `T0`.
+- As for `n0`, rerun the shared-payload reverse benchmark before treating the
+  profile-column AD-vs-FD comparison as current.
+
 ### 16-Step Shared-Payload Smoke Update
 
 Current run:
