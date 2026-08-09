@@ -163,6 +163,16 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   face bars before calling face-response/state/support VJPs. This preserves
   the face-primary forward math and does not evaluate a separate center NTX
   response.
+- The latest 16-step shared-payload reverse rerun got past the previous tree
+  mismatch and reached:
+  `runtime build = 295.737 s`, `solver components = 119.406 s`,
+  `profile-state VJP = 120.047 s`, `initial-carry VJP = 46.341 s`,
+  `realized-schedule VJP forward = 740.514 s`, then failed at segmented
+  cotangent sweep start because one inactive center flux cotangent arrived as
+  scalar `0`; `jax.linear_transpose(cell_centered_from_faces)` expected a
+  center-profile cotangent array. A third narrow reverse-bookkeeping patch now
+  normalizes `None`, scalar, and `float0` face/center bars to correctly shaped
+  zero arrays before applying the interpolation transpose.
 - New 8-parameter full-transport shared-payload reverse-AD snapshot is saved
   in `shared_payload_8param_benchmark_snapshot.md`. This run uses
   `density_shape_alpha`, `temperature_shape_alpha`, `RBC:1:0`, and `ZBS:1:0`,

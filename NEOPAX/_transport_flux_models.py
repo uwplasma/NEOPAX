@@ -1806,15 +1806,30 @@ def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
 
 
 def _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar):
+    def _is_scalar_bar(value) -> bool:
+        arr = jnp.asarray(value)
+        return arr.shape == ()
+
+    def _bar_or_zeros_like(value, template):
+        if value is None or _is_scalar_bar(value):
+            return jnp.zeros_like(template)
+        arr = jnp.asarray(value)
+        if arr.dtype == jax.dtypes.float0:
+            return jnp.zeros_like(template)
+        return jnp.asarray(value, dtype=template.dtype)
+
     def _face_bar_from_center_key(center_key, face_key):
-        face_bar = (
-            flux_bar[face_key]
-            if flux_bar.get(face_key, None) is not None
-            else jnp.zeros_like(face_output[face_key])
-        )
+        face_bar = _bar_or_zeros_like(flux_bar.get(face_key, None), face_output[face_key])
         center_bar = flux_bar.get(center_key, None)
-        if center_bar is None:
+        if center_bar is None or _is_scalar_bar(center_bar):
             return face_bar
+        center_template = jax.vmap(cell_centered_from_faces)(face_output[face_key])
+        if jnp.asarray(center_bar).dtype == jax.dtypes.float0:
+            return face_bar
+        center_bar = jnp.asarray(
+            center_bar,
+            dtype=center_template.dtype,
+        )
         (center_to_face_bar,) = jax.linear_transpose(
             lambda faces_value: jax.vmap(cell_centered_from_faces)(faces_value),
             face_output[face_key],

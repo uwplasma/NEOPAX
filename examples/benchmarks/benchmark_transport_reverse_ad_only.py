@@ -196,7 +196,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 )
 
 
-PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
+PARAMETER_ORDER = PROFILE_PARAMETER_ORDER
 _PROFILE_PARAMETER_DEFAULTS = {
     "n0": 4.21,
     "T0": 17.8,

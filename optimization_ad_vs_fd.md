@@ -546,6 +546,94 @@ Status:
 - Rerun the shared-payload reverse-AD smoke before making a current
   profile-column AD-vs-FD comparison.
 
+### 16-Step Full-Transport Profile FD: `density_shape_power`
+
+Current FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter density_shape_power \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+Run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter kind: `profile`
+- Baseline value: `1.000000e+01`
+- FD step: `3.000000e-06`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/density_shape_power_forward_fd_summary.json`
+
+| Objective | Value | 16-step FD `d/ddensity_shape_power` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040599404146e+01` | `-1.4622070000000000e-01` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764197009018e+01` | `-1.4053420000000000e-02` |
+| `transport:Er_transition_right` | `1.8376266968588908e+01` | `-8.8057860000000005e-04` |
+| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `1.2970930000000000e+01` |
+| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `2.0482620000000000e-01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `-4.5459640000000003e-05` |
+| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `2.4425430000000000e-01` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `2.7169120000000001e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `-1.3221880000000000e-02` |
+
+Status:
+
+- This is the fresh profile-parameter FD reference for
+  `density_shape_power` after the recent finite-volume boundary/evaluated-state
+  updates.
+- Rerun the shared-payload reverse-AD smoke before making a current
+  profile-column AD-vs-FD comparison.
+
+### 16-Step Full-Transport Profile FD: `temperature_shape_power`
+
+Current FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter temperature_shape_power \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+Run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter kind: `profile`
+- Baseline value: `2.000000e+00`
+- FD step: `6.000000e-07`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/temperature_shape_power_forward_fd_summary.json`
+
+| Objective | Value | 16-step FD `d/dtemperature_shape_power` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040599404146e+01` | `7.0010100000000000e+00` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764197009018e+01` | `-7.1740150000000003e+00` |
+| `transport:Er_transition_right` | `1.8376266968588908e+01` | `-6.3494940000000000e+00` |
+| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `-9.9282710000000002e+02` |
+| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `-2.7863390000000000e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `1.5250080000000001e+00` |
+| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `7.7515860000000001e+00` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `2.5035850000000002e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `1.5244090000000001e+00` |
+
+Status:
+
+- This is the fresh profile-parameter FD reference for
+  `temperature_shape_power` after the recent finite-volume
+  boundary/evaluated-state updates.
+- Rerun the shared-payload reverse-AD smoke before making a current
+  profile-column AD-vs-FD comparison.
+
 ## Full Transport: Mixed Shared-Payload AD Update
 
 This is the current mixed optimization-facing smoke after wiring the full
