@@ -459,6 +459,50 @@ Comparison against the saved 16-step shared-payload reverse AD rows:
 The transition and bootstrap rows are included in the current mixed
 shared-payload AD table below.
 
+### 16-Step Full-Transport Profile FD: `n0`
+
+Current FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter n0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+Run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter kind: `profile`
+- Baseline value: `4.210000e+00`
+- FD step: `1.263000e-06`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/n0_forward_fd_summary.json`
+
+| Objective | Value | 16-step FD `d/dn0` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040599404146e+01` | `-7.5793390000000000e+00` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764197009018e+01` | `-1.4451420000000000e+00` |
+| `transport:Er_transition_right` | `1.8376266968588908e+01` | `-1.6704680000000001e+00` |
+| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `6.6936770000000000e+02` |
+| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `1.6889930000000000e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `-8.6623840000000000e-04` |
+| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `8.0596720000000002e+00` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `3.0339720000000001e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `-1.0760220000000000e-03` |
+
+Status:
+
+- This is the fresh profile-parameter FD reference for `n0` after the recent
+  finite-volume boundary/evaluated-state updates.
+- Rerun the shared-payload reverse-AD smoke before making a current
+  profile-column AD-vs-FD comparison, because the existing reverse rows below
+  were saved before those updates.
+
 ## Full Transport: Mixed Shared-Payload AD Update
 
 This is the current mixed optimization-facing smoke after wiring the full

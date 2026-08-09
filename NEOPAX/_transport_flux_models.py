@@ -1796,6 +1796,9 @@ def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
     def _sanitize_leaf(primal_leaf, bar_leaf):
         arr = jnp.asarray(primal_leaf)
         if jnp.issubdtype(arr.dtype, jnp.inexact):
+            bar_arr = jnp.asarray(bar_leaf)
+            if bar_arr.dtype == jax.dtypes.float0:
+                return jnp.zeros_like(arr)
             return jnp.asarray(bar_leaf, dtype=arr.dtype)
         return jnp.zeros(arr.shape, dtype=jnp.float64)
 

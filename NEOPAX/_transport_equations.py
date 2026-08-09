@@ -1606,7 +1606,18 @@ class ComposedEquationSystem:
 
     @staticmethod
     def _shared_fluxes_add(lhs, rhs):
-        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+        def _add_leaf(a, b):
+            a_arr = jnp.asarray(a)
+            b_arr = jnp.asarray(b)
+            if a_arr.dtype == jax.dtypes.float0:
+                if b_arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros(b_arr.shape, dtype=jnp.float64)
+                return b_arr
+            if b_arr.dtype == jax.dtypes.float0:
+                return a_arr
+            return a_arr + b_arr
+
+        return jax.tree_util.tree_map(_add_leaf, lhs, rhs)
 
     def _debug_nonfinite_rhs_components(
         self,

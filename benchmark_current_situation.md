@@ -138,6 +138,20 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
 
 ## Current Open Items
 
+- The latest attempted 16-step shared-payload reverse-AD rerun after the
+  finite-volume boundary/evaluated-state changes failed before producing
+  objective/Jacobian rows. It reached:
+  `runtime build = 301.307 s`, `solver components = 119.625 s`,
+  `profile-state VJP = 120.077 s`, `initial-carry VJP = 56.074 s`,
+  `realized-schedule VJP forward = 775.634 s`, then failed at segmented
+  cotangent sweep start with a JAX `float0` addition in
+  `ComposedEquationSystem._shared_fluxes_add`.
+- A narrow reverse-bookkeeping patch now sanitizes `float0` cotangent leaves
+  to real zero bars in shared-flux cotangent addition and in
+  `_sanitize_float_delta_bar_tree`. This does not change the forward physics,
+  finite-volume equations, BCs, or NTX evaluation path. It should be retested
+  with the same 16-step shared-payload reverse command before comparing
+  profile-column AD against the fresh FD rows.
 - New 8-parameter full-transport shared-payload reverse-AD snapshot is saved
   in `shared_payload_8param_benchmark_snapshot.md`. This run uses
   `density_shape_alpha`, `temperature_shape_alpha`, `RBC:1:0`, and `ZBS:1:0`,
