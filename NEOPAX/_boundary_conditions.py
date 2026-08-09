@@ -286,12 +286,14 @@ def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_
 
         if right_type == "dirichlet":
             rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
-            rg = (3.0 * rv - 4.0 * u_im1 + u_im2) / (2.0 * dx)
+            # Cell-centered FV geometry: the boundary face is half a cell from
+            # u_im1 and three halves from u_im2.
+            rg = (8.0 * rv - 9.0 * u_im1 + u_im2) / (3.0 * dx)
             return rv, rg
 
         if right_type == "neumann":
             rg = zeros_like_default if right_gradient is None else _as_like_template(right_gradient, default_arr)
-            rv = (4.0 * u_im1 - u_im2 + 2.0 * dx * rg) / 3.0
+            rv = (3.0 * dx * rg + 9.0 * u_im1 - u_im2) / 8.0
             return rv, rg
 
         if right_type == "robin":
@@ -352,12 +354,14 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
 
         if left_type == "dirichlet":
             lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
-            lg = (-3.0 * lv + 4.0 * u_ip1 - u_ip2) / (2.0 * dx)
+            # Cell-centered FV geometry: the boundary face is half a cell from
+            # u_ip1 and three halves from u_ip2.
+            lg = (-8.0 * lv + 9.0 * u_ip1 - u_ip2) / (3.0 * dx)
             return lv, lg
 
         if left_type == "neumann":
             lg = zeros_like_default if left_gradient is None else _as_like_template(left_gradient, default_arr)
-            lv = (4.0 * u_ip1 - u_ip2 - 2.0 * dx * lg) / 3.0
+            lv = (-3.0 * dx * lg + 9.0 * u_ip1 - u_ip2) / 8.0
             return lv, lg
 
         if left_type == "robin":

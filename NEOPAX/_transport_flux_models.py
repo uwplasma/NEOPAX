@@ -411,6 +411,21 @@ class FaceTransportState:
         return self.pressure / safe_density(self.density)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class EvaluatedTransportState:
+    """Canonical finite-volume values and gradients used by flux models."""
+
+    center: TransportState
+    face: FaceTransportState
+    density_grad_center: jax.Array
+    temperature_grad_center: jax.Array
+    Er_grad_center: jax.Array
+    density_grad_face: jax.Array
+    temperature_grad_face: jax.Array
+    Er_grad_face: jax.Array
+
+
 def _flatten_flux_dict(fluxes: dict) -> tuple[jax.Array, tuple[str, ...]]:
     ordered_keys = tuple(sorted(str(key) for key in fluxes.keys()))
     flat_parts = []
@@ -447,12 +462,24 @@ def _extrapolated_right_face_value(state_arr: jax.Array) -> jax.Array:
     return arr[:, -1]
 
 
-def _extract_right_constraints(bc_model: Any, state_arr: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _extract_right_constraints(
+    bc_model: Any,
+    state_arr: jax.Array,
+    face_centers: jax.Array | None = None,
+) -> tuple[jax.Array | None, jax.Array | None]:
     n_species = state_arr.shape[0]
     default_value = _extrapolated_right_face_value(state_arr)
     default_grad = jnp.zeros_like(default_value)
     if bc_model is None:
         return default_value, default_grad
+
+    if face_centers is not None and hasattr(bc_model, "right_type"):
+        return right_constraints_from_bc_model(
+            bc_model,
+            default_value,
+            profile=state_arr,
+            face_centers=face_centers,
+        )
 
     right_type = str(getattr(bc_model, "right_type", "dirichlet")).strip().lower()
 
@@ -561,6 +588,34 @@ def _face_profile_gradient(profile, face_centers, bc_model=None):
     return grads
 
 
+def _center_profile_gradient(profile, face_centers, bc_model=None):
+    if profile.ndim == 1:
+        profile_2d = profile[None, :]
+        squeeze = True
+    else:
+        profile_2d = profile
+        squeeze = False
+    left_value, left_grad, right_value, right_grad = _extract_face_constraints(
+        bc_model,
+        profile_2d,
+        face_centers,
+    )
+
+    grads = jax.vmap(
+        lambda prof, lv, lg, rv, rg: make_profile_cell_variable(
+            prof,
+            face_centers,
+            left_face_constraint=lv,
+            left_face_grad_constraint=lg,
+            right_face_constraint=rv,
+            right_face_grad_constraint=rg,
+        ).grad()
+    )(profile_2d, left_value, left_grad, right_value, right_grad)
+    if squeeze:
+        return grads[0]
+    return grads
+
+
 def build_face_transport_state(
     state: TransportState,
     geometry: Any,
@@ -599,6 +654,71 @@ def build_face_transport_state(
         density=density_faces,
         pressure=pressure_faces,
         Er=er_faces,
+    )
+
+
+def build_evaluated_transport_state(
+    state: TransportState,
+    geometry: Any,
+    *,
+    bc_density: Any = None,
+    bc_temperature: Any = None,
+    bc_er: Any = None,
+    reconstruction: str = "linear",
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+) -> EvaluatedTransportState:
+    center_state = apply_transport_density_floor(state, density_floor)
+    center_state = apply_transport_temperature_floor(center_state, temperature_floor, density_floor)
+    face_state = build_face_transport_state(
+        center_state,
+        geometry,
+        bc_density=bc_density,
+        bc_temperature=bc_temperature,
+        bc_er=bc_er,
+        reconstruction=reconstruction,
+        density_floor=density_floor,
+        temperature_floor=temperature_floor,
+    )
+    density_center = safe_density(center_state.density, density_floor)
+    temperature_center = safe_temperature(center_state.temperature, temperature_floor)
+    density_face = safe_density(face_state.density, density_floor)
+    temperature_face = safe_temperature(face_state.temperature, temperature_floor)
+    face_state = dataclasses.replace(face_state, density=density_face, pressure=density_face * temperature_face)
+
+    return EvaluatedTransportState(
+        center=center_state,
+        face=face_state,
+        density_grad_center=_center_profile_gradient(
+            density_center,
+            geometry.r_grid_half,
+            bc_model=bc_density,
+        ),
+        temperature_grad_center=_center_profile_gradient(
+            temperature_center,
+            geometry.r_grid_half,
+            bc_model=bc_temperature,
+        ),
+        Er_grad_center=_center_profile_gradient(
+            center_state.Er,
+            geometry.r_grid_half,
+            bc_model=bc_er,
+        ),
+        density_grad_face=_face_profile_gradient(
+            density_center,
+            geometry.r_grid_half,
+            bc_model=bc_density,
+        ),
+        temperature_grad_face=_face_profile_gradient(
+            temperature_center,
+            geometry.r_grid_half,
+            bc_model=bc_temperature,
+        ),
+        Er_grad_face=_face_profile_gradient(
+            center_state.Er,
+            geometry.r_grid_half,
+            bc_model=bc_er,
+        ),
     )
 
 
@@ -1258,10 +1378,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
             self.bc_density,
             density,
+            self.geometry.r_grid_half,
         )
         temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
             self.bc_temperature,
             temperature,
+            self.geometry.r_grid_half,
         )
 
         def evaluator(radius_index, er_value):
@@ -1286,33 +1408,31 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
-        density = safe_density(state.density, self.density_floor)
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=kwargs.get("bc_density", self.bc_density),
+                bc_temperature=kwargs.get("bc_temperature", self.bc_temperature),
+                density_floor=self.density_floor,
+            )
         face_density = safe_density(face_state.density, self.density_floor)
-        bc_density = kwargs.get("bc_density")
-        bc_temperature = kwargs.get("bc_temperature")
         particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
         if particle_face_closure_mode in {"ntss_like", "ntss", "half_point"}:
             dndr_faces = _ntss_like_face_gradient(
-                density,
+                evaluated.center.density,
                 self.geometry.r_grid_half,
-                bc_model=bc_density,
+                bc_model=kwargs.get("bc_density", self.bc_density),
             )
             dTdr_faces = _ntss_like_face_gradient(
-                state.temperature,
+                evaluated.center.temperature,
                 self.geometry.r_grid_half,
-                bc_model=bc_temperature,
+                bc_model=kwargs.get("bc_temperature", self.bc_temperature),
             )
         else:
-            dndr_faces = _face_profile_gradient(
-                density,
-                self.geometry.r_grid_half,
-                bc_model=bc_density,
-            )
-            dTdr_faces = _face_profile_gradient(
-                state.temperature,
-                self.geometry.r_grid_half,
-                bc_model=bc_temperature,
-            )
+            dndr_faces = evaluated.density_grad_face
+            dTdr_faces = evaluated.temperature_grad_face
         _, gamma_neo, q_neo, upar_neo = get_Neoclassical_Fluxes_Faces(
             self.species,
             self.energy_grid,
@@ -5932,27 +6052,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         lij_by_radius = self._regularize_axis_radius0(lij_by_radius, self.geometry.r_grid_half)
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
-    def _assemble_center_fluxes(self, Er, temperature, density, lij, n_right, n_right_grad, t_right, t_right_grad):
-        dndr_all = jax.vmap(
-            lambda density_a, right_value, right_grad: get_gradient_density(
-                density_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(density, n_right, n_right_grad)
-        dTdr_all = jax.vmap(
-            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                temperature_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(temperature, t_right, t_right_grad)
+    def _assemble_center_fluxes(self, Er, temperature, density, dndr_all, dTdr_all, lij):
         a1 = jax.vmap(
             lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
                 charge,
@@ -5990,20 +6090,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return jax.vmap(faces_from_cell_centered)(flux)
 
     def __call__(self, state) -> dict:
-        density = safe_density(state.density, self.density_floor)
-        temperature = state.temperature
-        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
         lij = self._lij_center(state.Er, temperature, density)
         gamma, q, upar = self._assemble_center_fluxes(
             state.Er,
             temperature,
             density,
+            evaluated.density_grad_center,
+            evaluated.temperature_grad_center,
             lij,
-            n_right,
-            n_right_grad,
-            t_right,
-            t_right_grad,
         )
         gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
         return {
@@ -6020,31 +6124,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         momentum-correction solve before constructing ``Upar``.
         """
 
-        density = safe_density(state.density, self.density_floor)
-        temperature = state.temperature
-        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
-
-        dndr = jax.vmap(
-            lambda density_a, right_value, right_grad: get_gradient_density(
-                density_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(density, n_right, n_right_grad)
-        dTdr = jax.vmap(
-            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                temperature_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(temperature, t_right, t_right_grad)
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
+        dndr = evaluated.density_grad_center
+        dTdr = evaluated.temperature_grad_center
         A1 = jax.vmap(
             lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
                 charge,
@@ -6233,31 +6324,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def _momentum_corrected_upar_one_radius(self, state, radius_index, *, support=None):
         """Local corrected-Upar evaluator used by compact bootstrap pullbacks."""
 
-        density = safe_density(state.density, self.density_floor)
-        temperature = state.temperature
-        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
-
-        dndr = jax.vmap(
-            lambda density_a, right_value, right_grad: get_gradient_density(
-                density_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(density, n_right, n_right_grad)
-        dTdr = jax.vmap(
-            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                temperature_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(temperature, t_right, t_right_grad)
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
+        dndr = evaluated.density_grad_center
+        dTdr = evaluated.temperature_grad_center
         A1 = jax.vmap(
             lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
                 charge,
@@ -7824,10 +7902,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
-        density = safe_density(state.density, self.density_floor)
-        temperature = state.temperature
-        n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-        t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
 
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -7972,16 +8056,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return lij_axis
 
         def _assemble_face_fluxes_from_lij(face_state, face_density, lij_faces):
-            dndr_faces = _face_profile_gradient(
-                density,
-                self.geometry.r_grid_half,
-                bc_model=self.bc_density,
-            )
-            dTdr_faces = _face_profile_gradient(
-                temperature,
-                self.geometry.r_grid_half,
-                bc_model=self.bc_temperature,
-            )
+            dndr_faces = evaluated.density_grad_face
+            dTdr_faces = evaluated.temperature_grad_face
             a1 = jax.vmap(
                 lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
                     charge, density_a, temperature_a, dndr_a, dTdr_a, face_state.Er
@@ -8033,15 +8109,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             return gamma_faces, q_faces, upar_faces
 
-        face_state = build_face_transport_state(
-            state,
-            self.geometry,
-            bc_density=self.bc_density,
-            bc_temperature=self.bc_temperature,
-            density_floor=self.density_floor,
-            temperature_floor=self.temperature_floor,
-        )
-        face_density = safe_density(face_state.density, self.density_floor)
+        face_state = evaluated.face
+        face_density = evaluated.face.density
         face_temperature = face_state.temperature
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
         _debug_arrays_if_any_nonfinite(
@@ -8126,11 +8195,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 state.Er,
                 temperature,
                 density,
+                evaluated.density_grad_center,
+                evaluated.temperature_grad_center,
                 lij,
-                n_right,
-                n_right_grad,
-                t_right,
-                t_right_grad,
             )
             gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
             if lagged_timing_enabled():
@@ -8201,11 +8268,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             state.Er,
             temperature,
             density,
+            evaluated.density_grad_center,
+            evaluated.temperature_grad_center,
             lij,
-            n_right,
-            n_right_grad,
-            t_right,
-            t_right_grad,
         )
         gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
         return {
@@ -8242,11 +8307,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return NTXExactLijLaggedResponse(face_response=face_response_bar_acc)
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
-            density = safe_density(state.density, self.density_floor)
-            temperature = state.temperature
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            density = evaluated.center.density
+            temperature = evaluated.center.temperature
             n_species = int(temperature.shape[0])
-            n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-            t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
 
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -8296,11 +8367,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 state.Er,
                 temperature,
                 density,
+                evaluated.density_grad_center,
+                evaluated.temperature_grad_center,
                 lij,
-                n_right,
-                n_right_grad,
-                t_right,
-                t_right_grad,
             )
             gamma_bar, q_bar, upar_bar = jax.linear_transpose(
                 lambda gamma_value, q_value, upar_value: self._regularize_center_fluxes_axis0(
@@ -8313,26 +8382,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 upar,
             )((flux_bar["Gamma"], flux_bar["Q"], flux_bar["Upar"]))
 
-            dndr_all = jax.vmap(
-                lambda density_a, right_value, right_grad: get_gradient_density(
-                    density_a,
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                    right_face_constraint=right_value,
-                    right_face_grad_constraint=right_grad,
-                )
-            )(density, n_right, n_right_grad)
-            dTdr_all = jax.vmap(
-                lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                    temperature_a,
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                    right_face_constraint=right_value,
-                    right_face_grad_constraint=right_grad,
-                )
-            )(temperature, t_right, t_right_grad)
+            dndr_all = evaluated.density_grad_center
+            dTdr_all = evaluated.temperature_grad_center
             a1 = jax.vmap(
                 lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
                     charge,
@@ -8527,10 +8578,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return state_bar_acc
 
         if isinstance(center_response, NTXInterpolatedMomentResponse):
-            density = safe_density(state.density, self.density_floor)
-            temperature = state.temperature
-            n_right, n_right_grad = _extract_right_constraints(self.bc_density, density)
-            t_right, t_right_grad = _extract_right_constraints(self.bc_temperature, temperature)
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            density = evaluated.center.density
+            temperature = evaluated.center.temperature
 
             support = self._static_support()
             collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -8581,11 +8638,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 state.Er,
                 temperature,
                 density,
+                evaluated.density_grad_center,
+                evaluated.temperature_grad_center,
                 lij,
-                n_right,
-                n_right_grad,
-                t_right,
-                t_right_grad,
             )
             gamma_bar, q_bar, upar_bar = jax.linear_transpose(
                 lambda gamma_value, q_value, upar_value: self._regularize_center_fluxes_axis0(
@@ -8598,26 +8653,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 upar,
             )((flux_bar["Gamma"], flux_bar["Q"], flux_bar["Upar"]))
 
-            dndr_all = jax.vmap(
-                lambda density_a, right_value, right_grad: get_gradient_density(
-                    density_a,
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                    right_face_constraint=right_value,
-                    right_face_grad_constraint=right_grad,
-                )
-            )(density, n_right, n_right_grad)
-            dTdr_all = jax.vmap(
-                lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                    temperature_a,
-                    self.geometry.r_grid,
-                    self.geometry.r_grid_half,
-                    self.geometry.dr,
-                    right_face_constraint=right_value,
-                    right_face_grad_constraint=right_grad,
-                )
-            )(temperature, t_right, t_right_grad)
+            dndr_all = evaluated.density_grad_center
+            dTdr_all = evaluated.temperature_grad_center
             species_charge = jnp.asarray(self.species.charge, dtype=jnp.float64)[:, None]
             a1 = dndr_all / density - 1.5 * dTdr_all / temperature - state.Er[None, :] * species_charge / (
                 temperature * elementary_charge
@@ -8678,30 +8715,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             er_bar_direct = -jnp.sum(a1_bar * species_charge / (elementary_charge * temperature), axis=0)
 
             def _density_gradient_map(density_value):
-                local_n_right, local_n_right_grad = _extract_right_constraints(self.bc_density, density_value)
-                return jax.vmap(
-                    lambda density_a, right_value, right_grad: get_gradient_density(
-                        density_a,
-                        self.geometry.r_grid,
-                        self.geometry.r_grid_half,
-                        self.geometry.dr,
-                        right_face_constraint=right_value,
-                        right_face_grad_constraint=right_grad,
-                    )
-                )(density_value, local_n_right, local_n_right_grad)
+                return _center_profile_gradient(
+                    density_value,
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_density,
+                )
 
             def _temperature_gradient_map(temperature_value):
-                local_t_right, local_t_right_grad = _extract_right_constraints(self.bc_temperature, temperature_value)
-                return jax.vmap(
-                    lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                        temperature_a,
-                        self.geometry.r_grid,
-                        self.geometry.r_grid_half,
-                        self.geometry.dr,
-                        right_face_constraint=right_value,
-                        right_face_grad_constraint=right_grad,
-                    )
-                )(temperature_value, local_t_right, local_t_right_grad)
+                return _center_profile_gradient(
+                    temperature_value,
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_temperature,
+                )
 
             (density_grad_bar,) = jax.linear_transpose(_density_gradient_map, density)(dndr_bar)
             (temperature_grad_bar,) = jax.linear_transpose(_temperature_gradient_map, temperature)(dTdr_bar)
@@ -8872,42 +8897,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def build_local_particle_flux_evaluator(self, state):
-        density = safe_density(state.density, self.density_floor)
-        temperature = state.temperature
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
         support = self._static_support()
         center_prepared = support.center_prepared
         center_drds = support.center_channels.drds
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         v_thermal = get_v_thermal(self.species.mass, temperature)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
-        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
-            self.bc_density,
-            density,
-        )
-        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
-            self.bc_temperature,
-            temperature,
-        )
-        dndr_all = jax.vmap(
-            lambda density_a, right_value, right_grad: get_gradient_density(
-                density_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(density, density_right_constraint, density_right_grad_constraint)
-        dTdr_all = jax.vmap(
-            lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-                temperature_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-                right_face_constraint=right_value,
-                right_face_grad_constraint=right_grad,
-            )
-        )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
+        dndr_all = evaluated.density_grad_center
+        dTdr_all = evaluated.temperature_grad_center
 
         def evaluator(radius_index, er_value):
             radius_index = jnp.asarray(radius_index, dtype=jnp.int32)
@@ -8967,10 +8974,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "Upar": self._cell_centered_flux_to_faces_centered(center_fluxes["Upar"]),
             }
 
-        density = safe_density(state.density, self.density_floor)
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=kwargs.get("bc_density", self.bc_density),
+                bc_temperature=kwargs.get("bc_temperature", self.bc_temperature),
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+        density = evaluated.center.density
         face_density = safe_density(face_state.density, self.density_floor)
-        bc_density = kwargs.get("bc_density")
-        bc_temperature = kwargs.get("bc_temperature")
+        bc_density = kwargs.get("bc_density", self.bc_density)
+        bc_temperature = kwargs.get("bc_temperature", self.bc_temperature)
         particle_face_closure_mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
         if particle_face_closure_mode in {"ntss_like", "ntss", "half_point"}:
             dndr_faces = _ntss_like_face_gradient(
@@ -8979,21 +8996,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 bc_model=bc_density,
             )
             dTdr_faces = _ntss_like_face_gradient(
-                state.temperature,
+                evaluated.center.temperature,
                 self.geometry.r_grid_half,
                 bc_model=bc_temperature,
             )
         else:
-            dndr_faces = _face_profile_gradient(
-                density,
-                self.geometry.r_grid_half,
-                bc_model=bc_density,
-            )
-            dTdr_faces = _face_profile_gradient(
-                state.temperature,
-                self.geometry.r_grid_half,
-                bc_model=bc_temperature,
-            )
+            dndr_faces = evaluated.density_grad_face
+            dTdr_faces = evaluated.temperature_grad_face
         lij_faces = self._lij_faces(face_state.Er, face_state.temperature, face_density)
         a1 = jax.vmap(
             lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
@@ -9796,16 +9805,16 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
-        dndr_faces = _face_profile_gradient(
-            DENSITY_STATE_TO_PHYSICAL * state.density,
-            self.field.r_grid_half,
-            bc_model=bc_density,
-        )
-        dTdr_faces = _face_profile_gradient(
-            TEMPERATURE_STATE_TO_PHYSICAL * state.temperature,
-            self.field.r_grid_half,
-            bc_model=bc_temperature,
-        )
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
+        dndr_faces = DENSITY_STATE_TO_PHYSICAL * evaluated.density_grad_face
+        dTdr_faces = TEMPERATURE_STATE_TO_PHYSICAL * evaluated.temperature_grad_face
         gamma = -self.chi_n[:, None] * dndr_faces
         q = -(DENSITY_STATE_TO_PHYSICAL * face_state.density) * self.chi_t[:, None] * dTdr_faces
         upar = jnp.zeros_like(gamma)
@@ -9830,6 +9839,12 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
             bc_density=bc_density,
             bc_temperature=bc_temperature,
         )
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            self.field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+        )
         return FaceJVPTransportFluxResponse(
             reference_state=state,
             reference_face_flux=self.evaluate_face_fluxes(
@@ -9837,6 +9852,7 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
                 face_state,
                 bc_density=bc_density,
                 bc_temperature=bc_temperature,
+                evaluated_state=evaluated_state,
             ),
         )
 
@@ -9856,11 +9872,18 @@ class AnalyticalTurbulentTransportModel(TransportFluxModelBase):
                 bc_density=bc_density,
                 bc_temperature=bc_temperature,
             )
+            evaluated_state_value = build_evaluated_transport_state(
+                state_value,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
             return self.evaluate_face_fluxes(
                 state_value,
                 face_state_value,
                 bc_density=bc_density,
                 bc_temperature=bc_temperature,
+                evaluated_state=evaluated_state_value,
             )
 
         tangent_face_flux = jax.jvp(
@@ -9946,17 +9969,17 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         bc_density = kwargs.get("bc_density")
         bc_temperature = kwargs.get("bc_temperature")
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
         total_power_mw = self._effective_total_power_mw(state)
-        dndr_faces = _face_profile_gradient(
-            DENSITY_STATE_TO_PHYSICAL * state.density,
-            self.field.r_grid_half,
-            bc_model=bc_density,
-        )
-        dTdr_faces = _face_profile_gradient(
-            TEMPERATURE_STATE_TO_PHYSICAL * state.temperature,
-            self.field.r_grid_half,
-            bc_model=bc_temperature,
-        )
+        dndr_faces = DENSITY_STATE_TO_PHYSICAL * evaluated.density_grad_face
+        dTdr_faces = TEMPERATURE_STATE_TO_PHYSICAL * evaluated.temperature_grad_face
         electron_idx = int(self.species.species_idx["e"])
         ne_face = jnp.maximum(jnp.asarray(face_state.density[electron_idx], dtype=state.density.dtype), 1.0e-12)
         p075 = jnp.where(total_power_mw < 0.0, jnp.asarray(3.0, dtype=state.density.dtype), jnp.power(total_power_mw, 0.75))
@@ -9978,15 +10001,34 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         }
 
     def build_lagged_response(self, state, **kwargs):
-        del kwargs
-        face_state = build_face_transport_state(state, self.field)
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        face_state = build_face_transport_state(
+            state,
+            self.field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+        )
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            self.field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+        )
         return FaceJVPTransportFluxResponse(
             reference_state=state,
-            reference_face_flux=self.evaluate_face_fluxes(state, face_state),
+            reference_face_flux=self.evaluate_face_fluxes(
+                state,
+                face_state,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+                evaluated_state=evaluated_state,
+            ),
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
-        del kwargs
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
         delta_state = jax.tree_util.tree_map(
             lambda current, reference: current - reference,
             state,
@@ -9994,8 +10036,25 @@ class PowerAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         )
 
         def _face_fluxes_from_state(state_value):
-            face_state_value = build_face_transport_state(state_value, self.field)
-            return self.evaluate_face_fluxes(state_value, face_state_value)
+            face_state_value = build_face_transport_state(
+                state_value,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
+            evaluated_state_value = build_evaluated_transport_state(
+                state_value,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
+            return self.evaluate_face_fluxes(
+                state_value,
+                face_state_value,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+                evaluated_state=evaluated_state_value,
+            )
 
         tangent_face_flux = jax.jvp(
             _face_fluxes_from_state,
@@ -10203,15 +10262,27 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         }
 
     def build_lagged_response(self, state, **kwargs):
-        del kwargs
-        face_state = build_face_transport_state(state, self.field)
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
+        face_state = build_face_transport_state(
+            state,
+            self.field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+        )
         return FaceJVPTransportFluxResponse(
             reference_state=state,
-            reference_face_flux=self.evaluate_face_fluxes(state, face_state),
+            reference_face_flux=self.evaluate_face_fluxes(
+                state,
+                face_state,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            ),
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
-        del kwargs
+        bc_density = kwargs.get("bc_density")
+        bc_temperature = kwargs.get("bc_temperature")
         delta_state = jax.tree_util.tree_map(
             lambda current, reference: current - reference,
             state,
@@ -10219,8 +10290,18 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         )
 
         def _face_fluxes_from_state(state_value):
-            face_state_value = build_face_transport_state(state_value, self.field)
-            return self.evaluate_face_fluxes(state_value, face_state_value)
+            face_state_value = build_face_transport_state(
+                state_value,
+                self.field,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
+            return self.evaluate_face_fluxes(
+                state_value,
+                face_state_value,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+            )
 
         tangent_face_flux = jax.jvp(
             _face_fluxes_from_state,

@@ -16,6 +16,7 @@ from ._transport_flux_models import (
     _add_float_delta_tree,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
+    build_evaluated_transport_state,
     build_face_transport_state,
     build_ntss_like_face_transport_state,
 )
@@ -387,6 +388,16 @@ def build_density_equation(
     def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
         face_mode = str(particle_face_closure_mode).strip().lower()
         if face_mode in {"ntss_like", "ntss", "half_point"}:
             face_state = build_ntss_like_face_transport_state(
@@ -417,6 +428,7 @@ def build_density_equation(
             bc_er=bc_er,
             particle_face_closure_mode=face_mode,
             center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
         )
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
@@ -807,6 +819,16 @@ def build_temperature_equation(
     def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
         face_state = build_face_transport_state(
             state,
             field,
@@ -824,6 +846,7 @@ def build_temperature_equation(
             bc_temperature=bc_temperature,
             bc_er=bc_er,
             center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
         )
     temperature_ghost_builder = _build_species_ghost_builder(field, bc_temperature)
     if active_species_mask is None:
@@ -1216,7 +1239,10 @@ def build_equation_system(
     temperature_source_model = source_models.get("temperature")
     Er_relax = solver_cfg.get("Er_relax", 1.0)
     DEr = solver_cfg.get("DEr", 1.0)
-    Er_source_mode = solver_cfg.get("Er_source_mode", "ambipolar_local")
+    Er_source_mode = solver_cfg.get(
+        "Er_source_mode",
+        config.get("ambipolarity", {}).get("er_ambipolar_flux_mode", "ambipolar_local"),
+    )
     Er_permitivity_mode = solver_cfg.get(
         "Er_permittivity_mode",
         solver_cfg.get("Er_permitivity_mode", "neopax_local"),
@@ -1422,6 +1448,23 @@ class ComposedEquationSystem:
         return dataclasses.replace(model, **updates)
 
     @staticmethod
+    def _flux_model_geometry(model):
+        if model is None or not dataclasses.is_dataclass(model):
+            return None
+        for name in ("geometry", "field"):
+            if hasattr(model, name):
+                value = getattr(model, name)
+                if hasattr(value, "r_grid_half"):
+                    return value
+        for field in dataclasses.fields(model):
+            value = getattr(model, field.name)
+            if dataclasses.is_dataclass(value):
+                geometry = ComposedEquationSystem._flux_model_geometry(value)
+                if geometry is not None:
+                    return geometry
+        return None
+
+    @staticmethod
     def _direct_geometry_build_lagged_response_bar(model, geometry, state, response_bar):
         """Geometry cotangent for non-NTX lagged-response rebuilds.
 
@@ -1543,6 +1586,20 @@ class ComposedEquationSystem:
             er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
         return density_eq, temperature_eq, er_eq
 
+    def _shared_flux_bc_kwargs(self):
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        return {
+            "bc_density": getattr(density_eq, "density_bc_model", None),
+            "bc_temperature": getattr(temperature_eq, "temperature_bc_model", None),
+            "bc_er": getattr(er_eq, "er_bc_model", self.er_bc_model),
+        }
+
+    def _shared_flux_call_kwargs(self, extra_kwargs=None):
+        call_kwargs = dict(self._shared_flux_bc_kwargs())
+        if extra_kwargs:
+            call_kwargs.update(extra_kwargs)
+        return call_kwargs
+
     @staticmethod
     def _shared_fluxes_zero_like(shared_fluxes):
         return jax.tree_util.tree_map(jnp.zeros_like, shared_fluxes)
@@ -1575,13 +1632,27 @@ class ComposedEquationSystem:
             finite_mask = jnp.isfinite(value)
             flat_bad = jnp.ravel(jnp.logical_not(finite_mask))
             first_bad = jnp.argmax(flat_bad)
+            flat_value = jnp.ravel(value)
+            first_bad_value = flat_value[jnp.minimum(first_bad, flat_value.shape[0] - 1)]
             jax.debug.print(
-                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}} first_bad_flat={{first_bad}}",
+                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}} "
+                f"first_bad_flat={{first_bad}} first_bad_value={{first_bad_value:.6e}}",
                 finite=jnp.all(finite_mask),
                 min=jnp.nanmin(value),
                 max=jnp.nanmax(value),
                 first_bad=first_bad,
+                first_bad_value=first_bad_value,
             )
+
+        def _print_edge_stats(label, value):
+            value = jnp.asarray(value)
+            if value.ndim < 1:
+                return
+            _print_array_stats(f"{label}.left_edge", value[..., 0])
+            _print_array_stats(f"{label}.right_edge", value[..., -1])
+            if int(value.shape[-1]) > 1:
+                _print_array_stats(f"{label}.left_edge_1", value[..., 1])
+                _print_array_stats(f"{label}.right_edge_1", value[..., -2])
 
         def _print_center_from_faces_stats(fluxes, key):
             center_key = key
@@ -1593,19 +1664,65 @@ class ComposedEquationSystem:
                 jax.vmap(cell_centered_from_faces)(fluxes[face_key]),
             )
 
+        diagnostic_geometry = self._flux_model_geometry(self.shared_flux_model)
+        if diagnostic_geometry is None:
+            for equation in self.equations:
+                diagnostic_geometry = self._flux_model_geometry(getattr(equation, "flux_model", None))
+                if diagnostic_geometry is not None:
+                    break
+        evaluated_state = None
+        if diagnostic_geometry is not None:
+            evaluated_state = build_evaluated_transport_state(
+                working_state,
+                diagnostic_geometry,
+                **self._shared_flux_bc_kwargs(),
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+
         def _print(_):
             _print_array_stats("state.density", working_state.density)
             _print_array_stats("state.temperature", working_state.temperature)
             _print_array_stats("state.pressure", working_state.pressure)
             _print_array_stats("state.Er", working_state.Er)
+            _print_edge_stats("state.density", working_state.density)
+            _print_edge_stats("state.temperature", working_state.temperature)
+            _print_edge_stats("state.pressure", working_state.pressure)
+            _print_edge_stats("state.Er", working_state.Er)
+            if evaluated_state is not None:
+                _print_array_stats("evaluated.center.density", evaluated_state.center.density)
+                _print_array_stats("evaluated.center.temperature", evaluated_state.center.temperature)
+                _print_array_stats("evaluated.center.pressure", evaluated_state.center.pressure)
+                _print_array_stats("evaluated.center.Er", evaluated_state.center.Er)
+                _print_array_stats("evaluated.face.density", evaluated_state.face.density)
+                _print_array_stats("evaluated.face.temperature", evaluated_state.face.temperature)
+                _print_array_stats("evaluated.face.pressure", evaluated_state.face.pressure)
+                _print_array_stats("evaluated.face.Er", evaluated_state.face.Er)
+                _print_array_stats("evaluated.grad_center.density", evaluated_state.density_grad_center)
+                _print_array_stats("evaluated.grad_center.temperature", evaluated_state.temperature_grad_center)
+                _print_array_stats("evaluated.grad_center.Er", evaluated_state.Er_grad_center)
+                _print_array_stats("evaluated.grad_face.density", evaluated_state.density_grad_face)
+                _print_array_stats("evaluated.grad_face.temperature", evaluated_state.temperature_grad_face)
+                _print_array_stats("evaluated.grad_face.Er", evaluated_state.Er_grad_face)
+                _print_edge_stats("evaluated.face.density", evaluated_state.face.density)
+                _print_edge_stats("evaluated.face.temperature", evaluated_state.face.temperature)
+                _print_edge_stats("evaluated.face.pressure", evaluated_state.face.pressure)
+                _print_edge_stats("evaluated.face.Er", evaluated_state.face.Er)
+                _print_edge_stats("evaluated.grad_face.density", evaluated_state.density_grad_face)
+                _print_edge_stats("evaluated.grad_face.temperature", evaluated_state.temperature_grad_face)
+                _print_edge_stats("evaluated.grad_face.Er", evaluated_state.Er_grad_face)
             _print_array_stats("rhs.density", density_rhs)
             _print_array_stats("rhs.pressure", pressure_rhs)
             _print_array_stats("rhs.Er", Er_rhs)
+            _print_edge_stats("rhs.density", density_rhs)
+            _print_edge_stats("rhs.pressure", pressure_rhs)
+            _print_edge_stats("rhs.Er", Er_rhs)
             if isinstance(shared_fluxes, dict):
                 for key in sorted(shared_fluxes):
                     value = shared_fluxes.get(key)
                     if value is not None:
                         _print_array_stats(f"flux.{key}", value)
+                        _print_edge_stats(f"flux.{key}", value)
                 for key in ("Gamma", "Q", "Upar", "Gamma_neo", "Q_neo", "Upar_neo"):
                     _print_center_from_faces_stats(shared_fluxes, key)
             return jnp.asarray(0, dtype=jnp.int32)
@@ -1725,7 +1842,10 @@ class ComposedEquationSystem:
             jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
         flux_response = None
         if self.shared_flux_model is not None:
-            flux_response = self.shared_flux_model.build_lagged_response(working_state)
+            flux_response = self.shared_flux_model.build_lagged_response(
+                working_state,
+                **self._shared_flux_bc_kwargs(),
+            )
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("equations.build_lagged_response"), ordered=True)
         return TransportLaggedResponse(
@@ -1740,9 +1860,19 @@ class ComposedEquationSystem:
         else:
             pullback_fn = getattr(self.shared_flux_model, "pullback_build_lagged_response", None)
             if callable(pullback_fn):
-                working_state_bar = pullback_fn(working_state, flux_response_bar, **kwargs)
+                working_state_bar = pullback_fn(
+                    working_state,
+                    flux_response_bar,
+                    **self._shared_flux_call_kwargs(kwargs),
+                )
             else:
-                _, flux_pullback = jax.vjp(self.shared_flux_model.build_lagged_response, working_state)
+                _, flux_pullback = jax.vjp(
+                    lambda working_state_value: self.shared_flux_model.build_lagged_response(
+                        working_state_value,
+                        **self._shared_flux_call_kwargs(kwargs),
+                    ),
+                    working_state,
+                )
                 (working_state_bar,) = flux_pullback(flux_response_bar)
         return self._prepare_working_state_pullback(state, working_state_bar)
 
@@ -1776,13 +1906,21 @@ class ComposedEquationSystem:
         if callable(pullback_fn):
             return _sanitize_float_delta_bar_tree(
                 support,
-                pullback_fn(working_state, flux_response_bar, support, **kwargs),
+                pullback_fn(
+                    working_state,
+                    flux_response_bar,
+                    support,
+                    **self._shared_flux_call_kwargs(kwargs),
+                ),
             )
         support_delta0 = _float_delta_tree_like(support)
         _, support_delta_pullback = jax.vjp(
             lambda support_delta: self.shared_flux_model.with_support_payload(
                 _add_float_delta_tree(support, support_delta)
-            ).build_lagged_response(working_state, **kwargs),
+            ).build_lagged_response(
+                working_state,
+                **self._shared_flux_call_kwargs(kwargs),
+            ),
             support_delta0,
         )
         (support_bar,) = support_delta_pullback(flux_response_bar)
@@ -2003,16 +2141,23 @@ class ComposedEquationSystem:
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
         )
         flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
         pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response", None)
         if callable(pullback_fn):
-            flux_response_bar = pullback_fn(working_state, lagged_response.flux_response, flux_bar)
+            flux_response_bar = pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
         else:
             _, flux_pullback = jax.vjp(
                 lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
                     working_state,
                     response_value,
+                    **self._shared_flux_bc_kwargs(),
                 ),
                 lagged_response.flux_response,
             )
@@ -2063,6 +2208,7 @@ class ComposedEquationSystem:
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
         )
         flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
         pullback_fn = getattr(
@@ -2078,6 +2224,7 @@ class ComposedEquationSystem:
                     lagged_response.flux_response,
                     flux_bar,
                     support,
+                    **self._shared_flux_bc_kwargs(),
                 ),
             )
         support_delta0 = _float_delta_tree_like(support)
@@ -2087,6 +2234,7 @@ class ComposedEquationSystem:
             ).evaluate_with_lagged_response(
                 working_state,
                 lagged_response.flux_response,
+                **self._shared_flux_bc_kwargs(),
             ),
             support_delta0,
         )
@@ -2108,6 +2256,7 @@ class ComposedEquationSystem:
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
         )
 
         direct_working_state_bar = self._pullback_shared_flux_rhs_state(
@@ -2125,12 +2274,14 @@ class ComposedEquationSystem:
                 working_state,
                 lagged_response.flux_response,
                 flux_bar,
+                **self._shared_flux_bc_kwargs(),
             )
         else:
             _, flux_state_pullback = jax.vjp(
                 lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
                     working_state_value,
                     lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
                 ),
                 working_state,
             )
@@ -2153,6 +2304,7 @@ class ComposedEquationSystem:
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
         )
         direct_working_state_bar = self._pullback_shared_flux_rhs_state(
             state,
@@ -2173,6 +2325,7 @@ class ComposedEquationSystem:
         shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
         )
         flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
         flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
@@ -2181,12 +2334,14 @@ class ComposedEquationSystem:
                 working_state,
                 lagged_response.flux_response,
                 flux_bar,
+                **self._shared_flux_bc_kwargs(),
             )
         else:
             _, flux_state_pullback = jax.vjp(
                 lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
                     working_state_value,
                     lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
                 ),
                 working_state,
             )
@@ -2208,6 +2363,7 @@ class ComposedEquationSystem:
                 shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
                     working_state,
                     lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
                 )
 
         if shared_fluxes is not None:

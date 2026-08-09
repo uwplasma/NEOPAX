@@ -6532,6 +6532,86 @@ def _radau_stage_residual(
     return (stages - evals).reshape((-1,))
 
 
+def _radau_debug_array_stats(label, value):
+    value = jnp.asarray(value)
+    finite = jnp.all(jnp.isfinite(value))
+    bad = jnp.ravel(jnp.logical_not(jnp.isfinite(value)))
+    first_bad = jnp.argmax(bad)
+    jax.debug.print(
+        "[radau-nonfinite-detail] {label}: finite={finite} shape={shape} "
+        "min={min:.6e} max={max:.6e} max_abs={max_abs:.6e} first_bad_flat={first_bad}",
+        label=label,
+        finite=finite,
+        shape=value.shape,
+        min=jnp.nanmin(value),
+        max=jnp.nanmax(value),
+        max_abs=jnp.nanmax(jnp.abs(value)),
+        first_bad=first_bad,
+    )
+
+
+def _radau_debug_flat_state_parts(prefix, kernel_context, value):
+    arr = jnp.asarray(value)
+    density_size = int(kernel_context.density_size)
+    pressure_size = int(kernel_context.pressure_size)
+    er_size = int(kernel_context.er_size)
+    state_dim = int(kernel_context.state_dim)
+    matrix = arr.reshape((-1, state_dim))
+    density = matrix[:, :density_size].reshape((-1,))
+    pressure = matrix[:, density_size : density_size + pressure_size].reshape((-1,))
+    er = matrix[:, density_size + pressure_size : density_size + pressure_size + er_size].reshape((-1,))
+    _radau_debug_array_stats(f"{prefix}.density_part", density)
+    _radau_debug_array_stats(f"{prefix}.pressure_part", pressure)
+    _radau_debug_array_stats(f"{prefix}.Er_part", er)
+
+
+def _radau_debug_nonfinite_stage_residual(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs,
+    z_value,
+    initial_residual,
+    final_residual,
+):
+    stages, evals = _radau_evaluate_stage_model(
+        kernel_context,
+        physics_context,
+        flat_y=inputs.flat_y,
+        t_value=inputs.t_value,
+        h_value=inputs.h_value,
+        z_flat=z_value,
+        f0=inputs.f0,
+        jacobian_ref=inputs.jacobian_ref,
+        lagged_response=inputs.lagged_response,
+    )
+    stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
+    residual_matrix = stages - evals
+    jax.debug.print(
+        "[radau-nonfinite-detail] begin t={t:.6e} h={h:.6e} finite_initial_residual={finite_initial} finite_final_residual={finite_final}",
+        t=inputs.t_value,
+        h=inputs.h_value,
+        finite_initial=jnp.all(jnp.isfinite(initial_residual)),
+        finite_final=jnp.all(jnp.isfinite(final_residual)),
+    )
+    _radau_debug_array_stats("flat_y", inputs.flat_y)
+    _radau_debug_flat_state_parts("flat_y", kernel_context, inputs.flat_y)
+    _radau_debug_array_stats("f0", inputs.f0)
+    _radau_debug_flat_state_parts("f0", kernel_context, inputs.f0)
+    _radau_debug_array_stats("z_final", z_value)
+    _radau_debug_flat_state_parts("z_final", kernel_context, z_value)
+    _radau_debug_array_stats("stage_states", stage_states)
+    _radau_debug_flat_state_parts("stage_states", kernel_context, stage_states)
+    _radau_debug_array_stats("stage_rhs_evals", evals)
+    _radau_debug_flat_state_parts("stage_rhs_evals", kernel_context, evals)
+    _radau_debug_array_stats("initial_residual", initial_residual)
+    _radau_debug_flat_state_parts("initial_residual", kernel_context, initial_residual)
+    _radau_debug_array_stats("final_residual", final_residual)
+    _radau_debug_flat_state_parts("final_residual", kernel_context, final_residual)
+    _radau_debug_array_stats("residual_matrix", residual_matrix)
+    _radau_debug_flat_state_parts("residual_matrix", kernel_context, residual_matrix)
+    jax.debug.print("[radau-nonfinite-detail] end")
+
+
 def _radau_apply_stage_linear_solve(
     kernel_context: _RadauAcceptedStepKernelContext,
     *,
@@ -8220,6 +8300,29 @@ def _radau_run_stage_subsolve(
     nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
     nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
     final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
+    if kernel_context.debug_newton_trace:
+        debug_trigger = jnp.logical_or(
+            jnp.logical_not(finite_initial_residual),
+            jnp.logical_or(nonfinite_stage_state, nonfinite_stage_residual),
+        )
+
+        def _print_nonfinite_detail(_):
+            _radau_debug_nonfinite_stage_residual(
+                kernel_context,
+                physics_context,
+                inputs,
+                z_final,
+                initial_residual,
+                final_residual,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            debug_trigger,
+            _print_nonfinite_detail,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
     converged = jnp.logical_and(
         jnp.logical_and(
             jnp.all(jnp.isfinite(z_final)),

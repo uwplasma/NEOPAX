@@ -63,22 +63,61 @@ def _walk_stats(prefix: str, value):
         print(f"{prefix}: skipped ({type(exc).__name__}: {exc})")
 
 
-def _read_snapshot(path: Path, time_index: int) -> TransportState:
+def _select_time_index(h5, requested_index: int | None) -> int:
+    if requested_index is not None:
+        return int(requested_index)
+    if "ts" not in h5:
+        return -1
+    ts = jnp.asarray(h5["ts"][:])
+    finite = jnp.isfinite(ts)
+    finite_count = int(jax.device_get(jnp.sum(finite)))
+    if finite_count == 0:
+        return -1
+    valid_indices = jnp.where(finite, jnp.arange(ts.shape[0]), -1)
+    max_t = jnp.nanmax(jnp.where(finite, ts, -jnp.inf))
+    at_max_time = jnp.logical_and(finite, ts == max_t)
+    selected = jnp.max(jnp.where(at_max_time, valid_indices, -1))
+    return int(jax.device_get(selected))
+
+
+def _read_snapshot(path: Path, time_index: int | None) -> tuple[TransportState, int, float | None]:
     with h5py.File(path, "r") as h5:
         missing = [name for name in ("density", "pressure", "Er") if name not in h5]
         if missing:
             raise KeyError(f"{path} is missing datasets required for TransportState: {missing}")
-        density = jnp.asarray(h5["density"][time_index])
-        pressure = jnp.asarray(h5["pressure"][time_index])
-        er = jnp.asarray(h5["Er"][time_index])
-    return TransportState(density=density, pressure=pressure, Er=er)
+        selected_index = _select_time_index(h5, time_index)
+        selected_time = None
+        if "ts" in h5:
+            selected_time = float(h5["ts"][selected_index])
+            ts = jnp.asarray(h5["ts"][:])
+            print(
+                "[diagnose-h5-rhs] h5 time summary: "
+                f"n={ts.shape[0]} min={float(jax.device_get(jnp.nanmin(ts))):.16e} "
+                f"max={float(jax.device_get(jnp.nanmax(ts))):.16e} selected_index={selected_index}"
+            )
+        if "dts" in h5:
+            dts = jnp.asarray(h5["dts"][:])
+            print(
+                "[diagnose-h5-rhs] h5 dts summary: "
+                f"n={dts.shape[0]} min={float(jax.device_get(jnp.nanmin(dts))):.16e} "
+                f"max={float(jax.device_get(jnp.nanmax(dts))):.16e}"
+            )
+        density = jnp.asarray(h5["density"][selected_index])
+        pressure = jnp.asarray(h5["pressure"][selected_index])
+        er = jnp.asarray(h5["Er"][selected_index])
+    return TransportState(density=density, pressure=pressure, Er=er), selected_index, selected_time
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path, help="NEOPAX TOML used for the transport run.")
     parser.add_argument("--solution", required=True, type=Path, help="Saved transport_solution.h5 file.")
-    parser.add_argument("--time-index", type=int, default=-1, help="Snapshot index to diagnose, default final.")
+    parser.add_argument(
+        "--time-index",
+        type=int,
+        default=None,
+        help="Snapshot index to diagnose. Default selects the last snapshot at max(ts), avoiding padded trailing slots.",
+    )
     parser.add_argument(
         "--enable-ntx-debug",
         action="store_true",
@@ -93,13 +132,16 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config)
     runtime, initial_state = build_runtime_context(config)
-    state = _read_snapshot(args.solution, args.time_index)
+    state, selected_index, selected_time = _read_snapshot(args.solution, args.time_index)
     prepared = prepare_transport_solver_components(config, runtime, initial_state)
     equation_system = prepared["equation_system"]
     working_state, _ = equation_system._prepare_working_state(state)
 
     print(f"[diagnose-h5-rhs] config={args.config.resolve()}")
-    print(f"[diagnose-h5-rhs] solution={args.solution.resolve()} time_index={args.time_index}")
+    print(
+        f"[diagnose-h5-rhs] solution={args.solution.resolve()} "
+        f"time_index={selected_index} time={selected_time}"
+    )
     print("[diagnose-h5-rhs] saved state")
     _walk_stats("state", state)
     print("[diagnose-h5-rhs] prepared working state")
