@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import io
 import inspect
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -94,6 +95,11 @@ from ._transport_solvers import (
     _radau_sanitize_support_delta_bar_tree,
     _radau_zero_support_delta_tree_like,
 )
+
+
+def _reverse_tree_debug_enabled() -> bool:
+    raw = str(os.environ.get("NEOPAX_REVERSE_TREE_DEBUG", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 TransportReverseReport = Mapping[str, object]
@@ -3100,12 +3106,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     for objective_i, leaves in enumerate(objective_payload_bar_leaves):
         objective_name = objective_labels[objective_i]
         if len(leaves) != expected_support_leaf_count:
-            print(
-                "[autodiff-gate] support-payload-bar-structure mismatch "
-                f"objective={objective_name} leaf_count={len(leaves)} "
-                f"expected_leaf_count={expected_support_leaf_count}",
-                flush=True,
-            )
+            if _reverse_tree_debug_enabled():
+                print(
+                    "[autodiff-gate] support-payload-bar-structure mismatch "
+                    f"objective={objective_name} leaf_count={len(leaves)} "
+                    f"expected_leaf_count={expected_support_leaf_count}",
+                    flush=True,
+                )
             raise ValueError(
                 "Objective support-payload bar leaf-count mismatch for "
                 f"{objective_name}: got {len(leaves)}, expected {expected_support_leaf_count}."
@@ -3118,13 +3125,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 normalized_leaves.append(jnp.zeros_like(expected_arr))
                 continue
             if leaf_arr.shape != expected_arr.shape:
-                print(
-                    "[autodiff-gate] support-payload-bar-structure mismatch "
-                    f"objective={objective_name} leaf={leaf_i} "
-                    f"shape={leaf_arr.shape} expected_shape={expected_arr.shape} "
-                    f"dtype={leaf_arr.dtype} expected_dtype={expected_arr.dtype}",
-                    flush=True,
-                )
+                if _reverse_tree_debug_enabled():
+                    print(
+                        "[autodiff-gate] support-payload-bar-structure mismatch "
+                        f"objective={objective_name} leaf={leaf_i} "
+                        f"shape={leaf_arr.shape} expected_shape={expected_arr.shape} "
+                        f"dtype={leaf_arr.dtype} expected_dtype={expected_arr.dtype}",
+                        flush=True,
+                    )
                 raise ValueError(
                     "Objective support-payload bar leaf-shape mismatch for "
                     f"{objective_name} leaf {leaf_i}: got {leaf_arr.shape}, "

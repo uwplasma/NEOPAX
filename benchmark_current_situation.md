@@ -200,13 +200,16 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   `-1.9205081921396923e+03`.
 - Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
 - Add full-transport FD references for selected profile parameters if needed; current exact 16-step table is geometry `RBC:1:0`.
-- A 16-step FD run for `density_shape_alpha` produced all-zero gradients, but
-  that run is invalid. The benchmark-local `_parameterized_profile_set` in
+- A 16-step FD run for `density_shape_alpha` originally produced all-zero
+  gradients, but that run was invalid. The benchmark-local
+  `_parameterized_profile_set` in
   `examples/benchmarks/benchmark_transport_forward_fd_lane.py` accepted the
   alpha parameter name but did not pass `density_shape_alpha` or
   `temperature_shape_alpha` into `AnalyticalProfileModel`, so the perturbed
   alpha values were discarded before state construction. This wiring is now
-  fixed; rerun both alpha-exponent FD commands before saving alpha references.
+  fixed. The corrected `density_shape_alpha` and `temperature_shape_alpha` FD
+  references are saved in `shared_payload_fd_comparison.md` and
+  `optimization_ad_vs_fd.md`.
 - After fast-forwarding `en/clear_flux` to `8d9abc4`, the next 16-step
   shared-payload reverse run reached segmented cotangent sweep start and then
   failed in the turbulent submodel fallback VJP: the submodel forward output
@@ -238,13 +241,12 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   the legacy face-response alias `interpolate_center_response` still maps to a
   center-local response if the center-response option is omitted, so avoid that
   alias in benchmark TOMLs.
-- Step-5 diagnostics: generic flux-model fallback VJPs now print
-  `[reverse-flux-bar-tree]` only when the supplied flux cotangent dictionary
-  does not match the actual forward output keys, including missing keys, extra
-  keys, scalar/float0 bars, and key shapes. Before the full shared-payload
-  segmented reverse sweep, objective support-payload bars are checked against
-  the zero payload tree; leaf-count or shape mismatches now report the objective
-  name and leaf index before the expensive sweep starts. Scalar/float0 zero
-  bars are normalized to shaped zeros.
+- Step-5 diagnostics: structural reverse tree diagnostics are now opt-in via
+  `NEOPAX_REVERSE_TREE_DEBUG=1`. With the default unset, the reverse path stays
+  compact/quiet. If enabled, generic flux-model fallback VJPs print
+  `[reverse-flux-bar-tree]` when supplied flux cotangent dictionaries do not
+  match the actual forward output keys, and support-payload bar checks report
+  objective/leaf details before the expensive segmented reverse sweep.
+  Scalar/float0 zero bars are still normalized to shaped zeros.
 - Keep bootstrap-current objective in the root/full benchmark tables, but be careful not to reintroduce generic full flux VJPs that caused OOM.
 - Continue optimization-fusion work only through internals, preserving benchmark AD behavior.
