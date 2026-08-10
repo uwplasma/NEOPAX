@@ -71,11 +71,12 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 from vmex.core import implicit as im  # noqa: E402
 
 
-def _report_path(parameter_name: str) -> Path:
+def _report_path(parameter_name: str, *, root_fd_lane: str = "selected") -> Path:
     safe_name = parameter_name.replace(":", "_")
     outdir = ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "realtime_geometry_fd"
     outdir.mkdir(parents=True, exist_ok=True)
-    return outdir / f"{safe_name}_forward_fd_summary.json"
+    lane_suffix = "" if str(root_fd_lane) == "selected" else f"_{root_fd_lane}"
+    return outdir / f"{safe_name}_forward_fd{lane_suffix}_summary.json"
 
 
 def _root_only_report_path(parameter_name: str, *, root_fd_lane: str = "selected") -> Path:
@@ -167,15 +168,33 @@ def _objectives_on_realtime_geometry_frozen_trace(
     replay_mode: str,
     solver_override=None,
     initial_er_root_ad: str = "off",
+    initial_er_root_fd_root_lane: str = "selected",
+    baseline_er_profile=None,
+    baseline_residual=None,
+    baseline_dres_der=None,
 ):
-    state0 = _profile_state_from_values(
-        profile_values,
-        config=config,
-        initial_er_root_ad=initial_er_root_ad,
-        runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-    )
+    root_lane = str(initial_er_root_fd_root_lane).strip().lower()
+    if root_lane == "frozen_linearized":
+        if baseline_er_profile is None or baseline_residual is None or baseline_dres_der is None:
+            raise ValueError("frozen-linearized full-transport initial-Er FD requires baseline root data.")
+        state0 = _state_with_frozen_linearized_initial_er_root(
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            profile_values=profile_values,
+            baseline_er_profile=baseline_er_profile,
+            baseline_residual=baseline_residual,
+            baseline_dres_der=baseline_dres_der,
+        )
+    else:
+        state0 = _profile_state_from_values(
+            profile_values,
+            config=config,
+            initial_er_root_ad=initial_er_root_ad,
+            runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+        )
     components, prepared_rollout, execution_context = _prepare_rollout(
         config,
         runtime,
@@ -367,6 +386,10 @@ def _geometry_fd_objectives(
     frozen_linearized_bundle: dict[str, Any] | None = None,
     fixed_initial_er=None,
     initial_er_root_ad: str = "off",
+    initial_er_root_fd_root_lane: str = "selected",
+    baseline_er_profile=None,
+    baseline_residual=None,
+    baseline_dres_der=None,
 ):
     if str(geometry_fd_lane).strip().lower() == "frozen_linearized":
         if frozen_linearized_bundle is None:
@@ -389,6 +412,10 @@ def _geometry_fd_objectives(
         frozen_trace=frozen_trace,
         replay_mode=replay_mode,
         initial_er_root_ad=initial_er_root_ad,
+        initial_er_root_fd_root_lane=initial_er_root_fd_root_lane,
+        baseline_er_profile=baseline_er_profile,
+        baseline_residual=baseline_residual,
+        baseline_dres_der=baseline_dres_der,
     )
 
 
@@ -453,6 +480,38 @@ def _initial_er_root_only_frozen_linearized_objectives(
     er_profile = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype) - residual_delta / safe_dres_der
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
     return _initial_er_root_only_objective_values(rooted_state, runtime, objective_names), rooted_state
+
+
+def _state_with_frozen_linearized_initial_er_root(
+    *,
+    runtime,
+    baseline_state,
+    profile_cfg: dict[str, Any],
+    profile_values,
+    baseline_er_profile,
+    baseline_residual,
+    baseline_dres_der,
+):
+    pre_root_state = _profile_state_from_values(
+        profile_values,
+        initial_er_root_ad="off",
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+    )
+    residual_at_baseline_er = initial_er_charge_flux_residuals(
+        pre_root_state,
+        jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype),
+        runtime=runtime,
+    )
+    residual_delta = residual_at_baseline_er - jnp.asarray(baseline_residual, dtype=residual_at_baseline_er.dtype)
+    safe_dres_der = jnp.where(
+        jnp.abs(baseline_dres_der) > jnp.asarray(1.0e-30, dtype=residual_delta.dtype),
+        jnp.asarray(baseline_dres_der, dtype=residual_delta.dtype),
+        jnp.inf,
+    )
+    er_profile = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype) - residual_delta / safe_dres_der
+    return dataclasses.replace(pre_root_state, Er=er_profile)
 
 
 def _root_only_er_fd_diagnostics(minus_state, baseline_state, plus_state, h: float) -> dict[str, Any]:
@@ -563,6 +622,19 @@ def main() -> None:
             "Root-only FD oracle. 'selected' reruns the best-root selection at p +/- h. "
             "'frozen_linearized' freezes the baseline selected root branch and applies "
             "the same implicit residual linearization used by the AD rule."
+        ),
+    )
+    parser.add_argument(
+        "--initial-Er-root-fd-root-lane",
+        dest="initial_er_root_fd_root_lane",
+        choices=("selected", "frozen_linearized"),
+        default="selected",
+        help=(
+            "Full-transport FD oracle for the initial-Er root. 'selected' preserves "
+            "the existing behavior and reruns best-root selection at p +/- h. "
+            "'frozen_linearized' freezes the baseline selected root branch before "
+            "the Radau replay, using the same local implicit linearization as the "
+            "root-only FD diagnostic."
         ),
     )
     parser.add_argument(
@@ -851,6 +923,40 @@ def main() -> None:
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
     baseline_objectives = jax.block_until_ready(baseline_objectives)
+    full_root_fd_lane = str(args.initial_er_root_fd_root_lane).strip().lower()
+    if full_root_fd_lane == "frozen_linearized" and initial_er_root_ad == "off":
+        raise SystemExit(
+            "[autodiff-gate] --initial-Er-root-fd-root-lane frozen_linearized "
+            "requires --initial-Er-root-ad jax_selected_root."
+        )
+    baseline_er_profile = None
+    baseline_residual = None
+    baseline_dres_der = None
+    if full_root_fd_lane == "frozen_linearized":
+        print(
+            "[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch "
+            "for full-transport FD",
+            flush=True,
+        )
+        baseline_pre_root_state = _profile_state_from_values(
+            profile_values,
+            initial_er_root_ad="off",
+            runtime=baseline_runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+        )
+        baseline_er_profile = jnp.asarray(baseline_profile_state.Er, dtype=baseline_pre_root_state.Er.dtype)
+        baseline_residual = initial_er_charge_flux_residuals(
+            baseline_pre_root_state,
+            baseline_er_profile,
+            runtime=baseline_runtime,
+        )
+        baseline_dres_der = initial_er_charge_flux_residual_er_derivative(
+            baseline_pre_root_state,
+            baseline_er_profile,
+            runtime=baseline_runtime,
+        )
+        baseline_residual, baseline_dres_der = jax.block_until_ready((baseline_residual, baseline_dres_der))
     fixed_initial_er = (
         jax.lax.stop_gradient(baseline_state.Er)
         if (
@@ -885,6 +991,10 @@ def main() -> None:
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
             initial_er_root_ad=initial_er_root_ad,
+            initial_er_root_fd_root_lane=full_root_fd_lane,
+            baseline_er_profile=baseline_er_profile,
+            baseline_residual=baseline_residual,
+            baseline_dres_der=baseline_dres_der,
         )
         print("[autodiff-gate] progress: running profile fd_plus replay", flush=True)
         plus_profile_values = profile_values.at[param_index].set(
@@ -899,6 +1009,10 @@ def main() -> None:
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
             initial_er_root_ad=initial_er_root_ad,
+            initial_er_root_fd_root_lane=full_root_fd_lane,
+            baseline_er_profile=baseline_er_profile,
+            baseline_residual=baseline_residual,
+            baseline_dres_der=baseline_dres_der,
         )
         del param_index
     else:
@@ -928,6 +1042,10 @@ def main() -> None:
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
             initial_er_root_ad=initial_er_root_ad,
+            initial_er_root_fd_root_lane=full_root_fd_lane,
+            baseline_er_profile=baseline_er_profile,
+            baseline_residual=baseline_residual,
+            baseline_dres_der=baseline_dres_der,
         )
         print(
             "[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic",
@@ -966,6 +1084,10 @@ def main() -> None:
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
             initial_er_root_ad=initial_er_root_ad,
+            initial_er_root_fd_root_lane=full_root_fd_lane,
+            baseline_er_profile=baseline_er_profile,
+            baseline_residual=baseline_residual,
+            baseline_dres_der=baseline_dres_der,
         )
         baseline_geometry_final_state_fd = (
             _objective_vector(plus_replay["final_state"], baseline_runtime)
@@ -1008,6 +1130,10 @@ def main() -> None:
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
                 initial_er_root_ad=initial_er_root_ad,
+                initial_er_root_fd_root_lane=full_root_fd_lane,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
             )
             _plus_geometry_only_objectives, plus_geometry_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -1018,6 +1144,10 @@ def main() -> None:
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
                 initial_er_root_ad=initial_er_root_ad,
+                initial_er_root_fd_root_lane=full_root_fd_lane,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
             )
             _minus_support_only_objectives, minus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -1028,6 +1158,10 @@ def main() -> None:
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
                 initial_er_root_ad=initial_er_root_ad,
+                initial_er_root_fd_root_lane=full_root_fd_lane,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
             )
             _plus_support_only_objectives, plus_support_only_replay = _objectives_on_realtime_geometry_frozen_trace(
                 config=config,
@@ -1038,6 +1172,10 @@ def main() -> None:
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
                 initial_er_root_ad=initial_er_root_ad,
+                initial_er_root_fd_root_lane=full_root_fd_lane,
+                baseline_er_profile=baseline_er_profile,
+                baseline_residual=baseline_residual,
+                baseline_dres_der=baseline_dres_der,
             )
             geometry_only_final_state_fd = (
                 _objective_vector(plus_geometry_only_replay["final_state"], baseline_runtime)
@@ -1169,6 +1307,8 @@ def main() -> None:
         "fd_step": float(h),
         "replay_mode": str(args.replay_mode),
         "geometry_fd_lane": str(geometry_fd_lane),
+        "initial_er_root_ad": str(initial_er_root_ad),
+        "initial_er_root_fd_root_lane": str(full_root_fd_lane),
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "radau_jacobian_reuse_mode": None
         if args.radau_jacobian_reuse_mode is None
@@ -1225,7 +1365,8 @@ def main() -> None:
         "[autodiff-gate] mode=transport_realtime_geometry_forward_fd "
         f"parameter={parameter_name} parameter_kind={parameter_kind} "
         f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
-        f"replay_mode={args.replay_mode} geometry_fd_lane={geometry_fd_lane}"
+        f"replay_mode={args.replay_mode} geometry_fd_lane={geometry_fd_lane} "
+        f"root_fd_lane={full_root_fd_lane}"
     )
     print("[autodiff-gate] objective values:")
     for label, value in zip(OBJECTIVE_LABELS, baseline_np.tolist()):
@@ -1263,7 +1404,7 @@ def main() -> None:
                 f"diff={float(payload_value - prepared_value):.6e}"
             )
 
-    outpath = _report_path(parameter_name)
+    outpath = _report_path(parameter_name, root_fd_lane=full_root_fd_lane)
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
