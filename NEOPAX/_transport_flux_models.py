@@ -9420,7 +9420,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 density_floor=self.density_floor,
                 temperature_floor=self.temperature_floor,
             )
-            center_state = evaluated.center
             face_state = evaluated.face
             face_density = face_state.density
             face_temperature = face_state.temperature
@@ -9590,72 +9589,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             face_temperature_bar = face_temperature_bar + log_temperature_bar
             face_er_bar = face_er_bar + log_er_bar
 
-            def _density_face_map(density_value):
-                density_safe = safe_density(density_value, self.density_floor)
-                density_faces = _face_profile(
-                    density_safe,
-                    self.geometry.r_grid_half,
-                    bc_model=self.bc_density,
-                    reconstruction="linear",
+            def _face_inputs_from_state(state_value):
+                evaluated_value = build_evaluated_transport_state(
+                    state_value,
+                    self.geometry,
+                    bc_density=self.bc_density,
+                    bc_temperature=self.bc_temperature,
+                    density_floor=self.density_floor,
+                    temperature_floor=self.temperature_floor,
                 )
-                return safe_density(density_faces, self.density_floor)
-
-            def _temperature_face_map(temperature_value):
-                temperature_safe = safe_temperature(temperature_value, self.temperature_floor)
-                temperature_faces = _face_profile(
-                    temperature_safe,
-                    self.geometry.r_grid_half,
-                    bc_model=self.bc_temperature,
-                    reconstruction="linear",
-                )
-                return safe_temperature(temperature_faces, self.temperature_floor)
-
-            def _er_face_map(er_value):
-                return _face_profile(
-                    er_value,
-                    self.geometry.r_grid_half,
-                    bc_model=None,
-                    reconstruction="linear",
+                return (
+                    evaluated_value.face.density,
+                    evaluated_value.face.temperature,
+                    evaluated_value.face.Er,
+                    evaluated_value.density_grad_face,
+                    evaluated_value.temperature_grad_face,
                 )
 
-            def _density_face_gradient_map(density_value):
-                return _face_profile_gradient(
-                    safe_density(density_value, self.density_floor),
-                    self.geometry.r_grid_half,
-                    bc_model=self.bc_density,
+            _, face_inputs_pullback = jax.vjp(_face_inputs_from_state, state)
+            (face_state_bar,) = face_inputs_pullback(
+                (
+                    face_density_bar,
+                    face_temperature_bar,
+                    face_er_bar,
+                    dndr_faces_bar,
+                    dTdr_faces_bar,
                 )
-
-            def _temperature_face_gradient_map(temperature_value):
-                return _face_profile_gradient(
-                    safe_temperature(temperature_value, self.temperature_floor),
-                    self.geometry.r_grid_half,
-                    bc_model=self.bc_temperature,
-                )
-
-            _, density_face_pullback = jax.vjp(_density_face_map, center_state.density)
-            _, temperature_face_pullback = jax.vjp(_temperature_face_map, center_state.temperature)
-            _, er_face_pullback = jax.vjp(_er_face_map, center_state.Er)
-            _, density_grad_pullback = jax.vjp(_density_face_gradient_map, center_state.density)
-            _, temperature_grad_pullback = jax.vjp(_temperature_face_gradient_map, center_state.temperature)
-            (density_from_face_bar,) = density_face_pullback(face_density_bar)
-            (temperature_from_face_bar,) = temperature_face_pullback(face_temperature_bar)
-            (er_from_face_bar,) = er_face_pullback(face_er_bar)
-            (density_from_grad_bar,) = density_grad_pullback(dndr_faces_bar)
-            (temperature_from_grad_bar,) = temperature_grad_pullback(dTdr_faces_bar)
-
-            density_bar_direct = density_from_face_bar + density_from_grad_bar
-            temperature_bar = temperature_from_face_bar + temperature_from_grad_bar
-            density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), self.density_floor)
-            density_active = jnp.asarray(state.density) > density_floor_arr
-            density_safe = safe_density(state.density, self.density_floor)
-            pressure_bar = temperature_bar / density_safe
-            density_bar = density_bar_direct - temperature_bar * state.pressure / (density_safe * density_safe)
-            density_bar = density_bar * density_active.astype(density_bar.dtype)
+            )
             state_bar_acc = dataclasses.replace(
                 state_bar_acc,
-                density=state_bar_acc.density + density_bar,
-                pressure=state_bar_acc.pressure + pressure_bar,
-                Er=state_bar_acc.Er + er_from_face_bar,
+                density=state_bar_acc.density + face_state_bar.density,
+                pressure=state_bar_acc.pressure + face_state_bar.pressure,
+                Er=state_bar_acc.Er + face_state_bar.Er,
             )
             if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
                 return state_bar_acc
