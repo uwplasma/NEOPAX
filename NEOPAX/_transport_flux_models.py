@@ -8886,23 +8886,177 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             or self._resolved_center_response_mode() == "interpolate_from_faces"
         ):
             if isinstance(lagged_response.face_response, NTXInterpolatedMomentResponse):
-                face_channels_delta0 = _float_delta_tree_like(support.face_channels)
-                face_output, face_support_pullback = jax.vjp(
-                    lambda face_channels_delta: self.with_support_payload(
-                        _support_with_face_channel_delta(
-                            support,
-                            face_channels_delta,
-                        )
-                    ).evaluate_with_lagged_response(state, lagged_response),
-                    face_channels_delta0,
+                response = lagged_response.face_response
+                evaluated = build_evaluated_transport_state(
+                    state,
+                    self.geometry,
+                    bc_density=self.bc_density,
+                    bc_temperature=self.bc_temperature,
+                    density_floor=self.density_floor,
+                    temperature_floor=self.temperature_floor,
                 )
+                face_state = evaluated.face
+                face_density = evaluated.face.density
+                face_temperature = face_state.temperature
+
+                collisionality_kind = _collisionality_kind(self.collisionality_model)
+                face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+                species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+                radius_indices = jnp.arange(face_state.Er.shape[0], dtype=jnp.int32)
+
+                def _current_log_nu_star_from_drds(drds_values):
+                    def _current_log_nu_star_per_radius(radius_index):
+                        drds_value = jax.lax.dynamic_index_in_dim(
+                            drds_values,
+                            radius_index,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        er_value = jax.lax.dynamic_index_in_dim(
+                            face_state.Er,
+                            radius_index,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        temperature_local = jax.lax.dynamic_index_in_dim(
+                            face_temperature,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        density_local = jax.lax.dynamic_index_in_dim(
+                            face_density,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        vthermal_local = jax.lax.dynamic_index_in_dim(
+                            face_v_thermal,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        return jax.vmap(
+                            lambda species_index: self._log_nu_star_from_nu_hat(
+                                self._local_scan_inputs(
+                                    drds_value=drds_value,
+                                    species_index=species_index,
+                                    er_value=er_value,
+                                    temperature_local=temperature_local,
+                                    density_local=density_local,
+                                    vthermal_local=vthermal_local,
+                                    collisionality_kind=collisionality_kind,
+                                )[0]
+                            )
+                        )(species_indices)
+
+                    return jnp.swapaxes(
+                        self._map_radius_axis_regularized_at_axis0(
+                            _current_log_nu_star_per_radius,
+                            radius_indices,
+                            self.geometry.r_grid_half,
+                            unbatched=True,
+                        ),
+                        0,
+                        1,
+                    )
+
+                current_log_nu_star, drds_pullback = jax.vjp(
+                    _current_log_nu_star_from_drds,
+                    support.face_channels.drds,
+                )
+                delta_er = face_state.Er - response.reference_er
+                delta_log_nu_star = current_log_nu_star - response.reference_log_nu_star
+                transport_moments = (
+                    response.reference_transport_moments
+                    + response.dtransport_moments_d_er * delta_er[None, :, None]
+                    + response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+                )
+                lij_faces = self._batched_lij_from_transport_moments(transport_moments, face_v_thermal)
+
+                dndr_faces = evaluated.density_grad_face
+                dTdr_faces = evaluated.temperature_grad_face
+                a1 = jax.vmap(
+                    lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                        charge,
+                        density_a,
+                        temperature_a,
+                        dndr_a,
+                        dTdr_a,
+                        face_state.Er,
+                    )
+                )(self.species.charge, face_density, face_temperature, dndr_faces, dTdr_faces)
+                a2 = jax.vmap(get_Thermodynamical_Forces_A2)(face_temperature, dTdr_faces)
+                a3 = get_Thermodynamical_Forces_A3(face_state.Er)
+                density_phys = DENSITY_STATE_TO_PHYSICAL * face_density
+                temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * face_temperature
+                gamma_faces = -density_phys * (
+                    lij_faces[:, :, 0, 0] * a1
+                    + lij_faces[:, :, 0, 1] * a2
+                    + lij_faces[:, :, 0, 2] * a3[None, :]
+                )
+                q_faces = -temperature_phys * density_phys * (
+                    lij_faces[:, :, 1, 0] * a1
+                    + lij_faces[:, :, 1, 1] * a2
+                    + lij_faces[:, :, 1, 2] * a3[None, :]
+                )
+                upar_faces = -density_phys * (
+                    lij_faces[:, :, 2, 0] * a1
+                    + lij_faces[:, :, 2, 1] * a2
+                    + lij_faces[:, :, 2, 2] * a3[None, :]
+                )
+                face_output = {
+                    "Gamma_faces": gamma_faces,
+                    "Q_faces": q_faces,
+                    "Upar_faces": upar_faces,
+                }
                 face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
                 face_flux_bar = _complete_flux_bar_like(
                     face_output,
                     face_flux_bar,
                     context="NTXExactLijRuntimeTransportModel.support_payload.face_interpolated",
                 )
-                (face_channels_bar,) = face_support_pullback(face_flux_bar)
+                gamma_bar = face_flux_bar["Gamma_faces"]
+                q_bar = face_flux_bar["Q_faces"]
+                upar_bar = face_flux_bar["Upar_faces"]
+
+                lij_bar = jnp.zeros_like(lij_faces)
+                lij_bar = lij_bar.at[:, :, 0, 0].add(-density_phys * a1 * gamma_bar)
+                lij_bar = lij_bar.at[:, :, 0, 1].add(-density_phys * a2 * gamma_bar)
+                lij_bar = lij_bar.at[:, :, 0, 2].add(-density_phys * a3[None, :] * gamma_bar)
+                lij_bar = lij_bar.at[:, :, 1, 0].add(-temperature_phys * density_phys * a1 * q_bar)
+                lij_bar = lij_bar.at[:, :, 1, 1].add(-temperature_phys * density_phys * a2 * q_bar)
+                lij_bar = lij_bar.at[:, :, 1, 2].add(-temperature_phys * density_phys * a3[None, :] * q_bar)
+                lij_bar = lij_bar.at[:, :, 2, 0].add(-density_phys * a1 * upar_bar)
+                lij_bar = lij_bar.at[:, :, 2, 1].add(-density_phys * a2 * upar_bar)
+                lij_bar = lij_bar.at[:, :, 2, 2].add(-density_phys * a3[None, :] * upar_bar)
+
+                charge = jnp.asarray(self.species.charge, dtype=jnp.float64)[:, None]
+                mass = jnp.asarray(self.species.mass, dtype=jnp.float64)[:, None]
+                inv_sqrt_pi = 1.0 / jnp.sqrt(jnp.pi)
+                l11_fac = -inv_sqrt_pi * (mass / charge) ** 2 * face_v_thermal**3
+                l13_fac = -inv_sqrt_pi * (mass / charge) * face_v_thermal**2
+                l33_fac = -inv_sqrt_pi * face_v_thermal
+                transport_moments_bar = jnp.stack(
+                    (
+                        l11_fac * lij_bar[:, :, 0, 0],
+                        l11_fac * (lij_bar[:, :, 0, 1] + lij_bar[:, :, 1, 0]),
+                        l11_fac * lij_bar[:, :, 1, 1],
+                        l13_fac * (lij_bar[:, :, 0, 2] - lij_bar[:, :, 2, 0]),
+                        l13_fac * (lij_bar[:, :, 1, 2] - lij_bar[:, :, 2, 1]),
+                        l33_fac * lij_bar[:, :, 2, 2],
+                    ),
+                    axis=2,
+                )
+                current_log_nu_star_bar = jnp.sum(
+                    transport_moments_bar * response.dtransport_moments_d_log_nu_star,
+                    axis=2,
+                )
+                (face_drds_bar,) = drds_pullback(current_log_nu_star_bar)
+                face_channels_bar = dataclasses.replace(
+                    _float_delta_tree_like(support.face_channels),
+                    drds=face_drds_bar,
+                )
                 return _support_bar_from_face_bars(
                     support,
                     face_channels_bar,
