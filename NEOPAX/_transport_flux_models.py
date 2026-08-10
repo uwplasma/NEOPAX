@@ -7074,7 +7074,263 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 v_thermal=get_v_thermal(self.species.mass, face_temperature),
             )
 
-        if face_response_bar is not None:
+        if isinstance(face_response_bar, NTXInterpolatedMomentResponse):
+            support = self._static_support()
+            face_state0 = build_face_transport_state(
+                state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            face_density0 = safe_density(face_state0.density, self.density_floor)
+            face_temperature0 = face_state0.temperature
+            face_er0 = face_state0.Er
+            n_radius = int(face_er0.shape[0])
+            anchor_indices = self._response_anchor_indices(n_radius)
+            target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
+            anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
+            n_anchor = int(anchor_indices.shape[0])
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            response_field_bars = self._interpolated_response_field_bars(face_response_bar)
+            face_er_bar = jnp.asarray(face_response_bar.reference_er)
+            raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices,
+                anchor_rho=anchor_rho,
+                target_rho=target_rho,
+                field_bars=response_field_bars,
+            )
+            raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
+
+            face_density_bar = jnp.zeros_like(face_density0)
+            face_temperature_bar = jnp.zeros_like(face_temperature0)
+
+            if reverse_stage_cotangent_mode in {
+                "zero_rebuild_anchor_fields",
+                "zero_rebuild_interpolated_fields",
+                "rebuild_anchor_fields_zero",
+            }:
+                pass
+            else:
+                zero_local_moment_pullback = reverse_stage_cotangent_mode in {
+                    "zero_rebuild_local_moment_pullback",
+                    "zero_rebuild_local_moments",
+                    "rebuild_local_moment_pullback_zero",
+                }
+                scan_local_moment_pullback = reverse_stage_cotangent_mode in {
+                    "scan_rebuild_local_moment_pullback",
+                    "scan_rebuild_local_moments",
+                    "rebuild_local_moment_pullback_scan",
+                    "scan_rebuild_anchor_pullback",
+                    "scan_rebuild_anchor_local_moment_pullback",
+                }
+                scan_anchor_pullback = reverse_stage_cotangent_mode in {
+                    "scan_rebuild_anchor_pullback",
+                    "scan_rebuild_anchor_local_moment_pullback",
+                    "rebuild_anchor_pullback_scan",
+                }
+                anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
+
+                def _pullback_one_face_anchor(anchor_pos):
+                    radius_index = jax.lax.dynamic_index_in_dim(
+                        anchor_indices,
+                        anchor_pos,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    is_axis_anchor = jnp.logical_and(
+                        jnp.asarray(n_anchor >= 4),
+                        jnp.logical_and(
+                            jnp.asarray(anchor_pos == 0, dtype=jnp.bool_),
+                            jnp.isclose(
+                                jax.lax.dynamic_index_in_dim(anchor_rho, 0, axis=0, keepdims=False),
+                                0.0,
+                            ),
+                        ),
+                    )
+
+                    def _axis_anchor_zero_pullback(_):
+                        density_local0 = jax.lax.dynamic_index_in_dim(
+                            face_density0,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        temperature_local0 = jax.lax.dynamic_index_in_dim(
+                            face_temperature0,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        er_local0 = jax.lax.dynamic_index_in_dim(
+                            face_er0,
+                            radius_index,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        return (
+                            radius_index,
+                            jnp.zeros_like(density_local0),
+                            jnp.zeros_like(temperature_local0),
+                            jnp.zeros_like(er_local0),
+                        )
+
+                    def _non_axis_anchor_pullback(_):
+                        local_field_bars = tuple(
+                            jax.lax.dynamic_index_in_dim(
+                                field_bar,
+                                anchor_pos,
+                                axis=0,
+                                keepdims=False,
+                            )
+                            for field_bar in raw_anchor_response_fields
+                        )
+                        density_local0 = jax.lax.dynamic_index_in_dim(
+                            face_density0,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        temperature_local0 = jax.lax.dynamic_index_in_dim(
+                            face_temperature0,
+                            radius_index,
+                            axis=1,
+                            keepdims=False,
+                        )
+                        er_local0 = jax.lax.dynamic_index_in_dim(
+                            face_er0,
+                            radius_index,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        prepared_local = jax.tree_util.tree_map(
+                            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                            support.face_prepared,
+                        )
+                        drds_value_local = jax.lax.dynamic_index_in_dim(
+                            support.face_channels.drds,
+                            radius_index,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        if zero_local_moment_pullback:
+                            (
+                                er_local_bar,
+                                temperature_local_bar,
+                                density_local_bar,
+                            ) = (
+                                jnp.zeros_like(er_local0),
+                                jnp.zeros_like(temperature_local0),
+                                jnp.zeros_like(density_local0),
+                            )
+                        else:
+                            (
+                                er_local_bar,
+                                temperature_local_bar,
+                                density_local_bar,
+                            ) = self._pullback_interpolated_moment_response_local_fields(
+                                prepared_local,
+                                drds_value=drds_value_local,
+                                er_value=er_local0,
+                                temperature_local=temperature_local0,
+                                density_local=density_local0,
+                                collisionality_kind=collisionality_kind,
+                                field_bars=local_field_bars,
+                                scan_species=scan_local_moment_pullback,
+                            )
+                        return (
+                            radius_index,
+                            density_local_bar,
+                            temperature_local_bar,
+                            er_local_bar,
+                        )
+
+                    return jax.lax.cond(
+                        is_axis_anchor,
+                        _axis_anchor_zero_pullback,
+                        _non_axis_anchor_pullback,
+                        operand=None,
+                    )
+
+                if scan_anchor_pullback:
+                    def _accumulate_face_anchor(carry, anchor_pos):
+                        density_carry, temperature_carry, er_carry = carry
+                        (
+                            radius_index,
+                            density_local_bar,
+                            temperature_local_bar,
+                            er_local_bar,
+                        ) = _pullback_one_face_anchor(anchor_pos)
+                        return (
+                            density_carry.at[:, radius_index].add(density_local_bar),
+                            temperature_carry.at[:, radius_index].add(temperature_local_bar),
+                            er_carry.at[radius_index].add(er_local_bar),
+                        ), None
+
+                    (
+                        face_density_bar,
+                        face_temperature_bar,
+                        face_er_bar,
+                    ), _ = jax.lax.scan(
+                        _accumulate_face_anchor,
+                        (face_density_bar, face_temperature_bar, face_er_bar),
+                        anchor_positions,
+                    )
+                else:
+                    (
+                        anchor_radius_indices,
+                        density_anchor_bars,
+                        temperature_anchor_bars,
+                        er_anchor_bars,
+                    ) = jax.vmap(_pullback_one_face_anchor)(anchor_positions)
+                    face_density_bar = face_density_bar.at[:, anchor_radius_indices].add(
+                        jnp.swapaxes(density_anchor_bars, 0, 1)
+                    )
+                    face_temperature_bar = face_temperature_bar.at[:, anchor_radius_indices].add(
+                        jnp.swapaxes(temperature_anchor_bars, 0, 1)
+                    )
+                    face_er_bar = face_er_bar.at[anchor_radius_indices].add(er_anchor_bars)
+
+            def _face_state_values(density_value, pressure_value, er_value):
+                face_state = build_face_transport_state(
+                    dataclasses.replace(
+                        state,
+                        density=density_value,
+                        pressure=pressure_value,
+                        Er=er_value,
+                    ),
+                    self.geometry,
+                    bc_density=self.bc_density,
+                    bc_temperature=self.bc_temperature,
+                    density_floor=self.density_floor,
+                    temperature_floor=self.temperature_floor,
+                )
+                return (
+                    safe_density(face_state.density, self.density_floor),
+                    face_state.temperature,
+                    face_state.Er,
+                )
+
+            _, face_state_pullback = jax.vjp(
+                _face_state_values,
+                state.density,
+                state.pressure,
+                state.Er,
+            )
+            density_bar, pressure_bar, er_bar = face_state_pullback(
+                (face_density_bar, face_temperature_bar, face_er_bar)
+            )
+            state_bar_acc = dataclasses.replace(
+                state_bar_acc,
+                density=state_bar_acc.density + density_bar,
+                pressure=state_bar_acc.pressure + pressure_bar,
+                Er=state_bar_acc.Er + er_bar,
+            )
+            if center_response_bar is None:
+                return state_bar_acc
+
+        elif face_response_bar is not None:
             density_bar, pressure_bar, er_bar = _transpose_primitives_from_builder(
                 _build_face_response_from_primitives,
                 face_response_bar,
@@ -9126,17 +9382,188 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 center_response is None
                 or self._resolved_center_response_mode() == "interpolate_from_faces"
             )
-            face_output, face_state_pullback = jax.vjp(
-                lambda state_value: self.evaluate_with_lagged_response(
-                    state_value,
-                    NTXExactLijLaggedResponse(face_response=face_response),
-                ),
+            if not isinstance(face_response, NTXInterpolatedMomentResponse):
+                face_output, face_state_pullback = jax.vjp(
+                    lambda state_value: self.evaluate_with_lagged_response(
+                        state_value,
+                        NTXExactLijLaggedResponse(face_response=face_response),
+                    ),
+                    state,
+                )
+                if use_all_flux_bars_for_face:
+                    face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
+                else:
+                    face_flux_bar = _complete_flux_bar_like(
+                        face_output,
+                        {
+                            "Gamma_faces": flux_bar.get("Gamma_faces", None),
+                            "Q_faces": flux_bar.get("Q_faces", None),
+                            "Upar_faces": flux_bar.get("Upar_faces", None),
+                        },
+                        context="NTXExactLijRuntimeTransportModel.state.face",
+                    )
+                (face_state_bar,) = face_state_pullback(face_flux_bar)
+                state_bar_acc = dataclasses.replace(
+                    state_bar_acc,
+                    density=state_bar_acc.density + face_state_bar.density,
+                    pressure=state_bar_acc.pressure + face_state_bar.pressure,
+                    Er=state_bar_acc.Er + face_state_bar.Er,
+                )
+                if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
+                    return state_bar_acc
+
+            evaluated = build_evaluated_transport_state(
                 state,
+                self.geometry,
+                bc_density=self.bc_density,
+                bc_temperature=self.bc_temperature,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
             )
-            if use_all_flux_bars_for_face:
-                face_flux_bar = _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
-            else:
-                face_flux_bar = _complete_flux_bar_like(
+            center_state = evaluated.center
+            face_state = evaluated.face
+            face_density = face_state.density
+            face_temperature = face_state.temperature
+            face_er = face_state.Er
+            dndr_faces = evaluated.density_grad_face
+            dTdr_faces = evaluated.temperature_grad_face
+
+            support = self._static_support()
+            collisionality_kind = _collisionality_kind(self.collisionality_model)
+            species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+            radius_indices = jnp.arange(face_er.shape[0], dtype=jnp.int32)
+
+            def _current_log_nu_star_from_face_inputs(density_faces, temperature_faces, er_faces):
+                vthermal_faces = get_v_thermal(self.species.mass, temperature_faces)
+
+                def _current_log_nu_star_per_radius(radius_index):
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        support.face_channels.drds,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    er_value = jax.lax.dynamic_index_in_dim(
+                        er_faces,
+                        radius_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        temperature_faces,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(
+                        density_faces,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        vthermal_faces,
+                        radius_index,
+                        axis=1,
+                        keepdims=False,
+                    )
+                    return jax.vmap(
+                        lambda species_index: self._log_nu_star_from_nu_hat(
+                            self._local_scan_inputs(
+                                drds_value=drds_value,
+                                species_index=species_index,
+                                er_value=er_value,
+                                temperature_local=temperature_local,
+                                density_local=density_local,
+                                vthermal_local=vthermal_local,
+                                collisionality_kind=collisionality_kind,
+                            )[0]
+                        )
+                    )(species_indices)
+
+                return jnp.swapaxes(
+                    self._map_radius_axis_regularized_at_axis0(
+                        _current_log_nu_star_per_radius,
+                        radius_indices,
+                        self.geometry.r_grid_half,
+                        unbatched=True,
+                    ),
+                    0,
+                    1,
+                )
+
+            current_log_nu_star, current_log_pullback = jax.vjp(
+                _current_log_nu_star_from_face_inputs,
+                face_density,
+                face_temperature,
+                face_er,
+            )
+
+            def _face_fluxes_from_local_arrays(
+                density_faces,
+                temperature_faces,
+                er_faces,
+                dndr_value,
+                dTdr_value,
+                log_nu_star_value,
+            ):
+                face_v_thermal = get_v_thermal(self.species.mass, temperature_faces)
+                delta_er = er_faces - face_response.reference_er
+                delta_log_nu_star = log_nu_star_value - face_response.reference_log_nu_star
+                transport_moments = (
+                    face_response.reference_transport_moments
+                    + face_response.dtransport_moments_d_er * delta_er[None, :, None]
+                    + face_response.dtransport_moments_d_log_nu_star * delta_log_nu_star[:, :, None]
+                )
+                lij_faces = self._batched_lij_from_transport_moments(transport_moments, face_v_thermal)
+                a1 = jax.vmap(
+                    lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                        charge,
+                        density_a,
+                        temperature_a,
+                        dndr_a,
+                        dTdr_a,
+                        er_faces,
+                    )
+                )(self.species.charge, density_faces, temperature_faces, dndr_value, dTdr_value)
+                a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature_faces, dTdr_value)
+                a3 = get_Thermodynamical_Forces_A3(er_faces)
+                density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
+                temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
+                gamma_faces = -density_phys * (
+                    lij_faces[:, :, 0, 0] * a1
+                    + lij_faces[:, :, 0, 1] * a2
+                    + lij_faces[:, :, 0, 2] * a3[None, :]
+                )
+                q_faces = -temperature_phys * density_phys * (
+                    lij_faces[:, :, 1, 0] * a1
+                    + lij_faces[:, :, 1, 1] * a2
+                    + lij_faces[:, :, 1, 2] * a3[None, :]
+                )
+                upar_faces = -density_phys * (
+                    lij_faces[:, :, 2, 0] * a1
+                    + lij_faces[:, :, 2, 1] * a2
+                    + lij_faces[:, :, 2, 2] * a3[None, :]
+                )
+                return {
+                    "Gamma_faces": gamma_faces,
+                    "Q_faces": q_faces,
+                    "Upar_faces": upar_faces,
+                }
+
+            face_output, face_algebra_pullback = jax.vjp(
+                _face_fluxes_from_local_arrays,
+                face_density,
+                face_temperature,
+                face_er,
+                dndr_faces,
+                dTdr_faces,
+                current_log_nu_star,
+            )
+            face_flux_bar = (
+                _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar)
+                if use_all_flux_bars_for_face
+                else _complete_flux_bar_like(
                     face_output,
                     {
                         "Gamma_faces": flux_bar.get("Gamma_faces", None),
@@ -9145,12 +9572,90 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     },
                     context="NTXExactLijRuntimeTransportModel.state.face",
                 )
-            (face_state_bar,) = face_state_pullback(face_flux_bar)
+            )
+            (
+                face_density_bar,
+                face_temperature_bar,
+                face_er_bar,
+                dndr_faces_bar,
+                dTdr_faces_bar,
+                current_log_nu_star_bar,
+            ) = face_algebra_pullback(face_flux_bar)
+            (
+                log_density_bar,
+                log_temperature_bar,
+                log_er_bar,
+            ) = current_log_pullback(current_log_nu_star_bar)
+            face_density_bar = face_density_bar + log_density_bar
+            face_temperature_bar = face_temperature_bar + log_temperature_bar
+            face_er_bar = face_er_bar + log_er_bar
+
+            def _density_face_map(density_value):
+                density_safe = safe_density(density_value, self.density_floor)
+                density_faces = _face_profile(
+                    density_safe,
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_density,
+                    reconstruction="linear",
+                )
+                return safe_density(density_faces, self.density_floor)
+
+            def _temperature_face_map(temperature_value):
+                temperature_safe = safe_temperature(temperature_value, self.temperature_floor)
+                temperature_faces = _face_profile(
+                    temperature_safe,
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_temperature,
+                    reconstruction="linear",
+                )
+                return safe_temperature(temperature_faces, self.temperature_floor)
+
+            def _er_face_map(er_value):
+                return _face_profile(
+                    er_value,
+                    self.geometry.r_grid_half,
+                    bc_model=None,
+                    reconstruction="linear",
+                )
+
+            def _density_face_gradient_map(density_value):
+                return _face_profile_gradient(
+                    safe_density(density_value, self.density_floor),
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_density,
+                )
+
+            def _temperature_face_gradient_map(temperature_value):
+                return _face_profile_gradient(
+                    safe_temperature(temperature_value, self.temperature_floor),
+                    self.geometry.r_grid_half,
+                    bc_model=self.bc_temperature,
+                )
+
+            _, density_face_pullback = jax.vjp(_density_face_map, center_state.density)
+            _, temperature_face_pullback = jax.vjp(_temperature_face_map, center_state.temperature)
+            _, er_face_pullback = jax.vjp(_er_face_map, center_state.Er)
+            _, density_grad_pullback = jax.vjp(_density_face_gradient_map, center_state.density)
+            _, temperature_grad_pullback = jax.vjp(_temperature_face_gradient_map, center_state.temperature)
+            (density_from_face_bar,) = density_face_pullback(face_density_bar)
+            (temperature_from_face_bar,) = temperature_face_pullback(face_temperature_bar)
+            (er_from_face_bar,) = er_face_pullback(face_er_bar)
+            (density_from_grad_bar,) = density_grad_pullback(dndr_faces_bar)
+            (temperature_from_grad_bar,) = temperature_grad_pullback(dTdr_faces_bar)
+
+            density_bar_direct = density_from_face_bar + density_from_grad_bar
+            temperature_bar = temperature_from_face_bar + temperature_from_grad_bar
+            density_floor_arr = _broadcast_species_floor(jnp.asarray(state.density), self.density_floor)
+            density_active = jnp.asarray(state.density) > density_floor_arr
+            density_safe = safe_density(state.density, self.density_floor)
+            pressure_bar = temperature_bar / density_safe
+            density_bar = density_bar_direct - temperature_bar * state.pressure / (density_safe * density_safe)
+            density_bar = density_bar * density_active.astype(density_bar.dtype)
             state_bar_acc = dataclasses.replace(
                 state_bar_acc,
-                density=state_bar_acc.density + face_state_bar.density,
-                pressure=state_bar_acc.pressure + face_state_bar.pressure,
-                Er=state_bar_acc.Er + face_state_bar.Er,
+                density=state_bar_acc.density + density_bar,
+                pressure=state_bar_acc.pressure + pressure_bar,
+                Er=state_bar_acc.Er + er_from_face_bar,
             )
             if center_response is None or self._resolved_center_response_mode() == "interpolate_from_faces":
                 return state_bar_acc
