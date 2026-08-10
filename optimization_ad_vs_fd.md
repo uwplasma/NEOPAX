@@ -41,7 +41,7 @@ FD references:
 
 | Objective | Parameter | Reverse AD | FD | Abs diff | Rel diff |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `transport:softmax_Er` | `n0` | `-7.5788861196501287e+00` | `-7.5793386986675690e+00` | `4.525790e-04` | `5.971220e-05` |
+| `transport:softmax_Er` | `n0` | `-7.5788861196501287e+00` | `-7.5788280000000000e+00` | `5.811965e-05` | `7.668686e-06` |
 | `transport:softmax_Er` | `T0` | `5.5481041431530871e+00` | `5.5482120008555276e+00` | `1.078577e-04` | `1.944008e-05` |
 | `transport:softmax_Er` | `density_shape_power` | `-1.4065516873746525e-01` | `-1.4622072856222226e-01` | `5.565560e-03` | `3.806273e-02` |
 | `transport:softmax_Er` | `temperature_shape_power` | `7.0011320421952696e+00` | `7.0010103373855754e+00` | `1.217048e-04` | `1.738389e-05` |
@@ -55,28 +55,28 @@ FD references:
 | `transport:smooth_root_proxy` | `density_shape_alpha` | `-1.1970961861304089e-17` | `0.0000000000000000e+00` | `1.197096e-17` | not meaningful |
 | `transport:smooth_root_proxy` | `temperature_shape_alpha` | `3.6847635980041285e-13` | `0.0000000000000000e+00` | `3.684764e-13` | not meaningful |
 | `transport:smooth_root_proxy` | `vmec:RBC:1:0` | `-2.5108173983191352e-12` | `0.0000000000000000e+00` | `2.510817e-12` | not meaningful |
-| `transport:Er_transition_left` | `n0` | `-1.4467383415531603e+00` | `-1.4451422882330807e+00` | `1.596053e-03` | `1.104426e-03` |
+| `transport:Er_transition_left` | `n0` | `-1.4467383415531603e+00` | `-1.4467480000000000e+00` | `9.658447e-06` | `6.675970e-06` |
 | `transport:Er_transition_left` | `T0` | `1.8373054811266103e+00` | `1.8372731717199067e+00` | `3.230941e-05` | `1.758552e-05` |
 | `transport:Er_transition_left` | `density_shape_power` | `-1.2789965825941793e-02` | `-1.4053419169120691e-02` | `1.263453e-03` | `8.990363e-02` |
 | `transport:Er_transition_left` | `temperature_shape_power` | `-7.1806451200643551e+00` | `-7.1740150620058785e+00` | `6.630058e-03` | `9.241768e-04` |
 | `transport:Er_transition_left` | `density_shape_alpha` | `1.5785389591463254e-02` | `3.1093823812019159e-03` | `1.267601e-02` | `4.076696e+00` |
 | `transport:Er_transition_left` | `temperature_shape_alpha` | `1.6101823573643419e+01` | `1.6095074523529245e+01` | `6.749050e-03` | `4.193239e-04` |
 | `transport:Er_transition_left` | `vmec:RBC:1:0` | `-2.0306396145716139e+01` | `-2.0312180000000001e+01` | `5.783854e-03` | `2.847481e-04` |
-| `transport:Er_transition_right` | `n0` | `-1.6706147148780452e+00` | `-1.6704683080621412e+00` | `1.464068e-04` | `8.764417e-05` |
+| `transport:Er_transition_right` | `n0` | `-1.6706147148780452e+00` | `-1.6705960000000000e+00` | `1.871488e-05` | `1.120252e-05` |
 | `transport:Er_transition_right` | `T0` | `2.0017329575732847e+00` | `2.0114276919048364e+00` | `9.694734e-03` | `4.819827e-03` |
 | `transport:Er_transition_right` | `density_shape_power` | `-1.8191178260101894e-02` | `-8.8057857302222442e-04` | `1.731060e-02` | `1.965821e+01` |
 | `transport:Er_transition_right` | `temperature_shape_power` | `-6.2631084303152251e+00` | `-6.3494936271742599e+00` | `8.638520e-02` | `1.360505e-02` |
 | `transport:Er_transition_right` | `density_shape_alpha` | `2.3817948337074714e-02` | `1.9688862688364378e-01` | `1.730707e-01` | `8.790283e-01` |
 | `transport:Er_transition_right` | `temperature_shape_alpha` | `1.6294532234336653e+01` | `1.6294660956835592e+01` | `1.287225e-04` | `7.899673e-06` |
 | `transport:Er_transition_right` | `vmec:RBC:1:0` | `-2.2498789234739608e+01` | `-2.2498040000000000e+01` | `7.492347e-04` | `3.330222e-05` |
-| `transport:Er2_volume_average` | `n0` | `6.6923799716616873e+02` | `6.6936768886803588e+02` | `1.296917e-01` | `1.937526e-04` |
+| `transport:Er2_volume_average` | `n0` | `6.6923799716616873e+02` | `6.6924850000000000e+02` | `1.050283e-02` | `1.569347e-05` |
 | `transport:Er2_volume_average` | `T0` | `-3.6150089065989789e+02` | `-3.6161841989327218e+02` | `1.175292e-01` | `3.250090e-04` |
 | `transport:Er2_volume_average` | `density_shape_power` | `1.1723514237983892e+01` | `1.2970932535457298e+01` | `1.247418e+00` | `9.617029e-02` |
 | `transport:Er2_volume_average` | `temperature_shape_power` | `-9.9263140512588939e+02` | `-9.9282705091259993e+02` | `1.956458e-01` | `1.970593e-04` |
 | `transport:Er2_volume_average` | `density_shape_alpha` | `-2.5500745056169166e+01` | `-2.5300410489611146e+01` | `2.003346e-01` | `7.918234e-03` |
 | `transport:Er2_volume_average` | `temperature_shape_alpha` | `1.5501576948237096e+02` | `1.6728239311684473e+02` | `1.226662e+01` | `7.332884e-02` |
 | `transport:Er2_volume_average` | `vmec:RBC:1:0` | `5.4255042598612426e+03` | `5.4423260000000000e+03` | `1.682174e+01` | `3.090910e-03` |
-| `transport:Er_volume_average` | `n0` | `1.6894704215412517e+01` | `1.6889927917246521e+01` | `4.776298e-03` | `2.827897e-04` |
+| `transport:Er_volume_average` | `n0` | `1.6894704215412517e+01` | `1.6893630000000000e+01` | `1.074215e-03` | `6.358701e-05` |
 | `transport:Er_volume_average` | `T0` | `-1.0123399603364410e+01` | `-1.0112302954676650e+01` | `1.109665e-02` | `1.097341e-03` |
 | `transport:Er_volume_average` | `density_shape_power` | `1.6963617698293820e-01` | `2.0482617935080327e-01` | `3.519000e-02` | `1.718042e-01` |
 | `transport:Er_volume_average` | `temperature_shape_power` | `-2.7865259395311515e+01` | `-2.7863388379530583e+01` | `1.871016e-03` | `6.714961e-05` |
@@ -145,7 +145,7 @@ above, but has no saved transport FD file yet.
 
 | Objective | Parameter | Reverse AD | FD | Abs diff | Rel diff |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `transport:softmax_Er` | `n0` | `-7.5788861196501287e+00` | `-7.5793386986675690e+00` | `4.525790e-04` | `5.971220e-05` |
+| `transport:softmax_Er` | `n0` | `-7.5788861196501287e+00` | `-7.5788280000000000e+00` | `5.811965e-05` | `7.668686e-06` |
 | `transport:softmax_Er` | `T0` | `5.5481041431530871e+00` | `5.5482120008555276e+00` | `1.078577e-04` | `1.944008e-05` |
 | `transport:softmax_Er` | `density_shape_power` | `-1.4065516873746525e-01` | `-1.4622072856222226e-01` | `5.565560e-03` | `3.806273e-02` |
 | `transport:softmax_Er` | `temperature_shape_power` | `7.0011320421952696e+00` | `7.0010103373855754e+00` | `1.217048e-04` | `1.738389e-05` |
@@ -159,56 +159,56 @@ above, but has no saved transport FD file yet.
 | `transport:smooth_root_proxy` | `density_shape_alpha` | `-1.1970961861304089e-17` | `0.0000000000000000e+00` | `1.197096e-17` | not meaningful |
 | `transport:smooth_root_proxy` | `temperature_shape_alpha` | `3.6847635980041285e-13` | `0.0000000000000000e+00` | `3.684764e-13` | not meaningful |
 | `transport:smooth_root_proxy` | `vmec:RBC:1:0` | `-2.5108173983191352e-12` | `0.0000000000000000e+00` | `2.510817e-12` | not meaningful |
-| `transport:Er_transition_left` | `n0` | `-1.4467383415531603e+00` | `-1.4451422882330807e+00` | `1.596053e-03` | `1.104426e-03` |
+| `transport:Er_transition_left` | `n0` | `-1.4467383415531603e+00` | `-1.4467480000000000e+00` | `9.658447e-06` | `6.675970e-06` |
 | `transport:Er_transition_left` | `T0` | `1.8373054811266103e+00` | `1.8372731717199067e+00` | `3.230941e-05` | `1.758552e-05` |
 | `transport:Er_transition_left` | `density_shape_power` | `-1.2789965825941793e-02` | `-1.4053419169120691e-02` | `1.263453e-03` | `8.990363e-02` |
 | `transport:Er_transition_left` | `temperature_shape_power` | `-7.1806451200643551e+00` | `-7.1740150620058785e+00` | `6.630058e-03` | `9.241768e-04` |
 | `transport:Er_transition_left` | `density_shape_alpha` | `1.5785389591463254e-02` | `3.1093823812019159e-03` | `1.267601e-02` | `4.076696e+00` |
 | `transport:Er_transition_left` | `temperature_shape_alpha` | `1.6101823573643419e+01` | `1.6095074523529245e+01` | `6.749050e-03` | `4.193239e-04` |
 | `transport:Er_transition_left` | `vmec:RBC:1:0` | `-2.0306396145716139e+01` | `-2.0312180000000001e+01` | `5.783854e-03` | `2.847481e-04` |
-| `transport:Er_transition_right` | `n0` | `-1.6706147148780452e+00` | `-1.6704683080621412e+00` | `1.464068e-04` | `8.764417e-05` |
+| `transport:Er_transition_right` | `n0` | `-1.6706147148780452e+00` | `-1.6705960000000000e+00` | `1.871488e-05` | `1.120252e-05` |
 | `transport:Er_transition_right` | `T0` | `2.0017329575732847e+00` | `2.0114276919048364e+00` | `9.694734e-03` | `4.819827e-03` |
 | `transport:Er_transition_right` | `density_shape_power` | `-1.8191178260101894e-02` | `-8.8057857302222442e-04` | `1.731060e-02` | `1.965821e+01` |
 | `transport:Er_transition_right` | `temperature_shape_power` | `-6.2631084303152251e+00` | `-6.3494936271742599e+00` | `8.638520e-02` | `1.360505e-02` |
 | `transport:Er_transition_right` | `density_shape_alpha` | `2.3817948337074714e-02` | `1.9688862688364378e-01` | `1.730707e-01` | `8.790283e-01` |
 | `transport:Er_transition_right` | `temperature_shape_alpha` | `1.6294532234336653e+01` | `1.6294660956835592e+01` | `1.287225e-04` | `7.899673e-06` |
 | `transport:Er_transition_right` | `vmec:RBC:1:0` | `-2.2498789234739608e+01` | `-2.2498040000000000e+01` | `7.492347e-04` | `3.330222e-05` |
-| `transport:Er2_volume_average` | `n0` | `6.6923799716616873e+02` | `6.6936768886803588e+02` | `1.296917e-01` | `1.937526e-04` |
+| `transport:Er2_volume_average` | `n0` | `6.6923799716616873e+02` | `6.6924850000000000e+02` | `1.050283e-02` | `1.569347e-05` |
 | `transport:Er2_volume_average` | `T0` | `-3.6150089065989789e+02` | `-3.6161841989327218e+02` | `1.175292e-01` | `3.250090e-04` |
 | `transport:Er2_volume_average` | `density_shape_power` | `1.1723514237983892e+01` | `1.2970932535457298e+01` | `1.247418e+00` | `9.617029e-02` |
 | `transport:Er2_volume_average` | `temperature_shape_power` | `-9.9263140512588939e+02` | `-9.9282705091259993e+02` | `1.956458e-01` | `1.970593e-04` |
 | `transport:Er2_volume_average` | `density_shape_alpha` | `-2.5500745056169166e+01` | `-2.5300410489611146e+01` | `2.003346e-01` | `7.918234e-03` |
 | `transport:Er2_volume_average` | `temperature_shape_alpha` | `1.5501576948237096e+02` | `1.6728239311684473e+02` | `1.226662e+01` | `7.332884e-02` |
 | `transport:Er2_volume_average` | `vmec:RBC:1:0` | `5.4255042598612426e+03` | `5.4423260000000000e+03` | `1.682174e+01` | `3.090910e-03` |
-| `transport:Er_volume_average` | `n0` | `1.6894704215412517e+01` | `1.6889927917246521e+01` | `4.776298e-03` | `2.827897e-04` |
+| `transport:Er_volume_average` | `n0` | `1.6894704215412517e+01` | `1.6893630000000000e+01` | `1.074215e-03` | `6.358701e-05` |
 | `transport:Er_volume_average` | `T0` | `-1.0123399603364410e+01` | `-1.0112302954676650e+01` | `1.109665e-02` | `1.097341e-03` |
 | `transport:Er_volume_average` | `density_shape_power` | `1.6963617698293820e-01` | `2.0482617935080327e-01` | `3.519000e-02` | `1.718042e-01` |
 | `transport:Er_volume_average` | `temperature_shape_power` | `-2.7865259395311515e+01` | `-2.7863388379530583e+01` | `1.871016e-03` | `6.714961e-05` |
 | `transport:Er_volume_average` | `density_shape_alpha` | `-4.4400532599246079e-01` | `-4.3630139279215996e-01` | `7.703933e-03` | `1.765737e-02` |
 | `transport:Er_volume_average` | `temperature_shape_alpha` | `2.8276657155341169e+00` | `3.1741154119894572e+00` | `3.464497e-01` | `1.091484e-01` |
 | `transport:Er_volume_average` | `vmec:RBC:1:0` | `1.3669898081845315e+02` | `1.3656139999999999e+02` | `1.375808e-01` | `1.007465e-03` |
-| `transport:electron_temperature_volume_average_keV` | `n0` | `-8.6619872749393867e-04` | `-8.6623837336898967e-04` | `3.964588e-08` | `4.576786e-05` |
+| `transport:electron_temperature_volume_average_keV` | `n0` | `-8.6619872749393867e-04` | `-8.6577110000000000e-04` | `4.276275e-07` | `4.939267e-04` |
 | `transport:electron_temperature_volume_average_keV` | `T0` | `3.5611894122635163e-01` | `3.5611898182745305e-01` | `4.060110e-08` | `1.140099e-07` |
 | `transport:electron_temperature_volume_average_keV` | `density_shape_power` | `-4.3211954898123711e-05` | `-4.5459636055511510e-05` | `2.247681e-06` | `4.944345e-02` |
 | `transport:electron_temperature_volume_average_keV` | `temperature_shape_power` | `1.5250078231079183e+00` | `1.5250080035814999e+00` | `1.804736e-07` | `1.183427e-07` |
 | `transport:electron_temperature_volume_average_keV` | `density_shape_alpha` | `5.3339610943692328e-04` | `5.3341627411403658e-04` | `2.016468e-08` | `3.780289e-05` |
 | `transport:electron_temperature_volume_average_keV` | `temperature_shape_alpha` | `-3.0435342768367408e+00` | `-3.0435568569113043e+00` | `2.258007e-05` | `7.418976e-06` |
 | `transport:electron_temperature_volume_average_keV` | `vmec:RBC:1:0` | `-2.3726977964542796e-02` | `-2.3976259999999999e-02` | `2.492820e-04` | `1.039704e-02` |
-| `transport:total_pressure_volume_average` | `n0` | `8.0596720085197759e+00` | `8.0596719874266860e+00` | `2.109309e-08` | `2.617115e-09` |
+| `transport:total_pressure_volume_average` | `n0` | `8.0596720085197759e+00` | `8.0596760000000000e+00` | `3.991480e-06` | `4.952408e-07` |
 | `transport:total_pressure_volume_average` | `T0` | `1.8650270327188381e+00` | `1.8650271592592151e+00` | `1.265404e-07` | `6.784908e-08` |
 | `transport:total_pressure_volume_average` | `density_shape_power` | `2.4425502141668159e-01` | `2.4425428316969069e-01` | `7.382470e-07` | `3.022453e-06` |
 | `transport:total_pressure_volume_average` | `temperature_shape_power` | `7.7515855901247424e+00` | `7.7515860693229879e+00` | `4.791982e-07` | `6.181938e-08` |
 | `transport:total_pressure_volume_average` | `density_shape_alpha` | `-1.3265837825838147e+00` | `-1.3265836074083381e+00` | `1.751755e-07` | `1.320501e-07` |
 | `transport:total_pressure_volume_average` | `temperature_shape_alpha` | `-1.4519696704079431e+01` | `-1.4519704395847082e+01` | `7.691768e-06` | `5.297468e-07` |
 | `transport:total_pressure_volume_average` | `vmec:RBC:1:0` | `-7.6644633630893411e-02` | `-7.6944139999999994e-02` | `2.995064e-04` | `3.892517e-03` |
-| `transport:alpha_power_volume_average_mw_m3` | `n0` | `3.0339361742164600e-01` | `3.0339721932986841e-01` | `3.601908e-06` | `1.187192e-05` |
+| `transport:alpha_power_volume_average_mw_m3` | `n0` | `3.0339361742164600e-01` | `3.0339440000000000e-01` | `7.825784e-07` | `2.579409e-06` |
 | `transport:alpha_power_volume_average_mw_m3` | `T0` | `6.9385082611546092e-02` | `6.9380039198158119e-02` | `5.043413e-06` | `7.269257e-05` |
 | `transport:alpha_power_volume_average_mw_m3` | `density_shape_power` | `2.6728550609761139e-03` | `2.7169120101847946e-03` | `4.405695e-05` | `1.621582e-02` |
 | `transport:alpha_power_volume_average_mw_m3` | `temperature_shape_power` | `2.5036297131320684e-01` | `2.5035853991791279e-01` | `4.431395e-06` | `1.770020e-05` |
 | `transport:alpha_power_volume_average_mw_m3` | `density_shape_alpha` | `-8.2338695461871159e-03` | `-8.2329530230277718e-03` | `9.165232e-07` | `1.113237e-04` |
 | `transport:alpha_power_volume_average_mw_m3` | `temperature_shape_alpha` | `-4.1292076345191370e-01` | `-4.1248054398016859e-01` | `4.402195e-04` | `1.067249e-03` |
 | `transport:alpha_power_volume_average_mw_m3` | `vmec:RBC:1:0` | `1.9544849790848531e-01` | `1.9608570000000000e-01` | `6.372021e-04` | `3.249610e-03` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `n0` | `-1.0774573904620000e-03` | `-1.0760216505970404e-03` | `1.435740e-06` | `1.334304e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `n0` | `-1.0774573904620000e-03` | `-1.0791150000000000e-03` | `1.657610e-06` | `1.536082e-03` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `T0` | `2.3095562735965830e-01` | `2.3095589269598188e-01` | `2.653363e-07` | `1.148861e-06` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `density_shape_power` | `-1.3222637711917493e-02` | `-1.3221883476965957e-02` | `7.542350e-07` | `5.704444e-05` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `temperature_shape_power` | `1.5244064570671323e+00` | `1.5244087309129739e+00` | `2.273846e-06` | `1.491625e-06` |
@@ -233,13 +233,13 @@ and `RBC:1:0`. No `ZBS:1:0` transport FD reference is saved locally yet.
 | `transport:electron_temperature_volume_average_keV` | `density_shape_power` | `-4.3211954898123711e-05` | `-4.5459636055511510e-05` | `4.944345e-02` |
 | `transport:total_pressure_volume_average` | `vmec:RBC:1:0` | `-7.6644633630893411e-02` | `-7.6944139999999994e-02` | `3.892517e-03` |
 | `transport:alpha_power_volume_average_mw_m3` | `density_shape_power` | `2.6728550609761139e-03` | `2.7169120101847946e-03` | `1.621582e-02` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `n0` | `-1.0774573904620000e-03` | `-1.0760216505970404e-03` | `1.334304e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `n0` | `-1.0774573904620000e-03` | `-1.0791150000000000e-03` | `1.536082e-03` |
 
 Interpretation:
 
 - `bootstrap_current_softmax_abs_scaled` is now in good agreement with the
   saved 16-step FD references; the worst available relative difference is
-  `1.334304e-03`.
+  `1.536082e-03`.
 - `total_pressure_volume_average`, `alpha_power_volume_average_mw_m3`, and the
   main profile columns are also consistent at roughly `O(1e-2)` or better in
   the worst row, usually much better.
@@ -722,7 +722,7 @@ shared-payload AD table below.
 
 ### 16-Step Full-Transport Profile FD: `n0`
 
-Current FD run:
+Current frozen-root FD run:
 
 ```bash
 python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
@@ -732,7 +732,8 @@ python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
   --accepted-step-limit 16 \
   --radau-jacobian-reuse-mode legacy \
   --replay-mode accepted \
-  --initial-Er-root-ad jax_selected_root
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-fd-root-lane frozen_linearized
 ```
 
 Run summary:
@@ -741,28 +742,51 @@ Run summary:
 - Parameter kind: `profile`
 - Baseline value: `4.210000e+00`
 - FD step: `1.263000e-06`
-- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/n0_forward_fd_summary.json`
+- Root FD lane: `frozen_linearized`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/n0_forward_fd_frozen_linearized_summary.json`
 
-| Objective | Value | 16-step FD `d/dn0` |
+| Objective | Value | Frozen-root 16-step FD `d/dn0` |
 | --- | ---: | ---: |
-| `transport:softmax_Er` | `2.0493040599404146e+01` | `-7.5793390000000000e+00` |
+| `transport:softmax_Er` | `2.0493040599404146e+01` | `-7.5788280000000000e+00` |
 | `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
-| `transport:Er_transition_left` | `1.7729764197009018e+01` | `-1.4451420000000000e+00` |
-| `transport:Er_transition_right` | `1.8376266968588908e+01` | `-1.6704680000000001e+00` |
-| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `6.6936770000000000e+02` |
-| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `1.6889930000000000e+01` |
-| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `-8.6623840000000000e-04` |
-| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `8.0596720000000002e+00` |
-| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `3.0339720000000001e-01` |
-| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `-1.0760220000000000e-03` |
+| `transport:Er_transition_left` | `1.7729764197009018e+01` | `-1.4467480000000000e+00` |
+| `transport:Er_transition_right` | `1.8376266968588908e+01` | `-1.6705960000000000e+00` |
+| `transport:Er2_volume_average` | `2.3720952417865757e+02` | `6.6924850000000000e+02` |
+| `transport:Er_volume_average` | `-3.4526135846189607e+00` | `1.6893630000000000e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440779302155e+00` | `-8.6577110000000000e-04` |
+| `transport:total_pressure_volume_average` | `3.4213472702876274e+01` | `8.0596760000000000e+00` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810845846526e-01` | `3.0339440000000000e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485488845680283e+00` | `-1.0791150000000000e-03` |
+
+Current shared-payload reverse AD vs frozen-root FD:
+
+| Objective | Reverse AD | Frozen-root FD | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-7.5788861196501287e+00` | `-7.5788280000000000e+00` | `5.811965e-05` | `7.668686e-06` |
+| `transport:smooth_root_proxy` | `1.8468993787754641e-13` | `0.0000000000000000e+00` | `1.846899e-13` | not meaningful |
+| `transport:Er_transition_left` | `-1.4467383415531603e+00` | `-1.4467480000000000e+00` | `9.658447e-06` | `6.675970e-06` |
+| `transport:Er_transition_right` | `-1.6706147148780452e+00` | `-1.6705960000000000e+00` | `1.871488e-05` | `1.120252e-05` |
+| `transport:Er2_volume_average` | `6.6923799716616873e+02` | `6.6924850000000000e+02` | `1.050283e-02` | `1.569347e-05` |
+| `transport:Er_volume_average` | `1.6894704215412517e+01` | `1.6893630000000000e+01` | `1.074215e-03` | `6.358701e-05` |
+| `transport:electron_temperature_volume_average_keV` | `-8.6619872749393867e-04` | `-8.6577110000000000e-04` | `4.276275e-07` | `4.939267e-04` |
+| `transport:total_pressure_volume_average` | `8.0596720085197759e+00` | `8.0596760000000000e+00` | `3.991480e-06` | `4.952408e-07` |
+| `transport:alpha_power_volume_average_mw_m3` | `3.0339361742164600e-01` | `3.0339440000000000e-01` | `7.825784e-07` | `2.579409e-06` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.0774573904620000e-03` | `-1.0791150000000000e-03` | `1.657610e-06` | `1.536082e-03` |
 
 Status:
 
-- This is the fresh profile-parameter FD reference for `n0` after the recent
-  finite-volume boundary/evaluated-state updates.
-- Rerun the shared-payload reverse-AD smoke before making a current
-  profile-column AD-vs-FD comparison, because the existing reverse rows below
-  were saved before those updates.
+- This supersedes the selected-root `n0_forward_fd_summary.json` values for
+  AD-vs-FD comparison against the shared-payload reverse path.
+- The frozen-root lane matches the reverse AD selected initial-Er branch. All
+  nonzero rows are below `1.6e-03` relative error, with most rows at
+  `O(1e-05)` or better.
+- Compared with the earlier selected-root FD row, the Er/root-sensitive
+  objectives improved substantially: for example `Er_transition_left` improved
+  from `1.104426e-03` to `6.675970e-06` relative error. Two non-Er rows moved
+  slightly the other way but remain small: `electron_temperature_volume_average_keV`
+  changed from `4.576786e-05` to `4.939267e-04`, and
+  `bootstrap_current_softmax_abs_scaled` changed from `1.334304e-03` to
+  `1.536082e-03`.
 
 ### 16-Step Full-Transport Profile FD: `T0`
 
@@ -848,8 +872,68 @@ Status:
 - This is the fresh profile-parameter FD reference for
   `density_shape_power` after the recent finite-volume boundary/evaluated-state
   updates.
-- Rerun the shared-payload reverse-AD smoke before making a current
-  profile-column AD-vs-FD comparison.
+- This selected-root FD lane is branch-sensitive for the initial ambipolar
+  root and should be kept as a diagnostic, not as the final branch-compatible
+  AD comparison.
+
+Frozen-linearized initial-Er root FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter density_shape_power \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-fd-root-lane frozen_linearized
+```
+
+Frozen-root run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter kind: `profile`
+- Baseline value: `1.000000e+01`
+- FD step: `3.000000e-06`
+- Root FD lane: `frozen_linearized`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/density_shape_power_forward_fd_frozen_linearized_summary.json`
+
+| Objective | Value | Frozen-root 16-step FD `d/ddensity_shape_power` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040653150882e+01` | `-1.4061170000000000e-01` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `-2.8912060000000000e-13` |
+| `transport:Er_transition_left` | `1.7729764216611777e+01` | `-1.2781400000000000e-02` |
+| `transport:Er_transition_right` | `1.8376267082555081e+01` | `-1.8178450000000000e-02` |
+| `transport:Er2_volume_average` | `2.3720951871159608e+02` | `1.1721080000000000e+01` |
+| `transport:Er_volume_average` | `-3.4526136020634448e+00` | `1.6956640000000000e-01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440796139922e+00` | `-4.3206920000000000e-05` |
+| `transport:total_pressure_volume_average` | `3.4213472705740244e+01` | `2.4425500000000000e-01` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810831572644e-01` | `2.6727670000000000e-03` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485486870521171e+00` | `-1.3221700000000000e-02` |
+
+Current shared-payload reverse AD vs frozen-root FD:
+
+| Objective | Reverse AD | Frozen-root FD | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `-1.4065516873156680e-01` | `-1.4061170000000000e-01` | `4.346873e-05` | `3.091402e-04` |
+| `transport:smooth_root_proxy` | `6.5876403693064662e-18` | `-2.8912060000000000e-13` | `2.891272e-13` | not meaningful |
+| `transport:Er_transition_left` | `-1.2789965811649196e-02` | `-1.2781400000000000e-02` | `8.565812e-06` | `6.701779e-04` |
+| `transport:Er_transition_right` | `-1.8191168425367180e-02` | `-1.8178450000000000e-02` | `1.271843e-05` | `6.996430e-04` |
+| `transport:Er2_volume_average` | `1.1723514222734334e+01` | `1.1721080000000000e+01` | `2.434223e-03` | `2.076790e-04` |
+| `transport:Er_volume_average` | `1.6963617690233440e-01` | `1.6956640000000000e-01` | `6.977690e-05` | `4.115019e-04` |
+| `transport:electron_temperature_volume_average_keV` | `-4.3211955291746346e-05` | `-4.3206920000000000e-05` | `5.035292e-09` | `1.165390e-04` |
+| `transport:total_pressure_volume_average` | `2.4425502141708200e-01` | `2.4425500000000000e-01` | `2.141708e-08` | `8.768329e-08` |
+| `transport:alpha_power_volume_average_mw_m3` | `2.6728549616084540e-03` | `2.6727670000000000e-03` | `8.796161e-08` | `3.291032e-05` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `-1.3222637714283003e-02` | `-1.3221700000000000e-02` | `9.377143e-07` | `7.092237e-05` |
+
+Interpretation:
+
+- The previous large `density_shape_power` mismatches were caused by the FD
+  lane reselecting/changing the initial ambipolar root branch.
+- The frozen-root full-transport FD lane differentiates the same baseline
+  selected branch as the reverse AD rule and brings all nonzero rows to
+  approximately `O(1e-3)` relative error or better.
 
 ### 16-Step Full-Transport Profile FD: `density_shape_alpha`
 
@@ -977,8 +1061,65 @@ Status:
 - This is the fresh profile-parameter FD reference for
   `temperature_shape_power` after the recent finite-volume
   boundary/evaluated-state updates.
-- Rerun the shared-payload reverse-AD smoke before making a current
-  profile-column AD-vs-FD comparison.
+- This selected-root FD lane is branch-sensitive for the initial ambipolar
+  root and should be kept as a diagnostic.
+
+Frozen-linearized initial-Er root FD run:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter temperature_shape_power \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-fd-root-lane frozen_linearized
+```
+
+Frozen-root run summary:
+
+- Mode: `transport_realtime_geometry_forward_fd`
+- Parameter kind: `profile`
+- Baseline value: `2.000000e+00`
+- FD step: `6.000000e-07`
+- Root FD lane: `frozen_linearized`
+- Output JSON: `outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/temperature_shape_power_forward_fd_frozen_linearized_summary.json`
+
+| Objective | Value | Frozen-root 16-step FD `d/dtemperature_shape_power` |
+| --- | ---: | ---: |
+| `transport:softmax_Er` | `2.0493040653150882e+01` | `7.0011720000000004e+00` |
+| `transport:smooth_root_proxy` | `9.8039215686309099e-03` | `0.0000000000000000e+00` |
+| `transport:Er_transition_left` | `1.7729764216611777e+01` | `-7.1805420000000002e+00` |
+| `transport:Er_transition_right` | `1.8376267082555081e+01` | `-6.2632549999999998e+00` |
+| `transport:Er2_volume_average` | `2.3720951871159608e+02` | `-9.9263349999999991e+02` |
+| `transport:Er_volume_average` | `-3.4526136020634448e+00` | `-2.7865130000000001e+01` |
+| `transport:electron_temperature_volume_average_keV` | `6.5646440796139922e+00` | `1.5250040000000000e+00` |
+| `transport:total_pressure_volume_average` | `3.4213472705740244e+01` | `7.7515490000000000e+00` |
+| `transport:alpha_power_volume_average_mw_m3` | `5.8935810831572644e-01` | `2.5035980000000000e-01` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.4485486870521171e+00` | `1.5244080000000000e+00` |
+
+Current shared-payload reverse AD vs frozen-root FD:
+
+| Objective | Reverse AD | Frozen-root FD | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `7.0011320415517044e+00` | `7.0011720000000004e+00` | `3.995845e-05` | `5.707394e-06` |
+| `transport:smooth_root_proxy` | `-1.3072700012652828e-12` | `0.0000000000000000e+00` | `1.307270e-12` | not meaningful |
+| `transport:Er_transition_left` | `-7.1806451216258500e+00` | `-7.1805420000000002e+00` | `1.031216e-04` | `1.436126e-05` |
+| `transport:Er_transition_right` | `-6.2631095050085079e+00` | `-6.2632549999999998e+00` | `1.454950e-04` | `2.322993e-05` |
+| `transport:Er2_volume_average` | `-9.9263140345944248e+02` | `-9.9263349999999991e+02` | `2.096541e-03` | `2.112099e-06` |
+| `transport:Er_volume_average` | `-2.7865259386504583e+01` | `-2.7865130000000001e+01` | `1.293865e-04` | `4.643312e-06` |
+| `transport:electron_temperature_volume_average_keV` | `1.5250078231509216e+00` | `1.5250040000000000e+00` | `3.823151e-06` | `2.506978e-06` |
+| `transport:total_pressure_volume_average` | `7.7515855900810005e+00` | `7.7515490000000000e+00` | `3.659008e-05` | `4.720357e-06` |
+| `transport:alpha_power_volume_average_mw_m3` | `2.5036298217189984e-01` | `2.5035980000000000e-01` | `3.182172e-06` | `1.271039e-05` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `1.5244064573255467e+00` | `1.5244080000000000e+00` | `1.542674e-06` | `1.011983e-06` |
+
+Interpretation:
+
+- The frozen-root full-transport FD lane agrees very tightly with the current
+  shared-payload reverse AD for `temperature_shape_power`; all nonzero rows are
+  below `2.4e-05` relative error.
 
 ## Full Transport: Mixed Shared-Payload AD Update
 
