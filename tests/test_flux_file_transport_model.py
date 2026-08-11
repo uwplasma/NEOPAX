@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 
 import h5py
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -12,6 +13,7 @@ from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     FluxesRFileTransportModel,
     PowerAnalyticalTurbulentTransportModel,
+    SpectraXTurbulenceFDLaggedResponse,
     ReLUAnalyticalTurbulentTransportModel,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
@@ -221,6 +223,83 @@ def test_fluxes_r_file_invalid_profile_location_raises():
     )
     with pytest.raises(ValueError):
         model._normalize_profile_location()
+
+
+class DummyFDSpecies:
+    number_species = 2
+    names = ("e", "i")
+
+
+class DummyFDGeometry:
+    def __init__(self):
+        self.r_grid_half = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        self.r_grid = jnp.array([0.125, 0.375, 0.625, 0.875])
+        self.dr = 0.25
+        self.a_b = 0.5
+
+
+def _write_fd_flux_file(path: Path, r):
+    n_r = len(r)
+    gamma = 1.0 + jnp.arange(2 * n_r, dtype=float).reshape(2, n_r)
+    q = 10.0 * gamma
+    with h5py.File(path, "w") as f:
+        f["r"] = jnp.asarray(r)
+        f["Gamma"] = gamma
+        f["Q"] = q
+        f["Upar"] = jnp.zeros_like(gamma)
+        # One perturbation channel: (n_perturb, n_species, n_radius).
+        f["Gamma_perturb"] = (1.05 * gamma)[None, :, :]
+        f["Q_perturb"] = (1.05 * q)[None, :, :]
+        f["perturb_delta"] = 0.05 * jnp.ones((1, n_r))
+        f["perturb_present"] = jnp.ones((1, n_r), dtype=bool)
+        f["perturb_kind"] = ["temperature_gradient"]
+        f["perturb_species"] = ["i"]
+
+
+def _fd_state(n_r):
+    profile = jnp.linspace(2.0, 1.0, n_r)
+    density = jnp.stack([profile, profile])
+    temperature = jnp.stack([3.0 * profile, 2.0 * profile])
+    return TransportState(density=density, pressure=density * temperature, Er=jnp.zeros(n_r))
+
+
+def test_fd_lagged_response_rejects_a_flux_file_off_the_geometry_grid(tmp_path):
+    path = tmp_path / "fd_mismatched_fluxes.h5"
+    _write_fd_flux_file(path, r=[0.1, 0.3, 0.6, 0.9])
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="match NEOPAX geometry"):
+            build_fluxes_r_file_transport_model(
+                DummyFDSpecies(),
+                DummyFDGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+                lagged_response_mode="fd",
+            )
+
+
+def test_fd_lagged_response_builds_under_jit(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            fluxes_file=path,
+            grid_location="cell_centered",
+            lagged_response_mode="fd",
+        )
+    state = _fd_state(geometry.r_grid.shape[0])
+
+    eager = model.build_lagged_response(state)
+    jitted = jax.jit(model.build_lagged_response)(state)
+
+    assert isinstance(jitted, SpectraXTurbulenceFDLaggedResponse)
+    assert jnp.allclose(jitted.reference_flux["Q"], eager.reference_flux["Q"])
+    assert jnp.allclose(jitted.reference_basis, eager.reference_basis)
+    assert jnp.allclose(jitted.q_perturb, eager.q_perturb)
 
 
 def test_analytical_turbulent_transport_model_with_transport_coeffs_updates_coefficients():

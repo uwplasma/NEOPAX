@@ -846,7 +846,7 @@ def prepare_transport_solver_components(
         state,
         len(equations_to_evolve),
     )
-    shared_flux_model = runtime.models.flux if len(equations_to_evolve) > 1 else None
+    shared_flux_model = runtime.models.flux if len(equations_to_evolve) >= 1 else None
     temperature_active_mask = jnp.asarray(
         config.get("equations", {}).get(
             "toggle_temperature",

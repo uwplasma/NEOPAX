@@ -10440,6 +10440,16 @@ def read_flux_profile_fd_response_file(path, n_species, species_names):
     )
 
 
+def _require_matching_fd_grid(file_r, target_r):
+    file_r = jnp.asarray(file_r, dtype=jnp.float64)
+    target_r = jnp.asarray(target_r, dtype=jnp.float64)
+    if file_r.shape != target_r.shape or not bool(jnp.allclose(file_r, target_r, rtol=0.0, atol=1.0e-12)):
+        raise ValueError(
+            "fluxes_r_file lagged_response_mode='fd' currently requires the file radial grid "
+            "to match NEOPAX geometry.r_grid exactly."
+        )
+
+
 def _flux_profile_debug_summary(name, arr):
     if arr is None:
         return f"{name}=missing"
@@ -10540,6 +10550,7 @@ def build_fluxes_r_file_transport_model(
             perturb_kind_codes,
             perturb_species_indices,
         ) = read_flux_profile_fd_response_file(path, species.number_species, species.names)
+        _require_matching_fd_grid(r_data, geometry.r_grid)
     r_finite = jnp.isfinite(r_data)
     r_nfinite = int(jnp.sum(r_finite))
     if r_nfinite > 0:
@@ -10653,15 +10664,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             return None
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
-    def _require_matching_fd_grid(self):
-        file_r = jnp.asarray(self.r_data, dtype=jnp.float64)
-        target_r = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64)
-        if file_r.shape != target_r.shape or not bool(jnp.allclose(file_r, target_r, rtol=0.0, atol=1.0e-12)):
-            raise ValueError(
-                "fluxes_r_file lagged_response_mode='fd' currently requires the file radial grid "
-                "to match NEOPAX geometry.r_grid exactly."
-            )
-
     def _spectrax_fd_basis(self, state):
         density = safe_density(state.density)
         temperature = safe_temperature(state.temperature, 1.0e-12)
@@ -10735,7 +10737,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
             )
-        self._require_matching_fd_grid()
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 
 import NEOPAX._orchestrator as main_module
+import NEOPAX._transport_equations as transport_equations_module
 import NEOPAX._transport_flux_models as flux_models_module
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._state import TransportState
@@ -262,6 +263,98 @@ def test_pack_and_unpack_transport_state_arrays_restore_electron_row():
     assert unpacked.density.shape == state.density.shape
     assert jnp.allclose(unpacked.density[1:], state.density[1:])
     assert jnp.allclose(unpacked.density[0], state.density[1] + state.density[2])
+
+
+LAGGED_HEAT_FLUX = 7.0
+
+
+class _SingleTemperatureEquation:
+    name = "temperature"
+
+    def __init__(self, flux_model=None):
+        self.flux_model = flux_model
+
+    def __call__(self, working_state, fluxes=None):
+        if fluxes is None:
+            fluxes = self.flux_model(working_state)
+        return fluxes["Q"]
+
+
+class _LaggedFluxModel:
+    """Flux model whose lagged response returns a heat flux the direct call never produces."""
+
+    def __call__(self, state):
+        return {
+            "Gamma": jnp.zeros_like(state.density),
+            "Q": jnp.zeros_like(state.pressure),
+            "Upar": jnp.zeros_like(state.density),
+        }
+
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        return {"reference_pressure": state.pressure}
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del lagged_response, kwargs
+        return {
+            "Gamma": jnp.zeros_like(state.density),
+            "Q": jnp.full_like(state.pressure, LAGGED_HEAT_FLUX),
+            "Upar": jnp.zeros_like(state.density),
+        }
+
+
+def test_single_equation_solve_applies_the_lagged_flux_response(monkeypatch):
+    state = _dummy_state()
+    flux_model = _LaggedFluxModel()
+    runtime = main_module.RuntimeContext(
+        species=_dummy_species(),
+        energy_grid=None,
+        geometry=SimpleNamespace(dr=0.25),
+        database=None,
+        solver_parameters={"t0": 0.0, "t_final": 1.0, "dt": 0.1, "rtol": 1.0e-6, "atol": 1.0e-8},
+        models=main_module.Models(flux=flux_model, source={}),
+    )
+    monkeypatch.setattr(
+        transport_equations_module,
+        "build_equation_system",
+        lambda **kwargs: [_SingleTemperatureEquation(flux_model)],
+    )
+
+    prepared = main_module.prepare_transport_solver_components({}, runtime, state)
+    equation_system = prepared["equation_system"]
+
+    assert len(prepared["equations_to_evolve"]) == 1
+    assert equation_system.shared_flux_model is flux_model
+
+    # The solver drives exactly this pair via _lagged_response_hooks.
+    lagged = equation_system.build_lagged_response(state)
+    assert lagged.flux_response is not None
+
+    rhs = equation_system.evaluate_with_lagged_response(0.0, state, None, lagged)
+    assert jnp.allclose(rhs.pressure, LAGGED_HEAT_FLUX)
+
+
+def test_with_geometry_payload_keeps_the_shared_flux_model_for_one_equation(monkeypatch):
+    flux_model = object()
+    equation_system = ComposedEquationSystem(
+        equations=(_SingleTemperatureEquation(),),
+        temperature_equation=_SingleTemperatureEquation(),
+        species=_dummy_species(),
+        shared_flux_model=flux_model,
+        config={},
+        solver_cfg={},
+        boundary_models={},
+    )
+    monkeypatch.setattr(
+        transport_equations_module,
+        "build_equation_system",
+        lambda **kwargs: [_SingleTemperatureEquation()],
+    )
+
+    rebuilt = equation_system.with_geometry_payload(SimpleNamespace(dr=0.25))
+
+    assert len(rebuilt.equations) == 1
+    assert rebuilt.shared_flux_model is flux_model
 
 
 def test_project_state_to_quasi_neutrality_and_fixed_temperature_projection():
