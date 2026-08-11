@@ -4207,8 +4207,19 @@ def _run_local_stage_matvec_diagnostic_report(
         "diff_l2": float(diagnostic["diff_l2"]),
         "rel_err": float(diagnostic["rel_err"]),
         "max_abs_diff": float(diagnostic["max_abs_diff"]),
+        "generic_diff_l2": float(diagnostic["generic_diff_l2"]),
+        "generic_rel_err": float(diagnostic["generic_rel_err"]),
+        "generic_max_abs_diff": float(diagnostic["generic_max_abs_diff"]),
+        "radial_state_dim": int(diagnostic["radial_state_dim"]),
+        "radial_density_size": int(diagnostic["radial_density_size"]),
+        "radial_pressure_size": int(diagnostic["radial_pressure_size"]),
+        "radial_er_size": int(diagnostic["radial_er_size"]),
+        "radial_active_er_size": int(diagnostic["radial_active_er_size"]),
+        "radial_extra_size": int(diagnostic["radial_extra_size"]),
         "radial_block_count": int(diagnostic["radial_block_count"]),
         "radial_block_dim": int(diagnostic["radial_block_dim"]),
+        "radial_variables_per_cell": int(diagnostic["radial_variables_per_cell"]),
+        "radial_extra_per_cell_count": int(diagnostic["radial_extra_per_cell_count"]),
         "radial_off_tridiagonal_l2": float(diagnostic["radial_off_tridiagonal_l2"]),
         "radial_off_tridiagonal_rel_l2": float(diagnostic["radial_off_tridiagonal_rel_l2"]),
         "radial_off_tridiagonal_max_abs": float(diagnostic["radial_off_tridiagonal_max_abs"]),
@@ -4232,9 +4243,24 @@ def _run_local_stage_matvec_diagnostic_report(
         flush=True,
     )
     print(
+        "[autodiff-gate] local stage generic-vjp diagnostic values: "
+        f"generic_diff_l2={report['generic_diff_l2']:.6e} "
+        f"generic_rel_err={report['generic_rel_err']:.6e} "
+        f"generic_max_abs_diff={report['generic_max_abs_diff']:.6e}",
+        flush=True,
+    )
+    print(
         "[autodiff-gate] local stage radial-block diagnostic values: "
+        f"state_dim={report['radial_state_dim']} "
+        f"density_size={report['radial_density_size']} "
+        f"pressure_size={report['radial_pressure_size']} "
+        f"er_size={report['radial_er_size']} "
+        f"active_er_size={report['radial_active_er_size']} "
+        f"extra_size={report['radial_extra_size']} "
         f"block_count={report['radial_block_count']} "
         f"block_dim={report['radial_block_dim']} "
+        f"variables_per_cell={report['radial_variables_per_cell']} "
+        f"extra_per_cell={report['radial_extra_per_cell_count']} "
         f"off_tridiagonal_l2={report['radial_off_tridiagonal_l2']:.6e} "
         f"off_tridiagonal_rel_l2={report['radial_off_tridiagonal_rel_l2']:.6e} "
         f"off_tridiagonal_max_abs={report['radial_off_tridiagonal_max_abs']:.6e}",

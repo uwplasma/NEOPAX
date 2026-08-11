@@ -7711,6 +7711,7 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         primal_result,
         lagged_response,
     )
+    stage_times, stage_states = _radau_exact_stage_times_states(kernel_context, carry_in, primal_result)
     compact = _radau_exact_stage_residual_transpose_matvec(
         kernel_context,
         physics_context,
@@ -7718,12 +7719,47 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         primal_result,
         lagged_response,
         vector_arr,
+        stage_times=stage_times,
+        stage_states=stage_states,
     )
+    lambda_stages = vector_arr.reshape((kernel_context.num_stages, kernel_context.state_dim))
+
+    def _generic_stage_rhs_vjp(t_eval, y_eval, lambda_eval):
+        def _rhs_at_stage(y_value):
+            return _radau_eval_rhs(
+                t_eval,
+                y_value,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        _, rhs_pullback = jax.vjp(_rhs_at_stage, y_eval)
+        (jt_lambda,) = rhs_pullback(lambda_eval)
+        return jt_lambda
+
+    generic_jt_lambda_stages = jax.vmap(_generic_stage_rhs_vjp, in_axes=(0, 0, 0))(
+        stage_times,
+        stage_states,
+        lambda_stages,
+    )
+    generic_coupled = kernel_context.a.T @ generic_jt_lambda_stages
+    generic_compact = (
+        lambda_stages - primal_result.trial_dt * generic_coupled
+    ).reshape((-1,))
     dense = matrix.T @ vector_arr
     diff = compact - dense
+    generic_diff = generic_compact - dense
     diff_l2 = jnp.sqrt(jnp.maximum(jnp.vdot(diff, diff), jnp.asarray(0.0, dtype=kernel_context.dtype)))
+    generic_diff_l2 = jnp.sqrt(
+        jnp.maximum(jnp.vdot(generic_diff, generic_diff), jnp.asarray(0.0, dtype=kernel_context.dtype))
+    )
     dense_l2 = jnp.sqrt(jnp.maximum(jnp.vdot(dense, dense), jnp.asarray(0.0, dtype=kernel_context.dtype)))
     rel_err = diff_l2 / jnp.maximum(
+        dense_l2,
+        jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+    )
+    generic_rel_err = generic_diff_l2 / jnp.maximum(
         dense_l2,
         jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
     )
@@ -7768,6 +7804,9 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "diff_l2": diff_l2,
         "rel_err": rel_err,
         "max_abs_diff": jnp.max(jnp.abs(diff)),
+        "generic_diff_l2": generic_diff_l2,
+        "generic_rel_err": generic_rel_err,
+        "generic_max_abs_diff": jnp.max(jnp.abs(generic_diff)),
         "radial_state_dim": jnp.asarray(int(kernel_context.state_dim), dtype=jnp.int32),
         "radial_density_size": jnp.asarray(int(kernel_context.density_size), dtype=jnp.int32),
         "radial_pressure_size": jnp.asarray(int(kernel_context.pressure_size), dtype=jnp.int32),
@@ -7915,7 +7954,7 @@ def _radau_infer_radial_block_layout(kernel_context: _RadauAcceptedStepKernelCon
     radial_component_sizes = [size for size in (density_size, pressure_size, er_size) if size > 0]
     if not radial_component_sizes:
         raise ValueError("Cannot infer radial block layout for an empty Radau state.")
-    n_radial = er_size if er_size > 0 else radial_component_sizes[0]
+    n_radial = context_er_size if context_er_size > 0 else radial_component_sizes[0]
     for size in radial_component_sizes:
         n_radial = math.gcd(int(n_radial), int(size))
     if n_radial <= 0:
