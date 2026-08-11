@@ -1,0 +1,17 @@
+run,component,seconds,minutes
+bicgstab reference,runtime build,302.582000,5.043033
+bicgstab reference,solver components,120.784000,2.013067
+bicgstab reference,optimization smoke / setup,171.402000,2.856700
+bicgstab reference,realized schedule forward,729.535000,12.158917
+bicgstab reference,reverse segment sweep,4374.090000,72.901500
+bicgstab reference,initial-Er root pullback,162.307000,2.705117
+bicgstab reference,geometry final pullback,21.938000,0.365633
+bicgstab reference,other / Python overhead,1767.182000,29.453033
+structured check,runtime build,305.548000,5.092467
+structured check,solver components,121.299000,2.021650
+structured check,optimization smoke / setup,171.076000,2.851267
+structured check,realized schedule forward,731.214000,12.186900
+structured check,reverse segment sweep,4054.994000,67.583233
+structured check,initial-Er root pullback,162.971000,2.716183
+structured check,geometry final pullback,21.938000,0.365633
+structured check,other / Python overhead,1751.429000,29.190483
