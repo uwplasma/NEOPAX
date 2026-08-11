@@ -812,6 +812,52 @@ def _fill_saved_slots(
     )
 
 
+def _fill_realized_final_slot(
+    save_idx,
+    t0,
+    final_t,
+    flat_y,
+    accepted,
+    failed,
+    fail_code,
+    ys,
+    ts,
+    dts,
+    accs,
+    fails,
+    codes,
+):
+    save_n = ts.shape[0]
+
+    def _fill(args):
+        save_i, ys_l, ts_l, dts_l, accs_l, fails_l, codes_l = args
+        prev_i = jnp.maximum(save_i - 1, jnp.asarray(0, dtype=save_i.dtype))
+        prev_t = jnp.where(save_i > 0, ts_l[prev_i], jnp.asarray(t0, dtype=ts_l.dtype))
+        ys_l = ys_l.at[save_i].set(flat_y)
+        ts_l = ts_l.at[save_i].set(final_t)
+        dts_l = dts_l.at[save_i].set(final_t - prev_t)
+        accs_l = accs_l.at[save_i].set(accepted)
+        fails_l = fails_l.at[save_i].set(failed)
+        codes_l = codes_l.at[save_i].set(fail_code)
+        return save_i + 1, ys_l, ts_l, dts_l, accs_l, fails_l, codes_l
+
+    def _skip(args):
+        return args
+
+    last_i = jnp.maximum(save_idx - 1, jnp.asarray(0, dtype=save_idx.dtype))
+    last_saved_t = ts[last_i]
+    should_fill = jnp.logical_and(
+        save_idx < save_n,
+        final_t > (last_saved_t + jnp.asarray(1.0e-15, dtype=ts.dtype)),
+    )
+    return jax.lax.cond(
+        should_fill,
+        _fill,
+        _skip,
+        (save_idx, ys, ts, dts, accs, fails, codes),
+    )
+
+
 def _flat_rhs_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
 
@@ -1310,7 +1356,82 @@ def _run_saved_loop(
         last_attempt_lagged_reused0,
         last_attempt_jacobian_reused0,
     )
-    return jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+    loop_result = jax.lax.while_loop(cond_fun, body_fun, loop_carry)
+    (
+        final_step_state,
+        step_idx,
+        save_idx,
+        ys_saved,
+        ts_saved,
+        dts_saved,
+        accepted_mask_saved,
+        failed_mask_saved,
+        fail_codes_saved,
+        last_attempt_accepted,
+        last_attempt_converged,
+        last_attempt_err_norm,
+        last_attempt_fail_code,
+        last_attempt_diverged,
+        last_attempt_nonfinite_stage_state,
+        last_attempt_nonfinite_stage_residual,
+        last_attempt_finite_f0,
+        last_attempt_finite_z0,
+        last_attempt_finite_initial_residual,
+        last_attempt_newton_iter_count,
+        last_attempt_final_residual_norm,
+        last_attempt_final_delta_norm,
+        last_attempt_theta_final,
+        last_attempt_slow_contraction,
+        last_attempt_residual_blowup,
+        last_attempt_newton_nonfinite,
+        last_attempt_lagged_reused,
+        last_attempt_jacobian_reused,
+    ) = loop_result
+    save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_realized_final_slot(
+        save_idx,
+        t0,
+        final_step_state.t,
+        final_step_state.y,
+        last_attempt_accepted,
+        final_step_state.status[0] != 0,
+        final_step_state.status[1],
+        ys_saved,
+        ts_saved,
+        dts_saved,
+        accepted_mask_saved,
+        failed_mask_saved,
+        fail_codes_saved,
+    )
+    return (
+        final_step_state,
+        step_idx,
+        save_idx,
+        ys_saved,
+        ts_saved,
+        dts_saved,
+        accepted_mask_saved,
+        failed_mask_saved,
+        fail_codes_saved,
+        last_attempt_accepted,
+        last_attempt_converged,
+        last_attempt_err_norm,
+        last_attempt_fail_code,
+        last_attempt_diverged,
+        last_attempt_nonfinite_stage_state,
+        last_attempt_nonfinite_stage_residual,
+        last_attempt_finite_f0,
+        last_attempt_finite_z0,
+        last_attempt_finite_initial_residual,
+        last_attempt_newton_iter_count,
+        last_attempt_final_residual_norm,
+        last_attempt_final_delta_norm,
+        last_attempt_theta_final,
+        last_attempt_slow_contraction,
+        last_attempt_residual_blowup,
+        last_attempt_newton_nonfinite,
+        last_attempt_lagged_reused,
+        last_attempt_jacobian_reused,
+    )
 
 
 def _run_saved_loop_debug_walltime(
@@ -1416,6 +1537,22 @@ def _run_saved_loop_debug_walltime(
         last_attempt_jacobian_reused = jnp.asarray(False if getattr(step_info, "jacobian_reused", None) is None else getattr(step_info, "jacobian_reused"))
 
         step_idx += 1
+
+    save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_realized_final_slot(
+        save_idx,
+        t0,
+        step_state.t,
+        step_state.y,
+        last_attempt_accepted,
+        step_state.status[0] != 0,
+        step_state.status[1],
+        ys_saved,
+        ts_saved,
+        dts_saved,
+        accepted_mask_saved,
+        failed_mask_saved,
+        fail_codes_saved,
+    )
 
     return (
         step_state,
