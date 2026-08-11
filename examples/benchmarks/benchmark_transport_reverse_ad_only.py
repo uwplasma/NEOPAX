@@ -4229,6 +4229,10 @@ def _run_local_stage_matvec_diagnostic_report(
         "compact_flux_vs_generic_flux_pressure_diff_l2": float(
             diagnostic["compact_flux_vs_generic_flux_pressure_diff_l2"]
         ),
+        "compact_direct_vs_generic_direct_diff_l2": float(diagnostic["compact_direct_vs_generic_direct_diff_l2"]),
+        "compact_direct_vs_generic_direct_pressure_diff_l2": float(
+            diagnostic["compact_direct_vs_generic_direct_pressure_diff_l2"]
+        ),
         "explicit_rhs_state_density_diff_l2": float(diagnostic["explicit_rhs_state_density_diff_l2"]),
         "explicit_rhs_state_pressure_diff_l2": float(diagnostic["explicit_rhs_state_pressure_diff_l2"]),
         "explicit_rhs_state_er_tail_diff_l2": float(diagnostic["explicit_rhs_state_er_tail_diff_l2"]),
@@ -4291,7 +4295,10 @@ def _run_local_stage_matvec_diagnostic_report(
         f"direct_pressure_l2={report['direct_vs_generic_pressure_diff_l2']:.6e} "
         f"compact_flux_vs_generic_flux_l2={report['compact_flux_vs_generic_flux_diff_l2']:.6e} "
         f"compact_flux_vs_generic_flux_pressure_l2="
-        f"{report['compact_flux_vs_generic_flux_pressure_diff_l2']:.6e}",
+        f"{report['compact_flux_vs_generic_flux_pressure_diff_l2']:.6e} "
+        f"compact_direct_vs_generic_direct_l2={report['compact_direct_vs_generic_direct_diff_l2']:.6e} "
+        f"compact_direct_vs_generic_direct_pressure_l2="
+        f"{report['compact_direct_vs_generic_direct_pressure_diff_l2']:.6e}",
         flush=True,
     )
     print(

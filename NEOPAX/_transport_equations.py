@@ -2326,6 +2326,31 @@ class ComposedEquationSystem:
         )
         return self._prepare_working_state_pullback(state, direct_working_state_bar)
 
+    def pullback_evaluate_with_lagged_response_state_direct_generic(self, t, state, runtime, lagged_response, rhs_bar):
+        """Diagnostic generic VJP for fixed-shared-flux RHS state dependence."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+
+        def _rhs_from_working_state(working_state_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                shared_fluxes,
+            )
+
+        _, direct_pullback = jax.vjp(_rhs_from_working_state, working_state)
+        (direct_working_state_bar,) = direct_pullback(rhs_bar)
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
     def pullback_evaluate_with_lagged_response_state_flux(self, t, state, runtime, lagged_response, rhs_bar):
         """State pullback through the shared-flux model, with equation assembly transposed separately."""
         del t, runtime
