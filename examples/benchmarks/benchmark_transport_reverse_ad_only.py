@@ -4210,6 +4210,15 @@ def _run_local_stage_matvec_diagnostic_report(
         "generic_diff_l2": float(diagnostic["generic_diff_l2"]),
         "generic_rel_err": float(diagnostic["generic_rel_err"]),
         "generic_max_abs_diff": float(diagnostic["generic_max_abs_diff"]),
+        "explicit_rhs_state_diff_l2": float(diagnostic["explicit_rhs_state_diff_l2"]),
+        "explicit_rhs_state_rel_err": float(diagnostic["explicit_rhs_state_rel_err"]),
+        "explicit_rhs_state_max_abs_diff": float(diagnostic["explicit_rhs_state_max_abs_diff"]),
+        "split_rhs_state_diff_l2": float(diagnostic["split_rhs_state_diff_l2"]),
+        "split_rhs_state_rel_err": float(diagnostic["split_rhs_state_rel_err"]),
+        "split_rhs_state_max_abs_diff": float(diagnostic["split_rhs_state_max_abs_diff"]),
+        "explicit_rhs_state_density_diff_l2": float(diagnostic["explicit_rhs_state_density_diff_l2"]),
+        "explicit_rhs_state_pressure_diff_l2": float(diagnostic["explicit_rhs_state_pressure_diff_l2"]),
+        "explicit_rhs_state_er_tail_diff_l2": float(diagnostic["explicit_rhs_state_er_tail_diff_l2"]),
         "radial_state_dim": int(diagnostic["radial_state_dim"]),
         "radial_density_size": int(diagnostic["radial_density_size"]),
         "radial_pressure_size": int(diagnostic["radial_pressure_size"]),
@@ -4247,6 +4256,23 @@ def _run_local_stage_matvec_diagnostic_report(
         f"generic_diff_l2={report['generic_diff_l2']:.6e} "
         f"generic_rel_err={report['generic_rel_err']:.6e} "
         f"generic_max_abs_diff={report['generic_max_abs_diff']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage explicit-rhs-state diagnostic values: "
+        f"explicit_diff_l2={report['explicit_rhs_state_diff_l2']:.6e} "
+        f"explicit_rel_err={report['explicit_rhs_state_rel_err']:.6e} "
+        f"explicit_max_abs_diff={report['explicit_rhs_state_max_abs_diff']:.6e} "
+        f"split_diff_l2={report['split_rhs_state_diff_l2']:.6e} "
+        f"split_rel_err={report['split_rhs_state_rel_err']:.6e} "
+        f"split_max_abs_diff={report['split_rhs_state_max_abs_diff']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage explicit-rhs-state component errors: "
+        f"density_l2={report['explicit_rhs_state_density_diff_l2']:.6e} "
+        f"pressure_l2={report['explicit_rhs_state_pressure_diff_l2']:.6e} "
+        f"er_tail_l2={report['explicit_rhs_state_er_tail_diff_l2']:.6e}",
         flush=True,
     )
     print(

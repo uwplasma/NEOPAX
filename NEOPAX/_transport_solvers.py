@@ -7747,6 +7747,109 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     generic_compact = (
         lambda_stages - primal_result.trial_dt * generic_coupled
     ).reshape((-1,))
+    explicit_jt_lambda_stages = None
+    if physics_context.flat_rhs_state_pullback is not None:
+        explicit_jt_lambda_stages = jax.vmap(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            ),
+            in_axes=(0, 0, 0),
+        )(
+            stage_times,
+            stage_states,
+            lambda_stages,
+        )
+    direct_jt_lambda_stages = None
+    if physics_context.flat_rhs_direct_state_pullback is not None:
+        direct_jt_lambda_stages = jax.vmap(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_direct_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            ),
+            in_axes=(0, 0, 0),
+        )(
+            stage_times,
+            stage_states,
+            lambda_stages,
+        )
+    flux_jt_lambda_stages = None
+    if physics_context.flat_rhs_flux_state_pullback is not None:
+        flux_jt_lambda_stages = jax.vmap(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_flux_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            ),
+            in_axes=(0, 0, 0),
+        )(
+            stage_times,
+            stage_states,
+            lambda_stages,
+        )
+
+    def _tree_l2(value):
+        value_arr = jnp.asarray(value, dtype=kernel_context.dtype).reshape((-1,))
+        return jnp.sqrt(jnp.maximum(jnp.vdot(value_arr, value_arr), jnp.asarray(0.0, dtype=kernel_context.dtype)))
+
+    def _tree_max_abs(value):
+        value_arr = jnp.asarray(value, dtype=kernel_context.dtype).reshape((-1,))
+        return jnp.max(jnp.abs(value_arr))
+
+    diagnostic_nan = jnp.asarray(jnp.nan, dtype=kernel_context.dtype)
+    explicit_rhs_state_diff = (
+        explicit_jt_lambda_stages - generic_jt_lambda_stages
+        if explicit_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
+    explicit_rhs_state_diff_l2 = (
+        _tree_l2(explicit_rhs_state_diff)
+        if explicit_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    explicit_rhs_state_rel_err = explicit_rhs_state_diff_l2 / jnp.maximum(
+        _tree_l2(generic_jt_lambda_stages),
+        jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+    )
+    split_sum_jt_lambda_stages = None
+    if direct_jt_lambda_stages is not None and flux_jt_lambda_stages is not None:
+        split_sum_jt_lambda_stages = direct_jt_lambda_stages + flux_jt_lambda_stages
+    split_rhs_state_diff = (
+        split_sum_jt_lambda_stages - generic_jt_lambda_stages
+        if split_sum_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
+    split_rhs_state_diff_l2 = (
+        _tree_l2(split_rhs_state_diff)
+        if split_sum_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    split_rhs_state_rel_err = split_rhs_state_diff_l2 / jnp.maximum(
+        _tree_l2(generic_jt_lambda_stages),
+        jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+    )
+    density_end = int(kernel_context.density_size)
+    pressure_end = density_end + int(kernel_context.pressure_size)
+    explicit_density_diff_l2 = (
+        _tree_l2(explicit_rhs_state_diff[:, :density_end])
+        if explicit_jt_lambda_stages is not None and density_end > 0
+        else diagnostic_nan
+    )
+    explicit_pressure_diff_l2 = (
+        _tree_l2(explicit_rhs_state_diff[:, density_end:pressure_end])
+        if explicit_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    explicit_er_diff_l2 = (
+        _tree_l2(explicit_rhs_state_diff[:, pressure_end:])
+        if explicit_jt_lambda_stages is not None and pressure_end < int(kernel_context.state_dim)
+        else diagnostic_nan
+    )
     dense = matrix.T @ vector_arr
     diff = compact - dense
     generic_diff = generic_compact - dense
@@ -7807,6 +7910,23 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "generic_diff_l2": generic_diff_l2,
         "generic_rel_err": generic_rel_err,
         "generic_max_abs_diff": jnp.max(jnp.abs(generic_diff)),
+        "explicit_rhs_state_diff_l2": explicit_rhs_state_diff_l2,
+        "explicit_rhs_state_rel_err": explicit_rhs_state_rel_err,
+        "explicit_rhs_state_max_abs_diff": (
+            _tree_max_abs(explicit_rhs_state_diff)
+            if explicit_jt_lambda_stages is not None
+            else diagnostic_nan
+        ),
+        "split_rhs_state_diff_l2": split_rhs_state_diff_l2,
+        "split_rhs_state_rel_err": split_rhs_state_rel_err,
+        "split_rhs_state_max_abs_diff": (
+            _tree_max_abs(split_rhs_state_diff)
+            if split_sum_jt_lambda_stages is not None
+            else diagnostic_nan
+        ),
+        "explicit_rhs_state_density_diff_l2": explicit_density_diff_l2,
+        "explicit_rhs_state_pressure_diff_l2": explicit_pressure_diff_l2,
+        "explicit_rhs_state_er_tail_diff_l2": explicit_er_diff_l2,
         "radial_state_dim": jnp.asarray(int(kernel_context.state_dim), dtype=jnp.int32),
         "radial_density_size": jnp.asarray(int(kernel_context.density_size), dtype=jnp.int32),
         "radial_pressure_size": jnp.asarray(int(kernel_context.pressure_size), dtype=jnp.int32),
