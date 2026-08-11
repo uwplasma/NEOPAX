@@ -667,6 +667,7 @@ def _finalize_custom_solver_output(
     failed_f,
     fail_code_f,
     n_steps_f,
+    next_dt,
     last_attempt_accepted,
     last_attempt_converged,
     last_attempt_err_norm,
@@ -770,6 +771,7 @@ def _finalize_custom_solver_output(
         "final_reuse_last_linearization_dt": reuse_last_linearization_dt,
         "final_state": final_state,
         "final_time": t_final,
+        "next_dt": next_dt,
     }
 
 
@@ -13628,6 +13630,7 @@ class RADAUSolver(_RadauSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            step_state_f.dt,
             last_attempt_accepted,
             last_attempt_converged,
             last_attempt_err_norm,
@@ -16179,6 +16182,7 @@ class ThetaMethodSolver(_ThetaSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            step_state_f.dt,
             last_attempt_accepted,
             last_attempt_converged,
             last_attempt_err_norm,
@@ -16408,6 +16412,7 @@ class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
             failed_f,
             fail_code_f,
             n_acc_f,
+            step_state_f.dt,
             last_attempt_accepted,
             last_attempt_converged,
             last_attempt_err_norm,

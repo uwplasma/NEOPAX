@@ -1391,7 +1391,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     plot_n_times = int(transport_cfg.get("transport_plot_n_times", 1))
     rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
     transport_boundary_models = {}
-    if do_plot:
+    if do_plot or do_hdf5:
         from ._boundary_conditions import build_boundary_condition_model
 
         boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
@@ -1427,6 +1427,8 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 flux_model=runtime.models.flux,
                 geometry=runtime.geometry,
                 boundary_models=transport_boundary_models,
+                density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                temperature_floor=solver_cfg.get("temperature_floor"),
             )
         if do_hdf5:
             write_transport_hdf5(
@@ -1436,6 +1438,9 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 geometry=runtime.geometry,
                 species=runtime.species,
                 source_models=runtime.models.source,
+                boundary_models=transport_boundary_models,
+                density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                temperature_floor=solver_cfg.get("temperature_floor"),
             )
         if do_print_summary:
             if isinstance(result, dict):
@@ -2201,6 +2206,8 @@ def plot_transport_solution(
     flux_model=None,
     geometry=None,
     boundary_models=None,
+    density_floor=1.0e-6,
+    temperature_floor=None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -2326,6 +2333,33 @@ def plot_transport_solution(
     pressure_series = _select_time_slices(getattr(ys, "pressure", None), kind="species")
     temperature_series = _select_time_slices(getattr(ys, "temperature", None), kind="species")
     er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
+    face_rho = getattr(geometry, "rho_grid_half", None) if geometry is not None else None
+    density_face_series = []
+    pressure_face_series = []
+    temperature_face_series = []
+    er_face_series = []
+    if face_rho is not None and density_series and pressure_series and er_series:
+        n_face_snapshots = min(len(density_series), len(pressure_series), len(er_series))
+        for idx in range(n_face_snapshots):
+            time_label = density_series[idx][0]
+            snapshot_state = TransportState(
+                density=jnp.asarray(density_series[idx][1]),
+                pressure=jnp.asarray(pressure_series[idx][1]),
+                Er=jnp.asarray(er_series[idx][1]),
+            )
+            face_state = build_face_transport_state(
+                snapshot_state,
+                geometry,
+                bc_density=None if boundary_models is None else boundary_models.get("density"),
+                bc_temperature=None if boundary_models is None else boundary_models.get("temperature"),
+                bc_er=None if boundary_models is None else boundary_models.get("Er"),
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+            density_face_series.append((time_label, face_state.density))
+            pressure_face_series.append((time_label, face_state.pressure))
+            temperature_face_series.append((time_label, face_state.temperature))
+            er_face_series.append((time_label, face_state.Er))
     species_names = list(getattr(species, "names", ())) if species is not None else []
     def _resolve_reference_path(path_value):
         if path_value is None:
@@ -2564,6 +2598,7 @@ def plot_transport_solution(
         replacements = {
             "Density": r"$n$ [$10^{20} m^{-3}$]",
             "Temperature": r"$T$ [$keV$]",
+            "Pressure": r"$p$ [$10^{20} m^{-3} keV$]",
             "Er": r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]",
             "Total Power Source [MW/m^3]": r"Total Power Source [$MW/m^3$]",
             "Alpha Particle Source [1e20 m^-3 s^-1]": r"Alpha Particle Source [$10^{20} m^{-3} s^{-1}$]",
@@ -2801,6 +2836,102 @@ def plot_transport_solution(
             written[_species_label(species_idx)] = out_png
         return written
 
+    def _plot_species_time_series_on_grid(series, x_grid, ylabel, out_name, *, title=None):
+        if not series or x_grid is None:
+            return None
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not color_cycle:
+            color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
+        first_values = jnp.asarray(series[0][1])
+        if first_values.ndim == 0:
+            plt.close(fig)
+            return None
+        species_count = int(first_values.shape[0])
+        linestyle_cycle = ["-", "--", ":", "-."]
+        x_arr = jnp.asarray(x_grid)
+
+        for time_idx, (time_label, values) in enumerate(series):
+            values = jnp.asarray(values)
+            if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                continue
+            color = color_cycle[time_idx % len(color_cycle)]
+            for species_idx in range(values.shape[0]):
+                linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                ax.plot(x_arr, values[species_idx], color=color, linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH)
+
+        time_handles = []
+        for time_idx, (time_label, _) in enumerate(series):
+            color = color_cycle[time_idx % len(color_cycle)]
+            label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=_TRANSPORT_LINEWIDTH, label=label))
+
+        species_handles = []
+        for species_idx in range(species_count):
+            linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+            species_handles.append(
+                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH, label=_species_label(species_idx))
+            )
+
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
+        legend_times = ax.legend(handles=time_handles, title="Time", loc="upper left")
+        ax.add_artist(legend_times)
+        ax.legend(handles=species_handles, title="Species", loc="upper right")
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_png
+
+    def _plot_individual_species_series_on_grid(series, x_grid, ylabel, out_stem):
+        if not series or x_grid is None:
+            return {}
+        written = {}
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not color_cycle:
+            color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
+        first_values = jnp.asarray(series[0][1])
+        if first_values.ndim == 0:
+            return written
+        species_count = int(first_values.shape[0])
+        x_arr = jnp.asarray(x_grid)
+        for species_idx in range(species_count):
+            fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+            for time_idx, (time_label, values) in enumerate(series):
+                values = jnp.asarray(values)
+                if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                    continue
+                color = color_cycle[time_idx % len(color_cycle)]
+                label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+                ax.plot(x_arr, values[species_idx], color=color, linewidth=_TRANSPORT_LINEWIDTH, label=label)
+            _style_transport_axes(ax, ylabel=ylabel, title=f"{_transport_ylabel(ylabel)} faces: {_species_label(species_idx)}")
+            ax.legend(title="Time")
+            fig.tight_layout()
+            out_png = output_dir / f"{out_stem}_{_species_label(species_idx)}.png"
+            fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+            plt.close(fig)
+            written[_species_label(species_idx)] = out_png
+        return written
+
+    def _plot_scalar_time_series_on_grid(series, x_grid, ylabel, out_name, *, title=None, legend_loc="best"):
+        if not series or x_grid is None:
+            return None
+        x_arr = jnp.asarray(x_grid)
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        for time_idx, (time_label, values) in enumerate(series):
+            values = jnp.asarray(values)
+            if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                continue
+            label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+            ax.plot(x_arr, values, linewidth=_TRANSPORT_LINEWIDTH, label=label)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
+        ax.legend(loc=legend_loc, fontsize=15, frameon=True)
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_png
+
     def _plot_scalar_time_series(series, ylabel, out_name, title=None, reference_key=None, reference_label="NTSS reference"):
         if not series:
             return None
@@ -2924,6 +3055,65 @@ def plot_transport_solution(
     if temperature_series:
         _plot_species_time_series(temperature_series, "Temperature", "transport_temperature.png")
         _plot_individual_species_series(temperature_series, "Temperature", "transport_temperature")
+
+    density_faces_png = None
+    pressure_faces_png = None
+    temperature_faces_png = None
+    er_faces_png = None
+    density_faces_species_pngs = {}
+    pressure_faces_species_pngs = {}
+    temperature_faces_species_pngs = {}
+    if density_face_series:
+        density_faces_png = _plot_species_time_series_on_grid(
+            density_face_series,
+            face_rho,
+            "Density",
+            "transport_density_faces.png",
+            title="Density on Faces",
+        )
+        density_faces_species_pngs = _plot_individual_species_series_on_grid(
+            density_face_series,
+            face_rho,
+            "Density",
+            "transport_density_faces",
+        )
+    if pressure_face_series:
+        pressure_faces_png = _plot_species_time_series_on_grid(
+            pressure_face_series,
+            face_rho,
+            "Pressure",
+            "transport_pressure_faces.png",
+            title="Pressure on Faces",
+        )
+        pressure_faces_species_pngs = _plot_individual_species_series_on_grid(
+            pressure_face_series,
+            face_rho,
+            "Pressure",
+            "transport_pressure_faces",
+        )
+    if temperature_face_series:
+        temperature_faces_png = _plot_species_time_series_on_grid(
+            temperature_face_series,
+            face_rho,
+            "Temperature",
+            "transport_temperature_faces.png",
+            title="Temperature on Faces",
+        )
+        temperature_faces_species_pngs = _plot_individual_species_series_on_grid(
+            temperature_face_series,
+            face_rho,
+            "Temperature",
+            "transport_temperature_faces",
+        )
+    if er_face_series:
+        er_faces_png = _plot_scalar_time_series_on_grid(
+            er_face_series,
+            face_rho,
+            "Er",
+            "transport_Er_faces.png",
+            title=r"$E_r$ on Faces",
+            legend_loc="lower left",
+        )
 
     power_source_series = []
     he_source_series = []
@@ -3330,6 +3520,13 @@ def plot_transport_solution(
         "density": output_dir / "transport_density.png" if density_series else None,
         "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
         "Er": output_dir / "transport_Er.png" if er_series else None,
+        "density_faces": density_faces_png,
+        "pressure_faces": pressure_faces_png,
+        "temperature_faces": temperature_faces_png,
+        "Er_faces": er_faces_png,
+        "density_faces_species": density_faces_species_pngs,
+        "pressure_faces_species": pressure_faces_species_pngs,
+        "temperature_faces_species": temperature_faces_species_pngs,
         "Vprime": vprime_png,
         "Vprime_half": vprime_half_png,
         "power_sources_total": power_sources_png,
@@ -3346,8 +3543,19 @@ def plot_transport_solution(
     }
 
 
-def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None, source_models=None):
+def write_transport_hdf5(
+    rho,
+    solution,
+    output_dir,
+    geometry=None,
+    species=None,
+    source_models=None,
+    boundary_models=None,
+    density_floor=1.0e-6,
+    temperature_floor=None,
+):
     import h5py
+    from ._transport_flux_models import build_face_transport_state
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -3358,6 +3566,38 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
     dts = getattr(solution, "dts", None)
     if dts is None:
         dts = solution.get("dts") if isinstance(solution, dict) else None
+
+    def _solution_value(name):
+        value = getattr(solution, name, None)
+        if value is None and isinstance(solution, dict):
+            value = solution.get(name)
+        return value
+
+    def _face_states_from_saved(density, pressure, er):
+        if density is None or pressure is None or er is None or geometry is None:
+            return None
+        density_arr = jnp.asarray(density)
+        pressure_arr = jnp.asarray(pressure)
+        er_arr = jnp.asarray(er)
+
+        def _build_one(dens, pres, er_prof):
+            return build_face_transport_state(
+                TransportState(
+                    density=jnp.asarray(dens),
+                    pressure=jnp.asarray(pres),
+                    Er=jnp.asarray(er_prof),
+                ),
+                geometry,
+                bc_density=None if boundary_models is None else boundary_models.get("density"),
+                bc_temperature=None if boundary_models is None else boundary_models.get("temperature"),
+                bc_er=None if boundary_models is None else boundary_models.get("Er"),
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+
+        if density_arr.ndim == 2:
+            return _build_one(density_arr, pressure_arr, er_arr)
+        return jax.vmap(_build_one)(density_arr, pressure_arr, er_arr)
 
     out_h5 = output_dir / "transport_solution.h5"
     with h5py.File(out_h5, "w") as f:
@@ -3382,6 +3622,16 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
             f.create_dataset("ts", data=jnp.asarray(ts))
         if dts is not None:
             f.create_dataset("dts", data=jnp.asarray(dts))
+        final_time = _solution_value("final_time")
+        if final_time is not None:
+            final_time_arr = jnp.asarray(final_time)
+            f.create_dataset("final_time", data=final_time_arr)
+            f.create_dataset("t_final", data=final_time_arr)
+        next_dt = _solution_value("next_dt")
+        if next_dt is not None:
+            next_dt_arr = jnp.asarray(next_dt)
+            f.create_dataset("next_dt", data=next_dt_arr)
+            f.create_dataset("dt_next", data=next_dt_arr)
         if ys is not None:
             density = getattr(ys, "density", None)
             pressure = getattr(ys, "pressure", None)
@@ -3395,6 +3645,12 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
                 f.create_dataset("temperature", data=jnp.asarray(temperature))
             if er is not None:
                 f.create_dataset("Er", data=jnp.asarray(er))
+            face_state = _face_states_from_saved(density, pressure, er)
+            if face_state is not None:
+                f.create_dataset("density_faces", data=jnp.asarray(face_state.density))
+                f.create_dataset("pressure_faces", data=jnp.asarray(face_state.pressure))
+                f.create_dataset("temperature_faces", data=jnp.asarray(face_state.temperature))
+                f.create_dataset("Er_faces", data=jnp.asarray(face_state.Er))
             if (
                 density is not None
                 and pressure is not None
