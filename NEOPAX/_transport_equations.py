@@ -2359,6 +2359,48 @@ class ComposedEquationSystem:
             (working_state_bar,) = flux_state_pullback(flux_bar)
         return self._prepare_working_state_pullback(state, working_state_bar)
 
+    def pullback_evaluate_with_lagged_response_state_flux_generic(self, t, state, runtime, lagged_response, rhs_bar):
+        """Diagnostic generic VJP for flux-model state dependence."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+
+        def _complete_bar_like(output, bar):
+            if not isinstance(output, dict) or not isinstance(bar, dict):
+                return bar
+
+            def _bar_or_zero(key, template):
+                value = bar.get(key, None)
+                if value is None:
+                    return jnp.zeros_like(template)
+                arr = jnp.asarray(value)
+                if arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros_like(template)
+                return jnp.asarray(value, dtype=jnp.asarray(template).dtype)
+
+            return {key: _bar_or_zero(key, value) for key, value in output.items()}
+
+        def _fluxes_from_working_state(working_state_value):
+            fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                working_state_value,
+                lagged_response.flux_response,
+                **self._shared_flux_bc_kwargs(),
+            )
+            return _with_center_fluxes_from_faces(fluxes)
+
+        flux_output, flux_state_pullback = jax.vjp(_fluxes_from_working_state, working_state)
+        flux_bar = _complete_bar_like(flux_output, flux_bar)
+        (working_state_bar,) = flux_state_pullback(flux_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
+
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
         from ._state import TransportState
