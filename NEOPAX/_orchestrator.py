@@ -2338,7 +2338,12 @@ def plot_transport_solution(
     pressure_face_series = []
     temperature_face_series = []
     er_face_series = []
+    density_face_grad_series = []
+    temperature_face_grad_series = []
+    er_face_grad_series = []
     if face_rho is not None and density_series and pressure_series and er_series:
+        from ._transport_flux_models import _face_profile_gradient
+
         n_face_snapshots = min(len(density_series), len(pressure_series), len(er_series))
         for idx in range(n_face_snapshots):
             time_label = density_series[idx][0]
@@ -2360,6 +2365,30 @@ def plot_transport_solution(
             pressure_face_series.append((time_label, face_state.pressure))
             temperature_face_series.append((time_label, face_state.temperature))
             er_face_series.append((time_label, face_state.Er))
+            density_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.density,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("density"),
+                ),
+            ))
+            temperature_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.temperature,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("temperature"),
+                ),
+            ))
+            er_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.Er,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("Er"),
+                ),
+            ))
     species_names = list(getattr(species, "names", ())) if species is not None else []
     def _resolve_reference_path(path_value):
         if path_value is None:
@@ -3060,9 +3089,14 @@ def plot_transport_solution(
     pressure_faces_png = None
     temperature_faces_png = None
     er_faces_png = None
+    density_face_grad_png = None
+    temperature_face_grad_png = None
+    er_face_grad_png = None
     density_faces_species_pngs = {}
     pressure_faces_species_pngs = {}
     temperature_faces_species_pngs = {}
+    density_face_grad_species_pngs = {}
+    temperature_face_grad_species_pngs = {}
     if density_face_series:
         density_faces_png = _plot_species_time_series_on_grid(
             density_face_series,
@@ -3112,6 +3146,43 @@ def plot_transport_solution(
             "Er",
             "transport_Er_faces.png",
             title=r"$E_r$ on Faces",
+            legend_loc="lower left",
+        )
+    if density_face_grad_series:
+        density_face_grad_png = _plot_species_time_series_on_grid(
+            density_face_grad_series,
+            face_rho,
+            "Density Gradient",
+            "transport_density_face_gradients.png",
+            title="Density Gradient on Faces",
+        )
+        density_face_grad_species_pngs = _plot_individual_species_series_on_grid(
+            density_face_grad_series,
+            face_rho,
+            "Density Gradient",
+            "transport_density_face_gradients",
+        )
+    if temperature_face_grad_series:
+        temperature_face_grad_png = _plot_species_time_series_on_grid(
+            temperature_face_grad_series,
+            face_rho,
+            "Temperature Gradient",
+            "transport_temperature_face_gradients.png",
+            title="Temperature Gradient on Faces",
+        )
+        temperature_face_grad_species_pngs = _plot_individual_species_series_on_grid(
+            temperature_face_grad_series,
+            face_rho,
+            "Temperature Gradient",
+            "transport_temperature_face_gradients",
+        )
+    if er_face_grad_series:
+        er_face_grad_png = _plot_scalar_time_series_on_grid(
+            er_face_grad_series,
+            face_rho,
+            "Er Gradient",
+            "transport_Er_face_gradients.png",
+            title=r"$\partial E_r / \partial r$ on Faces",
             legend_loc="lower left",
         )
 
@@ -3524,9 +3595,14 @@ def plot_transport_solution(
         "pressure_faces": pressure_faces_png,
         "temperature_faces": temperature_faces_png,
         "Er_faces": er_faces_png,
+        "density_face_gradients": density_face_grad_png,
+        "temperature_face_gradients": temperature_face_grad_png,
+        "Er_face_gradients": er_face_grad_png,
         "density_faces_species": density_faces_species_pngs,
         "pressure_faces_species": pressure_faces_species_pngs,
         "temperature_faces_species": temperature_faces_species_pngs,
+        "density_face_gradient_species": density_face_grad_species_pngs,
+        "temperature_face_gradient_species": temperature_face_grad_species_pngs,
         "Vprime": vprime_png,
         "Vprime_half": vprime_half_png,
         "power_sources_total": power_sources_png,
@@ -3555,7 +3631,7 @@ def write_transport_hdf5(
     temperature_floor=None,
 ):
     import h5py
-    from ._transport_flux_models import build_face_transport_state
+    from ._transport_flux_models import _face_profile_gradient, build_face_transport_state
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -3598,6 +3674,36 @@ def write_transport_hdf5(
         if density_arr.ndim == 2:
             return _build_one(density_arr, pressure_arr, er_arr)
         return jax.vmap(_build_one)(density_arr, pressure_arr, er_arr)
+
+    def _face_gradients_from_saved(density, temperature, er):
+        if density is None or temperature is None or er is None or geometry is None:
+            return None
+        density_arr = jnp.asarray(density)
+        temperature_arr = jnp.asarray(temperature)
+        er_arr = jnp.asarray(er)
+
+        def _build_one(dens, temp, er_prof):
+            return {
+                "density": _face_profile_gradient(
+                    jnp.asarray(dens),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("density"),
+                ),
+                "temperature": _face_profile_gradient(
+                    jnp.asarray(temp),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("temperature"),
+                ),
+                "Er": _face_profile_gradient(
+                    jnp.asarray(er_prof),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("Er"),
+                ),
+            }
+
+        if density_arr.ndim == 2:
+            return _build_one(density_arr, temperature_arr, er_arr)
+        return jax.vmap(_build_one)(density_arr, temperature_arr, er_arr)
 
     out_h5 = output_dir / "transport_solution.h5"
     with h5py.File(out_h5, "w") as f:
@@ -3651,6 +3757,11 @@ def write_transport_hdf5(
                 f.create_dataset("pressure_faces", data=jnp.asarray(face_state.pressure))
                 f.create_dataset("temperature_faces", data=jnp.asarray(face_state.temperature))
                 f.create_dataset("Er_faces", data=jnp.asarray(face_state.Er))
+            face_gradients = _face_gradients_from_saved(density, temperature, er)
+            if face_gradients is not None:
+                f.create_dataset("density_grad_faces", data=jnp.asarray(face_gradients["density"]))
+                f.create_dataset("temperature_grad_faces", data=jnp.asarray(face_gradients["temperature"]))
+                f.create_dataset("Er_grad_faces", data=jnp.asarray(face_gradients["Er"]))
             if (
                 density is not None
                 and pressure is not None
