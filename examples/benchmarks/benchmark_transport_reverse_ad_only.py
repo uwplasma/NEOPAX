@@ -4169,6 +4169,83 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
 
+def _run_local_stage_matvec_diagnostic_report(
+    *,
+    args,
+    reverse_setup: _ReverseStaticSetup,
+    accepted_step_index: int,
+    mode_label: str = "transport_reverse_ad_only_local_stage_matvec_diagnostic",
+):
+    if accepted_step_index < 0:
+        raise SystemExit("[autodiff-gate] --local-transpose-diagnostic-accepted-step must be >= 0.")
+    print("[autodiff-gate] progress: running local stage transpose matvec diagnostic", flush=True)
+    baseline_rollout = _radau_adaptive_schedule_rollout(
+        reverse_setup.execution_context,
+        reverse_setup.prepared_rollout.initial_carry,
+        max_total_steps=reverse_setup.max_total_steps,
+        stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
+    )
+    diagnostic = _radau_debug_local_stage_transpose_matvec(
+        reverse_setup.execution_context,
+        reverse_setup.prepared_rollout.initial_carry,
+        baseline_rollout.trace,
+        accepted_step_index=accepted_step_index,
+    )
+    diagnostic = jax.device_get(diagnostic)
+    report = {
+        "mode": mode_label,
+        "config_path": str(Path(args.config)),
+        "objective_name": args.objective,
+        "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
+        "diagnostic_accepted_step_index": accepted_step_index,
+        "target_attempt_index": int(diagnostic["target_attempt_index"]),
+        "found_target": bool(diagnostic["found_target"]),
+        "lagged_response_valid_in": bool(diagnostic["lagged_response_valid_in"]),
+        "local_branch_reuse": bool(diagnostic["local_branch_reuse"]),
+        "compact_l2": float(diagnostic["compact_l2"]),
+        "dense_l2": float(diagnostic["dense_l2"]),
+        "diff_l2": float(diagnostic["diff_l2"]),
+        "rel_err": float(diagnostic["rel_err"]),
+        "max_abs_diff": float(diagnostic["max_abs_diff"]),
+        "radial_block_count": int(diagnostic["radial_block_count"]),
+        "radial_block_dim": int(diagnostic["radial_block_dim"]),
+        "radial_off_tridiagonal_l2": float(diagnostic["radial_off_tridiagonal_l2"]),
+        "radial_off_tridiagonal_rel_l2": float(diagnostic["radial_off_tridiagonal_rel_l2"]),
+        "radial_off_tridiagonal_max_abs": float(diagnostic["radial_off_tridiagonal_max_abs"]),
+    }
+    print(
+        "[autodiff-gate] local stage matvec diagnostic: "
+        f"accepted_step_index={accepted_step_index} "
+        f"target_attempt_index={report['target_attempt_index']} "
+        f"found_target={report['found_target']} "
+        f"lagged_response_valid_in={report['lagged_response_valid_in']} "
+        f"local_branch_reuse={report['local_branch_reuse']}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage matvec diagnostic values: "
+        f"compact_l2={report['compact_l2']:.6e} "
+        f"dense_l2={report['dense_l2']:.6e} "
+        f"diff_l2={report['diff_l2']:.6e} "
+        f"rel_err={report['rel_err']:.6e} "
+        f"max_abs_diff={report['max_abs_diff']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage radial-block diagnostic values: "
+        f"block_count={report['radial_block_count']} "
+        f"block_dim={report['radial_block_dim']} "
+        f"off_tridiagonal_l2={report['radial_off_tridiagonal_l2']:.6e} "
+        f"off_tridiagonal_rel_l2={report['radial_off_tridiagonal_rel_l2']:.6e} "
+        f"off_tridiagonal_max_abs={report['radial_off_tridiagonal_max_abs']:.6e}",
+        flush=True,
+    )
+    outpath = _report_path(args.objective)
+    outpath.write_text(json.dumps(report, indent=2))
+    print(f"Wrote {outpath.relative_to(ROOT)}")
+    return report
+
+
 def _run_realtime_geometry_reverse_mode(
     *,
     args,
@@ -4182,10 +4259,11 @@ def _run_realtime_geometry_reverse_mode(
             "[autodiff-gate] realtime-geometry reverse mode does not support "
             "--timing-mode split-vjp-warm. Use jit-warm, jit-compile-only, or eager."
         )
-    if args.local_transpose_diagnostic_accepted_step is not None:
+    local_transpose_diagnostic_accepted_step = args.local_transpose_diagnostic_accepted_step
+    if local_transpose_diagnostic_accepted_step is not None and not bool(args.stage_matvec_diagnostic):
         raise SystemExit(
-            "[autodiff-gate] local accepted-step transpose diagnostics are only "
-            "available for the profile-only static reverse setup."
+            "[autodiff-gate] realtime-geometry local transpose diagnostics currently "
+            "support only --stage-matvec-diagnostic."
         )
     if bool(args.diagnose_final_objective_cotangent):
         raise SystemExit(
@@ -4269,6 +4347,27 @@ def _run_realtime_geometry_reverse_mode(
                 "--realtime-geometry-gradient-path reverse_payload so it exercises "
                 "the validated full realtime geometry table."
             )
+        if local_transpose_diagnostic_accepted_step is not None:
+            core_setup = prepare_realtime_geometry_support_segment_core_setup(
+                args=args,
+                config=config,
+                baseline_values=baseline_values,
+                baseline_runtime=baseline_runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                neoclassical_cfg=neoclassical_cfg,
+                parameter_order=PARAMETER_ORDER,
+                find_ntx_support_payload=_find_ntx_support_payload,
+                prepare_reverse_static_setup=_prepare_reverse_static_setup,
+                geometry_volume_diagnostics=_geometry_volume_diagnostics,
+            )
+            _run_local_stage_matvec_diagnostic_report(
+                args=args,
+                reverse_setup=core_setup.reverse_setup,
+                accepted_step_index=int(local_transpose_diagnostic_accepted_step),
+                mode_label="transport_reverse_ad_only_realtime_geometry_local_stage_matvec_diagnostic",
+            )
+            return
         _run_realtime_geometry_optimization_api_smoke(
             args=args,
             config=config,
@@ -4853,8 +4952,7 @@ def main() -> None:
             "transformed LU transpose approximation and is the lightweight default; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
-            "'exact_block_compact' enables the exact per-step block prototype "
-            "behind the planned compact rule."
+            "'exact_block_compact' requires a non-dense exact compact solve hook."
         ),
     )
     parser.add_argument(
@@ -5173,57 +5271,11 @@ def main() -> None:
         if accepted_step_index < 0:
             raise SystemExit("[autodiff-gate] --local-transpose-diagnostic-accepted-step must be >= 0.")
         if bool(args.stage_matvec_diagnostic):
-            print("[autodiff-gate] progress: running local stage transpose matvec diagnostic", flush=True)
-            baseline_rollout = _radau_adaptive_schedule_rollout(
-                reverse_setup.execution_context,
-                reverse_setup.prepared_rollout.initial_carry,
-                max_total_steps=reverse_setup.max_total_steps,
-                stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
-            )
-            diagnostic = _radau_debug_local_stage_transpose_matvec(
-                reverse_setup.execution_context,
-                reverse_setup.prepared_rollout.initial_carry,
-                baseline_rollout.trace,
+            _run_local_stage_matvec_diagnostic_report(
+                args=args,
+                reverse_setup=reverse_setup,
                 accepted_step_index=accepted_step_index,
             )
-            diagnostic = jax.device_get(diagnostic)
-            report = {
-                "mode": "transport_reverse_ad_only_local_stage_matvec_diagnostic",
-                "config_path": str(Path(args.config)),
-                "objective_name": args.objective,
-                "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
-                "diagnostic_accepted_step_index": accepted_step_index,
-                "target_attempt_index": int(diagnostic["target_attempt_index"]),
-                "found_target": bool(diagnostic["found_target"]),
-                "lagged_response_valid_in": bool(diagnostic["lagged_response_valid_in"]),
-                "local_branch_reuse": bool(diagnostic["local_branch_reuse"]),
-                "compact_l2": float(diagnostic["compact_l2"]),
-                "dense_l2": float(diagnostic["dense_l2"]),
-                "diff_l2": float(diagnostic["diff_l2"]),
-                "rel_err": float(diagnostic["rel_err"]),
-                "max_abs_diff": float(diagnostic["max_abs_diff"]),
-            }
-            print(
-                "[autodiff-gate] local stage matvec diagnostic: "
-                f"accepted_step_index={accepted_step_index} "
-                f"target_attempt_index={report['target_attempt_index']} "
-                f"found_target={report['found_target']} "
-                f"lagged_response_valid_in={report['lagged_response_valid_in']} "
-                f"local_branch_reuse={report['local_branch_reuse']}",
-                flush=True,
-            )
-            print(
-                "[autodiff-gate] local stage matvec diagnostic values: "
-                f"compact_l2={report['compact_l2']:.6e} "
-                f"dense_l2={report['dense_l2']:.6e} "
-                f"diff_l2={report['diff_l2']:.6e} "
-                f"rel_err={report['rel_err']:.6e} "
-                f"max_abs_diff={report['max_abs_diff']:.6e}",
-                flush=True,
-            )
-            outpath = _report_path(args.objective)
-            outpath.write_text(json.dumps(report, indent=2))
-            print(f"Wrote {outpath.relative_to(ROOT)}")
             return
         print("[autodiff-gate] progress: running local accepted-step transpose diagnostic", flush=True)
         baseline_rollout = _radau_adaptive_schedule_rollout(

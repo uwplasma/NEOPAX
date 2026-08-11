@@ -149,10 +149,25 @@ compact_l2, dense_l2, diff_l2, rel_err, max_abs_diff
 It still does not activate `exact_block_compact` or change the shared-payload
 gradient path.
 
-`exact_block_compact` can now be selected, but at this stage it reuses the exact
-dense `block` helper internally. This gives us a mode to validate against
-one-accepted-step and 16-step references before swapping in the real compact
-factorization.
+`exact_block_compact` can now be selected, but it intentionally refuses to run
+unless a non-dense compact solve hook is present. The previous dense fallback is
+disabled so this mode cannot accidentally materialize the full
+`(num_stages * state_dim)^2` matrix while being called "compact".
+
+The important algebraic constraint is:
+
+```text
+structured: factors I - h * eig(A) * J_ref
+exact:      factors delta_ij I - h * A_ij * J_i
+```
+
+where `J_ref = df(t_n, y_n)/dy`, but the exact nonlinear Radau stage residual
+uses one `J_i = df(t_i, y_i)/dy_i` for each converged stage state. The Radau
+stage transform diagonalizes the stage coupling only when the same Jacobian is
+used at every stage. Therefore the exact compact non-iterative rule cannot just
+reuse the existing structured LU without changing the derivative; that is why
+`structured` is fast but not accurate enough for the full-transport objective
+table.
 
 The desired rule should use the accepted primal step's already-built Radau /
 Newton linearization objects where possible, but solve the true nonlinear
@@ -164,6 +179,121 @@ lambda_i - h sum_j A_ji J_j^T lambda_j = rhs_i
 
 not merely the approximate transformed Newton linear-solve transpose used by
 `structured`.
+
+The next real implementation step is a true exact compact representation of
+the per-stage Jacobian block system. That means either:
+
+- adding explicit sparse/banded RHS Jacobian assembly hooks and doing one
+  direct sparse/block factorization per accepted step with all objective RHS
+  columns solved together, or
+- finding/proving a transport-specific block factorization of the per-stage
+  `J_i` system that avoids materializing the full dense block.
+
+Using the current matrix-free VJP operator plus a direct inverse is not enough:
+VJP gives compact actions of `(dR/dz)^T`, but a non-iterative inverse still
+needs some factored representation of that operator.
+
+## Compact Block Direction
+
+The promising direct compact rule is radial-block factorization, not dense
+stage-block factorization.
+
+The current flat ordering is:
+
+```text
+[density(:), pressure(:), Er(:)]
+```
+
+and the exact dense stage matrix is naturally written stage-major:
+
+```text
+stage 0 all state, stage 1 all state, ...
+```
+
+For a compact direct solve we should instead view the unknowns as radial-cell
+blocks:
+
+```text
+cell k: all evolved variables at cell k for all Radau stages
+```
+
+With face-primary finite-volume transport, most RHS couplings are local in
+radius:
+
+- density/temperature flux-divergence terms couple through neighboring faces
+- center/source/work terms are cell-local, plus species coupling
+- Er ambipolar terms use center fluxes, interpolated or locally evaluated from
+  the same face/center response data
+- quasi-neutrality and active-temperature projection add local species mixing
+
+This suggests an exact block-banded system in radius. The block size is roughly:
+
+```text
+num_stages * variables_per_radial_cell
+```
+
+rather than:
+
+```text
+num_stages * total_state_dim
+```
+
+The implementation target for `solve_exact_stage_transpose_compact(...)` is:
+
+1. Build per-stage local RHS derivative blocks in radial-block form, including
+   equation assembly and lagged flux-response derivatives.
+2. Assemble the exact transpose stage residual in radial block-banded form.
+3. Factor it once per accepted step with a block-banded/direct sweep.
+4. Solve all objective RHS columns in that one factorization.
+5. Validate against `bicgstab` first, then against frozen-root FD.
+
+This is the analogue of the compact VMEC/NTX block solve: not one objective at
+a time, not Krylov iteration, and not dense global materialization.
+
+Initial infrastructure now exists in `_transport_solvers.py`:
+
+- `_radau_block_tridiagonal_solve(...)` solves block-tridiagonal systems with
+  one or many RHS columns, including transpose systems, without global dense
+  materialization.
+- `_radau_infer_radial_block_layout(...)` infers the packed density/pressure/Er
+  per-cell variable layout from the Radau kernel context.
+- `_radau_stage_stack_to_radial_blocks(...)` and
+  `_radau_radial_blocks_to_stage_stack(...)` convert between the current
+  stage-major ordering and the planned radial-block ordering.
+
+The next code step is to assemble the actual lower/diagonal/upper radial blocks
+for the exact per-stage transport RHS. Until those blocks exist,
+`exact_block_compact` correctly refuses to run.
+
+The existing local stage diagnostic now also reports whether the exact dense
+operator is compatible with this radial block-tridiagonal assumption:
+
+```text
+--local-transpose-diagnostic-accepted-step 0 --stage-matvec-diagnostic
+```
+
+The relevant output fields are:
+
+```text
+radial_block_count
+radial_block_dim
+radial_off_tridiagonal_l2
+radial_off_tridiagonal_rel_l2
+radial_off_tridiagonal_max_abs
+```
+
+Interpretation:
+
+- If `radial_off_tridiagonal_rel_l2` and `radial_off_tridiagonal_max_abs` are
+  near roundoff, a block-tridiagonal radial factorization is structurally
+  correct for that configuration.
+- If they are not small, then some term is coupling beyond nearest radial
+  neighbors and the compact direct solve must use a wider radial bandwidth or
+  isolate that nonlocal term.
+
+The block-tridiagonal solve utility was checked against an explicitly assembled
+dense toy system for both primal and transpose solves; the relative errors were
+approximately `9.1e-17` and `6.3e-17`.
 
 ## Validation Gate
 
