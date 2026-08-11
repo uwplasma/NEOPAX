@@ -2020,11 +2020,6 @@ def _apply_radau_lean_timestep_controller(
     )
     growth = jnp.clip(growth, min_step_factor, growth_cap)
     growth = jnp.where(
-        jnp.logical_and(jnp.logical_not(jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller)), jnp.logical_and(difficult_accept, growth <= jnp.asarray(1.35, dtype=dtype))),
-        jnp.asarray(1.0, dtype=dtype),
-        growth,
-    )
-    growth = jnp.where(
         jnp.logical_and(jnp.logical_not(jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller)), jnp.logical_and(jnp.logical_and(step_state.regrowth_cooldown > 0, jnp.logical_not(use_gustafsson_controller)), recovery_ready)),
         jnp.maximum(growth, jnp.asarray(1.2, dtype=dtype)),
         growth,
