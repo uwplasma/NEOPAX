@@ -4221,6 +4221,10 @@ def _run_local_stage_matvec_diagnostic_report(
         "split_rhs_state_diff_l2": float(diagnostic["split_rhs_state_diff_l2"]),
         "split_rhs_state_rel_err": float(diagnostic["split_rhs_state_rel_err"]),
         "split_rhs_state_max_abs_diff": float(diagnostic["split_rhs_state_max_abs_diff"]),
+        "flux_vs_generic_residual_diff_l2": float(diagnostic["flux_vs_generic_residual_diff_l2"]),
+        "direct_vs_generic_residual_diff_l2": float(diagnostic["direct_vs_generic_residual_diff_l2"]),
+        "flux_vs_generic_pressure_diff_l2": float(diagnostic["flux_vs_generic_pressure_diff_l2"]),
+        "direct_vs_generic_pressure_diff_l2": float(diagnostic["direct_vs_generic_pressure_diff_l2"]),
         "explicit_rhs_state_density_diff_l2": float(diagnostic["explicit_rhs_state_density_diff_l2"]),
         "explicit_rhs_state_pressure_diff_l2": float(diagnostic["explicit_rhs_state_pressure_diff_l2"]),
         "explicit_rhs_state_er_tail_diff_l2": float(diagnostic["explicit_rhs_state_er_tail_diff_l2"]),
@@ -4273,6 +4277,14 @@ def _run_local_stage_matvec_diagnostic_report(
         f"split_diff_l2={report['split_rhs_state_diff_l2']:.6e} "
         f"split_rel_err={report['split_rhs_state_rel_err']:.6e} "
         f"split_max_abs_diff={report['split_rhs_state_max_abs_diff']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage explicit-rhs-state split attribution: "
+        f"flux_vs_generic_residual_l2={report['flux_vs_generic_residual_diff_l2']:.6e} "
+        f"direct_vs_generic_residual_l2={report['direct_vs_generic_residual_diff_l2']:.6e} "
+        f"flux_pressure_l2={report['flux_vs_generic_pressure_diff_l2']:.6e} "
+        f"direct_pressure_l2={report['direct_vs_generic_pressure_diff_l2']:.6e}",
         flush=True,
     )
     print(

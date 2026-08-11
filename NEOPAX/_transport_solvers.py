@@ -7844,9 +7844,29 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         if split_sum_jt_lambda_stages is not None
         else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
     )
+    flux_vs_generic_residual_diff = (
+        flux_jt_lambda_stages - (generic_jt_lambda_stages - direct_jt_lambda_stages)
+        if direct_jt_lambda_stages is not None and flux_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
+    direct_vs_generic_residual_diff = (
+        direct_jt_lambda_stages - (generic_jt_lambda_stages - flux_jt_lambda_stages)
+        if direct_jt_lambda_stages is not None and flux_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
     split_rhs_state_diff_l2 = (
         _tree_l2(split_rhs_state_diff)
         if split_sum_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    flux_vs_generic_residual_diff_l2 = (
+        _tree_l2(flux_vs_generic_residual_diff)
+        if direct_jt_lambda_stages is not None and flux_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    direct_vs_generic_residual_diff_l2 = (
+        _tree_l2(direct_vs_generic_residual_diff)
+        if direct_jt_lambda_stages is not None and flux_jt_lambda_stages is not None
         else diagnostic_nan
     )
     split_rhs_state_rel_err = split_rhs_state_diff_l2 / jnp.maximum(
@@ -7863,6 +7883,20 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     explicit_pressure_diff_l2 = (
         _tree_l2(explicit_rhs_state_diff[:, density_end:pressure_end])
         if explicit_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    flux_vs_generic_pressure_diff_l2 = (
+        _tree_l2(flux_vs_generic_residual_diff[:, density_end:pressure_end])
+        if direct_jt_lambda_stages is not None
+        and flux_jt_lambda_stages is not None
+        and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    direct_vs_generic_pressure_diff_l2 = (
+        _tree_l2(direct_vs_generic_residual_diff[:, density_end:pressure_end])
+        if direct_jt_lambda_stages is not None
+        and flux_jt_lambda_stages is not None
+        and int(kernel_context.pressure_size) > 0
         else diagnostic_nan
     )
     projected_explicit_pressure_diff_l2 = (
@@ -7952,6 +7986,10 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             if split_sum_jt_lambda_stages is not None
             else diagnostic_nan
         ),
+        "flux_vs_generic_residual_diff_l2": flux_vs_generic_residual_diff_l2,
+        "direct_vs_generic_residual_diff_l2": direct_vs_generic_residual_diff_l2,
+        "flux_vs_generic_pressure_diff_l2": flux_vs_generic_pressure_diff_l2,
+        "direct_vs_generic_pressure_diff_l2": direct_vs_generic_pressure_diff_l2,
         "explicit_rhs_state_density_diff_l2": explicit_density_diff_l2,
         "explicit_rhs_state_pressure_diff_l2": explicit_pressure_diff_l2,
         "explicit_rhs_state_er_tail_diff_l2": explicit_er_diff_l2,
