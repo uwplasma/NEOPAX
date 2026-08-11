@@ -1566,6 +1566,7 @@ class ComposedEquationSystem:
             working_state,
             self.temperature_active_mask,
             self.fixed_temperature_profile,
+            density_floor=self.density_floor,
         )
         working_state = apply_transport_temperature_floor(
             working_state,
