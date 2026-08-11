@@ -7768,8 +7768,15 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "diff_l2": diff_l2,
         "rel_err": rel_err,
         "max_abs_diff": jnp.max(jnp.abs(diff)),
+        "radial_state_dim": jnp.asarray(int(kernel_context.state_dim), dtype=jnp.int32),
+        "radial_density_size": jnp.asarray(int(kernel_context.density_size), dtype=jnp.int32),
+        "radial_pressure_size": jnp.asarray(int(kernel_context.pressure_size), dtype=jnp.int32),
+        "radial_er_size": jnp.asarray(int(kernel_context.er_size), dtype=jnp.int32),
+        "radial_extra_size": jnp.asarray(layout.extra_size, dtype=jnp.int32),
         "radial_block_count": jnp.asarray(layout.n_radial, dtype=jnp.int32),
         "radial_block_dim": jnp.asarray(radial_block_dim, dtype=jnp.int32),
+        "radial_variables_per_cell": jnp.asarray(layout.variables_per_cell, dtype=jnp.int32),
+        "radial_extra_per_cell_count": jnp.asarray(layout.extra_per_cell_count, dtype=jnp.int32),
         "radial_off_tridiagonal_l2": off_tridiagonal_l2,
         "radial_off_tridiagonal_rel_l2": off_tridiagonal_l2 / jnp.maximum(
             matrix_l2,
@@ -7874,6 +7881,8 @@ class _RadauRadialBlockLayout:
     density_species_count: int
     pressure_species_count: int
     has_er: bool
+    extra_per_cell_count: int
+    extra_size: int
     variables_per_cell: int
 
 
@@ -7883,22 +7892,39 @@ def _radau_infer_radial_block_layout(kernel_context: _RadauAcceptedStepKernelCon
     pressure_size = int(kernel_context.pressure_size)
     er_size = int(kernel_context.er_size)
     state_dim = int(kernel_context.state_dim)
-    nonzero_sizes = [size for size in (density_size, pressure_size, er_size) if size > 0]
-    if not nonzero_sizes:
+    component_size = density_size + pressure_size + er_size
+    extra_size = state_dim - component_size
+    if extra_size < 0:
+        raise ValueError(
+            "Packed Radau component sizes exceed the packed state size; "
+            f"state_dim={state_dim}, density_size={density_size}, "
+            f"pressure_size={pressure_size}, er_size={er_size}."
+        )
+    radial_component_sizes = [size for size in (density_size, pressure_size, er_size) if size > 0]
+    if not radial_component_sizes:
         raise ValueError("Cannot infer radial block layout for an empty Radau state.")
-    n_radial = er_size if er_size > 0 else nonzero_sizes[0]
-    for size in nonzero_sizes:
+    n_radial = er_size if er_size > 0 else radial_component_sizes[0]
+    for size in radial_component_sizes:
         n_radial = math.gcd(int(n_radial), int(size))
     if n_radial <= 0:
         raise ValueError("Invalid radial block layout: inferred non-positive radial size.")
     if state_dim % n_radial != 0:
         raise ValueError(
             "Packed Radau state size is not divisible by the inferred radial size; "
-            f"state_dim={state_dim}, n_radial={n_radial}."
+            f"state_dim={state_dim}, n_radial={n_radial}, density_size={density_size}, "
+            f"pressure_size={pressure_size}, er_size={er_size}, extra_size={extra_size}."
         )
     if density_size % n_radial != 0 or pressure_size % n_radial != 0 or er_size % n_radial != 0:
         raise ValueError(
-            "Packed Radau component sizes are not compatible with one shared radial grid."
+            "Packed Radau component sizes are not compatible with one shared radial grid; "
+            f"n_radial={n_radial}, density_size={density_size}, "
+            f"pressure_size={pressure_size}, er_size={er_size}."
+        )
+    if extra_size % n_radial != 0:
+        raise ValueError(
+            "Packed Radau extra state tail is not compatible with the inferred radial grid; "
+            f"state_dim={state_dim}, n_radial={n_radial}, density_size={density_size}, "
+            f"pressure_size={pressure_size}, er_size={er_size}, extra_size={extra_size}."
         )
     density_species_count = density_size // n_radial
     pressure_species_count = pressure_size // n_radial
@@ -7908,16 +7934,23 @@ def _radau_infer_radial_block_layout(kernel_context: _RadauAcceptedStepKernelCon
             "Expected at most one Er unknown per radial cell in the packed Radau state; "
             f"got {er_count}."
         )
-    variables_per_cell = density_species_count + pressure_species_count + er_count
+    extra_per_cell_count = extra_size // n_radial
+    variables_per_cell = density_species_count + pressure_species_count + er_count + extra_per_cell_count
     if variables_per_cell * n_radial != state_dim:
         raise ValueError(
-            "Inferred radial block layout does not reproduce the packed state size."
+            "Inferred radial block layout does not reproduce the packed state size; "
+            f"state_dim={state_dim}, n_radial={n_radial}, variables_per_cell={variables_per_cell}, "
+            f"density_species_count={density_species_count}, "
+            f"pressure_species_count={pressure_species_count}, er_count={er_count}, "
+            f"extra_per_cell_count={extra_per_cell_count}."
         )
     return _RadauRadialBlockLayout(
         n_radial=n_radial,
         density_species_count=density_species_count,
         pressure_species_count=pressure_species_count,
         has_er=bool(er_count),
+        extra_per_cell_count=extra_per_cell_count,
+        extra_size=extra_size,
         variables_per_cell=variables_per_cell,
     )
 
@@ -7933,6 +7966,7 @@ def _radau_stage_stack_to_radial_blocks(
     )
     density_end = int(kernel_context.density_size)
     pressure_end = density_end + int(kernel_context.pressure_size)
+    er_end = pressure_end + int(kernel_context.er_size)
     pieces = []
     if layout.density_species_count:
         density = stage_stack[:, :density_end].reshape(
@@ -7945,10 +7979,15 @@ def _radau_stage_stack_to_radial_blocks(
         )
         pieces.append(jnp.swapaxes(pressure, 1, 2))
     if layout.has_er:
-        er = stage_stack[:, pressure_end:pressure_end + int(kernel_context.er_size)].reshape(
+        er = stage_stack[:, pressure_end:er_end].reshape(
             (kernel_context.num_stages, 1, layout.n_radial)
         )
         pieces.append(jnp.swapaxes(er, 1, 2))
+    if layout.extra_per_cell_count:
+        extra = stage_stack[:, er_end:].reshape(
+            (kernel_context.num_stages, layout.extra_per_cell_count, layout.n_radial)
+        )
+        pieces.append(jnp.swapaxes(extra, 1, 2))
     per_stage_blocks = jnp.concatenate(pieces, axis=2)
     return jnp.swapaxes(per_stage_blocks, 0, 1).reshape(
         (layout.n_radial, int(kernel_context.num_stages) * layout.variables_per_cell)
@@ -7978,6 +8017,10 @@ def _radau_radial_blocks_to_stage_stack(
     if layout.has_er:
         er = per_stage_blocks[:, :, cursor:cursor + 1]
         pieces.append(jnp.swapaxes(er, 1, 2).reshape((kernel_context.num_stages, -1)))
+        cursor += 1
+    if layout.extra_per_cell_count:
+        extra = per_stage_blocks[:, :, cursor:cursor + layout.extra_per_cell_count]
+        pieces.append(jnp.swapaxes(extra, 1, 2).reshape((kernel_context.num_stages, -1)))
     return jnp.concatenate(pieces, axis=1)
 
 
