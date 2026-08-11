@@ -293,6 +293,32 @@ def _unpack_transport_state_arrays(
     return state_like
 
 
+def _unpack_transport_state_cotangent_arrays(
+    state_like: Any,
+    template_state: Any,
+    species: Any = None,
+) -> Any:
+    """Rebuild a TransportState-shaped cotangent from the packed solver layout."""
+    if (
+        dataclasses.is_dataclass(template_state)
+        and hasattr(template_state, "density")
+        and hasattr(template_state, "pressure")
+        and hasattr(template_state, "Er")
+        and isinstance(state_like, tuple)
+        and len(state_like) == 3
+    ):
+        density_bar, pressure_bar, er_bar = state_like
+        eidx = _electron_density_index(species)
+        if eidx is not None and density_bar.shape[-2] == template_state.density.shape[0] - 1:
+            full_shape = pressure_bar.shape[:-2] + (template_state.density.shape[0], pressure_bar.shape[-1])
+            full_density_bar = jnp.zeros(full_shape, dtype=density_bar.dtype)
+            full_density_bar = full_density_bar.at[..., :eidx, :].set(density_bar[..., :eidx, :])
+            full_density_bar = full_density_bar.at[..., eidx + 1 :, :].set(density_bar[..., eidx:, :])
+            density_bar = full_density_bar
+        return dataclasses.replace(template_state, density=density_bar, pressure=pressure_bar, Er=er_bar)
+    return state_like
+
+
 def _restore_state_metadata(state_like: Any, template_state: Any) -> Any:
     """Hook for restoring state metadata after solver calls."""
     return state_like
@@ -479,6 +505,15 @@ def _make_solver_state_transform(
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
+
+    def unpack_flat_cotangent(flat_y):
+        return _unpack_transport_state_cotangent_arrays(
+            unravel_packed(flat_y),
+            template_state,
+            species,
+        )
+
+    unpack_flat.cotangent = unpack_flat_cotangent
 
     def unpack_packed(packed_state_like):
         return _unpack_transport_state_arrays(
@@ -1000,6 +1035,7 @@ def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwar
     pullback_fn = _lagged_response_eval_pullback_hook(vector_field)
     if pullback_fn is None:
         return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
 
     def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1007,7 +1043,7 @@ def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwar
             project_flat,
         )
         state_y = unravel(projected_flat_y)
-        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        rhs_bar_state = unravel_bar(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
         return pullback_fn(
             t_value,
             state_y,
@@ -1045,6 +1081,7 @@ def _flat_rhs_lagged_response_support_pullback_factory(unravel, vector_field, ar
     pullback_fn = _lagged_response_eval_support_pullback_hook(vector_field)
     if pullback_fn is None:
         return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
 
     def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat, support):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1052,7 +1089,7 @@ def _flat_rhs_lagged_response_support_pullback_factory(unravel, vector_field, ar
             project_flat,
         )
         state_y = unravel(projected_flat_y)
-        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        rhs_bar_state = unravel_bar(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
         return pullback_fn(
             t_value,
             state_y,
@@ -1070,6 +1107,7 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
     pullback_fn = _lagged_response_state_pullback_hook(vector_field)
     if pullback_fn is None:
         return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
 
     def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1077,7 +1115,7 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
             project_flat,
         )
         state_y = unravel(projected_flat_y)
-        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        rhs_bar_state = unravel_bar(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
         state_bar = pullback_fn(
             t_value,
             state_y,
@@ -1122,6 +1160,7 @@ def _flat_rhs_split_state_pullback_factory(
         raise ValueError(f"Unknown RHS-state pullback component {component!r}.")
     if pullback_fn is None:
         return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
 
     def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1129,7 +1168,7 @@ def _flat_rhs_split_state_pullback_factory(
             project_flat,
         )
         state_y = unravel(projected_flat_y)
-        rhs_bar_state = unravel(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        rhs_bar_state = unravel_bar(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
         state_bar = pullback_fn(
             t_value,
             state_y,
