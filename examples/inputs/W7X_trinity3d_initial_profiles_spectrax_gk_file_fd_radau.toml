@@ -9,7 +9,7 @@ mode = "transport"
 [geometry]
 vmec_file = "./examples/inputs/wout_w7x.nc"
 boozer_file = "./examples/inputs/boozmn_w7x.nc"
-n_radial = 9
+n_radial = 8
 rho_edge = 0.7
 
 [neoclassical]

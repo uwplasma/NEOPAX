@@ -89,7 +89,18 @@ def test_transport_flux_base_lagged_response_is_flux_linearization():
     assert jnp.allclose(out["Upar"], exact["Upar"])
 
 
-def _write_flux_file(path: Path, r, gamma=None, q=None, upar=None):
+def _write_flux_file(
+    path: Path,
+    r,
+    gamma=None,
+    q=None,
+    upar=None,
+    *,
+    r_center=None,
+    gamma_center=None,
+    q_center=None,
+    upar_center=None,
+):
     with h5py.File(path, "w") as f:
         f["r"] = jnp.asarray(r)
         if gamma is not None:
@@ -98,6 +109,14 @@ def _write_flux_file(path: Path, r, gamma=None, q=None, upar=None):
             f["Q"] = jnp.asarray(q)
         if upar is not None:
             f["Upar"] = jnp.asarray(upar)
+        if r_center is not None:
+            f["r_center"] = jnp.asarray(r_center)
+        if gamma_center is not None:
+            f["Gamma_center"] = jnp.asarray(gamma_center)
+        if q_center is not None:
+            f["Q_center"] = jnp.asarray(q_center)
+        if upar_center is not None:
+            f["Upar_center"] = jnp.asarray(upar_center)
 
 
 def test_read_flux_profile_file_accepts_1d_and_2d_inputs(tmp_path):
@@ -116,6 +135,131 @@ def test_read_flux_profile_file_accepts_1d_and_2d_inputs(tmp_path):
     assert upar_data is None
     assert jnp.allclose(gamma_data[0], jnp.array([1.0, 2.0, 3.0]))
     assert jnp.allclose(gamma_data[1], jnp.array([1.0, 2.0, 3.0]))
+
+
+def test_fluxes_r_file_default_is_face_centered_and_reconstructs_cells(tmp_path):
+    path = tmp_path / "default_face_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    q_faces = jnp.array([[10.0, 30.0, 50.0], [20.0, 40.0, 60.0]])
+    _write_flux_file(path, r=[0.0, 0.5, 1.0], gamma=gamma_faces, q=q_faces)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+        )
+
+    center_fluxes = model(state=None)
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+
+    assert jnp.allclose(face_fluxes["Gamma"], gamma_faces)
+    assert jnp.allclose(face_fluxes["Q"], q_faces)
+    assert jnp.allclose(center_fluxes["Gamma"], jnp.vstack([cell_centered_from_faces(gamma_faces[0]), cell_centered_from_faces(gamma_faces[1])]))
+    assert jnp.allclose(center_fluxes["Q"], jnp.vstack([cell_centered_from_faces(q_faces[0]), cell_centered_from_faces(q_faces[1])]))
+    assert jnp.allclose(center_fluxes["Gamma_faces"], gamma_faces)
+    assert jnp.allclose(center_fluxes["Q_faces"], q_faces)
+
+
+def test_fluxes_r_file_default_rejects_center_only_grid_that_misses_boundary_faces(tmp_path):
+    path = tmp_path / "center_only_fluxes.h5"
+    gamma = jnp.array([[1.0, 3.0], [2.0, 4.0]])
+    q = jnp.array([[10.0, 30.0], [20.0, 40.0]])
+    _write_flux_file(path, r=[0.25, 0.75], gamma=gamma, q=q)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="does not cover"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_cell_grid(tmp_path):
+    path = tmp_path / "narrow_cell_fluxes.h5"
+    _write_flux_file(path, r=[0.3, 0.7], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_face_grid(tmp_path):
+    path = tmp_path / "narrow_face_fluxes.h5"
+    _write_flux_file(path, r=[0.0, 0.5, 0.9], gamma=jnp.ones((2, 3)), q=jnp.ones((2, 3)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid_half"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="face_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_too_short_to_interpolate(tmp_path):
+    path = tmp_path / "single_point_fluxes.h5"
+    _write_flux_file(path, r=[0.5], gamma=jnp.ones((2, 1)), q=jnp.ones((2, 1)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"at least 2"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_descending_file_grid(tmp_path):
+    path = tmp_path / "descending_fluxes.h5"
+    _write_flux_file(path, r=[0.75, 0.25], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"strictly increasing"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_with_non_finite_radii(tmp_path):
+    path = tmp_path / "nonfinite_fluxes.h5"
+    _write_flux_file(path, r=[0.25, jnp.nan], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"non-finite"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_accepts_a_file_whose_endpoints_touch_the_grid(tmp_path):
+    path = tmp_path / "touching_fluxes.h5"
+    gamma = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    _write_flux_file(path, r=[0.25, 0.5, 0.75], gamma=gamma, q=gamma)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            grid_location="cell_centered",
+        )
+
+    assert jnp.all(jnp.isfinite(model(state=None)["Gamma"]))
 
 
 def test_fluxes_r_file_model_cell_centered_reconstructs_faces(tmp_path):
@@ -188,6 +332,55 @@ def test_fluxes_r_file_model_face_centered_reconstructs_cells(tmp_path):
     center_fluxes = model(state=None)
     assert jnp.allclose(center_fluxes["Gamma"], jnp.vstack([cell_centered_from_faces(gamma_faces[0]), cell_centered_from_faces(gamma_faces[1])]))
     assert jnp.allclose(center_fluxes["Q"], jnp.vstack([cell_centered_from_faces(q_faces[0]), cell_centered_from_faces(q_faces[1])]))
+
+
+def test_fluxes_r_file_direct_center_mode_reads_center_datasets(tmp_path):
+    path = tmp_path / "face_and_center_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    q_faces = jnp.array([[10.0, 30.0, 50.0], [20.0, 40.0, 60.0]])
+    gamma_center = jnp.array([[11.0, 13.0], [12.0, 14.0]])
+    q_center = jnp.array([[110.0, 130.0], [120.0, 140.0]])
+    _write_flux_file(
+        path,
+        r=[0.0, 0.5, 1.0],
+        gamma=gamma_faces,
+        q=q_faces,
+        r_center=[0.25, 0.75],
+        gamma_center=gamma_center,
+        q_center=q_center,
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            center_flux_mode="file_center",
+        )
+
+    center_fluxes = model(state=None)
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+
+    assert jnp.allclose(face_fluxes["Gamma"], gamma_faces)
+    assert jnp.allclose(face_fluxes["Q"], q_faces)
+    assert jnp.allclose(center_fluxes["Gamma"], gamma_center)
+    assert jnp.allclose(center_fluxes["Q"], q_center)
+
+
+def test_fluxes_r_file_direct_center_mode_requires_center_datasets(tmp_path):
+    path = tmp_path / "missing_center_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    _write_flux_file(path, r=[0.0, 0.5, 1.0], gamma=gamma_faces)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.warns(RuntimeWarning, match="center_flux_mode='file_center'"):
+            with pytest.raises(ValueError, match="requires center-grid datasets"):
+                build_fluxes_r_file_transport_model(
+                    DummySpecies(),
+                    DummyGeometry(),
+                    fluxes_file=path,
+                    center_flux_mode="file_center",
+                )
 
 
 def test_fluxes_r_file_with_q_scale_returns_updated_model(tmp_path):
@@ -268,12 +461,30 @@ def test_fd_lagged_response_rejects_a_flux_file_off_the_geometry_grid(tmp_path):
     _write_fd_flux_file(path, r=[0.1, 0.3, 0.6, 0.9])
 
     with contextlib.redirect_stdout(io.StringIO()):
-        with pytest.raises(ValueError, match="match NEOPAX geometry"):
+        with pytest.raises(ValueError, match="does not cover|primary NEOPAX flux grid"):
             build_fluxes_r_file_transport_model(
                 DummyFDSpecies(),
                 DummyFDGeometry(),
                 fluxes_file=path,
-                grid_location="cell_centered",
+                lagged_response_mode="fd",
+            )
+
+
+def test_fd_lagged_response_rejects_center_length_perturbation_data_on_face_grid(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_bad_perturb_shape_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
+    with h5py.File(path, "r+") as f:
+        center_n = geometry.r_grid.shape[0]
+        del f["Q_perturb"]
+        f["Q_perturb"] = jnp.ones((1, 2, center_n))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="Q_perturb/Q_perturbed"):
+            build_fluxes_r_file_transport_model(
+                DummyFDSpecies(),
+                geometry,
+                fluxes_file=path,
                 lagged_response_mode="fd",
             )
 
@@ -281,14 +492,13 @@ def test_fd_lagged_response_rejects_a_flux_file_off_the_geometry_grid(tmp_path):
 def test_fd_lagged_response_builds_under_jit(tmp_path):
     geometry = DummyFDGeometry()
     path = tmp_path / "fd_fluxes.h5"
-    _write_fd_flux_file(path, r=geometry.r_grid)
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
 
     with contextlib.redirect_stdout(io.StringIO()):
         model = build_fluxes_r_file_transport_model(
             DummyFDSpecies(),
             geometry,
             fluxes_file=path,
-            grid_location="cell_centered",
             lagged_response_mode="fd",
         )
     state = _fd_state(geometry.r_grid.shape[0])
@@ -297,7 +507,7 @@ def test_fd_lagged_response_builds_under_jit(tmp_path):
     jitted = jax.jit(model.build_lagged_response)(state)
 
     assert isinstance(jitted, SpectraXTurbulenceFDLaggedResponse)
-    assert jnp.allclose(jitted.reference_flux["Q"], eager.reference_flux["Q"])
+    assert jnp.allclose(jitted.reference_flux["Q_faces"], eager.reference_flux["Q_faces"])
     assert jnp.allclose(jitted.reference_basis, eager.reference_basis)
     assert jnp.allclose(jitted.q_perturb, eager.q_perturb)
 

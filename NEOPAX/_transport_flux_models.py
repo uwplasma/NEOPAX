@@ -14,6 +14,7 @@ import lineax
 import numpy as np
 import sys
 import types
+import warnings
 from pathlib import Path
 from ._cell_variable import (
     get_gradient_density,
@@ -10394,6 +10395,31 @@ def read_flux_profile_file(path, n_species):
     return r_arr, gamma_arr, q_arr, upar_arr
 
 
+def read_flux_profile_center_file(path, n_species):
+    with h5py.File(path, "r") as f:
+        keys = set(f.keys())
+
+        def _first(*names):
+            for name in names:
+                if name in keys:
+                    return f[name][...]
+            return None
+
+        r = _first("r_center", "rho_center", "r_grid_center", "radius_center")
+        gamma = _first("Gamma_center", "gamma_center")
+        q = _first("Q_center", "q_center")
+        upar = _first("Upar_center", "upar_center", "u_par_center")
+
+    if r is None or (gamma is None and q is None and upar is None):
+        return None
+
+    r_arr = jnp.ravel(jnp.asarray(r, dtype=float))
+    gamma_arr = None if gamma is None else _normalize_flux_dataset(gamma, n_species)
+    q_arr = None if q is None else _normalize_flux_dataset(q, n_species)
+    upar_arr = None if upar is None else _normalize_flux_dataset(upar, n_species)
+    return r_arr, gamma_arr, q_arr, upar_arr
+
+
 def read_flux_profile_fd_response_file(path, n_species, species_names):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
@@ -10446,7 +10472,55 @@ def _require_matching_fd_grid(file_r, target_r):
     if file_r.shape != target_r.shape or not bool(jnp.allclose(file_r, target_r, rtol=0.0, atol=1.0e-12)):
         raise ValueError(
             "fluxes_r_file lagged_response_mode='fd' currently requires the file radial grid "
-            "to match NEOPAX geometry.r_grid exactly."
+            "to match the primary NEOPAX flux grid exactly."
+        )
+
+
+def _require_matching_flux_grid(file_r, target_r, *, label):
+    file_r = jnp.asarray(file_r, dtype=jnp.float64)
+    target_r = jnp.asarray(target_r, dtype=jnp.float64)
+    if file_r.shape != target_r.shape or not bool(jnp.allclose(file_r, target_r, rtol=0.0, atol=1.0e-12)):
+        raise ValueError(
+            f"fluxes_r_file {label} radial grid must match the corresponding NEOPAX geometry grid exactly."
+        )
+
+
+def _require_interpolatable_flux_grid(file_r, target_r, target_name):
+    file_r = jnp.asarray(file_r, dtype=jnp.float64)
+    target_r = jnp.asarray(target_r, dtype=jnp.float64)
+    if file_r.size < 2:
+        raise ValueError(
+            f"fluxes_r_file radial grid holds {file_r.size} entries; interpolation needs at least 2. "
+            "The finiteness and ordering checks below are vacuous on a shorter grid."
+        )
+    if not bool(jnp.all(jnp.isfinite(file_r))):
+        raise ValueError(
+            "fluxes_r_file radial grid holds non-finite entries, which interpolate to NaN at every radius."
+        )
+    if not bool(jnp.all(jnp.diff(file_r) > 0.0)):
+        raise ValueError(
+            "fluxes_r_file radial grid must be strictly increasing. interpax takes its first and last "
+            "entries as the interpolation bounds, so a descending grid interpolates to NaN everywhere "
+            "and an unordered one silently reads from the wrong interval."
+        )
+    # Bounds come from the end points rather than min/max, matching how interpax reads them.
+    file_lo, file_hi = float(file_r[0]), float(file_r[-1])
+    target_lo, target_hi = float(jnp.min(target_r)), float(jnp.max(target_r))
+    if not (file_lo <= target_lo and target_hi <= file_hi):
+        raise ValueError(
+            f"fluxes_r_file radial grid [{file_lo:.6e}, {file_hi:.6e}] does not cover "
+            f"{target_name} [{target_lo:.6e}, {target_hi:.6e}]. Radii outside the file grid "
+            "interpolate to NaN and would reach the transport solve unreported."
+        )
+
+
+def _require_fd_response_radial_shape(name, arr, target_r):
+    arr = jnp.asarray(arr)
+    target_n = int(jnp.asarray(target_r).shape[0])
+    if arr.shape[-1] != target_n:
+        raise ValueError(
+            f"fluxes_r_file lagged_response_mode='fd' dataset {name} has radial length "
+            f"{arr.shape[-1]}, expected {target_n} to match the primary NEOPAX flux grid."
         )
 
 
@@ -10501,7 +10575,7 @@ def build_fluxes_r_file_transport_model(
     neoclassical_file=None,
     turbulence_file=None,
     classical_file=None,
-    grid_location="cell_centered",
+    grid_location="face_centered",
     profile_location=None,
     **kwargs,
 ):
@@ -10520,6 +10594,12 @@ def build_fluxes_r_file_transport_model(
             kwargs.pop("response_mode", "none"),
         )
     ).strip().lower()
+    center_flux_mode = str(
+        kwargs.pop(
+            "center_flux_mode",
+            kwargs.pop("center_response_mode", "interpolate_from_faces"),
+        )
+    ).strip().lower()
     path = (
         fluxes_file
         or file
@@ -10535,6 +10615,30 @@ def build_fluxes_r_file_transport_model(
     )
     location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    normalized_location_for_check = str(location).strip().lower()
+    if normalized_location_for_check in {"face", "faces", "face_centered", "face-centred", "face_centred"}:
+        _require_interpolatable_flux_grid(r_data, geometry.r_grid_half, "geometry.r_grid_half")
+    elif normalized_location_for_check in {"cell", "cells", "center", "centers", "cell_centered", "cell-centred", "cell_centred"}:
+        _require_interpolatable_flux_grid(r_data, geometry.r_grid, "geometry.r_grid")
+    center_r_data = None
+    center_gamma_data = None
+    center_q_data = None
+    center_upar_data = None
+    if center_flux_mode in {"file_center", "file_centers", "direct_file_center", "direct"}:
+        center_payload = read_flux_profile_center_file(path, species.number_species)
+        if center_payload is None:
+            warnings.warn(
+                "fluxes_r_file center_flux_mode='file_center' requested, but the file does not contain "
+                "center datasets (r_center/rho_center plus Gamma_center/Q_center/Upar_center).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            raise ValueError(
+                "fluxes_r_file center_flux_mode='file_center' requires center-grid datasets in the flux file."
+            )
+        center_r_data, center_gamma_data, center_q_data, center_upar_data = center_payload
+        _require_interpolatable_flux_grid(center_r_data, geometry.r_grid, "geometry.r_grid")
+        _require_matching_flux_grid(center_r_data, geometry.r_grid, label="center")
     gamma_perturb_data = None
     q_perturb_data = None
     perturb_delta_data = None
@@ -10550,7 +10654,11 @@ def build_fluxes_r_file_transport_model(
             perturb_kind_codes,
             perturb_species_indices,
         ) = read_flux_profile_fd_response_file(path, species.number_species, species.names)
-        _require_matching_fd_grid(r_data, geometry.r_grid)
+        _require_matching_fd_grid(r_data, geometry.r_grid_half)
+        _require_fd_response_radial_shape("Gamma_perturb/Gamma_perturbed", gamma_perturb_data, geometry.r_grid_half)
+        _require_fd_response_radial_shape("Q_perturb/Q_perturbed", q_perturb_data, geometry.r_grid_half)
+        _require_fd_response_radial_shape("perturb_delta", perturb_delta_data, geometry.r_grid_half)
+        _require_fd_response_radial_shape("perturb_present", perturb_present_data, geometry.r_grid_half)
     r_finite = jnp.isfinite(r_data)
     r_nfinite = int(jnp.sum(r_finite))
     if r_nfinite > 0:
@@ -10565,7 +10673,7 @@ def build_fluxes_r_file_transport_model(
     print(
         "[NEOPAX] fluxes_r_file loaded: "
         f"path={path} profile_location={str(location).strip().lower()} "
-        f"r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
+        f"center_flux_mode={center_flux_mode} r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
     )
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Q', q_data)}")
@@ -10578,6 +10686,7 @@ def build_fluxes_r_file_transport_model(
         q_data=q_data,
         upar_data=upar_data,
         profile_location=str(location).strip().lower(),
+        center_flux_mode=center_flux_mode,
         q_scale=q_scale,
         lagged_response_mode=lagged_response_mode,
         gamma_perturb_data=gamma_perturb_data,
@@ -10586,6 +10695,10 @@ def build_fluxes_r_file_transport_model(
         perturb_present_data=perturb_present_data,
         perturb_kind_codes=perturb_kind_codes,
         perturb_species_indices=perturb_species_indices,
+        center_r_data=center_r_data,
+        center_gamma_data=center_gamma_data,
+        center_q_data=center_q_data,
+        center_upar_data=center_upar_data,
     )
 
 
@@ -10597,7 +10710,8 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     gamma_data: Any = None
     q_data: Any = None
     upar_data: Any = None
-    profile_location: str = "cell_centered"
+    profile_location: str = "face_centered"
+    center_flux_mode: str = "interpolate_from_faces"
     q_scale: float = 1.0
     lagged_response_mode: str = "none"
     gamma_perturb_data: Any = None
@@ -10606,6 +10720,10 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
     perturb_present_data: Any = None
     perturb_kind_codes: Any = None
     perturb_species_indices: Any = None
+    center_r_data: Any = None
+    center_gamma_data: Any = None
+    center_q_data: Any = None
+    center_upar_data: Any = None
 
     def with_q_scale(self, q_scale: float) -> "FluxesRFileTransportModel":
         return dataclasses.replace(self, q_scale=float(q_scale))
@@ -10614,6 +10732,13 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         if data is None:
             return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
+
+    def _interp_center_species_profile(self, data, target_r):
+        if data is None:
+            return jnp.zeros((self.species.number_species, target_r.shape[0]), dtype=target_r.dtype)
+        if self.center_r_data is None:
+            raise ValueError("fluxes_r_file center grid data is missing.")
+        return jax.vmap(lambda prof: interpax.interp1d(target_r, self.center_r_data, prof))(data)
 
     def _normalize_profile_location(self):
         location = str(self.profile_location).strip().lower()
@@ -10638,7 +10763,34 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             )
         return aliases[location]
 
+    def _normalize_center_flux_mode(self):
+        mode = str(self.center_flux_mode).strip().lower()
+        aliases = {
+            "interpolate": "interpolate_from_faces",
+            "interpolate_from_faces": "interpolate_from_faces",
+            "from_faces": "interpolate_from_faces",
+            "cell_centered_from_faces": "interpolate_from_faces",
+            "file_center": "file_center",
+            "file_centers": "file_center",
+            "direct": "file_center",
+            "direct_file_center": "file_center",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                f"Unsupported fluxes_r_file center_flux_mode '{self.center_flux_mode}'. "
+                "Expected interpolate_from_faces or file_center."
+            )
+        return aliases[mode]
+
     def _data_on_cell_grid(self, data):
+        center_mode = self._normalize_center_flux_mode()
+        if center_mode == "file_center":
+            if data is self.gamma_data:
+                return self._interp_center_species_profile(self.center_gamma_data, self.geometry.r_grid)
+            if data is self.q_data:
+                return self._interp_center_species_profile(self.center_q_data, self.geometry.r_grid)
+            if data is self.upar_data:
+                return self._interp_center_species_profile(self.center_upar_data, self.geometry.r_grid)
         location = self._normalize_profile_location()
         if location == "cell_centered":
             return self._interp_species_profile(data, self.geometry.r_grid)
@@ -10698,12 +10850,24 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             )
         )(self.perturb_kind_codes, self.perturb_species_indices)
 
+    def _spectrax_fd_face_basis(self, state):
+        center_basis = self._spectrax_fd_basis(state)
+        return jax.vmap(faces_from_cell_centered)(center_basis)
+
     def __call__(self, state) -> dict:
         del state
         gamma = self._data_on_cell_grid(self.gamma_data)
         q = self.q_scale * self._data_on_cell_grid(self.q_data)
         upar = self._data_on_cell_grid(self.upar_data)
-        return {"Gamma": gamma, "Q": q, "Upar": upar}
+        face_fluxes = self.evaluate_face_fluxes(None, None)
+        return {
+            "Gamma": gamma,
+            "Q": q,
+            "Upar": upar,
+            "Gamma_faces": face_fluxes["Gamma"],
+            "Q_faces": face_fluxes["Q"],
+            "Upar_faces": face_fluxes["Upar"],
+        }
 
     def build_local_particle_flux_evaluator(self, state):
         del state
@@ -10740,7 +10904,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),
-            reference_basis=self._spectrax_fd_basis(state),
+            reference_basis=self._spectrax_fd_face_basis(state),
             perturb_kind_codes=self.perturb_kind_codes,
             perturb_species_indices=self.perturb_species_indices,
             perturb_delta=jnp.asarray(self.perturb_delta_data, dtype=float),
@@ -10771,7 +10935,7 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 tangent_flux,
             )
 
-        current_basis = self._spectrax_fd_basis(state)
+        current_basis = self._spectrax_fd_face_basis(state)
         delta_basis = current_basis - lagged_response.reference_basis
         perturb_present = lagged_response.perturb_present[:, None, :]
         safe_delta = jnp.where(
@@ -10781,20 +10945,27 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         )
         dgamma = jnp.where(
             perturb_present,
-            (lagged_response.gamma_perturb - lagged_response.reference_flux["Gamma"][None, :, :]) / safe_delta[:, None, :],
+            (lagged_response.gamma_perturb - lagged_response.reference_flux["Gamma_faces"][None, :, :]) / safe_delta[:, None, :],
             0.0,
         )
         dq = jnp.where(
             perturb_present,
-            (lagged_response.q_perturb - lagged_response.reference_flux["Q"][None, :, :]) / safe_delta[:, None, :],
+            (lagged_response.q_perturb - lagged_response.reference_flux["Q_faces"][None, :, :]) / safe_delta[:, None, :],
             0.0,
         )
-        gamma = lagged_response.reference_flux["Gamma"] + jnp.sum(dgamma * delta_basis[:, None, :], axis=0)
-        q = lagged_response.reference_flux["Q"] + jnp.sum(dq * delta_basis[:, None, :], axis=0)
+        gamma_faces = lagged_response.reference_flux["Gamma_faces"] + jnp.sum(dgamma * delta_basis[:, None, :], axis=0)
+        q_faces = lagged_response.reference_flux["Q_faces"] + jnp.sum(dq * delta_basis[:, None, :], axis=0)
+        upar_faces = lagged_response.reference_flux["Upar_faces"]
+        gamma = jax.vmap(cell_centered_from_faces)(gamma_faces)
+        q = jax.vmap(cell_centered_from_faces)(q_faces)
+        upar = jax.vmap(cell_centered_from_faces)(upar_faces)
         return {
             "Gamma": gamma,
             "Q": q,
-            "Upar": lagged_response.reference_flux["Upar"],
+            "Upar": upar,
+            "Gamma_faces": gamma_faces,
+            "Q_faces": q_faces,
+            "Upar_faces": upar_faces,
         }
 
 
