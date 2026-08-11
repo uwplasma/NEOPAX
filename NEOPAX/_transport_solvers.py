@@ -7815,6 +7815,21 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         stage_states,
         lambda_stages,
     )
+    full_lagged_generic_jt_lambda_stages = jax.vmap(
+        lambda t_eval, y_eval, lambda_eval: jax.vjp(
+            lambda y_value: physics_context.flat_rhs_with_lagged_response(
+                t_eval,
+                y_value,
+                lagged_response,
+            ),
+            y_eval,
+        )[1](lambda_eval)[0],
+        in_axes=(0, 0, 0),
+    )(
+        stage_times,
+        stage_states,
+        lambda_stages,
+    )
     generic_coupled = kernel_context.a.T @ generic_jt_lambda_stages
     generic_compact = (
         lambda_stages - primal_result.trial_dt * generic_coupled
@@ -7986,6 +8001,12 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         if joint_generic_jt_lambda_stages is not None
         else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
     )
+    full_lagged_generic_diff = full_lagged_generic_jt_lambda_stages - generic_jt_lambda_stages
+    explicit_vs_full_lagged_generic_diff = (
+        explicit_jt_lambda_stages - full_lagged_generic_jt_lambda_stages
+        if explicit_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
     split_rhs_state_diff_l2 = (
         _tree_l2(split_rhs_state_diff)
         if split_sum_jt_lambda_stages is not None
@@ -8014,6 +8035,12 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     joint_generic_diff_l2 = (
         _tree_l2(joint_generic_diff)
         if joint_generic_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    full_lagged_generic_diff_l2 = _tree_l2(full_lagged_generic_diff)
+    explicit_vs_full_lagged_generic_diff_l2 = (
+        _tree_l2(explicit_vs_full_lagged_generic_diff)
+        if explicit_jt_lambda_stages is not None
         else diagnostic_nan
     )
     split_rhs_state_rel_err = split_rhs_state_diff_l2 / jnp.maximum(
@@ -8063,6 +8090,16 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     joint_generic_pressure_diff_l2 = (
         _tree_l2(joint_generic_diff[:, density_end:pressure_end])
         if joint_generic_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    full_lagged_generic_pressure_diff_l2 = (
+        _tree_l2(full_lagged_generic_diff[:, density_end:pressure_end])
+        if int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    explicit_vs_full_lagged_generic_pressure_diff_l2 = (
+        _tree_l2(explicit_vs_full_lagged_generic_diff[:, density_end:pressure_end])
+        if explicit_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
         else diagnostic_nan
     )
     projected_explicit_pressure_diff_l2 = (
@@ -8135,6 +8172,10 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "generic_diff_l2": generic_diff_l2,
         "generic_rel_err": generic_rel_err,
         "generic_max_abs_diff": jnp.max(jnp.abs(generic_diff)),
+        "full_lagged_generic_diff_l2": full_lagged_generic_diff_l2,
+        "full_lagged_generic_pressure_diff_l2": full_lagged_generic_pressure_diff_l2,
+        "explicit_vs_full_lagged_generic_diff_l2": explicit_vs_full_lagged_generic_diff_l2,
+        "explicit_vs_full_lagged_generic_pressure_diff_l2": explicit_vs_full_lagged_generic_pressure_diff_l2,
         "explicit_rhs_state_diff_l2": explicit_rhs_state_diff_l2,
         "explicit_rhs_state_rel_err": explicit_rhs_state_rel_err,
         "explicit_rhs_state_max_abs_diff": (

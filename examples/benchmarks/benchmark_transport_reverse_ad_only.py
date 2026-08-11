@@ -4210,6 +4210,14 @@ def _run_local_stage_matvec_diagnostic_report(
         "generic_diff_l2": float(diagnostic["generic_diff_l2"]),
         "generic_rel_err": float(diagnostic["generic_rel_err"]),
         "generic_max_abs_diff": float(diagnostic["generic_max_abs_diff"]),
+        "full_lagged_generic_diff_l2": float(diagnostic["full_lagged_generic_diff_l2"]),
+        "full_lagged_generic_pressure_diff_l2": float(diagnostic["full_lagged_generic_pressure_diff_l2"]),
+        "explicit_vs_full_lagged_generic_diff_l2": float(
+            diagnostic["explicit_vs_full_lagged_generic_diff_l2"]
+        ),
+        "explicit_vs_full_lagged_generic_pressure_diff_l2": float(
+            diagnostic["explicit_vs_full_lagged_generic_pressure_diff_l2"]
+        ),
         "explicit_rhs_state_diff_l2": float(diagnostic["explicit_rhs_state_diff_l2"]),
         "explicit_rhs_state_rel_err": float(diagnostic["explicit_rhs_state_rel_err"]),
         "explicit_rhs_state_max_abs_diff": float(diagnostic["explicit_rhs_state_max_abs_diff"]),
@@ -4274,7 +4282,9 @@ def _run_local_stage_matvec_diagnostic_report(
         "[autodiff-gate] local stage generic-vjp diagnostic values: "
         f"generic_diff_l2={report['generic_diff_l2']:.6e} "
         f"generic_rel_err={report['generic_rel_err']:.6e} "
-        f"generic_max_abs_diff={report['generic_max_abs_diff']:.6e}",
+        f"generic_max_abs_diff={report['generic_max_abs_diff']:.6e} "
+        f"full_lagged_generic_l2={report['full_lagged_generic_diff_l2']:.6e} "
+        f"full_lagged_generic_pressure_l2={report['full_lagged_generic_pressure_diff_l2']:.6e}",
         flush=True,
     )
     print(
@@ -4302,7 +4312,10 @@ def _run_local_stage_matvec_diagnostic_report(
         f"compact_direct_vs_generic_direct_pressure_l2="
         f"{report['compact_direct_vs_generic_direct_pressure_diff_l2']:.6e} "
         f"joint_generic_l2={report['joint_generic_diff_l2']:.6e} "
-        f"joint_generic_pressure_l2={report['joint_generic_pressure_diff_l2']:.6e}",
+        f"joint_generic_pressure_l2={report['joint_generic_pressure_diff_l2']:.6e} "
+        f"explicit_vs_full_lagged_generic_l2={report['explicit_vs_full_lagged_generic_diff_l2']:.6e} "
+        f"explicit_vs_full_lagged_generic_pressure_l2="
+        f"{report['explicit_vs_full_lagged_generic_pressure_diff_l2']:.6e}",
         flush=True,
     )
     print(
