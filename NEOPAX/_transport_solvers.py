@@ -943,6 +943,14 @@ def _lagged_response_flux_state_pullback_generic_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_joint_generic_state_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_joint_generic", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _lagged_response_build_support_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1108,6 +1116,8 @@ def _flat_rhs_split_state_pullback_factory(
         pullback_fn = _lagged_response_flux_state_pullback_hook(vector_field)
     elif component == "flux_generic":
         pullback_fn = _lagged_response_flux_state_pullback_generic_hook(vector_field)
+    elif component == "joint_generic":
+        pullback_fn = _lagged_response_joint_generic_state_pullback_hook(vector_field)
     else:
         raise ValueError(f"Unknown RHS-state pullback component {component!r}.")
     if pullback_fn is None:
@@ -3112,6 +3122,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_direct_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_flux_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_flux_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_joint_generic_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     exact_stage_transpose_solve_compact: Callable[..., Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
@@ -7844,6 +7855,21 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             stage_states,
             lambda_stages,
         )
+    joint_generic_jt_lambda_stages = None
+    if physics_context.flat_rhs_joint_generic_state_pullback is not None:
+        joint_generic_jt_lambda_stages = jax.vmap(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_joint_generic_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            ),
+            in_axes=(0, 0, 0),
+        )(
+            stage_times,
+            stage_states,
+            lambda_stages,
+        )
 
     def _tree_l2(value):
         value_arr = jnp.asarray(value, dtype=kernel_context.dtype).reshape((-1,))
@@ -7916,6 +7942,11 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         if direct_jt_lambda_stages is not None and generic_direct_jt_lambda_stages is not None
         else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
     )
+    joint_generic_diff = (
+        joint_generic_jt_lambda_stages - generic_jt_lambda_stages
+        if joint_generic_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
     split_rhs_state_diff_l2 = (
         _tree_l2(split_rhs_state_diff)
         if split_sum_jt_lambda_stages is not None
@@ -7939,6 +7970,11 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     compact_direct_vs_generic_direct_diff_l2 = (
         _tree_l2(compact_direct_vs_generic_direct_diff)
         if direct_jt_lambda_stages is not None and generic_direct_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
+    joint_generic_diff_l2 = (
+        _tree_l2(joint_generic_diff)
+        if joint_generic_jt_lambda_stages is not None
         else diagnostic_nan
     )
     split_rhs_state_rel_err = split_rhs_state_diff_l2 / jnp.maximum(
@@ -7983,6 +8019,11 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         if direct_jt_lambda_stages is not None
         and generic_direct_jt_lambda_stages is not None
         and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    joint_generic_pressure_diff_l2 = (
+        _tree_l2(joint_generic_diff[:, density_end:pressure_end])
+        if joint_generic_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
         else diagnostic_nan
     )
     projected_explicit_pressure_diff_l2 = (
@@ -8080,6 +8121,8 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "compact_flux_vs_generic_flux_pressure_diff_l2": compact_flux_vs_generic_flux_pressure_diff_l2,
         "compact_direct_vs_generic_direct_diff_l2": compact_direct_vs_generic_direct_diff_l2,
         "compact_direct_vs_generic_direct_pressure_diff_l2": compact_direct_vs_generic_direct_pressure_diff_l2,
+        "joint_generic_diff_l2": joint_generic_diff_l2,
+        "joint_generic_pressure_diff_l2": joint_generic_pressure_diff_l2,
         "explicit_rhs_state_density_diff_l2": explicit_density_diff_l2,
         "explicit_rhs_state_pressure_diff_l2": explicit_pressure_diff_l2,
         "explicit_rhs_state_er_tail_diff_l2": explicit_er_diff_l2,
@@ -14004,6 +14047,15 @@ def _build_prepared_radau_accepted_rollout(
         project_flat=project_flat,
         component="flux_generic",
     )
+    flat_rhs_joint_generic_state_pullback = _flat_rhs_split_state_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+        component="joint_generic",
+    )
     exact_stage_transpose_solve_compact = _exact_stage_transpose_solve_compact_hook(vector_field)
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     reverse_stage_adjoint_solve_mode = str(
@@ -14163,6 +14215,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_direct_state_pullback_generic=flat_rhs_direct_state_pullback_generic,
         flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
         flat_rhs_flux_state_pullback_generic=flat_rhs_flux_state_pullback_generic,
+        flat_rhs_joint_generic_state_pullback=flat_rhs_joint_generic_state_pullback,
         exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
