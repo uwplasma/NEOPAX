@@ -7807,12 +7807,32 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         if explicit_jt_lambda_stages is not None
         else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
     )
+    projected_explicit_jt_lambda_stages = None
+    if explicit_jt_lambda_stages is not None and physics_context.project_flat is not None:
+        projected_explicit_jt_lambda_stages = jax.vmap(
+            lambda y_eval, explicit_bar: jax.vjp(physics_context.project_flat, y_eval)[1](explicit_bar)[0],
+            in_axes=(0, 0),
+        )(stage_states, explicit_jt_lambda_stages)
+    projected_explicit_rhs_state_diff = (
+        projected_explicit_jt_lambda_stages - generic_jt_lambda_stages
+        if projected_explicit_jt_lambda_stages is not None
+        else jnp.full_like(generic_jt_lambda_stages, jnp.nan)
+    )
     explicit_rhs_state_diff_l2 = (
         _tree_l2(explicit_rhs_state_diff)
         if explicit_jt_lambda_stages is not None
         else diagnostic_nan
     )
+    projected_explicit_rhs_state_diff_l2 = (
+        _tree_l2(projected_explicit_rhs_state_diff)
+        if projected_explicit_jt_lambda_stages is not None
+        else diagnostic_nan
+    )
     explicit_rhs_state_rel_err = explicit_rhs_state_diff_l2 / jnp.maximum(
+        _tree_l2(generic_jt_lambda_stages),
+        jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+    )
+    projected_explicit_rhs_state_rel_err = projected_explicit_rhs_state_diff_l2 / jnp.maximum(
         _tree_l2(generic_jt_lambda_stages),
         jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
     )
@@ -7843,6 +7863,11 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     explicit_pressure_diff_l2 = (
         _tree_l2(explicit_rhs_state_diff[:, density_end:pressure_end])
         if explicit_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
+        else diagnostic_nan
+    )
+    projected_explicit_pressure_diff_l2 = (
+        _tree_l2(projected_explicit_rhs_state_diff[:, density_end:pressure_end])
+        if projected_explicit_jt_lambda_stages is not None and int(kernel_context.pressure_size) > 0
         else diagnostic_nan
     )
     explicit_er_diff_l2 = (
@@ -7917,6 +7942,9 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             if explicit_jt_lambda_stages is not None
             else diagnostic_nan
         ),
+        "projected_explicit_rhs_state_diff_l2": projected_explicit_rhs_state_diff_l2,
+        "projected_explicit_rhs_state_rel_err": projected_explicit_rhs_state_rel_err,
+        "projected_explicit_rhs_state_pressure_diff_l2": projected_explicit_pressure_diff_l2,
         "split_rhs_state_diff_l2": split_rhs_state_diff_l2,
         "split_rhs_state_rel_err": split_rhs_state_rel_err,
         "split_rhs_state_max_abs_diff": (
