@@ -242,6 +242,7 @@ The currently registered source models include:
 - ``fusion_power_fraction_electrons``
 - ``dt_reaction``
 - ``power_exchange``
+- ``power_exchange_temperature_equilibration``
 - ``bremsstrahlung_radiation``
 - ``analytic``
 - ``example_state``

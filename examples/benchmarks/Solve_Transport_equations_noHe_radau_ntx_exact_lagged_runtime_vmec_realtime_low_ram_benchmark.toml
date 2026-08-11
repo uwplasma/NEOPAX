@@ -25,7 +25,7 @@ ntx_exact_n_theta = 3
 ntx_exact_n_zeta = 9
 ntx_exact_n_xi = 17
 ntx_exact_surface_backend = "vmec"
-ntx_exact_face_response_mode = "interpolate_center_response"
+ntx_exact_center_response_mode = "interpolate_from_faces"
 ntx_exact_response_anchor_count = 16
 
 [ambipolarity]

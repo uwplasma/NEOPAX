@@ -17,12 +17,83 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_NTX_EXACT_DERIVATIVE_MODE = "direct"
+DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE = "compact_vjp"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY = "inline"
+DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA = "ntx_helper"
+
+
+def _apply_transport_solver_backend_override(config: dict, backend_override: str | None) -> None:
+    """Switch the benchmark TOML between solver backends without editing the file."""
+    if backend_override in (None, "", "config"):
+        return
+    backend = str(backend_override).strip().lower()
+    solver_cfg = config.setdefault("transport_solver", {})
+    solver_cfg["transport_solver_backend"] = backend
+    solver_cfg["integrator"] = backend
+    if backend in {"theta", "theta_newton"}:
+        solver_cfg.setdefault("theta_implicit", 1.0)
+        solver_cfg.setdefault("theta_predictor_mode", "linearized")
+        solver_cfg.setdefault(
+            "theta_rhs_mode",
+            solver_cfg.get("radau_rhs_mode", solver_cfg.get("rhs_mode", "lagged_response")),
+        )
+        if backend == "theta_newton":
+            solver_cfg.setdefault("theta_controller_mode", "current")
+            solver_cfg.setdefault("theta_jacobian_reuse_mode", "refresh_each_iteration")
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_mode",
+                solver_cfg.get("lagged_response_reuse_mode", "retry_only"),
+            )
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_rtol",
+                solver_cfg.get("lagged_response_reuse_rtol", 5.0e-2),
+            )
+            solver_cfg.setdefault(
+                "theta_lagged_response_reuse_atol",
+                solver_cfg.get("lagged_response_reuse_atol", 1.0e-8),
+            )
+
+
+def _run_transport_solver_forward_smoke(*, args, solver, solve_vector_field, runtime, baseline_state) -> None:
+    phase_start = time.perf_counter()
+    print(
+        "[autodiff-gate] progress: running transport solver forward smoke "
+        f"solver={type(solver).__name__}",
+        flush=True,
+    )
+    result = solver.solve(baseline_state, solve_vector_field, runtime.species)
+    final_state = result["final_state"]
+    objective_values = _objective_vector(final_state, runtime)
+    jax.block_until_ready(objective_values)
+    objective_values_np = np.asarray(jax.device_get(objective_values), dtype=float)
+    print(
+        "[autodiff-gate] mode=transport_solver_forward_smoke "
+        f"solver={type(solver).__name__} objective=all "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
+    print("[autodiff-gate] forward-smoke objective values:", flush=True)
+    for label, value in zip(OBJECTIVE_LABELS, objective_values_np, strict=False):
+        print(f"  - {label}: value={value:.16e}", flush=True)
+    if "n_steps" in result:
+        print(
+            "[autodiff-gate] forward-smoke solver summary: "
+            f"n_steps={int(np.asarray(jax.device_get(result['n_steps'])))} "
+            f"done={bool(np.asarray(jax.device_get(result.get('done', False))))} "
+            f"failed={bool(np.asarray(jax.device_get(result.get('failed', False))))} "
+            f"fail_code={int(np.asarray(jax.device_get(result.get('fail_code', 0))))}",
+            flush=True,
+        )
+
+
 from benchmark_transport_forward_fd_lane import (  # noqa: E402
     DEFAULT_CONFIG,
     OBJECTIVE_LABELS,
     _adaptive_rollout_diagnostics,
     _alpha_power_volume_average,
     _baseline_profile_cfg,
+    _bootstrap_current_softmax_abs_scaled,
     _electron_temperature_volume_average,
     _objective_vector,
     _parameterized_profile_set,
@@ -52,6 +123,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     runtime_with_ntx_support_payload as _core_runtime_with_ntx_support_payload,
 )
 from NEOPAX._reverse_ad_parameters import (  # noqa: E402
+    PROFILE_PARAMETER_ORDER,
     VmecBoundaryParameterSpec,
     discover_vmec_boundary_parameter_specs,
     normalize_vmec_boundary_families,
@@ -62,16 +134,24 @@ from NEOPAX._reverse_ad_parameters import (  # noqa: E402
 from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     build_initial_er_root_only_least_squares_runner,
     build_transport_realtime_geometry_least_squares_runner,
+    evaluate_geometry_transport_realtime_geometry_least_squares,
+    evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
+    geometry as geometry_objectives,
     geometry_active_initial_er_root_only_reverse_table,
     LeastSquaresEvaluation,
+    INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES,
     INITIAL_ER_ROOT_ONLY_OBJECTIVES,
     residuals_and_jacobian_reverse_ad,
+    LeastSquaresTerm,
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
+    TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     grouped_transport_reverse_report_builder,
     grouped_transport_reverse_table_result_builder,
+    internal_realtime_geometry_transport_reverse_table_result_builder,
     prepare_realtime_geometry_support_segment_core_setup,
+    realtime_geometry_transport_reverse_table_request,
     RealtimeGeometrySupportReverseDependencies,
     realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector,
     realtime_geometry_support_cotangents_from_parameter_vector,
@@ -116,8 +196,23 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 )
 
 
-PARAMETER_ORDER = ("n0", "T0", "density_shape_power", "temperature_shape_power")
+PARAMETER_ORDER = PROFILE_PARAMETER_ORDER
+_PROFILE_PARAMETER_DEFAULTS = {
+    "n0": 4.21,
+    "T0": 17.8,
+    "density_shape_power": 2.0,
+    "temperature_shape_power": 2.0,
+    "density_shape_alpha": 1.0,
+    "temperature_shape_alpha": 1.0,
+}
 _REALTIME_GEOMETRY_BACKENDS = {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+
+
+def _profile_cfg_scalar_value(profile_cfg: dict[str, Any], name: str) -> float:
+    raw = profile_cfg.get(name, _PROFILE_PARAMETER_DEFAULTS[name])
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0]
+    return float(raw)
 
 
 def _initial_er_root_ad_mode(value: str | None) -> str:
@@ -258,6 +353,10 @@ def _objective_scalar_by_index(final_state, runtime, objective_index: int):
     if objective_name == "smooth_root_proxy":
         rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
         return _smooth_root_proxy(er, rho)
+    if objective_name == "Er_transition_left":
+        return er[max(0, min(20, int(er.shape[-1]) - 1))]
+    if objective_name == "Er_transition_right":
+        return er[max(0, min(21, int(er.shape[-1]) - 1))]
     if objective_name == "Er2_volume_average":
         return _volume_average(er * er, runtime.geometry)
     if objective_name == "Er_volume_average":
@@ -268,6 +367,8 @@ def _objective_scalar_by_index(final_state, runtime, objective_index: int):
         return _total_pressure_volume_average(final_state, runtime)
     if objective_name == "alpha_power_volume_average_mw_m3":
         return _alpha_power_volume_average(final_state, runtime)
+    if objective_name == "bootstrap_current_softmax_abs_scaled":
+        return _bootstrap_current_softmax_abs_scaled(final_state, runtime)
     raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
 
@@ -576,8 +677,8 @@ def _check_compact_ntx_derivative_pullback_available() -> None:
         from ntx._solver_prepared import solve_prepared_coefficient_vector_derivative_vjp  # noqa: F401
     except ImportError as exc:
         raise SystemExit(
-            "[autodiff-gate] --ntx-exact-derivative-field-pullback-mode compact_vjp "
-            "requires the matching NTX patch/export: "
+            "[autodiff-gate] the default compact NTX field pullback requires "
+            "the matching NTX patch/export: "
             "solve_prepared_coefficient_vector_derivative_vjp. Sync/apply the NTX "
             "changes before running this mode."
         ) from exc
@@ -660,7 +761,8 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
     if str(geometry_parameter).strip().lower() == "all":
         family, m, n = ("RBC", 0, 0)
     else:
-        family, m, n = _parse_reverse_geometry_parameter(geometry_parameter)
+        first_geometry_parameter = str(geometry_parameter).split(",", 1)[0].strip()
+        family, m, n = _parse_reverse_geometry_parameter(first_geometry_parameter)
     geom_cfg = config.get("geometry", {})
     backend = str(geom_cfg.get("backend", "")).strip().lower()
     if backend not in _REALTIME_GEOMETRY_BACKENDS:
@@ -671,24 +773,47 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
     vmec_input_file = geom_cfg.get("vmec_input_file")
     if vmec_input_file is None:
         raise ValueError("Realtime geometry reverse mode requires geometry.vmec_input_file.")
+    surface_s_raw = geom_cfg.get(
+        "surface_s",
+        geom_cfg.get("vmec_surface_s", (0.1, 0.28, 0.46, 0.64, 0.82, 1.0)),
+    )
+    if isinstance(surface_s_raw, str):
+        surface_s = tuple(float(item.strip()) for item in surface_s_raw.split(",") if item.strip())
+    else:
+        surface_s = tuple(float(item) for item in surface_s_raw)
     return build_geometry_autodiff_context(
         vmec_input_file,
         param_family=family,
         param_m=m,
         param_n=n,
-        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 12))),
-        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 12))),
+        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 18))),
+        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 18))),
+        surface_s=surface_s,
     )
 
 
 def _reverse_geometry_parameter_order(geometry_parameter: str) -> tuple[str, ...]:
     if str(geometry_parameter).strip().lower() == "all":
         return (*PARAMETER_ORDER, "vmec:all")
-    return (*PARAMETER_ORDER, _format_reverse_geometry_parameter(geometry_parameter))
+    return (
+        *PARAMETER_ORDER,
+        *(
+            _format_reverse_geometry_parameter(raw_parameter.strip())
+            for raw_parameter in str(geometry_parameter).split(",")
+            if raw_parameter.strip()
+        ),
+    )
 
 
 def _geometry_param_specs_from_parameter_name(geometry_parameter: str) -> tuple[tuple[str, int, int], ...]:
-    return (_parse_reverse_geometry_parameter(geometry_parameter),)
+    specs = tuple(
+        _parse_reverse_geometry_parameter(raw_parameter.strip())
+        for raw_parameter in str(geometry_parameter).split(",")
+        if raw_parameter.strip()
+    )
+    if not specs:
+        raise ValueError("At least one reverse geometry parameter must be provided.")
+    return specs
 
 
 def _all_geometry_param_specs_from_context(
@@ -2782,6 +2907,10 @@ def _run_realtime_geometry_support_segment_probe(
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] realtime geometry payload pullback:",
+            return_branch_gradients=not (
+                bool(getattr(args, "optimization_api_smoke", False))
+                or bool(getattr(args, "full_transport_shared_payload_smoke", False))
+            ),
         )
         table_result = assembly_result.table_result
         geometry_pullback_result = assembly_result.payload_pullback_result
@@ -3293,42 +3422,157 @@ def _run_realtime_geometry_optimization_api_smoke(
 
     geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
     include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    profile_parameter_order = (
+        PROFILE_PARAMETER_ORDER
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else PARAMETER_ORDER
+    )
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profile_dofs,
+        profiles=profile_parameter_order if include_profile_dofs else None,
         vmec_boundary=tuple(
             VmecBoundaryParameterSpec(family, m, n)
             for family, m, n in geometry_param_specs
         ),
     )
+    objective_labels = (
+        TRANSPORT_REVERSE_OBJECTIVE_LABELS
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else tuple(OBJECTIVE_LABELS)
+    )
     objective_names = (
-        OBJECTIVE_LABELS
+        objective_labels
         if str(args.objective) == "all"
         else (str(args.objective),)
     )
     terms = transport_least_squares_terms(objective_names)
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        terms = tuple(terms) + (
+            LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
+            LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
+            LeastSquaresTerm(geometry_objectives.vmec_aspect_ratio),
+            LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
+            LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
+            LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+        )
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        geom_cfg_for_context = config.get("geometry", {})
+        context_geometry_values0 = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg_for_context,
+            geometry_param_specs,
+        )
+        context_profile_values0 = jnp.asarray(
+            [
+                _profile_cfg_scalar_value(profile_cfg, name)
+                for name in PROFILE_PARAMETER_ORDER
+            ],
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        context_baseline_values = jnp.concatenate(
+            [
+                context_profile_values0,
+                jnp.asarray(context_geometry_values0, dtype=context_profile_values0.dtype),
+            ],
+            axis=0,
+        )
+    else:
+        context_baseline_values = baseline_values
     table_context, run_grouped_report = _make_realtime_geometry_support_segment_builder_inputs(
         args=args,
         config=config,
-        baseline_values=baseline_values,
+        baseline_values=context_baseline_values,
         baseline_runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         neoclassical_cfg=neoclassical_cfg,
     )
-    runner = build_transport_realtime_geometry_least_squares_runner(
-        config,
-        objective_names=objective_names,
-        parameter_set=parameter_set,
-        table_context=table_context,
-        run_grouped_report=run_grouped_report,
-        objective_labels=OBJECTIVE_LABELS,
-        options={"quiet": True},
-    )
     print(
         "[autodiff-gate] progress: running realtime geometry optimization API smoke",
         flush=True,
     )
-    evaluation = runner(terms)
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        geom_cfg = config.get("geometry", {})
+        neoclassical_cfg = config.get("neoclassical", {})
+        geometry_values0 = _baseline_geometry_delta_vector_for_specs(
+            geom_cfg,
+            geometry_param_specs,
+        )
+        profile_values0 = jnp.asarray(
+            [
+                _profile_cfg_scalar_value(profile_cfg, spec.name)
+                for spec in parameter_set.profile_specs
+            ],
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        parameter_values = jnp.asarray(
+            (
+                list(np.asarray(profile_values0, dtype=float))
+                if include_profile_dofs
+                else []
+            )
+            + list(np.asarray(geometry_values0, dtype=float)),
+            dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
+            table_context=table_context,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=geometry_values0,
+            combined_geometry_payload=True,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+            n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+            n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+            surface_backend=str(
+                neoclassical_cfg.get(
+                    "ntx_exact_surface_backend",
+                    neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                )
+            ),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            accepted_step_limit=args.accepted_step_limit,
+            reverse_segment_length=args.reverse_segment_length,
+            initial_er_root_ad=str(args.initial_er_root_ad),
+            reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
+            reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+            reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+            max_reverse_accepted_steps=(
+                None
+                if args.max_reverse_accepted_steps is None
+                else int(args.max_reverse_accepted_steps)
+            ),
+            progress_label="[autodiff-gate] full-transport shared payload:",
+        )
+        request = realtime_geometry_transport_reverse_table_request(
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            context=table_context,
+            options={"quiet": True},
+        )
+        evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+            config,
+            request=request,
+            terms=terms,
+            geometry_context=geometry_context,
+            parameter_values=parameter_values,
+            table_result_builder=table_result_builder,
+            objective_labels=objective_labels,
+            options={"quiet": True},
+            quiet_default=True,
+            geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+            geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+        )
+    else:
+        runner = build_transport_realtime_geometry_least_squares_runner(
+            config,
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            table_context=table_context,
+            run_grouped_report=run_grouped_report,
+            objective_labels=objective_labels,
+            options={"quiet": True},
+        )
+        evaluation = runner(terms)
     result = evaluation.result
     residuals = evaluation.residuals
     jacobian = evaluation.jacobian
@@ -3340,7 +3584,9 @@ def _run_realtime_geometry_optimization_api_smoke(
         for label, value in result.objective_values.items()
     }
     report = {
-        "mode": "transport_reverse_ad_only_optimization_api_smoke",
+        "mode": "transport_reverse_ad_only_full_transport_shared_payload_smoke"
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else "transport_reverse_ad_only_optimization_api_smoke",
         "parameter_mode": str(args.reverse_parameter_mode),
         "config_path": str(Path(args.config)),
         "objective_name": str(args.objective),
@@ -3355,10 +3601,17 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
         "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
         "initial_er_root_ad": str(args.initial_er_root_ad),
+        "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
+        "shared_payload_note": (
+            "Full transport shared-path smoke uses the internal realtime-geometry "
+            "transport table-result builder once and writes JSON for offline "
+            "comparison against saved reference benchmark output."
+        ),
         "elapsed_s": float(elapsed_s),
     }
     print(
-        "[autodiff-gate] mode=transport_reverse_ad_only_optimization_api_smoke "
+        "[autodiff-gate] mode="
+        f"{report['mode']} "
         f"objective={args.objective} "
         f"residual_count={len(result.residual_labels)} "
         f"parameter_count={len(result.parameter_labels)} "
@@ -3370,7 +3623,11 @@ def _run_realtime_geometry_optimization_api_smoke(
         print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
         for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
             print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
-    outpath = _report_path("optimization_api_smoke")
+    outpath = _report_path(
+        "full_transport_shared_payload_smoke"
+        if bool(getattr(args, "full_transport_shared_payload_smoke", False))
+        else "optimization_api_smoke"
+    )
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
@@ -3393,20 +3650,30 @@ def _run_initial_er_root_only_optimization_api_smoke(
             "an ambipolar Er initialization mode in the TOML and "
             "--initial-Er-root-ad jax_selected_root."
         )
-    objective_names = (
-        INITIAL_ER_ROOT_ONLY_OBJECTIVES
-        if str(args.objective) == "all"
-        else (str(args.objective),)
-    )
-    unsupported = tuple(name for name in objective_names if name not in INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
+    include_geometry_dofs = str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    if str(args.objective) == "all":
+        objective_names = (
+            (*INITIAL_ER_ROOT_ONLY_OBJECTIVES, "bootstrap_current_softmax_abs_scaled")
+            if include_geometry_dofs
+            else INITIAL_ER_ROOT_ONLY_OBJECTIVES
+        )
+    else:
+        objective_names = (str(args.objective),)
+    unsupported = tuple(name for name in objective_names if name not in INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
     if unsupported:
-        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_OBJECTIVES)
+        allowed = ", ".join(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
         raise SystemExit(
             "[autodiff-gate] initial-Er root-only smoke supports only Er objectives; "
             f"unsupported={unsupported!r}, choices are: {allowed}."
         )
-    include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
-    include_geometry_dofs = str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    if "bootstrap_current_softmax_abs_scaled" in objective_names and not include_geometry_dofs:
+        raise SystemExit(
+            "[autodiff-gate] bootstrap_current_softmax_abs_scaled currently requires the "
+            "geometry-active compact root-only path. Use "
+            "--reverse-parameter-mode profiles_plus_realtime_geometry and "
+            "--reverse-geometry-parameter ..."
+        )
     geometry_param_specs = (
         _geometry_param_specs_from_args(args, geometry_context)
         if include_geometry_dofs
@@ -3414,6 +3681,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
     )
     parameter_set = reverse_ad_optimization_parameter_set(
         include_profiles=include_profile_dofs,
+        profiles=PARAMETER_ORDER if include_profile_dofs else None,
         vmec_boundary=tuple(
             VmecBoundaryParameterSpec(family, m, n)
             for family, m, n in geometry_param_specs
@@ -3426,7 +3694,10 @@ def _run_initial_er_root_only_optimization_api_smoke(
         )
     geom_cfg = config.get("geometry", {})
     profile_values0 = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+        [
+            _profile_cfg_scalar_value(profile_cfg, spec.name)
+            for spec in parameter_set.profile_specs
+        ],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
     geometry_values0 = (
@@ -3464,6 +3735,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "[autodiff-gate] progress: running initial-Er root-only optimization API smoke",
         flush=True,
     )
+    shared_compare_report = None
     if not include_geometry_dofs:
         runner = build_initial_er_root_only_least_squares_runner(
             config,
@@ -3489,6 +3761,81 @@ def _run_initial_er_root_only_optimization_api_smoke(
                 runtime=baseline_runtime,
             )
 
+        if bool(getattr(args, "initial_er_root_shared_payload_compare_smoke", False)):
+            print(
+                "[autodiff-gate] progress: running initial-Er shared-payload root-only smoke",
+                flush=True,
+            )
+            mixed_terms = tuple(terms) + (
+                LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
+                LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
+                LeastSquaresTerm(geometry_objectives.vmec_aspect_ratio),
+                LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
+                LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
+                LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+            )
+            evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+                config,
+                parameter_set=parameter_set,
+                parameter_values=parameter_values,
+                terms=mixed_terms,
+                geometry_context=geometry_context,
+                runtime=baseline_runtime,
+                baseline_profile_values=profile_values0,
+                pre_root_state_from_profile_values=_pre_root_state_from_profile_values,
+                n_r=int(geom_cfg.get("n_radial", 51)),
+                n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(
+                    neoclassical_cfg.get(
+                        "ntx_exact_surface_backend",
+                        neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                    )
+                ),
+                geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+                geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            )
+            result = evaluation.result
+            residuals_np = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+            jacobian_np = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+            objective_values_np = {
+                label: float(np.asarray(jax.device_get(value), dtype=float))
+                for label, value in result.objective_values.items()
+            }
+            report = {
+                "mode": "transport_reverse_ad_only_initial_er_root_shared_payload_smoke",
+                "config_path": str(Path(args.config)),
+                "objective_name": str(args.objective),
+                "objective_order": list(objective_names),
+                "mixed_residual_labels": list(result.residual_labels),
+                "parameter_order": list(result.parameter_labels),
+                "optimization_api_profile_dofs": str(getattr(args, "optimization_api_profile_dofs", "include")),
+                "geometry_parameter_specs": [_format_geometry_param_spec(spec) for spec in geometry_param_specs],
+                "objective_values": objective_values_np,
+                "residuals": residuals_np.tolist(),
+                "jacobian": jacobian_np.tolist(),
+                "initial_er_root_ad": str(args.initial_er_root_ad),
+                "elapsed_s": float(evaluation.elapsed_s),
+            }
+            print(
+                "[autodiff-gate] mode=transport_reverse_ad_only_initial_er_root_shared_payload_smoke "
+                f"objective={args.objective} "
+                f"residual_count={len(result.residual_labels)} "
+                f"parameter_count={len(result.parameter_labels)} "
+                f"elapsed_s={evaluation.elapsed_s:.3f}",
+                flush=True,
+            )
+            print("[autodiff-gate] initial-Er shared-payload residuals/Jacobian rows:")
+            for row_i, label in enumerate(result.residual_labels):
+                print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
+                for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
+                    print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
+            outpath = _report_path("initial_er_root_shared_payload_smoke")
+            outpath.write_text(json.dumps(report, indent=2))
+            print(f"Wrote {outpath.relative_to(ROOT)}")
+            return
+
         table_result = geometry_active_initial_er_root_only_reverse_table(
             config=config,
             objective_names=objective_names,
@@ -3503,7 +3850,12 @@ def _run_initial_er_root_only_optimization_api_smoke(
             n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
             n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
             n_xi=int(neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-            surface_backend=str(neoclassical_cfg.get("ntx_surface_backend", "vmec")),
+            surface_backend=str(
+                neoclassical_cfg.get(
+                    "ntx_exact_surface_backend",
+                    neoclassical_cfg.get("ntx_surface_backend", "vmec"),
+                )
+            ),
             max_iter=geom_cfg.get("vmec_max_iter"),
             solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
             progress_label="[autodiff-gate] initial-Er root-only geometry payload pullback:",
@@ -3544,6 +3896,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "jacobian": jacobian_np.tolist(),
         "initial_er_root_ad": str(args.initial_er_root_ad),
         "elapsed_s": float(evaluation.elapsed_s),
+        "shared_payload_compare": shared_compare_report,
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only_initial_er_root_only_optimization_api_smoke "
@@ -3848,7 +4201,7 @@ def _run_realtime_geometry_reverse_mode(
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
     geom_cfg = config.get("geometry", {})
     baseline_values = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER]
+        [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER]
         + [float(geom_cfg.get("vmec_param_delta", 0.0))],
         dtype=jnp.float64,
     )
@@ -3899,10 +4252,19 @@ def _run_realtime_geometry_reverse_mode(
         f"local_devices={[str(device) for device in jax.local_devices()]}",
         flush=True,
     )
-    if bool(args.optimization_api_smoke):
+    if bool(getattr(args, "transport_solver_forward_smoke", False)):
+        _run_transport_solver_forward_smoke(
+            args=args,
+            solver=static_solver,
+            solve_vector_field=baseline_components["solve_vector_field"],
+            runtime=baseline_runtime,
+            baseline_state=baseline_profile_state,
+        )
+        return
+    if bool(args.optimization_api_smoke) or bool(args.full_transport_shared_payload_smoke):
         if str(args.realtime_geometry_gradient_path) != "reverse_payload":
             raise SystemExit(
-                "[autodiff-gate] --optimization-api-smoke currently requires "
+                "[autodiff-gate] --optimization-api-smoke/--full-transport-shared-payload-smoke currently requires "
                 "--realtime-geometry-gradient-path reverse_payload so it exercises "
                 "the validated full realtime geometry table."
             )
@@ -4163,7 +4525,7 @@ def main() -> None:
         "--objective",
         type=str,
         default="softmax_Er",
-        choices=tuple(OBJECTIVE_LABELS) + ("all",),
+        choices=tuple(dict.fromkeys(tuple(OBJECTIVE_LABELS) + tuple(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES) + ("all",))),
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
             "objective-by-parameter reverse derivative matrix for every metric."
@@ -4191,7 +4553,7 @@ def main() -> None:
         help=(
             "Differentiated parameter set. 'profiles' preserves the current "
             "profile-only reverse lane. 'profiles_plus_realtime_geometry' adds "
-            "one realtime VMEC boundary parameter to the four profile parameters."
+            "selected realtime VMEC boundary parameters to the active profile parameters."
         ),
     )
     parser.add_argument(
@@ -4201,6 +4563,7 @@ def main() -> None:
         help=(
             "Realtime VMEC geometry parameter used when --reverse-parameter-mode "
             "is profiles_plus_realtime_geometry. Syntax: FAMILY:m:n, e.g. RBC:1:0. "
+            "Use comma-separated values for multiple harmonics, e.g. RBC:1:0,ZBS:1:0. "
             "Use 'all' to pull back to all selected VMEC boundary harmonics."
         ),
     )
@@ -4309,6 +4672,36 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--full-transport-shared-payload-smoke",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry reverse_payload runs, execute only "
+            "the full transport internal realtime-geometry table path and write a "
+            "shared-path JSON report for offline comparison against saved reference "
+            "benchmark output. This does not run the reference path in the same process."
+        ),
+    )
+    parser.add_argument(
+        "--max-reverse-accepted-steps",
+        type=int,
+        default=None,
+        help=(
+            "When reverse AD is run to the solver t_final rather than an explicit "
+            "--accepted-step-limit, use this as a schedule-discovery guard. The "
+            "reverse path still requires reaching t_final; exceeding this guard is "
+            "reported as a failed trial instead of compiling a max_steps-sized trace."
+        ),
+    )
+    parser.add_argument(
+        "--transport-solver-forward-smoke",
+        action="store_true",
+        help=(
+            "For profiles_plus_realtime_geometry setup, run only the production transport "
+            "solver forward from the benchmark initial state and print objective values. "
+            "This is useful for theta/theta_newton backend checks before running reverse."
+        ),
+    )
+    parser.add_argument(
         "--optimization-api-profile-dofs",
         choices=("include", "exclude"),
         default="include",
@@ -4328,6 +4721,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--initial-Er-root-shared-payload-compare-smoke",
+        dest="initial_er_root_shared_payload_compare_smoke",
+        action="store_true",
+        help=(
+            "With --initial-Er-root-only-optimization-smoke and realtime geometry "
+            "DOFs, run only the shared-payload/fused root-only path and write "
+            "its own report for offline comparison against saved reference JSON."
+        ),
+    )
+    parser.add_argument(
         "--initial-Er-root-ad",
         dest="initial_er_root_ad",
         default="off",
@@ -4341,89 +4744,28 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument(
+        "--transport-solver-backend-override",
+        choices=("config", "radau", "theta", "theta_newton"),
+        default="config",
+        help=(
+            "Override transport_solver_backend/integrator in memory for this benchmark run. "
+            "Use theta_newton to test the theta/TORAX-style production solve against the "
+            "same benchmark TOML without editing the validated Radau config. Normal reverse "
+            "uses reverse_stage_cotangent_mode='full' and dispatches by the configured solver."
+        ),
+    )
+    parser.add_argument(
         "--accepted-step-limit",
         type=int,
         default=None,
         help="Optional accepted-step prefix to stop the adaptive rollout.",
     )
-    parser.add_argument(
-        "--ntx-exact-derivative-mode",
-        default="direct",
-        choices=(
-            "direct",
-            "custom_jvp",
-            "custom_vjp",
-            "recompute_vjp",
-            "iterative_vjp",
-            "iterative_jvp",
-        ),
-        help="NTX exact-runtime derivative mode.",
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-field-pullback-mode",
-        default="compact_vjp",
-        choices=("generic_jvp", "compact_vjp"),
-        help=(
-            "Reverse-only NTX derivative-field pullback mode. 'compact_vjp' uses "
-            "the NTX compact second-order coefficient-solve VJP helper and is the "
-            "intended reverse-lane path. 'generic_jvp' keeps the older fallback "
-            "that can compile through NTX factorization JVPs."
-        ),
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-boundary",
-        default="inline",
-        choices=("inline", "per_energy_jit"),
-        help=(
-            "Reverse-only boundary mode for the compact NTX derivative-field "
-            "pullback. 'inline' keeps the current monolithic reverse kernel. "
-            "'per_energy_jit' wraps each per-energy derivative pullback in its "
-            "own JIT call boundary to test XLA graph partitioning."
-        ),
-    )
-    parser.add_argument(
-        "--ntx-exact-derivative-pullback-algebra",
-        default="ntx_helper",
-        choices=(
-            "ntx_helper",
-            "scalar_contract",
-            "scalar_contract_lowdot",
-            "scalar_contract_lowdot_sequential",
-            "scalar_contract_lowdot_ntx",
-            "scalar_contract_lowdot_recompute",
-            "scalar_contract_matrix_free",
-        ),
-        help=(
-            "Reverse-only algebra mode for compact NTX derivative-field "
-            "pullbacks. 'ntx_helper' uses NTX's current compact helper. "
-            "'scalar_contract' uses a NEOPAX-local scalar-contraction path "
-            "that avoids Python-unrolled mode loops where possible. "
-            "'scalar_contract_lowdot' additionally avoids full tangent-mode "
-            "stacks for the field-bar contraction. "
-            "'scalar_contract_lowdot_sequential' keeps that exact algebra but "
-            "assembles the energy-scan bars with a sequential JAX loop to test "
-            "whether factorization temporaries stop being live across the full "
-            "energy axis. "
-            "'scalar_contract_lowdot_ntx' moves the fused lowdot algebra into "
-            "NTX while keeping NEOPAX's transport-moment cotangent mapping. "
-            "'scalar_contract_lowdot_recompute' recomputes the lowdot adjoint "
-            "before field-dot contractions to test peak-memory reduction. "
-            "'scalar_contract_matrix_free' avoids saved LU-factor tensors by "
-            "using Krylov solves on the NTX block operator."
-        ),
-    )
-    parser.add_argument(
-        "--reverse-ntx-prepared-solve-boundary",
-        default="default",
-        choices=("default", "custom_vjp", "recompute_vjp"),
-        help=(
-            "Reverse-only diagnostic boundary for the NTX prepared coefficient solve. "
-            "'default' preserves --ntx-exact-derivative-mode. 'custom_vjp' forces "
-            "the response solve through NTX's custom-VJP boundary without changing "
-            "the forward-AD lane. 'recompute_vjp' uses an exact custom-VJP boundary "
-            "that rebuilds the NTX factorization in backward instead of saving it "
-            "in the forward residual."
-        ),
+    parser.set_defaults(
+        ntx_exact_derivative_mode=DEFAULT_NTX_EXACT_DERIVATIVE_MODE,
+        ntx_exact_derivative_field_pullback_mode=DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE,
+        ntx_exact_derivative_pullback_boundary=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY,
+        ntx_exact_derivative_pullback_algebra=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
+        reverse_ntx_prepared_solve_boundary="default",
     )
     parser.add_argument(
         "--ntx-radial-batch-size",
@@ -4537,6 +4879,10 @@ def main() -> None:
             "scan_rebuild_local_moment_pullback",
             "scan_rebuild_anchor_pullback",
             "zero_step_bwd",
+            "theta_state_only",
+            "theta_zero_lagged",
+            "theta_compact_support_probe",
+            "theta_implicit_transpose_probe",
             "force_reuse_bwd",
             "force_rebuild_bwd",
             "dynamic_call_bwd",
@@ -4559,7 +4905,15 @@ def main() -> None:
             "'scan_rebuild_anchor_pullback' additionally scans over rebuild anchors and "
             "accumulates state bars directly; "
             "'zero_step_bwd' bypasses the accepted-step "
-            "backward body inside segmented replay; 'force_reuse_bwd' and 'force_rebuild_bwd' "
+            "backward body inside segmented replay; for theta solvers, 'full' dispatches "
+            "to the one-step theta implicit residual transpose; theta-only diagnostics "
+            "'theta_state_only' and 'theta_zero_lagged' replay the theta realized schedule "
+            "through state/carry cotangents but intentionally return zero support-payload bars; "
+            "'theta_compact_support_probe' additionally threads support as a VJP primal and "
+            "uses compact lagged-RHS support pullbacks for diagnosis; "
+            "'theta_implicit_transpose_probe' uses a one-step theta residual transpose "
+            "and compact RHS/rebuild support pullbacks; "
+            "'force_reuse_bwd' and 'force_rebuild_bwd' "
             "compile only one lagged-response backward branch for diagnosis. Most non-full "
             "diagnostic modes intentionally change gradients unless the forced branch matches the "
             "realized primal branch for every accepted step; 'scan_rebuild_local_moment_pullback' "
@@ -4734,18 +5088,6 @@ def main() -> None:
     if str(args.ntx_exact_derivative_field_pullback_mode) == "compact_vjp":
         _check_compact_ntx_derivative_pullback_available()
     effective_ntx_exact_derivative_mode = str(args.ntx_exact_derivative_mode)
-    if str(args.reverse_ntx_prepared_solve_boundary) in {"custom_vjp", "recompute_vjp"}:
-        if str(args.ntx_exact_derivative_mode) not in {
-            "direct",
-            "custom_vjp",
-            "recompute_vjp",
-        }:
-            raise SystemExit(
-                "[autodiff-gate] --reverse-ntx-prepared-solve-boundary custom_vjp "
-                "or recompute_vjp is only compatible with --ntx-exact-derivative-mode "
-                "direct, custom_vjp, or recompute_vjp."
-            )
-        effective_ntx_exact_derivative_mode = str(args.reverse_ntx_prepared_solve_boundary)
 
     config = _prepare_benchmark_config(
         Path(args.config),
@@ -4756,6 +5098,9 @@ def main() -> None:
         ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
+        config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})
     if args.ntx_radial_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_radial_batch_size"] = int(args.ntx_radial_batch_size)
@@ -4788,7 +5133,7 @@ def main() -> None:
         )
         return
     baseline_values = jnp.asarray(
-        [float(profile_cfg[name]) for name in PARAMETER_ORDER],
+        [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
         dtype=jnp.asarray(baseline_state.pressure).dtype,
     )
     objective_index = None if args.objective == "all" else OBJECTIVE_LABELS.index(args.objective)

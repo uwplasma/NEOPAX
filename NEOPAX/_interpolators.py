@@ -298,7 +298,8 @@ def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
     # log10(|Er|) axis from the first radius row and use that for the 3D query.
     grid_Er_internal = jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er)))
     r_grid = database.rho * database.a_b
-    er_raw_log_grid = database.Er_list[0, :] + jnp.log10(jnp.maximum(r_grid[0], 1.0e-30))
+    r_ref = jnp.max(r_grid)
+    er_raw_log_grid = database.Er_list[0, :] + jnp.log10(jnp.maximum(r_ref, 1.0e-30))
     xg11 = interpax.Interpolator3D(
         r_grid,
         database.nu_log,

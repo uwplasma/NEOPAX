@@ -203,15 +203,15 @@ def main() -> None:
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="Benchmark TOML.")
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     parser.add_argument("--accepted-step-limit", type=int, default=None)
-    parser.add_argument("--ntx-exact-derivative-mode", default="direct", choices=("direct", "custom_vjp"))
+    parser.add_argument("--ntx-exact-derivative-mode", default="direct", choices=("direct",))
     parser.add_argument(
         "--ntx-exact-derivative-field-pullback-mode",
-        default=None,
+        default="compact_vjp",
         help="Accepted for parity with reverse benchmark config preparation.",
     )
     parser.add_argument(
         "--ntx-exact-derivative-pullback-algebra",
-        default=None,
+        default="ntx_helper",
         help="Accepted for parity with reverse benchmark config preparation.",
     )
     parser.add_argument("--radau-jacobian-reuse-mode", type=str, default=None)

@@ -16,9 +16,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX  # noqa: E402
+from NEOPAX._constants import elementary_charge  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._profiles import AnalyticalProfileModel  # noqa: E402
-from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
+from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, PRESSURE_SOURCE_STATE_TO_MW_M3  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
@@ -149,7 +150,9 @@ def _parameterized_profile_set(
         c_density=None if cfg.get("c_density") is None else tuple(cfg.get("c_density")),
         c_temperature=None if cfg.get("c_temperature") is None else tuple(cfg.get("c_temperature")),
         density_shape_power=cfg.get("density_shape_power", 2.0),
+        density_shape_alpha=cfg.get("density_shape_alpha", 1.0),
         temperature_shape_power=cfg.get("temperature_shape_power", 2.0),
+        temperature_shape_alpha=cfg.get("temperature_shape_alpha", 1.0),
         n_scale=cfg.get("n_scale", 1.0),
         T_scale=cfg.get("T_scale", 1.0),
         er0_scale=cfg.get("er0_scale", 100.0),
@@ -233,6 +236,40 @@ def _electron_temperature_volume_average(final_state, runtime) -> jax.Array:
 def _total_pressure_volume_average(final_state, runtime) -> jax.Array:
     total_pressure = jnp.sum(jnp.asarray(final_state.pressure, dtype=final_state.pressure.dtype), axis=0)
     return _volume_average(total_pressure, runtime.geometry)
+
+
+def _bootstrap_current_softmax_abs_scaled(
+    final_state,
+    runtime,
+    *,
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+) -> jax.Array:
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    if not callable(corrected_fluxes_fn):
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled requires realtime NTX "
+            "evaluate_momentum_corrected_fluxes; refusing to use lagged, "
+            "uncorrected, or database fallback Upar in the FD objective."
+        )
+    fluxes = corrected_fluxes_fn(final_state)
+    upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
+    if upar is None:
+        raise ValueError("momentum-corrected realtime NTX fluxes did not return Upar.")
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
+    current_weights = jnp.sign(charge_qp)
+    upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)
+    upar_physical = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
+    if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+        jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0)
+    else:
+        jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1)
+    jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
 
 
 def _objective_vector(final_state, runtime) -> jax.Array:

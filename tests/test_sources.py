@@ -7,6 +7,7 @@ from NEOPAX._source_models import (
     DTReactionSource,
     FusionPowerFractionElectronsSource,
     PowerExchangeSource,
+    TemperatureEquilibrationPowerExchangeSource,
     SourceModelBase,
     get_source,
     register_source,
@@ -176,6 +177,40 @@ def test_power_exchange():
     src = PowerExchangeSource(mode="all")
     result = src(state, species)
     assert result["power_exchange"].shape == state.temperature.shape
+
+
+def test_power_exchange_temperature_equilibration():
+    state = make_dummy_state()
+    species = make_dummy_species()
+    src = TemperatureEquilibrationPowerExchangeSource(mode="all")
+    result = src(state, species)
+    assert result["power_exchange_temperature_equilibration"].shape == state.temperature.shape
+
+
+def test_power_exchange_temperature_equilibration_is_pairwise_conservative():
+    density = jnp.asarray(
+        [
+            [0.35, 0.31],
+            [0.35, 0.31],
+        ]
+    )
+    temperature = jnp.asarray(
+        [
+            [6.7, 5.5],
+            [1.0, 1.2],
+        ]
+    )
+    state = TransportState(density=density, pressure=density * temperature, Er=jnp.zeros(2))
+    species = Species(
+        number_species=2,
+        species_indices=jnp.arange(2),
+        mass_mp=jnp.asarray([0.000544617, 1.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "ion"),
+    )
+    src = TemperatureEquilibrationPowerExchangeSource(mode="all")
+    result = src(state, species)["power_exchange_temperature_equilibration"]
+    assert jnp.allclose(jnp.sum(result, axis=0), jnp.zeros(result.shape[-1]), rtol=1e-10, atol=1e-10)
 
 
 def test_bremsstrahlung_radiation():

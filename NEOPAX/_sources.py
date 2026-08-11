@@ -147,6 +147,80 @@ def power_exchange(state, species, pair_active_mask, coulomb_log_mode="neopax_si
         )
     return _power_exchange_impl(state, species, pair_active_mask, jnp.asarray(use_ntssfusion_lnL))
 
+
+@jit
+def _power_exchange_temperature_equilibration_impl(state, species, pair_active_mask):
+    # A pairwise temperature-equilibration model in the same general spirit as
+    # T3D, but kept in the native NEOPAX conservative pair-exchange form.
+    n_species = state.temperature.shape[0]
+    idx_i, idx_j = jnp.triu_indices(n_species, k=1)
+    nA = state.density[idx_i]
+    nB = state.density[idx_j]
+    TA = state.temperature[idx_i]
+    TB = state.temperature[idx_j]
+    mA = species.mass_mp[idx_i]
+    mB = species.mass_mp[idx_j]
+    qA = species.charge_qp[idx_i]
+    qB = species.charge_qp[idx_j]
+
+    nA_cgs = jnp.maximum(nA * 1.0e14, 1.0e-30)
+    nB_cgs = jnp.maximum(nB * 1.0e14, 1.0e-30)
+    TA_eV = jnp.maximum(TA * 1.0e3, 1.0e-30)
+    TB_eV = jnp.maximum(TB * 1.0e3, 1.0e-30)
+    qA_abs = jnp.maximum(jnp.abs(qA), 1.0e-30)
+    qB_abs = jnp.maximum(jnp.abs(qB), 1.0e-30)
+
+    a_is_electron = qA < 0.0
+    b_is_electron = qB < 0.0
+    both_electrons = a_is_electron & b_is_electron
+    electron_ion = a_is_electron ^ b_is_electron
+
+    lnL_ee = (
+        23.5
+        - jnp.log(jnp.sqrt(nA_cgs) / jnp.power(TA_eV, 1.25))
+        - jnp.sqrt(1.0e-5 + jnp.square(jnp.log(TA_eV) - 2.0) / 16.0)
+    )
+    lnL_ei = jnp.where(
+        a_is_electron,
+        24.0 - jnp.log(jnp.sqrt(nA_cgs) / TA_eV),
+        24.0 - jnp.log(jnp.sqrt(nB_cgs) / TB_eV),
+    )
+    lnL_ii = 23.0 - jnp.log(
+        (qA_abs * qB_abs)
+        * (mA + mB)
+        / jnp.maximum(mA * TB_eV + mB * TA_eV, 1.0e-30)
+        * jnp.sqrt(
+            nA_cgs * qA_abs**2 / TA_eV
+            + nB_cgs * qB_abs**2 / TB_eV
+        )
+    )
+    lnL = jnp.where(both_electrons, lnL_ee, jnp.where(electron_ion, lnL_ei, lnL_ii))
+
+    pair_prefactor = (
+        (4.0 * 2.85e2 / jnp.sqrt(jnp.pi))
+        * jnp.sqrt(mA[:, None] * mB[:, None])
+        * jnp.square((qA * qB)[:, None])
+    )
+    Pab = (
+        pair_prefactor
+        * nA
+        * nB
+        * lnL
+        * (TB - TA)
+        / jnp.power(mA[:, None] * TB + mB[:, None] * TA, 1.5)
+    )
+    pair_mask = jnp.asarray(pair_active_mask, dtype=Pab.dtype)[:, None]
+    Pab = Pab * pair_mask
+
+    out = jnp.zeros((n_species,) + Pab.shape[1:], dtype=Pab.dtype)
+    out = out.at[idx_i].add(Pab)
+    out = out.at[idx_j].add(-Pab)
+    return out
+
+
+def power_exchange_temperature_equilibration(state, species, pair_active_mask):
+    return _power_exchange_temperature_equilibration_impl(state, species, pair_active_mask)
+
 @jit
 def bremsstrahlung_radiation_generalized(
     state,

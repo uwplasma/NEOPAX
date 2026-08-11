@@ -22,6 +22,8 @@ PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "T0",
     "density_shape_power",
     "temperature_shape_power",
+    "density_shape_alpha",
+    "temperature_shape_alpha",
 )
 
 VMEC_BOUNDARY_FAMILIES: tuple[str, ...] = ("RBC", "ZBS")

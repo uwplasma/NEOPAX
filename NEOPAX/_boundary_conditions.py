@@ -286,12 +286,14 @@ def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_
 
         if right_type == "dirichlet":
             rv = default_arr if right_value is None else _as_like_template(right_value, default_arr)
-            rg = (3.0 * rv - 4.0 * u_im1 + u_im2) / (2.0 * dx)
+            # Cell-centered FV geometry: the boundary face is half a cell from
+            # u_im1 and three halves from u_im2.
+            rg = (8.0 * rv - 9.0 * u_im1 + u_im2) / (3.0 * dx)
             return rv, rg
 
         if right_type == "neumann":
             rg = zeros_like_default if right_gradient is None else _as_like_template(right_gradient, default_arr)
-            rv = (4.0 * u_im1 - u_im2 + 2.0 * dx * rg) / 3.0
+            rv = (3.0 * dx * rg + 9.0 * u_im1 - u_im2) / 8.0
             return rv, rg
 
         if right_type == "robin":
@@ -300,7 +302,11 @@ def right_constraints_from_bc_model(bc_model, default_value, profile=None, face_
                 if right_decay is None
                 else _as_like_template(right_decay, default_arr)
             )
-            rv = (4.0 * u_im1 - u_im2) / (3.0 + 2.0 * dx / (decay + 1e-12))
+            # FV cell-centered stencil for dU/dr = -U_face / decay at the
+            # right boundary face.  The NTSS 4,-1 formula assumes node values
+            # one and two full spacings inside the boundary; here the nearest
+            # cells are half a spacing and three halves inside the face.
+            rv = (9.0 * u_im1 - u_im2) / (8.0 + 3.0 * dx / (decay + 1e-12))
             rg = -rv / (decay + 1e-12)
             return rv, rg
 
@@ -348,12 +354,14 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
 
         if left_type == "dirichlet":
             lv = default_arr if left_value is None else _as_like_template(left_value, default_arr)
-            lg = (-3.0 * lv + 4.0 * u_ip1 - u_ip2) / (2.0 * dx)
+            # Cell-centered FV geometry: the boundary face is half a cell from
+            # u_ip1 and three halves from u_ip2.
+            lg = (-8.0 * lv + 9.0 * u_ip1 - u_ip2) / (3.0 * dx)
             return lv, lg
 
         if left_type == "neumann":
             lg = zeros_like_default if left_gradient is None else _as_like_template(left_gradient, default_arr)
-            lv = (4.0 * u_ip1 - u_ip2 - 2.0 * dx * lg) / 3.0
+            lv = (-3.0 * dx * lg + 9.0 * u_ip1 - u_ip2) / 8.0
             return lv, lg
 
         if left_type == "robin":
@@ -362,7 +370,10 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
                 if left_decay is None
                 else _as_like_template(left_decay, default_arr)
             )
-            lv = (4.0 * u_ip1 - u_ip2) / (3.0 - 2.0 * dx / (decay + 1e-12))
+            # FV cell-centered stencil for dU/dr = +U_face / decay at the
+            # left boundary face, matching the cell-to-face geometry used by
+            # CellVariable rather than NTSS boundary-node indexing.
+            lv = (9.0 * u_ip1 - u_ip2) / (8.0 + 3.0 * dx / (decay + 1e-12))
             lg = lv / (decay + 1e-12)
             return lv, lg
 
@@ -388,7 +399,13 @@ def left_constraints_from_bc_model(bc_model, default_value, profile=None, face_c
 
 
 def apply_cell_centered_boundary_state(profile, bc_model, face_centers):
-    """Project cell-centered profiles so boundary cells satisfy the configured BCs."""
+    """Project cell-centered profiles to a BC-consistent endpoint guess.
+
+    This helper is for preprocessing and legacy compatibility paths.  The
+    transport FV operator should prefer face constraints directly through
+    ``CellVariable`` rather than mutating the terminal cell to act like the
+    boundary.
+    """
     if bc_model is None:
         return jnp.asarray(profile)
 
@@ -440,3 +457,8 @@ def apply_cell_centered_boundary_state(profile, bc_model, face_centers):
         out = out.at[:, -1].set(right_cell)
 
     return out[0] if squeeze else out
+
+
+def preprocess_cell_centered_boundary_guess(profile, bc_model, face_centers):
+    """Compatibility wrapper for boundary-state preprocessing outside the FV solve."""
+    return apply_cell_centered_boundary_state(profile, bc_model, face_centers)

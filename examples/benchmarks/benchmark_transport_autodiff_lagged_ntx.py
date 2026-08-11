@@ -44,9 +44,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import NEOPAX
+from NEOPAX._constants import elementary_charge
 from NEOPAX._orchestrator import build_runtime_context, prepare_transport_solver_components, run_transport
 from NEOPAX._profiles import AnalyticalProfileModel
-from NEOPAX._transport_flux_models import PRESSURE_SOURCE_STATE_TO_MW_M3
+from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, PRESSURE_SOURCE_STATE_TO_MW_M3
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
     _extract_fixed_temperature_projection,
@@ -88,11 +89,14 @@ PROFILE_VECTOR_PARAMETERS = ("n0", "T0", "density_shape_power", "temperature_sha
 OBJECTIVE_LABELS = [
     "softmax_Er",
     "smooth_root_proxy",
+    "Er_transition_left",
+    "Er_transition_right",
     "Er2_volume_average",
     "Er_volume_average",
     "electron_temperature_volume_average_keV",
     "total_pressure_volume_average",
     "alpha_power_volume_average_mw_m3",
+    "bootstrap_current_softmax_abs_scaled",
 ]
 DEFAULT_FD_SWEEP_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
 STANDALONE_SUBSOLVE_LABELS = [
@@ -298,23 +302,63 @@ def _total_pressure_volume_average(final_state, runtime) -> jax.Array:
     return _volume_average(total_pressure, runtime.geometry)
 
 
+def _bootstrap_current_softmax_abs_scaled(
+    final_state,
+    runtime,
+    *,
+    beta: float = 128.0,
+    eps: float = 1.0e-12,
+) -> jax.Array:
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    if not callable(corrected_fluxes_fn):
+        raise NotImplementedError(
+            "bootstrap_current_softmax_abs_scaled requires realtime NTX "
+            "evaluate_momentum_corrected_fluxes; refusing to use lagged, "
+            "uncorrected, or database fallback Upar in the FD objective."
+        )
+    fluxes = corrected_fluxes_fn(final_state)
+    upar = fluxes.get("Upar_neo", fluxes.get("Upar", None)) if isinstance(fluxes, dict) else None
+    if upar is None:
+        raise ValueError("momentum-corrected realtime NTX fluxes did not return Upar.")
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=final_state.pressure.dtype)
+    current_weights = jnp.sign(charge_qp)
+    upar_arr = jnp.asarray(upar, dtype=final_state.pressure.dtype)
+    upar_physical = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
+    if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
+        jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0)
+    else:
+        jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1)
+    jboot = jboot * jnp.asarray(elementary_charge * 1.0e-5, dtype=final_state.pressure.dtype)
+    smooth_abs = jnp.sqrt(jboot * jboot + jnp.asarray(eps, dtype=jboot.dtype) ** 2)
+    beta_arr = jnp.asarray(beta, dtype=jboot.dtype)
+    return jax.scipy.special.logsumexp(beta_arr * smooth_abs) / beta_arr
+
+
 def _objective_vector(final_state, runtime) -> jax.Array:
     er = jnp.asarray(final_state.Er)
     rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
+    transition_left = er[max(0, min(20, int(er.shape[-1]) - 1))]
+    transition_right = er[max(0, min(21, int(er.shape[-1]) - 1))]
     er2_vol = _volume_average(er * er, runtime.geometry)
     er_vol = _volume_average(er, runtime.geometry)
     te_vol = _electron_temperature_volume_average(final_state, runtime)
     p_tot_vol = _total_pressure_volume_average(final_state, runtime)
     alpha_vol = _alpha_power_volume_average(final_state, runtime)
+    bootstrap_current = _bootstrap_current_softmax_abs_scaled(final_state, runtime)
     return jnp.stack(
         [
             _softmax_objective(er),
             _smooth_root_proxy(er, rho),
+            transition_left,
+            transition_right,
             er2_vol,
             er_vol,
             te_vol,
             p_tot_vol,
             alpha_vol,
+            bootstrap_current,
         ]
     )
 
@@ -11055,7 +11099,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-derivative-mode-compare-check",
         action="store_true",
-        help="Dedicated opt-in mode: run the same realized-trace checkpoint frozen-FD benchmark twice, once with NTX direct AD and once with NTX custom_vjp, and compare timings and custom-AD derivatives.",
+        help="Retired; the supported NTX derivative lane is direct + compact_vjp + ntx_helper.",
     )
     parser.add_argument(
         "--adaptive-vs-frozen-custom-ad-check",
@@ -11075,7 +11119,7 @@ def main() -> None:
     parser.add_argument(
         "--ntx-exact-derivative-mode",
         default="direct",
-        choices=("direct", "custom_vjp"),
+        choices=("direct",),
         help="NTX exact-runtime derivative mode used by the benchmark when a single-mode run is requested.",
     )
     parser.add_argument(
@@ -11348,16 +11392,9 @@ def main() -> None:
             checkpoint_index=args.realized_trace_checkpoint_index,
         )
     elif args.ntx_derivative_mode_compare_check:
-        report = build_ntx_derivative_mode_compare_report(
-            config_path=args.config,
-            parameter_name=args.parameter,
-            rel_fd_step=args.fd_rel_step,
-            abs_fd_step=args.fd_abs_step,
-            device=args.device,
-            checkpoint_index=args.realized_trace_checkpoint_index,
-            replay_mode=args.realized_schedule_frozen_replay_mode,
-            include_direct_ad=not args.skip_direct_ad_in_frozen_check,
-            compute_five_point=False,
+        raise SystemExit(
+            "[autodiff-gate] --ntx-derivative-mode-compare-check was retired. "
+            "The supported NTX derivative lane is direct + compact_vjp + ntx_helper."
         )
     elif args.adaptive_vs_frozen_custom_ad_check:
         report = build_adaptive_vs_frozen_custom_ad_report(

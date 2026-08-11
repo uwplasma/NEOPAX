@@ -14,6 +14,22 @@ from typing import Any
 import jax.numpy as jnp
 
 
+def _right_face_value_from_cells(profile: jnp.ndarray) -> jnp.ndarray:
+    """Estimate the outer-face value from cell-centered samples."""
+    prof = jnp.asarray(profile)
+    if prof.ndim == 1:
+        prof = prof[None, :]
+        squeeze = True
+    else:
+        squeeze = False
+
+    if prof.shape[1] >= 2:
+        edge = 1.5 * prof[:, -1] - 0.5 * prof[:, -2]
+    else:
+        edge = prof[:, -1]
+    return edge[0] if squeeze else edge
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class ProfileSet:
     """Output container for physical profiles and boundary values."""
@@ -55,8 +71,8 @@ class AnalyticalProfileModel(ProfileModel):
         if n_species < 1:
             raise ValueError("StandardAnalyticalProfileModel requires at least one species.")
 
-        r_max = jnp.maximum(field.r_grid[-1], jnp.asarray(1.0e-30, dtype=field.r_grid.dtype))
-        x = field.r_grid / r_max
+        edge_radius = jnp.maximum(field.r_grid_half[-1], jnp.asarray(1.0e-30, dtype=field.r_grid_half.dtype))
+        x = field.r_grid / edge_radius
 
         # User-facing TOML convention:
         #   density inputs in units of 1e20 m^-3
@@ -124,15 +140,8 @@ class AnalyticalProfileModel(ProfileModel):
             temperature = temperature.at[i, :].set(c_temperature[i] * T_scale[i] * base_temperature_i)
             density = density.at[i, :].set(c_density[i] * n_scale[i] * base_density_i)
 
-        T_edge = temperature[:, -1]
-        n_edge = density[:, -1]
-
-        # Center/edge boundary initialization.
-        fr = 0.0
-        temperature = temperature.at[:, 0].set((4.0 * temperature[:, 1] - temperature[:, 2] - fr * 2.0 * field.dr) / 3.0)
-        density = density.at[:, 0].set((4.0 * density[:, 1] - density[:, 2] - fr * 2.0 * field.dr) / 3.0)
-        temperature = temperature.at[:, -1].set(T_edge)
-        density = density.at[:, -1].set(n_edge)
+        T_edge = temperature_scale_physical * T_edge
+        n_edge = density_scale_physical * n_edge
 
         return ProfileSet(
             temperature=temperature,
@@ -164,9 +173,9 @@ class PrescribedProfileModel(ProfileModel):
         if er.shape[0] != field.r_grid.shape[0]:
             raise ValueError("prescribed Er radial dimension must match field radial grid")
 
-        # Extract edge values directly from profile arrays (not user inputs)
-        T_edge = temp[:, -1]
-        n_edge = dens[:, -1]
+        # Cell-centered prescribed profiles do not include the boundary face.
+        T_edge = _right_face_value_from_cells(temp)
+        n_edge = _right_face_value_from_cells(dens)
 
         return ProfileSet(
             temperature=temp,

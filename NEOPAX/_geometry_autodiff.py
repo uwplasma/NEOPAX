@@ -780,6 +780,13 @@ class GeometryRawBlockSolve:
     param_entries: tuple[dict[str, Any], ...]
 
 
+def _stop_gradient_if_jax_value(leaf):
+    try:
+        return jax.lax.stop_gradient(leaf)
+    except TypeError:
+        return leaf
+
+
 def geometry_raw_block_solve_from_param_vector(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -800,7 +807,16 @@ def geometry_raw_block_solve_from_param_vector(
         max_iter=max_iter,
         solver_device=solver_device,
     )
+    # The raw-block transpose below differentiates the residual with respect to
+    # the full VMEC parameter pytree and then extracts requested harmonic
+    # columns.  It does not need the traced construction history from the
+    # optimizer's compact parameter vector to the full VMEC input arrays.  Cutting
+    # that ancestry keeps the payload/state VJPs from scaling with the number of
+    # selected boundary harmonics.
+    implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
     state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+    state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
+    dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
     return GeometryRawBlockSolve(
         implicit=implicit,
         implicit_params=implicit_params,
@@ -859,6 +875,30 @@ def _implicit_state_pullback_multi_rhs_with_assemble_rhs(
     )(lambda_batch)
     assemble_param_bar = jax.vmap(lambda state_bar: assemble_vjp_p(state_bar)[0])(state_bar_batch)
     return jax.tree.map(lambda left, right: left + right, implicit_param_bar, assemble_param_bar)
+
+
+def geometry_raw_block_transpose_from_state_bars(
+    raw_block_solve: GeometryRawBlockSolve,
+    state_bar_batch,
+    *,
+    probe_chunk_size: int = 1,
+) -> jnp.ndarray:
+    """Pull a batch of VMEC-state cotangents back to raw boundary parameters."""
+
+    implicit = raw_block_solve.implicit
+    if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+        raise AttributeError(
+            "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
+        )
+    param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+        raw_block_solve.implicit_params,
+        raw_block_solve.implicit_cfg,
+        raw_block_solve.state,
+        raw_block_solve.dof_mask,
+        state_bar_batch,
+        probe_chunk_size=int(probe_chunk_size),
+    )
+    return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, raw_block_solve.param_entries)
 
 
 def _boundary_with_boundary_deltas(
@@ -3104,8 +3144,9 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
-) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
-    """Return geometry objective values and W @ d(objectives)/d(params).
+    return_state_bars: bool = False,
+) -> tuple[dict[str, jnp.ndarray], object]:
+    """Return geometry objective values and objective cotangents.
 
     This is the memory-conscious table path for the combined geometry gate.
     It avoids the generic ``jacrev(objective_vector)`` path because that path
@@ -3113,6 +3154,10 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     residual graph.  Instead, it builds state-level cotangents by objective
     group and applies the QI pullback once, then scales that cotangent into the
     requested output rows.
+
+    By default, the second return value is ``W @ d(objectives)/d(params)``.
+    If ``return_state_bars`` is true, the final VMEC raw-block pullback is
+    skipped and the second return value is the VMEC-state cotangent tree.
     """
 
     param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
@@ -3312,10 +3357,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
     _progress("aspect proxy cotangents ready", aspect_proxy_state_bar)
 
-    j_qi_maxj_indices = (
-        names.index("boozer_qi_objective"),
-        names.index("boozer_maxj_objective"),
-    )
+    j_qi_maxj_names = ("boozer_qi_objective", "boozer_maxj_objective")
+    j_qi_maxj_indices = tuple(names.index(name) for name in j_qi_maxj_names)
 
     def j_qi_maxj_vector(booz_inner):
         values = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
@@ -3332,10 +3375,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     j_qi_maxj_values, j_qi_maxj_pullback = jax.vjp(j_qi_maxj_vector, booz)
-    values_by_name["boozer_qi_objective"] = j_qi_maxj_values[0]
-    values_by_name["boozer_maxj_objective"] = j_qi_maxj_values[1]
+    values_by_name.update(
+        {name: j_qi_maxj_values[i] for i, name in enumerate(j_qi_maxj_names)}
+    )
     j_qi_maxj_basis = jax.vmap(lambda cot: j_qi_maxj_pullback(cot)[0])(
-        jnp.eye(2, dtype=jnp.float64)
+        jnp.eye(len(j_qi_maxj_names), dtype=jnp.float64)
     )
     j_qi_maxj_boozer_bar = _tree_weighted_basis_sum(
         j_qi_maxj_basis,
@@ -3348,6 +3392,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
+    if bool(return_state_bars):
+        return values_by_name, state_bar
     if final_mode == "raw_block_transpose":
         if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
             raise AttributeError(
@@ -3513,15 +3559,27 @@ def _surface_indices_for_s_values(static, s_values: Sequence[float]):
 
 
 def _boozer_surface_indices_and_rho(static, rho_values):
-    s_values = tuple(float(jnp.asarray(rho_value) ** 2) for rho_value in rho_values)
-    surface_indices = jnp.unique(_surface_indices_for_s_values(static, s_values))
+    rho_values_np = np.asarray(rho_values, dtype=float).reshape(-1)
+    s_values = tuple(float(rho_value**2) for rho_value in rho_values_np)
+    surface_indices_arr = np.unique(
+        np.asarray(_surface_indices_for_s_values(static, s_values), dtype=np.int32)
+    )
+    surface_indices = jnp.asarray(surface_indices_arr, dtype=jnp.int32)
     s_full = jnp.asarray(static.s, dtype=jnp.float64)
     s_half = 0.5 * (s_full[:-1] + s_full[1:])
     sample_rho = jnp.sqrt(jnp.maximum(s_half[surface_indices], 0.0))
     return surface_indices, sample_rho
 
 
-def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
+def _boozer_rmnc00_from_state_at_rho(
+    context: GeometryAutodiffContext,
+    state,
+    rho_values,
+    *,
+    boozer_surface_sampling=None,
+    booz_constants_grids=None,
+    booz_mode00: int | None = None,
+):
     """Return Boozer R(m=0,n=0) on requested rho values.
 
     The frozen NTX path derives r00 from boozermn rmnc_b on VMEC half-mesh
@@ -3530,7 +3588,10 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     different major-radius profile from the geometry object.
     """
     rho_arr = jnp.asarray(rho_values, dtype=jnp.float64)
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_arr)
+    if boozer_surface_sampling is None:
+        surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, rho_values)
+    else:
+        surface_indices, sample_rho = boozer_surface_sampling
     vmec_jax = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
     inputs = _booz_xform_inputs_from_state(
@@ -3540,7 +3601,10 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
         signgs=context.signgs,
         flux=context.flux,
     )
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    if booz_constants_grids is None:
+        booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    else:
+        booz_constants, booz_grids = booz_constants_grids
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=booz_constants,
@@ -3550,13 +3614,32 @@ def _boozer_rmnc00_from_state_at_rho(context: GeometryAutodiffContext, state, rh
     )
     if "rmnc_b" not in out:
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+    if booz_mode00 is None:
+        mode00 = _find_boozer_mode_index(booz_grids.xm_b, booz_grids.xn_b, m_value=0, n_value=0)
+    else:
+        mode00 = int(booz_mode00)
     if mode00 is None:
         raise ValueError("Boozer output is missing the R(m=0,n=0) mode.")
     rmnc00_samples = jnp.asarray(out["rmnc_b"], dtype=jnp.float64)[:, mode00]
     return interpax.Interpolator1D(sample_rho, rmnc00_samples, extrap=True)(rho_arr)
+
+
+def _neopax_geometry_requested_sample_rho(context: GeometryAutodiffContext, *, n_r: int):
+    rho_grid_half = np.linspace(0.0, 1.0, int(n_r) + 1, dtype=float)
+    s_full = np.asarray(jax.device_get(context.static.s), dtype=float)
+    rho_half = np.sqrt(np.maximum(0.5 * (s_full[1:] + s_full[:-1]), 0.0))
+    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
+    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
+    return np.unique(
+        np.concatenate(
+            [
+                rho_grid_half[1:-1],
+                rho_half[:edge_count],
+                edge_rho,
+            ],
+            axis=0,
+        )
+    )
 
 
 def _vmec_r00_from_state_at_rho(context: GeometryAutodiffContext, state, rho_values):
@@ -3580,20 +3663,15 @@ def _build_neopax_geometry_from_state(
     state,
     *,
     n_r: int,
+    requested_sample_rho=None,
+    boozer_surface_sampling=None,
+    booz_constants_grids=None,
+    booz_mode_indices=None,
 ):
     from NEOPAX._geometry_models import VmecBoozer
 
-    rho_grid = jnp.linspace(0.0, 1.0, int(n_r))
-    if int(n_r) > 1:
-        rho_grid_half = jnp.concatenate(
-            [
-                jnp.array([0.0], dtype=rho_grid.dtype),
-                0.5 * (rho_grid[:-1] + rho_grid[1:]),
-                jnp.array([1.0], dtype=rho_grid.dtype),
-            ]
-        )
-    else:
-        rho_grid_half = jnp.array([0.0, 1.0], dtype=rho_grid.dtype)
+    rho_grid_half = jnp.linspace(0.0, 1.0, int(n_r) + 1)
+    rho_grid = 0.5 * (rho_grid_half[:-1] + rho_grid_half[1:])
     try:
         forces_module = _import_vmec_module("vmec_forces")
         residue_module = _import_vmec_module("vmec_residue")
@@ -3684,18 +3762,12 @@ def _build_neopax_geometry_from_state(
     # launching Boozer on every VMEC half-mesh surface.  Include a few real VMEC
     # half-mesh points at the axis and edge so extrapolated quantities such as
     # B0(r_grid) use a frozen-like local slope.
-    edge_count = min(8, max(int(rho_half.shape[0]) - 1, 0))
-    edge_rho = rho_half[-edge_count:] if edge_count > 0 else rho_half[:0]
-    requested_sample_rho = jnp.unique(
-        jnp.concatenate(
-            [
-                rho_grid_half[1:-1],
-                rho_half[1 : 1 + edge_count],
-                edge_rho,
-            ],
-            axis=0,
-        )
-    )
+    if requested_sample_rho is None:
+        requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
+    if boozer_surface_sampling is None:
+        surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
+    else:
+        surface_indices, sample_rho = boozer_surface_sampling
 
     phipf = jnp.asarray(context.flux.phipf)
     phi = jnp.concatenate(
@@ -3718,8 +3790,10 @@ def _build_neopax_geometry_from_state(
         signgs=context.signgs,
         flux=context.flux,
     )
-    surface_indices, sample_rho = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
-    booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    if booz_constants_grids is None:
+        booz_constants, booz_grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    else:
+        booz_constants, booz_grids = booz_constants_grids
     out = booz_api.booz_xform_from_inputs(
         inputs=inputs,
         constants=booz_constants,
@@ -3734,24 +3808,27 @@ def _build_neopax_geometry_from_state(
         raise ValueError("booz_xform_from_inputs output is missing rmnc_b.")
     gmnc_b = jnp.asarray(out["gmnc_b"])
     rmnc_b = jnp.asarray(out["rmnc_b"])
-    ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
-    ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
-    mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
-    if mode00 is None:
-        raise ValueError("Boozer output is missing the (0,0) mode.")
-    mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+    if booz_mode_indices is None:
+        ixm_b = jnp.asarray(out["ixm_b"], dtype=jnp.int32)
+        ixn_b = jnp.asarray(out["ixn_b"], dtype=jnp.int32)
+        mode00 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=0, n_value=0)
+        if mode00 is None:
+            raise ValueError("Boozer output is missing the (0,0) mode.")
+        mode10 = _find_boozer_mode_index(ixm_b, ixn_b, m_value=1, n_value=0)
+    else:
+        mode00, mode10 = booz_mode_indices
 
     r0_value = rmnc_b[-1, mode00]
     a_b = jnp.sqrt(volume_p / (2.0 * jnp.pi**2 * r0_value))
     r_grid = rho_grid * a_b
     r_grid_half = rho_grid_half * a_b
-    dr = r_grid[1] - r_grid[0] if int(n_r) > 1 else jnp.asarray(0.0, dtype=r_grid.dtype)
+    dr = r_grid_half[1] - r_grid_half[0] if int(n_r) > 0 else jnp.asarray(0.0, dtype=r_grid_half.dtype)
 
     dVdr = interpax.Interpolator1D(rho_half[1:], jnp.asarray(vp)[1:], extrap=True)
     volume_scale = (2.0 * jnp.pi) ** 2
     vprime = dVdr(rho_grid) * 2.0 * rho_grid / a_b * volume_scale
     vprime_half = dVdr(rho_grid_half) * 2.0 * rho_grid_half / a_b * volume_scale
-    over_vprime = _safe_reciprocal(vprime).at[0].set(0.0)
+    over_vprime = _safe_reciprocal(vprime)
 
     iota_samples = jnp.asarray(out["iota_b"])
     i_value_samples = jnp.asarray(out["buco_b"])
@@ -3774,15 +3851,15 @@ def _build_neopax_geometry_from_state(
 
     b_00 = b0_interp(rho_grid)
     b0 = b_00
-    b_10 = _safe_divide(b10_interp(rho_grid), b_00).at[0].set(0.0)
+    b_10 = _safe_divide(b10_interp(rho_grid), b_00)
     iota = iota_interp(rho_grid)
     i_value = i_interp(rho_grid)
     g_value = g_interp(rho_grid)
     # Match frozen VmecBoozer: epsilon_t uses the Boozer R00 profile, not the
     # edge major radius used to define a_b.
     epsilon_t = _safe_divide(rho_grid * a_b, r00_interp(rho_grid))
-    curvature = _safe_divide(jnp.abs(b_10), epsilon_t).at[0].set(0.0)
-    enlogation = jnp.square(_safe_divide(epsilon_t, b_10)).at[0].set(0.0)
+    curvature = _safe_divide(jnp.abs(b_10), epsilon_t)
+    enlogation = jnp.square(_safe_divide(epsilon_t, b_10))
     # b0_interp is tabulated against rho; B0prime follows the frozen geometry
     # convention of dB0/dr, so convert dB00/drho by drho/dr = 1 / a_b.
     b0prime = jax.vmap(jax.grad(lambda rho: b0_interp(rho)))(rho_grid) / a_b
@@ -4295,6 +4372,94 @@ def _traceable_vmec_surfaces_from_state(context: GeometryAutodiffContext, state,
     )
 
 
+def _positive_transport_s_values_from_rho(rho_values):
+    rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
+    positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
+    if positive.size == 0:
+        return tuple(float(rho_value**2) for rho_value in rho_np)
+    first_transport_rho = float(np.min(positive))
+    return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
+
+
+def _build_ntx_center_prepared_from_vmec_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    center_count: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str,
+):
+    """Build only the center prepared NTX system used by compact root pullbacks."""
+
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
+
+    rho_center_sample = np.linspace(0.0, 1.0, int(center_count), dtype=float)
+    center_s_values = _positive_transport_s_values_from_rho(rho_center_sample)
+    surface_backend_key = str(surface_backend).strip().lower()
+
+    if surface_backend_key in {"vmec", "vmec_jax"}:
+        center_surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state,
+            s_values=center_s_values,
+        )
+    elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
+        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
+        if surfaces_fn is None:
+            try:
+                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
+            except ImportError:
+                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
+
+                def surfaces_fn(**kwargs):
+                    s_values = kwargs.pop("s_values")
+                    return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
+
+        static_phipf = jnp.asarray(context.flux.phipf, dtype=jnp.float64)
+        static_s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
+        static_phi = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=static_phipf.dtype),
+                jnp.cumsum(static_phipf[1:] * (static_s_full[1:] - static_s_full[:-1])),
+            ],
+            axis=0,
+        )
+        static_ntx_psia = jnp.abs(static_phi[-1])
+        center_surfaces = surfaces_fn(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            s_values=center_s_values,
+            mboz=int(context.mboz),
+            nboz=int(context.nboz),
+            psi_p=static_ntx_psia,
+        )
+    else:
+        raise ValueError(
+            "ntx_exact_surface_backend for realtime geometry must be one of "
+            "'vmec', 'booz', or 'auto'."
+        )
+
+    grid_spec = ntx.GridSpec(n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi))
+
+    def _stack_optional(*values):
+        first = values[0]
+        if first is None:
+            return None
+        return jnp.stack([jnp.asarray(value) for value in values], axis=0)
+
+    center_prepared_tuple = tuple(ntx.prepare_monoenergetic_system(surface, grid_spec) for surface in center_surfaces)
+    return jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
+
+
 def build_ntx_exact_lij_support_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -4305,6 +4470,9 @@ def build_ntx_exact_lij_support_from_vmec_state(
     n_xi: int,
     surface_backend: str = "booz",
     progress_label: str | None = None,
+    r00_boozer_surface_sampling=None,
+    r00_booz_constants_grids=None,
+    r00_booz_mode00: int | None = None,
 ):
     _ensure_local_stack_on_path()
     ntx_src = _repo_root() / "NTX" / "src"
@@ -4354,12 +4522,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
         ],
         axis=0,
     )
-    static_ntx_psia = float(jax.device_get(jnp.abs(static_phi[-1])))
-    r00_support_rho = jnp.unique(jnp.concatenate([rho_center, rho_face], axis=0))
-    r00_support = _boozer_rmnc00_from_state_at_rho(context, state, r00_support_rho)
-    r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
-    r00_center = r00_interp(rho_center)
-    r00_face = r00_interp(rho_face)
+    static_ntx_psia = jnp.abs(static_phi[-1])
     rho_center_sample = np.linspace(0.0, 1.0, int(rho_center.shape[0]), dtype=float)
     if int(rho_face.shape[0]) > 1:
         rho_face_sample = np.concatenate(
@@ -4372,16 +4535,21 @@ def build_ntx_exact_lij_support_from_vmec_state(
         )
     else:
         rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
+    r00_support_rho_np = np.unique(np.concatenate([rho_center_sample, rho_face_sample], axis=0))
+    r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
+    r00_support = _boozer_rmnc00_from_state_at_rho(
+        context,
+        state,
+        r00_support_rho_np,
+        boozer_surface_sampling=r00_boozer_surface_sampling,
+        booz_constants_grids=r00_booz_constants_grids,
+        booz_mode00=r00_booz_mode00,
+    )
+    r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
+    r00_center = r00_interp(rho_center)
+    r00_face = r00_interp(rho_face)
     center_s_values = tuple(float(rho_value**2) for rho_value in rho_center_sample)
     face_s_values = tuple(float(rho_value**2) for rho_value in rho_face_sample)
-
-    def _positive_transport_s_values(rho_values):
-        rho_np = np.asarray(rho_values, dtype=float).reshape(-1)
-        positive = rho_np[np.isfinite(rho_np) & (rho_np > 0.0)]
-        if positive.size == 0:
-            return tuple(float(rho_value**2) for rho_value in rho_np)
-        first_transport_rho = float(np.min(positive))
-        return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
 
     surface_backend_key = str(surface_backend).strip().lower()
     if progress_label is not None:
@@ -4398,12 +4566,12 @@ def build_ntx_exact_lij_support_from_vmec_state(
         center_surfaces = _traceable_vmec_surfaces_from_state(
             context,
             state,
-            s_values=_positive_transport_s_values(rho_center_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_center_sample),
         )
         face_surfaces = _traceable_vmec_surfaces_from_state(
             context,
             state,
-            s_values=_positive_transport_s_values(rho_face_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_face_sample),
         )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
         if progress_label is not None:
@@ -4416,7 +4584,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=_positive_transport_s_values(rho_center_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_center_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4426,7 +4594,7 @@ def build_ntx_exact_lij_support_from_vmec_state(
             static=context.static,
             indata=context.indata,
             signgs=context.signgs,
-            s_values=_positive_transport_s_values(rho_face_sample),
+            s_values=_positive_transport_s_values_from_rho(rho_face_sample),
             mboz=int(context.mboz),
             nboz=int(context.nboz),
             psi_p=static_ntx_psia,
@@ -4589,13 +4757,22 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     progress_label: str | None = None,
     return_branch_gradients: bool = False,
     raw_block_solve: GeometryRawBlockSolve | None = None,
-) -> jnp.ndarray:
+    return_state_bars: bool = False,
+    extra_state_bars: object | None = None,
+    extra_state_bars_factory=None,
+    return_raw_block_solve: bool = False,
+) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
     The payload graph is differentiated only from payload leaves back to the
     converged VMEC state.  The nonlinear VMEC solve pullback is then handled by
     the validated raw block-tridiagonal transpose rule, matching the
     geometry-objective table convention.
+
+    If ``return_state_bars`` is true, stop before the raw-block transpose and
+    return the assembled VMEC-state cotangent batch.  ``extra_state_bars`` or
+    ``extra_state_bars_factory`` lets fused callers append already-assembled
+    VMEC-state cotangents before the same compact raw-block transpose.
     """
 
     if not payload_bars:
@@ -4621,9 +4798,70 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
+    geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
+    geometry_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static,
+        geometry_requested_sample_rho,
+    )
+    r00_center_sample = np.linspace(0.0, 1.0, int(n_r), dtype=float)
+    if int(n_r) > 1:
+        r00_face_sample = np.concatenate(
+            [
+                np.asarray([0.0], dtype=float),
+                0.5 * (r00_center_sample[:-1] + r00_center_sample[1:]),
+                np.asarray([1.0], dtype=float),
+            ],
+            axis=0,
+        )
+    else:
+        r00_face_sample = np.asarray([0.0, 1.0], dtype=float)
+    r00_support_rho_sample = np.unique(
+        np.concatenate([r00_center_sample, r00_face_sample], axis=0)
+    )
+    r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static,
+        r00_support_rho_sample,
+    )
+    geometry_boozer_inputs = _booz_xform_inputs_from_state(
+        state=state,
+        static=context.static,
+        indata=context.indata,
+        signgs=context.signgs,
+        flux=context.flux,
+    )
+    geometry_booz_constants_grids = _booz_constants_and_grids_for_inputs(
+        context,
+        geometry_boozer_inputs,
+    )
+    _geometry_booz_constants, geometry_booz_grids = geometry_booz_constants_grids
+    geometry_booz_mode00 = _find_boozer_mode_index(
+        geometry_booz_grids.xm_b,
+        geometry_booz_grids.xn_b,
+        m_value=0,
+        n_value=0,
+    )
+    if geometry_booz_mode00 is None:
+        raise ValueError("Boozer grids are missing the (0,0) mode.")
+    geometry_booz_mode_indices = (
+        geometry_booz_mode00,
+        _find_boozer_mode_index(
+            geometry_booz_grids.xm_b,
+            geometry_booz_grids.xn_b,
+            m_value=1,
+            n_value=0,
+        ),
+    )
 
     def geometry_from_state(state_inner):
-        return _build_neopax_geometry_from_state(context, state_inner, n_r=n_r)
+        return _build_neopax_geometry_from_state(
+            context,
+            state_inner,
+            n_r=n_r,
+            requested_sample_rho=geometry_requested_sample_rho,
+            boozer_surface_sampling=geometry_boozer_surface_sampling,
+            booz_constants_grids=geometry_booz_constants_grids,
+            booz_mode_indices=geometry_booz_mode_indices,
+        )
 
     def ntx_support_from_state(state_inner):
         geometry_inner = geometry_from_state(state_inner)
@@ -4636,6 +4874,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             n_xi=int(n_xi),
             surface_backend=str(surface_backend),
             progress_label=progress_label,
+            r00_boozer_surface_sampling=r00_boozer_surface_sampling,
+            r00_booz_constants_grids=geometry_booz_constants_grids,
+            r00_booz_mode00=geometry_booz_mode00,
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
@@ -4678,8 +4919,64 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             zero_like_state,
         )
 
-    def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
-        payload_template = payload_fn(state)
+    def _tree_path_names(path):
+        names = []
+        for key in path:
+            name = getattr(key, "name", None)
+            if name is None:
+                name = getattr(key, "key", None)
+            if name is None:
+                name = str(key)
+            names.append(str(name))
+        return tuple(names)
+
+    def _center_drds_from_state(state_inner):
+        geometry_inner = geometry_from_state(state_inner)
+        rho_arr = (
+            jnp.asarray(geometry_inner.r_grid, dtype=jnp.float64)
+            / jnp.asarray(geometry_inner.a_b, dtype=jnp.float64)
+        )
+        rho_positive = rho_arr > 0.0
+        rho_safe = jnp.where(rho_positive, rho_arr, 1.0)
+        return jnp.where(rho_positive, jnp.asarray(geometry_inner.a_b, dtype=jnp.float64) / (2.0 * rho_safe), 0.0)
+
+    def _center_prepared_from_state(state_inner, *, center_count: int):
+        return _build_ntx_center_prepared_from_vmec_state(
+            context,
+            state_inner,
+            center_count=center_count,
+            n_theta=int(n_theta),
+            n_zeta=int(n_zeta),
+            n_xi=int(n_xi),
+            surface_backend=str(surface_backend),
+        )
+
+    def _batched_bar_tangent_contract(batched_bars, tangent_leaves):
+        total = None
+        for bars, tangent in zip(batched_bars, tangent_leaves, strict=True):
+            bars_arr = jnp.asarray(bars)
+            tangent_arr = jnp.asarray(tangent, dtype=bars_arr.dtype)
+            rows = int(bars_arr.shape[0])
+            contribution = jnp.reshape(bars_arr, (rows, -1)) @ jnp.ravel(tangent_arr)
+            total = contribution if total is None else total + contribution
+        if total is None:
+            return jnp.zeros((len(payload_bars),), dtype=jnp.float64)
+        return total
+
+    def _implicit_param_tangent_batch():
+        zero_params = jax.tree_util.tree_map(jnp.zeros_like, implicit_params)
+        tangents = []
+        for entry in param_entries:
+            field_name = entry["input_field"]
+            base = getattr(zero_params, field_name)
+            updates = {
+                field_name: base.at[int(entry["n_offset"]), int(entry["m_index"])].set(1.0)
+            }
+            tangents.append(dataclasses.replace(zero_params, **updates))
+        return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *tangents)
+
+    def _payload_branch_pullback_setup(branch_name, payload_fn, branch_bars):
+        payload_template = branch_bars[0]
         payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
         payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
         float_leaf_indices = tuple(
@@ -4721,17 +5018,123 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 flush=True,
             )
         if not active_float_leaf_indices:
-            return _zero_state_bar_batch()
+            return {
+                "active": False,
+                "single_state_bar": lambda _objective_i: zero_like_state,
+                "tangent_contraction": lambda _state_tangent: jnp.zeros((len(payload_bars),), dtype=jnp.float64),
+            }
+
+        active_leaf_paths = tuple(
+            _tree_path_names(payload_template_paths_and_leaves[leaf_i][0])
+            for leaf_i in active_float_leaf_indices
+        )
+
+        def _compact_initial_er_setup():
+            if branch_name != "ntx_support":
+                return None
+            prepared_template = payload_template.center_prepared
+            prepared_leaves = jax.tree_util.tree_leaves(prepared_template)
+            if not prepared_leaves:
+                return None
+            center_count = int(jnp.asarray(prepared_leaves[0]).shape[0])
+            prepared_paths = {
+                _tree_path_names(path): local_i
+                for local_i, (path, _leaf) in enumerate(
+                    jax.tree_util.tree_flatten_with_path(prepared_template)[0]
+                )
+            }
+            compact_specs = []
+            for leaf_i, path_names in zip(active_float_leaf_indices, active_leaf_paths, strict=True):
+                if path_names == ("center_channels", "drds"):
+                    compact_specs.append(("center_drds", leaf_i, None))
+                    continue
+                if len(path_names) >= 2 and path_names[0] == "center_prepared":
+                    prepared_path = path_names[1:]
+                    if prepared_path not in prepared_paths:
+                        return None
+                    compact_specs.append(("center_prepared", leaf_i, prepared_paths[prepared_path]))
+                    continue
+                return None
+
+            def compact_support_float_leaves_from_state(state_inner):
+                center_drds = None
+                center_prepared = None
+                center_prepared_leaves = None
+                out = []
+                for kind, _leaf_i, local_i in compact_specs:
+                    if kind == "center_drds":
+                        if center_drds is None:
+                            center_drds = _center_drds_from_state(state_inner)
+                        out.append(jnp.asarray(center_drds))
+                    else:
+                        if center_prepared is None:
+                            center_prepared = _center_prepared_from_state(
+                                state_inner,
+                                center_count=center_count,
+                            )
+                            center_prepared_leaves = jax.tree_util.tree_leaves(center_prepared)
+                        out.append(jnp.asarray(center_prepared_leaves[local_i]))
+                return tuple(out)
+
+            batched_compact_bars = tuple(
+                jnp.stack(
+                    [
+                        jnp.asarray(
+                            payload_bar_leaves_by_objective[objective_i][leaf_i],
+                            dtype=jnp.asarray(payload_template_leaves[leaf_i]).dtype,
+                        )
+                        for objective_i in range(len(branch_bars))
+                    ],
+                    axis=0,
+                )
+                for _kind, leaf_i, _local_i in compact_specs
+            )
+            compact_pullback_cache = []
+
+            def _compact_pullback():
+                if not compact_pullback_cache:
+                    _compact_baseline, compact_pullback = jax.vjp(
+                        compact_support_float_leaves_from_state,
+                        state,
+                    )
+                    del _compact_baseline
+                    compact_pullback_cache.append(compact_pullback)
+                return compact_pullback_cache[0]
+
+            def _single_state_bar(objective_i):
+                compact_bar_leaves = tuple(
+                    jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
+                    for leaf in batched_compact_bars
+                )
+                return _compact_pullback()(tuple(compact_bar_leaves))[0]
+
+            def _tangent_contraction(state_tangent):
+                _, tangent_leaves = jax.jvp(
+                    compact_support_float_leaves_from_state,
+                    (state,),
+                    (state_tangent,),
+                )
+                return _batched_bar_tangent_contract(batched_compact_bars, tangent_leaves)
+
+            if progress_label is not None:
+                print(
+                    f"{progress_label} {branch_name}_compact_initial_er_support_pullback=True",
+                    flush=True,
+                )
+            return {
+                "active": True,
+                "single_state_bar": _single_state_bar,
+                "tangent_contraction": _tangent_contraction,
+            }
+
+        compact_setup = _compact_initial_er_setup()
+        if compact_setup is not None:
+            return compact_setup
 
         def payload_float_leaves_from_state(state_inner):
             leaves = jax.tree_util.tree_leaves(payload_fn(state_inner))
             return tuple(jnp.asarray(leaves[leaf_i]) for leaf_i in active_float_leaf_indices)
 
-        _payload_float_baseline, payload_float_pullback = jax.vjp(
-            payload_float_leaves_from_state,
-            state,
-        )
-        del _payload_float_baseline
         batched_payload_float_bars = tuple(
             jnp.stack(
                 [
@@ -4745,14 +5148,45 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
             for leaf_i in active_float_leaf_indices
         )
+        payload_float_pullback_cache = []
 
-        def _single_state_bar_from_payload_bars(payload_bar_leaves):
-            return payload_float_pullback(tuple(payload_bar_leaves))[0]
+        def _payload_float_pullback():
+            if not payload_float_pullback_cache:
+                _payload_float_baseline, payload_float_pullback = jax.vjp(
+                    payload_float_leaves_from_state,
+                    state,
+                )
+                del _payload_float_baseline
+                payload_float_pullback_cache.append(payload_float_pullback)
+            return payload_float_pullback_cache[0]
 
-        state_bar_batch_value = jax.lax.map(
-            _single_state_bar_from_payload_bars,
-            batched_payload_float_bars,
-        )
+        def _single_state_bar(objective_i):
+            payload_bar_leaves = tuple(
+                jax.lax.dynamic_index_in_dim(leaf, objective_i, axis=0, keepdims=False)
+                for leaf in batched_payload_float_bars
+            )
+            return _payload_float_pullback()(tuple(payload_bar_leaves))[0]
+
+        def _tangent_contraction(state_tangent):
+            _, tangent_leaves = jax.jvp(
+                payload_float_leaves_from_state,
+                (state,),
+                (state_tangent,),
+            )
+            return _batched_bar_tangent_contract(batched_payload_float_bars, tangent_leaves)
+
+        return {
+            "active": True,
+            "single_state_bar": _single_state_bar,
+            "tangent_contraction": _tangent_contraction,
+        }
+
+    def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
+        setup = _payload_branch_pullback_setup(branch_name, payload_fn, branch_bars)
+        if not bool(setup["active"]):
+            return _zero_state_bar_batch()
+        state_bar_rows = tuple(setup["single_state_bar"](i) for i in range(len(branch_bars)))
+        state_bar_batch_value = jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *state_bar_rows)
         branch_all_finite = _print_state_bar_batch_finiteness(branch_name, state_bar_batch_value)
         if (
             progress_label is not None
@@ -4797,47 +5231,140 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                     break
         return state_bar_batch_value
 
-    geometry_state_bar_batch = None
-    support_state_bar_batch = None
-    if combined_payload:
+    def _payload_raw_block_state_bar_batch():
+        geometry_state_bar_batch = None
+        support_state_bar_batch = None
+        if combined_payload:
+            geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
+            support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+            # Build the heavy NTX support VJP before the lighter geometry VJP so
+            # the support compile/execution does not overlap the geometry
+            # state-bar batch.  This preserves the same cotangent sum and final
+            # raw-block transpose while reducing peak device memory.
+            support_state_bar_batch = _state_bar_batch_from_payload_branch(
+                "ntx_support",
+                ntx_support_from_state,
+                support_bars,
+            )
+            geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
+                "geometry",
+                geometry_from_state,
+                geometry_bars,
+            )
+            state_bar_batch = jax.tree_util.tree_map(
+                lambda geometry_bar, support_bar: geometry_bar + support_bar,
+                geometry_state_bar_batch,
+                support_state_bar_batch,
+            )
+            _print_state_bar_batch_finiteness("combined", state_bar_batch)
+        else:
+            state_bar_batch = _state_bar_batch_from_payload_branch(
+                "ntx_support",
+                ntx_support_from_state,
+                tuple(payload_bars),
+            )
+            _print_state_bar_batch_finiteness("combined", state_bar_batch)
+
+        if return_branch_gradients and combined_payload:
+            return jax.tree_util.tree_map(
+                lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
+                    [geometry_bar, support_bar, total_bar],
+                    axis=0,
+                ),
+                geometry_state_bar_batch,
+                support_state_bar_batch,
+                state_bar_batch,
+            )
+        return state_bar_batch
+
+    def _try_compact_payload_tangent_contract_to_param_matrix():
+        if (
+            not combined_payload
+            or return_branch_gradients
+            or return_state_bars
+            or extra_state_bars is not None
+            or extra_state_bars_factory is not None
+            or not hasattr(implicit, "implicit_state_tangent_raw_block")
+        ):
+            return None
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
         support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
-        geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
-            "geometry",
-            geometry_from_state,
-            geometry_bars,
-        )
-        support_state_bar_batch = _state_bar_batch_from_payload_branch(
-            "ntx_support",
-            ntx_support_from_state,
-            support_bars,
-        )
-        state_bar_batch = jax.tree_util.tree_map(
-            lambda geometry_bar, support_bar: geometry_bar + support_bar,
-            geometry_state_bar_batch,
-            support_state_bar_batch,
-        )
-        _print_state_bar_batch_finiteness("combined", state_bar_batch)
-    else:
-        state_bar_batch = _state_bar_batch_from_payload_branch(
-            "ntx_support",
-            ntx_support_from_state,
-            tuple(payload_bars),
-        )
-        _print_state_bar_batch_finiteness("combined", state_bar_batch)
+        geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
+        support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
+        if not param_entries:
+            return jnp.zeros((len(payload_bars), 0), dtype=jnp.float64)
+        param_tangent_batch = _implicit_param_tangent_batch()
 
-    if return_branch_gradients and combined_payload:
-        raw_block_state_bar_batch = jax.tree_util.tree_map(
-            lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
-                [geometry_bar, support_bar, total_bar],
-                axis=0,
-            ),
-            geometry_state_bar_batch,
-            support_state_bar_batch,
-            state_bar_batch,
+        def _single_gradient_column(param_tangent):
+            state_tangent = implicit.implicit_state_tangent_raw_block(
+                implicit_params,
+                implicit_cfg,
+                state,
+                dof_mask,
+                param_tangent,
+                probe_chunk_size=1,
+            )
+            return (
+                geometry_setup["tangent_contraction"](state_tangent)
+                + support_setup["tangent_contraction"](state_tangent)
+            )
+
+        gradient_columns = jax.lax.map(
+            _single_gradient_column,
+            param_tangent_batch,
         )
-    else:
-        raw_block_state_bar_batch = state_bar_batch
+        if progress_label is not None:
+            print(
+                f"{progress_label} compact_payload_tangent_contract=True",
+                flush=True,
+            )
+        return jnp.swapaxes(gradient_columns, 0, 1)
+
+    streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
+    if streamed_gradient_matrix is not None:
+        if progress_label is not None:
+            arr = np.asarray(jax.device_get(streamed_gradient_matrix))
+            finite = np.isfinite(arr)
+            all_finite = bool(np.all(finite))
+            finite_values = arr[finite]
+            l2 = float(np.sum(finite_values * finite_values) ** 0.5) if finite_values.size else 0.0
+            first_bad = None
+            if not all_finite:
+                bad = np.argwhere(~finite)
+                first_bad = None if bad.size == 0 else tuple(int(v) for v in bad[0])
+            print(
+                f"{progress_label} raw_block_param_bar_l2={l2:.6e} "
+                f"raw_block_param_bar_all_finite={all_finite} "
+                f"raw_block_param_bar_first_nonfinite={first_bad}",
+                flush=True,
+            )
+        return streamed_gradient_matrix
+
+    raw_block_state_bar_batch = _payload_raw_block_state_bar_batch()
+
+    if extra_state_bars is None and extra_state_bars_factory is not None:
+        raw_block_state_bar_batch = jax.block_until_ready(raw_block_state_bar_batch)
+        extra_state_bars = extra_state_bars_factory(raw_block_solve)
+
+    if bool(return_state_bars):
+        if extra_state_bars is None:
+            result_state_bars = raw_block_state_bar_batch
+        else:
+            result_state_bars = jax.tree_util.tree_map(
+                lambda payload_bar, extra_bar: jnp.concatenate([payload_bar, extra_bar], axis=0),
+                raw_block_state_bar_batch,
+                extra_state_bars,
+            )
+        if bool(return_raw_block_solve):
+            return result_state_bars, raw_block_solve
+        return result_state_bars
+
+    if extra_state_bars is not None:
+        raw_block_state_bar_batch = jax.tree_util.tree_map(
+            lambda payload_bar, extra_bar: jnp.concatenate([payload_bar, extra_bar], axis=0),
+            raw_block_state_bar_batch,
+            extra_state_bars,
+        )
 
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,

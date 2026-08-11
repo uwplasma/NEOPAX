@@ -17,18 +17,45 @@ NEOPAX documentation
 =========================
 
 Welcome to NEOPAX!
-This is a Python package in JAX to perform optimization of Neoclassical and 1D transport calculations in JAX
+This is a Python package in JAX for neoclassical physics, 1D radial transport,
+and differentiable transport/geometry workflows.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Getting Started
 
-   overview
+   installation
+   quickstart
+   dimensional_scaling
+   getting_started
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Tutorials
+
+   tutorials
+   worked_examples
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Theory and Numerics
+
+   theory_and_conventions
+   equations_and_derivations
+   algorithms
+   confinement_physics
+   architecture
+   mirror_geometry
    transport_physics_and_flux_models
    solver_backends
    expensive_response_methods
-   getting_started
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Reference
+
+   api_reference
+   cli_reference
    methods_of_use
    custom_models
    input_file_reference
-   worked_examples

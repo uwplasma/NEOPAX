@@ -23,7 +23,7 @@ ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 21
 ntx_exact_n_xi = 33
 ntx_exact_surface_backend = "vmec"
-ntx_exact_face_response_mode = "interpolate_center_response"
+ntx_exact_center_response_mode = "interpolate_from_faces"
 ntx_exact_response_anchor_count = 48
 
 [ambipolarity]
@@ -156,8 +156,8 @@ max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
 throw = false
-debug_stage_markers = true
-debug_walltime_attempts = true
+debug_stage_markers = false
+debug_walltime_attempts = false
 debug_disable_jit = false
 save_n = 10
 

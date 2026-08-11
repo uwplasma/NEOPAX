@@ -1,0 +1,69 @@
+diff --git a/NEOPAX/_orchestrator.py b/NEOPAX/_orchestrator.py
+index 09d982d..2b376a6 100644
+--- a/NEOPAX/_orchestrator.py
++++ b/NEOPAX/_orchestrator.py
+@@ -402,7 +402,13 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
+                 f"min={float(jnp.min(finite_roots)):.6e}",
+                 f"max={float(jnp.max(finite_roots)):.6e}",
+             )
+-        if runtime.models.flux is not None and runtime.geometry is not None:
++        run_scan_diagnostic = bool(
++            amb_cfg.get(
++                "er_initialization_debug_scan_diagnostic",
++                runtime.solver_parameters.get("er_initialization_debug_scan_diagnostic", False),
++            )
++        )
++        if run_scan_diagnostic and runtime.models.flux is not None and runtime.geometry is not None:
+             try:
+                 local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
+                 if local_particle_flux is not None:
+@@ -440,17 +446,18 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
+                             sign_change_count,
+                         )
+ 
+-                    gamma_debug = jax.vmap(gamma_scan_for_radius)(sample_radii)
+-                    for radius_idx, vals in zip(sample_radii.tolist(), gamma_debug):
+-                        g_left, g_right, g_best, er_best, n_changes = vals
+-                        print(
+-                            f"[NEOPAX] ambipolar scan diagnostic[r={int(radius_idx)}]:",
+-                            f"gamma_at_scan_min={float(g_left):.6e}",
+-                            f"gamma_at_scan_max={float(g_right):.6e}",
+-                            f"minabs_gamma={float(g_best):.6e}",
+-                            f"minabs_gamma_Er={float(er_best):.6e}",
+-                            f"coarse_sign_changes={int(n_changes)}",
+-                        )
++                    gamma_left, gamma_right, gamma_best, er_best, n_changes = jax.vmap(gamma_scan_for_radius)(
++                        sample_radii
++                    )
++                    for k, radius_idx in enumerate(sample_radii.tolist()):
++                        print(
++                            f"[NEOPAX] ambipolar scan diagnostic[r={int(radius_idx)}]:",
++                            f"gamma_at_scan_min={float(gamma_left[k]):.6e}",
++                            f"gamma_at_scan_max={float(gamma_right[k]):.6e}",
++                            f"minabs_gamma={float(gamma_best[k]):.6e}",
++                            f"minabs_gamma_Er={float(er_best[k]):.6e}",
++                            f"coarse_sign_changes={int(n_changes[k])}",
++                        )
+             except Exception as exc:
+                 print(f"[NEOPAX] ambipolar scan diagnostic unavailable: {exc}")
+     return _apply_configured_er_dirichlet_boundaries(config, dataclasses.replace(state, Er=er_init))
+diff --git a/NEOPAX/_transport_flux_models.py b/NEOPAX/_transport_flux_models.py
+index b2311f1..51b66b2 100644
+--- a/NEOPAX/_transport_flux_models.py
++++ b/NEOPAX/_transport_flux_models.py
+@@ -1478,6 +1478,15 @@ def _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend="auto"):
+ def build_ntx_runtime_surfaces(vmec_file, boozer_file, rho_values, *, surface_backend="auto") -> tuple[Any, ...]:
+     rho_arr = _as_float_array(rho_values, name="rho_values")
+     _, loader = _build_ntx_surface_loader(vmec_file, boozer_file, surface_backend=surface_backend)
++    if rho_arr.shape[0] >= 2 and np.isclose(float(rho_arr[0]), 0.0):
++        # NTX/VMEC transport normalization is singular exactly on axis. The
++        # coefficient maps regularize the axis from neighboring radii, so use
++        # the first non-axis surface as the load/prepare placeholder.
++        axis_placeholder_rho = float(rho_arr[1])
++        return tuple(
++            loader(axis_placeholder_rho if index == 0 else float(rho_value))
++            for index, rho_value in enumerate(rho_arr)
++        )
+     return tuple(loader(float(rho_value)) for rho_value in rho_arr)
+ 
+ 

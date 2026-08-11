@@ -159,6 +159,7 @@ Where positivity or filtering is needed, prefer smooth substitutes:
 - soft weighting,
 - differentiable normalization floors.
 
+
 ## Comparison with the NTX exact-runtime path
 
 The intended user experience should be similar to the existing NTX exact-runtime turbulence/neoclassical integration pattern:

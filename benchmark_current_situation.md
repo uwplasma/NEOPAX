@@ -1,0 +1,255 @@
+# Current Benchmark Situation
+
+This file records the current benchmark state for the AD/FD validation work around shared-payload optimization internals. The detailed numeric comparison tables are saved in:
+
+- `optimization_ad_vs_fd.md`
+- `shared_payload_fd_comparison.md`
+
+## Protected Baseline
+
+- The benchmark AD paths are treated as reference behavior. Do not change them while working on optimization plumbing unless explicitly agreed first.
+- Optimization internals should reproduce the benchmark AD graph/numerics, especially the compact root/transport pullbacks and raw-block geometry pullback behavior.
+- The fused/shared optimization path should reuse the same geometry state/payload where possible, but not change the differentiated physics path.
+
+## Validated Geometry Objectives
+
+Geometry-only frozen-linearized FD checks using `input.QI_nfp2_newNT_opt_hires_true` have been run for `RBC:1:0`.
+
+| Objective | Value | Frozen Linearized FD | Forward JVP | Internal Reverse Grad | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `boozer_qi_objective` | `3.2109136309506803e-03` | `8.9996041589633161e-02` | `8.9989229074526111e-02` | `8.9989229072212851e-02` | AD/JVP match; FD close |
+| `boozer_maxj_objective` | `1.3389843913753766e-01` | `-1.1591364898936340e+00` | `-1.1593167988198267e+00` | `-1.1593167987078914e+00` | AD/JVP match; FD close |
+
+Commands:
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_qi_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+```bash
+python ./examples/benchmarks/compare_geometry_qi_frozen_linearized_fd.py \
+  --vmec-input ./examples/inputs/input.QI_nfp2_newNT_opt_hires_true \
+  --parameter RBC:1:0 \
+  --objective boozer_maxj_objective \
+  --multigrid \
+  --forward-linear-solve-mode raw_block \
+  --forward-linear-maxiter 300 \
+  --adjoint-maxiter 300
+```
+
+## Validated Initial-Er Root Only
+
+Root-only shared payload AD/FD checks include:
+
+- `softmax_Er`
+- `smooth_root_proxy`
+- `Er_transition_left`
+- `Er_transition_right`
+- `Er2_volume_average`
+- `Er_volume_average`
+- `bootstrap_current_softmax_abs_scaled`
+
+The corrected frozen-linearized root FD lane is needed for stable comparisons of root-branch-sensitive volume averages.
+
+Example FD command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter n0 \
+  --geometry-fd-lane frozen_linearized \
+  --radau-jacobian-reuse-mode legacy \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-only-fd \
+  --initial-Er-root-only-fd-root-lane frozen_linearized \
+  --root-only-objective all
+```
+
+Known root-only FD examples:
+
+| Parameter | Objective | FD |
+| --- | --- | ---: |
+| `RBC:1:0` | `bootstrap_current_softmax_abs_scaled` | `-1.705882e+00` |
+| `T0` | `bootstrap_current_softmax_abs_scaled` | `2.162376e-01` |
+| `density_shape_power` | `bootstrap_current_softmax_abs_scaled` | `-1.229510e-02` |
+| `temperature_shape_power` | `bootstrap_current_softmax_abs_scaled` | `1.439570e+00` |
+| `n0` | `bootstrap_current_softmax_abs_scaled` | `-2.147247e-03` |
+
+## Full Transport Shared Payload
+
+The 2-step shared-payload AD smoke ran successfully without OOM and used optimization internals.
+
+Command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --ntx-exact-derivative-mode direct \
+  --ntx-exact-derivative-field-pullback-mode generic_jvp \
+  --objective all \
+  --accepted-step-limit 2 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 1 \
+  --reverse-stage-adjoint-solve-mode bicgstab \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
+
+The 16-step `RBC:1:0` FD reference was refreshed on 2026-08-09 after the
+finite-volume/lagged-response cleanup. The previous shared-payload AD
+comparison is now historical until the reverse benchmark is rerun against this
+same baseline.
+
+| Objective | Current FD d/d`RBC:1:0` | Explicit-geometry FD | Final-state FD |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | `-7.859465e+01` | `0.000000e+00` | `-7.859465e+01` |
+| `smooth_root_proxy` | `0.000000e+00` | `0.000000e+00` | `0.000000e+00` |
+| `Er_transition_left` | `-2.031218e+01` | `0.000000e+00` | `-2.031218e+01` |
+| `Er_transition_right` | `-2.249804e+01` | `0.000000e+00` | `-2.249804e+01` |
+| `Er2_volume_average` | `5.442326e+03` | `3.485674e-01` | `5.441977e+03` |
+| `Er_volume_average` | `1.365614e+02` | `-5.066563e-02` | `1.366120e+02` |
+| `electron_temperature_volume_average_keV` | `-2.397626e-02` | `-1.226367e-02` | `-1.171259e-02` |
+| `total_pressure_volume_average` | `-7.694414e-02` | `-7.382077e-02` | `-3.123393e-03` |
+| `alpha_power_volume_average_mw_m3` | `1.960857e-01` | `-1.870960e-03` | `1.979567e-01` |
+| `bootstrap_current_softmax_abs_scaled` | `-1.767152e+00` | `-1.674224e+00` | `-9.293104e-02` |
+
+16-step FD command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --parameter RBC:1:0 \
+  --geometry-fd-lane frozen_linearized \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --replay-mode accepted \
+  --initial-Er-root-ad jax_selected_root
+```
+
+## Current Open Items
+
+- The latest attempted 16-step shared-payload reverse-AD rerun after the
+  finite-volume boundary/evaluated-state changes failed before producing
+  objective/Jacobian rows. It reached:
+  `runtime build = 301.307 s`, `solver components = 119.625 s`,
+  `profile-state VJP = 120.077 s`, `initial-carry VJP = 56.074 s`,
+  `realized-schedule VJP forward = 775.634 s`, then failed at segmented
+  cotangent sweep start with a JAX `float0` addition in
+  `ComposedEquationSystem._shared_fluxes_add`.
+- A narrow reverse-bookkeeping patch now sanitizes `float0` cotangent leaves
+  to real zero bars in shared-flux cotangent addition and in
+  `_sanitize_float_delta_bar_tree`. This does not change the forward physics,
+  finite-volume equations, BCs, or NTX evaluation path. It should be retested
+  with the same 16-step shared-payload reverse command before comparing
+  profile-column AD against the fresh FD rows.
+- The next 16-step shared-payload reverse rerun got past the `float0` failure
+  and then failed at NTX lagged-response state pullback with a cotangent tree
+  mismatch: the face-only VJP produced `Gamma_faces`, `Q_faces`, `Upar_faces`,
+  but the assembled equation bar also contained center keys `Gamma`, `Q`,
+  `Upar`. For `ntx_center_response = interpolate_from_faces`, those center
+  bars mathematically belong to the face fluxes through
+  `cell_centered_from_faces`. A second narrow reverse-bookkeeping patch now
+  transposes `cell_centered_from_faces` and adds center bars onto the matching
+  face bars before calling face-response/state/support VJPs. This preserves
+  the face-primary forward math and does not evaluate a separate center NTX
+  response.
+- The latest 16-step shared-payload reverse rerun got past the previous tree
+  mismatch and reached:
+  `runtime build = 295.737 s`, `solver components = 119.406 s`,
+  `profile-state VJP = 120.047 s`, `initial-carry VJP = 46.341 s`,
+  `realized-schedule VJP forward = 740.514 s`, then failed at segmented
+  cotangent sweep start because one inactive center flux cotangent arrived as
+  scalar `0`; `jax.linear_transpose(cell_centered_from_faces)` expected a
+  center-profile cotangent array. A third narrow reverse-bookkeeping patch now
+  normalizes `None`, scalar, and `float0` face/center bars to correctly shaped
+  zero arrays before applying the interpolation transpose.
+- New 8-parameter full-transport shared-payload reverse-AD snapshot is saved
+  in `shared_payload_8param_benchmark_snapshot.md`. This run uses
+  `density_shape_alpha`, `temperature_shape_alpha`, `RBC:1:0`, and `ZBS:1:0`,
+  so it should be validated against newly rerun FD references instead of the
+  older 5-parameter table.
+- New current QI frozen-linearized FD for `RBC:1:0` is saved in the 8-parameter
+  snapshot: FD `5.9397387449796542e+00`, forward JVP
+  `5.9392891189187216e+00`, optimization-internal reverse
+  `5.9392891187135319e+00`, shared-payload reverse
+  `5.9392927523725234e+00`.
+- New current QI frozen-linearized FD for `ZBS:1:0` is saved in the
+  8-parameter snapshot: FD `-1.2367491295362752e-01`, forward JVP
+  `-1.2365550023172692e-01`, optimization-internal reverse
+  `-1.2365550092181365e-01`, shared-payload reverse
+  `-1.2365499862085017e-01`.
+- New current maxJ frozen-linearized FD for `RBC:1:0` is saved in the
+  8-parameter snapshot: FD `-3.8425374640355458e+03`, forward JVP
+  `-3.8431351880877260e+03`, optimization-internal reverse
+  `-3.8431351877333364e+03`, shared-payload reverse
+  `-3.8431400490597589e+03`.
+- New current maxJ frozen-linearized FD for `ZBS:1:0` is saved in the
+  8-parameter snapshot: FD `-1.9205101180950553e+03`, forward JVP
+  `-1.9205082810004324e+03`, optimization-internal reverse
+  `-1.9205082803893893e+03`, shared-payload reverse
+  `-1.9205081921396923e+03`.
+- Save matching 2-step FD references if we want a formal 2-step AD-vs-FD table.
+- Add/rerun the matching current shared-payload reverse AD rows for the refreshed 16-step geometry `RBC:1:0` FD table.
+- A 16-step FD run for `density_shape_alpha` originally produced all-zero
+  gradients, but that run was invalid. The benchmark-local
+  `_parameterized_profile_set` in
+  `examples/benchmarks/benchmark_transport_forward_fd_lane.py` accepted the
+  alpha parameter name but did not pass `density_shape_alpha` or
+  `temperature_shape_alpha` into `AnalyticalProfileModel`, so the perturbed
+  alpha values were discarded before state construction. This wiring is now
+  fixed. The corrected `density_shape_alpha` and `temperature_shape_alpha` FD
+  references are saved in `shared_payload_fd_comparison.md` and
+  `optimization_ad_vs_fd.md`.
+- After fast-forwarding `en/clear_flux` to `8d9abc4`, the next 16-step
+  shared-payload reverse run reached segmented cotangent sweep start and then
+  failed in the turbulent submodel fallback VJP: the submodel forward output
+  had both center and face keys (`Gamma`, `Gamma_faces`, `Q`, `Q_faces`,
+  `Upar`, `Upar_faces`), while the combined flux bar only contained the active
+  center keys. The generic fallback state VJP now completes missing output keys
+  with shaped zero cotangents before calling the pullback. This is reverse
+  cotangent bookkeeping only; it does not change the forward flux values.
+- Step-2 reverse audit also found the same missing-key risk in the combined
+  lagged-response pullback, the combined support-payload fallback pullback, and
+  the NTX exact-runtime custom response/state/support pullbacks. These paths
+  now complete cotangent dictionaries against the actual forward output PyTree
+  before calling generic VJPs. The combined state pullback now also propagates
+  face-bar keys to submodels instead of center bars only.
+- Step-3 center/face audit: equation VJPs own the transpose from face outputs
+  to center uses when the shared flux tree exposes only face keys. NTX
+  interpolate-from-faces support/state pullbacks already folded any explicit
+  center bars back into face bars; the lagged-response pullback now uses the
+  same condition, so interpolated-center bars cannot be dropped in that path.
+  The combined model still only routes bars to submodels; it does not perform
+  the center-to-face transpose itself, avoiding double counting.
+- Step-4 compact-rule audit: the benchmark shared-payload reverse path uses the
+  NTX compact helper `solve_prepared_coefficient_vector_derivative_vjp`; it is
+  not using the old exposed derivative-mode flags. The compact
+  `build_lagged_response` state transpose now uses the configured
+  `density_floor`, matching the forward lagged-response builder for both
+  coefficient and interpolated center-response branches. Current benchmark
+  TOMLs explicitly set `ntx_exact_center_response_mode = "interpolate_from_faces"`;
+  the legacy face-response alias `interpolate_center_response` still maps to a
+  center-local response if the center-response option is omitted, so avoid that
+  alias in benchmark TOMLs.
+- Step-5 diagnostics: structural reverse tree diagnostics are now opt-in via
+  `NEOPAX_REVERSE_TREE_DEBUG=1`. With the default unset, the reverse path stays
+  compact/quiet. If enabled, generic flux-model fallback VJPs print
+  `[reverse-flux-bar-tree]` when supplied flux cotangent dictionaries do not
+  match the actual forward output keys, and support-payload bar checks report
+  objective/leaf details before the expensive segmented reverse sweep.
+  Scalar/float0 zero bars are still normalized to shaped zeros.
+- Keep bootstrap-current objective in the root/full benchmark tables, but be careful not to reintroduce generic full flux VJPs that caused OOM.
+- Continue optimization-fusion work only through internals, preserving benchmark AD behavior.

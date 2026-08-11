@@ -13,7 +13,7 @@ neoclassical_file = "./examples/inputs/Dij_NTX_QI_Er_Optimized.h5"
 ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 21
 ntx_exact_n_xi = 32
-ntx_exact_face_response_mode = "interpolate_center_response"
+ntx_exact_center_response_mode = "interpolate_from_faces"
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
