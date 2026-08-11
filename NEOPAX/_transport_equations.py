@@ -2070,6 +2070,20 @@ class ComposedEquationSystem:
             flux_bar = self._shared_fluxes_add(flux_bar, er_flux_bar)
         return flux_bar
 
+    def _pullback_shared_flux_rhs_state_and_fluxes(self, state, working_state, eidx, shared_fluxes, rhs_bar):
+        """Joint assembly pullback with respect to working state and shared fluxes."""
+
+        def _assembly_map(working_state_value, fluxes_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                fluxes_value,
+            )
+
+        _, assembly_pullback = jax.vjp(_assembly_map, working_state, shared_fluxes)
+        return assembly_pullback(rhs_bar)
+
     def _pullback_shared_flux_rhs_state(self, state, working_state, eidx, shared_fluxes, rhs_bar):
         """Reverse-only split pullback for fixed-shared-flux RHS state dependence."""
         density_eq, temperature_eq, er_eq = self._resolve_equations()
@@ -2270,15 +2284,13 @@ class ComposedEquationSystem:
             **self._shared_flux_bc_kwargs(),
         )
 
-        direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
             state,
             working_state,
             eidx,
             shared_fluxes,
             rhs_bar,
         )
-
-        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
         flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
         if callable(flux_state_pullback_fn):
             working_state_bar = flux_state_pullback_fn(
