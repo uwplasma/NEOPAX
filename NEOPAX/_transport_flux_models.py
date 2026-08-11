@@ -1140,61 +1140,96 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         q_faces_total_bar = flux_bar.get("Q_faces", 0)
         upar_faces_total_bar = flux_bar.get("Upar_faces", 0)
 
-        zero_gamma = self._zero_like_flux(flux_bar.get("Gamma", None), 0)
-        zero_gamma_faces = self._zero_like_flux(flux_bar.get("Gamma_faces", None), 0)
+        def _is_missing_bar(value):
+            if value is None:
+                return True
+            arr = jnp.asarray(value)
+            return arr.shape == () or arr.dtype == jax.dtypes.float0
+
+        def _first_bar_template(keys, fallback=0):
+            for key in keys:
+                value = flux_bar.get(key, None)
+                if not _is_missing_bar(value):
+                    return jnp.asarray(value)
+            return fallback
+
+        def _bar_or_zero(key, template):
+            value = flux_bar.get(key, None)
+            if _is_missing_bar(value):
+                return jnp.zeros_like(jnp.asarray(template))
+            return jnp.asarray(value, dtype=jnp.asarray(template).dtype)
+
+        gamma_template = _first_bar_template(("Gamma", "Gamma_neo", "Gamma_turb", "Gamma_classical"), 0)
+        q_template = _first_bar_template(("Q", "Q_neo", "Q_turb", "Q_classical"), 0)
+        upar_template = _first_bar_template(("Upar", "Upar_neo", "Upar_turb", "Upar_classical"), 0)
+        gamma_faces_template = _first_bar_template(
+            ("Gamma_faces", "Gamma_neo_faces", "Gamma_turb_faces", "Gamma_classical_faces"),
+            0,
+        )
+        q_faces_template = _first_bar_template(("Q_faces", "Q_neo_faces", "Q_turb_faces", "Q_classical_faces"), 0)
+        upar_faces_template = _first_bar_template(
+            ("Upar_faces", "Upar_neo_faces", "Upar_turb_faces", "Upar_classical_faces"),
+            0,
+        )
+        gamma_total_bar = _bar_or_zero("Gamma", gamma_template)
+        q_total_bar = _bar_or_zero("Q", q_template)
+        upar_total_bar = _bar_or_zero("Upar", upar_template)
+        gamma_faces_total_bar = _bar_or_zero("Gamma_faces", gamma_faces_template)
+        q_faces_total_bar = _bar_or_zero("Q_faces", q_faces_template)
+        upar_faces_total_bar = _bar_or_zero("Upar_faces", upar_faces_template)
         neo_flux_bar = {}
         turb_flux_bar = {}
         classical_flux_bar = {}
         if any(key in flux_bar for key in ("Gamma", "Q", "Upar", "Gamma_neo", "Q_neo", "Upar_neo")):
             neo_flux_bar.update(
                 {
-                    "Gamma": gamma_total_bar + flux_bar.get("Gamma_neo", zero_gamma),
-                    "Q": q_total_bar + flux_bar.get("Q_neo", 0),
-                    "Upar": upar_total_bar + flux_bar.get("Upar_neo", 0),
+                    "Gamma": gamma_total_bar + _bar_or_zero("Gamma_neo", gamma_template),
+                    "Q": q_total_bar + _bar_or_zero("Q_neo", q_template),
+                    "Upar": upar_total_bar + _bar_or_zero("Upar_neo", upar_template),
                 }
             )
             turb_flux_bar.update(
                 {
                     "Gamma": (
-                        gamma_total_bar + flux_bar.get("Gamma_turb", zero_gamma)
+                        gamma_total_bar + _bar_or_zero("Gamma_turb", gamma_template)
                         if self.include_turbulent_particle_flux
-                        else flux_bar.get("Gamma_turb", zero_gamma)
+                        else _bar_or_zero("Gamma_turb", gamma_template)
                     ),
-                    "Q": q_total_bar + flux_bar.get("Q_turb", 0),
-                    "Upar": upar_total_bar + flux_bar.get("Upar_turb", 0),
+                    "Q": q_total_bar + _bar_or_zero("Q_turb", q_template),
+                    "Upar": upar_total_bar + _bar_or_zero("Upar_turb", upar_template),
                 }
             )
             classical_flux_bar.update(
                 {
-                    "Gamma": gamma_total_bar + flux_bar.get("Gamma_classical", zero_gamma),
-                    "Q": q_total_bar + flux_bar.get("Q_classical", 0),
-                    "Upar": upar_total_bar + flux_bar.get("Upar_classical", 0),
+                    "Gamma": gamma_total_bar + _bar_or_zero("Gamma_classical", gamma_template),
+                    "Q": q_total_bar + _bar_or_zero("Q_classical", q_template),
+                    "Upar": upar_total_bar + _bar_or_zero("Upar_classical", upar_template),
                 }
             )
         if any(key in flux_bar for key in ("Gamma_faces", "Q_faces", "Upar_faces", "Gamma_neo_faces", "Q_neo_faces", "Upar_neo_faces")):
             neo_flux_bar.update(
                 {
-                    "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_neo_faces", zero_gamma_faces),
-                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_neo_faces", 0),
-                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_neo_faces", 0),
+                    "Gamma_faces": gamma_faces_total_bar + _bar_or_zero("Gamma_neo_faces", gamma_faces_template),
+                    "Q_faces": q_faces_total_bar + _bar_or_zero("Q_neo_faces", q_faces_template),
+                    "Upar_faces": upar_faces_total_bar + _bar_or_zero("Upar_neo_faces", upar_faces_template),
                 }
             )
             turb_flux_bar.update(
                 {
                     "Gamma_faces": (
-                        gamma_faces_total_bar + flux_bar.get("Gamma_turb_faces", zero_gamma_faces)
+                        gamma_faces_total_bar + _bar_or_zero("Gamma_turb_faces", gamma_faces_template)
                         if self.include_turbulent_particle_flux
-                        else flux_bar.get("Gamma_turb_faces", zero_gamma_faces)
+                        else _bar_or_zero("Gamma_turb_faces", gamma_faces_template)
                     ),
-                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_turb_faces", 0),
-                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_turb_faces", 0),
+                    "Q_faces": q_faces_total_bar + _bar_or_zero("Q_turb_faces", q_faces_template),
+                    "Upar_faces": upar_faces_total_bar + _bar_or_zero("Upar_turb_faces", upar_faces_template),
                 }
             )
             classical_flux_bar.update(
                 {
-                    "Gamma_faces": gamma_faces_total_bar + flux_bar.get("Gamma_classical_faces", zero_gamma_faces),
-                    "Q_faces": q_faces_total_bar + flux_bar.get("Q_classical_faces", 0),
-                    "Upar_faces": upar_faces_total_bar + flux_bar.get("Upar_classical_faces", 0),
+                    "Gamma_faces": gamma_faces_total_bar + _bar_or_zero("Gamma_classical_faces", gamma_faces_template),
+                    "Q_faces": q_faces_total_bar + _bar_or_zero("Q_classical_faces", q_faces_template),
+                    "Upar_faces": upar_faces_total_bar + _bar_or_zero("Upar_classical_faces", upar_faces_template),
                 }
             )
 
