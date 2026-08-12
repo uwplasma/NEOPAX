@@ -2061,6 +2061,86 @@ class ComposedEquationSystem:
             working_state_bar = _add_state_bars(working_state_bar, er_state_bar)
         return working_state_bar
 
+    def _pullback_shared_flux_rhs_state_component(
+        self,
+        state,
+        working_state,
+        eidx,
+        shared_fluxes,
+        rhs_bar,
+        *,
+        component: str,
+    ):
+        """Diagnostic fixed-shared-flux state pullback for one equation block."""
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        zero_working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+        component_name = str(component).strip().lower()
+
+        def _density_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state_value, density_rhs)
+            return density_rhs
+
+        def _pressure_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            pressure_rhs = (
+                temperature_eq(working_state_value, fluxes=shared_fluxes)
+                if temperature_eq is not None
+                else jnp.zeros_like(state.pressure)
+            )
+            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
+                    working_state_value,
+                    density_rhs,
+                    pressure_rhs,
+                )
+            return pressure_rhs
+
+        def _er_map(working_state_value):
+            er_rhs = (
+                er_eq(working_state_value, fluxes=shared_fluxes)
+                if er_eq is not None
+                else jnp.zeros_like(state.Er)
+            )
+            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
+            return er_rhs
+
+        if component_name == "density":
+            if density_eq is None:
+                return zero_working_state_bar
+            _, density_pullback = jax.vjp(_density_map, working_state)
+            (density_state_bar,) = density_pullback(rhs_bar.density)
+            return density_state_bar
+        if component_name == "pressure":
+            if temperature_eq is None:
+                return zero_working_state_bar
+            _, pressure_pullback = jax.vjp(_pressure_map, working_state)
+            (pressure_state_bar,) = pressure_pullback(rhs_bar.pressure)
+            return pressure_state_bar
+        if component_name == "er":
+            if er_eq is None:
+                return zero_working_state_bar
+            _, er_pullback = jax.vjp(_er_map, working_state)
+            (er_state_bar,) = er_pullback(rhs_bar.Er)
+            return er_state_bar
+        raise ValueError(f"Unknown direct RHS state component {component!r}.")
+
     def pullback_evaluate_with_lagged_response(self, t, state, runtime, lagged_response, rhs_bar):
         """Reverse-only pullback for lagged-response dependence of the RHS."""
         del t, runtime
@@ -2242,6 +2322,66 @@ class ComposedEquationSystem:
             rhs_bar,
         )
         return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def _pullback_evaluate_with_lagged_response_state_direct_component(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        *,
+        component: str,
+    ):
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar = self._pullback_shared_flux_rhs_state_component(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+            component=component,
+        )
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_direct_density(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="density",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_pressure(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="pressure",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er",
+        )
 
     def pullback_evaluate_with_lagged_response_state_direct_generic(self, t, state, runtime, lagged_response, rhs_bar):
         """Diagnostic generic VJP for fixed-shared-flux RHS state dependence."""

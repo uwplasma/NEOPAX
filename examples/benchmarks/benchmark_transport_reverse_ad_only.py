@@ -4274,6 +4274,18 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_direct_rhs_component_off_l2": float(diagnostic["radial_direct_rhs_component_off_l2"]),
         "radial_direct_rhs_component_off_rel_l2": float(diagnostic["radial_direct_rhs_component_off_rel_l2"]),
         "radial_direct_rhs_component_off_max_abs": float(diagnostic["radial_direct_rhs_component_off_max_abs"]),
+        "radial_direct_density_rhs_component_l2": float(diagnostic["radial_direct_density_rhs_component_l2"]),
+        "radial_direct_density_rhs_component_off_l2": float(diagnostic["radial_direct_density_rhs_component_off_l2"]),
+        "radial_direct_density_rhs_component_off_rel_l2": float(diagnostic["radial_direct_density_rhs_component_off_rel_l2"]),
+        "radial_direct_density_rhs_component_off_max_abs": float(diagnostic["radial_direct_density_rhs_component_off_max_abs"]),
+        "radial_direct_pressure_rhs_component_l2": float(diagnostic["radial_direct_pressure_rhs_component_l2"]),
+        "radial_direct_pressure_rhs_component_off_l2": float(diagnostic["radial_direct_pressure_rhs_component_off_l2"]),
+        "radial_direct_pressure_rhs_component_off_rel_l2": float(diagnostic["radial_direct_pressure_rhs_component_off_rel_l2"]),
+        "radial_direct_pressure_rhs_component_off_max_abs": float(diagnostic["radial_direct_pressure_rhs_component_off_max_abs"]),
+        "radial_direct_er_rhs_component_l2": float(diagnostic["radial_direct_er_rhs_component_l2"]),
+        "radial_direct_er_rhs_component_off_l2": float(diagnostic["radial_direct_er_rhs_component_off_l2"]),
+        "radial_direct_er_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_rhs_component_off_rel_l2"]),
+        "radial_direct_er_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_rhs_component_off_max_abs"]),
         "radial_joint_generic_rhs_component_l2": float(diagnostic["radial_joint_generic_rhs_component_l2"]),
         "radial_joint_generic_rhs_component_off_l2": float(diagnostic["radial_joint_generic_rhs_component_off_l2"]),
         "radial_joint_generic_rhs_component_off_rel_l2": float(diagnostic["radial_joint_generic_rhs_component_off_rel_l2"]),
@@ -4422,6 +4434,22 @@ def _run_local_stage_matvec_diagnostic_report(
         f"joint_generic_off_l2={report.get('radial_joint_generic_rhs_component_off_l2', _missing_component_value):.6e} "
         f"joint_generic_off_rel={report.get('radial_joint_generic_rhs_component_off_rel_l2', _missing_component_value):.6e} "
         f"joint_generic_off_max={report.get('radial_joint_generic_rhs_component_off_max_abs', _missing_component_value):.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage direct off-band equation attribution: "
+        f"density_l2={report['radial_direct_density_rhs_component_l2']:.6e} "
+        f"density_off_l2={report['radial_direct_density_rhs_component_off_l2']:.6e} "
+        f"density_off_rel={report['radial_direct_density_rhs_component_off_rel_l2']:.6e} "
+        f"density_off_max={report['radial_direct_density_rhs_component_off_max_abs']:.6e} "
+        f"pressure_l2={report['radial_direct_pressure_rhs_component_l2']:.6e} "
+        f"pressure_off_l2={report['radial_direct_pressure_rhs_component_off_l2']:.6e} "
+        f"pressure_off_rel={report['radial_direct_pressure_rhs_component_off_rel_l2']:.6e} "
+        f"pressure_off_max={report['radial_direct_pressure_rhs_component_off_max_abs']:.6e} "
+        f"er_l2={report['radial_direct_er_rhs_component_l2']:.6e} "
+        f"er_off_l2={report['radial_direct_er_rhs_component_off_l2']:.6e} "
+        f"er_off_rel={report['radial_direct_er_rhs_component_off_rel_l2']:.6e} "
+        f"er_off_max={report['radial_direct_er_rhs_component_off_max_abs']:.6e}",
         flush=True,
     )
     print(
