@@ -4388,6 +4388,26 @@ def _run_local_stage_matvec_diagnostic_report(
         flush=True,
     )
     print(
+        "[autodiff-gate] local stage off-band component attribution: "
+        f"explicit_l2={report['radial_explicit_rhs_component_l2']:.6e} "
+        f"explicit_off_l2={report['radial_explicit_rhs_component_off_l2']:.6e} "
+        f"explicit_off_rel={report['radial_explicit_rhs_component_off_rel_l2']:.6e} "
+        f"explicit_off_max={report['radial_explicit_rhs_component_off_max_abs']:.6e} "
+        f"flux_l2={report['radial_flux_rhs_component_l2']:.6e} "
+        f"flux_off_l2={report['radial_flux_rhs_component_off_l2']:.6e} "
+        f"flux_off_rel={report['radial_flux_rhs_component_off_rel_l2']:.6e} "
+        f"flux_off_max={report['radial_flux_rhs_component_off_max_abs']:.6e} "
+        f"direct_l2={report['radial_direct_rhs_component_l2']:.6e} "
+        f"direct_off_l2={report['radial_direct_rhs_component_off_l2']:.6e} "
+        f"direct_off_rel={report['radial_direct_rhs_component_off_rel_l2']:.6e} "
+        f"direct_off_max={report['radial_direct_rhs_component_off_max_abs']:.6e} "
+        f"joint_generic_l2={report['radial_joint_generic_rhs_component_l2']:.6e} "
+        f"joint_generic_off_l2={report['radial_joint_generic_rhs_component_off_l2']:.6e} "
+        f"joint_generic_off_rel={report['radial_joint_generic_rhs_component_off_rel_l2']:.6e} "
+        f"joint_generic_off_max={report['radial_joint_generic_rhs_component_off_max_abs']:.6e}",
+        flush=True,
+    )
+    print(
         "[autodiff-gate] local stage off-tridiagonal low-rank values: "
         f"top8_singular_values="
         f"{','.join(f'{value:.6e}' for value in report['radial_off_tridiagonal_svals_top8'])} "

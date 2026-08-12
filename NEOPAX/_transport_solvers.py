@@ -8157,6 +8157,165 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         radial_blocks,
         jnp.zeros_like(radial_blocks),
     )
+
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    stage_basis_rows = jnp.eye(system_size, dtype=kernel_context.dtype).reshape(
+        (
+            system_size,
+            int(kernel_context.num_stages),
+            int(kernel_context.state_dim),
+        )
+    )
+
+    def _component_transpose_matrix_from_stage_pullback(stage_pullback):
+        jt_basis_stages = jax.vmap(
+            lambda lambda_stages_for_basis: jax.vmap(
+                stage_pullback,
+                in_axes=(0, 0, 0),
+            )(
+                stage_times,
+                stage_states,
+                lambda_stages_for_basis,
+            )
+        )(stage_basis_rows)
+        coupled = jnp.einsum("ij,bin->bjn", kernel_context.a, jt_basis_stages)
+        transpose_rows = (-primal_result.trial_dt * coupled).reshape((system_size, system_size))
+        return transpose_rows.T
+
+    def _component_radial_offband_stats(component_matrix):
+        radial_component_matrix = component_matrix[radial_permutation[:, None], radial_permutation[None, :]]
+        component_blocks = radial_component_matrix.reshape(
+            (
+                int(layout.n_radial),
+                radial_block_dim,
+                int(layout.n_radial),
+                radial_block_dim,
+            )
+        )
+        component_blocks = jnp.transpose(component_blocks, (0, 2, 1, 3))
+        component_off_blocks = jnp.where(
+            off_tridiagonal_mask[:, :, None, None],
+            component_blocks,
+            jnp.zeros_like(component_blocks),
+        )
+        component_l2 = jnp.sqrt(
+            jnp.maximum(
+                jnp.vdot(component_matrix, component_matrix),
+                jnp.asarray(0.0, dtype=kernel_context.dtype),
+            )
+        )
+        component_off_l2 = jnp.sqrt(
+            jnp.maximum(
+                jnp.vdot(component_off_blocks, component_off_blocks),
+                jnp.asarray(0.0, dtype=kernel_context.dtype),
+            )
+        )
+        return (
+            component_l2,
+            component_off_l2,
+            component_off_l2
+            / jnp.maximum(
+                component_l2,
+                jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+            ),
+            jnp.max(jnp.abs(component_off_blocks)),
+        )
+
+    def _missing_component_stats():
+        return (diagnostic_nan, diagnostic_nan, diagnostic_nan, diagnostic_nan)
+
+    if physics_context.flat_rhs_state_pullback is not None:
+        explicit_component_matrix = _component_transpose_matrix_from_stage_pullback(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            )
+        )
+        (
+            explicit_component_l2,
+            explicit_component_off_l2,
+            explicit_component_off_rel,
+            explicit_component_off_max,
+        ) = _component_radial_offband_stats(explicit_component_matrix)
+    else:
+        (
+            explicit_component_l2,
+            explicit_component_off_l2,
+            explicit_component_off_rel,
+            explicit_component_off_max,
+        ) = _missing_component_stats()
+
+    if physics_context.flat_rhs_flux_state_pullback is not None:
+        flux_component_matrix = _component_transpose_matrix_from_stage_pullback(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_flux_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            )
+        )
+        (
+            flux_component_l2,
+            flux_component_off_l2,
+            flux_component_off_rel,
+            flux_component_off_max,
+        ) = _component_radial_offband_stats(flux_component_matrix)
+    else:
+        (
+            flux_component_l2,
+            flux_component_off_l2,
+            flux_component_off_rel,
+            flux_component_off_max,
+        ) = _missing_component_stats()
+
+    if physics_context.flat_rhs_direct_state_pullback is not None:
+        direct_component_matrix = _component_transpose_matrix_from_stage_pullback(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_direct_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            )
+        )
+        (
+            direct_component_l2,
+            direct_component_off_l2,
+            direct_component_off_rel,
+            direct_component_off_max,
+        ) = _component_radial_offband_stats(direct_component_matrix)
+    else:
+        (
+            direct_component_l2,
+            direct_component_off_l2,
+            direct_component_off_rel,
+            direct_component_off_max,
+        ) = _missing_component_stats()
+
+    if physics_context.flat_rhs_joint_generic_state_pullback is not None:
+        joint_generic_component_matrix = _component_transpose_matrix_from_stage_pullback(
+            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_joint_generic_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                lambda_eval,
+            )
+        )
+        (
+            joint_generic_component_l2,
+            joint_generic_component_off_l2,
+            joint_generic_component_off_rel,
+            joint_generic_component_off_max,
+        ) = _component_radial_offband_stats(joint_generic_component_matrix)
+    else:
+        (
+            joint_generic_component_l2,
+            joint_generic_component_off_l2,
+            joint_generic_component_off_rel,
+            joint_generic_component_off_max,
+        ) = _missing_component_stats()
+
     matrix_l2 = jnp.sqrt(jnp.maximum(jnp.vdot(matrix, matrix), jnp.asarray(0.0, dtype=kernel_context.dtype)))
     off_tridiagonal_l2 = jnp.sqrt(
         jnp.maximum(
@@ -8368,6 +8527,22 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
         ),
         "radial_off_tridiagonal_max_abs": jnp.max(jnp.abs(off_tridiagonal_blocks)),
+        "radial_explicit_rhs_component_l2": explicit_component_l2,
+        "radial_explicit_rhs_component_off_l2": explicit_component_off_l2,
+        "radial_explicit_rhs_component_off_rel_l2": explicit_component_off_rel,
+        "radial_explicit_rhs_component_off_max_abs": explicit_component_off_max,
+        "radial_flux_rhs_component_l2": flux_component_l2,
+        "radial_flux_rhs_component_off_l2": flux_component_off_l2,
+        "radial_flux_rhs_component_off_rel_l2": flux_component_off_rel,
+        "radial_flux_rhs_component_off_max_abs": flux_component_off_max,
+        "radial_direct_rhs_component_l2": direct_component_l2,
+        "radial_direct_rhs_component_off_l2": direct_component_off_l2,
+        "radial_direct_rhs_component_off_rel_l2": direct_component_off_rel,
+        "radial_direct_rhs_component_off_max_abs": direct_component_off_max,
+        "radial_joint_generic_rhs_component_l2": joint_generic_component_l2,
+        "radial_joint_generic_rhs_component_off_l2": joint_generic_component_off_l2,
+        "radial_joint_generic_rhs_component_off_rel_l2": joint_generic_component_off_rel,
+        "radial_joint_generic_rhs_component_off_max_abs": joint_generic_component_off_max,
         "radial_offset0_l2": offset0_l2,
         "radial_offset1_l2": offset1_l2,
         "radial_offset2_l2": offset2_l2,
