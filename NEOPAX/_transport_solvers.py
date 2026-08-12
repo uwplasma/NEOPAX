@@ -8219,6 +8219,28 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     off_tridiagonal_significant_count = jnp.sum(
         jnp.logical_and(off_tridiagonal_mask, block_l2 > significant_block_tol).astype(jnp.int32)
     )
+    off_tridiagonal_matrix = jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(radial_matrix.shape)
+    off_tridiagonal_svals = jnp.linalg.svd(off_tridiagonal_matrix, compute_uv=False)
+    off_tridiagonal_sval0 = off_tridiagonal_svals[0]
+    off_tridiagonal_sval1 = off_tridiagonal_svals[1]
+    off_tridiagonal_sval2 = off_tridiagonal_svals[2]
+    off_tridiagonal_sval3 = off_tridiagonal_svals[3]
+    off_tridiagonal_sval4 = off_tridiagonal_svals[4]
+    off_tridiagonal_sval5 = off_tridiagonal_svals[5]
+    off_tridiagonal_sval6 = off_tridiagonal_svals[6]
+    off_tridiagonal_sval7 = off_tridiagonal_svals[7]
+    off_tridiagonal_sval_sq = off_tridiagonal_svals * off_tridiagonal_svals
+    off_tridiagonal_sval_total = jnp.sum(off_tridiagonal_sval_sq)
+    off_tridiagonal_sval_cume = jnp.cumsum(off_tridiagonal_sval_sq)
+    off_tridiagonal_rank_999 = (
+        jnp.argmax(off_tridiagonal_sval_cume >= 0.999 * off_tridiagonal_sval_total) + 1
+    )
+    off_tridiagonal_rank_9999 = (
+        jnp.argmax(off_tridiagonal_sval_cume >= 0.9999 * off_tridiagonal_sval_total) + 1
+    )
+    off_tridiagonal_numerical_rank = jnp.sum(
+        (off_tridiagonal_svals > 1.0e-10 * jnp.maximum(off_tridiagonal_sval0, 1.0)).astype(jnp.int32)
+    )
     return {
         "compact_l2": jnp.sqrt(jnp.maximum(jnp.vdot(compact, compact), jnp.asarray(0.0, dtype=kernel_context.dtype))),
         "dense_l2": dense_l2,
@@ -8287,6 +8309,20 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "radial_max_significant_offset": jnp.asarray(max_significant_offset, dtype=jnp.int32),
         "radial_off_tridiagonal_significant_count": jnp.asarray(
             off_tridiagonal_significant_count,
+            dtype=jnp.int32,
+        ),
+        "radial_off_tridiagonal_sval0": off_tridiagonal_sval0,
+        "radial_off_tridiagonal_sval1": off_tridiagonal_sval1,
+        "radial_off_tridiagonal_sval2": off_tridiagonal_sval2,
+        "radial_off_tridiagonal_sval3": off_tridiagonal_sval3,
+        "radial_off_tridiagonal_sval4": off_tridiagonal_sval4,
+        "radial_off_tridiagonal_sval5": off_tridiagonal_sval5,
+        "radial_off_tridiagonal_sval6": off_tridiagonal_sval6,
+        "radial_off_tridiagonal_sval7": off_tridiagonal_sval7,
+        "radial_off_tridiagonal_rank_999": jnp.asarray(off_tridiagonal_rank_999, dtype=jnp.int32),
+        "radial_off_tridiagonal_rank_9999": jnp.asarray(off_tridiagonal_rank_9999, dtype=jnp.int32),
+        "radial_off_tridiagonal_numerical_rank": jnp.asarray(
+            off_tridiagonal_numerical_rank,
             dtype=jnp.int32,
         ),
     }

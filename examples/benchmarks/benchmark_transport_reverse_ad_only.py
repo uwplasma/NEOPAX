@@ -4267,6 +4267,12 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_offset_ge5_l2": float(diagnostic["radial_offset_ge5_l2"]),
         "radial_max_significant_offset": int(diagnostic["radial_max_significant_offset"]),
         "radial_off_tridiagonal_significant_count": int(diagnostic["radial_off_tridiagonal_significant_count"]),
+        "radial_off_tridiagonal_svals_top8": [
+            float(diagnostic[f"radial_off_tridiagonal_sval{i}"]) for i in range(8)
+        ],
+        "radial_off_tridiagonal_rank_999": int(diagnostic["radial_off_tridiagonal_rank_999"]),
+        "radial_off_tridiagonal_rank_9999": int(diagnostic["radial_off_tridiagonal_rank_9999"]),
+        "radial_off_tridiagonal_numerical_rank": int(diagnostic["radial_off_tridiagonal_numerical_rank"]),
     }
     print(
         "[autodiff-gate] local stage matvec diagnostic: "
@@ -4361,6 +4367,15 @@ def _run_local_stage_matvec_diagnostic_report(
         f"offset_ge5_l2={report['radial_offset_ge5_l2']:.6e} "
         f"max_significant_offset={report['radial_max_significant_offset']} "
         f"off_tridiagonal_significant_count={report['radial_off_tridiagonal_significant_count']}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage off-tridiagonal low-rank values: "
+        f"top8_singular_values="
+        f"{','.join(f'{value:.6e}' for value in report['radial_off_tridiagonal_svals_top8'])} "
+        f"rank_999={report['radial_off_tridiagonal_rank_999']} "
+        f"rank_9999={report['radial_off_tridiagonal_rank_9999']} "
+        f"numerical_rank={report['radial_off_tridiagonal_numerical_rank']}",
         flush=True,
     )
     outpath = _report_path(args.objective)
