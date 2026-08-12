@@ -4387,24 +4387,25 @@ def _run_local_stage_matvec_diagnostic_report(
         f"off_tridiagonal_significant_count={report['radial_off_tridiagonal_significant_count']}",
         flush=True,
     )
+    _missing_component_value = float("nan")
     print(
         "[autodiff-gate] local stage off-band component attribution: "
-        f"explicit_l2={report['radial_explicit_rhs_component_l2']:.6e} "
-        f"explicit_off_l2={report['radial_explicit_rhs_component_off_l2']:.6e} "
-        f"explicit_off_rel={report['radial_explicit_rhs_component_off_rel_l2']:.6e} "
-        f"explicit_off_max={report['radial_explicit_rhs_component_off_max_abs']:.6e} "
-        f"flux_l2={report['radial_flux_rhs_component_l2']:.6e} "
-        f"flux_off_l2={report['radial_flux_rhs_component_off_l2']:.6e} "
-        f"flux_off_rel={report['radial_flux_rhs_component_off_rel_l2']:.6e} "
-        f"flux_off_max={report['radial_flux_rhs_component_off_max_abs']:.6e} "
-        f"direct_l2={report['radial_direct_rhs_component_l2']:.6e} "
-        f"direct_off_l2={report['radial_direct_rhs_component_off_l2']:.6e} "
-        f"direct_off_rel={report['radial_direct_rhs_component_off_rel_l2']:.6e} "
-        f"direct_off_max={report['radial_direct_rhs_component_off_max_abs']:.6e} "
-        f"joint_generic_l2={report['radial_joint_generic_rhs_component_l2']:.6e} "
-        f"joint_generic_off_l2={report['radial_joint_generic_rhs_component_off_l2']:.6e} "
-        f"joint_generic_off_rel={report['radial_joint_generic_rhs_component_off_rel_l2']:.6e} "
-        f"joint_generic_off_max={report['radial_joint_generic_rhs_component_off_max_abs']:.6e}",
+        f"explicit_l2={report.get('radial_explicit_rhs_component_l2', _missing_component_value):.6e} "
+        f"explicit_off_l2={report.get('radial_explicit_rhs_component_off_l2', _missing_component_value):.6e} "
+        f"explicit_off_rel={report.get('radial_explicit_rhs_component_off_rel_l2', _missing_component_value):.6e} "
+        f"explicit_off_max={report.get('radial_explicit_rhs_component_off_max_abs', _missing_component_value):.6e} "
+        f"flux_l2={report.get('radial_flux_rhs_component_l2', _missing_component_value):.6e} "
+        f"flux_off_l2={report.get('radial_flux_rhs_component_off_l2', _missing_component_value):.6e} "
+        f"flux_off_rel={report.get('radial_flux_rhs_component_off_rel_l2', _missing_component_value):.6e} "
+        f"flux_off_max={report.get('radial_flux_rhs_component_off_max_abs', _missing_component_value):.6e} "
+        f"direct_l2={report.get('radial_direct_rhs_component_l2', _missing_component_value):.6e} "
+        f"direct_off_l2={report.get('radial_direct_rhs_component_off_l2', _missing_component_value):.6e} "
+        f"direct_off_rel={report.get('radial_direct_rhs_component_off_rel_l2', _missing_component_value):.6e} "
+        f"direct_off_max={report.get('radial_direct_rhs_component_off_max_abs', _missing_component_value):.6e} "
+        f"joint_generic_l2={report.get('radial_joint_generic_rhs_component_l2', _missing_component_value):.6e} "
+        f"joint_generic_off_l2={report.get('radial_joint_generic_rhs_component_off_l2', _missing_component_value):.6e} "
+        f"joint_generic_off_rel={report.get('radial_joint_generic_rhs_component_off_rel_l2', _missing_component_value):.6e} "
+        f"joint_generic_off_max={report.get('radial_joint_generic_rhs_component_off_max_abs', _missing_component_value):.6e}",
         flush=True,
     )
     print(
