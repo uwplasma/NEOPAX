@@ -8306,6 +8306,8 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     woodbury_rank12_l2, woodbury_rank12_rel, woodbury_rank12_max = _woodbury_solve_error(12)
     woodbury_rank16_l2, woodbury_rank16_rel, woodbury_rank16_max = _woodbury_solve_error(16)
     woodbury_rank24_l2, woodbury_rank24_rel, woodbury_rank24_max = _woodbury_solve_error(24)
+    woodbury_rank32_l2, woodbury_rank32_rel, woodbury_rank32_max = _woodbury_solve_error(32)
+    woodbury_rank48_l2, woodbury_rank48_rel, woodbury_rank48_max = _woodbury_solve_error(48)
     return {
         "compact_l2": jnp.sqrt(jnp.maximum(jnp.vdot(compact, compact), jnp.asarray(0.0, dtype=kernel_context.dtype))),
         "dense_l2": dense_l2,
@@ -8399,6 +8401,12 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         "radial_woodbury_rank24_solve_diff_l2": woodbury_rank24_l2,
         "radial_woodbury_rank24_solve_rel_err": woodbury_rank24_rel,
         "radial_woodbury_rank24_solve_max_abs": woodbury_rank24_max,
+        "radial_woodbury_rank32_solve_diff_l2": woodbury_rank32_l2,
+        "radial_woodbury_rank32_solve_rel_err": woodbury_rank32_rel,
+        "radial_woodbury_rank32_solve_max_abs": woodbury_rank32_max,
+        "radial_woodbury_rank48_solve_diff_l2": woodbury_rank48_l2,
+        "radial_woodbury_rank48_solve_rel_err": woodbury_rank48_rel,
+        "radial_woodbury_rank48_solve_max_abs": woodbury_rank48_max,
     }
 
 

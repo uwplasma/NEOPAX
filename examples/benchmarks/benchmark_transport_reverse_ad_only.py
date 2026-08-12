@@ -4282,6 +4282,12 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_woodbury_rank24_solve_diff_l2": float(diagnostic["radial_woodbury_rank24_solve_diff_l2"]),
         "radial_woodbury_rank24_solve_rel_err": float(diagnostic["radial_woodbury_rank24_solve_rel_err"]),
         "radial_woodbury_rank24_solve_max_abs": float(diagnostic["radial_woodbury_rank24_solve_max_abs"]),
+        "radial_woodbury_rank32_solve_diff_l2": float(diagnostic["radial_woodbury_rank32_solve_diff_l2"]),
+        "radial_woodbury_rank32_solve_rel_err": float(diagnostic["radial_woodbury_rank32_solve_rel_err"]),
+        "radial_woodbury_rank32_solve_max_abs": float(diagnostic["radial_woodbury_rank32_solve_max_abs"]),
+        "radial_woodbury_rank48_solve_diff_l2": float(diagnostic["radial_woodbury_rank48_solve_diff_l2"]),
+        "radial_woodbury_rank48_solve_rel_err": float(diagnostic["radial_woodbury_rank48_solve_rel_err"]),
+        "radial_woodbury_rank48_solve_max_abs": float(diagnostic["radial_woodbury_rank48_solve_max_abs"]),
     }
     print(
         "[autodiff-gate] local stage matvec diagnostic: "
@@ -4397,7 +4403,13 @@ def _run_local_stage_matvec_diagnostic_report(
         f"rank16_max={report['radial_woodbury_rank16_solve_max_abs']:.6e} "
         f"rank24_l2={report['radial_woodbury_rank24_solve_diff_l2']:.6e} "
         f"rank24_rel={report['radial_woodbury_rank24_solve_rel_err']:.6e} "
-        f"rank24_max={report['radial_woodbury_rank24_solve_max_abs']:.6e}",
+        f"rank24_max={report['radial_woodbury_rank24_solve_max_abs']:.6e} "
+        f"rank32_l2={report['radial_woodbury_rank32_solve_diff_l2']:.6e} "
+        f"rank32_rel={report['radial_woodbury_rank32_solve_rel_err']:.6e} "
+        f"rank32_max={report['radial_woodbury_rank32_solve_max_abs']:.6e} "
+        f"rank48_l2={report['radial_woodbury_rank48_solve_diff_l2']:.6e} "
+        f"rank48_rel={report['radial_woodbury_rank48_solve_rel_err']:.6e} "
+        f"rank48_max={report['radial_woodbury_rank48_solve_max_abs']:.6e}",
         flush=True,
     )
     outpath = _report_path(args.objective)
