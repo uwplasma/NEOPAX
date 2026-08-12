@@ -8220,7 +8220,10 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         jnp.logical_and(off_tridiagonal_mask, block_l2 > significant_block_tol).astype(jnp.int32)
     )
     off_tridiagonal_matrix = jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(radial_matrix.shape)
-    off_tridiagonal_svals = jnp.linalg.svd(off_tridiagonal_matrix, compute_uv=False)
+    off_tridiagonal_u, off_tridiagonal_svals, off_tridiagonal_vh = jnp.linalg.svd(
+        off_tridiagonal_matrix,
+        full_matrices=False,
+    )
     off_tridiagonal_sval0 = off_tridiagonal_svals[0]
     off_tridiagonal_sval1 = off_tridiagonal_svals[1]
     off_tridiagonal_sval2 = off_tridiagonal_svals[2]
@@ -8241,6 +8244,68 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
     off_tridiagonal_numerical_rank = jnp.sum(
         (off_tridiagonal_svals > 1.0e-10 * jnp.maximum(off_tridiagonal_sval0, 1.0)).astype(jnp.int32)
     )
+    transpose_radial_blocks = jnp.swapaxes(jnp.swapaxes(radial_blocks, 0, 1), -1, -2)
+    transpose_radial_matrix = radial_matrix.T
+    block_indices = jnp.arange(int(layout.n_radial), dtype=jnp.int32)
+    block_diagonal = transpose_radial_blocks[block_indices, block_indices]
+    zero_block = jnp.zeros_like(block_diagonal[:1])
+    block_lower = jnp.concatenate(
+        [zero_block, transpose_radial_blocks[block_indices[1:], block_indices[:-1]]],
+        axis=0,
+    )
+    block_upper = jnp.concatenate(
+        [transpose_radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
+        axis=0,
+    )
+    radial_rhs = vector_arr[radial_permutation]
+    dense_solve_radial = jnp.linalg.solve(transpose_radial_matrix, radial_rhs)
+
+    def _block_solve_flat(rhs_flat):
+        rhs_blocks = jnp.asarray(rhs_flat, dtype=kernel_context.dtype).reshape((int(layout.n_radial), radial_block_dim))
+        solution_blocks = _radau_block_tridiagonal_solve(
+            block_lower,
+            block_diagonal,
+            block_upper,
+            rhs_blocks,
+        )
+        return solution_blocks.reshape((-1,))
+
+    def _woodbury_solve_error(rank: int):
+        u_rank = off_tridiagonal_u[:, :rank] * off_tridiagonal_svals[:rank][None, :]
+        v_rank = off_tridiagonal_vh[:rank, :].T
+        # The SVD was computed for R from the primal residual matrix; for the
+        # transpose solve the residual is R.T, so swap U/V in the correction.
+        u_transpose = v_rank
+        v_transpose = u_rank
+        b_solve = _block_solve_flat(radial_rhs)
+        bu = jax.vmap(_block_solve_flat, in_axes=1, out_axes=1)(u_transpose)
+        small_matrix = (
+            jnp.eye(rank, dtype=kernel_context.dtype)
+            + v_transpose.T @ bu
+        )
+        small_rhs = v_transpose.T @ b_solve
+        correction_coeff = jnp.linalg.solve(small_matrix, small_rhs)
+        woodbury_solution = b_solve - bu @ correction_coeff
+        woodbury_diff = woodbury_solution - dense_solve_radial
+        woodbury_diff_l2 = jnp.sqrt(
+            jnp.maximum(jnp.vdot(woodbury_diff, woodbury_diff), jnp.asarray(0.0, dtype=kernel_context.dtype))
+        )
+        dense_solution_l2 = jnp.sqrt(
+            jnp.maximum(
+                jnp.vdot(dense_solve_radial, dense_solve_radial),
+                jnp.asarray(0.0, dtype=kernel_context.dtype),
+            )
+        )
+        return (
+            woodbury_diff_l2,
+            woodbury_diff_l2
+            / jnp.maximum(dense_solution_l2, jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype)),
+            jnp.max(jnp.abs(woodbury_diff)),
+        )
+
+    woodbury_rank12_l2, woodbury_rank12_rel, woodbury_rank12_max = _woodbury_solve_error(12)
+    woodbury_rank16_l2, woodbury_rank16_rel, woodbury_rank16_max = _woodbury_solve_error(16)
+    woodbury_rank24_l2, woodbury_rank24_rel, woodbury_rank24_max = _woodbury_solve_error(24)
     return {
         "compact_l2": jnp.sqrt(jnp.maximum(jnp.vdot(compact, compact), jnp.asarray(0.0, dtype=kernel_context.dtype))),
         "dense_l2": dense_l2,
@@ -8325,6 +8390,15 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             off_tridiagonal_numerical_rank,
             dtype=jnp.int32,
         ),
+        "radial_woodbury_rank12_solve_diff_l2": woodbury_rank12_l2,
+        "radial_woodbury_rank12_solve_rel_err": woodbury_rank12_rel,
+        "radial_woodbury_rank12_solve_max_abs": woodbury_rank12_max,
+        "radial_woodbury_rank16_solve_diff_l2": woodbury_rank16_l2,
+        "radial_woodbury_rank16_solve_rel_err": woodbury_rank16_rel,
+        "radial_woodbury_rank16_solve_max_abs": woodbury_rank16_max,
+        "radial_woodbury_rank24_solve_diff_l2": woodbury_rank24_l2,
+        "radial_woodbury_rank24_solve_rel_err": woodbury_rank24_rel,
+        "radial_woodbury_rank24_solve_max_abs": woodbury_rank24_max,
     }
 
 

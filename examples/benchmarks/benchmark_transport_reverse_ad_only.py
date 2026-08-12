@@ -4273,6 +4273,15 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_off_tridiagonal_rank_999": int(diagnostic["radial_off_tridiagonal_rank_999"]),
         "radial_off_tridiagonal_rank_9999": int(diagnostic["radial_off_tridiagonal_rank_9999"]),
         "radial_off_tridiagonal_numerical_rank": int(diagnostic["radial_off_tridiagonal_numerical_rank"]),
+        "radial_woodbury_rank12_solve_diff_l2": float(diagnostic["radial_woodbury_rank12_solve_diff_l2"]),
+        "radial_woodbury_rank12_solve_rel_err": float(diagnostic["radial_woodbury_rank12_solve_rel_err"]),
+        "radial_woodbury_rank12_solve_max_abs": float(diagnostic["radial_woodbury_rank12_solve_max_abs"]),
+        "radial_woodbury_rank16_solve_diff_l2": float(diagnostic["radial_woodbury_rank16_solve_diff_l2"]),
+        "radial_woodbury_rank16_solve_rel_err": float(diagnostic["radial_woodbury_rank16_solve_rel_err"]),
+        "radial_woodbury_rank16_solve_max_abs": float(diagnostic["radial_woodbury_rank16_solve_max_abs"]),
+        "radial_woodbury_rank24_solve_diff_l2": float(diagnostic["radial_woodbury_rank24_solve_diff_l2"]),
+        "radial_woodbury_rank24_solve_rel_err": float(diagnostic["radial_woodbury_rank24_solve_rel_err"]),
+        "radial_woodbury_rank24_solve_max_abs": float(diagnostic["radial_woodbury_rank24_solve_max_abs"]),
     }
     print(
         "[autodiff-gate] local stage matvec diagnostic: "
@@ -4376,6 +4385,19 @@ def _run_local_stage_matvec_diagnostic_report(
         f"rank_999={report['radial_off_tridiagonal_rank_999']} "
         f"rank_9999={report['radial_off_tridiagonal_rank_9999']} "
         f"numerical_rank={report['radial_off_tridiagonal_numerical_rank']}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage Woodbury solve diagnostic values: "
+        f"rank12_l2={report['radial_woodbury_rank12_solve_diff_l2']:.6e} "
+        f"rank12_rel={report['radial_woodbury_rank12_solve_rel_err']:.6e} "
+        f"rank12_max={report['radial_woodbury_rank12_solve_max_abs']:.6e} "
+        f"rank16_l2={report['radial_woodbury_rank16_solve_diff_l2']:.6e} "
+        f"rank16_rel={report['radial_woodbury_rank16_solve_rel_err']:.6e} "
+        f"rank16_max={report['radial_woodbury_rank16_solve_max_abs']:.6e} "
+        f"rank24_l2={report['radial_woodbury_rank24_solve_diff_l2']:.6e} "
+        f"rank24_rel={report['radial_woodbury_rank24_solve_rel_err']:.6e} "
+        f"rank24_max={report['radial_woodbury_rank24_solve_max_abs']:.6e}",
         flush=True,
     )
     outpath = _report_path(args.objective)
