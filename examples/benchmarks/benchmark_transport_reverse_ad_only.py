@@ -2155,6 +2155,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    reverse_stage_adjoint_woodbury_rank: int = 24,
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -2190,6 +2191,7 @@ def _prepare_reverse_static_setup(
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+                reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
             ),
         )
     stop_after_accepted_steps = (
@@ -3956,6 +3958,7 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
         reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
         reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
+        reverse_stage_adjoint_woodbury_rank=args.reverse_stage_adjoint_woodbury_rank,
     )
     if args.objective == "all":
         print(
@@ -5117,15 +5120,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-solve-mode",
-        choices=("structured", "bicgstab", "block", "gmres", "exact_block_compact"),
+        choices=("structured", "bicgstab", "block", "gmres", "exact_block_compact", "woodbury_compact"),
         default="structured",
         help=(
             "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
             "transformed LU transpose approximation and is the lightweight default; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
-            "'exact_block_compact' requires a non-dense exact compact solve hook."
+            "'exact_block_compact' requires a non-dense exact compact solve hook; "
+            "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve."
         ),
+    )
+    parser.add_argument(
+        "--reverse-stage-adjoint-woodbury-rank",
+        type=int,
+        default=24,
+        help="Rank used by --reverse-stage-adjoint-solve-mode woodbury_compact.",
     )
     parser.add_argument(
         "--reverse-rhs-transpose-mode",
@@ -5352,6 +5362,8 @@ def main() -> None:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-maxiter must be positive.")
     if float(args.reverse_stage_adjoint_iter_tol) <= 0.0:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-tol must be positive.")
+    if int(args.reverse_stage_adjoint_woodbury_rank) <= 0:
+        raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-woodbury-rank must be positive.")
     if (
         str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
         and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
@@ -5436,6 +5448,7 @@ def main() -> None:
         reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
         reverse_stage_adjoint_iter_maxiter=int(args.reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(args.reverse_stage_adjoint_iter_tol),
+        reverse_stage_adjoint_woodbury_rank=int(args.reverse_stage_adjoint_woodbury_rank),
     )
 
     if args.local_transpose_diagnostic_accepted_step is not None:
@@ -5698,6 +5711,7 @@ def main() -> None:
             "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
             "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
             "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+            "reverse_stage_adjoint_woodbury_rank": int(args.reverse_stage_adjoint_woodbury_rank),
             "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
             "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
             "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
@@ -5826,6 +5840,7 @@ def main() -> None:
             "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
             "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
             "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+            "reverse_stage_adjoint_woodbury_rank": int(args.reverse_stage_adjoint_woodbury_rank),
             "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
             "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
             "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
@@ -5982,6 +5997,7 @@ def main() -> None:
         "reverse_lagged_rebuild_count": reverse_lagged_rebuild_count,
         "reverse_direct_stage_adjoint": bool(reverse_direct_stage_adjoint),
         "reverse_stage_adjoint_solve_mode": str(args.reverse_stage_adjoint_solve_mode),
+        "reverse_stage_adjoint_woodbury_rank": int(args.reverse_stage_adjoint_woodbury_rank),
         "reverse_rhs_transpose_mode": str(args.reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(args.reverse_stage_cotangent_mode),
         "reverse_step_bwd_mode": str(args.reverse_step_bwd_mode),
@@ -6021,6 +6037,7 @@ def main() -> None:
         f"reverse_lagged_rebuild_count={reverse_lagged_rebuild_count} "
         f"reverse_direct_stage_adjoint={bool(reverse_direct_stage_adjoint)} "
         f"reverse_stage_adjoint_solve_mode={args.reverse_stage_adjoint_solve_mode} "
+        f"reverse_stage_adjoint_woodbury_rank={args.reverse_stage_adjoint_woodbury_rank} "
         f"reverse_rhs_transpose_mode={args.reverse_rhs_transpose_mode} "
         f"reverse_stage_cotangent_mode={args.reverse_stage_cotangent_mode} "
         f"reverse_step_bwd_mode={args.reverse_step_bwd_mode} "

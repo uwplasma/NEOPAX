@@ -1277,6 +1277,7 @@ def full_transport_profile_least_squares_problem(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    reverse_stage_adjoint_woodbury_rank: int = 24,
 ) -> ProfileFullTransportLeastSquaresProblem:
     """Build a profile-only optimizer problem for full Radau transport objectives."""
 
@@ -1323,6 +1324,7 @@ def full_transport_profile_least_squares_problem(
         reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
         reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+        reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
     )
 
     def _internal_support_segment_probe(
@@ -1442,6 +1444,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    reverse_stage_adjoint_woodbury_rank: int = 24,
     max_reverse_accepted_steps: int | None = None,
 ) -> GeometryFullTransportLeastSquaresProblem:
     """Build a geometry-only optimizer problem for full Radau transport objectives."""
@@ -1548,6 +1551,7 @@ def geometry_full_transport_least_squares_problem(
         "reverse_stage_adjoint_memory_mode": str(reverse_stage_adjoint_memory_mode),
         "reverse_stage_adjoint_iter_maxiter": int(reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
+        "reverse_stage_adjoint_woodbury_rank": int(reverse_stage_adjoint_woodbury_rank),
         "max_reverse_accepted_steps": (
             None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
         ),
@@ -1581,6 +1585,7 @@ def geometry_full_transport_least_squares_problem(
         reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
         reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+        reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
         max_reverse_accepted_steps=(
             None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
         ),

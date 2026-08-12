@@ -2518,6 +2518,7 @@ def prepare_reverse_static_setup(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    reverse_stage_adjoint_woodbury_rank: int = 24,
     max_reverse_accepted_steps: int | None = None,
 ) -> RealtimeGeometryReverseStaticSetup:
     state0_static = initial_state_for_parameter_vector(
@@ -2554,6 +2555,7 @@ def prepare_reverse_static_setup(
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+                reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
             ),
         )
     stop_after_accepted_steps = (
@@ -2764,6 +2766,7 @@ def prepare_realtime_geometry_support_segment_core_setup(
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
         reverse_stage_adjoint_iter_maxiter=args.reverse_stage_adjoint_iter_maxiter,
         reverse_stage_adjoint_iter_tol=args.reverse_stage_adjoint_iter_tol,
+        reverse_stage_adjoint_woodbury_rank=getattr(args, "reverse_stage_adjoint_woodbury_rank", 24),
     )
     early_geometry_diagnostics = (
         None
@@ -4206,6 +4209,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_memory_mode: str = "default",
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
+    reverse_stage_adjoint_woodbury_rank: int = 24,
     max_reverse_accepted_steps: int | None = None,
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
@@ -4300,6 +4304,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_stage_adjoint_iter_tol=float(
                 opts.get("reverse_stage_adjoint_iter_tol", reverse_stage_adjoint_iter_tol)
+            ),
+            reverse_stage_adjoint_woodbury_rank=int(
+                opts.get("reverse_stage_adjoint_woodbury_rank", reverse_stage_adjoint_woodbury_rank)
             ),
             max_reverse_accepted_steps=(
                 None
