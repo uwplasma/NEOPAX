@@ -4259,6 +4259,14 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_off_tridiagonal_l2": float(diagnostic["radial_off_tridiagonal_l2"]),
         "radial_off_tridiagonal_rel_l2": float(diagnostic["radial_off_tridiagonal_rel_l2"]),
         "radial_off_tridiagonal_max_abs": float(diagnostic["radial_off_tridiagonal_max_abs"]),
+        "radial_offset0_l2": float(diagnostic["radial_offset0_l2"]),
+        "radial_offset1_l2": float(diagnostic["radial_offset1_l2"]),
+        "radial_offset2_l2": float(diagnostic["radial_offset2_l2"]),
+        "radial_offset3_l2": float(diagnostic["radial_offset3_l2"]),
+        "radial_offset4_l2": float(diagnostic["radial_offset4_l2"]),
+        "radial_offset_ge5_l2": float(diagnostic["radial_offset_ge5_l2"]),
+        "radial_max_significant_offset": int(diagnostic["radial_max_significant_offset"]),
+        "radial_off_tridiagonal_significant_count": int(diagnostic["radial_off_tridiagonal_significant_count"]),
     }
     print(
         "[autodiff-gate] local stage matvec diagnostic: "
@@ -4341,6 +4349,18 @@ def _run_local_stage_matvec_diagnostic_report(
         f"off_tridiagonal_l2={report['radial_off_tridiagonal_l2']:.6e} "
         f"off_tridiagonal_rel_l2={report['radial_off_tridiagonal_rel_l2']:.6e} "
         f"off_tridiagonal_max_abs={report['radial_off_tridiagonal_max_abs']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage radial-block bandwidth values: "
+        f"offset0_l2={report['radial_offset0_l2']:.6e} "
+        f"offset1_l2={report['radial_offset1_l2']:.6e} "
+        f"offset2_l2={report['radial_offset2_l2']:.6e} "
+        f"offset3_l2={report['radial_offset3_l2']:.6e} "
+        f"offset4_l2={report['radial_offset4_l2']:.6e} "
+        f"offset_ge5_l2={report['radial_offset_ge5_l2']:.6e} "
+        f"max_significant_offset={report['radial_max_significant_offset']} "
+        f"off_tridiagonal_significant_count={report['radial_off_tridiagonal_significant_count']}",
         flush=True,
     )
     outpath = _report_path(args.objective)

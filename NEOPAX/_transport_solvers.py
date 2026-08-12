@@ -8163,6 +8163,62 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             jnp.asarray(0.0, dtype=kernel_context.dtype),
         )
     )
+    block_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(radial_blocks * radial_blocks, axis=(-2, -1)),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    block_abs_offset = jnp.abs(row_ids - col_ids)
+    offset0_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset == 0, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    offset1_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset == 1, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    offset2_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset == 2, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    offset3_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset == 3, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    offset4_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset == 4, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    offset_ge5_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.where(block_abs_offset >= 5, block_l2 * block_l2, jnp.zeros_like(block_l2))),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    significant_block_tol = jnp.asarray(1.0e-10, dtype=kernel_context.dtype) * jnp.maximum(
+        jnp.max(block_l2),
+        jnp.asarray(1.0, dtype=kernel_context.dtype),
+    )
+    significant_offsets = jnp.where(
+        block_l2 > significant_block_tol,
+        block_abs_offset,
+        jnp.zeros_like(block_abs_offset),
+    )
+    max_significant_offset = jnp.max(significant_offsets)
+    off_tridiagonal_significant_count = jnp.sum(
+        jnp.logical_and(off_tridiagonal_mask, block_l2 > significant_block_tol).astype(jnp.int32)
+    )
     return {
         "compact_l2": jnp.sqrt(jnp.maximum(jnp.vdot(compact, compact), jnp.asarray(0.0, dtype=kernel_context.dtype))),
         "dense_l2": dense_l2,
@@ -8222,6 +8278,17 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
         ),
         "radial_off_tridiagonal_max_abs": jnp.max(jnp.abs(off_tridiagonal_blocks)),
+        "radial_offset0_l2": offset0_l2,
+        "radial_offset1_l2": offset1_l2,
+        "radial_offset2_l2": offset2_l2,
+        "radial_offset3_l2": offset3_l2,
+        "radial_offset4_l2": offset4_l2,
+        "radial_offset_ge5_l2": offset_ge5_l2,
+        "radial_max_significant_offset": jnp.asarray(max_significant_offset, dtype=jnp.int32),
+        "radial_off_tridiagonal_significant_count": jnp.asarray(
+            off_tridiagonal_significant_count,
+            dtype=jnp.int32,
+        ),
     }
 
 
