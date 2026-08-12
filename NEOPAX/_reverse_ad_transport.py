@@ -3224,6 +3224,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_cache_pullback_used = False
     initial_cache_pullback_skipped = False
     if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
+        phase_start = time.perf_counter()
         initial_cache_support_bars = jax.lax.map(
             lambda lagged_bar: build_support_pullback(
                 carry0.y,
@@ -3232,6 +3233,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             ),
             reduced_bars.lagged_response_cache,
         )
+        initial_cache_support_bars = jax.block_until_ready(initial_cache_support_bars)
         initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
         support_bar_leaves = tuple(
             accumulated + increment
@@ -3245,6 +3247,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
         )
         initial_cache_pullback_used = True
+        print(
+            f"{progress_prefix} progress: support reverse initial-cache support pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
     elif initial_lagged_response_valid and build_support_pullback is not None:
         initial_cache_pullback_skipped = True
 
@@ -3256,8 +3263,22 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             lagged_reference_y=reduced_bar.lagged_reference_y,
         )
 
+    phase_start = time.perf_counter()
     carry0_bars = jax.vmap(_full_carry_bar_from_reduced)(reduced_bars)
+    carry0_bars = jax.block_until_ready(carry0_bars)
+    print(
+        f"{progress_prefix} progress: support reverse reduced carry bars expanded ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
+    phase_start = time.perf_counter()
     initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(carry0_bars)
+    initial_state_bars = jax.block_until_ready(initial_state_bars)
+    print(
+        f"{progress_prefix} progress: support reverse initial state pullback ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
     initial_er_root_support_bars = None
     if initial_er_root_enabled:
         phase_start = time.perf_counter()
@@ -3355,7 +3376,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
         initial_state_bars = pre_root_initial_state_bars
 
+    phase_start = time.perf_counter()
     gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
+    gradient_matrix = jax.block_until_ready(gradient_matrix)
+    print(
+        f"{progress_prefix} progress: support reverse profile parameter pullback ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
     if initial_er_root_support_bars is not None:
         raw_initial_er_root_support_bar_leaves = tuple(initial_er_root_support_bars)
         if len(raw_initial_er_root_support_bar_leaves) != len(support_bar_leaves):

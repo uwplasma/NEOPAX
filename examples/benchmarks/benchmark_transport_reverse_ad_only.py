@@ -5120,7 +5120,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-stage-adjoint-solve-mode",
-        choices=("structured", "bicgstab", "block", "gmres", "exact_block_compact", "woodbury_compact"),
+        choices=(
+            "structured",
+            "bicgstab",
+            "block",
+            "gmres",
+            "exact_block_compact",
+            "woodbury_compact",
+            "woodbury_matvec_compact",
+        ),
         default="structured",
         help=(
             "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
@@ -5128,7 +5136,9 @@ def main() -> None:
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
             "'exact_block_compact' requires a non-dense exact compact solve hook; "
-            "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve."
+            "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve; "
+            "'woodbury_matvec_compact' builds the same Woodbury system from the compact "
+            "transpose matvec instead of jacfwd."
         ),
     )
     parser.add_argument(

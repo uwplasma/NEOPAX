@@ -8799,6 +8799,121 @@ def _radau_solve_exact_stage_residual_transpose_woodbury(
     return solution_rows if batched else solution_rows[0]
 
 
+def _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    batched: bool = False,
+):
+    """Woodbury solve using the compact transpose matvec to materialize A.T."""
+    rank = int(getattr(physics_context, "reverse_stage_adjoint_woodbury_rank", 24))
+    if rank <= 0:
+        raise ValueError("reverse_stage_adjoint_woodbury_rank must be positive.")
+
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context,
+        carry_in,
+        primal_result,
+    )
+    basis_rows = jnp.eye(system_size, dtype=kernel_context.dtype)
+    transpose_columns_as_rows = _radau_exact_stage_residual_transpose_matvec_batched(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        basis_rows,
+        stage_times=stage_times,
+        stage_states=stage_states,
+    ).reshape((system_size, system_size))
+    transpose_matrix = transpose_columns_as_rows.T
+
+    layout = _radau_infer_radial_block_layout(kernel_context)
+    stage_indices = jnp.arange(system_size, dtype=kernel_context.dtype).reshape(
+        (int(kernel_context.num_stages), int(kernel_context.state_dim))
+    )
+    radial_permutation = _radau_stage_stack_to_radial_blocks(
+        kernel_context,
+        stage_indices,
+    ).reshape((-1,)).astype(jnp.int32)
+    radial_matrix = transpose_matrix[radial_permutation[:, None], radial_permutation[None, :]]
+    radial_block_dim = int(kernel_context.num_stages) * int(layout.variables_per_cell)
+    radial_blocks = radial_matrix.reshape(
+        (
+            int(layout.n_radial),
+            radial_block_dim,
+            int(layout.n_radial),
+            radial_block_dim,
+        )
+    )
+    radial_blocks = jnp.transpose(radial_blocks, (0, 2, 1, 3))
+    row_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[:, None]
+    col_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[None, :]
+    off_tridiagonal_mask = jnp.abs(row_ids - col_ids) > 1
+    off_tridiagonal_blocks = jnp.where(
+        off_tridiagonal_mask[:, :, None, None],
+        radial_blocks,
+        jnp.zeros_like(radial_blocks),
+    )
+    off_tridiagonal_matrix = jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(
+        radial_matrix.shape
+    )
+    off_tridiagonal_u, off_tridiagonal_svals, off_tridiagonal_vh = jnp.linalg.svd(
+        off_tridiagonal_matrix,
+        full_matrices=False,
+    )
+    rank = min(rank, int(off_tridiagonal_svals.shape[0]))
+    u_rank = off_tridiagonal_u[:, :rank] * off_tridiagonal_svals[:rank][None, :]
+    v_rank = off_tridiagonal_vh[:rank, :].T
+
+    block_indices = jnp.arange(int(layout.n_radial), dtype=jnp.int32)
+    block_diagonal = radial_blocks[block_indices, block_indices]
+    zero_block = jnp.zeros_like(block_diagonal[:1])
+    block_lower = jnp.concatenate(
+        [zero_block, radial_blocks[block_indices[1:], block_indices[:-1]]],
+        axis=0,
+    )
+    block_upper = jnp.concatenate(
+        [radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
+        axis=0,
+    )
+
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
+    if batched:
+        rhs_rows = rhs_arr.reshape((-1, system_size))
+    else:
+        rhs_rows = rhs_arr.reshape((1, -1))
+    radial_rhs_rows = -rhs_rows[:, radial_permutation]
+
+    def _block_solve_columns(rhs_columns):
+        rhs_blocks = jnp.asarray(rhs_columns, dtype=kernel_context.dtype).reshape(
+            (int(layout.n_radial), radial_block_dim, -1)
+        )
+        solution_blocks = _radau_block_tridiagonal_solve(
+            block_lower,
+            block_diagonal,
+            block_upper,
+            rhs_blocks,
+        )
+        return solution_blocks.reshape((-1, rhs_blocks.shape[-1]))
+
+    solved_u = _block_solve_columns(u_rank)
+    small_matrix = jnp.eye(rank, dtype=kernel_context.dtype) + v_rank.T @ solved_u
+    rhs_columns = radial_rhs_rows.T
+    base = _block_solve_columns(rhs_columns)
+    small_rhs = v_rank.T @ base
+    correction = jax.scipy.linalg.solve(small_matrix, small_rhs, assume_a="gen")
+    radial_solution_columns = base - solved_u @ correction
+    radial_solution_rows = radial_solution_columns.T
+    solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(radial_solution_rows)
+    return solution_rows if batched else solution_rows[0]
+
+
 def _radau_solve_exact_stage_residual_transpose_compact(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -8873,6 +8988,16 @@ def _radau_solve_exact_stage_residual_transpose(
             rhs=rhs,
             batched=False,
         )
+    if mode == "woodbury_matvec_compact":
+        return _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+            batched=False,
+        )
     if mode in {"gmres", "bicgstab"}:
         return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
@@ -8936,6 +9061,16 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         )
     if mode == "woodbury_compact":
         return _radau_solve_exact_stage_residual_transpose_woodbury(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            batched=True,
+        )
+    if mode == "woodbury_matvec_compact":
+        return _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
             kernel_context,
             physics_context,
             carry_in,
