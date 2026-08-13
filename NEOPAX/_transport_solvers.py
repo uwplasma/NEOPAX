@@ -9268,11 +9268,11 @@ def _radau_exact_stage_transpose_radial_bands_from_matvec(
             (radial_block_dim, system_size),
             dtype=kernel_context.dtype,
         )
-        col_start = block_index * radial_block_dim
+        col_start = block_index * jnp.asarray(radial_block_dim, dtype=jnp.int32)
         radial_vectors = jax.lax.dynamic_update_slice(
             radial_vectors,
             eye_block,
-            (0, col_start),
+            (jnp.asarray(0, dtype=jnp.int32), col_start),
         )
         stage_vectors = jnp.zeros_like(radial_vectors).at[:, radial_permutation].set(radial_vectors)
         stage_outputs = _radau_exact_stage_residual_transpose_matvec_batched(
@@ -9289,10 +9289,10 @@ def _radau_exact_stage_transpose_radial_bands_from_matvec(
 
         def _gather_row_block(row_index):
             row_index = jnp.clip(row_index, 0, n_radial - 1)
-            row_start = row_index * radial_block_dim
+            row_start = row_index * jnp.asarray(radial_block_dim, dtype=jnp.int32)
             block_columns = jax.lax.dynamic_slice(
                 radial_outputs,
-                (0, row_start),
+                (jnp.asarray(0, dtype=jnp.int32), row_start),
                 (radial_block_dim, radial_block_dim),
             )
             return block_columns.T
