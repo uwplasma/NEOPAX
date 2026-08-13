@@ -161,9 +161,9 @@ max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
 throw = false
-debug_stage_markers = true
-debug_walltime_attempts = true
-debug_nonfinite_rhs_components = true
+debug_stage_markers = false
+debug_walltime_attempts = false
+debug_nonfinite_rhs_components = false
 debug_disable_jit = false
 save_n = 10
 
