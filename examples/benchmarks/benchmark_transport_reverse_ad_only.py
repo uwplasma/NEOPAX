@@ -4314,6 +4314,13 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_offset_ge5_l2": float(diagnostic["radial_offset_ge5_l2"]),
         "radial_max_significant_offset": int(diagnostic["radial_max_significant_offset"]),
         "radial_off_tridiagonal_significant_count": int(diagnostic["radial_off_tridiagonal_significant_count"]),
+        "radial_band_builder_block_dim": int(diagnostic["radial_band_builder_block_dim"]),
+        "radial_band_builder_permutation_max_abs_diff": int(
+            diagnostic["radial_band_builder_permutation_max_abs_diff"]
+        ),
+        "radial_band_builder_diff_l2": float(diagnostic["radial_band_builder_diff_l2"]),
+        "radial_band_builder_rel_err": float(diagnostic["radial_band_builder_rel_err"]),
+        "radial_band_builder_max_abs_diff": float(diagnostic["radial_band_builder_max_abs_diff"]),
         "radial_off_tridiagonal_svals_top8": [
             float(diagnostic[f"radial_off_tridiagonal_sval{i}"]) for i in range(8)
         ],
