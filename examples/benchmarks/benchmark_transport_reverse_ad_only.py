@@ -4286,6 +4286,22 @@ def _run_local_stage_matvec_diagnostic_report(
         "radial_direct_er_rhs_component_off_l2": float(diagnostic["radial_direct_er_rhs_component_off_l2"]),
         "radial_direct_er_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_rhs_component_off_rel_l2"]),
         "radial_direct_er_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_rhs_component_off_max_abs"]),
+        "radial_direct_er_diffusion_rhs_component_l2": float(diagnostic["radial_direct_er_diffusion_rhs_component_l2"]),
+        "radial_direct_er_diffusion_rhs_component_off_l2": float(diagnostic["radial_direct_er_diffusion_rhs_component_off_l2"]),
+        "radial_direct_er_diffusion_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_diffusion_rhs_component_off_rel_l2"]),
+        "radial_direct_er_diffusion_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_diffusion_rhs_component_off_max_abs"]),
+        "radial_direct_er_ambipolar_rhs_component_l2": float(diagnostic["radial_direct_er_ambipolar_rhs_component_l2"]),
+        "radial_direct_er_ambipolar_rhs_component_off_l2": float(diagnostic["radial_direct_er_ambipolar_rhs_component_off_l2"]),
+        "radial_direct_er_ambipolar_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_ambipolar_rhs_component_off_rel_l2"]),
+        "radial_direct_er_ambipolar_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_ambipolar_rhs_component_off_max_abs"]),
+        "radial_direct_er_ambi_coeff_rhs_component_l2": float(diagnostic["radial_direct_er_ambi_coeff_rhs_component_l2"]),
+        "radial_direct_er_ambi_coeff_rhs_component_off_l2": float(diagnostic["radial_direct_er_ambi_coeff_rhs_component_off_l2"]),
+        "radial_direct_er_ambi_coeff_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_ambi_coeff_rhs_component_off_rel_l2"]),
+        "radial_direct_er_ambi_coeff_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_ambi_coeff_rhs_component_off_max_abs"]),
+        "radial_direct_er_ambi_charge_flux_rhs_component_l2": float(diagnostic["radial_direct_er_ambi_charge_flux_rhs_component_l2"]),
+        "radial_direct_er_ambi_charge_flux_rhs_component_off_l2": float(diagnostic["radial_direct_er_ambi_charge_flux_rhs_component_off_l2"]),
+        "radial_direct_er_ambi_charge_flux_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_ambi_charge_flux_rhs_component_off_rel_l2"]),
+        "radial_direct_er_ambi_charge_flux_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_ambi_charge_flux_rhs_component_off_max_abs"]),
         "radial_joint_generic_rhs_component_l2": float(diagnostic["radial_joint_generic_rhs_component_l2"]),
         "radial_joint_generic_rhs_component_off_l2": float(diagnostic["radial_joint_generic_rhs_component_off_l2"]),
         "radial_joint_generic_rhs_component_off_rel_l2": float(diagnostic["radial_joint_generic_rhs_component_off_rel_l2"]),
@@ -4450,6 +4466,26 @@ def _run_local_stage_matvec_diagnostic_report(
         f"er_off_l2={report['radial_direct_er_rhs_component_off_l2']:.6e} "
         f"er_off_rel={report['radial_direct_er_rhs_component_off_rel_l2']:.6e} "
         f"er_off_max={report['radial_direct_er_rhs_component_off_max_abs']:.6e}",
+        flush=True,
+    )
+    print(
+        "[autodiff-gate] local stage Er direct subterm attribution: "
+        f"diffusion_l2={report['radial_direct_er_diffusion_rhs_component_l2']:.6e} "
+        f"diffusion_off_l2={report['radial_direct_er_diffusion_rhs_component_off_l2']:.6e} "
+        f"diffusion_off_rel={report['radial_direct_er_diffusion_rhs_component_off_rel_l2']:.6e} "
+        f"diffusion_off_max={report['radial_direct_er_diffusion_rhs_component_off_max_abs']:.6e} "
+        f"ambipolar_l2={report['radial_direct_er_ambipolar_rhs_component_l2']:.6e} "
+        f"ambipolar_off_l2={report['radial_direct_er_ambipolar_rhs_component_off_l2']:.6e} "
+        f"ambipolar_off_rel={report['radial_direct_er_ambipolar_rhs_component_off_rel_l2']:.6e} "
+        f"ambipolar_off_max={report['radial_direct_er_ambipolar_rhs_component_off_max_abs']:.6e} "
+        f"coeff_l2={report['radial_direct_er_ambi_coeff_rhs_component_l2']:.6e} "
+        f"coeff_off_l2={report['radial_direct_er_ambi_coeff_rhs_component_off_l2']:.6e} "
+        f"coeff_off_rel={report['radial_direct_er_ambi_coeff_rhs_component_off_rel_l2']:.6e} "
+        f"coeff_off_max={report['radial_direct_er_ambi_coeff_rhs_component_off_max_abs']:.6e} "
+        f"charge_flux_l2={report['radial_direct_er_ambi_charge_flux_rhs_component_l2']:.6e} "
+        f"charge_flux_off_l2={report['radial_direct_er_ambi_charge_flux_rhs_component_off_l2']:.6e} "
+        f"charge_flux_off_rel={report['radial_direct_er_ambi_charge_flux_rhs_component_off_rel_l2']:.6e} "
+        f"charge_flux_off_max={report['radial_direct_er_ambi_charge_flux_rhs_component_off_max_abs']:.6e}",
         flush=True,
     )
     print(

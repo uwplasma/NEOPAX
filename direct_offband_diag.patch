@@ -1,0 +1,459 @@
+From 28b5dac645092a1c1d03983aac87a73080f62285 Mon Sep 17 00:00:00 2001
+From: eduardolneto <eduardo.lascasneto@gmail.com>
+Date: Thu, 13 Aug 2026 00:58:04 +0100
+Subject: [PATCH] Add direct RHS equation off-band diagnostic
+
+---
+ NEOPAX/_transport_equations.py                | 140 ++++++++++++++
+ NEOPAX/_transport_solvers.py                  | 174 ++++++++++++++++++
+ .../benchmark_transport_reverse_ad_only.py    |  28 +++
+ 3 files changed, 342 insertions(+)
+
+diff --git a/NEOPAX/_transport_equations.py b/NEOPAX/_transport_equations.py
+index 025227a..0778f98 100644
+--- a/NEOPAX/_transport_equations.py
++++ b/NEOPAX/_transport_equations.py
+@@ -2061,6 +2061,86 @@ class ComposedEquationSystem:
+             working_state_bar = _add_state_bars(working_state_bar, er_state_bar)
+         return working_state_bar
+ 
++    def _pullback_shared_flux_rhs_state_component(
++        self,
++        state,
++        working_state,
++        eidx,
++        shared_fluxes,
++        rhs_bar,
++        *,
++        component: str,
++    ):
++        """Diagnostic fixed-shared-flux state pullback for one equation block."""
++        density_eq, temperature_eq, er_eq = self._resolve_equations()
++        zero_working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
++        component_name = str(component).strip().lower()
++
++        def _density_map(working_state_value):
++            density_rhs = (
++                density_eq(working_state_value, fluxes=shared_fluxes)
++                if density_eq is not None
++                else jnp.zeros_like(state.density)
++            )
++            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
++            if eidx is not None:
++                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
++            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
++                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state_value, density_rhs)
++            return density_rhs
++
++        def _pressure_map(working_state_value):
++            density_rhs = (
++                density_eq(working_state_value, fluxes=shared_fluxes)
++                if density_eq is not None
++                else jnp.zeros_like(state.density)
++            )
++            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
++            if eidx is not None:
++                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
++            pressure_rhs = (
++                temperature_eq(working_state_value, fluxes=shared_fluxes)
++                if temperature_eq is not None
++                else jnp.zeros_like(state.pressure)
++            )
++            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
++                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
++                    working_state_value,
++                    density_rhs,
++                    pressure_rhs,
++                )
++            return pressure_rhs
++
++        def _er_map(working_state_value):
++            er_rhs = (
++                er_eq(working_state_value, fluxes=shared_fluxes)
++                if er_eq is not None
++                else jnp.zeros_like(state.Er)
++            )
++            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
++                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
++            return er_rhs
++
++        if component_name == "density":
++            if density_eq is None:
++                return zero_working_state_bar
++            _, density_pullback = jax.vjp(_density_map, working_state)
++            (density_state_bar,) = density_pullback(rhs_bar.density)
++            return density_state_bar
++        if component_name == "pressure":
++            if temperature_eq is None:
++                return zero_working_state_bar
++            _, pressure_pullback = jax.vjp(_pressure_map, working_state)
++            (pressure_state_bar,) = pressure_pullback(rhs_bar.pressure)
++            return pressure_state_bar
++        if component_name == "er":
++            if er_eq is None:
++                return zero_working_state_bar
++            _, er_pullback = jax.vjp(_er_map, working_state)
++            (er_state_bar,) = er_pullback(rhs_bar.Er)
++            return er_state_bar
++        raise ValueError(f"Unknown direct RHS state component {component!r}.")
++
+     def pullback_evaluate_with_lagged_response(self, t, state, runtime, lagged_response, rhs_bar):
+         """Reverse-only pullback for lagged-response dependence of the RHS."""
+         del t, runtime
+@@ -2243,6 +2323,66 @@ class ComposedEquationSystem:
+         )
+         return self._prepare_working_state_pullback(state, direct_working_state_bar)
+ 
++    def _pullback_evaluate_with_lagged_response_state_direct_component(
++        self,
++        t,
++        state,
++        runtime,
++        lagged_response,
++        rhs_bar,
++        *,
++        component: str,
++    ):
++        del t, runtime
++        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
++            return jax.tree_util.tree_map(jnp.zeros_like, state)
++
++        working_state, eidx = self._prepare_working_state(state)
++        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
++            working_state,
++            lagged_response.flux_response,
++            **self._shared_flux_bc_kwargs(),
++        )
++        direct_working_state_bar = self._pullback_shared_flux_rhs_state_component(
++            state,
++            working_state,
++            eidx,
++            shared_fluxes,
++            rhs_bar,
++            component=component,
++        )
++        return self._prepare_working_state_pullback(state, direct_working_state_bar)
++
++    def pullback_evaluate_with_lagged_response_state_direct_density(self, t, state, runtime, lagged_response, rhs_bar):
++        return self._pullback_evaluate_with_lagged_response_state_direct_component(
++            t,
++            state,
++            runtime,
++            lagged_response,
++            rhs_bar,
++            component="density",
++        )
++
++    def pullback_evaluate_with_lagged_response_state_direct_pressure(self, t, state, runtime, lagged_response, rhs_bar):
++        return self._pullback_evaluate_with_lagged_response_state_direct_component(
++            t,
++            state,
++            runtime,
++            lagged_response,
++            rhs_bar,
++            component="pressure",
++        )
++
++    def pullback_evaluate_with_lagged_response_state_direct_er(self, t, state, runtime, lagged_response, rhs_bar):
++        return self._pullback_evaluate_with_lagged_response_state_direct_component(
++            t,
++            state,
++            runtime,
++            lagged_response,
++            rhs_bar,
++            component="er",
++        )
++
+     def pullback_evaluate_with_lagged_response_state_direct_generic(self, t, state, runtime, lagged_response, rhs_bar):
+         """Diagnostic generic VJP for fixed-shared-flux RHS state dependence."""
+         del t, runtime
+diff --git a/NEOPAX/_transport_solvers.py b/NEOPAX/_transport_solvers.py
+index e45f267..f052bb9 100644
+--- a/NEOPAX/_transport_solvers.py
++++ b/NEOPAX/_transport_solvers.py
+@@ -962,6 +962,30 @@ def _lagged_response_direct_state_pullback_generic_hook(vector_field: Callable):
+     return pullback_fn if callable(pullback_fn) else None
+ 
+ 
++def _lagged_response_direct_density_state_pullback_hook(vector_field: Callable):
++    owner = getattr(vector_field, "__self__", None)
++    if owner is None:
++        return None
++    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_direct_density", None)
++    return pullback_fn if callable(pullback_fn) else None
++
++
++def _lagged_response_direct_pressure_state_pullback_hook(vector_field: Callable):
++    owner = getattr(vector_field, "__self__", None)
++    if owner is None:
++        return None
++    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_direct_pressure", None)
++    return pullback_fn if callable(pullback_fn) else None
++
++
++def _lagged_response_direct_er_state_pullback_hook(vector_field: Callable):
++    owner = getattr(vector_field, "__self__", None)
++    if owner is None:
++        return None
++    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_state_direct_er", None)
++    return pullback_fn if callable(pullback_fn) else None
++
++
+ def _lagged_response_flux_state_pullback_hook(vector_field: Callable):
+     owner = getattr(vector_field, "__self__", None)
+     if owner is None:
+@@ -1150,6 +1174,12 @@ def _flat_rhs_split_state_pullback_factory(
+         pullback_fn = _lagged_response_direct_state_pullback_hook(vector_field)
+     elif component == "direct_generic":
+         pullback_fn = _lagged_response_direct_state_pullback_generic_hook(vector_field)
++    elif component == "direct_density":
++        pullback_fn = _lagged_response_direct_density_state_pullback_hook(vector_field)
++    elif component == "direct_pressure":
++        pullback_fn = _lagged_response_direct_pressure_state_pullback_hook(vector_field)
++    elif component == "direct_er":
++        pullback_fn = _lagged_response_direct_er_state_pullback_hook(vector_field)
+     elif component == "flux":
+         pullback_fn = _lagged_response_flux_state_pullback_hook(vector_field)
+     elif component == "flux_generic":
+@@ -3159,6 +3189,9 @@ class _RadauAcceptedStepPhysicsContext:
+     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+     flat_rhs_direct_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+     flat_rhs_direct_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
++    flat_rhs_direct_density_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
++    flat_rhs_direct_pressure_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
++    flat_rhs_direct_er_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+     flat_rhs_flux_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+     flat_rhs_flux_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
+     flat_rhs_joint_generic_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+@@ -8293,6 +8326,75 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
+             direct_component_off_max,
+         ) = _missing_component_stats()
+ 
++    if physics_context.flat_rhs_direct_density_state_pullback is not None:
++        direct_density_component_matrix = _component_transpose_matrix_from_stage_pullback(
++            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_direct_density_state_pullback(
++                t_eval,
++                y_eval,
++                lagged_response,
++                lambda_eval,
++            )
++        )
++        (
++            direct_density_component_l2,
++            direct_density_component_off_l2,
++            direct_density_component_off_rel,
++            direct_density_component_off_max,
++        ) = _component_radial_offband_stats(direct_density_component_matrix)
++    else:
++        (
++            direct_density_component_l2,
++            direct_density_component_off_l2,
++            direct_density_component_off_rel,
++            direct_density_component_off_max,
++        ) = _missing_component_stats()
++
++    if physics_context.flat_rhs_direct_pressure_state_pullback is not None:
++        direct_pressure_component_matrix = _component_transpose_matrix_from_stage_pullback(
++            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_direct_pressure_state_pullback(
++                t_eval,
++                y_eval,
++                lagged_response,
++                lambda_eval,
++            )
++        )
++        (
++            direct_pressure_component_l2,
++            direct_pressure_component_off_l2,
++            direct_pressure_component_off_rel,
++            direct_pressure_component_off_max,
++        ) = _component_radial_offband_stats(direct_pressure_component_matrix)
++    else:
++        (
++            direct_pressure_component_l2,
++            direct_pressure_component_off_l2,
++            direct_pressure_component_off_rel,
++            direct_pressure_component_off_max,
++        ) = _missing_component_stats()
++
++    if physics_context.flat_rhs_direct_er_state_pullback is not None:
++        direct_er_component_matrix = _component_transpose_matrix_from_stage_pullback(
++            lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_direct_er_state_pullback(
++                t_eval,
++                y_eval,
++                lagged_response,
++                lambda_eval,
++            )
++        )
++        (
++            direct_er_component_l2,
++            direct_er_component_off_l2,
++            direct_er_component_off_rel,
++            direct_er_component_off_max,
++        ) = _component_radial_offband_stats(direct_er_component_matrix)
++    else:
++        (
++            direct_er_component_l2,
++            direct_er_component_off_l2,
++            direct_er_component_off_rel,
++            direct_er_component_off_max,
++        ) = _missing_component_stats()
++
+     if physics_context.flat_rhs_joint_generic_state_pullback is not None:
+         joint_generic_component_matrix = _component_transpose_matrix_from_stage_pullback(
+             lambda t_eval, y_eval, lambda_eval: physics_context.flat_rhs_joint_generic_state_pullback(
+@@ -8539,6 +8641,18 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
+         "radial_direct_rhs_component_off_l2": direct_component_off_l2,
+         "radial_direct_rhs_component_off_rel_l2": direct_component_off_rel,
+         "radial_direct_rhs_component_off_max_abs": direct_component_off_max,
++        "radial_direct_density_rhs_component_l2": direct_density_component_l2,
++        "radial_direct_density_rhs_component_off_l2": direct_density_component_off_l2,
++        "radial_direct_density_rhs_component_off_rel_l2": direct_density_component_off_rel,
++        "radial_direct_density_rhs_component_off_max_abs": direct_density_component_off_max,
++        "radial_direct_pressure_rhs_component_l2": direct_pressure_component_l2,
++        "radial_direct_pressure_rhs_component_off_l2": direct_pressure_component_off_l2,
++        "radial_direct_pressure_rhs_component_off_rel_l2": direct_pressure_component_off_rel,
++        "radial_direct_pressure_rhs_component_off_max_abs": direct_pressure_component_off_max,
++        "radial_direct_er_rhs_component_l2": direct_er_component_l2,
++        "radial_direct_er_rhs_component_off_l2": direct_er_component_off_l2,
++        "radial_direct_er_rhs_component_off_rel_l2": direct_er_component_off_rel,
++        "radial_direct_er_rhs_component_off_max_abs": direct_er_component_off_max,
+         "radial_joint_generic_rhs_component_l2": joint_generic_component_l2,
+         "radial_joint_generic_rhs_component_off_l2": joint_generic_component_off_l2,
+         "radial_joint_generic_rhs_component_off_rel_l2": joint_generic_component_off_rel,
+@@ -14739,6 +14853,33 @@ def _build_prepared_radau_accepted_rollout(
+         project_flat=project_flat,
+         component="direct_generic",
+     )
++    flat_rhs_direct_density_state_pullback = _flat_rhs_split_state_pullback_factory(
++        unravel=unpack_flat,
++        pack_flat=pack_state,
++        vector_field=vector_field,
++        args=args,
++        kwargs=kwargs,
++        project_flat=project_flat,
++        component="direct_density",
++    )
++    flat_rhs_direct_pressure_state_pullback = _flat_rhs_split_state_pullback_factory(
++        unravel=unpack_flat,
++        pack_flat=pack_state,
++        vector_field=vector_field,
++        args=args,
++        kwargs=kwargs,
++        project_flat=project_flat,
++        component="direct_pressure",
++    )
++    flat_rhs_direct_er_state_pullback = _flat_rhs_split_state_pullback_factory(
++        unravel=unpack_flat,
++        pack_flat=pack_state,
++        vector_field=vector_field,
++        args=args,
++        kwargs=kwargs,
++        project_flat=project_flat,
++        component="direct_er",
++    )
+     flat_rhs_flux_state_pullback = _flat_rhs_split_state_pullback_factory(
+         unravel=unpack_flat,
+         pack_flat=pack_state,
+@@ -14923,6 +15064,9 @@ def _build_prepared_radau_accepted_rollout(
+         flat_rhs_state_pullback=flat_rhs_state_pullback,
+         flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
+         flat_rhs_direct_state_pullback_generic=flat_rhs_direct_state_pullback_generic,
++        flat_rhs_direct_density_state_pullback=flat_rhs_direct_density_state_pullback,
++        flat_rhs_direct_pressure_state_pullback=flat_rhs_direct_pressure_state_pullback,
++        flat_rhs_direct_er_state_pullback=flat_rhs_direct_er_state_pullback,
+         flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
+         flat_rhs_flux_state_pullback_generic=flat_rhs_flux_state_pullback_generic,
+         flat_rhs_joint_generic_state_pullback=flat_rhs_joint_generic_state_pullback,
+@@ -15107,6 +15251,33 @@ class RADAUSolver(_RadauSolverConfig):
+             project_flat=project_flat,
+             component="direct",
+         )
++        flat_rhs_direct_density_state_pullback = _flat_rhs_split_state_pullback_factory(
++            unravel=unpack_flat,
++            pack_flat=pack_state,
++            vector_field=vector_field,
++            args=args,
++            kwargs=kwargs,
++            project_flat=project_flat,
++            component="direct_density",
++        )
++        flat_rhs_direct_pressure_state_pullback = _flat_rhs_split_state_pullback_factory(
++            unravel=unpack_flat,
++            pack_flat=pack_state,
++            vector_field=vector_field,
++            args=args,
++            kwargs=kwargs,
++            project_flat=project_flat,
++            component="direct_pressure",
++        )
++        flat_rhs_direct_er_state_pullback = _flat_rhs_split_state_pullback_factory(
++            unravel=unpack_flat,
++            pack_flat=pack_state,
++            vector_field=vector_field,
++            args=args,
++            kwargs=kwargs,
++            project_flat=project_flat,
++            component="direct_er",
++        )
+         flat_rhs_flux_state_pullback = _flat_rhs_split_state_pullback_factory(
+             unravel=unpack_flat,
+             pack_flat=pack_state,
+@@ -15293,6 +15464,9 @@ class RADAUSolver(_RadauSolverConfig):
+             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+             flat_rhs_state_pullback=flat_rhs_state_pullback,
+             flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
++            flat_rhs_direct_density_state_pullback=flat_rhs_direct_density_state_pullback,
++            flat_rhs_direct_pressure_state_pullback=flat_rhs_direct_pressure_state_pullback,
++            flat_rhs_direct_er_state_pullback=flat_rhs_direct_er_state_pullback,
+             flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
+             exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
+             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
+diff --git a/examples/benchmarks/benchmark_transport_reverse_ad_only.py b/examples/benchmarks/benchmark_transport_reverse_ad_only.py
+index 0e706ea..eaa93d8 100644
+--- a/examples/benchmarks/benchmark_transport_reverse_ad_only.py
++++ b/examples/benchmarks/benchmark_transport_reverse_ad_only.py
+@@ -4274,6 +4274,18 @@ def _run_local_stage_matvec_diagnostic_report(
+         "radial_direct_rhs_component_off_l2": float(diagnostic["radial_direct_rhs_component_off_l2"]),
+         "radial_direct_rhs_component_off_rel_l2": float(diagnostic["radial_direct_rhs_component_off_rel_l2"]),
+         "radial_direct_rhs_component_off_max_abs": float(diagnostic["radial_direct_rhs_component_off_max_abs"]),
++        "radial_direct_density_rhs_component_l2": float(diagnostic["radial_direct_density_rhs_component_l2"]),
++        "radial_direct_density_rhs_component_off_l2": float(diagnostic["radial_direct_density_rhs_component_off_l2"]),
++        "radial_direct_density_rhs_component_off_rel_l2": float(diagnostic["radial_direct_density_rhs_component_off_rel_l2"]),
++        "radial_direct_density_rhs_component_off_max_abs": float(diagnostic["radial_direct_density_rhs_component_off_max_abs"]),
++        "radial_direct_pressure_rhs_component_l2": float(diagnostic["radial_direct_pressure_rhs_component_l2"]),
++        "radial_direct_pressure_rhs_component_off_l2": float(diagnostic["radial_direct_pressure_rhs_component_off_l2"]),
++        "radial_direct_pressure_rhs_component_off_rel_l2": float(diagnostic["radial_direct_pressure_rhs_component_off_rel_l2"]),
++        "radial_direct_pressure_rhs_component_off_max_abs": float(diagnostic["radial_direct_pressure_rhs_component_off_max_abs"]),
++        "radial_direct_er_rhs_component_l2": float(diagnostic["radial_direct_er_rhs_component_l2"]),
++        "radial_direct_er_rhs_component_off_l2": float(diagnostic["radial_direct_er_rhs_component_off_l2"]),
++        "radial_direct_er_rhs_component_off_rel_l2": float(diagnostic["radial_direct_er_rhs_component_off_rel_l2"]),
++        "radial_direct_er_rhs_component_off_max_abs": float(diagnostic["radial_direct_er_rhs_component_off_max_abs"]),
+         "radial_joint_generic_rhs_component_l2": float(diagnostic["radial_joint_generic_rhs_component_l2"]),
+         "radial_joint_generic_rhs_component_off_l2": float(diagnostic["radial_joint_generic_rhs_component_off_l2"]),
+         "radial_joint_generic_rhs_component_off_rel_l2": float(diagnostic["radial_joint_generic_rhs_component_off_rel_l2"]),
+@@ -4424,6 +4436,22 @@ def _run_local_stage_matvec_diagnostic_report(
+         f"joint_generic_off_max={report.get('radial_joint_generic_rhs_component_off_max_abs', _missing_component_value):.6e}",
+         flush=True,
+     )
++    print(
++        "[autodiff-gate] local stage direct off-band equation attribution: "
++        f"density_l2={report['radial_direct_density_rhs_component_l2']:.6e} "
++        f"density_off_l2={report['radial_direct_density_rhs_component_off_l2']:.6e} "
++        f"density_off_rel={report['radial_direct_density_rhs_component_off_rel_l2']:.6e} "
++        f"density_off_max={report['radial_direct_density_rhs_component_off_max_abs']:.6e} "
++        f"pressure_l2={report['radial_direct_pressure_rhs_component_l2']:.6e} "
++        f"pressure_off_l2={report['radial_direct_pressure_rhs_component_off_l2']:.6e} "
++        f"pressure_off_rel={report['radial_direct_pressure_rhs_component_off_rel_l2']:.6e} "
++        f"pressure_off_max={report['radial_direct_pressure_rhs_component_off_max_abs']:.6e} "
++        f"er_l2={report['radial_direct_er_rhs_component_l2']:.6e} "
++        f"er_off_l2={report['radial_direct_er_rhs_component_off_l2']:.6e} "
++        f"er_off_rel={report['radial_direct_er_rhs_component_off_rel_l2']:.6e} "
++        f"er_off_max={report['radial_direct_er_rhs_component_off_max_abs']:.6e}",
++        flush=True,
++    )
+     print(
+         "[autodiff-gate] local stage off-tridiagonal low-rank values: "
+         f"top8_singular_values="
+-- 
+2.43.0
+

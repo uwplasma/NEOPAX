@@ -2076,6 +2076,46 @@ class ComposedEquationSystem:
         zero_working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
         component_name = str(component).strip().lower()
 
+        def _er_direct_subterm_map(working_state_value, subterm_name):
+            if er_eq is None:
+                return jnp.zeros_like(state.Er)
+            Er = working_state_value.Er
+            plasma_permitivity = _plasma_permitivity_from_prefactor(
+                working_state_value,
+                er_eq.species_mass,
+                er_eq.permitivity_prefactor,
+            )
+            Gamma = _get_center_flux(shared_fluxes, "Gamma")
+            _, ambi_term = er_eq._charge_flux_and_ambi_term(
+                working_state_value,
+                Gamma,
+                plasma_permitivity,
+            )
+            _, er_diffusion = er_eq._er_diffusion(Er)
+            if subterm_name == "er_diffusion":
+                er_rhs = er_eq.Er_relax * er_eq.DEr * er_diffusion
+            elif subterm_name in {"er_ambipolar", "er_ambi_coeff"}:
+                er_rhs = -er_eq.Er_relax * ambi_term
+                if er_eq.boundary_mode == "floating_ambipolar_edge":
+                    er_rhs = er_rhs.at[-1].set(
+                        -er_eq.Er_relax
+                        * er_eq._outer_face_ambi_term(
+                            working_state_value,
+                            Gamma,
+                            plasma_permitivity,
+                        )
+                    )
+            elif subterm_name == "er_ambi_charge_flux":
+                # In this fixed-shared-flux diagnostic, charge_flux is held
+                # fixed; any nonzero state pullback here would indicate we
+                # accidentally differentiated through the flux model again.
+                er_rhs = jnp.zeros_like(state.Er)
+            else:
+                raise ValueError(f"Unknown Er direct RHS subterm {subterm_name!r}.")
+            if hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
+            return er_rhs
+
         def _density_map(working_state_value):
             density_rhs = (
                 density_eq(working_state_value, fluxes=shared_fluxes)
@@ -2137,6 +2177,15 @@ class ComposedEquationSystem:
             if er_eq is None:
                 return zero_working_state_bar
             _, er_pullback = jax.vjp(_er_map, working_state)
+            (er_state_bar,) = er_pullback(rhs_bar.Er)
+            return er_state_bar
+        if component_name in {"er_diffusion", "er_ambipolar", "er_ambi_coeff", "er_ambi_charge_flux"}:
+            if er_eq is None:
+                return zero_working_state_bar
+            _, er_pullback = jax.vjp(
+                lambda working_state_value: _er_direct_subterm_map(working_state_value, component_name),
+                working_state,
+            )
             (er_state_bar,) = er_pullback(rhs_bar.Er)
             return er_state_bar
         raise ValueError(f"Unknown direct RHS state component {component!r}.")
@@ -2381,6 +2430,46 @@ class ComposedEquationSystem:
             lagged_response,
             rhs_bar,
             component="er",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_diffusion(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_diffusion",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambipolar(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambipolar",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambi_coeff(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambi_coeff",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambi_charge_flux(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambi_charge_flux",
         )
 
     def pullback_evaluate_with_lagged_response_state_direct_generic(self, t, state, runtime, lagged_response, rhs_bar):
