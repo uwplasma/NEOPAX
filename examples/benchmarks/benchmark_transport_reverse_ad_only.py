@@ -4431,6 +4431,15 @@ def _run_local_stage_matvec_diagnostic_report(
         f"off_tridiagonal_significant_count={report['radial_off_tridiagonal_significant_count']}",
         flush=True,
     )
+    print(
+        "[autodiff-gate] local stage radial-band builder check: "
+        f"block_dim={report['radial_band_builder_block_dim']} "
+        f"permutation_max_abs_diff={report['radial_band_builder_permutation_max_abs_diff']} "
+        f"diff_l2={report['radial_band_builder_diff_l2']:.6e} "
+        f"rel_err={report['radial_band_builder_rel_err']:.6e} "
+        f"max_abs_diff={report['radial_band_builder_max_abs_diff']:.6e}",
+        flush=True,
+    )
     _missing_component_value = float("nan")
     print(
         "[autodiff-gate] local stage off-band component attribution: "

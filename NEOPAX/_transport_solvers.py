@@ -8618,6 +8618,48 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
         [transpose_radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
         axis=0,
     )
+    (
+        band_builder_permutation,
+        band_builder_block_dim,
+        band_builder_lower,
+        band_builder_diagonal,
+        band_builder_upper,
+    ) = _radau_exact_stage_transpose_radial_bands_from_matvec(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    band_builder_diff = jnp.concatenate(
+        [
+            (band_builder_lower - block_lower).reshape((-1,)),
+            (band_builder_diagonal - block_diagonal).reshape((-1,)),
+            (band_builder_upper - block_upper).reshape((-1,)),
+        ],
+        axis=0,
+    )
+    dense_band_reference = jnp.concatenate(
+        [
+            block_lower.reshape((-1,)),
+            block_diagonal.reshape((-1,)),
+            block_upper.reshape((-1,)),
+        ],
+        axis=0,
+    )
+    band_builder_diff_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.vdot(band_builder_diff, band_builder_diff),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    band_builder_reference_l2 = jnp.sqrt(
+        jnp.maximum(
+            jnp.vdot(dense_band_reference, dense_band_reference),
+            jnp.asarray(0.0, dtype=kernel_context.dtype),
+        )
+    )
+    band_builder_permutation_diff = jnp.max(jnp.abs(band_builder_permutation - radial_permutation))
     radial_rhs = vector_arr[radial_permutation]
     dense_solve_radial = jnp.linalg.solve(transpose_radial_matrix, radial_rhs)
 
@@ -8783,6 +8825,18 @@ def _radau_exact_stage_residual_transpose_matvec_diagnostic(
             off_tridiagonal_significant_count,
             dtype=jnp.int32,
         ),
+        "radial_band_builder_block_dim": jnp.asarray(band_builder_block_dim, dtype=jnp.int32),
+        "radial_band_builder_permutation_max_abs_diff": jnp.asarray(
+            band_builder_permutation_diff,
+            dtype=jnp.int32,
+        ),
+        "radial_band_builder_diff_l2": band_builder_diff_l2,
+        "radial_band_builder_rel_err": band_builder_diff_l2
+        / jnp.maximum(
+            band_builder_reference_l2,
+            jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+        ),
+        "radial_band_builder_max_abs_diff": jnp.max(jnp.abs(band_builder_diff)),
         "radial_off_tridiagonal_sval0": off_tridiagonal_sval0,
         "radial_off_tridiagonal_sval1": off_tridiagonal_sval1,
         "radial_off_tridiagonal_sval2": off_tridiagonal_sval2,
@@ -9181,6 +9235,88 @@ def _radau_solve_radial_block_tridiagonal_plus_low_rank(
     radial_solution_rows = radial_solution_columns.T
     solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(radial_solution_rows)
     return solution_rows if batched else solution_rows[0]
+
+
+def _radau_exact_stage_transpose_radial_bands_from_matvec(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+):
+    """Assemble exact radial block bands from compact transpose matvecs.
+
+    This intentionally stores only the lower/diagonal/upper radial bands. It is
+    an intermediate compact builder for the production Woodbury path: the
+    nonlocal Er-coefficient correction must be supplied separately as low-rank
+    factors rather than recovered from a dense residual matrix.
+    """
+    layout, radial_permutation, radial_block_dim = _radau_stage_to_radial_permutation_and_block_dim(
+        kernel_context
+    )
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    n_radial = int(layout.n_radial)
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context,
+        carry_in,
+        primal_result,
+    )
+    eye_block = jnp.eye(radial_block_dim, dtype=kernel_context.dtype)
+
+    def _block_column_bands(block_index):
+        radial_vectors = jnp.zeros(
+            (radial_block_dim, system_size),
+            dtype=kernel_context.dtype,
+        )
+        col_start = block_index * radial_block_dim
+        radial_vectors = jax.lax.dynamic_update_slice(
+            radial_vectors,
+            eye_block,
+            (0, col_start),
+        )
+        stage_vectors = jnp.zeros_like(radial_vectors).at[:, radial_permutation].set(radial_vectors)
+        stage_outputs = _radau_exact_stage_residual_transpose_matvec_batched(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            stage_vectors,
+            stage_times=stage_times,
+            stage_states=stage_states,
+        ).reshape((radial_block_dim, system_size))
+        radial_outputs = stage_outputs[:, radial_permutation]
+
+        def _gather_row_block(row_index):
+            row_index = jnp.clip(row_index, 0, n_radial - 1)
+            row_start = row_index * radial_block_dim
+            block_columns = jax.lax.dynamic_slice(
+                radial_outputs,
+                (0, row_start),
+                (radial_block_dim, radial_block_dim),
+            )
+            return block_columns.T
+
+        above_block = jnp.where(
+            block_index > 0,
+            _gather_row_block(block_index - 1),
+            jnp.zeros((radial_block_dim, radial_block_dim), dtype=kernel_context.dtype),
+        )
+        diagonal_block = _gather_row_block(block_index)
+        below_block = jnp.where(
+            block_index < n_radial - 1,
+            _gather_row_block(block_index + 1),
+            jnp.zeros((radial_block_dim, radial_block_dim), dtype=kernel_context.dtype),
+        )
+        return above_block, diagonal_block, below_block
+
+    above_by_column, diagonal, below_by_column = jax.vmap(_block_column_bands)(
+        jnp.arange(n_radial, dtype=jnp.int32)
+    )
+    zero_block = jnp.zeros_like(diagonal[:1])
+    lower = jnp.concatenate([zero_block, below_by_column[:-1]], axis=0)
+    upper = jnp.concatenate([above_by_column[1:], zero_block], axis=0)
+    return radial_permutation, radial_block_dim, lower, diagonal, upper
 
 
 def _radau_solve_exact_stage_residual_transpose_block(

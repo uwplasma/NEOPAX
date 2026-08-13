@@ -430,3 +430,21 @@ For this case, rank 24 is already effectively at the useful accuracy floor of
 the diagnostic. Higher rank improves only marginally because the remaining
 error is dominated by numerical conditioning/roundoff rather than missing
 low-rank modes.
+
+Next compact-solver guard added on this branch:
+
+```text
+local stage radial-band builder check:
+  block_dim=...
+  permutation_max_abs_diff=...
+  diff_l2=...
+  rel_err=...
+  max_abs_diff=...
+```
+
+This compares the new compact band assembly, built from compact transpose
+matvecs and storing only lower/diagonal/upper radial block bands, against the
+dense radial transpose oracle. For the compact direct solver to be trusted, the
+band-builder `rel_err` should be at roundoff, like the existing compact-vs-dense
+transpose checks. If this passes, the remaining production work is only the
+analytic Er-ambipolar-coefficient low-rank factor path.

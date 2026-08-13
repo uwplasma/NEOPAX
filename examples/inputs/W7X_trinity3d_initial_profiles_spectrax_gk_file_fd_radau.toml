@@ -19,7 +19,7 @@ entropy_model = "none"
 [turbulence]
 flux_model = "fluxes_r_file"
 turbulence_file = "./examples/inputs/neopax_fluxes_w7x_t3d.h5"
-lagged_response_mode = "fd"
+lagged_response_mode = "none"
 
 [classical]
 flux_model = "none"
@@ -98,7 +98,7 @@ density_floor = 1.0e-3
 temperature_floor = 1.0e-3
 transport_solver_backend = "radau"
 integrator = "radau"
-radau_rhs_mode = "lagged_response"
+radau_rhs_mode = "black_box"
 radau_num_stages = 7
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
@@ -108,7 +108,7 @@ radau_error_estimator = "embedded2_ntss_transport_scale"
 radau_controller_mode = "hairer_lean_transport_discounted"
 radau_predictor_mode = "collocation_transport_weighted"
 lagged_response_reuse_mode = "global_state_drift"
-lagged_response_reuse_rtol = 1.0e-2
+lagged_response_reuse_rtol = 1.0e-3
 lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
 t_final = 0.006
