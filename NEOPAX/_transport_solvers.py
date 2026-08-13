@@ -9319,6 +9319,136 @@ def _radau_exact_stage_transpose_radial_bands_from_matvec(
     return radial_permutation, radial_block_dim, lower, diagonal, upper
 
 
+def _radau_exact_stage_transpose_er_coeff_low_rank_factors_compact(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rank: int,
+):
+    """Build non-dense Woodbury factors for the Er ambipolar-coefficient tail.
+
+    The block-tridiagonal bands are built from the compact exact transpose
+    matvec. The only long-range term seen in diagnostics is the fixed-flux Er
+    ambipolar coefficient pullback, whose columns are nonzero only for Er
+    cotangents. We therefore materialize that skinny column block, remove its
+    block-tridiagonal part, and compress only that correction.
+    """
+    if physics_context.flat_rhs_direct_er_ambi_coeff_state_pullback is None:
+        raise ValueError(
+            "woodbury_er_coeff_compact requires flat_rhs_direct_er_ambi_coeff_state_pullback."
+        )
+
+    layout, radial_permutation, radial_block_dim = _radau_stage_to_radial_permutation_and_block_dim(
+        kernel_context
+    )
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    active_er_size = int(layout.active_er_size)
+    if active_er_size <= 0:
+        raise ValueError("woodbury_er_coeff_compact requires active Er state variables.")
+
+    (
+        band_permutation,
+        band_block_dim,
+        block_lower,
+        block_diagonal,
+        block_upper,
+    ) = _radau_exact_stage_transpose_radial_bands_from_matvec(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    if int(band_block_dim) != int(radial_block_dim):
+        raise ValueError("Radial band builder returned an inconsistent block dimension.")
+
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context,
+        carry_in,
+        primal_result,
+    )
+    density_end = int(kernel_context.density_size)
+    pressure_end = density_end + int(kernel_context.pressure_size)
+    er_start = pressure_end
+    er_stop = er_start + active_er_size
+    er_basis = jnp.eye(active_er_size, dtype=kernel_context.dtype)
+    er_cotangent_basis = jnp.zeros(
+        (active_er_size, int(kernel_context.state_dim)),
+        dtype=kernel_context.dtype,
+    ).at[:, er_start:er_stop].set(er_basis)
+
+    def _stage_er_coeff_pullback(t_eval, y_eval):
+        return jax.vmap(
+            lambda er_cotangent: physics_context.flat_rhs_direct_er_ambi_coeff_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                er_cotangent,
+            )
+        )(er_cotangent_basis)
+
+    # Shape: (stage_i, er_column, state_input).
+    er_coeff_pullbacks = jax.vmap(_stage_er_coeff_pullback, in_axes=(0, 0))(
+        stage_times,
+        stage_states,
+    )
+    # Transpose residual contribution for a lambda column at stage i is
+    # -dt * A[i, j] * J_i.T lambda_i in output stage j.
+    stage_major_columns = (
+        -primal_result.trial_dt
+        * jnp.einsum("ij,ikn->ikjn", kernel_context.a, er_coeff_pullbacks)
+    ).reshape((int(kernel_context.num_stages) * active_er_size, system_size)).T
+    radial_columns = stage_major_columns[radial_permutation, :]
+
+    stage_ids = jnp.arange(int(kernel_context.num_stages), dtype=jnp.int32)[:, None]
+    er_ids = jnp.arange(active_er_size, dtype=jnp.int32)[None, :]
+    selected_stage_positions = (
+        stage_ids * jnp.asarray(int(kernel_context.state_dim), dtype=jnp.int32)
+        + jnp.asarray(er_start, dtype=jnp.int32)
+        + er_ids
+    ).reshape((-1,))
+    inverse_radial_permutation = jnp.zeros((system_size,), dtype=jnp.int32).at[
+        radial_permutation
+    ].set(jnp.arange(system_size, dtype=jnp.int32))
+    selected_radial_positions = inverse_radial_permutation[selected_stage_positions]
+
+    row_block = jnp.arange(system_size, dtype=jnp.int32)[:, None] // jnp.asarray(
+        radial_block_dim,
+        dtype=jnp.int32,
+    )
+    column_block = selected_radial_positions[None, :] // jnp.asarray(
+        radial_block_dim,
+        dtype=jnp.int32,
+    )
+    off_band_columns = jnp.where(
+        jnp.abs(row_block - column_block) > 1,
+        radial_columns,
+        jnp.zeros_like(radial_columns),
+    )
+
+    u_full, singular_values, vh_full = jnp.linalg.svd(off_band_columns, full_matrices=False)
+    max_rank = int(singular_values.shape[0])
+    rank = min(int(rank), max_rank)
+    u_rank = u_full[:, :rank] * singular_values[:rank][None, :]
+    skinny_v = vh_full[:rank, :].T
+    v_rank = jnp.zeros((system_size, rank), dtype=kernel_context.dtype).at[
+        selected_radial_positions, :
+    ].set(skinny_v)
+
+    return (
+        band_permutation,
+        int(band_block_dim),
+        block_lower,
+        block_diagonal,
+        block_upper,
+        u_rank,
+        v_rank,
+    )
+
+
 def _radau_solve_exact_stage_residual_transpose_block(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -9477,35 +9607,46 @@ def _radau_solve_exact_stage_residual_transpose_er_coeff_woodbury_compact(
 ):
     """Production target: block-tridiagonal solve plus analytic Er-coeff correction.
 
-    The solver side intentionally only consumes already-built compact factors.
-    The equation system must provide the block-tridiagonal base bands and the
-    Er-ambipolar-coefficient low-rank factors. Keeping construction outside
-    this generic solver prevents this mode from falling back to dense matrix
-    materialization or in-JIT SVD.
+    This mode avoids the full Radau stage matrix. By default it builds compact
+    block-tridiagonal bands from transpose matvecs and a skinny low-rank
+    correction from the Er ambipolar-coefficient pullback. Equation systems may
+    override the factor builder with an even more specialized hook.
     """
     factors_fn = physics_context.exact_stage_transpose_low_rank_factors
-    if factors_fn is None:
-        raise ValueError(
-            "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires "
-            "the equation system to implement exact_stage_transpose_low_rank_factors(...). "
-            "The dense/SVD Woodbury validation modes are intentionally not used here."
+    if factors_fn is not None:
+        (
+            radial_permutation,
+            radial_block_dim,
+            block_lower,
+            block_diagonal,
+            block_upper,
+            u_rank,
+            v_rank,
+        ) = factors_fn(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rank=int(getattr(physics_context, "reverse_stage_adjoint_woodbury_rank", 24)),
         )
-    (
-        radial_permutation,
-        radial_block_dim,
-        block_lower,
-        block_diagonal,
-        block_upper,
-        u_rank,
-        v_rank,
-    ) = factors_fn(
-        kernel_context,
-        physics_context,
-        carry_in,
-        primal_result,
-        lagged_response,
-        rank=int(getattr(physics_context, "reverse_stage_adjoint_woodbury_rank", 24)),
-    )
+    else:
+        (
+            radial_permutation,
+            radial_block_dim,
+            block_lower,
+            block_diagonal,
+            block_upper,
+            u_rank,
+            v_rank,
+        ) = _radau_exact_stage_transpose_er_coeff_low_rank_factors_compact(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rank=int(getattr(physics_context, "reverse_stage_adjoint_woodbury_rank", 24)),
+        )
     return _radau_solve_radial_block_tridiagonal_plus_low_rank(
         kernel_context,
         radial_permutation,
@@ -15291,15 +15432,6 @@ def _build_prepared_radau_accepted_rollout(
             "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
             "disabled by design."
         )
-    if (
-        reverse_stage_adjoint_solve_mode == "woodbury_er_coeff_compact"
-        and exact_stage_transpose_low_rank_factors is None
-    ):
-        raise ValueError(
-            "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires the equation system "
-            "to implement exact_stage_transpose_low_rank_factors(...). This mode is reserved for "
-            "the non-dense Er-ambipolar-coefficient Woodbury path."
-        )
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
             "Radau lagged transport response mode requires a vector field owner that defines "
@@ -15721,15 +15853,6 @@ class RADAUSolver(_RadauSolverConfig):
                 "reverse_stage_adjoint_solve_mode='exact_block_compact' requires the equation system "
                 "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
                 "disabled by design."
-            )
-        if (
-            reverse_stage_adjoint_solve_mode == "woodbury_er_coeff_compact"
-            and exact_stage_transpose_low_rank_factors is None
-        ):
-            raise ValueError(
-                "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires the equation system "
-                "to implement exact_stage_transpose_low_rank_factors(...). This mode is reserved for "
-                "the non-dense Er-ambipolar-coefficient Woodbury path."
             )
         if rhs_mode not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
             raise ValueError(
